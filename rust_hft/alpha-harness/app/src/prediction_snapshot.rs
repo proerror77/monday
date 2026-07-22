@@ -192,8 +192,9 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
         "--polymarket-content-sha256",
         "--polymarket-manifest-sha256",
     ];
-    const BOOLEAN_FLAGS: [&str; 3] = [
+    const BOOLEAN_FLAGS: [&str; 4] = [
         "--allow-missing-official-settlement",
+        "--polymarket-chainlink-baseline",
         "--skip-deribit",
         "--verified-artifacts",
     ];
@@ -405,6 +406,17 @@ mod tests {
         };
 
         validate_snapshot_args(&args).expect("verified artifact flags must be forwarded");
+    }
+
+    #[test]
+    fn snapshot_wrapper_forwards_polymarket_chainlink_baseline_profile() {
+        let args = PredictionSnapshotArgs {
+            work_dir: PathBuf::from("work"),
+            result_put_url: "snapshot.zip".to_string(),
+            compiler_args: vec![OsString::from("--polymarket-chainlink-baseline")],
+        };
+
+        validate_snapshot_args(&args).expect("baseline profile must reach the snapshot compiler");
     }
 
     #[test]

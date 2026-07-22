@@ -85,12 +85,14 @@ pub use replay::replay_fills;
 #[cfg(feature = "db")]
 pub use research_snapshot::{build_research_snapshot_from_database, ResearchSnapshotBuildOptions};
 pub use research_snapshot::{
+    build_research_snapshot_from_polymarket_chainlink_baseline,
     build_research_snapshot_from_verified_artifacts, load_research_snapshot,
     validate_snapshot_request, validate_snapshot_request_coverage, write_research_snapshot,
     ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
     ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
     ResearchSnapshotRowCounts, VerifiedArtifactSnapshotBuildOptions,
-    RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+    BINANCE_SURFACES_OMITTED_QUALITY_FLAG, POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
+    POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use verified_binance_projection::{
     project_verified_binance_market_tape, VerifiedBinanceResearchProjection,

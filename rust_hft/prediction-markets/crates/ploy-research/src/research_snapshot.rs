@@ -11,7 +11,7 @@ use std::time::Instant;
 use anyhow::{ensure, Context, Result};
 #[cfg(feature = "db")]
 use chrono::Timelike;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use data::binance_market_tape_artifact::VerifiedBinanceMarketTape;
 use ploy_market_contracts::MarketUpdate;
 use ploy_market_data::polymarket_evidence::VerifiedPolymarketEvidenceSet;
@@ -28,6 +28,10 @@ use crate::{
 };
 
 pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v2";
+pub const POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND: &str =
+    "verified_polymarket_chainlink_baseline";
+pub const POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT: &str = "polymarket_chainlink_baseline";
+pub const BINANCE_SURFACES_OMITTED_QUALITY_FLAG: &str = "binance_surfaces_intentionally_omitted";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchSnapshotArtifacts {
@@ -292,6 +296,83 @@ fn bind_and_filter_verified_observations(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<FactorObservation>> {
+    bind_and_filter_verified_observations_with_binance_requirement(
+        observations,
+        contracts,
+        outcomes,
+        symbol,
+        start,
+        end,
+        true,
+    )
+}
+
+fn bind_and_filter_polymarket_chainlink_baseline_observations(
+    observations: Vec<FactorObservation>,
+    contracts: &[ResearchPolymarketContract],
+    outcomes: &HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>,
+    symbol: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<FactorObservation>> {
+    bind_and_filter_verified_observations_with_binance_requirement(
+        observations,
+        contracts,
+        outcomes,
+        symbol,
+        start,
+        end,
+        false,
+    )
+}
+
+fn clear_polymarket_chainlink_baseline_unavailable_features(row: &mut FactorObservation) {
+    row.signed_distance_to_beat = f64::NAN;
+    row.abs_distance_to_beat = f64::NAN;
+    row.drift_10s = f64::NAN;
+    row.drift_30s = f64::NAN;
+    row.flip_age_secs = f64::NAN;
+    row.post_flip_drift = f64::NAN;
+    row.sigma_horizon = f64::NAN;
+    row.implied_sigma_horizon = f64::NAN;
+    row.vol_gap = f64::NAN;
+    row.distance_over_sigma = f64::NAN;
+    row.model_prob_up = f64::NAN;
+    row.chainlink_prob_up = f64::NAN;
+    row.model_edge_up = f64::NAN;
+    row.obi = f64::NAN;
+    row.spread_bps = f64::NAN;
+    row.microprice_offset_bps = f64::NAN;
+    row.bid_depth_near = f64::NAN;
+    row.ask_depth_near = f64::NAN;
+    row.depth_ratio = f64::NAN;
+    row.depth_imbalance = f64::NAN;
+    row.depth_far_ratio = f64::NAN;
+    row.depth_acceleration = f64::NAN;
+    row.obi_10 = f64::NAN;
+    row.cum_obi_delta_5m = f64::NAN;
+    row.cum_depth_delta_5m = f64::NAN;
+    row.cum_mprice_drift_5m = f64::NAN;
+    row.cum_trade_imbalance_5m = f64::NAN;
+    row.cex_bar_return_30s = f64::NAN;
+    row.cex_bar_return_60s = f64::NAN;
+    row.cex_bar_volume_ratio_30s = f64::NAN;
+    row.cex_bar_volume_trend_3 = f64::NAN;
+    row.cex_signed_volume_ratio_30s = f64::NAN;
+    row.cex_consecutive_up_bars = f64::NAN;
+    row.cex_consecutive_down_bars = f64::NAN;
+    row.cex_breakout_volume_score = f64::NAN;
+}
+
+fn bind_and_filter_verified_observations_with_binance_requirement(
+    observations: Vec<FactorObservation>,
+    contracts: &[ResearchPolymarketContract],
+    outcomes: &HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>,
+    symbol: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    require_binance: bool,
+) -> Result<Vec<FactorObservation>> {
     let contracts_by_event = contracts
         .iter()
         .map(|contract| (contract.event_id.as_str(), contract))
@@ -319,10 +400,17 @@ fn bind_and_filter_verified_observations(
         if !observation_is_available(row.tick_ts, contract, start, end) {
             continue;
         }
+        if !require_binance {
+            row.binance_spot_fresh = false;
+            row.binance_lob_fresh = false;
+            row.binance_agg_trade_fresh = false;
+            clear_polymarket_chainlink_baseline_unavailable_features(&mut row);
+        }
         if !row.chainlink_reference_fresh
-            || !row.binance_spot_fresh
-            || !row.binance_lob_fresh
-            || !row.binance_agg_trade_fresh
+            || (require_binance
+                && (!row.binance_spot_fresh
+                    || !row.binance_lob_fresh
+                    || !row.binance_agg_trade_fresh))
         {
             continue;
         }
@@ -346,6 +434,52 @@ fn bind_and_filter_verified_observations(
         );
     }
     Ok(available)
+}
+
+fn polymarket_chainlink_baseline_ticks(
+    books: &[ResearchPmBookSnapshot],
+    contracts: &[ResearchPolymarketContract],
+) -> Result<Vec<MarketUpdate>> {
+    let mut ticks = Vec::new();
+    for contract in contracts {
+        let mut event_books = books
+            .iter()
+            .filter(|book| book.event_id == contract.event_id)
+            .collect::<Vec<_>>();
+        event_books
+            .sort_by(|left, right| (left.ts, &left.token_id).cmp(&(right.ts, &right.token_id)));
+        let mut has_up = false;
+        let mut has_down = false;
+        let mut emitted = HashSet::new();
+        for book in event_books {
+            ensure!(
+                !book.bids.is_empty() && !book.asks.is_empty(),
+                "baseline token books must contain both bid and ask depth"
+            );
+            if book.token_id == contract.up_token_id && book.side.eq_ignore_ascii_case("up") {
+                has_up = true;
+            } else if book.token_id == contract.down_token_id
+                && book.side.eq_ignore_ascii_case("down")
+            {
+                has_down = true;
+            } else {
+                anyhow::bail!("baseline token book identity does not match its event contract");
+            }
+            if has_up && has_down && emitted.insert(book.ts) {
+                ticks.push(MarketUpdate::SpotPrice {
+                    symbol: Arc::from(contract.symbol.as_str()),
+                    price: contract.price_to_beat,
+                    ts: book.ts,
+                });
+            }
+        }
+        ensure!(
+            has_up && has_down && !emitted.is_empty(),
+            "baseline event {} requires both Up and Down token books",
+            contract.event_id
+        );
+    }
+    Ok(ticks)
 }
 
 fn verified_source_surfaces(
@@ -616,6 +750,253 @@ pub fn build_research_snapshot_from_verified_artifacts(
                 merged_sampled_rows: pm_book_snapshots.len(),
                 archive_dir: None,
                 archive_status: "verified_artifact_projection".to_string(),
+            },
+        },
+        observations,
+        deribit_snapshots: Vec::new(),
+        pm_book_snapshots,
+    })
+}
+
+pub fn build_research_snapshot_from_polymarket_chainlink_baseline(
+    polymarket: &VerifiedPolymarketEvidenceSet,
+    options: VerifiedArtifactSnapshotBuildOptions,
+) -> Result<ResearchSnapshot> {
+    validate_verified_options(&options)?;
+    ensure!(
+        options.start.timestamp().rem_euclid(300) == 0
+            && options.start.timestamp_subsec_nanos() == 0
+            && options.end.timestamp().rem_euclid(300) == 0
+            && options.end.timestamp_subsec_nanos() == 0,
+        "Polymarket + Chainlink baseline window must align to full five-minute events"
+    );
+    ensure!(
+        polymarket.event_start_gte() <= options.start && polymarket.event_start_lt() >= options.end,
+        "verified Polymarket evidence does not cover the baseline snapshot window"
+    );
+    let history_start = options
+        .start
+        .checked_sub_signed(Duration::seconds(options.max_quote_age_secs))
+        .context("baseline history window overflows")?;
+
+    let mut polymarket_updates = Vec::new();
+    let mut pm_book_snapshots = Vec::new();
+    let mut contracts = Vec::new();
+    let mut settlements = Vec::new();
+    let mut generated_at = None;
+    for member in polymarket.members() {
+        let projection = project_verified_polymarket_evidence(
+            member,
+            i64::from(options.pm_book_sample_secs),
+            options.max_quote_age_secs,
+        )?;
+        polymarket_updates.extend(projection.updates);
+        pm_book_snapshots.extend(projection.pm_book_snapshots);
+        contracts.extend(projection.contracts);
+        settlements.extend(projection.settlements);
+        generated_at = Some(generated_at.map_or(
+            projection.evidence_available_through,
+            |current: DateTime<Utc>| current.max(projection.evidence_available_through),
+        ));
+    }
+
+    contracts.retain(|contract| {
+        contract.symbol == options.symbol
+            && contract.event_start >= options.start
+            && contract.event_end <= options.end
+    });
+    ensure!(
+        !contracts.is_empty(),
+        "baseline snapshot has no complete five-minute Polymarket contracts"
+    );
+    let selected_events = contracts
+        .iter()
+        .map(|contract| contract.event_id.as_str())
+        .collect::<HashSet<_>>();
+    let selected_tokens = contracts
+        .iter()
+        .flat_map(|contract| {
+            [
+                contract.up_token_id.as_str(),
+                contract.down_token_id.as_str(),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    polymarket_updates.retain(|update| {
+        update.sort_ts() >= history_start
+            && update.sort_ts() < options.end
+            && match update {
+                MarketUpdate::ReferencePrice { symbol, .. } => symbol.as_ref() == options.symbol,
+                MarketUpdate::Quote { token_id, .. } => selected_tokens.contains(token_id.as_ref()),
+                _ => false,
+            }
+    });
+    pm_book_snapshots.retain(|book| {
+        selected_events.contains(book.event_id.as_str())
+            && book.ts >= history_start
+            && book.ts < options.end
+    });
+    let chainlink_rows = polymarket_updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                update,
+                MarketUpdate::ReferencePrice {
+                    source,
+                    is_carried_forward: false,
+                    received_at: Some(_),
+                    ..
+                } if source.eq_ignore_ascii_case("chainlink")
+            )
+        })
+        .count();
+    ensure!(
+        chainlink_rows >= contracts.len(),
+        "baseline snapshot requires authenticated event-local Chainlink reference evidence"
+    );
+    let outcomes = append_verified_contracts(&mut polymarket_updates, &contracts, &settlements)?;
+    polymarket_updates.extend(polymarket_chainlink_baseline_ticks(
+        &pm_book_snapshots,
+        &contracts,
+    )?);
+    polymarket_updates.sort_by_key(MarketUpdate::sort_ts);
+    pm_book_snapshots.sort_by(|left, right| {
+        (left.ts, &left.event_id, &left.token_id).cmp(&(right.ts, &right.event_id, &right.token_id))
+    });
+
+    let observations =
+        crate::factors::build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
+            &polymarket_updates,
+            &[],
+            &[],
+            options.max_quote_age_secs,
+            options.observation_sample_secs,
+        );
+    let observations = bind_and_filter_polymarket_chainlink_baseline_observations(
+        observations,
+        &contracts,
+        &outcomes,
+        &options.symbol,
+        options.start,
+        options.end,
+    )?;
+    ensure!(
+        observations.iter().all(|row| {
+            !row.binance_spot_fresh && !row.binance_lob_fresh && !row.binance_agg_trade_fresh
+        }),
+        "baseline snapshot must not claim Binance freshness"
+    );
+
+    let input_artifacts = polymarket
+        .identities()
+        .enumerate()
+        .map(|(index, identity)| ResearchSnapshotInputArtifact {
+            name: format!("polymarket_evidence_{index:04}"),
+            path: format!(
+                "verified+polymarket://sha256/{}/manifest/{}",
+                identity.content_sha256, identity.manifest_sha256
+            ),
+            content_hash: Some(format!("sha256:{}", identity.content_sha256)),
+            row_count: usize::try_from(identity.rows).ok(),
+        })
+        .collect::<Vec<_>>();
+    let counts = [
+        chainlink_rows,
+        0,
+        0,
+        0,
+        pm_book_snapshots.len(),
+        outcomes.len(),
+    ];
+    let mut source_surfaces =
+        verified_source_surfaces(counts, options.lob_sample_secs, options.pm_book_sample_secs);
+    for surface in &mut source_surfaces {
+        if surface.name.starts_with("binance_") {
+            surface.role = "intentionally_omitted".to_string();
+            surface.gate_category = "optional_context".to_string();
+            surface.snapshot_sampled = false;
+            surface.sample_secs = None;
+            surface.row_count = Some(0);
+            surface.notes =
+                "Intentionally omitted by the explicit Polymarket + Chainlink baseline profile."
+                    .to_string();
+        }
+    }
+    let generated_at = generated_at.context("verified Polymarket evidence set is empty")?;
+    ensure!(
+        generated_at >= options.end,
+        "verified Polymarket evidence was not available through the baseline snapshot end"
+    );
+    let audit = serde_json::json!({
+        "schema": "monday.polymarket_chainlink_baseline_audit.v1",
+        "profile": POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
+        "symbol": &options.symbol,
+        "snapshot_start": options.start,
+        "snapshot_end": options.end,
+        "generated_at": generated_at,
+        "contracts": contracts.len(),
+        "chainlink_references": chainlink_rows,
+        "polymarket_books": pm_book_snapshots.len(),
+        "official_settlements": outcomes.len(),
+        "intentional_omissions": ["binance_price", "binance_agg_trades", "binance_lob"],
+        "input_artifacts": &input_artifacts,
+    });
+    let audit_bytes = serde_json::to_vec(&audit).context("serialize baseline artifact audit")?;
+    let audit_sha256 = format!("{:x}", Sha256::digest(audit_bytes));
+    let row_counts = ResearchSnapshotRowCounts {
+        observations: observations.len(),
+        deribit_snapshots: 0,
+        pm_book_snapshots: pm_book_snapshots.len(),
+    };
+
+    Ok(ResearchSnapshot {
+        manifest: ResearchSnapshotManifest {
+            schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
+            snapshot_hash: None,
+            snapshot_contract_hash: None,
+            generated_at,
+            git_sha: options.git_sha,
+            symbols: vec![options.symbol],
+            start: options.start,
+            end: options.end,
+            history_start,
+            lob_sample_secs: options.lob_sample_secs,
+            pm_book_sample_secs: Some(options.pm_book_sample_secs),
+            observation_sample_secs: options.observation_sample_secs,
+            max_quote_age_secs: options.max_quote_age_secs,
+            stake_usd: options.stake_usd,
+            require_official_settlement: true,
+            immutable_input: true,
+            source_kind: POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND.to_string(),
+            optimizer_data_dir: Some(options.optimizer_data_dir),
+            source_surfaces,
+            input_artifacts,
+            data_requirements: [
+                POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
+                "chainlink_reference",
+                "polymarket_orderbook",
+                "polymarket_official_settlement",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            data_audit_status: Some("ok".to_string()),
+            data_audit_report: Some(format!(
+                "verified+polymarket-chainlink-baseline-audit://sha256/{audit_sha256}"
+            )),
+            include_deribit: false,
+            artifacts: ResearchSnapshotArtifacts::default(),
+            row_counts,
+            phase_timings: Vec::new(),
+            quality_flags: vec![BINANCE_SURFACES_OMITTED_QUALITY_FLAG.to_string()],
+            pm_book_source: ResearchSnapshotPmBookSource {
+                hot_postgres_sampled_rows: 0,
+                archive_sampled_rows: 0,
+                archive_manifest_rows: 0,
+                archive_files: 0,
+                archive_token_windows: 0,
+                merged_sampled_rows: pm_book_snapshots.len(),
+                archive_dir: None,
+                archive_status: "verified_polymarket_chainlink_baseline_projection".to_string(),
             },
         },
         observations,
@@ -2309,6 +2690,7 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResearchPmBookLevel;
 
     fn verified_contract(available_at: &str) -> ResearchPolymarketContract {
         ResearchPolymarketContract {
@@ -2466,6 +2848,107 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("no available factor observation"));
+    }
+
+    #[test]
+    fn polymarket_chainlink_baseline_binding_clears_all_binance_freshness() {
+        let contract = verified_contract("2026-07-17T05:31:00Z");
+        let row = verified_observation("2026-07-17T05:31:00Z");
+        let rows = bind_and_filter_polymarket_chainlink_baseline_observations(
+            vec![row],
+            std::slice::from_ref(&contract),
+            &verified_outcomes(true),
+            "BTCUSDT",
+            contract.event_start,
+            contract.event_end,
+        )
+        .expect("available baseline observation");
+
+        assert!(rows[0].chainlink_reference_fresh);
+        assert!(!rows[0].binance_spot_fresh);
+        assert!(!rows[0].binance_lob_fresh);
+        assert!(!rows[0].binance_agg_trade_fresh);
+        assert!(
+            [
+                rows[0].signed_distance_to_beat,
+                rows[0].abs_distance_to_beat,
+                rows[0].drift_10s,
+                rows[0].drift_30s,
+                rows[0].sigma_horizon,
+                rows[0].distance_over_sigma,
+                rows[0].model_prob_up,
+                rows[0].chainlink_prob_up,
+                rows[0].model_edge_up,
+                rows[0].obi,
+                rows[0].spread_bps,
+                rows[0].bid_depth_near,
+                rows[0].ask_depth_near,
+                rows[0].cum_obi_delta_5m,
+                rows[0].cum_trade_imbalance_5m,
+                rows[0].cex_bar_return_30s,
+            ]
+            .iter()
+            .all(|value| value.is_nan()),
+            "baseline rows must not expose finite Binance-derived placeholders"
+        );
+
+        let mut stale_chainlink = verified_observation("2026-07-17T05:31:00Z");
+        stale_chainlink.chainlink_reference_fresh = false;
+        assert!(bind_and_filter_polymarket_chainlink_baseline_observations(
+            vec![stale_chainlink],
+            std::slice::from_ref(&contract),
+            &verified_outcomes(true),
+            "BTCUSDT",
+            contract.event_start,
+            contract.event_end,
+        )
+        .expect_err("baseline still requires fresh Chainlink evidence")
+        .to_string()
+        .contains("no available factor observation"));
+    }
+
+    #[test]
+    fn polymarket_chainlink_baseline_ticks_require_both_token_books() {
+        let contract = verified_contract("2026-07-17T05:29:59Z");
+        let first = "2026-07-17T05:30:02Z".parse().unwrap();
+        let second = "2026-07-17T05:30:03Z".parse().unwrap();
+        let book = |token_id: &str, side: &str, ts| ResearchPmBookSnapshot {
+            event_id: contract.event_id.clone(),
+            token_id: token_id.to_string(),
+            side: side.to_string(),
+            ts,
+            bids: vec![ResearchPmBookLevel {
+                price: 0.4,
+                size: 10.0,
+            }],
+            asks: vec![ResearchPmBookLevel {
+                price: 0.6,
+                size: 10.0,
+            }],
+        };
+        let books = vec![
+            book(&contract.up_token_id, "UP", first),
+            book(&contract.down_token_id, "DOWN", second),
+        ];
+
+        let ticks = polymarket_chainlink_baseline_ticks(&books, std::slice::from_ref(&contract))
+            .expect("both token books produce a baseline clock");
+        assert_eq!(ticks.len(), 1);
+        match &ticks[0] {
+            MarketUpdate::SpotPrice { symbol, price, ts } => {
+                assert_eq!(symbol.as_ref(), "BTCUSDT");
+                assert_eq!(price, &contract.price_to_beat);
+                assert_eq!(ts, &second);
+            }
+            other => panic!("expected derived baseline clock, got {other:?}"),
+        }
+
+        assert!(
+            polymarket_chainlink_baseline_ticks(&books[..1], std::slice::from_ref(&contract),)
+                .expect_err("one-sided token evidence must fail closed")
+                .to_string()
+                .contains("both Up and Down token books")
+        );
     }
 
     #[test]
@@ -2807,16 +3290,26 @@ mod tests {
     }
 
     #[test]
-    fn write_and_load_empty_snapshot_roundtrips_manifest() {
+    fn write_and_load_baseline_snapshot_roundtrips_manifest_and_unavailable_features() {
         let root = std::env::temp_dir().join(format!(
             "ploy-research-snapshot-test-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let start = "2026-04-24T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let end = "2026-05-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let subset_start = "2026-04-25T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        let subset_end = "2026-04-27T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let contract = verified_contract("2026-07-17T05:31:00Z");
+        let start = contract.event_start;
+        let end = contract.event_end;
+        let subset_start = start + Duration::seconds(60);
+        let subset_end = start + Duration::seconds(120);
+        let observations = bind_and_filter_polymarket_chainlink_baseline_observations(
+            vec![verified_observation("2026-07-17T05:31:00Z")],
+            std::slice::from_ref(&contract),
+            &verified_outcomes(true),
+            "BTCUSDT",
+            start,
+            end,
+        )
+        .expect("build baseline observation fixture");
         let snapshot = ResearchSnapshot {
             manifest: ResearchSnapshotManifest {
                 schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
@@ -2835,17 +3328,17 @@ mod tests {
                 stake_usd: 15.0,
                 require_official_settlement: true,
                 immutable_input: true,
-                source_kind: "unit_test".to_string(),
+                source_kind: POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND.to_string(),
                 optimizer_data_dir: Some("/tmp/immutable-parquet".to_string()),
                 source_surfaces: vec![ResearchSnapshotSourceSurface {
-                    name: "unit_surface".to_string(),
-                    role: "test".to_string(),
-                    gate_category: "required_for_prediction".to_string(),
+                    name: "binance_price_ticks".to_string(),
+                    role: "intentionally_omitted".to_string(),
+                    gate_category: "optional_context".to_string(),
                     raw_full_fidelity: false,
-                    snapshot_sampled: true,
-                    sample_secs: Some(30),
+                    snapshot_sampled: false,
+                    sample_secs: None,
                     row_count: Some(0),
-                    notes: "unit test sampled surface".to_string(),
+                    notes: "Intentionally omitted by the explicit baseline profile.".to_string(),
                 }],
                 input_artifacts: vec![ResearchSnapshotInputArtifact {
                     name: "unit_input".to_string(),
@@ -2853,9 +3346,11 @@ mod tests {
                     content_hash: Some("abc123".to_string()),
                     row_count: Some(0),
                 }],
-                data_requirements: vec!["polymarket_quotes".to_string()],
+                data_requirements: vec![POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT.to_string()],
                 data_audit_status: Some("ok".to_string()),
-                data_audit_report: Some("data-gap-audit.json".to_string()),
+                data_audit_report: Some(
+                    "verified+polymarket-chainlink-baseline-audit://sha256/test".to_string(),
+                ),
                 include_deribit: false,
                 artifacts: ResearchSnapshotArtifacts::default(),
                 row_counts: ResearchSnapshotRowCounts::default(),
@@ -2864,10 +3359,10 @@ mod tests {
                     elapsed_ms: 1,
                     rows: Some(0),
                 }],
-                quality_flags: vec![],
+                quality_flags: vec![BINANCE_SURFACES_OMITTED_QUALITY_FLAG.to_string()],
                 pm_book_source: ResearchSnapshotPmBookSource::default(),
             },
-            observations: vec![],
+            observations,
             deribit_snapshots: vec![],
             pm_book_snapshots: vec![],
         };
@@ -2884,11 +3379,24 @@ mod tests {
         assert_eq!(contract_hex.len(), 64);
         assert!(contract_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(loaded.manifest.git_sha.as_deref(), Some("test-sha"));
+        assert_eq!(
+            loaded.manifest.source_kind,
+            POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        );
+        assert!(loaded
+            .manifest
+            .quality_flags
+            .iter()
+            .any(|flag| flag == BINANCE_SURFACES_OMITTED_QUALITY_FLAG));
         assert_eq!(loaded.manifest.source_surfaces.len(), 1);
-        assert!(loaded.manifest.source_surfaces[0].snapshot_sampled);
+        assert!(!loaded.manifest.source_surfaces[0].snapshot_sampled);
+        assert_eq!(
+            loaded.manifest.source_surfaces[0].role,
+            "intentionally_omitted"
+        );
         assert_eq!(
             loaded.manifest.source_surfaces[0].gate_category,
-            "required_for_prediction"
+            "optional_context"
         );
         assert_eq!(loaded.manifest.input_artifacts.len(), 1);
         validate_snapshot_request(
@@ -2936,12 +3444,12 @@ mod tests {
             },
         );
         assert!(exact_subset_result.is_err());
-        assert_eq!(loaded.manifest.row_counts.observations, 0);
+        assert_eq!(loaded.manifest.row_counts.observations, 1);
         let quality = std::fs::read_to_string(root.join("quality.md")).expect("read quality");
         assert!(quality.contains("Snapshot contract hash: `sha256:"));
         assert!(quality.contains("## Source Surfaces"));
-        assert!(quality.contains("gate_category=`required_for_prediction`"));
-        assert!(quality.contains("snapshot_sampled=`true`"));
+        assert!(quality.contains("gate_category=`optional_context`"));
+        assert!(quality.contains("snapshot_sampled=`false`"));
         assert!(quality.contains("## Input Artifacts"));
 
         let mut artifact_reads = HashMap::<String, usize>::new();
@@ -2961,7 +3469,10 @@ mod tests {
         );
         let captured_observations: Vec<FactorObservation> =
             serde_json::from_slice(&captured.observations_json).unwrap();
-        assert!(captured_observations.is_empty());
+        assert_eq!(captured_observations.len(), 1);
+        assert!(captured_observations[0].model_prob_up.is_nan());
+        assert!(captured_observations[0].distance_over_sigma.is_nan());
+        assert!(captured_observations[0].obi.is_nan());
 
         #[cfg(feature = "polars-export")]
         {
