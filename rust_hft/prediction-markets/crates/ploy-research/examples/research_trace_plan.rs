@@ -934,12 +934,6 @@ mod tests {
         assert!(patterns.contains(&pooled_marker));
         assert!(!patterns.contains(&side_marker));
 
-        sqlx::query("DELETE FROM experiment_trace WHERE run_id IN ($1, $2)")
-            .bind(&pooled_run_id)
-            .bind(&side_run_id)
-            .execute(&pool)
-            .await
-            .expect("clean traces");
         sqlx::query("DELETE FROM factor_evaluations WHERE factor_id IN ($1::uuid, $2::uuid)")
             .bind(&pooled_factor_id)
             .bind(&side_factor_id)
