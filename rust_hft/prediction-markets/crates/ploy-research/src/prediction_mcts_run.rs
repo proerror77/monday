@@ -12,11 +12,13 @@ use crate::prediction_loop::{
 };
 use crate::prediction_loop_fs::{atomic_write_json, next_attempt_dir, read_json, OutputLock};
 use crate::prediction_mcts::{
-    PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsEngine,
-    PredictionMctsEvaluation,
+    PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsCheckpointArtifact,
+    PredictionMctsEngine, PredictionMctsEvaluation, PredictionMctsIdentity,
+    SettlementTrainingEvidence,
 };
 
 const RUN_STATE_VERSION: u32 = 1;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v1";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -72,6 +74,109 @@ struct PredictionMctsRunState {
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
     pause_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PredictionMctsRunArtifact {
+    version: &'static str,
+    identity: PredictionMctsIdentity,
+    prompt_snapshot_id: String,
+    search_policy_snapshot_id: String,
+    phase: &'static str,
+    baseline_complete: bool,
+    checkpoint: Option<PredictionMctsCheckpointArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<PredictionMctsCandidate>,
+    training: Vec<PredictionMctsTrainingArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected: Option<PredictionMctsCandidate>,
+    held_out_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pause_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PredictionMctsTrainingArtifact {
+    candidate: PredictionMctsCandidate,
+    training_settlement: SettlementTrainingEvidence,
+}
+
+impl PredictionMctsRunState {
+    fn read_only_artifact(&self) -> Result<PredictionMctsRunArtifact, String> {
+        let identity = PredictionMctsIdentity::from_mission(&self.mission)?;
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .map(PredictionMctsCheckpoint::read_only_artifact)
+            .transpose()?;
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.identity != identity)
+        {
+            return Err(
+                "prediction MCTS checkpoint identity does not match the mission".to_string(),
+            );
+        }
+        let training = self
+            .training
+            .iter()
+            .map(|record| {
+                if record.candidate.identity != identity
+                    || record.evaluation.training_settlement.identity != identity
+                    || record.evaluation.training_settlement.candidate_id
+                        != record.candidate.candidate_id
+                    || record
+                        .evaluation
+                        .training_settlement
+                        .probability_blend_sha256
+                        != record.candidate.probability_blend_sha256
+                    || record.evaluation.held_out_settlement.is_some()
+                    || record.evaluation.execution.is_some()
+                {
+                    return Err("invalid prediction MCTS training artifact state".to_string());
+                }
+                Ok(PredictionMctsTrainingArtifact {
+                    candidate: record.candidate.clone(),
+                    training_settlement: record.evaluation.training_settlement.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for candidate in [&self.pending, &self.selected].into_iter().flatten() {
+            if candidate.identity != identity {
+                return Err(
+                    "prediction MCTS candidate identity does not match the mission".to_string(),
+                );
+            }
+        }
+        Ok(PredictionMctsRunArtifact {
+            version: RUN_ARTIFACT_VERSION,
+            identity,
+            prompt_snapshot_id: self.mission.prompt_snapshot_id.clone(),
+            search_policy_snapshot_id: self.mission.search_policy_snapshot_id.clone(),
+            phase: if self.pause_reason.is_some() {
+                "paused"
+            } else if self.held_out_complete {
+                "held_out_complete"
+            } else if self.selected.is_some() {
+                "selected"
+            } else if self.pending.is_some() {
+                "training_pending"
+            } else if self.checkpoint.is_some() {
+                "training_ready"
+            } else if self.baseline_complete {
+                "baseline_complete"
+            } else {
+                "baseline_pending"
+            },
+            baseline_complete: self.baseline_complete,
+            checkpoint,
+            pending: self.pending.clone(),
+            training,
+            selected: self.selected.clone(),
+            held_out_complete: self.held_out_complete,
+            pause_reason: self.pause_reason.clone(),
+        })
+    }
 }
 
 /// Run the shared-kernel prediction controller after the caller has validated
@@ -337,7 +442,12 @@ fn summary(
 }
 
 fn checkpoint(path: &Path, state: &PredictionMctsRunState) -> Result<(), String> {
-    atomic_write_json(path, state)
+    let artifact = state.read_only_artifact()?;
+    atomic_write_json(path, state)?;
+    atomic_write_json(
+        &path.with_file_name("prediction-mcts-artifact.json"),
+        &artifact,
+    )
 }
 
 fn now_unix_millis() -> u64 {
@@ -572,6 +682,87 @@ mod tests {
             PredictionMctsIdentity::from_mission(&mission(2, 1))
                 .unwrap()
                 .mission_id
+        );
+    }
+
+    #[test]
+    fn runner_writes_a_stable_read_only_checkpoint_artifact() {
+        let output = temp_dir("checkpoint-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("search run");
+
+        let artifact_path = output.join("prediction-mcts-artifact.json");
+        let first = std::fs::read(&artifact_path).expect("checkpoint artifact");
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&first).expect("parse checkpoint artifact");
+        assert_eq!(artifact["training"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            artifact["prompt_snapshot_id"],
+            mission(1, 1).prompt_snapshot_id
+        );
+        assert_eq!(
+            artifact["search_policy_snapshot_id"],
+            mission(1, 1).search_policy_snapshot_id
+        );
+        assert!(artifact["training"][0].get("held_out_settlement").is_none());
+        assert!(artifact["training"][0].get("execution").is_none());
+
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("resume completed run");
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), first);
+    }
+
+    #[test]
+    fn runner_rejects_a_checkpoint_with_a_mismatched_identity_before_rewriting_it() {
+        let output = temp_dir("forged-checkpoint-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("search run");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let artifact_path = output.join("prediction-mcts-artifact.json");
+        let artifact_before_forgery = std::fs::read(&artifact_path).unwrap();
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged["checkpoint"]["config"]["identity"]["symbol"] = serde_json::json!("SOL");
+        let forged = serde_json::to_vec_pretty(&forged).unwrap();
+        std::fs::write(&state_path, &forged).unwrap();
+
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect_err("forged checkpoint must be rejected");
+        assert!(error.contains("checkpoint identity does not match the mission"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), forged);
+        assert_eq!(
+            std::fs::read(&artifact_path).unwrap(),
+            artifact_before_forgery
         );
     }
 }
