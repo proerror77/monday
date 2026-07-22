@@ -57,7 +57,12 @@ market_json=$(jq -cn \
   '{symbol_count:1200,snapshot_ready_count:1200,sequence_gaps:0,
     upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
     catalog_sha256:$catalog,
-    session_id:"session-1",oss_roundtrips:2}')
+    session_id:"session-1",oss_roundtrips:2,
+    agg_trade_segments:2,agg_trade_count:2,
+    oss_roundtrip_evidence:[
+      {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+      {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+    ]}')
 jq -n \
   --arg artifact "$artifact" \
   --arg bundle "$bundle" \
@@ -82,6 +87,17 @@ if jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
   printf 'gate policy accepted evidence from a different deployment bundle\n' >&2
+  exit 1
+fi
+
+jq '.markets.usdm.oss_roundtrip_evidence[1].start_received_at_ns = 199' \
+  "$tmp_dir/gate.json" >"$tmp_dir/overlapping-agg-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/overlapping-agg-trades.json" >/dev/null; then
+  printf 'gate policy accepted overlapping aggregate-trade segments\n' >&2
   exit 1
 fi
 
@@ -123,6 +139,39 @@ if jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/stale-health.json" >/dev/null; then
   printf 'gate policy accepted a health freshness gap over 90 seconds\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.agg_trade_count = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/zero-agg-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/zero-agg-trades.json" >/dev/null; then
+  printf 'gate policy accepted zero aggregate trades\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.spot.oss_roundtrip_evidence[0].success_uri)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-success-marker.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-success-marker.json" >/dev/null; then
+  printf 'gate policy accepted aggregate-trade evidence without a success marker\n' >&2
+  exit 1
+fi
+
+jq '.markets.usdm.agg_trade_segments = 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-agg-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/non-continuous-agg-trades.json" >/dev/null; then
+  printf 'gate policy accepted aggregate trades from fewer than two segments\n' >&2
   exit 1
 fi
 

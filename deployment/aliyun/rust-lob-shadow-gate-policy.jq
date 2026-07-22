@@ -29,6 +29,28 @@ and (.markets.spot.session_id | length) > 0
 and (.markets.spot.oss_roundtrips | type) == "number"
 and .markets.spot.oss_roundtrips == (.markets.spot.oss_roundtrips | floor)
 and .markets.spot.oss_roundtrips >= 2
+and (.markets.spot.agg_trade_segments | type) == "number"
+and .markets.spot.agg_trade_segments == (.markets.spot.agg_trade_segments | floor)
+and .markets.spot.agg_trade_segments >= 2
+and .markets.spot.agg_trade_segments == .markets.spot.oss_roundtrips
+and (.markets.spot.agg_trade_count | type) == "number"
+and .markets.spot.agg_trade_count == (.markets.spot.agg_trade_count | floor)
+and .markets.spot.agg_trade_count > 0
+and (.markets.spot.oss_roundtrip_evidence | type) == "array"
+and (.markets.spot.oss_roundtrip_evidence | length) == .markets.spot.oss_roundtrips
+and all(.markets.spot.oss_roundtrip_evidence[];
+  (.success_uri | type) == "string" and (.success_uri | length) > 0
+  and (.start_received_at_ns | type) == "number"
+  and .start_received_at_ns == (.start_received_at_ns | floor)
+  and (.end_received_at_ns | type) == "number"
+  and .end_received_at_ns == (.end_received_at_ns | floor)
+  and .end_received_at_ns >= .start_received_at_ns
+  and (.agg_trade_count | type) == "number"
+  and .agg_trade_count == (.agg_trade_count | floor)
+  and .agg_trade_count > 0)
+and (.markets.spot.oss_roundtrip_evidence as $round_trips
+  | all(range(1; ($round_trips | length));
+      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns))
 and (.markets.usdm.symbol_count | type) == "number"
 and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
 and .markets.usdm.symbol_count >= 400
@@ -50,3 +72,25 @@ and (.markets.usdm.session_id | length) > 0
 and (.markets.usdm.oss_roundtrips | type) == "number"
 and .markets.usdm.oss_roundtrips == (.markets.usdm.oss_roundtrips | floor)
 and .markets.usdm.oss_roundtrips >= 2
+and (.markets.usdm.agg_trade_segments | type) == "number"
+and .markets.usdm.agg_trade_segments == (.markets.usdm.agg_trade_segments | floor)
+and .markets.usdm.agg_trade_segments >= 2
+and .markets.usdm.agg_trade_segments == .markets.usdm.oss_roundtrips
+and (.markets.usdm.agg_trade_count | type) == "number"
+and .markets.usdm.agg_trade_count == (.markets.usdm.agg_trade_count | floor)
+and .markets.usdm.agg_trade_count > 0
+and (.markets.usdm.oss_roundtrip_evidence | type) == "array"
+and (.markets.usdm.oss_roundtrip_evidence | length) == .markets.usdm.oss_roundtrips
+and all(.markets.usdm.oss_roundtrip_evidence[];
+  (.success_uri | type) == "string" and (.success_uri | length) > 0
+  and (.start_received_at_ns | type) == "number"
+  and .start_received_at_ns == (.start_received_at_ns | floor)
+  and (.end_received_at_ns | type) == "number"
+  and .end_received_at_ns == (.end_received_at_ns | floor)
+  and .end_received_at_ns >= .start_received_at_ns
+  and (.agg_trade_count | type) == "number"
+  and .agg_trade_count == (.agg_trade_count | floor)
+  and .agg_trade_count > 0)
+and (.markets.usdm.oss_roundtrip_evidence as $round_trips
+  | all(range(1; ($round_trips | length));
+      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns))
