@@ -171,7 +171,7 @@ impl WeightComponent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 enum ExpansionAction {
     Increase { component: WeightComponent },
     LlmAdvisor { blend: LlmProbabilityBlendSpec },
@@ -741,6 +741,25 @@ mod tests {
         let actual = restored.propose().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(restored.checkpoint.nodes, engine.checkpoint.nodes);
+    }
+
+    #[test]
+    fn checkpoint_with_llm_action_round_trips_through_json() {
+        let mission = mission();
+        let engine = PredictionMctsEngine::new(
+            &mission,
+            blend("baseline"),
+            vec![blend("advisor")],
+            7,
+            1.4,
+            3,
+        )
+        .unwrap();
+        let checkpoint = engine.checkpoint().unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        let restored: PredictionMctsCheckpoint = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored, checkpoint);
     }
 
     #[test]

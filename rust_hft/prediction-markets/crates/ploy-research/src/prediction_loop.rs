@@ -234,7 +234,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 37] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 38] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -296,6 +296,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 37] {
         (
             "crates/ploy-research/src/prediction_mcts.rs",
             include_bytes!("prediction_mcts.rs"),
+        ),
+        (
+            "crates/ploy-research/src/prediction_mcts_run.rs",
+            include_bytes!("prediction_mcts_run.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_loop_fs.rs",
