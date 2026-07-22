@@ -142,7 +142,8 @@ pub use factors_v2::{
     build_factor_observations_v2_with_deribit_and_pm_books, build_factor_stability_report,
     build_full_depth_execution_matrix, build_prediction_research_feedback,
     build_settlement_probability_promotion_gate_report, build_settlement_probability_report,
-    build_settlement_probability_report_with_prior, factor_v2_descriptors,
+    build_settlement_probability_report_with_prior,
+    build_settlement_training_probability_report_with_prior, factor_v2_descriptors,
     format_factor_combo_v1_report, format_factor_review_v2_report, format_factor_stability_report,
     format_factor_walk_forward_v2_report, format_fillability_review_v1_report,
     format_full_depth_execution_matrix_report, format_liquidity_gate_v1_report,
@@ -185,10 +186,10 @@ pub use factors_v2::{
     SettlementProbabilityReportOptions, SettlementProbabilitySymbolHoldoutRow,
     SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
     SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
-    SettlementVerdictWalkForwardAggregate, SettlementVerdictWalkForwardReport,
-    SettlementVerdictWalkForwardWindow, SingleFactorReview, ThreeLayerArchive,
-    TradeFormationPathRow, TradeFormationReviewOptions, TradeFormationReviewReport,
-    TradeFormationRuleRow,
+    SettlementTrainingProbabilityReport, SettlementVerdictWalkForwardAggregate,
+    SettlementVerdictWalkForwardReport, SettlementVerdictWalkForwardWindow, SingleFactorReview,
+    ThreeLayerArchive, TradeFormationPathRow, TradeFormationReviewOptions,
+    TradeFormationReviewReport, TradeFormationRuleRow,
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};

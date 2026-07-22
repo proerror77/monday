@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use ploy_market_contracts::Regime;
@@ -631,6 +631,13 @@ pub struct SettlementProbabilityWalkForwardReport {
     pub options: SettlementProbabilityWalkForwardOptions,
     pub windows: Vec<SettlementProbabilityWalkForwardWindow>,
     pub aggregates: Vec<SettlementProbabilityWalkForwardAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementTrainingProbabilityReport {
+    pub training_cohort_id: String,
+    pub event_count: usize,
+    pub baselines: Vec<SettlementProbabilityBaselineRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3091,6 +3098,81 @@ pub fn walk_forward_settlement_probability_report_with_prior(
         options,
         windows,
         aggregates,
+    }
+}
+
+/// Build search reward evidence from the mission-pinned training cohort only.
+/// Held-out rows are used solely to establish the first decision timestamp;
+/// their labels, probabilities, execution, and metrics are never evaluated.
+pub fn build_settlement_training_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    prior: Option<&LlmPriorSpec>,
+    options: SettlementProbabilityWalkForwardOptions,
+) -> SettlementTrainingProbabilityReport {
+    let Some(cohort) = options.time_cohort else {
+        return SettlementTrainingProbabilityReport {
+            training_cohort_id: "missing-time-cohort".to_string(),
+            event_count: 0,
+            baselines: Vec::new(),
+        };
+    };
+    let cohort_id = format!(
+        "settlement-training-before-{}-{}s",
+        cohort.boundary.timestamp_millis(),
+        cohort.event_window_secs
+    );
+    let Some(bounds) = settlement_walk_forward_window_bounds(start, end, &options)
+        .into_iter()
+        .next()
+    else {
+        return SettlementTrainingProbabilityReport {
+            training_cohort_id: cohort_id,
+            event_count: 0,
+            baselines: Vec::new(),
+        };
+    };
+    let mut rows = rows.to_vec();
+    rows.sort_by_key(|row| row.tick_ts);
+    let event_ends = event_ends_for_walk_forward(&rows, Some(&cohort));
+    let label_observation_times = official_label_observation_times(&rows);
+    let (training, _) = event_disjoint_walk_forward_slices(
+        &rows,
+        &event_ends,
+        &label_observation_times,
+        Some(&cohort),
+        (
+            bounds.train_start,
+            bounds.train_end,
+            bounds.test_start,
+            bounds.test_end,
+        ),
+    );
+    let event_count = training
+        .iter()
+        .map(|row| row.event_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if training.len() < options.walk_forward.review.min_observations {
+        return SettlementTrainingProbabilityReport {
+            training_cohort_id: cohort_id,
+            event_count,
+            baselines: Vec::new(),
+        };
+    }
+    let probability_options =
+        normalize_settlement_probability_report_options(options.probability.clone());
+    let report = build_settlement_probability_report_with_surface(
+        &training,
+        &training,
+        prior,
+        probability_options,
+    );
+    SettlementTrainingProbabilityReport {
+        training_cohort_id: cohort_id,
+        event_count,
+        baselines: report.baselines,
     }
 }
 
@@ -12570,6 +12652,28 @@ mod tests {
             (midpoint.train_n, midpoint.test_n),
             (1, 1),
             "the boundary-crossing event must enter neither cohort"
+        );
+    }
+
+    #[test]
+    fn settlement_training_report_never_scores_the_held_out_event() {
+        let (start, boundary, end, rows, options) = short_settlement_time_cohort_case();
+        let options = SettlementProbabilityWalkForwardOptions {
+            time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+            ..options
+        };
+        let report = build_settlement_training_probability_report_with_prior(
+            &rows, start, end, None, options,
+        );
+
+        assert_eq!(report.event_count, 1);
+        assert!(report.baselines.iter().all(|baseline| baseline.n == 1));
+        assert_eq!(
+            report.training_cohort_id,
+            format!(
+                "settlement-training-before-{}-300s",
+                boundary.timestamp_millis()
+            )
         );
     }
 
