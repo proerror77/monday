@@ -36,7 +36,7 @@ usage() {
 }
 
 for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
-  mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc; do
+  mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -605,7 +605,9 @@ verify_oss_round_trips() {
   local uris="$tmp_dir/${market}-manifest-uris.txt"
   local candidates="$tmp_dir/${market}-manifest-candidates.tsv"
   local index=0
-  local uri manifest start_ns file digest zst_uri zst_path actual_digest bytes
+  local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
+  local actual_digest bytes agg_trade_count manifest_agg_trade_count
+  local previous_end_ns=0
   local round_trips='[]'
 
   manifest_uris "$market" "$listing" >"$uris"
@@ -619,20 +621,34 @@ verify_oss_round_trips() {
       --arg market "$market" \
       --arg dataset "${dataset[$market]}" \
       --arg shard "${shard_id[$market]}" \
-      --argjson gate_started_ns "$gate_started_ns" \
       '.market == $market
         and .dataset == $dataset
         and .shard_id == $shard
-        and .start_received_at_ns >= $gate_started_ns
+        and (.start_received_at_ns | type) == "number"
+        and .start_received_at_ns == (.start_received_at_ns | floor)
+        and (.end_received_at_ns | type) == "number"
+        and .end_received_at_ns == (.end_received_at_ns | floor)
+        and .end_received_at_ns >= .start_received_at_ns
         and (.file | type == "string" and test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))
         and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))' \
       "$manifest" >/dev/null; then
-      continue
+      die "$market has a malformed manifest during gate discovery: $uri"
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
+    end_ns=$(jq -er '.end_received_at_ns' "$manifest")
+    ((end_ns < gate_started_ns)) && continue
+    jq -e \
+      '.schema == "binance.market_tape.v1"
+        and (.event_types.agg_trade | type) == "number"
+        and .event_types.agg_trade == (.event_types.agg_trade | floor)
+        and .event_types.agg_trade > 0' \
+      "$manifest" >/dev/null \
+      || die "$market has an incomplete market-tape manifest after gate start: $uri"
     file=$(jq -er '.file' "$manifest")
     digest=$(jq -er '.sha256' "$manifest")
-    printf '%s\t%s\t%s\t%s\t%s\n' "$start_ns" "$uri" "$file" "$digest" "$manifest" \
+    manifest_agg_trade_count=$(jq -er '.event_types.agg_trade' "$manifest")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$start_ns" "$end_ns" "$uri" "$file" "$digest" "$manifest" "$manifest_agg_trade_count" \
       >>"$candidates"
   done <"$uris"
 
@@ -641,24 +657,63 @@ verify_oss_round_trips() {
     || die "$market has fewer than two OSS manifests created after gate start"
 
   index=0
-  while IFS=$'\t' read -r start_ns uri file digest manifest; do
+  while IFS=$'\t' read -r start_ns end_ns uri file digest manifest manifest_agg_trade_count; do
     index=$((index + 1))
-    ((index <= 2)) || break
+    if ((previous_end_ns > 0 && start_ns < previous_end_ns)); then
+      die "$market gate segments overlap at $uri"
+    fi
+    previous_end_ns=$end_ns
     zst_uri="${uri%/*}/$file"
     zst_path="$tmp_dir/${market}-${index}.jsonl.zst"
     run_oss "$market" cp "$zst_uri" "$zst_path" --force --no-progress >/dev/null
     actual_digest=$(sha256sum "$zst_path" | awk '{print $1}')
     [[ $actual_digest == "$digest" ]] || die "$market OSS round-trip digest mismatch: $zst_uri"
+    success_uri="${uri%/*}/${file}._SUCCESS"
+    success_path="$tmp_dir/${market}-${index}._SUCCESS"
+    run_oss "$market" cp "$success_uri" "$success_path" --force --no-progress >/dev/null
+    printf '%s\n' "$digest" | cmp -s - "$success_path" \
+      || die "$market OSS success marker does not match segment SHA-256: $success_uri"
+    agg_trade_count=$(zstd -q -d -c "$zst_path" | jq -er -n '
+      def valid_agg_trade:
+        .schema == "binance.market_tape.v1"
+        and (.received_at_ns | type) == "number"
+        and .received_at_ns >= 0
+        and (.frame.data.e == "aggTrade")
+        and (.frame.data.s | type) == "string"
+        and (.frame.data.s | length) > 0
+        and (.frame.data.a | type) == "number"
+        and .frame.data.a >= 0
+        and (.frame.data.a | floor) == .frame.data.a
+        and (.frame.data.p | type) == "string"
+        and (.frame.data.p | length) > 0
+        and (.frame.data.q | type) == "string"
+        and (.frame.data.q | length) > 0
+        and (.frame.data.E | type) == "number"
+        and (.frame.data.T | type) == "number"
+        and (.frame.data.m | type) == "boolean";
+      reduce inputs as $row
+        ({count:0,invalid:false};
+          if $row.type == "agg_trade" then
+            .count += 1 | .invalid = (.invalid or (($row | valid_agg_trade) | not))
+          else . end)
+      | if .count == 0 or .invalid then error("missing or malformed agg_trade") else .count end') \
+      || die "$market segment has no valid aggregate trades: $zst_uri"
+    [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
+      || die "$market manifest aggregate-trade count does not match segment: $uri"
     bytes=$(stat -c '%s' "$zst_path")
     install -m 0640 "$manifest" "$evidence_dir/${market}-manifest-${index}.json"
     round_trip=$(jq -cn \
       --arg manifest_uri "$uri" \
       --arg data_uri "$zst_uri" \
+      --arg success_uri "$success_uri" \
       --arg sha256 "$digest" \
       --argjson start_received_at_ns "$start_ns" \
+      --argjson end_received_at_ns "$end_ns" \
       --argjson bytes "$bytes" \
-      '{manifest_uri:$manifest_uri,data_uri:$data_uri,sha256:$sha256,
-        start_received_at_ns:$start_received_at_ns,bytes:$bytes}')
+      --argjson agg_trade_count "$agg_trade_count" \
+      '{manifest_uri:$manifest_uri,data_uri:$data_uri,success_uri:$success_uri,sha256:$sha256,
+        start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,bytes:$bytes,
+        agg_trade_count:$agg_trade_count}')
     round_trips=$(jq -cn --argjson values "$round_trips" --argjson value "$round_trip" \
       '$values + [$value]')
   done < <(sort -n -k1,1 "$candidates")
@@ -706,6 +761,8 @@ for market in "${markets[@]}"; do
       memory_peak_bytes:$memory_peak_bytes,memory_max_bytes:$memory_max_bytes,
       health_sha256:$health_sha256,
       oss_roundtrips:($oss_round_trips | length),
+      agg_trade_segments:($oss_round_trips | length),
+      agg_trade_count:([$oss_round_trips[].agg_trade_count] | add),
       oss_roundtrip_evidence:$oss_round_trips}')
   markets_json=$(jq -cn \
     --argjson values "$markets_json" \
