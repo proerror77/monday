@@ -4297,6 +4297,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-search-kernel"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "hft-snapshot"
 version = "0.1.0"
 dependencies = [
@@ -5967,6 +5974,7 @@ dependencies = [
  "ciborium",
  "fs2",
  "hft-data",
+ "hft-search-kernel",
  "libc",
  "optimizer",
  "ploy-feed-loaders",

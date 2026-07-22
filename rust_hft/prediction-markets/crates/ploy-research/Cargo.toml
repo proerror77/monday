@@ -40,6 +40,7 @@ tracing.workspace = true
 uuid.workspace = true
 anyhow = "1"
 fs2 = "0.4"
+hft-search-kernel = { path = "../../../research-core/search-kernel" }
 libc.workspace = true
 burn = { version = "0.20.1", default-features = false, features = ["ndarray", "autodiff", "std"], optional = true }
 burn-ndarray = { version = "0.20.1", optional = true }
