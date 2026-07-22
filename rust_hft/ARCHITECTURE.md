@@ -44,7 +44,13 @@ flowchart TB
 
 - `alpha-harness/domain`: mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.
 - `alpha-harness/store`: DuckDB migrations and append-only control-plane repositories.
-- `alpha-harness/engine`: resumable search kernel, GP/MCTS/Bayesian engines, causal evaluator, bounded LLM client, offline-RL lab engine, and learning coordinator.
+- `research-core/search-kernel`: domain-neutral deterministic UCT selection,
+  topology and reward statistics. It owns no candidate grammar, evaluator,
+  dataset, or storage contract.
+- `alpha-harness/engine`: research-domain search adapters, GP/MCTS/Bayesian
+  engines, causal evaluator, bounded LLM client, offline-RL lab engine, and
+  learning coordinator. Domain checkpoints bind candidates and evaluator state
+  around the shared UCT mechanics.
 - `alpha-harness/app`: structured CLI for data, loops, missions, evaluation, promotion, approvals, policies, feedback, and signing.
 - `tools/collector`: streaming connectors plus governed public Binance OHLCV acquisition.
 - `market-core` and `data-pipelines`: events, runtime construction, venue market data, and replay.

@@ -82,6 +82,7 @@ members = [
     "research-core/factor-dsl",
     "research-core/manifest",
     "research-core/ml",
+    "research-core/search-kernel",
 
     # Bounded Loop Engineer research plane
     "alpha-harness/domain",

@@ -14,6 +14,7 @@ alpha-store = { path = "../store", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 hex = { workspace = true }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
+hft-search-kernel = { path = "../../research-core/search-kernel" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -642,6 +642,7 @@ dependencies = [
  "hft-core",
  "hft-factor-dsl",
  "hft-research-manifest",
+ "hft-search-kernel",
  "hft-strategy-formula",
  "reqwest 0.12.28",
  "rust_decimal",
@@ -6025,6 +6026,13 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hft-search-kernel"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

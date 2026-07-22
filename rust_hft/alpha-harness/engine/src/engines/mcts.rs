@@ -5,6 +5,7 @@ use crate::{
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
+use hft_search_kernel::{backpropagate, select_expandable, validate_tree, UctNode, UctStats};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,6 +30,34 @@ struct Node {
     visits: u64,
     total_reward: f64,
     best_reward: Option<f64>,
+}
+
+impl UctNode for Node {
+    fn parent(&self) -> Option<usize> {
+        self.parent
+    }
+
+    fn children(&self) -> &[usize] {
+        &self.children
+    }
+
+    fn is_expandable(&self) -> bool {
+        !self.unexpanded_actions.is_empty()
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn stats(&self) -> Result<UctStats, hft_search_kernel::UctError> {
+        UctStats::from_parts(self.visits, self.total_reward, self.best_reward)
+    }
+
+    fn replace_stats(&mut self, stats: UctStats) {
+        self.visits = stats.visits();
+        self.total_reward = stats.total_reward();
+        self.best_reward = stats.best_reward();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,39 +220,6 @@ impl MctsEngine {
         })
     }
 
-    fn select_expandable(&self, node_id: usize) -> Option<usize> {
-        let node = &self.nodes[node_id];
-        if !node.unexpanded_actions.is_empty() {
-            return Some(node_id);
-        }
-        node.children
-            .iter()
-            .copied()
-            .filter(|child| self.has_expandable(*child))
-            .max_by(|left, right| {
-                self.uct(*left, node.visits)
-                    .total_cmp(&self.uct(*right, node.visits))
-            })
-            .and_then(|child| self.select_expandable(child))
-    }
-
-    fn has_expandable(&self, node_id: usize) -> bool {
-        !self.nodes[node_id].unexpanded_actions.is_empty()
-            || self.nodes[node_id]
-                .children
-                .iter()
-                .any(|child| self.has_expandable(*child))
-    }
-
-    fn uct(&self, node_id: usize, parent_visits: u64) -> f64 {
-        let node = &self.nodes[node_id];
-        if node.visits == 0 {
-            return f64::INFINITY;
-        }
-        node.total_reward / node.visits as f64
-            + self.exploration * ((parent_visits.max(1) as f64).ln() / node.visits as f64).sqrt()
-    }
-
     fn expand(&mut self, parent_id: usize) -> Result<usize, String> {
         let action_index = self
             .rng
@@ -283,8 +279,8 @@ impl ProposalEngine for MctsEngine {
             return Err("MCTS expansion budget is exhausted".to_string());
         }
         for attempt in 1..=remaining.expansions.min(256) {
-            let parent = self
-                .select_expandable(0)
+            let parent = select_expandable(&self.nodes, 0, self.exploration)
+                .map_err(|error| error.to_string())?
                 .ok_or_else(|| "MCTS tree has no expandable node".to_string())?;
             let node_id = self.expand(parent)?;
             let formula = self.nodes[node_id].ast.to_string();
@@ -305,25 +301,13 @@ impl ProposalEngine for MctsEngine {
     }
 
     fn observe(&mut self, proposal: &EngineProposal, evaluation: &CandidateEvaluation) {
-        let Some(mut node_id) = self.candidates.remove(&proposal.candidate_id) else {
+        let Some(node_id) = self.candidates.remove(&proposal.candidate_id) else {
             return;
         };
         if !evaluation.score.is_finite() {
             return;
         }
-        loop {
-            let node = &mut self.nodes[node_id];
-            node.visits += 1;
-            node.total_reward += evaluation.score;
-            node.best_reward = Some(
-                node.best_reward
-                    .map_or(evaluation.score, |best| best.max(evaluation.score)),
-            );
-            match node.parent {
-                Some(parent) => node_id = parent,
-                None => break,
-            }
-        }
+        let _ = backpropagate(&mut self.nodes, 0, node_id, evaluation.score);
     }
 
     fn abandon(&mut self, proposal: &EngineProposal) {
@@ -331,6 +315,8 @@ impl ProposalEngine for MctsEngine {
     }
 
     fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        let mut nodes = self.nodes.clone();
+        let mut seen = self.seen.clone();
         for observation in observations {
             let CandidateArtifact::Formula(ast) = &observation.proposal.artifact else {
                 return Err("MCTS history contains a non-formula artifact".to_string());
@@ -338,17 +324,12 @@ impl ProposalEngine for MctsEngine {
             if !observation.evaluation.score.is_finite() {
                 return Err("MCTS history contains a non-finite score".to_string());
             }
-            self.seen.insert(ast.to_string());
-            let root = &mut self.nodes[0];
-            root.visits += 1;
-            root.total_reward += observation.evaluation.score;
-            root.best_reward = Some(
-                root.best_reward
-                    .map_or(observation.evaluation.score, |best| {
-                        best.max(observation.evaluation.score)
-                    }),
-            );
+            seen.insert(ast.to_string());
+            backpropagate(&mut nodes, 0, 0, observation.evaluation.score)
+                .map_err(|error| format!("invalid MCTS history: {error}"))?;
         }
+        self.nodes = nodes;
+        self.seen = seen;
         Ok(())
     }
 
@@ -427,6 +408,8 @@ impl MctsCheckpointV2 {
         if root.ast != self.config.root_ast || root.parent.is_some() || root.depth != 0 {
             return Err("MCTS checkpoint root does not match its configuration".to_string());
         }
+        validate_tree(&self.nodes, 0, self.config.max_depth)
+            .map_err(|error| format!("invalid MCTS checkpoint tree: {error}"))?;
 
         for (node_id, node) in self.nodes.iter().enumerate() {
             node.ast
@@ -437,17 +420,8 @@ impl MctsCheckpointV2 {
                     format!("invalid live MCTS checkpoint node {node_id}: {error}")
                 })?;
             }
-            if !node.total_reward.is_finite()
-                || node.best_reward.is_some_and(|reward| !reward.is_finite())
-                || node.depth > self.config.max_depth
-                || (node.depth == self.config.max_depth && !node.unexpanded_actions.is_empty())
-            {
+            if node.depth == self.config.max_depth && !node.unexpanded_actions.is_empty() {
                 return Err(format!("invalid MCTS checkpoint node {node_id}"));
-            }
-            if (node.visits == 0) != (node.total_reward == 0.0 && node.best_reward.is_none()) {
-                return Err(format!(
-                    "invalid MCTS checkpoint rewards for node {node_id}"
-                ));
             }
             let actions = node
                 .unexpanded_actions
@@ -463,33 +437,6 @@ impl MctsCheckpointV2 {
                 return Err(format!(
                     "invalid MCTS checkpoint actions for node {node_id}"
                 ));
-            }
-            if node.children.windows(2).any(|pair| pair[0] >= pair[1]) {
-                return Err(format!(
-                    "invalid MCTS checkpoint children for node {node_id}"
-                ));
-            }
-            for child_id in &node.children {
-                let Some(child) = self.nodes.get(*child_id) else {
-                    return Err(format!("invalid MCTS checkpoint child for node {node_id}"));
-                };
-                if *child_id <= node_id || child.parent != Some(node_id) {
-                    return Err(format!("invalid MCTS checkpoint child for node {node_id}"));
-                }
-            }
-            if node_id > 0 {
-                let Some(parent_id) = node.parent else {
-                    return Err(format!("MCTS checkpoint node {node_id} has no parent"));
-                };
-                let Some(parent) = self.nodes.get(parent_id) else {
-                    return Err(format!("MCTS checkpoint node {node_id} has invalid parent"));
-                };
-                if parent_id >= node_id
-                    || node.depth != parent.depth + 1
-                    || !parent.children.contains(&node_id)
-                {
-                    return Err(format!("MCTS checkpoint node {node_id} is inconsistent"));
-                }
             }
         }
 
@@ -633,6 +580,100 @@ mod tests {
     }
 
     #[test]
+    fn shared_kernel_preserves_seeded_expansion_and_checkpoint_wire_shape() {
+        let mut engine = MctsEngine::new(3, "oi", "imbalance", 1.4, 3).unwrap();
+        let dataset = super::super::test_dataset();
+        let first = engine
+            .propose("mission", 0, &dataset.proposal_context(), &budget())
+            .unwrap();
+        let CandidateArtifact::Formula(first_ast) = &first.artifact else {
+            panic!("MCTS must emit a formula candidate");
+        };
+        assert_eq!(first_ast.to_string(), "mean(oi, 20)");
+        engine.observe(&first, &evaluation(0.5));
+
+        let checkpoint = engine.checkpoint().unwrap();
+        assert_eq!(
+            checkpoint.state,
+            serde_json::json!({
+                "config": {
+                    "seed": 3,
+                    "root_ast": {"Terminal": {"Field": "oi"}},
+                    "secondary_field": "imbalance",
+                    "exploration": 1.4,
+                    "max_depth": 3,
+                    "live_only": false
+                },
+                "rng": 2_088_359_638_719_790_806_u64,
+                "nodes": [
+                    {
+                        "ast": {"Terminal": {"Field": "oi"}},
+                        "parent": null,
+                        "children": [1],
+                        "unexpanded_actions": [0, 1, 3],
+                        "depth": 0,
+                        "visits": 1,
+                        "total_reward": 0.5,
+                        "best_reward": 0.5
+                    },
+                    {
+                        "ast": {"Call": {
+                            "operator": "Mean",
+                            "args": [
+                                {"Terminal": {"Field": "oi"}},
+                                {"Terminal": {"Constant": "20"}}
+                            ]
+                        }},
+                        "parent": 0,
+                        "children": [],
+                        "unexpanded_actions": [0, 1, 2, 3],
+                        "depth": 1,
+                        "visits": 1,
+                        "total_reward": 0.5,
+                        "best_reward": 0.5
+                    }
+                ],
+                "candidates": {},
+                "seen": ["mean(oi, 20)"]
+            })
+        );
+        let expected_trace = vec![
+            MctsNodeSnapshot {
+                node_id: 0,
+                parent_id: None,
+                visits: 1,
+                total_reward: 0.5,
+                best_reward: Some(0.5),
+                formula: "oi".to_string(),
+            },
+            MctsNodeSnapshot {
+                node_id: 1,
+                parent_id: Some(0),
+                visits: 1,
+                total_reward: 0.5,
+                best_reward: Some(0.5),
+                formula: "mean(oi, 20)".to_string(),
+            },
+        ];
+        assert_eq!(engine.trace(), expected_trace);
+
+        let mut restored = MctsEngine::new(3, "oi", "imbalance", 1.4, 3).unwrap();
+        restored.restore_checkpoint(&checkpoint, &[]).unwrap();
+        assert_eq!(restored.trace(), expected_trace);
+        let expected = engine
+            .propose("mission", 1, &dataset.proposal_context(), &budget())
+            .unwrap();
+        let actual = restored
+            .propose("mission", 1, &dataset.proposal_context(), &budget())
+            .unwrap();
+        assert_eq!(actual, expected);
+        let CandidateArtifact::Formula(actual_ast) = &actual.artifact else {
+            panic!("MCTS must emit a formula candidate");
+        };
+        assert_eq!(actual_ast.to_string(), "rank(oi)");
+    }
+
+    #[test]
     fn restored_search_continues_like_uninterrupted_search() {
         let mut uninterrupted = MctsEngine::new(9, "oi", "imbalance", 1.4, 4).unwrap();
         for (iteration, score) in [0.2, 0.8, -0.1].into_iter().enumerate() {
@@ -681,6 +722,10 @@ mod tests {
         let mut malformed = checkpoint;
         malformed.state = serde_json::json!({"unexpected": true});
         assert!(restored.restore_checkpoint(&malformed, &[]).is_err());
+
+        let mut cyclic = engine.checkpoint().unwrap();
+        cyclic.state["nodes"][0]["children"] = serde_json::json!([0]);
+        assert!(restored.restore_checkpoint(&cyclic, &[]).is_err());
     }
 
     #[test]
