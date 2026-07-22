@@ -1380,6 +1380,13 @@ async fn main() {
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
     let prediction_mcts_training_candidate_json =
         flag_value(&args, "--prediction-mcts-training-candidate-json");
+    let prediction_mcts_selected_candidate_json =
+        flag_value(&args, "--prediction-mcts-selected-candidate-json");
+    if prediction_mcts_training_candidate_json.is_some()
+        && prediction_mcts_selected_candidate_json.is_some()
+    {
+        panic!("prediction MCTS evaluator accepts exactly one candidate stage");
+    }
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
     let reprice_pilot_10s = flag_present(&args, "--reprice-pilot-10s");
     let settlement_time_cohort = settlement_time_cohort_from_args(
@@ -1633,26 +1640,40 @@ async fn main() {
         &all_pm_book_snapshots,
         &options.review,
     );
-    if let Some(candidate_path) = prediction_mcts_training_candidate_json.as_deref() {
-        let candidate: PredictionMctsCandidate = std::fs::read(candidate_path)
-            .map_err(|error| format!("read prediction MCTS candidate: {error}"))
-            .and_then(|bytes| {
-                serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("parse prediction MCTS candidate: {error}"))
-            })
-            .unwrap_or_else(|reason| panic!("prediction MCTS training input invalid: {reason}"));
+    let prediction_mcts_candidate = prediction_mcts_training_candidate_json
+        .as_deref()
+        .or(prediction_mcts_selected_candidate_json.as_deref())
+        .map(|candidate_path| {
+            let candidate: PredictionMctsCandidate = std::fs::read(candidate_path)
+                .map_err(|error| format!("read prediction MCTS candidate: {error}"))
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("parse prediction MCTS candidate: {error}"))
+                })
+                .unwrap_or_else(|reason| {
+                    panic!("prediction MCTS training input invalid: {reason}")
+                });
+            let prior = governed_prediction_prior
+                .filter(|prior| prior.probability_blends.len() == 1)
+                .unwrap_or_else(|| panic!("prediction MCTS training requires one governed blend"));
+            if prior.mission_id.as_deref() != Some(candidate.identity.mission_id.as_str())
+                || prior.data_snapshot_id.as_deref()
+                    != Some(candidate.identity.data_snapshot_id.as_str())
+                || prior.symbols.as_slice() != [candidate.identity.symbol.as_str()]
+                || prior.horizon.as_deref() != Some(candidate.identity.horizon.as_str())
+                || prior.probability_blends[0] != candidate.probability_blend
+            {
+                panic!("prediction MCTS candidate does not match governed evaluator prior");
+            }
+            candidate
+        });
+    if prediction_mcts_training_candidate_json.is_some() {
+        let candidate = prediction_mcts_candidate
+            .as_ref()
+            .expect("training candidate was loaded");
         let prior = governed_prediction_prior
             .filter(|prior| prior.probability_blends.len() == 1)
-            .unwrap_or_else(|| panic!("prediction MCTS training requires one governed blend"));
-        if prior.mission_id.as_deref() != Some(candidate.identity.mission_id.as_str())
-            || prior.data_snapshot_id.as_deref()
-                != Some(candidate.identity.data_snapshot_id.as_str())
-            || prior.symbols.as_slice() != [candidate.identity.symbol.as_str()]
-            || prior.horizon.as_deref() != Some(candidate.identity.horizon.as_str())
-            || prior.probability_blends[0] != candidate.probability_blend
-        {
-            panic!("prediction MCTS candidate does not match governed evaluator prior");
-        }
+            .expect("training candidate prior was validated");
         let training = build_settlement_training_probability_report_with_prior(
             &autofactor_rows,
             start,
