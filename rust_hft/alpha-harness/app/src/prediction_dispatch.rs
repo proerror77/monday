@@ -1,12 +1,16 @@
 use crate::{
-    cli::{print_json, PredictionDispatchRenderArgs, PredictionDispatchSubmitArgs},
+    cli::{
+        print_json, PredictionDispatchRenderArgs, PredictionDispatchStatusArgs,
+        PredictionDispatchSubmitArgs,
+    },
     mission_runner::normalized_sha256,
 };
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs::File,
     io::{Read, Write},
@@ -59,6 +63,106 @@ struct RenderedSubmission {
     job_name: String,
     secret_name: String,
     result_identity_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct StatusJob {
+    metadata: StatusMetadata,
+    #[serde(default)]
+    status: StatusJobState,
+}
+
+#[derive(Deserialize)]
+struct StatusMetadata {
+    name: String,
+    namespace: String,
+    uid: String,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
+}
+
+#[derive(Default, Deserialize)]
+struct StatusJobState {
+    #[serde(default)]
+    conditions: Vec<StatusCondition>,
+}
+
+#[derive(Deserialize)]
+struct StatusPodList {
+    items: Vec<StatusPod>,
+}
+
+#[derive(Deserialize)]
+struct StatusPod {
+    metadata: StatusPodMetadata,
+    #[serde(default)]
+    status: StatusPodState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusPodMetadata {
+    #[serde(default)]
+    owner_references: Vec<StatusOwnerReference>,
+}
+
+#[derive(Deserialize)]
+struct StatusOwnerReference {
+    uid: String,
+    name: String,
+    kind: String,
+    #[serde(default)]
+    controller: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusPodState {
+    #[serde(default)]
+    conditions: Vec<StatusCondition>,
+    #[serde(default)]
+    container_statuses: Vec<StatusContainer>,
+}
+
+#[derive(Deserialize)]
+struct StatusCondition {
+    #[serde(rename = "type")]
+    kind: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct StatusContainer {
+    state: StatusContainerState,
+}
+
+#[derive(Deserialize)]
+struct StatusContainerState {
+    running: Option<Value>,
+    terminated: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct StatusEvidence {
+    lane: String,
+    mission_id: String,
+    mission_sha256: String,
+    snapshot_archive_sha256: String,
+}
+
+#[derive(Serialize)]
+struct PredictionStatus {
+    job_name: String,
+    namespace: String,
+    mission_id: String,
+    mission_sha256: String,
+    snapshot_sha256: String,
+    submitted: bool,
+    scheduled: bool,
+    image_ready: bool,
+    snapshot_ready: Option<bool>,
+    evaluator_started: Option<bool>,
+    completed: bool,
 }
 
 pub fn render(args: PredictionDispatchRenderArgs) -> anyhow::Result<()> {
@@ -133,6 +237,136 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
         "result_identity_sha256": rendered.result_identity_sha256,
         "recovered_after_create_error": recovered_after_create_error,
     }))
+}
+
+pub fn status(args: PredictionDispatchStatusArgs) -> anyhow::Result<()> {
+    validate_cluster_target(&args.context, &args.namespace)?;
+    validate_dns_label("prediction Job name", &args.job_name)?;
+    let job = kubectl_json(
+        &args.context,
+        &args.namespace,
+        ["get", "job", &args.job_name, "-o", "json"],
+        "read prediction Job status",
+    )?;
+    let job_uid = status_job_uid(&job)?;
+    let selector = format!("batch.kubernetes.io/controller-uid={job_uid}");
+    let pods = kubectl_json(
+        &args.context,
+        &args.namespace,
+        ["get", "pods", "-l", &selector, "-o", "json"],
+        "read prediction Pod status",
+    )?;
+    let evidence = args
+        .evidence
+        .as_deref()
+        .map(load_status_evidence)
+        .transpose()?;
+    let derived = derive_status(&job, &pods, evidence.as_ref())?;
+    if derived.job_name != args.job_name || derived.namespace != args.namespace {
+        bail!("Kubernetes Job readback does not match the requested immutable identity");
+    }
+    print_json(&json!({"context": args.context, "status": derived}))
+}
+
+fn status_job_uid(job: &Value) -> anyhow::Result<String> {
+    let job: StatusJob =
+        serde_json::from_value(job.clone()).context("parse prediction Job readback")?;
+    validate_identifier("prediction Job UID", &job.metadata.uid)?;
+    Ok(job.metadata.uid)
+}
+
+fn load_status_evidence(path: &Path) -> anyhow::Result<Value> {
+    let file = File::open(path)
+        .with_context(|| format!("open prediction execution evidence {}", path.display()))?;
+    if file.metadata()?.len() > MAX_SUBMISSION_BYTES {
+        bail!("prediction execution evidence exceeds {MAX_SUBMISSION_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SUBMISSION_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SUBMISSION_BYTES {
+        bail!("prediction execution evidence exceeds {MAX_SUBMISSION_BYTES} bytes");
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse prediction execution evidence {}", path.display()))
+}
+
+fn derive_status(
+    job: &Value,
+    pods: &Value,
+    evidence: Option<&Value>,
+) -> anyhow::Result<PredictionStatus> {
+    let job: StatusJob =
+        serde_json::from_value(job.clone()).context("parse prediction Job readback")?;
+    let pods: StatusPodList =
+        serde_json::from_value(pods.clone()).context("parse prediction Pod readback")?;
+    let annotation = |key: &str| {
+        job.metadata
+            .annotations
+            .get(key)
+            .map(String::as_str)
+            .with_context(|| format!("prediction Job is missing {key} annotation"))
+    };
+    if annotation("research.monday/lane")? != "prediction_market" {
+        bail!("Kubernetes Job is not a prediction research Job");
+    }
+    let mission_id = annotation("research.monday/mission-id")?.to_owned();
+    validate_identifier("Job mission id", &mission_id)?;
+    let mission_sha256 =
+        normalized_sha256("Job mission", annotation("research.monday/mission-sha256")?)?;
+    let snapshot_sha256 = normalized_sha256(
+        "Job snapshot",
+        annotation("research.monday/snapshot-sha256")?,
+    )?;
+    let research_ready = if let Some(evidence) = evidence {
+        let evidence: StatusEvidence = serde_json::from_value(evidence.clone())
+            .context("parse prediction execution evidence")?;
+        if evidence.lane != "prediction_market"
+            || evidence.mission_id != mission_id
+            || normalized_sha256("evidence mission", &evidence.mission_sha256)? != mission_sha256
+            || normalized_sha256("evidence snapshot", &evidence.snapshot_archive_sha256)?
+                != snapshot_sha256
+        {
+            bail!("prediction execution evidence does not match the immutable Job identity");
+        }
+        Some(true)
+    } else {
+        None
+    };
+    let condition = |conditions: &[StatusCondition], kind: &str| {
+        conditions
+            .iter()
+            .any(|condition| condition.kind == kind && condition.status == "True")
+    };
+    let owned_pods = pods.items.iter().filter(|pod| {
+        pod.metadata.owner_references.iter().any(|owner| {
+            owner.controller
+                && owner.kind == "Job"
+                && owner.name == job.metadata.name
+                && owner.uid == job.metadata.uid
+        })
+    });
+    let scheduled = owned_pods
+        .clone()
+        .any(|pod| condition(&pod.status.conditions, "PodScheduled"));
+    let image_ready = owned_pods.clone().any(|pod| {
+        pod.status.container_statuses.iter().any(|container| {
+            container.state.running.is_some() || container.state.terminated.is_some()
+        })
+    });
+    Ok(PredictionStatus {
+        job_name: job.metadata.name,
+        namespace: job.metadata.namespace,
+        mission_id,
+        mission_sha256,
+        snapshot_sha256,
+        submitted: true,
+        scheduled,
+        image_ready,
+        snapshot_ready: research_ready,
+        evaluator_started: research_ready,
+        completed: condition(&job.status.conditions, "Complete"),
+    })
 }
 
 fn load_submission(path: &Path) -> anyhow::Result<PredictionSubmission> {
@@ -675,6 +909,74 @@ mod tests {
             let actual = create_failure_recovered(jobs, "job", &annotations);
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn status_derives_only_kubernetes_milestones_without_evidence() {
+        let status = derive_status(&status_job(), &status_pods(), None).unwrap();
+        assert!(status.submitted && status.scheduled && status.image_ready && status.completed);
+        assert_eq!(status.snapshot_ready, None);
+        assert_eq!(status.evaluator_started, None);
+    }
+
+    #[test]
+    fn matching_execution_evidence_asserts_research_milestones() {
+        let evidence = status_evidence();
+        let status = derive_status(&status_job(), &status_pods(), Some(&evidence)).unwrap();
+        assert_eq!(status.snapshot_ready, Some(true));
+        assert_eq!(status.evaluator_started, Some(true));
+    }
+
+    #[test]
+    fn status_rejects_evidence_from_another_mission_or_snapshot() {
+        for field in ["mission_id", "mission_sha256", "snapshot_archive_sha256"] {
+            let mut evidence = status_evidence();
+            evidence[field] = if field == "mission_id" {
+                json!("mission-2")
+            } else {
+                json!("e".repeat(64))
+            };
+            assert!(derive_status(&status_job(), &status_pods(), Some(&evidence)).is_err());
+        }
+    }
+
+    #[test]
+    fn pod_from_another_job_cannot_advance_milestones() {
+        let mut pods = status_pods();
+        pods["items"][0]["metadata"]["ownerReferences"][0]["uid"] = json!("other-uid");
+        let status = derive_status(&status_job(), &pods, None).unwrap();
+        assert!(!status.scheduled && !status.image_ready);
+    }
+
+    fn status_job() -> Value {
+        json!({
+            "metadata": {"name": "prediction-job", "namespace": "monday-research", "uid": "job-uid", "annotations": {
+                "research.monday/lane": "prediction_market",
+                "research.monday/mission-id": "mission-1",
+                "research.monday/mission-sha256": "c".repeat(64),
+                "research.monday/snapshot-sha256": "d".repeat(64)
+            }},
+            "status": {"conditions": [{"type": "Complete", "status": "True"}]}
+        })
+    }
+
+    fn status_pods() -> Value {
+        json!({"items": [{"metadata": {"ownerReferences": [{
+            "uid": "job-uid", "name": "prediction-job", "kind": "Job", "controller": true
+        }]}, "status": {
+            "conditions": [{"type": "PodScheduled", "status": "True"}],
+            "containerStatuses": [{"state": {"running": {}}}]
+        }}]})
+    }
+
+    fn status_evidence() -> Value {
+        json!({
+            "lane": "prediction_market",
+            "mission_id": "mission-1",
+            "mission_sha256": "c".repeat(64),
+            "snapshot_archive_sha256": "d".repeat(64),
+            "runner_exit_code": 0
+        })
     }
 
     fn valid_submission() -> PredictionSubmission {

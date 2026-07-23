@@ -275,6 +275,12 @@ Submit with `alpha-harness prediction dispatch submit --submission FILE --contex
 CONTEXT --namespace NS`. The query-free result URL is the duplicate guard; each
 Job has isolated storage. Treat rendered Secret `stringData` as sensitive.
 
+Read Job and Pod milestones without mutation using `alpha-harness prediction
+dispatch status --context CONTEXT --namespace NS --job-name JOB`. Snapshot-ready
+and evaluator-started remain `null` unless `--evidence execution-evidence.json`
+is supplied. Evidence is accepted only when its mission ID, mission SHA, and
+snapshot SHA match the immutable Job annotations; a mismatch fails closed.
+
 The URL Secret must always contain `resume-url` and `resume-sha256`; set both to
 empty strings for the first attempt. A paused or failed runner still uploads its
 results and append-only state to the attempt's immutable result URL before the

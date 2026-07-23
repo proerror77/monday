@@ -102,6 +102,7 @@ enum PredictionCommand {
 #[derive(Debug, Subcommand)]
 enum PredictionDispatchCommand {
     Render(PredictionDispatchRenderArgs),
+    Status(PredictionDispatchStatusArgs),
     Submit(PredictionDispatchSubmitArgs),
 }
 
@@ -121,6 +122,18 @@ pub struct PredictionDispatchSubmitArgs {
     pub context: String,
     #[arg(long)]
     pub namespace: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PredictionDispatchStatusArgs {
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+    #[arg(long)]
+    pub job_name: String,
+    #[arg(long)]
+    pub evidence: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -649,6 +662,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             PredictionCommand::Dispatch { command } => match command {
                 PredictionDispatchCommand::Render(args) => prediction_dispatch::render(args),
+                PredictionDispatchCommand::Status(args) => prediction_dispatch::status(args),
                 PredictionDispatchCommand::Submit(args) => prediction_dispatch::submit(args),
             },
         },
@@ -806,6 +820,12 @@ mod tests {
     #[test]
     fn parses_prediction_dispatch_render() {
         let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_prediction_dispatch_status_with_explicit_cluster_identity() {
+        let args = "alpha-harness prediction dispatch status --context ack --namespace monday-research --job-name prediction-job";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
