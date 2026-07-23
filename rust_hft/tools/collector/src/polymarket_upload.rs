@@ -21,8 +21,9 @@ pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_comp
 pub(crate) const TRADE_COMPLETION_BASIS: &str =
     "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1";
 
-const ALLOWED_KINDS: [&str; 8] = [
+const ALLOWED_KINDS: [&str; 9] = [
     "quote",
+    "quote_collection_failure",
     "event_discovered",
     "event_expired",
     "reference_price",
@@ -261,6 +262,10 @@ fn decimal_or_none(
     Decimal::from_str(&text)
         .map(Some)
         .map_err(|_| anyhow!("line {line_number}: {field} must be numeric"))
+}
+
+fn polymarket_tradeable_price(price: Decimal) -> bool {
+    price > Decimal::new(2, 2) && price < Decimal::new(98, 2)
 }
 
 fn value_text(value: Option<&Value>) -> String {
@@ -877,7 +882,10 @@ fn scan_tape_with_identity_at(
     let mut symbols = BTreeSet::new();
     let mut token_ids = BTreeSet::new();
     let mut known_event_tokens = BTreeSet::new();
+    let mut quoted_token_ids = BTreeSet::new();
+    let mut attempted_quote_token_ids = BTreeSet::new();
     let mut contextless_quote_tokens = BTreeSet::new();
+    let mut last_quote_source_at = BTreeMap::<String, DateTime<Utc>>::new();
     let mut first_recorded_at: Option<String> = None;
     let mut last_recorded_at: Option<String> = None;
     let mut previous_recorded_at: Option<DateTime<Utc>> = None;
@@ -887,6 +895,15 @@ fn scan_tape_with_identity_at(
     let mut crossed_quotes = 0_u64;
     let mut one_sided_quotes = 0_u64;
     let mut empty_quotes = 0_u64;
+    let mut non_executable_quotes = 0_u64;
+    let mut executable_quotes = 0_u64;
+    let mut missing_bid_size = 0_u64;
+    let mut missing_ask_size = 0_u64;
+    let mut incomplete_quotes = 0_u64;
+    let mut max_quote_latency_ms = 0_i64;
+    let mut request_attempts = 0_u64;
+    let mut request_failures = 0_u64;
+    let mut max_request_latency_ms = 0_i64;
     let mut out_of_range_prices = 0_u64;
     let mut negative_sizes = 0_u64;
     let mut max_bid_levels = 0_usize;
@@ -1071,19 +1088,50 @@ fn scan_tape_with_identity_at(
             _ => {}
         }
 
-        if kind == "quote" {
-            if !token_id.is_some_and(|token| known_event_tokens.contains(token)) {
+        if matches!(kind, "quote" | "quote_collection_failure") {
+            let token = required_text(update, "token_id", line_number)?;
+            attempted_quote_token_ids.insert(token.to_owned());
+            request_attempts += 1;
+            if !known_event_tokens.contains(token) {
                 contextless_quotes += 1;
-                if let Some(token) = token_id {
-                    contextless_quote_tokens.insert(token.to_owned());
-                }
+                contextless_quote_tokens.insert(token.to_owned());
             }
+        }
+
+        if kind == "quote" {
+            if update.get("request_status").and_then(Value::as_str) != Some("success") {
+                bail!("line {line_number}: quote requires request_status=success");
+            }
+            let source_at = parse_timestamp(update.get("ts"), "ts", line_number)
+                .map_err(|_| anyhow!("line {line_number}: quote requires ts"))?;
+            let quote_latency_ms = recorded_at
+                .signed_duration_since(source_at)
+                .num_milliseconds();
+            if quote_latency_ms < 0 {
+                bail!("line {line_number}: quote source time is after received time");
+            }
+            max_quote_latency_ms = max_quote_latency_ms.max(quote_latency_ms);
+            let token = required_text(update, "token_id", line_number)?;
+            if last_quote_source_at
+                .insert(token.to_owned(), source_at)
+                .is_some_and(|previous| source_at < previous)
+            {
+                bail!("line {line_number}: quote source time moved backwards");
+            }
+            quoted_token_ids.insert(token.to_owned());
             let bid = decimal_or_none(update.get("bid"), "bid", line_number)?;
             let ask = decimal_or_none(update.get("ask"), "ask", line_number)?;
             let bid_size = decimal_or_none(update.get("bid_size"), "bid_size", line_number)?;
             let ask_size = decimal_or_none(update.get("ask_size"), "ask_size", line_number)?;
             let bid_levels = quote_levels(update.get("bid_levels"), line_number)?;
             let ask_levels = quote_levels(update.get("ask_levels"), line_number)?;
+            let mut all_levels_non_executable = true;
+            if bid.is_some() && bid_size.is_none() {
+                missing_bid_size += 1;
+            }
+            if ask.is_some() && ask_size.is_none() {
+                missing_ask_size += 1;
+            }
             if quote_depth_levels > 0
                 && (bid_levels.len() > quote_depth_levels || ask_levels.len() > quote_depth_levels)
             {
@@ -1091,7 +1139,7 @@ fn scan_tape_with_identity_at(
             }
             max_bid_levels = max_bid_levels.max(bid_levels.len());
             max_ask_levels = max_ask_levels.max(ask_levels.len());
-            for (side, levels) in [("bid_levels", bid_levels), ("ask_levels", ask_levels)] {
+            for (side, levels) in [("bid_levels", &bid_levels), ("ask_levels", &ask_levels)] {
                 for (level_index, level) in levels.iter().enumerate() {
                     let level = level.as_object().ok_or_else(|| {
                         anyhow!("line {line_number}: {side}[{level_index}] must be an object")
@@ -1111,17 +1159,19 @@ fn scan_tape_with_identity_at(
                     };
                     if !(Decimal::ZERO..=Decimal::ONE).contains(&level_price) {
                         out_of_range_prices += 1;
+                        all_levels_non_executable = false;
                     }
-                    if level_size < Decimal::ZERO {
+                    if level_size <= Decimal::ZERO {
                         negative_sizes += 1;
+                        all_levels_non_executable = false;
+                    }
+                    if polymarket_tradeable_price(level_price) {
+                        all_levels_non_executable = false;
                     }
                 }
             }
-            match (bid, ask) {
-                (None, None) => empty_quotes += 1,
-                (None, Some(_)) | (Some(_), None) => one_sided_quotes += 1,
-                (Some(bid), Some(ask)) if bid > ask => crossed_quotes += 1,
-                _ => {}
+            if matches!((bid, ask), (Some(bid), Some(ask)) if bid > ask) {
+                crossed_quotes += 1;
             }
             for price in [bid, ask].into_iter().flatten() {
                 if !(Decimal::ZERO..=Decimal::ONE).contains(&price) {
@@ -1133,6 +1183,87 @@ fn scan_tape_with_identity_at(
                     negative_sizes += 1;
                 }
             }
+            let collection_result = match (bid, ask, bid_size, ask_size) {
+                (None, None, None, None) if bid_levels.is_empty() && ask_levels.is_empty() => {
+                    "empty"
+                }
+                (None, None, None, None) if all_levels_non_executable => "non_executable",
+                (Some(bid), Some(ask), Some(bid_size), Some(ask_size))
+                    if bid <= ask
+                        && polymarket_tradeable_price(bid)
+                        && polymarket_tradeable_price(ask)
+                        && bid_size > Decimal::ZERO
+                        && ask_size > Decimal::ZERO =>
+                {
+                    "executable"
+                }
+                (Some(price), None, Some(size), None) | (None, Some(price), None, Some(size))
+                    if polymarket_tradeable_price(price) && size > Decimal::ZERO =>
+                {
+                    "one_sided"
+                }
+                _ => "incomplete",
+            };
+            if update.get("collection_result").and_then(Value::as_str) != Some(collection_result) {
+                bail!(
+                    "line {line_number}: quote collection_result does not match {collection_result}"
+                );
+            }
+            match collection_result {
+                "executable" => executable_quotes += 1,
+                "one_sided" => one_sided_quotes += 1,
+                "empty" => empty_quotes += 1,
+                "non_executable" => non_executable_quotes += 1,
+                _ => incomplete_quotes += 1,
+            }
+        } else if kind == "quote_collection_failure" {
+            if update.get("request_status").and_then(Value::as_str) != Some("failure")
+                || update.get("collection_result").and_then(Value::as_str) != Some("api_failure")
+            {
+                bail!("line {line_number}: quote collection failure requires explicit status");
+            }
+            let request_started_at = parse_timestamp(
+                update.get("request_started_at"),
+                "request_started_at",
+                line_number,
+            )?;
+            let failed_at = parse_timestamp(update.get("ts"), "ts", line_number)?;
+            if request_started_at > failed_at || failed_at > recorded_at {
+                bail!("line {line_number}: invalid quote request timing");
+            }
+            let request_latency_ms = failed_at
+                .signed_duration_since(request_started_at)
+                .num_milliseconds();
+            max_request_latency_ms = max_request_latency_ms.max(request_latency_ms);
+            let error_kind = required_text(update, "error_kind", line_number)?;
+            if !matches!(
+                error_kind,
+                "transport"
+                    | "http_status"
+                    | "invalid_response"
+                    | "websocket_connect"
+                    | "websocket_subscription_encode"
+                    | "websocket_subscribe"
+                    | "websocket_payload"
+                    | "websocket_pong"
+                    | "websocket_close"
+                    | "websocket_receive"
+                    | "websocket_eof"
+                    | "websocket_heartbeat_timeout"
+                    | "websocket_heartbeat_send"
+            ) {
+                bail!("line {line_number}: unsupported quote collection error_kind");
+            }
+            match update.get("http_status") {
+                Some(Value::Null) | None if error_kind != "http_status" => {}
+                Some(status)
+                    if error_kind == "http_status"
+                        && status
+                            .as_u64()
+                            .is_some_and(|status| (100..=599).contains(&status)) => {}
+                _ => bail!("line {line_number}: invalid quote collection http_status"),
+            }
+            request_failures += 1;
         }
 
         let recorded_at_text = record
@@ -1164,6 +1295,23 @@ fn scan_tape_with_identity_at(
         .expect("recorded_at was validated")
         .with_timezone(&Utc);
     let event_context_complete = contextless_quotes == 0;
+    let missing_quote_tokens = known_event_tokens
+        .difference(&quoted_token_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let missing_quote_attempt_tokens = known_event_tokens
+        .difference(&attempted_quote_token_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let quote_quality_complete = incomplete_quotes == 0
+        && crossed_quotes == 0
+        && out_of_range_prices == 0
+        && negative_sizes == 0;
+    let quote_coverage_complete = missing_quote_tokens.is_empty()
+        && missing_quote_attempt_tokens.is_empty()
+        && request_failures == 0
+        && event_context_complete
+        && quote_quality_complete;
     let has_quotes = event_types.get("quote").copied().unwrap_or_default() > 0;
     let has_reference_records = [
         "market_metadata",
@@ -1175,11 +1323,12 @@ fn scan_tape_with_identity_at(
     .any(|kind| event_types.get(*kind).copied().unwrap_or_default() > 0);
     for (market_id, completion) in &trade_completions {
         let condition_id = completion["condition_id"].as_str().unwrap_or_default();
-        let expected = metadata_identities
-            .get(&(market_id.clone(), condition_id.to_owned()));
+        let expected = metadata_identities.get(&(market_id.clone(), condition_id.to_owned()));
         let actual = (
             completion["symbol"].as_str().unwrap_or_default().to_owned(),
-            completion["market_window_secs"].as_u64().unwrap_or_default(),
+            completion["market_window_secs"]
+                .as_u64()
+                .unwrap_or_default(),
         );
         if expected != Some(&actual) {
             bail!("event-local trade completion identity contradicts market metadata");
@@ -1188,6 +1337,12 @@ fn scan_tape_with_identity_at(
     let reference_context_complete = dependent_reference_contexts.is_subset(&metadata_contexts);
     let depth_complete = has_quotes && quote_depth_levels == 0;
     let temporal_updates_complete = has_quotes && quote_sample_ms == 0;
+    let quote_count = event_types.get("quote").copied().unwrap_or_default();
+    let executable_quote_ratio = if quote_count == 0 {
+        0.0
+    } else {
+        executable_quotes as f64 / quote_count as f64
+    };
     let replay_scope = if !reference_context_complete {
         "reference_hour_segment_requires_market_metadata_context"
     } else if has_reference_records && !has_quotes {
@@ -1209,18 +1364,44 @@ fn scan_tape_with_identity_at(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow!("source file name is not UTF-8"))?;
+    let quality = json!({
+        "crossed_quotes": crossed_quotes,
+        "executable_quotes": executable_quotes,
+        "executable_quote_ratio": executable_quote_ratio,
+        "missing_bid_size": missing_bid_size,
+        "missing_ask_size": missing_ask_size,
+        "incomplete_quotes": incomplete_quotes,
+        "max_quote_latency_ms": max_quote_latency_ms,
+        "request_attempts": request_attempts,
+        "request_successes": quote_count,
+        "request_failures": request_failures,
+        "max_request_latency_ms": max_request_latency_ms,
+        "one_sided_quotes": one_sided_quotes,
+        "empty_quotes": empty_quotes,
+        "non_executable_quotes": non_executable_quotes,
+        "out_of_range_prices": out_of_range_prices,
+        "negative_sizes": negative_sizes,
+        "max_bid_levels": max_bid_levels,
+        "max_ask_levels": max_ask_levels,
+        "contextless_quotes": contextless_quotes,
+        "duplicate_record_ids": 0,
+    });
     let mut manifest = json!({
         "schema": "monday.polymarket.raw.v1",
-        "canonical": reference_context_complete,
+        "canonical": reference_context_complete && quote_coverage_complete,
         "venue": "polymarket",
         "dataset": dataset,
         "format": "ndjson.zst",
         "replay_scope": replay_scope,
         "venue_depth_complete": depth_complete,
         "temporal_updates_complete": temporal_updates_complete,
-        "segment_complete": reference_context_complete,
+        "segment_complete": reference_context_complete && quote_coverage_complete,
         "source_session_closed": true,
         "event_context_complete": event_context_complete,
+        "quote_coverage_complete": quote_coverage_complete,
+        "quote_quality_complete": quote_quality_complete,
+        "missing_quote_tokens": missing_quote_tokens,
+        "missing_quote_attempt_tokens": missing_quote_attempt_tokens,
         "contextless_quote_tokens": contextless_quote_tokens,
         "events": last_sequence - first_sequence + 1,
         "event_types": event_types,
@@ -1245,17 +1426,7 @@ fn scan_tape_with_identity_at(
         "field_non_null": non_null_fields,
         "source_field_presence": source_field_presence,
         "source_field_non_null": source_field_non_null,
-        "quality": {
-            "crossed_quotes": crossed_quotes,
-            "one_sided_quotes": one_sided_quotes,
-            "empty_quotes": empty_quotes,
-            "out_of_range_prices": out_of_range_prices,
-            "negative_sizes": negative_sizes,
-            "max_bid_levels": max_bid_levels,
-            "max_ask_levels": max_ask_levels,
-            "contextless_quotes": contextless_quotes,
-            "duplicate_record_ids": 0,
-        },
+        "quality": quality,
         "source_file": source_file,
         "source_bytes": identity.bytes,
     });
@@ -1657,6 +1828,44 @@ where
 fn canonical_complete_manifest(manifest: &Value) -> bool {
     manifest.get("canonical").and_then(Value::as_bool) == Some(true)
         && manifest.get("segment_complete").and_then(Value::as_bool) == Some(true)
+        && manifest
+            .get("event_context_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && manifest
+            .get("quote_coverage_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && manifest
+            .get("quote_quality_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && manifest
+            .get("missing_quote_tokens")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && manifest
+            .get("missing_quote_attempt_tokens")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && manifest["quality"]["request_failures"].as_u64() == Some(0)
+        && manifest["quality"]["incomplete_quotes"].as_u64() == Some(0)
+        && [
+            "executable_quotes",
+            "missing_bid_size",
+            "missing_ask_size",
+            "incomplete_quotes",
+            "max_quote_latency_ms",
+            "request_attempts",
+            "request_successes",
+            "request_failures",
+            "max_request_latency_ms",
+            "one_sided_quotes",
+            "empty_quotes",
+            "non_executable_quotes",
+        ]
+        .into_iter()
+        .all(|field| manifest["quality"][field].as_u64().is_some())
 }
 
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
@@ -1857,6 +2066,7 @@ mod tests {
                     "bid_size": "10", "ask_size": "11",
                     "bid_levels": [{"price": "0.49", "size": "10"}],
                     "ask_levels": [{"price": "0.51", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
                     "ts": "2026-07-15T01:00:01Z",
                 }),
             ),
@@ -1999,6 +2209,208 @@ mod tests {
     }
 
     #[test]
+    fn classifies_quote_executability() {
+        let root = TestDir::new();
+        let mut executable = sample_rows()[1].clone();
+        executable["sequence"] = json!(0);
+        let mut missing_ask_size = executable.clone();
+        missing_ask_size["sequence"] = json!(1);
+        missing_ask_size["update"]["ask_size"] = Value::Null;
+        missing_ask_size["update"]["ask_levels"] = json!([]);
+        missing_ask_size["update"]["collection_result"] = json!("incomplete");
+        let mut one_sided = executable.clone();
+        one_sided["sequence"] = json!(2);
+        one_sided["update"]["ask"] = Value::Null;
+        one_sided["update"]["ask_size"] = Value::Null;
+        one_sided["update"]["ask_levels"] = json!([]);
+        one_sided["update"]["collection_result"] = json!("one_sided");
+        let mut empty = executable.clone();
+        empty["sequence"] = json!(3);
+        empty["recorded_at"] = json!("2026-07-15T01:00:04Z");
+        for field in ["bid", "ask", "bid_size", "ask_size"] {
+            empty["update"][field] = Value::Null;
+        }
+        empty["update"]["bid_levels"] = json!([]);
+        empty["update"]["ask_levels"] = json!([]);
+        empty["update"]["collection_result"] = json!("empty");
+        let mut non_executable = empty.clone();
+        non_executable["sequence"] = json!(4);
+        non_executable["recorded_at"] = json!("2026-07-15T01:00:05Z");
+        non_executable["update"]["bid_levels"] = json!([{"price": "0.01", "size": "5"}]);
+        non_executable["update"]["ask_levels"] = json!([{"price": "0.99", "size": "6"}]);
+        non_executable["update"]["collection_result"] = json!("non_executable");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[
+                executable,
+                missing_ask_size,
+                one_sided,
+                empty,
+                non_executable,
+            ],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["quality"]["executable_quotes"], 1);
+        assert_eq!(manifest["quality"]["missing_bid_size"], 0);
+        assert_eq!(manifest["quality"]["missing_ask_size"], 1);
+        assert_eq!(manifest["quality"]["one_sided_quotes"], 1);
+        assert_eq!(manifest["quality"]["empty_quotes"], 1);
+        assert_eq!(manifest["quality"]["non_executable_quotes"], 1);
+        assert_eq!(manifest["quality"]["incomplete_quotes"], 1);
+        assert_eq!(manifest["quality"]["max_quote_latency_ms"], 4_000);
+        assert_eq!(
+            manifest["quality"]["executable_quotes"].as_u64().unwrap()
+                + manifest["quality"]["one_sided_quotes"].as_u64().unwrap()
+                + manifest["quality"]["empty_quotes"].as_u64().unwrap()
+                + manifest["quality"]["non_executable_quotes"]
+                    .as_u64()
+                    .unwrap()
+                + manifest["quality"]["incomplete_quotes"].as_u64().unwrap(),
+            manifest["event_types"]["quote"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_quote_without_explicit_collection_status() {
+        let root = TestDir::new();
+        let mut quote = sample_rows()[1].clone();
+        quote["sequence"] = json!(0);
+        quote["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("request_status");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[quote],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error.to_string().contains("quote requires request_status"));
+    }
+
+    #[test]
+    fn rejects_non_executable_label_when_tradeable_levels_are_present() {
+        let root = TestDir::new();
+        let mut quote = sample_rows()[1].clone();
+        quote["sequence"] = json!(0);
+        for field in ["bid", "ask", "bid_size", "ask_size"] {
+            quote["update"][field] = Value::Null;
+        }
+        quote["update"]["collection_result"] = json!("non_executable");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[quote],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collection_result does not match incomplete"));
+    }
+
+    #[test]
+    fn retains_request_failure_but_marks_segment_incomplete() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            record(
+                1,
+                "2026-07-15T01:00:01Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "up-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:00.900Z",
+                    "http_status": null, "error_kind": "websocket_connect",
+                    "ts": "2026-07-15T01:00:01Z"
+                }),
+            ),
+            record(
+                2,
+                "2026-07-15T01:00:02Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "down-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:01.900Z",
+                    "http_status": null, "error_kind": "websocket_receive",
+                    "ts": "2026-07-15T01:00:02Z"
+                }),
+            ),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["quality"]["request_attempts"], 2);
+        assert_eq!(manifest["quality"]["request_failures"], 2);
+        assert_eq!(manifest["quality"]["max_request_latency_ms"], 100);
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["segment_complete"], false);
+    }
+
+    #[test]
+    fn rejects_quote_source_time_regression_per_token() {
+        let root = TestDir::new();
+        let mut first = sample_rows()[1].clone();
+        first["sequence"] = json!(0);
+        first["recorded_at"] = json!("2026-07-15T01:00:02Z");
+        first["update"]["ts"] = json!("2026-07-15T01:00:02Z");
+        let mut second = first.clone();
+        second["sequence"] = json!(1);
+        second["recorded_at"] = json!("2026-07-15T01:00:03Z");
+        second["update"]["ts"] = json!("2026-07-15T01:00:01Z");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[first, second],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("quote source time moved backwards"));
+    }
+
+    #[test]
+    fn rejects_quote_without_source_time() {
+        let root = TestDir::new();
+        let mut quote = sample_rows()[1].clone();
+        quote["sequence"] = json!(0);
+        quote["update"].as_object_mut().unwrap().remove("ts");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[quote],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error.to_string().contains("quote requires ts"));
+    }
+
+    #[test]
+    fn marks_missing_event_token_quote_coverage() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["missing_quote_tokens"], json!(["down-1"]));
+        assert_eq!(manifest["segment_complete"], false);
+    }
+
+    #[test]
     fn records_event_local_trade_completion_identity() {
         let root = TestDir::new();
         let rows = vec![
@@ -2128,6 +2540,8 @@ mod tests {
         );
         let manifest = scan_tape(&contextless, "crypto_expiry", 1, 1_000).unwrap();
         assert_eq!(manifest["event_context_complete"], false);
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["segment_complete"], false);
         assert!(manifest["replay_scope"]
             .as_str()
             .unwrap()
@@ -2405,14 +2819,31 @@ mod tests {
     }
 
     #[test]
-    fn canonical_upload_count_requires_both_manifest_flags() {
-        assert!(canonical_complete_manifest(
-            &json!({"canonical": true, "segment_complete": true})
-        ));
+    fn canonical_upload_count_requires_complete_quote_manifest() {
+        let complete = json!({
+            "canonical":true,"segment_complete":true,"event_context_complete":true,
+            "quote_coverage_complete":true,"quote_quality_complete":true,
+            "missing_quote_tokens":[],"missing_quote_attempt_tokens":[],
+            "quality":{"executable_quotes":1,
+            "missing_bid_size":0,"missing_ask_size":0,"one_sided_quotes":0,
+            "empty_quotes":0,"non_executable_quotes":0,"incomplete_quotes":0,"max_quote_latency_ms":0,
+            "request_attempts":1,"request_successes":1,"request_failures":0,
+            "max_request_latency_ms":0}
+        });
+        assert!(canonical_complete_manifest(&complete));
+        let mut not_canonical = complete.clone();
+        not_canonical["canonical"] = json!(false);
+        let mut incomplete_segment = complete.clone();
+        incomplete_segment["segment_complete"] = json!(false);
+        let mut incomplete_coverage = complete.clone();
+        incomplete_coverage["quote_coverage_complete"] = json!(false);
+        let mut missing_quality = complete.clone();
+        missing_quality["quality"]["executable_quotes"] = Value::Null;
         for manifest in [
-            json!({"canonical": false, "segment_complete": true}),
-            json!({"canonical": true, "segment_complete": false}),
-            json!({"canonical": true}),
+            not_canonical,
+            incomplete_segment,
+            incomplete_coverage,
+            missing_quality,
         ] {
             assert!(!canonical_complete_manifest(&manifest));
         }
