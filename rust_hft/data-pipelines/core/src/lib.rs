@@ -5,6 +5,7 @@
 pub mod binance_lob_replay;
 pub mod binance_market_tape;
 pub mod binance_market_tape_artifact;
+pub mod binance_usdm_reference;
 
 pub mod capabilities {
     #[derive(Debug, Clone, Default)]
