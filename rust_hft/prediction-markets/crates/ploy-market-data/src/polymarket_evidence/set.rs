@@ -70,7 +70,39 @@ impl VerifiedPolymarketEvidenceSet {
 }
 
 pub fn aggregate_verified_polymarket_evidence(
+    members: Vec<VerifiedPolymarketEvidence>,
+) -> Result<VerifiedPolymarketEvidenceSet> {
+    aggregate_with_required_symbols(members, BTreeSet::from(REQUIRED_SYMBOLS))
+}
+
+pub fn aggregate_verified_polymarket_evidence_for_symbols(
+    members: Vec<VerifiedPolymarketEvidence>,
+    required_symbols: &[String],
+) -> Result<VerifiedPolymarketEvidenceSet> {
+    ensure!(
+        !required_symbols.is_empty(),
+        "verified evidence required symbols must not be empty"
+    );
+    let required = required_symbols
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        required.len() == required_symbols.len(),
+        "verified evidence required symbols contain a duplicate"
+    );
+    ensure!(
+        required
+            .iter()
+            .all(|symbol| REQUIRED_SYMBOLS.contains(symbol)),
+        "verified evidence required symbols are unsupported"
+    );
+    aggregate_with_required_symbols(members, required)
+}
+
+fn aggregate_with_required_symbols(
     mut members: Vec<VerifiedPolymarketEvidence>,
+    required_symbols: BTreeSet<&str>,
 ) -> Result<VerifiedPolymarketEvidenceSet> {
     ensure!(
         !members.is_empty(),
@@ -91,7 +123,7 @@ pub fn aggregate_verified_polymarket_evidence(
                     .cmp(&right.identity().content_sha256)
             })
     });
-    let (event_start_gte, event_start_lt) = validate_members(&members)?;
+    let (event_start_gte, event_start_lt) = validate_members(&members, &required_symbols)?;
     Ok(VerifiedPolymarketEvidenceSet {
         members,
         event_start_gte,
@@ -101,6 +133,7 @@ pub fn aggregate_verified_polymarket_evidence(
 
 fn validate_members(
     members: &[VerifiedPolymarketEvidence],
+    required_symbols: &BTreeSet<&str>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let mut content_digests = BTreeSet::new();
     let mut manifest_digests = BTreeSet::new();
@@ -125,7 +158,7 @@ fn validate_members(
     let end = members[members.len() - 1].identity().event_start_lt;
     validate_global_identities(members)?;
     for member in members {
-        validate_member_slot_pairs(member)?;
+        validate_member_slot_pairs(member, required_symbols)?;
     }
     Ok((start, end))
 }
@@ -170,7 +203,10 @@ fn validate_global_identities(members: &[VerifiedPolymarketEvidence]) -> Result<
     Ok(())
 }
 
-fn validate_member_slot_pairs(member: &VerifiedPolymarketEvidence) -> Result<()> {
+fn validate_member_slot_pairs(
+    member: &VerifiedPolymarketEvidence,
+    required_symbols: &BTreeSet<&str>,
+) -> Result<()> {
     let start = member.identity().event_start_gte;
     let end = member.identity().event_start_lt;
     let mut slots: BTreeMap<DateTime<Utc>, BTreeSet<&str>> = BTreeMap::new();
@@ -191,11 +227,10 @@ fn validate_member_slot_pairs(member: &VerifiedPolymarketEvidence) -> Result<()>
     if usize::try_from(slot_count)? != slots.len() {
         bail!("verified evidence set is missing a 5-minute slot");
     }
-    let required = BTreeSet::from(REQUIRED_SYMBOLS);
     let mut expected_start = start;
     for (slot_start, symbols) in slots {
-        if slot_start != expected_start || symbols != required {
-            bail!("every verified 5-minute slot must contain BTCUSDT and SOLUSDT");
+        if slot_start != expected_start || &symbols != required_symbols {
+            bail!("every verified 5-minute slot must contain exactly the required symbols");
         }
         expected_start = expected_start
             .checked_add_signed(Duration::seconds(WINDOW_SECS))
@@ -359,6 +394,40 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_complete_single_requested_symbol() {
+        let start = base();
+        for symbol in REQUIRED_SYMBOLS {
+            let rows = event_rows(symbol, start, &format!("{symbol}-only"));
+            let set = aggregate_verified_polymarket_evidence_for_symbols(
+                vec![verified(&rows, start)],
+                &[symbol.to_string()],
+            )
+            .unwrap();
+
+            assert_eq!(set.contracts().count(), 1);
+            assert_eq!(set.books().count(), 2);
+            assert_eq!(set.references().count(), 1);
+            assert_eq!(set.settlements().count(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_requested_symbols() {
+        for (symbols, expected) in [
+            (vec![], "must not be empty"),
+            (
+                vec!["BTCUSDT".to_string(), "BTCUSDT".to_string()],
+                "contain a duplicate",
+            ),
+            (vec!["ETHUSDT".to_string()], "are unsupported"),
+        ] {
+            let error =
+                aggregate_verified_polymarket_evidence_for_symbols(vec![], &symbols).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
     fn aggregates_two_contiguous_verified_hourly_artifacts() {
         let start: DateTime<Utc> = "2026-07-17T05:00:00Z".parse().unwrap();
         let second_start = start + Duration::hours(1);
@@ -444,7 +513,7 @@ mod tests {
             aggregate_verified_polymarket_evidence(vec![first(), verified(&missing, second_start)])
                 .unwrap_err();
         assert!(
-            error.to_string().contains("BTCUSDT and SOLUSDT"),
+            error.to_string().contains("exactly the required symbols"),
             "{error:#}"
         );
 

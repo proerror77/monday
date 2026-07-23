@@ -15,7 +15,7 @@ use data::binance_market_tape_artifact::{
 };
 use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
 use ploy_market_data::polymarket_evidence::{
-    aggregate_verified_polymarket_evidence, seal_polymarket_evidence_triplet,
+    aggregate_verified_polymarket_evidence_for_symbols, seal_polymarket_evidence_triplet,
     verify_polymarket_evidence, PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor,
     VerifiedPolymarketEvidence, VerifiedPolymarketEvidenceSet,
 };
@@ -279,12 +279,13 @@ fn verify_binance_artifacts(
 
 fn verify_polymarket_artifacts(
     artifacts: &[AnchoredArtifact],
+    required_symbols: &[String],
 ) -> anyhow::Result<VerifiedPolymarketEvidenceSet> {
     let verified = artifacts
         .iter()
         .map(verify_polymarket_artifact)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    aggregate_verified_polymarket_evidence(verified)
+    aggregate_verified_polymarket_evidence_for_symbols(verified, required_symbols)
 }
 
 fn verify_polymarket_only(args: &[String]) -> anyhow::Result<()> {
@@ -432,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
     let verified_artifacts = parse_verified_artifact_args(&args, &symbols)?;
 
     let manifest = if let Some(artifacts) = verified_artifacts {
-        let polymarket = verify_polymarket_artifacts(&artifacts.polymarket)?;
+        let polymarket = verify_polymarket_artifacts(&artifacts.polymarket, &symbols)?;
         let options = VerifiedArtifactSnapshotBuildOptions {
             symbol: symbols[0].clone(),
             start,
