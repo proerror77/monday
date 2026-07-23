@@ -4,6 +4,7 @@ mod governance;
 mod loop_control;
 mod mission;
 mod mission_runner;
+mod prediction_dispatch;
 mod prediction_runner;
 mod prediction_snapshot;
 

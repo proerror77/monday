@@ -1,6 +1,6 @@
 use crate::{
-    data_mission, governance, loop_control, mission, mission_runner, prediction_runner,
-    prediction_snapshot,
+    data_mission, governance, loop_control, mission, mission_runner, prediction_dispatch,
+    prediction_runner, prediction_snapshot,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -93,6 +93,34 @@ enum DataCommand {
 enum PredictionCommand {
     Execute(PredictionExecuteArgs),
     Snapshot(PredictionSnapshotArgs),
+    Dispatch {
+        #[command(subcommand)]
+        command: PredictionDispatchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PredictionDispatchCommand {
+    Render(PredictionDispatchRenderArgs),
+    Submit(PredictionDispatchSubmitArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PredictionDispatchRenderArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PredictionDispatchSubmitArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -619,6 +647,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("prediction snapshot worker failed")?
             }
+            PredictionCommand::Dispatch { command } => match command {
+                PredictionDispatchCommand::Render(args) => prediction_dispatch::render(args),
+                PredictionDispatchCommand::Submit(args) => prediction_dispatch::submit(args),
+            },
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
@@ -769,6 +801,12 @@ mod tests {
             )),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn parses_prediction_dispatch_render() {
+        let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
     #[cfg(unix)]

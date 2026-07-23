@@ -267,6 +267,14 @@ variables from the dedicated LLM Secret. The base URL must be reachable through
 the VPC, and every non-loopback endpoint must use HTTPS; a public LLM endpoint is
 not reachable from the private worker pool.
 
+Create a private submission JSON; never commit signed URLs. Include IDs,
+digest-pinned image/evaluator, `standard-v1`, URL+SHA pairs, attempt-bound result,
+LLM Secret, and an optional complete resume pair. Render and review offline with
+`alpha-harness prediction dispatch render --submission FILE --namespace NS`.
+Submit with `alpha-harness prediction dispatch submit --submission FILE --context
+CONTEXT --namespace NS`. The query-free result URL is the duplicate guard; each
+Job has isolated storage. Treat rendered Secret `stringData` as sensitive.
+
 The URL Secret must always contain `resume-url` and `resume-sha256`; set both to
 empty strings for the first attempt. A paused or failed runner still uploads its
 results and append-only state to the attempt's immutable result URL before the
