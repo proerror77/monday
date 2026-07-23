@@ -607,10 +607,7 @@ fn validate_explicit_selection(manifest: &EvidenceManifest) -> Result<ExplicitSe
     })
 }
 
-fn validate_inputs(
-    inputs: &ValidatedInputs,
-    allow_disclosed_quote_collection_failures: bool,
-) -> Result<()> {
+fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result<()> {
     match inputs {
         ValidatedInputs::V1(inputs) => {
             if inputs.schema != INPUT_SCHEMA {
@@ -655,7 +652,7 @@ fn validate_inputs(
                 bail!("unsupported validated input contract");
             }
             validate_segment(&inputs.market, "crypto_expiry")?;
-            let market_event_types = if allow_disclosed_quote_collection_failures {
+            let market_event_types = if explicit_selection {
                 &[
                     "event_discovered",
                     "event_expired",
@@ -695,19 +692,52 @@ fn validate_inputs(
             {
                 bail!("validated reference inputs are missing a required event type");
             }
+            let hour = |segment: &SegmentIdentity| {
+                parse_time(
+                    &format!("{}T{}:00:00Z", segment.date, segment.hour),
+                    "validated reference date/hour",
+                )
+            };
             for pair in inputs.references.windows(2) {
-                let hour = |segment: &SegmentIdentity| {
-                    parse_time(
-                        &format!("{}T{}:00:00Z", segment.date, segment.hour),
-                        "validated reference date/hour",
-                    )
-                };
                 let current_hour = hour(&pair[0])?;
                 let next_hour = hour(&pair[1])?;
-                let ordered_same_hour = next_hour == current_hour
-                    && parse_time(&pair[1].start_recorded_at, "start_recorded_at")?
-                        >= parse_time(&pair[0].end_recorded_at, "end_recorded_at")?;
-                if !ordered_same_hour && next_hour != current_hour + chrono::Duration::hours(1) {
+                if next_hour < current_hour
+                    || (next_hour == current_hour
+                        && parse_time(&pair[1].start_recorded_at, "start_recorded_at")?
+                            < parse_time(&pair[0].end_recorded_at, "end_recorded_at")?)
+                {
+                    bail!("validated reference inputs must be chronologically ordered");
+                }
+            }
+            let mut has_prior_metadata = false;
+            let mut saw_completion_only = false;
+            let mut data_references = Vec::new();
+            for reference in &inputs.references {
+                let completion_only = explicit_selection && is_completion_only_reference(reference);
+                if completion_only && (!has_prior_metadata || data_references.is_empty()) {
+                    bail!("validated completion-only reference input must follow evidence data");
+                }
+                has_prior_metadata |= reference
+                    .event_types
+                    .get("market_metadata")
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                if !completion_only {
+                    if saw_completion_only {
+                        bail!("validated completion-only reference inputs must follow all evidence data");
+                    }
+                    data_references.push(reference);
+                } else {
+                    saw_completion_only = true;
+                }
+            }
+            for pair in data_references.windows(2) {
+                let current_hour = hour(pair[0])?;
+                let next_hour = hour(pair[1])?;
+                if next_hour != current_hour
+                    && next_hour != current_hour + chrono::Duration::hours(1)
+                {
                     bail!("validated reference inputs must be consecutive UTC hours");
                 }
             }
@@ -720,6 +750,22 @@ fn validate_inputs(
             .map(|_| ())
         }
     }
+}
+
+fn is_completion_only_reference(reference: &SegmentIdentity) -> bool {
+    !reference.trade_completions.is_empty()
+        && reference
+            .event_types
+            .get("market_metadata")
+            .copied()
+            .unwrap_or_default()
+            > 0
+        && reference.event_types.keys().all(|kind| {
+            matches!(
+                kind.as_str(),
+                "market_metadata" | "polymarket_trade_collection_complete"
+            )
+        })
 }
 
 fn validate_reference_event_identity(reference: &SegmentIdentity) -> Result<()> {
@@ -1112,6 +1158,22 @@ pub(super) mod tests {
         json!({"schema":INPUT_SCHEMA_V2,"market":value["market"].clone(),"references":[first,second]})
     }
 
+    fn rewrite_inputs(triplet: &PolymarketEvidenceTriplet, inputs: Value, explicit: bool) {
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        if explicit {
+            manifest["schema"] = json!(EXPLICIT_MANIFEST_SCHEMA);
+            manifest["market_ids"] = json!(["market-1"]);
+            manifest["symbols"] = json!(["BTCUSDT"]);
+            manifest["event_selection"] = json!(EXPLICIT_EVENT_SELECTION);
+        }
+        manifest["validated_inputs"] = inputs;
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+    }
+
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
         let rows = SURFACES.map(|surface| {
@@ -1352,6 +1414,137 @@ pub(super) mod tests {
                 accepted
             );
         }
+    }
+
+    #[test]
+    fn seals_a_later_completion_only_reference_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut inputs = plural_inputs("20");
+        inputs["references"][0]["hour"] = json!("17");
+        inputs["references"][0]["start_recorded_at"] = json!("2026-07-17T17:00:00Z");
+        inputs["references"][0]["end_recorded_at"] = json!("2026-07-17T17:01:00Z");
+        inputs["references"][0]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade":1,"market_settlement":1});
+        inputs["references"][0]["events"] = json!(3);
+        inputs["references"][0]["end_sequence"] = json!(3);
+        inputs["references"][1]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade_collection_complete":1});
+        rewrite_inputs(&triplet, inputs, true);
+
+        let result = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet));
+
+        assert!(result.is_ok(), "{:#}", result.unwrap_err());
+    }
+
+    #[test]
+    fn rejects_a_sparse_completion_only_reference_for_a_non_explicit_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut inputs = plural_inputs("20");
+        inputs["references"][0]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade":1,"market_settlement":1});
+        inputs["references"][0]["events"] = json!(3);
+        inputs["references"][0]["end_sequence"] = json!(3);
+        inputs["references"][1]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade_collection_complete":1});
+        rewrite_inputs(&triplet, inputs, false);
+
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("consecutive UTC hours"));
+    }
+
+    #[test]
+    fn rejects_an_early_or_interleaved_completion_only_reference_input() {
+        let rejects = |mut inputs: Value| {
+            let temp = tempfile::tempdir().unwrap();
+            let triplet = write_triplet(&temp);
+            rewrite_inputs(&triplet, inputs.take(), true);
+            seal_polymarket_evidence_triplet(&triplet, &trust(&triplet))
+                .unwrap_err()
+                .to_string()
+        };
+
+        let mut early = plural_inputs("17");
+        early["references"][0]["hour"] = json!("16");
+        early["references"][0]["start_recorded_at"] = json!("2026-07-17T16:00:00Z");
+        early["references"][0]["end_recorded_at"] = json!("2026-07-17T16:01:00Z");
+        early["references"][0]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade_collection_complete":1});
+        early["references"][0]["trade_completions"] =
+            early["references"][1]["trade_completions"].clone();
+        for completion in early["references"][0]["trade_completions"]
+            .as_object_mut()
+            .expect("reference trade completions")
+            .values_mut()
+        {
+            completion["retrieved_at"] = json!("2026-07-17T16:01:00Z");
+        }
+        early["references"][0]["record_id_versions"] = json!([]);
+        early["references"][1]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade":1,"market_settlement":1});
+        early["references"][1]["events"] = json!(3);
+        early["references"][1]["end_sequence"] = json!(3);
+        early["references"][1]["trade_completions"] = json!({});
+        early["references"][1]["record_id_versions"] = json!(["v2"]);
+        assert!(rejects(early).contains("completion-only reference input must follow"));
+
+        let mut after_data = plural_inputs("20");
+        after_data["references"][0]["hour"] = json!("17");
+        after_data["references"][0]["start_recorded_at"] = json!("2026-07-17T17:00:00Z");
+        after_data["references"][0]["end_recorded_at"] = json!("2026-07-17T17:01:00Z");
+        after_data["references"][0]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade":1,"market_settlement":1});
+        after_data["references"][0]["events"] = json!(3);
+        after_data["references"][0]["end_sequence"] = json!(3);
+        after_data["references"][1]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade_collection_complete":1});
+
+        let mut later_data = after_data["references"][0].clone();
+        later_data["hour"] = json!("18");
+        later_data["start_recorded_at"] = json!("2026-07-17T18:00:00Z");
+        later_data["end_recorded_at"] = json!("2026-07-17T18:01:00Z");
+        let mut reversed = after_data.clone();
+        reversed["references"]
+            .as_array_mut()
+            .unwrap()
+            .push(later_data.clone());
+        assert!(rejects(reversed).contains("chronologically ordered"));
+
+        let mut interleaved = after_data;
+        interleaved["references"][1]["hour"] = json!("17");
+        interleaved["references"][1]["start_recorded_at"] = json!("2026-07-17T17:02:00Z");
+        interleaved["references"][1]["end_recorded_at"] = json!("2026-07-17T17:03:00Z");
+        for completion in interleaved["references"][1]["trade_completions"]
+            .as_object_mut()
+            .expect("reference trade completions")
+            .values_mut()
+        {
+            completion["retrieved_at"] = json!("2026-07-17T17:03:00Z");
+        }
+        interleaved["references"]
+            .as_array_mut()
+            .unwrap()
+            .push(later_data);
+        assert!(rejects(interleaved).contains("must follow all evidence data"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_later_completion_only_reference_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut inputs = plural_inputs("20");
+        inputs["references"][0]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade":1,"market_settlement":1});
+        inputs["references"][0]["events"] = json!(3);
+        inputs["references"][0]["end_sequence"] = json!(3);
+        inputs["references"][1]["event_types"] =
+            json!({"market_metadata":1,"polymarket_trade_collection_complete":2});
+        inputs["references"][1]["events"] = json!(3);
+        inputs["references"][1]["end_sequence"] = json!(3);
+        rewrite_inputs(&triplet, inputs, true);
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_err());
     }
 
     #[test]
