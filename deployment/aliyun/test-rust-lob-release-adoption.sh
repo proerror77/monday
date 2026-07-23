@@ -143,9 +143,16 @@ setup_fixture() {
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
       agg_trade_segments:2,agg_trade_count:2,
+      strict_trade_summary_readback:true,max_segment_gap_ns:0,
       oss_roundtrip_evidence:[
-        {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
-        {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+        {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",
+         sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+         manifest_sha256:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+         gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+        {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",
+         sha256:"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+         manifest_sha256:"9999999999999999999999999999999999999999999999999999999999999999",
+         gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
       ]}')
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
