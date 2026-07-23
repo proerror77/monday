@@ -531,7 +531,7 @@ fn validate_manifest(
     {
         bail!("unsupported immutable evidence manifest contract");
     }
-    validate_inputs(&manifest.validated_inputs)?;
+    validate_inputs(&manifest.validated_inputs, explicit_selection.is_some())?;
     parse_digest(&manifest.content_sha256, "content_sha256")?;
     let lower = parse_time(&manifest.event_start_gte, "event_start_gte")?;
     let upper = parse_time(&manifest.event_start_lt, "event_start_lt")?;
@@ -607,7 +607,10 @@ fn validate_explicit_selection(manifest: &EvidenceManifest) -> Result<ExplicitSe
     })
 }
 
-fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
+fn validate_inputs(
+    inputs: &ValidatedInputs,
+    allow_disclosed_quote_collection_failures: bool,
+) -> Result<()> {
     match inputs {
         ValidatedInputs::V1(inputs) => {
             if inputs.schema != INPUT_SCHEMA {
@@ -652,15 +655,23 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
                 bail!("unsupported validated input contract");
             }
             validate_segment(&inputs.market, "crypto_expiry")?;
-            validate_v2_event_types(
-                &inputs.market,
+            let market_event_types = if allow_disclosed_quote_collection_failures {
+                &[
+                    "event_discovered",
+                    "event_expired",
+                    "quote",
+                    "quote_collection_failure",
+                    "reference_price",
+                ][..]
+            } else {
                 &[
                     "event_discovered",
                     "event_expired",
                     "quote",
                     "reference_price",
-                ],
-            )?;
+                ][..]
+            };
+            validate_v2_event_types(&inputs.market, market_event_types)?;
             let mut reference_event_types = BTreeMap::<String, u64>::new();
             for reference in &inputs.references {
                 validate_segment(reference, "crypto_expiry_reference")?;
@@ -1193,6 +1204,95 @@ pub(super) mod tests {
         );
 
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn only_explicit_v3_inputs_may_disclose_quote_collection_failures() {
+        let legacy_temp = tempfile::tempdir().unwrap();
+        let legacy_triplet = write_triplet(&legacy_temp);
+        let mut legacy_manifest: Value =
+            serde_json::from_slice(&fs::read(&legacy_triplet.manifest).unwrap()).unwrap();
+        legacy_manifest["validated_inputs"]["market"]["event_types"] =
+            json!({"quote": 2, "quote_collection_failure": 1});
+        legacy_manifest["validated_inputs"]["market"]["events"] = json!(3);
+        legacy_manifest["validated_inputs"]["market"]["end_sequence"] = json!(3);
+        rewrite_read_only(
+            &legacy_triplet.manifest,
+            format!("{}\n", serde_json::to_string(&legacy_manifest).unwrap()),
+        );
+        assert!(
+            seal_polymarket_evidence_triplet(&legacy_triplet, &trust(&legacy_triplet))
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported event type")
+        );
+
+        let non_explicit_v2_temp = tempfile::tempdir().unwrap();
+        let non_explicit_v2_triplet = write_triplet(&non_explicit_v2_temp);
+        let mut non_explicit_v2_manifest: Value =
+            serde_json::from_slice(&fs::read(&non_explicit_v2_triplet.manifest).unwrap()).unwrap();
+        non_explicit_v2_manifest["validated_inputs"] = plural_inputs("06");
+        non_explicit_v2_manifest["validated_inputs"]["market"]["event_types"] =
+            json!({"quote": 2, "quote_collection_failure": 1});
+        non_explicit_v2_manifest["validated_inputs"]["market"]["events"] = json!(3);
+        non_explicit_v2_manifest["validated_inputs"]["market"]["end_sequence"] = json!(3);
+        rewrite_read_only(
+            &non_explicit_v2_triplet.manifest,
+            format!(
+                "{}\n",
+                serde_json::to_string(&non_explicit_v2_manifest).unwrap()
+            ),
+        );
+        assert!(seal_polymarket_evidence_triplet(
+            &non_explicit_v2_triplet,
+            &trust(&non_explicit_v2_triplet),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported event type"));
+
+        let explicit_temp = tempfile::tempdir().unwrap();
+        let explicit_triplet = write_triplet(&explicit_temp);
+        let mut explicit_manifest: Value =
+            serde_json::from_slice(&fs::read(&explicit_triplet.manifest).unwrap()).unwrap();
+        let market = explicit_manifest["validated_inputs"]["market"].clone();
+        let reference = explicit_manifest["validated_inputs"]["reference"].clone();
+        explicit_manifest["schema"] = json!(EXPLICIT_MANIFEST_SCHEMA);
+        explicit_manifest["market_ids"] = json!(["market-1"]);
+        explicit_manifest["symbols"] = json!(["BTCUSDT"]);
+        explicit_manifest["event_selection"] = json!(EXPLICIT_EVENT_SELECTION);
+        explicit_manifest["validated_inputs"] = json!({
+            "schema": INPUT_SCHEMA_V2,
+            "market": market,
+            "references": [reference],
+        });
+        explicit_manifest["validated_inputs"]["market"]["event_types"] =
+            json!({"quote": 2, "quote_collection_failure": 1});
+        explicit_manifest["validated_inputs"]["market"]["events"] = json!(3);
+        explicit_manifest["validated_inputs"]["market"]["end_sequence"] = json!(3);
+        rewrite_read_only(
+            &explicit_triplet.manifest,
+            format!("{}\n", serde_json::to_string(&explicit_manifest).unwrap()),
+        );
+
+        assert!(
+            seal_polymarket_evidence_triplet(&explicit_triplet, &trust(&explicit_triplet)).is_ok()
+        );
+
+        explicit_manifest["validated_inputs"]["market"]["event_types"] =
+            json!({"quote": 2, "quote_collection_failure": 1, "unknown_market_event": 1});
+        explicit_manifest["validated_inputs"]["market"]["events"] = json!(4);
+        explicit_manifest["validated_inputs"]["market"]["end_sequence"] = json!(4);
+        rewrite_read_only(
+            &explicit_triplet.manifest,
+            format!("{}\n", serde_json::to_string(&explicit_manifest).unwrap()),
+        );
+        assert!(
+            seal_polymarket_evidence_triplet(&explicit_triplet, &trust(&explicit_triplet))
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported event type")
+        );
     }
 
     #[test]
