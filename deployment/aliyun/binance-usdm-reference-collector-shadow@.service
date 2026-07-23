@@ -1,0 +1,32 @@
+[Unit]
+Description=Monday Binance USD-M reference collector shadow for artifact %i
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=simple
+User=hftcollector
+Group=hftcollector
+Environment=RUST_LOG=info
+ExecStart=/opt/monday/releases/binance-usdm-reference-collector/%i/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference-shadow/%i --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000
+Restart=on-failure
+RestartSec=5
+RuntimeMaxSec=7500
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday/spool/binance-usdm-reference-shadow/%i
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=40%
+MemoryHigh=256M
+MemoryMax=320M

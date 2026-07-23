@@ -199,17 +199,6 @@ jobs:
             sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
             sha256sum binance-usdm-reference-collector \
               | tee binance-usdm-reference-collector.sha256
-            reference_candidate_sha=$(awk 'NR == 1 {print $1}' \
-              binance-usdm-reference-collector.sha256)
-            jq -S -n \
-              --arg source_revision '${{ github.sha }}' \
-              --arg candidate_sha256 "$reference_candidate_sha" \
-              '{schema:"monday.binance_usdm_reference_release.v1",
-                source_revision:$source_revision,
-                candidate:{file:"binance-usdm-reference-collector",sha256:$candidate_sha256}}' \
-              > binance-usdm-reference-release.json
-            sha256sum binance-usdm-reference-release.json \
-              > binance-usdm-reference-release.json.sha256
           )
           control_assets=(
             polymarket-raw-ops-shadow-gate.sh
@@ -230,6 +219,18 @@ jobs:
             tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
               -czf ../../artifact/polymarket-raw-ops-control.tar.gz "${control_assets[@]}"
           )
+          reference_control_assets=(
+            binance-usdm-reference-collector-shadow@.service
+            binance-usdm-reference-shadow-gate-policy.jq
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${reference_control_assets[@]}" \
+              > ../../artifact/binance-usdm-reference-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf ../../artifact/binance-usdm-reference-control.tar.gz \
+              "${reference_control_assets[@]}"
+          )
           (
             cd artifact
             candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
@@ -237,6 +238,30 @@ jobs:
               | awk '{print $1}')
             control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
               | awk '{print $1}')
+            reference_candidate_sha=$(awk 'NR == 1 {print $1}' \
+              binance-usdm-reference-collector.sha256)
+            reference_control_manifest_sha=$(sha256sum \
+              binance-usdm-reference-control-assets.sha256 | awk '{print $1}')
+            reference_control_archive_sha=$(sha256sum \
+              binance-usdm-reference-control.tar.gz | awk '{print $1}')
+            jq -S -n \
+              --arg source_revision '${{ github.sha }}' \
+              --arg candidate_sha256 "$reference_candidate_sha" \
+              --arg control_manifest_sha256 "$reference_control_manifest_sha" \
+              --arg control_archive_sha256 "$reference_control_archive_sha" \
+              '{schema:"monday.binance_usdm_reference_release.v1",
+                source_revision:$source_revision,
+                candidate:{file:"binance-usdm-reference-collector",sha256:$candidate_sha256},
+                control_manifest:{file:"binance-usdm-reference-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"binance-usdm-reference-control.tar.gz",
+                  sha256:$control_archive_sha256}}' \
+              > binance-usdm-reference-release.json
+            sha256sum binance-usdm-reference-release.json \
+              > binance-usdm-reference-release.json.sha256
+            printf '%s  %s\n' "$reference_control_archive_sha" \
+              binance-usdm-reference-control.tar.gz \
+              > binance-usdm-reference-control.tar.gz.sha256
             jq -S -n \
               --arg source_revision '${{ github.sha }}' \
               --arg candidate_sha256 "$candidate_sha" \
