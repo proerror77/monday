@@ -608,7 +608,7 @@ verify_oss_round_trips() {
   local index=0
   local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
   local segment_dir manifest_path manifest_digest actual_manifest_digest
-  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns lob_continuity
+  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
   local previous_end_ns=0
   local round_trips='[]'
   local -a strict_verifier_args=(--require-lob-continuity)
@@ -624,7 +624,6 @@ verify_oss_round_trips() {
       --arg market "$market" \
       --arg dataset "${dataset[$market]}" \
       --arg shard "${shard_id[$market]}" \
-      --arg session_id "${observed_session[$market]}" \
       '.market == $market
         and .dataset == $dataset
         and .shard_id == $shard
@@ -641,7 +640,7 @@ verify_oss_round_trips() {
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
     ((end_ns < gate_started_ns)) && continue
-    jq -e \
+    jq -e --arg session_id "${observed_session[$market]}" \
       '.schema == "binance.market_tape.v1"
         and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
         and (.trade_summaries | type) == "object"
@@ -759,8 +758,6 @@ verify_oss_round_trips() {
       || die "$market segment has no valid aggregate trades: $zst_uri"
     [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
       || die "$market manifest aggregate-trade count does not match segment: $uri"
-    lob_continuity=$(jq -ce '.lob_continuity' "$manifest_path") \
-      || die "$market manifest has no readable LOB continuity summary: $uri"
     strict_verifier_args+=(
       --verify-segment "$zst_path"
       --segment-content-sha256 "$digest"
@@ -779,8 +776,9 @@ verify_oss_round_trips() {
       --argjson gap_from_previous_ns "$gap_ns" \
       --argjson bytes "$bytes" \
       --argjson agg_trade_count "$agg_trade_count" \
-      --argjson lob_continuity "$lob_continuity" \
-      '{manifest_uri:$manifest_uri,data_uri:$data_uri,success_uri:$success_uri,sha256:$sha256,
+      --slurpfile manifest "$manifest_path" \
+      '($manifest[0].lob_continuity) as $lob_continuity
+      | {manifest_uri:$manifest_uri,data_uri:$data_uri,success_uri:$success_uri,sha256:$sha256,
         manifest_sha256:$manifest_sha256,gap_from_previous_ns:$gap_from_previous_ns,
         start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,bytes:$bytes,
         agg_trade_count:$agg_trade_count,

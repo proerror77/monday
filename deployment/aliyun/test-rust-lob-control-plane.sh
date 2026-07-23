@@ -28,6 +28,12 @@ grep -Fq -- '--segment-manifest-sha256' "$GATE"
 grep -Fq -- '--require-lob-continuity' "$GATE"
 grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"
 grep -Fq '.lob_continuity.contract == "binance.lob_continuity.v1"' "$GATE"
+grep -Fq 'jq -e --arg session_id "${observed_session[$market]}"' "$GATE"
+grep -Fq -- '--slurpfile manifest "$manifest_path"' "$GATE"
+if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
+  printf 'shadow gate passes the full-catalog LOB summary through argv\n' >&2
+  exit 1
+fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 
