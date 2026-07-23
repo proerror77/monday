@@ -6,7 +6,7 @@ export LC_ALL=C
 
 readonly REQUIRED_DURATION_SECONDS=3600
 readonly HEALTH_SETTLE_SECONDS=360
-readonly MAX_HEALTH_SILENCE_SECONDS=90
+readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver

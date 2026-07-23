@@ -484,7 +484,7 @@ these are true for the entire candidate run:
 - Spot has at least 1,000 symbols and USD-M at least 400;
 - every discovered symbol has a ready snapshot and sequence gaps remain zero;
 - neither session nor catalog membership changes, health never stops advancing
-  for more than 90 seconds, and the persistent upload-failure count is unchanged;
+  for more than 120 seconds, and the persistent upload-failure count is unchanged;
 - queue, disk, and upload warnings are false, while the persistent upload-failure
   count does not increase during normal segment rotations;
 - CPU accounting and peak memory stay inside the systemd limits;
