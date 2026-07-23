@@ -1,14 +1,17 @@
 use crate::lob_archiver::command_status_with_timeout;
-use crate::polymarket_upload::{ensure_canonical_directory, scan_tape, TRADE_COMPLETION_KIND};
+use crate::polymarket_upload::{
+    ensure_canonical_directory, scan_tape, validate_canonical_trade, validate_market_settlement,
+    TRADE_COMPLETION_KIND,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -549,6 +552,64 @@ fn segment_hour(identity: &SegmentIdentity) -> Result<DateTime<Utc>> {
         .context("invalid reference date/hour")
 }
 
+fn trade_merge_identity(update: &Value, line: usize) -> Result<(String, Vec<Value>)> {
+    let update = update
+        .as_object()
+        .ok_or_else(|| anyhow!("line {line}: polymarket_trade update must be an object"))?;
+    let record_id = validate_canonical_trade(update, line)?;
+    let fields = [
+        "record_id_version",
+        "market_id",
+        "condition_id",
+        "token_id",
+        "symbol",
+        "market_window_secs",
+        "outcome",
+        "source",
+    ];
+    Ok((
+        record_id,
+        fields
+            .into_iter()
+            .map(|field| update.get(field).cloned().unwrap_or(Value::Null))
+            .collect(),
+    ))
+}
+
+fn settlement_merge_identity(update: &Value, line: usize) -> Result<(String, Vec<Value>)> {
+    let update = update
+        .as_object()
+        .ok_or_else(|| anyhow!("line {line}: market_settlement update must be an object"))?;
+    validate_market_settlement(update, line)?;
+    let market_id = update
+        .get("market_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("line {line}: market_settlement requires market_id"))?
+        .to_owned();
+    let market = update
+        .get("market")
+        .and_then(Value::as_object)
+        .expect("settlement validator checked market");
+    let mut identity = [
+        "condition_id",
+        "symbol",
+        "market_window_secs",
+        "winning_token_id",
+        "winning_outcome",
+        "resolved_up_won",
+        "resolution_source",
+    ]
+    .into_iter()
+    .map(|field| update.get(field).cloned().unwrap_or(Value::Null))
+    .collect::<Vec<_>>();
+    identity.extend(
+        ["conditionId", "clobTokenIds", "outcomes", "outcomePrices"]
+            .into_iter()
+            .map(|field| market.get(field).cloned().unwrap_or(Value::Null)),
+    );
+    Ok((market_id, identity))
+}
+
 fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
     let combined = scratch.join("references.ndjson");
     let mut output = OpenOptions::new()
@@ -556,21 +617,49 @@ fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
         .create_new(true)
         .mode(0o600)
         .open(&combined)?;
-    let mut trade_ids = BTreeSet::new();
-    for path in paths {
-        for line in BufReader::new(File::open(path)?).lines() {
-            let row: Value = serde_json::from_str(&line?)?;
+    let mut trade_ids = BTreeMap::<String, (usize, Vec<Value>)>::new();
+    let mut settlements = BTreeMap::<String, (usize, Vec<Value>)>::new();
+    for (segment, path) in paths.iter().enumerate() {
+        for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+            let line = line?;
+            let line_number = index + 1;
+            let row: Value = serde_json::from_str(&line)?;
             let update = &row["update"];
+            let mut duplicate = false;
             if update["kind"] == "polymarket_trade" {
-                let record_id = update["record_id"]
-                    .as_str()
-                    .expect("rescanned trade has a record ID");
-                if !trade_ids.insert(record_id.to_owned()) {
-                    bail!("duplicate polymarket_trade record_id across reference segments");
+                let (record_id, identity) = trade_merge_identity(update, line_number)?;
+                match trade_ids.get(&record_id) {
+                    Some((existing_segment, _)) if *existing_segment == segment => {
+                        bail!("duplicate polymarket_trade record_id within reference segment")
+                    }
+                    Some((_, existing)) if *existing != identity => {
+                        bail!("conflicting polymarket_trade record_id across reference segments")
+                    }
+                    Some(_) => duplicate = true,
+                    None => {
+                        trade_ids.insert(record_id, (segment, identity));
+                    }
+                }
+            } else if update["kind"] == "market_settlement" {
+                let (market_id, identity) = settlement_merge_identity(update, line_number)?;
+                match settlements.get(&market_id) {
+                    Some((existing_segment, _)) if *existing_segment == segment => {
+                        bail!("duplicate market_settlement within reference segment")
+                    }
+                    Some((_, existing)) if *existing != identity => {
+                        bail!("conflicting market_settlement across reference segments")
+                    }
+                    Some(_) => duplicate = true,
+                    None => {
+                        settlements.insert(market_id, (segment, identity));
+                    }
                 }
             }
+            if !duplicate {
+                output.write_all(line.as_bytes())?;
+                output.write_all(b"\n")?;
+            }
         }
-        std::io::copy(&mut File::open(path)?, &mut output)?;
     }
     output.sync_all()?;
     Ok(combined)
@@ -747,6 +836,7 @@ mod tests {
     use crate::lob_archiver::sha256_file;
     use crate::polymarket_upload::{derived_trade_record_id, trade_record_ids_sha256};
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::fs::File;
     use std::io::Write;
     fn row(sequence: u64, update: Value) -> Value {
@@ -761,6 +851,7 @@ mod tests {
                 "id": "market-1", "conditionId": "0xcondition",
                 "question": "Bitcoin Up or Down - 5 minutes", "slug": "btc-updown-5m-test",
                 "startDate": "2026-07-17T05:00:00Z", "endDate": "2026-07-17T05:05:00Z",
+                "resolutionSource": "https://data.chain.link/streams/btc-usd",
                 "clobTokenIds": "[\"up-token\",\"down-token\"]",
                 "outcomes": "[\"Up\",\"Down\"]", "makerBaseFee": 1000, "takerBaseFee": 1000,
             },
@@ -795,8 +886,20 @@ mod tests {
         })
     }
 
-    fn trade_completion() -> Value {
-        let record_id = trade()["record_id"].as_str().unwrap().to_owned();
+    fn later_trade() -> Value {
+        let mut value = trade();
+        value["trade"]["transactionHash"] = json!("0xlater");
+        value["transaction_hash"] = json!("0xlater");
+        value["record_id"] = json!(derived_trade_record_id(value["trade"].as_object().unwrap()));
+        value
+    }
+
+    fn trade_completion_for(trades: &[Value]) -> Value {
+        let mut record_ids = trades
+            .iter()
+            .map(|trade| trade["record_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        record_ids.sort();
         json!({
             "kind": TRADE_COMPLETION_KIND,
             "market_id": "market-1",
@@ -804,8 +907,8 @@ mod tests {
             "symbol": "BTCUSDT",
             "market_window_secs": 300,
             "record_id_version": "v2",
-            "trade_count": 1,
-            "trade_record_ids_sha256": trade_record_ids_sha256([record_id.as_str()]),
+            "trade_count": record_ids.len(),
+            "trade_record_ids_sha256": trade_record_ids_sha256(record_ids.iter().map(String::as_str)),
             "source": "polymarket_data_api",
             "retrieved_at": "2026-07-17T05:01:00Z",
             "completeness_basis": crate::polymarket_upload::TRADE_COMPLETION_BASIS,
@@ -815,6 +918,10 @@ mod tests {
             "finalization_lag_secs": 60,
             "stable_polls_required": 2,
         })
+    }
+
+    fn trade_completion() -> Value {
+        trade_completion_for(&[trade()])
     }
 
     fn market_rows() -> Vec<Value> {
@@ -1107,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_trade_ids_across_reference_segments() {
+    fn merges_identical_trade_ids_across_reference_segments_preserving_first_row() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let market = triplet(&root, "crypto_expiry", &market_rows());
@@ -1130,7 +1237,211 @@ mod tests {
             references: vec![first, second],
         };
 
-        rejects(&config, "duplicate polymarket_trade record_id");
+        let combined = with_validated_research_segments(&config, |_, _, references| {
+            Ok(fs::read_to_string(references)?)
+        })
+        .unwrap();
+        let trades = combined
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["update"]["kind"] == "polymarket_trade")
+            .collect::<Vec<_>>();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0]["recorded_at"], "2026-07-17T05:01:00Z");
+    }
+
+    #[test]
+    fn retains_later_only_trades_while_deduplicating_earlier_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, trade())],
+        );
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, trade()),
+            row(2, later_trade()),
+            row(3, metadata("market_settlement")),
+        ];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T05:02:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        let combined = with_validated_research_segments(&config, |_, _, references| {
+            Ok(fs::read_to_string(references)?)
+        })
+        .unwrap();
+        let trade_ids = combined
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["update"]["kind"] == "polymarket_trade")
+            .map(|row| row["update"]["record_id"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(trade_ids.len(), 2);
+        assert!(trade_ids.contains(trade()["record_id"].as_str().unwrap()));
+        assert!(trade_ids.contains(later_trade()["record_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn merged_trade_union_matches_later_completion_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first_trade = trade();
+        let missing_trade = later_trade();
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[
+                row(0, metadata("market_metadata")),
+                row(1, first_trade.clone()),
+            ],
+        );
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, first_trade.clone()),
+            row(2, missing_trade.clone()),
+            row(3, metadata("market_settlement")),
+            row(
+                4,
+                trade_completion_for(&[first_trade.clone(), missing_trade.clone()]),
+            ),
+        ];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T05:02:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let config = crate::polymarket_research_normalize::PolymarketEvidenceConfig {
+            segments: ResearchSegmentValidationConfig {
+                market,
+                references: vec![first, second],
+            },
+            event_start_gte: "2026-07-17T05:00:00Z".to_owned(),
+            event_start_lt: "2026-07-17T05:05:00Z".to_owned(),
+            market_ids: vec!["market-1".to_owned()],
+        };
+
+        let normalized =
+            crate::polymarket_research_normalize::normalize_polymarket_evidence(&config).unwrap();
+        let trades = String::from_utf8(normalized.ndjson)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["surface"] == "polymarket_trade")
+            .map(|row| {
+                (
+                    row["record_id"].as_str().unwrap().to_owned(),
+                    row["available_at"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(normalized.report.surface_counts["polymarket_trade"], 2);
+        assert_eq!(trades.len(), 2);
+        assert_eq!(
+            trades[first_trade["record_id"].as_str().unwrap()],
+            "2026-07-17T05:01:00Z"
+        );
+        assert_eq!(
+            trades[missing_trade["record_id"].as_str().unwrap()],
+            "2026-07-17T05:02:00Z"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_trade_ids_with_conflicting_market_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, trade())],
+        );
+        let mut conflicting = trade();
+        conflicting["symbol"] = json!("SOLUSDT");
+        let second = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[
+                row(0, metadata("market_metadata")),
+                row(1, conflicting),
+                row(2, metadata("market_settlement")),
+            ],
+        );
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        rejects(&config, "conflicting polymarket_trade record_id");
+    }
+
+    #[test]
+    fn merges_identical_settlements_preserving_first_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(&root, "crypto_expiry_reference", &reference_rows(true));
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, metadata("market_settlement")),
+        ];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T05:02:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        let combined = with_validated_research_segments(&config, |_, _, references| {
+            Ok(fs::read_to_string(references)?)
+        })
+        .unwrap();
+        let settlements = combined
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["update"]["kind"] == "market_settlement")
+            .collect::<Vec<_>>();
+
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0]["recorded_at"], "2026-07-17T05:01:00Z");
+    }
+
+    #[test]
+    fn rejects_duplicate_settlements_with_conflicting_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(&root, "crypto_expiry_reference", &reference_rows(true));
+        let mut conflicting = metadata("market_settlement");
+        conflicting["winning_token_id"] = json!("down-token");
+        conflicting["winning_outcome"] = json!("Down");
+        conflicting["resolved_up_won"] = json!(false);
+        conflicting["market"]["outcomePrices"] = json!("[\"0.001\",\"0.999\"]");
+        let second = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, conflicting)],
+        );
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        rejects(&config, "conflicting market_settlement");
     }
 
     #[test]
