@@ -22,7 +22,7 @@ and .markets.spot.health_samples == (.markets.spot.health_samples | floor)
 and .markets.spot.health_samples >= 40
 and (.markets.spot.max_health_silence_seconds | type) == "number"
 and .markets.spot.max_health_silence_seconds >= 0
-and .markets.spot.max_health_silence_seconds <= 90
+and .markets.spot.max_health_silence_seconds <= 120
 and (.markets.spot.catalog_sha256 | type) == "string"
 and (.markets.spot.catalog_sha256 | test("^[a-f0-9]{64}$"))
 and (.markets.spot.session_id | type) == "string"
@@ -116,7 +116,7 @@ and .markets.usdm.health_samples == (.markets.usdm.health_samples | floor)
 and .markets.usdm.health_samples >= 40
 and (.markets.usdm.max_health_silence_seconds | type) == "number"
 and .markets.usdm.max_health_silence_seconds >= 0
-and .markets.usdm.max_health_silence_seconds <= 90
+and .markets.usdm.max_health_silence_seconds <= 120
 and (.markets.usdm.catalog_sha256 | type) == "string"
 and (.markets.usdm.catalog_sha256 | test("^[a-f0-9]{64}$"))
 and (.markets.usdm.session_id | type) == "string"

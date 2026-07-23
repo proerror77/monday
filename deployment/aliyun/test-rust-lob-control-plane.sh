@@ -36,6 +36,7 @@ if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
 fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
+grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -49,18 +50,26 @@ for current_mono in $(seq 30 30 3600); do
   read -r last_updated_ns last_advance_mono max_gap sample_increment < <(
     monday_observe_health_freshness \
       "$last_updated_ns" "$last_advance_mono" "$max_gap" \
-      "$current_updated_ns" "$current_mono" 90
+      "$current_updated_ns" "$current_mono" 120
   )
   health_sample_increments=$((health_sample_increments + sample_increment))
 done
-((health_sample_increments == 120 && max_gap <= 90)) || {
+((health_sample_increments == 120 && max_gap <= 120)) || {
   printf 'fresh one-hour health sequence did not pass the monotonic observer\n' >&2
   exit 1
 }
+read -r jitter_updated_ns jitter_advance_mono jitter_max_gap jitter_increment < <(
+  monday_observe_health_freshness 1 0 0 2 91 120
+)
+[[ $jitter_updated_ns == 2 && $jitter_advance_mono == 91 \
+  && $jitter_max_gap == 91 && $jitter_increment == 1 ]] || {
+  printf 'monotonic observer rejected an advancing 91-second jitter sample\n' >&2
+  exit 1
+}
 if monday_observe_health_freshness \
-  "$last_updated_ns" "$last_advance_mono" "$max_gap" \
-  "$last_updated_ns" "$((last_advance_mono + 91))" 90 >/dev/null; then
-  printf 'monotonic observer accepted a 91-second health freeze\n' >&2
+  "$jitter_updated_ns" "$jitter_advance_mono" "$jitter_max_gap" \
+  "$jitter_updated_ns" "$((jitter_advance_mono + 121))" 120 >/dev/null; then
+  printf 'monotonic observer accepted a 121-second health freeze\n' >&2
   exit 1
 fi
 
@@ -207,16 +216,31 @@ if jq -e \
   exit 1
 fi
 
-jq '.markets.usdm.max_health_silence_seconds = 91' \
-  "$tmp_dir/gate.json" >"$tmp_dir/stale-health.json"
-if jq -e \
-  --arg candidate_sha256 "$artifact" \
-  --arg deployment_bundle_sha256 "$bundle" \
-  --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/stale-health.json" >/dev/null; then
-  printf 'gate policy accepted a health freshness gap over 90 seconds\n' >&2
-  exit 1
-fi
+for market in spot usdm; do
+  jq --arg market "$market" \
+    '.markets[$market].max_health_silence_seconds = 91' \
+    "$tmp_dir/gate.json" >"$tmp_dir/rotation-jitter-health-$market.json"
+  jq -e \
+    --arg candidate_sha256 "$artifact" \
+    --arg deployment_bundle_sha256 "$bundle" \
+    --arg deployment_source_revision "$source_revision" \
+    -f "$POLICY" "$tmp_dir/rotation-jitter-health-$market.json" >/dev/null || {
+    printf 'gate policy rejected a 91-second %s rotation jitter gap\n' "$market" >&2
+    exit 1
+  }
+
+  jq --arg market "$market" \
+    '.markets[$market].max_health_silence_seconds = 121' \
+    "$tmp_dir/gate.json" >"$tmp_dir/stale-health-$market.json"
+  if jq -e \
+    --arg candidate_sha256 "$artifact" \
+    --arg deployment_bundle_sha256 "$bundle" \
+    --arg deployment_source_revision "$source_revision" \
+    -f "$POLICY" "$tmp_dir/stale-health-$market.json" >/dev/null; then
+    printf 'gate policy accepted a %s health freshness gap over 120 seconds\n' "$market" >&2
+    exit 1
+  fi
+done
 
 jq '.markets.spot.agg_trade_count = 0' \
   "$tmp_dir/gate.json" >"$tmp_dir/zero-agg-trades.json"
