@@ -150,6 +150,11 @@ impl BinaryDatasetContract {
         feature_names: Vec<String>,
     ) -> Result<Self> {
         let snapshot = verified_snapshot.snapshot();
+        ensure!(
+            snapshot.manifest.source_kind
+                != crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
+            "supervised binary ML does not implement the reduced-authority Polymarket + Chainlink baseline"
+        );
         validate_prediction_mission(mission, &mission.search_policy_snapshot_id)
             .map_err(anyhow::Error::msg)
             .context("validate prediction mission contract")?;
@@ -2020,6 +2025,18 @@ mod tests {
 
     #[test]
     fn rejects_unregistered_label_features_and_caller_supplied_values() {
+        let mut baseline = context();
+        baseline.snapshot.snapshot.manifest.source_kind =
+            crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND.to_string();
+        assert!(BinaryDatasetContract::from_prediction_snapshot(
+            &baseline.snapshot,
+            &baseline.mission,
+            feature_names(),
+        )
+        .expect_err("generic supervised trainer must reject the baseline profile")
+        .to_string()
+        .contains("does not implement"));
+
         let context = context();
         for forbidden in ["settlement_up", "future_up_ask_change_30s", "unknown"] {
             let error = BinaryDatasetContract::from_prediction_snapshot(

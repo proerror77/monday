@@ -326,7 +326,9 @@ fn bind_and_filter_polymarket_chainlink_baseline_observations(
     )
 }
 
-fn clear_polymarket_chainlink_baseline_unavailable_features(row: &mut FactorObservation) {
+pub(crate) fn clear_polymarket_chainlink_baseline_unavailable_features(
+    row: &mut FactorObservation,
+) {
     row.signed_distance_to_beat = f64::NAN;
     row.abs_distance_to_beat = f64::NAN;
     row.drift_10s = f64::NAN;

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::factors_v2::SettlementProbabilityComponentProfile;
 use crate::prediction_loop::{
     build_prediction_prompt, current_prediction_policy_snapshot_id, validate_prediction_mission,
     validate_prediction_proposal, LoopRunStatus, LoopRunSummary, PredictionProposal,
@@ -20,7 +21,7 @@ use crate::prediction_mcts::{
     SettlementTrainingEvidence,
 };
 
-const RUN_STATE_VERSION: u32 = 1;
+const RUN_STATE_VERSION: u32 = 2;
 const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v1";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
@@ -214,13 +215,36 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
     client: &mut C,
     evaluator: &mut E,
 ) -> Result<LoopRunSummary, String> {
+    run_or_resume_prediction_mcts_with_component_profile(
+        mission,
+        snapshot_dir,
+        output_dir,
+        client,
+        evaluator,
+        SettlementProbabilityComponentProfile::FullSurface,
+    )
+}
+
+pub fn run_or_resume_prediction_mcts_with_component_profile<
+    C: ProposalClient,
+    E: PredictionMctsRunEvaluator,
+>(
+    mission: PredictionResearchMission,
+    snapshot_dir: &Path,
+    output_dir: &Path,
+    client: &mut C,
+    evaluator: &mut E,
+    component_profile: SettlementProbabilityComponentProfile,
+) -> Result<LoopRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
     let _lock = OutputLock::acquire(output_dir)?;
     let state_path = output_dir.join("prediction-mcts-state.json");
     let mut state = if state_path.exists() {
         let state: PredictionMctsRunState = read_json(&state_path)?;
         if state.version != RUN_STATE_VERSION || state.mission != mission {
-            return Err("prediction MCTS output belongs to a different mission".to_string());
+            return Err(
+                "prediction MCTS output uses an incompatible state version or mission".to_string(),
+            );
         }
         state
     } else {
@@ -289,7 +313,15 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
     }
 
     if state.advisor.is_none() {
-        let advice = if mission.search_budget.max_llm_calls == 0 {
+        let advice = if component_profile
+            == SettlementProbabilityComponentProfile::MarketMidpointOnly
+        {
+            state.advisor_failure = Some(
+                "reduced-authority baseline has no LLM-expandable probability components"
+                    .to_string(),
+            );
+            Vec::new()
+        } else if mission.search_budget.max_llm_calls == 0 {
             Vec::new()
         } else if state.advisor_call_consumed {
             return Err(
@@ -327,13 +359,14 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
         checkpoint(&state_path, &mut state)?;
     }
 
-    let mut engine = PredictionMctsEngine::new(
+    let mut engine = PredictionMctsEngine::new_with_component_profile(
         &mission,
-        baseline_blend(),
+        baseline_blend(component_profile),
         state.advisor.clone().unwrap_or_default(),
         MCTS_SEED,
         MCTS_EXPLORATION,
         MCTS_MAX_DEPTH,
+        component_profile,
     )?;
     if let Some(saved) = state.checkpoint.clone() {
         engine.restore_checkpoint(saved)?;
@@ -424,15 +457,28 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
     ))
 }
 
-fn baseline_blend() -> ProposedProbabilityBlend {
-    ProposedProbabilityBlend {
-        name: "shared_mcts_baseline".to_string(),
-        hypothesis: "Equal-weight registered probability components".to_string(),
-        market_midpoint_weight: 1.0,
-        chainlink_digital_weight: 1.0,
-        distance_lob_vol_weight: 1.0,
-        event_surface_weight: 1.0,
-        existing_model_weight: 1.0,
+fn baseline_blend(
+    component_profile: SettlementProbabilityComponentProfile,
+) -> ProposedProbabilityBlend {
+    match component_profile {
+        SettlementProbabilityComponentProfile::FullSurface => ProposedProbabilityBlend {
+            name: "shared_mcts_baseline".to_string(),
+            hypothesis: "Equal-weight registered probability components".to_string(),
+            market_midpoint_weight: 1.0,
+            chainlink_digital_weight: 1.0,
+            distance_lob_vol_weight: 1.0,
+            event_surface_weight: 1.0,
+            existing_model_weight: 1.0,
+        },
+        SettlementProbabilityComponentProfile::MarketMidpointOnly => ProposedProbabilityBlend {
+            name: "market_midpoint_baseline".to_string(),
+            hypothesis: "Verified Polymarket midpoint is the only eligible component".to_string(),
+            market_midpoint_weight: 1.0,
+            chainlink_digital_weight: 0.0,
+            distance_lob_vol_weight: 0.0,
+            event_surface_weight: 0.0,
+            existing_model_weight: 0.0,
+        },
     }
 }
 
@@ -947,8 +993,8 @@ mod tests {
     }
 
     #[test]
-    fn runner_resumes_a_legacy_state_without_budget_exhausted() {
-        let output = temp_dir("legacy-budget-exhausted");
+    fn runner_rejects_v1_state_without_component_profile() {
+        let output = temp_dir("legacy-component-profile");
         let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
@@ -961,24 +1007,27 @@ mod tests {
             &mut client,
             &mut paused,
         )
-        .expect("pause with a durable v1 state");
+        .expect("pause with a durable v2 state");
 
         let state_path = output.join("prediction-mcts-state.json");
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        legacy.as_object_mut().unwrap().remove("budget_exhausted");
+        legacy["version"] = serde_json::json!(1);
+        legacy["checkpoint"]["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("component_profile");
         std::fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
-        let mut resumed = FakeEvaluator::default();
-        let summary = run_or_resume_prediction_mcts(
+        let error = run_or_resume_prediction_mcts(
             mission(1, 1),
             Path::new("unused-snapshot"),
             &output,
             &mut client,
-            &mut resumed,
+            &mut FakeEvaluator::default(),
         )
-        .expect("legacy state resumes with a false terminal flag");
-        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        .expect_err("v1 state must be rejected after explicit deserialization");
+        assert!(error.contains("incompatible state version"));
     }
 
     #[test]

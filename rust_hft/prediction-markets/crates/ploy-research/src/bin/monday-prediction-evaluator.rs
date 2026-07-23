@@ -6,9 +6,13 @@
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use ploy_research::factors_v2::{
-    build_full_depth_execution_matrix_with_event_rows, FullDepthExecutionEventRow,
+    build_full_depth_execution_matrix_with_event_rows,
+    validate_prediction_research_prior_for_source_kind, FullDepthExecutionEventRow,
+    SettlementProbabilityComponentProfile,
 };
-use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
+use ploy_research::prediction_loop::{
+    current_prediction_policy_snapshot_id, validate_prediction_snapshot_sources,
+};
 use ploy_research::prediction_mcts::{
     PredictionMctsCandidate, PredictionMctsEvaluation, SettlementTrainingEvidence,
 };
@@ -635,6 +639,24 @@ fn validate_prediction_snapshot_contract_id(
     Ok(())
 }
 
+fn validate_prediction_snapshot_profile(
+    source_kind: &str,
+    baseline_flag: bool,
+) -> Result<SettlementProbabilityComponentProfile, String> {
+    let baseline = source_kind == ploy_research::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND;
+    match (baseline, baseline_flag) {
+        (true, true) => Ok(SettlementProbabilityComponentProfile::MarketMidpointOnly),
+        (true, false) => {
+            Err("reduced-authority snapshot requires --polymarket-chainlink-baseline".to_string())
+        }
+        (false, true) => Err(
+            "--polymarket-chainlink-baseline does not match the loaded snapshot profile"
+                .to_string(),
+        ),
+        (false, false) => Ok(SettlementProbabilityComponentProfile::FullSurface),
+    }
+}
+
 fn validate_expected_prediction_policy(
     expected: Option<&str>,
     governed_prior: Option<&LlmPriorSpec>,
@@ -845,8 +867,9 @@ mod tests {
         parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
         settlement_time_cohort_from_args, sorted_distinct_reprice_pilot_market_ids,
         validate_expected_prediction_policy, validate_prediction_snapshot_contract_id,
-        validate_report_observation_count, validate_reprice_pilot_config,
-        validate_time_cohort_range, write_report_set, ReportArtifactContext, RepricePilotConfig,
+        validate_prediction_snapshot_profile, validate_report_observation_count,
+        validate_reprice_pilot_config, validate_time_cohort_range, write_report_set,
+        ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
@@ -871,6 +894,21 @@ mod tests {
             validate_expected_prediction_policy(Some("sha256:stale"), None)
                 .expect_err("stale controller policy must fail")
                 .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn reduced_authority_profile_requires_an_exact_explicit_flag_match() {
+        let baseline = ploy_research::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND;
+        assert_eq!(
+            validate_prediction_snapshot_profile(baseline, true).unwrap(),
+            ploy_research::factors_v2::SettlementProbabilityComponentProfile::MarketMidpointOnly
+        );
+        assert!(validate_prediction_snapshot_profile(baseline, false).is_err());
+        assert!(validate_prediction_snapshot_profile("verified_artifacts", true).is_err());
+        assert_eq!(
+            validate_prediction_snapshot_profile("verified_artifacts", false).unwrap(),
+            ploy_research::factors_v2::SettlementProbabilityComponentProfile::FullSurface
         );
     }
 
@@ -1387,6 +1425,7 @@ async fn main() {
         flag_value(&args, "--prediction-mcts-training-candidate-json");
     let prediction_mcts_selected_candidate_json =
         flag_value(&args, "--prediction-mcts-selected-candidate-json");
+    let polymarket_chainlink_baseline = flag_present(&args, "--polymarket-chainlink-baseline");
     if prediction_mcts_training_candidate_json.is_some()
         && prediction_mcts_selected_candidate_json.is_some()
     {
@@ -1482,6 +1521,8 @@ async fn main() {
     let snapshot_hash: String;
     let snapshot_contract_hash: Option<String>;
     let snapshot_data_audit_status: Option<String>;
+    let snapshot_source_kind: String;
+    let settlement_component_profile: SettlementProbabilityComponentProfile;
     let include_deribit: bool;
     let (observations, deribit_snapshots, all_pm_book_snapshots): (
         Vec<FactorObservation>,
@@ -1491,6 +1532,16 @@ async fn main() {
         let started = std::time::Instant::now();
         let snapshot =
             load_research_snapshot(&snapshot_dir).expect("load research snapshot failed");
+        snapshot_source_kind = snapshot.manifest.source_kind.clone();
+        settlement_component_profile = validate_prediction_snapshot_profile(
+            &snapshot_source_kind,
+            polymarket_chainlink_baseline,
+        )
+        .unwrap_or_else(|reason| panic!("prediction snapshot profile mismatch: {reason}"));
+        if expected_prediction_policy.is_some() {
+            validate_prediction_snapshot_sources(&snapshot.manifest)
+                .unwrap_or_else(|reason| panic!("prediction snapshot sources invalid: {reason}"));
+        }
         let snapshot_symbol_set: HashSet<&str> = snapshot
             .manifest
             .symbols
@@ -1615,6 +1666,8 @@ async fn main() {
     }
 
     if let Some(prior) = governed_prediction_prior {
+        validate_prediction_research_prior_for_source_kind(prior, &snapshot_source_kind)
+            .unwrap_or_else(|reason| panic!("prediction research prior is ineligible: {reason}"));
         let prior_snapshot_id = prior
             .data_snapshot_id
             .as_deref()
@@ -1701,6 +1754,7 @@ async fn main() {
                 walk_forward: options.clone(),
                 probability: SettlementProbabilityReportOptions {
                     min_bucket_observations: options.review.min_observations.max(20),
+                    component_profile: settlement_component_profile,
                     ..Default::default()
                 },
                 time_cohort: settlement_time_cohort,
@@ -1845,6 +1899,7 @@ async fn main() {
         llm_prior.as_ref(),
         SettlementProbabilityReportOptions {
             min_bucket_observations: options.review.min_observations.max(20),
+            component_profile: settlement_component_profile,
             ..Default::default()
         },
     );
@@ -1856,6 +1911,7 @@ async fn main() {
         walk_forward: options.clone(),
         probability: SettlementProbabilityReportOptions {
             min_bucket_observations: options.review.min_observations.max(20),
+            component_profile: settlement_component_profile,
             ..Default::default()
         },
         time_cohort: settlement_time_cohort,
