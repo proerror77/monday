@@ -102,6 +102,7 @@ grep -Fq 'ExecStart=/opt/monday/releases/binance-usdm-reference-collector/%i/bin
 grep -Fq -- '--output-root /data/monday/spool/binance-usdm-reference-shadow/%i' "$service"
 grep -Fq 'ReadWritePaths=/data/monday/spool/binance-usdm-reference-shadow/%i' "$service"
 grep -Fq 'binance-usdm-reference-collector-shadow@.service' "$workflow"
+grep -Fq 'binance-usdm-reference-shadow-gate.sh' "$workflow"
 grep -Fq 'binance-usdm-reference-shadow-gate-policy.jq' "$workflow"
 grep -Fq 'binance-usdm-reference-control-assets.sha256' "$workflow"
 grep -Fq 'binance-usdm-reference-control.tar.gz' "$workflow"
@@ -115,6 +116,7 @@ if grep -Fq 'binance-usdm-reference-' <<<"$shared_assets"; then
   exit 1
 fi
 grep -Fq 'binance-usdm-reference-collector-shadow@.service' <<<"$reference_assets"
+grep -Fq 'binance-usdm-reference-shadow-gate.sh' <<<"$reference_assets"
 grep -Fq 'binance-usdm-reference-shadow-gate-policy.jq' <<<"$reference_assets"
 grep -Fq 'control_manifest:{file:"binance-usdm-reference-control-assets.sha256"' \
   <<<"$reference_release"
