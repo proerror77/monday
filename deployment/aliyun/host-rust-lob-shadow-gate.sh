@@ -608,10 +608,10 @@ verify_oss_round_trips() {
   local index=0
   local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
   local segment_dir manifest_path manifest_digest actual_manifest_digest
-  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
+  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns lob_continuity
   local previous_end_ns=0
   local round_trips='[]'
-  local -a strict_verifier_args=()
+  local -a strict_verifier_args=(--require-lob-continuity)
 
   manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
@@ -624,6 +624,7 @@ verify_oss_round_trips() {
       --arg market "$market" \
       --arg dataset "${dataset[$market]}" \
       --arg shard "${shard_id[$market]}" \
+      --arg session_id "${observed_session[$market]}" \
       '.market == $market
         and .dataset == $dataset
         and .shard_id == $shard
@@ -645,6 +646,42 @@ verify_oss_round_trips() {
         and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
         and (.trade_summaries | type) == "object"
         and (.trade_summaries | length) > 0
+        and .lob_continuity.contract == "binance.lob_continuity.v1"
+        and .lob_continuity.capture_session_id == $session_id
+        and (.lob_continuity.reconnect_boundary | type) == "boolean"
+        and .lob_continuity.sequence_gaps == 0
+        and .lob_continuity.source_time_rollbacks == 0
+        and .lob_continuity.declared_symbol_count == (.symbols | length)
+        and .lob_continuity.covered_symbol_count == (.symbols | length)
+        and .lob_continuity.missing_symbols == []
+        and (.lob_continuity.symbols | type) == "object"
+        and (.lob_continuity.symbols | length) == (.symbols | length)
+        and all(.lob_continuity.symbols[];
+          .snapshot_seed_count > 0
+          and .diff_count > 0
+          and .checkpoint_count > 0
+          and (.first_update_id | type) == "number"
+          and (.last_update_id | type) == "number"
+          and .last_update_id >= .first_update_id
+          and (.first_source_time_ms | type) == "number"
+          and (.last_source_time_ms | type) == "number"
+          and .last_source_time_ms >= .first_source_time_ms
+          and (.first_received_at_ns | type) == "number"
+          and (.last_received_at_ns | type) == "number"
+          and .last_received_at_ns >= .first_received_at_ns
+          and (.min_source_latency_ms | type) == "number"
+          and (.max_source_latency_ms | type) == "number"
+          and .min_source_latency_ms >= -1000
+          and .max_source_latency_ms <= 30000
+          and .max_source_latency_ms >= .min_source_latency_ms
+          and (.min_bid_levels | type) == "number"
+          and (.max_bid_levels | type) == "number"
+          and .min_bid_levels > 0
+          and .max_bid_levels >= .min_bid_levels
+          and (.min_ask_levels | type) == "number"
+          and (.max_ask_levels | type) == "number"
+          and .min_ask_levels > 0
+          and .max_ask_levels >= .min_ask_levels)
         and (.event_types.agg_trade | type) == "number"
         and .event_types.agg_trade == (.event_types.agg_trade | floor)
         and .event_types.agg_trade > 0' \
@@ -722,6 +759,8 @@ verify_oss_round_trips() {
       || die "$market segment has no valid aggregate trades: $zst_uri"
     [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
       || die "$market manifest aggregate-trade count does not match segment: $uri"
+    lob_continuity=$(jq -ce '.lob_continuity' "$manifest_path") \
+      || die "$market manifest has no readable LOB continuity summary: $uri"
     strict_verifier_args+=(
       --verify-segment "$zst_path"
       --segment-content-sha256 "$digest"
@@ -740,16 +779,35 @@ verify_oss_round_trips() {
       --argjson gap_from_previous_ns "$gap_ns" \
       --argjson bytes "$bytes" \
       --argjson agg_trade_count "$agg_trade_count" \
+      --argjson lob_continuity "$lob_continuity" \
       '{manifest_uri:$manifest_uri,data_uri:$data_uri,success_uri:$success_uri,sha256:$sha256,
         manifest_sha256:$manifest_sha256,gap_from_previous_ns:$gap_from_previous_ns,
         start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,bytes:$bytes,
-        agg_trade_count:$agg_trade_count}')
+        agg_trade_count:$agg_trade_count,
+        lob_capture_session_id:$lob_continuity.capture_session_id,
+        lob_reconnect_boundary:$lob_continuity.reconnect_boundary,
+        lob_sequence_gaps:$lob_continuity.sequence_gaps,
+        lob_source_time_rollbacks:$lob_continuity.source_time_rollbacks,
+        lob_declared_symbol_count:$lob_continuity.declared_symbol_count,
+        lob_covered_symbol_count:$lob_continuity.covered_symbol_count,
+        lob_min_source_latency_ms:([$lob_continuity.symbols[].min_source_latency_ms] | min),
+        lob_max_source_latency_ms:([$lob_continuity.symbols[].max_source_latency_ms] | max),
+        lob_min_bid_levels:([$lob_continuity.symbols[].min_bid_levels] | min),
+        lob_min_ask_levels:([$lob_continuity.symbols[].min_ask_levels] | min)}')
     round_trips=$(jq -cn --argjson values "$round_trips" --argjson value "$round_trip" \
       '$values + [$value]')
   done < <(sort -n -k1,1 "$candidates")
 
   "$candidate_binary" "${strict_verifier_args[@]}" >/dev/null \
-    || die "$market strict aggregate-trade summary readback failed"
+    || die "$market strict aggregate-trade and LOB continuity readback failed"
+
+  jq -e --arg session_id "${observed_session[$market]}" '
+    (map(select(.lob_reconnect_boundary)) | length) == 1
+    and .[0].lob_reconnect_boundary == true
+    and all(.[1:][].lob_reconnect_boundary; . == false)
+    and all(.[].lob_capture_session_id; . == $session_id)' \
+    <<<"$round_trips" >/dev/null \
+    || die "$market LOB evidence crosses a capture-session boundary"
 
   printf '%s\n' "$round_trips"
 }
@@ -794,6 +852,12 @@ for market in "${markets[@]}"; do
       memory_peak_bytes:$memory_peak_bytes,memory_max_bytes:$memory_max_bytes,
       health_sha256:$health_sha256,
       strict_trade_summary_readback:true,
+      strict_lob_continuity_readback:true,
+      lob_reconnect_boundaries:([$oss_round_trips[].lob_reconnect_boundary] | map(select(.)) | length),
+      min_lob_source_latency_ms:([$oss_round_trips[].lob_min_source_latency_ms] | min),
+      max_lob_source_latency_ms:([$oss_round_trips[].lob_max_source_latency_ms] | max),
+      min_lob_bid_levels:([$oss_round_trips[].lob_min_bid_levels] | min),
+      min_lob_ask_levels:([$oss_round_trips[].lob_min_ask_levels] | min),
       max_segment_gap_ns:([$oss_round_trips[].gap_from_previous_ns] | max),
       oss_roundtrips:($oss_round_trips | length),
       agg_trade_segments:($oss_round_trips | length),
@@ -815,7 +879,7 @@ if [[ $test_only == true ]] || ((duration_seconds < REQUIRED_DURATION_SECONDS));
 fi
 
 jq -n \
-  --arg schema monday.rust_lob_shadow_gate.v2 \
+  --arg schema monday.rust_lob_shadow_gate.v3 \
   --arg candidate_sha256 "$candidate_sha" \
   --arg candidate_binary "$candidate_binary" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \

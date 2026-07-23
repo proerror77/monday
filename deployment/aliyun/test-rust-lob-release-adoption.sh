@@ -143,26 +143,46 @@ setup_fixture() {
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
       agg_trade_segments:2,agg_trade_count:2,
-      strict_trade_summary_readback:true,max_segment_gap_ns:0,
+      strict_trade_summary_readback:true,strict_lob_continuity_readback:true,
+      lob_reconnect_boundaries:1,
+      min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
+      min_lob_bid_levels:1,min_lob_ask_levels:1,max_segment_gap_ns:0,
       oss_roundtrip_evidence:[
         {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",
          sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
          manifest_sha256:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-         gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+         gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
+         lob_capture_session_id:"shadow-session",lob_reconnect_boundary:true,
+         lob_sequence_gaps:0,lob_source_time_rollbacks:0,
+         lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+         lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
+         lob_min_bid_levels:1,lob_min_ask_levels:1},
         {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",
          sha256:"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
          manifest_sha256:"9999999999999999999999999999999999999999999999999999999999999999",
-         gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+         gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1,
+         lob_capture_session_id:"shadow-session",lob_reconnect_boundary:false,
+         lob_sequence_gaps:0,lob_source_time_rollbacks:0,
+         lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+         lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
+         lob_min_bid_levels:1,lob_min_ask_levels:1}
       ]}')
+  usdm_market=$(jq -c '
+    .symbol_count = 500
+    | .snapshot_ready_count = 500
+    | .oss_roundtrip_evidence |= map(
+        .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500)' \
+    <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source "$DEPLOYMENT_SOURCE_REVISION" \
     --argjson market "$market" \
-    '{schema:"monday.rust_lob_shadow_gate.v2",candidate_sha256:$artifact,
+    --argjson usdm_market "$usdm_market" \
+    '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
       passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
-      markets:{spot:$market,usdm:($market + {symbol_count:500,snapshot_ready_count:500})}}' \
+      markets:{spot:$market,usdm:$usdm_market}}' \
     >"$gate_dir/gate.json"
   (cd "$gate_dir" && sha256sum gate.json >PASSED.sha256)
   now_ns=$(($(date +%s) * 1000000000))

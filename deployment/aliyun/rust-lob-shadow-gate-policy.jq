@@ -1,4 +1,5 @@
-.schema == "monday.rust_lob_shadow_gate.v2"
+. as $gate
+| .schema == "monday.rust_lob_shadow_gate.v3"
 and .candidate_sha256 == $candidate_sha256
 and .deployment_bundle_sha256 == $deployment_bundle_sha256
 and .deployment_source_revision == $deployment_source_revision
@@ -37,6 +38,18 @@ and (.markets.spot.agg_trade_count | type) == "number"
 and .markets.spot.agg_trade_count == (.markets.spot.agg_trade_count | floor)
 and .markets.spot.agg_trade_count > 0
 and .markets.spot.strict_trade_summary_readback == true
+and .markets.spot.strict_lob_continuity_readback == true
+and (.markets.spot.lob_reconnect_boundaries | type) == "number"
+and .markets.spot.lob_reconnect_boundaries == 1
+and (.markets.spot.min_lob_source_latency_ms | type) == "number"
+and .markets.spot.min_lob_source_latency_ms >= -1000
+and (.markets.spot.max_lob_source_latency_ms | type) == "number"
+and .markets.spot.max_lob_source_latency_ms <= 30000
+and .markets.spot.max_lob_source_latency_ms >= .markets.spot.min_lob_source_latency_ms
+and (.markets.spot.min_lob_bid_levels | type) == "number"
+and .markets.spot.min_lob_bid_levels > 0
+and (.markets.spot.min_lob_ask_levels | type) == "number"
+and .markets.spot.min_lob_ask_levels > 0
 and (.markets.spot.max_segment_gap_ns | type) == "number"
 and .markets.spot.max_segment_gap_ns == (.markets.spot.max_segment_gap_ns | floor)
 and .markets.spot.max_segment_gap_ns >= 0
@@ -59,9 +72,32 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and .end_received_at_ns >= .start_received_at_ns
   and (.agg_trade_count | type) == "number"
   and .agg_trade_count == (.agg_trade_count | floor)
-  and .agg_trade_count > 0)
+  and .agg_trade_count > 0
+  and .lob_capture_session_id == $gate.markets.spot.session_id
+  and (.lob_reconnect_boundary | type) == "boolean"
+  and .lob_sequence_gaps == 0
+  and .lob_source_time_rollbacks == 0
+  and .lob_declared_symbol_count == $gate.markets.spot.symbol_count
+  and .lob_covered_symbol_count == $gate.markets.spot.symbol_count
+  and (.lob_min_source_latency_ms | type) == "number"
+  and .lob_min_source_latency_ms >= -1000
+  and (.lob_max_source_latency_ms | type) == "number"
+  and .lob_max_source_latency_ms <= 30000
+  and .lob_max_source_latency_ms >= .lob_min_source_latency_ms
+  and (.lob_min_bid_levels | type) == "number"
+  and .lob_min_bid_levels > 0
+  and (.lob_min_ask_levels | type) == "number"
+  and .lob_min_ask_levels > 0)
 and (.markets.spot.oss_roundtrip_evidence as $round_trips
   | $round_trips[0].gap_from_previous_ns == 0
+  and $round_trips[0].lob_reconnect_boundary == true
+  and all($round_trips[1:][].lob_reconnect_boundary; . == false)
+  and .markets.spot.lob_reconnect_boundaries
+    == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
+  and .markets.spot.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
+  and .markets.spot.max_lob_source_latency_ms == ([$round_trips[].lob_max_source_latency_ms] | max)
+  and .markets.spot.min_lob_bid_levels == ([$round_trips[].lob_min_bid_levels] | min)
+  and .markets.spot.min_lob_ask_levels == ([$round_trips[].lob_min_ask_levels] | min)
   and .markets.spot.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
   and all(range(1; ($round_trips | length));
       $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
@@ -96,6 +132,18 @@ and (.markets.usdm.agg_trade_count | type) == "number"
 and .markets.usdm.agg_trade_count == (.markets.usdm.agg_trade_count | floor)
 and .markets.usdm.agg_trade_count > 0
 and .markets.usdm.strict_trade_summary_readback == true
+and .markets.usdm.strict_lob_continuity_readback == true
+and (.markets.usdm.lob_reconnect_boundaries | type) == "number"
+and .markets.usdm.lob_reconnect_boundaries == 1
+and (.markets.usdm.min_lob_source_latency_ms | type) == "number"
+and .markets.usdm.min_lob_source_latency_ms >= -1000
+and (.markets.usdm.max_lob_source_latency_ms | type) == "number"
+and .markets.usdm.max_lob_source_latency_ms <= 30000
+and .markets.usdm.max_lob_source_latency_ms >= .markets.usdm.min_lob_source_latency_ms
+and (.markets.usdm.min_lob_bid_levels | type) == "number"
+and .markets.usdm.min_lob_bid_levels > 0
+and (.markets.usdm.min_lob_ask_levels | type) == "number"
+and .markets.usdm.min_lob_ask_levels > 0
 and (.markets.usdm.max_segment_gap_ns | type) == "number"
 and .markets.usdm.max_segment_gap_ns == (.markets.usdm.max_segment_gap_ns | floor)
 and .markets.usdm.max_segment_gap_ns >= 0
@@ -118,9 +166,32 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and .end_received_at_ns >= .start_received_at_ns
   and (.agg_trade_count | type) == "number"
   and .agg_trade_count == (.agg_trade_count | floor)
-  and .agg_trade_count > 0)
+  and .agg_trade_count > 0
+  and .lob_capture_session_id == $gate.markets.usdm.session_id
+  and (.lob_reconnect_boundary | type) == "boolean"
+  and .lob_sequence_gaps == 0
+  and .lob_source_time_rollbacks == 0
+  and .lob_declared_symbol_count == $gate.markets.usdm.symbol_count
+  and .lob_covered_symbol_count == $gate.markets.usdm.symbol_count
+  and (.lob_min_source_latency_ms | type) == "number"
+  and .lob_min_source_latency_ms >= -1000
+  and (.lob_max_source_latency_ms | type) == "number"
+  and .lob_max_source_latency_ms <= 30000
+  and .lob_max_source_latency_ms >= .lob_min_source_latency_ms
+  and (.lob_min_bid_levels | type) == "number"
+  and .lob_min_bid_levels > 0
+  and (.lob_min_ask_levels | type) == "number"
+  and .lob_min_ask_levels > 0)
 and (.markets.usdm.oss_roundtrip_evidence as $round_trips
   | $round_trips[0].gap_from_previous_ns == 0
+  and $round_trips[0].lob_reconnect_boundary == true
+  and all($round_trips[1:][].lob_reconnect_boundary; . == false)
+  and .markets.usdm.lob_reconnect_boundaries
+    == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
+  and .markets.usdm.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
+  and .markets.usdm.max_lob_source_latency_ms == ([$round_trips[].lob_max_source_latency_ms] | max)
+  and .markets.usdm.min_lob_bid_levels == ([$round_trips[].lob_min_bid_levels] | min)
+  and .markets.usdm.min_lob_ask_levels == ([$round_trips[].lob_min_ask_levels] | min)
   and .markets.usdm.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
   and all(range(1; ($round_trips | length));
       $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
