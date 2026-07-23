@@ -14,6 +14,7 @@ on:
           - hft-trading
           - binance-lob-archiver
           - polymarket-evidence-compiler
+          - polymarket-market-recorder
 
 permissions:
   contents: read
@@ -34,14 +35,15 @@ jobs:
           TARGET: ${{ inputs.target }}
         run: |
           case "$TARGET" in
-            all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler) ;;
+            all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder) ;;
             *) echo "Unsupported publish target: $TARGET" >&2; exit 1 ;;
           esac
           matrix=$(jq -cn --arg target "$TARGET" '
             [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},
              {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime"},
              {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime"},
-             {repository:"polymarket-evidence-compiler",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime"}]
+             {repository:"polymarket-evidence-compiler",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime"},
+             {repository:"polymarket-market-recorder",file:"rust_hft/deployment/docker/Dockerfile.polymarket-market-recorder",target:"runtime"}]
             | {include: map(select($target == "all" or .repository == $target))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -202,6 +204,19 @@ jobs:
             --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
             "$IMAGE")
           test "$actual_source_revision" = "$SOURCE_REVISION"
+
+      - name: Verify Polymarket market recorder image
+        if: matrix.repository == 'polymarket-market-recorder'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          docker pull "$IMAGE"
+          actual_source_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$IMAGE")
+          test "$actual_source_revision" = "$SOURCE_REVISION"
+          docker run --rm "$IMAGE" --help 2>&1 | grep -Fq -- '--dry-run'
 
       - name: Verify research runner image
         if: matrix.repository == 'research-runner'
