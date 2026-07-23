@@ -122,6 +122,13 @@ alpha-harness prediction execute \
   --result-put-url 'https://signed-results-put-url'
 ```
 
+Workers may add `--snapshot-cache-dir /cache/research-snapshots` to reuse a
+read-only archive stored as `<snapshot-sha256>.zip`. The key is the normalized
+authenticated SHA-256, not the mission, URL, or a mutable tag. A missing entry
+uses `--snapshot-url` unchanged; an existing entry is copied into the attempt's
+private input directory and hashed before the runner starts. A digest mismatch
+fails closed instead of falling back to the URL.
+
 If the prediction LoopRun pauses, the failed attempt still publishes its state
 and evidence. Start a new attempt in a new work directory with a new result PUT URL and add
 `--resume-url <previous-results-get-url> --resume-sha256 <previous-bundle-sha>`;
@@ -133,6 +140,10 @@ The harness verifies the mission and snapshot outer hashes (and the resume
 bundle hash when supplied) before starting the precompiled Rust runner, safely
 extracts the snapshot into a new private directory on every retry, preserves
 runner evidence with atomic artifact writes, and uses an immutable result PUT.
+`execution-evidence.json` records `snapshot_archive_source` as
+`verified_cache` for a verified cache hit or `trusted_fetch` for the existing
+URL fetch path; both remain bound to the same `snapshot_archive_sha256` trust
+anchor.
 The runner directly invokes the precompiled prediction
 evaluator; the runtime image contains no Cargo or source tree. These commands
 have no order, submit, cancel, replace, reconciliation, OMS, or venue-key input.

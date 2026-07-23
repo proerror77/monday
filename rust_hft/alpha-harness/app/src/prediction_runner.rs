@@ -40,6 +40,7 @@ struct PredictionExecutionEvidence<'a> {
     evaluator_version: &'a str,
     mission_sha256: &'a str,
     snapshot_archive_sha256: &'a str,
+    snapshot_archive_source: &'static str,
     resume_bundle_sha256: Option<&'a str>,
     runner_exit_code: Option<i32>,
 }
@@ -88,15 +89,8 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         .context("prediction mission identity is invalid JSON")?;
     validate_mission_identity(&mission)?;
 
-    let (_, snapshot_sha256) = fetch_to_file(
-        &client,
-        &args.snapshot_url,
-        &snapshot_archive,
-        MAX_SNAPSHOT_ARCHIVE_BYTES,
-    )?;
-    if snapshot_sha256 != normalized_sha256("snapshot archive", &args.snapshot_sha256)? {
-        bail!("prediction snapshot archive SHA256 mismatch");
-    }
+    let (snapshot_sha256, snapshot_archive_source) =
+        stage_snapshot_archive(&client, &args, &snapshot_archive)?;
     // The declared archive SHA-256 is the trust anchor. A prior work-dir
     // extraction is writable state, so a retry always extracts into a fresh
     // private directory instead of attempting to reuse it.
@@ -150,6 +144,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         evaluator_version: &mission.search_policy_snapshot_id,
         mission_sha256: &mission_sha256,
         snapshot_archive_sha256: &snapshot_sha256,
+        snapshot_archive_source,
         resume_bundle_sha256: resume_bundle_sha256.as_deref(),
         runner_exit_code: status.code(),
     };
@@ -190,6 +185,46 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
     }
     resume_source(args)?;
     Ok(())
+}
+
+fn stage_snapshot_archive(
+    client: &Client,
+    args: &PredictionExecuteArgs,
+    destination: &Path,
+) -> anyhow::Result<(String, &'static str)> {
+    let expected_sha256 = normalized_sha256("snapshot archive", &args.snapshot_sha256)?;
+    if let Some(cache_dir) = &args.snapshot_cache_dir {
+        let cached_archive = cache_dir.join(format!("{expected_sha256}.zip"));
+        if cached_archive.try_exists().with_context(|| {
+            format!(
+                "inspect prediction snapshot cache entry {}",
+                cached_archive.display()
+            )
+        })? {
+            let cache_source = cached_archive.to_string_lossy();
+            let (_, actual_sha256) = fetch_to_file(
+                client,
+                cache_source.as_ref(),
+                destination,
+                MAX_SNAPSHOT_ARCHIVE_BYTES,
+            )?;
+            if actual_sha256 != expected_sha256 {
+                bail!("prediction snapshot archive SHA256 mismatch");
+            }
+            return Ok((actual_sha256, "verified_cache"));
+        }
+    }
+
+    let (_, actual_sha256) = fetch_to_file(
+        client,
+        &args.snapshot_url,
+        destination,
+        MAX_SNAPSHOT_ARCHIVE_BYTES,
+    )?;
+    if actual_sha256 != expected_sha256 {
+        bail!("prediction snapshot archive SHA256 mismatch");
+    }
+    Ok((actual_sha256, "trusted_fetch"))
 }
 
 fn resume_source(args: &PredictionExecuteArgs) -> anyhow::Result<Option<(&str, &str)>> {
@@ -327,6 +362,88 @@ mod tests {
         assert!(error
             .to_string()
             .contains("prediction snapshot archive SHA256 mismatch"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_reuses_verified_snapshot_cache_across_isolated_attempts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = execute_fixture("verified-cache");
+        let cache_dir = fixture.root.join("snapshot-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::copy(
+            fixture.root.join("input-snapshot.zip"),
+            cache_dir.join(format!("{}.zip", fixture.args.snapshot_sha256)),
+        )
+        .unwrap();
+        let runner = fixture.root.join("monday-prediction-research");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let missing_remote = fixture.root.join("remote-must-not-be-read");
+        let mut first = fixture.args.clone();
+        first.snapshot_cache_dir = Some(cache_dir.clone());
+        first.snapshot_url = missing_remote.to_string_lossy().into_owned();
+
+        execute_with_runner(first, &runner).unwrap();
+
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .args
+                    .work_dir
+                    .join("artifacts/execution-evidence.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence["snapshot_archive_source"], "verified_cache");
+        let second_result = fixture.root.join("second-results.zip");
+        let mut second = fixture.args.clone();
+        second.work_dir = fixture.root.join("second-work");
+        second.result_put_url = second_result.to_string_lossy().into_owned();
+        second.snapshot_cache_dir = Some(cache_dir);
+        second.snapshot_url = missing_remote.to_string_lossy().into_owned();
+
+        execute_with_runner(second, &runner).unwrap();
+
+        assert!(fixture.result_path.is_file());
+        assert!(second_result.is_file());
+        assert_ne!(fixture.args.work_dir, fixture.root.join("second-work"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_corrupt_snapshot_cache_before_starting_runner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = execute_fixture("corrupt-cache");
+        let cache_dir = fixture.root.join("snapshot-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join(format!("{}.zip", fixture.args.snapshot_sha256)),
+            "corrupt\n",
+        )
+        .unwrap();
+        let marker = fixture.root.join("runner-started");
+        let runner = fixture.root.join("must-not-start");
+        std::fs::write(&runner, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = fixture.args;
+        args.snapshot_cache_dir = Some(cache_dir);
+
+        let error = execute_with_runner(args, &runner).expect_err("corrupt cache must fail");
+
+        assert!(error
+            .to_string()
+            .contains("prediction snapshot archive SHA256 mismatch"));
+        assert!(!marker.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -596,6 +713,7 @@ mod tests {
             mission_sha256: format!("{:x}", Sha256::digest(&mission_bytes)),
             snapshot_url: snapshot_path.to_string_lossy().into_owned(),
             snapshot_sha256: sha256_file(&snapshot_path).unwrap(),
+            snapshot_cache_dir: None,
             resume_url: None,
             resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
