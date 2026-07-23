@@ -107,6 +107,9 @@ pub struct PredictionExecuteArgs {
     pub snapshot_url: String,
     #[arg(long)]
     pub snapshot_sha256: String,
+    /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
+    #[arg(long)]
+    pub snapshot_cache_dir: Option<PathBuf>,
     /// Prior immutable prediction result bundle for a paused LoopRun.
     #[arg(long, requires = "resume_sha256")]
     pub resume_url: Option<String>,
