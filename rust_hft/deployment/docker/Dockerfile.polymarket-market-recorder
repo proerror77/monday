@@ -38,8 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /work
 COPY --from=builder /out/bin/new-ploy-runner /usr/local/bin/new-ploy-runner
+COPY --chmod=0755 deployment/docker/polymarket-market-recorder-entrypoint.sh \
+    /usr/local/bin/polymarket-market-recorder-entrypoint
 
 USER recorder
 ENV RUST_LOG=info
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/new-ploy-runner"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/polymarket-market-recorder-entrypoint"]
 CMD ["--help"]

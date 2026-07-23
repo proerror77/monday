@@ -216,7 +216,13 @@ jobs:
             --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
             "$IMAGE")
           test "$actual_source_revision" = "$SOURCE_REVISION"
-          docker run --rm "$IMAGE" --help 2>&1 | grep -Fq -- '--dry-run'
+          if output=$(docker run --rm "$IMAGE" --config /nonexistent 2>&1); then
+            echo "recorder accepted an invocation without --dry-run" >&2
+            exit 1
+          fi
+          grep -Fq 'requires --dry-run' <<<"$output"
+          docker run --rm "$IMAGE" --dry-run --help 2>&1 \
+            | grep -Fq -- '--dry-run'
 
       - name: Verify research runner image
         if: matrix.repository == 'research-runner'
