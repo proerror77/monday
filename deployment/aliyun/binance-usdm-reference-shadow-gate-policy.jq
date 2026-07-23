@@ -1,6 +1,9 @@
 def sha256:
   type == "string" and test("^[a-f0-9]{64}$");
 
+def invocation_id:
+  type == "string" and test("^[a-f0-9]{32}$");
+
 def endpoints:
   . == [
     "https://fapi.binance.com/fapi/v1/time",
@@ -12,7 +15,7 @@ def endpoints:
 def complete_coverage:
   (.active_contracts | type) == "number"
   and .active_contracts == (.active_contracts | floor)
-  and .active_contracts > 0
+  and .active_contracts >= 400
   and .metadata_observations == .active_contracts
   and .mark_index_funding_observations == .active_contracts
   and .open_interest_observations == .active_contracts
@@ -29,6 +32,7 @@ def canonical_artifact:
   and .data_schema == "binance.usdm_reference.v2"
   and .source_origin == "https://fapi.binance.com"
   and (.source_endpoints | endpoints)
+  and .max_staleness_ms == 30000
   and (.data_sha256 | sha256)
   and (.manifest_sha256 | sha256)
   and .success_sha256 == .data_sha256
@@ -54,6 +58,8 @@ and .service.unit == ("binance-usdm-reference-collector-shadow@" + $candidate_sh
 and .service.active == true
 and .service.restart_count == 0
 and .service.binary_sha256 == $candidate_sha256
+and (.service.invocation_id_start | invocation_id)
+and .service.invocation_id_end == .service.invocation_id_start
 and .health.schema == "binance.usdm_reference_health.v1"
 and .health.status == "healthy"
 and .health.source_origin == "https://fapi.binance.com"
@@ -74,6 +80,7 @@ and ([.artifacts[].manifest_sha256] | unique | length) == .artifact_count
 and ([.artifacts[].observed_at_ns] as $times
   | $times == ($times | sort)
   and ($times | unique | length) == ($times | length)
+  and $times[-1] - $times[0] >= (.duration_seconds * 1000000000)
   and ([range(1; $times | length) as $index
     | $times[$index] - $times[$index - 1]] as $gaps
     | all($gaps[]; . > 0 and . <= 90000000000)
