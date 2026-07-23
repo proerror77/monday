@@ -45,46 +45,42 @@ jobs:
             | {include: map(select($target == "all" or .repository == $target))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-  publish:
+  research-runner-binaries:
     needs: selector
+    if: inputs.target == 'all' || inputs.target == 'research-runner'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.selector.outputs.matrix) }}
-
+    container: rust:1.91-bookworm
+    defaults:
+      run:
+        working-directory: rust_hft
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install research runner toolchain
-        if: matrix.repository == 'research-runner'
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.91.0
-
-      - name: Install research runner build dependencies
-        if: matrix.repository == 'research-runner'
+      - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
             clang \
             cmake \
             mold \
             pkg-config \
             protobuf-compiler \
             sccache
-          sudo rm -rf /var/lib/apt/lists/*
+          rm -rf /var/lib/apt/lists/*
 
-      - name: Cache research runner Rust dependencies
-        if: matrix.repository == 'research-runner'
+      - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
           key: research-image-bookworm-${{ hashFiles('rust_hft/**/Cargo.lock') }}
           cache-all-crates: true
 
-      - name: Cache research runner compiler output
-        if: matrix.repository == 'research-runner'
+      - name: Cache sccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/sccache
@@ -93,11 +89,6 @@ jobs:
             ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-
 
       - name: Build research runner binaries
-        if: matrix.repository == 'research-runner'
-        working-directory: rust_hft
-        env:
-          CARGO_INCREMENTAL: "0"
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           sccache --zero-stats
@@ -119,10 +110,44 @@ jobs:
           install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-bin/monday-prediction-research
           install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-bin/monday-prediction-evaluator
           install -D -m 0755 target/prediction-markets/release/monday-prediction-snapshot research-bin/monday-prediction-snapshot
-          for binary in hft-backtest alpha-harness lob-pit-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-            test -x "research-bin/$binary"
-          done
+          ../.github/scripts/verify-research-runner-binaries.sh research-bin
           sccache --show-stats
+
+      - name: Upload research runner binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: research-runner-binaries-${{ github.sha }}
+          path: rust_hft/research-bin/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [selector, research-runner-binaries]
+    if: always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.selector.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Require research runner binaries
+        if: matrix.repository == 'research-runner' && needs.research-runner-binaries.result != 'success'
+        run: exit 1
+
+      - name: Download research runner binaries
+        if: matrix.repository == 'research-runner'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: research-runner-binaries-${{ github.sha }}
+          path: rust_hft/research-bin/
+
+      - name: Verify research runner binary artifact
+        if: matrix.repository == 'research-runner'
+        run: |
+          .github/scripts/verify-research-runner-binaries.sh rust_hft/research-bin
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
