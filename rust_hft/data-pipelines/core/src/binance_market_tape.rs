@@ -34,6 +34,8 @@ pub struct SymbolLobContinuitySummary {
     pub snapshot_seed_count: u64,
     pub diff_count: u64,
     pub checkpoint_count: u64,
+    #[serde(default)]
+    pub stream_coverage_verified: bool,
     pub first_update_id: Option<u64>,
     pub last_update_id: Option<u64>,
     pub first_source_time_ms: Option<u64>,
@@ -153,6 +155,8 @@ impl LobContinuitySummaryBuilder {
                     .checkpoint_count
                     .checked_add(1)
                     .context("LOB checkpoint count overflow")?;
+                summary.stream_coverage_verified |=
+                    raw.get("stream_coverage_verified").and_then(Value::as_bool) == Some(true);
                 summary.observe_received_at(received_at_ns);
                 summary.observe_depth(bid_levels, ask_levels);
             }
@@ -186,8 +190,8 @@ impl LobContinuitySummaryBuilder {
             .iter()
             .filter(|(_, summary)| {
                 summary.snapshot_seed_count == 0
-                    || summary.diff_count == 0
                     || summary.checkpoint_count == 0
+                    || (summary.diff_count == 0 && !summary.stream_coverage_verified)
             })
             .map(|(symbol, _)| symbol.clone())
             .collect::<Vec<_>>();
@@ -301,6 +305,7 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
         MARKET_TAPE_SCHEMA => matches!(
             event_type,
             "session_start"
+                | "stream_coverage"
                 | "snapshot"
                 | "diff"
                 | "checkpoint"

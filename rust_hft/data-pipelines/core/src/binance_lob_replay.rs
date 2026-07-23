@@ -63,6 +63,7 @@ struct ReplaySequenceState {
     session_id: String,
     last_update_id: u64,
     bridged: bool,
+    continuity_complete: bool,
     bids: HashMap<String, String>,
     asks: HashMap<String, String>,
 }
@@ -131,10 +132,35 @@ impl ReplaySequenceValidator {
         raw: &serde_json::Map<String, Value>,
         received_at_ns: u64,
     ) -> Result<Vec<ReplaySequenceEvent>> {
+        self.observe_inner(event_type, raw, received_at_ns, false)
+    }
+
+    pub fn observe_verified_stream_coverage_checkpoint(
+        &mut self,
+        raw: &serde_json::Map<String, Value>,
+        received_at_ns: u64,
+    ) -> Result<Vec<ReplaySequenceEvent>> {
+        if raw.get("stream_coverage_verified").and_then(Value::as_bool) != Some(true) {
+            anyhow::bail!("checkpoint has no verified stream coverage");
+        }
+        self.observe_inner("checkpoint", raw, received_at_ns, true)
+    }
+
+    fn observe_inner(
+        &mut self,
+        event_type: &str,
+        raw: &serde_json::Map<String, Value>,
+        received_at_ns: u64,
+        allow_verified_static_checkpoint: bool,
+    ) -> Result<Vec<ReplaySequenceEvent>> {
         let mut events = Vec::new();
         match event_type {
             "snapshot" if required_string(raw, "symbol")? == self.symbol => {
-                if self.state.as_ref().is_some_and(|state| !state.bridged) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| !state.continuity_complete)
+                {
                     anyhow::bail!("snapshot replaced an unbridged replay series");
                 }
                 let snapshot = raw
@@ -148,6 +174,7 @@ impl ReplaySequenceValidator {
                         .and_then(Value::as_u64)
                         .ok_or_else(|| anyhow::anyhow!("snapshot payload has no lastUpdateId"))?,
                     bridged: false,
+                    continuity_complete: false,
                     bids: parse_snapshot_side(snapshot.get("bids"))?,
                     asks: parse_snapshot_side(snapshot.get("asks"))?,
                 });
@@ -184,7 +211,12 @@ impl ReplaySequenceValidator {
                     self.pending.push(diff);
                 } else if self.state.as_ref().expect("checked state").session_id != diff.session_id
                 {
-                    if !self.state.as_ref().expect("checked state").bridged {
+                    if !self
+                        .state
+                        .as_ref()
+                        .expect("checked state")
+                        .continuity_complete
+                    {
                         anyhow::bail!("diff replaced an unbridged replay series");
                     }
                     self.state = None;
@@ -208,6 +240,12 @@ impl ReplaySequenceValidator {
                         .get("bridged")
                         .and_then(Value::as_bool)
                         .ok_or_else(|| anyhow::anyhow!("checkpoint has no bridged state"))?,
+                    continuity_complete: raw
+                        .get("continuity_complete")
+                        .and_then(Value::as_bool)
+                        .unwrap_or_else(|| {
+                            raw.get("bridged").and_then(Value::as_bool) == Some(true)
+                        }),
                     bids: parse_snapshot_side(raw.get("bids"))?,
                     asks: parse_snapshot_side(raw.get("asks"))?,
                 };
@@ -220,15 +258,29 @@ impl ReplaySequenceValidator {
                         events.push(replay_checkpoint_seed(raw, received_at_ns)?);
                     }
                     Some(state) if state.session_id != checkpoint.session_id => {
-                        if !state.bridged {
+                        if !state.continuity_complete {
                             anyhow::bail!("checkpoint replaced an unbridged replay series");
                         }
                         self.state = Some(checkpoint);
                         events.push(replay_checkpoint_seed(raw, received_at_ns)?);
                     }
                     Some(state)
+                        if allow_verified_static_checkpoint
+                            && !state.bridged
+                            && !checkpoint.bridged
+                            && checkpoint.continuity_complete
+                            && raw.get("stream_coverage_verified").and_then(Value::as_bool)
+                                == Some(true)
+                            && state.last_update_id == checkpoint.last_update_id
+                            && state.bids == checkpoint.bids
+                            && state.asks == checkpoint.asks =>
+                    {
+                        self.state = Some(checkpoint);
+                    }
+                    Some(state)
                         if state.last_update_id != checkpoint.last_update_id
                             || state.bridged != checkpoint.bridged
+                            || state.continuity_complete != checkpoint.continuity_complete
                             || state.bids != checkpoint.bids
                             || state.asks != checkpoint.asks =>
                     {
@@ -274,6 +326,7 @@ impl ReplaySequenceValidator {
         }
         state.last_update_id = update.diff.final_update_id;
         state.bridged = true;
+        state.continuity_complete = true;
         update_side(&mut state.bids, &update.diff.bids);
         update_side(&mut state.asks, &update.diff.asks);
         Ok(true)
@@ -282,7 +335,10 @@ impl ReplaySequenceValidator {
     pub fn finish(&self) -> Result<()> {
         if !self.pending.is_empty()
             || self.state.is_none()
-            || self.state.as_ref().is_some_and(|state| !state.bridged)
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.continuity_complete)
         {
             anyhow::bail!("collector replay did not finish in a bridged state");
         }
@@ -293,7 +349,7 @@ impl ReplaySequenceValidator {
         let state = self
             .state
             .as_ref()
-            .filter(|state| state.bridged)
+            .filter(|state| state.continuity_complete)
             .ok_or_else(|| anyhow::anyhow!("collector replay has no bridged book snapshot"))?;
         Ok(ReplayBookSnapshot {
             last_update_id: state.last_update_id,
@@ -464,6 +520,72 @@ mod tests {
             .unwrap();
 
         assert!(replay.book_snapshot().is_err());
+    }
+
+    #[test]
+    fn verified_stream_coverage_bridges_an_unchanged_snapshot() {
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let snapshot = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "snapshot": {
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]]
+            }
+        });
+        replay
+            .observe("snapshot", snapshot.as_object().unwrap(), 100)
+            .unwrap();
+        let checkpoint = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "last_update_id": 100,
+            "bridged": false,
+            "continuity_complete": true,
+            "stream_coverage_verified": true,
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]]
+        });
+
+        replay
+            .observe_verified_stream_coverage_checkpoint(checkpoint.as_object().unwrap(), 101)
+            .unwrap();
+        replay.finish().unwrap();
+    }
+
+    #[test]
+    fn generic_replay_does_not_adopt_collector_stream_coverage_semantics() {
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let snapshot = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "snapshot": {
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]]
+            }
+        });
+        replay
+            .observe("snapshot", snapshot.as_object().unwrap(), 100)
+            .unwrap();
+        let checkpoint = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "last_update_id": 100,
+            "bridged": false,
+            "continuity_complete": true,
+            "stream_coverage_verified": true,
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]]
+        });
+
+        let error = replay
+            .observe("checkpoint", checkpoint.as_object().unwrap(), 101)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("checkpoint does not match replayed update state"));
     }
 
     #[test]

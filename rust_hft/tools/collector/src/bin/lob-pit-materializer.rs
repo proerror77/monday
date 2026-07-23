@@ -712,7 +712,8 @@ mod tests {
     #[rustfmt::skip]
     fn valid_rows() -> Vec<Value> {
         vec![
-            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":1}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":2,"websocket_streams":2}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
             diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
             trade(700),
@@ -722,7 +723,7 @@ mod tests {
             diff(4_400, 179, 179, 178, json!([["101", "0"]]), json!([])),
             diff(5_400, 180, 180, 179, json!([["100", "12"]]), json!([])),
             diff(6_400, 181, 181, 180, json!([]), json!([["101.5", "5"]])),
-            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"bids":[["100","12"],["99","5"]],"asks":[["101.5","5"],["102","4"],["103","6"]],"reason":"test","replay_safe":true}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","12"],["99","5"]],"asks":[["101.5","5"],["102","4"],["103","6"]],"reason":"test","replay_safe":true}),
         ]
     }
 
@@ -784,8 +785,10 @@ mod tests {
                 "has_replay_safe_checkpoint": true,
                 "snapshot_ready_count": 1,
                 "bridged_count": 1,
+                "stream_coverage_verified_count": 1,
                 "snapshot_only_symbols": [],
                 "all_symbols_bridged": true,
+                "all_stream_coverage_verified": true,
                 "start_received_at_ns": rows.first().unwrap()["received_at_ns"],
                 "end_received_at_ns": rows.last().unwrap()["received_at_ns"],
                 "date": "2026-07-14",

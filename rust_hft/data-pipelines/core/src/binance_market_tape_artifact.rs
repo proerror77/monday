@@ -265,7 +265,7 @@ fn verify_binance_market_tape_with_requirements(
         {
             bail!("market-tape segments do not share one market/dataset/shard scope");
         }
-        validate_manifest_quality(&segment.manifest)?;
+        validate_manifest_quality(&segment.manifest, require_lob_continuity)?;
         let has_trade_summary_contract = segment.manifest.trade_summary_contract.as_deref()
             == Some(AGGREGATE_TRADE_SUMMARY_CONTRACT);
         if require_trade_summaries && !has_trade_summary_contract {
@@ -285,6 +285,8 @@ fn verify_binance_market_tape_with_requirements(
         let mut lob_continuity = LobContinuitySummaryBuilder::new(symbols.iter().cloned())?;
         let mut checkpoints = BTreeSet::new();
         let mut snapshot_seeds = BTreeSet::new();
+        let mut coverage_shard_count = None;
+        let mut session_shard_count = None;
         for (index, range) in segment.rows.iter().enumerate() {
             let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
                 .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
@@ -345,14 +347,28 @@ fn verify_binance_market_tape_with_requirements(
                         }
                         if raw.get("replay_safe").and_then(Value::as_bool) != Some(true)
                             || raw.get("synced").and_then(Value::as_bool) != Some(true)
-                            || raw.get("bridged").and_then(Value::as_bool) != Some(true)
+                            || if require_lob_continuity {
+                                raw.get("continuity_complete").and_then(Value::as_bool)
+                                    != Some(true)
+                            } else {
+                                raw.get("bridged").and_then(Value::as_bool) != Some(true)
+                            }
+                            || (require_lob_continuity
+                                && raw.get("stream_coverage_verified").and_then(Value::as_bool)
+                                    != Some(true))
                         {
                             bail!("market-tape checkpoint is not replay safe");
                         }
                         checkpoints.insert(symbol.clone());
                     }
-                    let events =
-                        observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?;
+                    let events = if event_type == "checkpoint" && require_lob_continuity {
+                        replay
+                            .get_mut(&symbol)
+                            .context("market-tape symbol is outside its declared scope")?
+                            .observe_verified_stream_coverage_checkpoint(raw, received_at_ns)?
+                    } else {
+                        observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?
+                    };
                     record_replay_events(&mut replayed_events, &symbol, events)?;
                     if event_type == "checkpoint" {
                         replayed_events
@@ -377,6 +393,29 @@ fn verify_binance_market_tape_with_requirements(
                     if required_string(raw, "market")? != market.as_str() {
                         bail!("market-tape session market does not match its manifest");
                     }
+                    let declared_count = u64::try_from(symbols.len())?;
+                    if raw.get("symbols").and_then(Value::as_u64) != Some(declared_count)
+                        || raw.get("websocket_shards").and_then(Value::as_u64) == Some(0)
+                        || raw
+                            .get("websocket_shards")
+                            .and_then(Value::as_u64)
+                            .is_none()
+                        || (require_lob_continuity
+                            && raw.get("websocket_streams").and_then(Value::as_u64)
+                                != Some(declared_count.saturating_mul(2)))
+                        || raw
+                            .get("websocket_streams")
+                            .is_some_and(|value| value.as_u64() != Some(declared_count * 2))
+                    {
+                        bail!("market-tape session stream counts do not match its manifest");
+                    }
+                    session_shard_count = raw.get("websocket_shards").and_then(Value::as_u64);
+                }
+                "stream_coverage" => {
+                    let shard_count = validate_stream_coverage_row(raw, &symbols)?;
+                    if coverage_shard_count.replace(shard_count).is_some() {
+                        bail!("market-tape segment has duplicate stream coverage evidence");
+                    }
                 }
                 _ => bail!("incomplete market-tape event {event_type}"),
             }
@@ -385,6 +424,18 @@ fn verify_binance_market_tape_with_requirements(
             || segment.rows.len() as u64 != segment.manifest.events
         {
             bail!("market-tape event counts do not match the manifest");
+        }
+        if require_lob_continuity && counts.get("agg_trade").copied().unwrap_or(0) == 0 {
+            bail!("market-tape segment is missing aggregate trades");
+        }
+        if require_lob_continuity && coverage_shard_count.is_none() {
+            bail!("market-tape segment is missing stream coverage evidence");
+        }
+        if session_shard_count
+            .zip(coverage_shard_count)
+            .is_some_and(|(declared, proven)| declared != proven)
+        {
+            bail!("market-tape stream coverage shard count does not match session start");
         }
         let trade_summaries = trade_summaries.finish()?;
         if segment
@@ -410,15 +461,17 @@ fn verify_binance_market_tape_with_requirements(
         }
         identities.push(segment.identity(market, trade_summaries));
     }
-    let aggregate_trade_symbols = aggregate_trades
-        .iter()
-        .map(|trade| trade.symbol.as_str())
-        .collect::<BTreeSet<_>>();
-    if symbols
-        .iter()
-        .any(|symbol| !aggregate_trade_symbols.contains(symbol.as_str()))
-    {
-        bail!("verified market-tape is missing aggregate trades for a declared symbol");
+    if !require_lob_continuity {
+        let aggregate_trade_symbols = aggregate_trades
+            .iter()
+            .map(|trade| trade.symbol.as_str())
+            .collect::<BTreeSet<_>>();
+        if symbols
+            .iter()
+            .any(|symbol| !aggregate_trade_symbols.contains(symbol.as_str()))
+        {
+            bail!("verified market-tape is missing aggregate trades for a declared symbol");
+        }
     }
     let mut replayed_books = Vec::with_capacity(replay.len());
     for (symbol, validator) in replay {
@@ -505,8 +558,12 @@ struct TapeManifest {
     has_replay_safe_checkpoint: bool,
     snapshot_ready_count: u64,
     bridged_count: u64,
+    #[serde(default)]
+    stream_coverage_verified_count: u64,
     snapshot_only_symbols: Vec<String>,
     all_symbols_bridged: bool,
+    #[serde(default)]
+    all_stream_coverage_verified: bool,
     start_received_at_ns: u64,
     end_received_at_ns: u64,
     date: String,
@@ -587,7 +644,7 @@ fn validate_manifest_identity(
     Ok(())
 }
 
-fn validate_manifest_quality(manifest: &TapeManifest) -> Result<()> {
+fn validate_manifest_quality(manifest: &TapeManifest, require_stream_coverage: bool) -> Result<()> {
     if !manifest.has_replay_safe_checkpoint {
         bail!("market-tape segment is missing a replay-safe checkpoint");
     }
@@ -601,6 +658,9 @@ fn validate_manifest_quality(manifest: &TapeManifest) -> Result<()> {
         || manifest.bridged_count != symbols.len() as u64
         || !manifest.snapshot_only_symbols.is_empty()
         || !manifest.all_symbols_bridged
+        || (require_stream_coverage
+            && (manifest.stream_coverage_verified_count != symbols.len() as u64
+                || !manifest.all_stream_coverage_verified))
         || manifest
             .security_token_symbols
             .iter()
@@ -642,12 +702,65 @@ fn complete_event_type(event_type: &str) -> bool {
 #[rustfmt::skip]
 fn allowed_fields(event_type: &str) -> &'static [&'static str] {
     match event_type {
-        "session_start" => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards"],
+        "session_start" => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards", "websocket_streams"],
+        "stream_coverage" => &["schema", "received_at_ns", "type", "session_id", "shards"],
         "snapshot" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "symbol", "request_started_at_ns", "snapshot"],
         "diff" | "agg_trade" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
-        "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "bids", "asks", "reason", "replay_safe"],
+        "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "continuity_complete", "stream_coverage_verified", "bids", "asks", "reason", "replay_safe"],
         _ => unreachable!("event type checked above"),
     }
+}
+
+fn validate_stream_coverage_row(
+    raw: &Map<String, Value>,
+    symbols: &BTreeSet<String>,
+) -> Result<u64> {
+    let shards = raw
+        .get("shards")
+        .and_then(Value::as_array)
+        .context("market-tape stream coverage has no shard array")?;
+    if shards.is_empty() {
+        bail!("market-tape stream coverage has no shards");
+    }
+    let listed = shards
+        .iter()
+        .map(|shard| {
+            let shard = shard
+                .as_array()
+                .context("market-tape stream coverage shard is not an array")?;
+            if shard.is_empty() {
+                bail!("market-tape stream coverage shard is empty");
+            }
+            shard
+                .iter()
+                .map(|stream| {
+                    stream
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("market-tape stream coverage contains a non-string stream")
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let stream_count = listed.iter().map(Vec::len).sum::<usize>();
+    let actual = listed.into_iter().flatten().collect::<BTreeSet<_>>();
+    if actual.len() != stream_count {
+        bail!("market-tape stream coverage contains duplicate streams");
+    }
+    let expected = symbols
+        .iter()
+        .flat_map(|symbol| {
+            let symbol = symbol.to_ascii_lowercase();
+            [
+                format!("{symbol}@depth@100ms"),
+                format!("{symbol}@aggTrade"),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!("market-tape stream coverage does not match declared symbols");
+    }
+    Ok(u64::try_from(shards.len())?)
 }
 
 fn validate_row<'a>(
@@ -828,7 +941,7 @@ mod tests {
     #[rustfmt::skip]
     fn valid_rows() -> Vec<Value> {
         vec![
-            json!({"schema":"binance.market_tape.v1","received_at_ns":START_NS,"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":1}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":START_NS,"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":1,"websocket_streams":2}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":START_NS+100_000_000,"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":START_NS+50_000_000,"snapshot":{"lastUpdateId":100,"bids":[["100","1"]],"asks":[["101","1"]]}}),
             depth_row(START_NS + 200_000_000, 101, 100),
             trade_row(START_NS + 300_000_000, 10),
@@ -848,21 +961,52 @@ mod tests {
 
     #[rustfmt::skip]
     fn checkpoint_row(received_at_ns: u64, last_update_id: u64) -> Value {
-        json!({"schema":"binance.market_tape.v1","received_at_ns":received_at_ns,"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":last_update_id,"synced":true,"bridged":true,"bids":[["100","2"]],"asks":[["101","1"]],"replay_safe":true,"reason":"test"})
+        json!({"schema":"binance.market_tape.v1","received_at_ns":received_at_ns,"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":last_update_id,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","2"]],"asks":[["101","1"]],"replay_safe":true,"reason":"test"})
     }
 
     fn two_symbol_rows_without_sol_trade() -> Vec<Value> {
         let mut rows = valid_rows();
         rows[0]["symbols"] = json!(2);
+        rows[0]["websocket_streams"] = json!(4);
         let mut sol_snapshot = rows[1].clone();
         sol_snapshot["received_at_ns"] = json!(START_NS + 150_000_000);
         sol_snapshot["symbol"] = json!("SOLUSDT");
         sol_snapshot["snapshot"]["lastUpdateId"] = json!(200);
-        let mut sol_diff = depth_row(START_NS + 250_000_000, 201, 200);
-        sol_diff["frame"]["data"]["s"] = json!("SOLUSDT");
-        let mut sol_checkpoint = checkpoint_row(START_NS + 450_000_000, 201);
+        let mut sol_checkpoint = checkpoint_row(START_NS + 450_000_000, 200);
         sol_checkpoint["symbol"] = json!("SOLUSDT");
-        rows.extend([sol_snapshot, sol_diff, sol_checkpoint]);
+        sol_checkpoint["bridged"] = json!(false);
+        sol_checkpoint["bids"][0][1] = json!("1");
+        rows.extend([sol_snapshot, sol_checkpoint]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        rows
+    }
+
+    fn with_stream_coverage(mut rows: Vec<Value>, symbols: &[&str]) -> Vec<Value> {
+        let received_at_ns = rows
+            .iter()
+            .find(|row| row["type"] == "session_start")
+            .map_or_else(
+                || {
+                    rows.iter()
+                        .map(|row| row["received_at_ns"].as_u64().unwrap())
+                        .min()
+                        .unwrap()
+                },
+                |row| row["received_at_ns"].as_u64().unwrap() + 1,
+            );
+        if let Some(session) = rows.iter_mut().find(|row| row["type"] == "session_start") {
+            session["websocket_shards"] = json!(2);
+            session["websocket_streams"] = json!(symbols.len() * 2);
+        }
+        let depth = symbols
+            .iter()
+            .map(|symbol| format!("{}@depth@100ms", symbol.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        let trades = symbols
+            .iter()
+            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+        rows.push(json!({"schema":"binance.market_tape.v1","received_at_ns":received_at_ns,"type":"stream_coverage","session_id":"session-1","shards":[depth,trades]}));
         rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
         rows
     }
@@ -974,7 +1118,9 @@ mod tests {
             "replay_scope":"captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs","venue_depth_complete":false,
             "events":rows.len(),"event_types":counts,"has_replay_safe_checkpoint":has_checkpoint,
             "snapshot_ready_count":checkpointed_symbols.len(),"bridged_count":checkpointed_symbols.len(),
+            "stream_coverage_verified_count":checkpointed_symbols.len(),
             "snapshot_only_symbols":snapshot_only_symbols,"all_symbols_bridged":checkpointed_symbols == declared_symbols,
+            "all_stream_coverage_verified":checkpointed_symbols == declared_symbols,
             "start_received_at_ns":start,"end_received_at_ns":end,"date":"2023-11-14","hour":"22","file":name,"bytes":compressed.len(),"sha256":data_sha,
             "trade_representation":"aggregate_trade_only","price_surface_derivation":"latest aggregate trade price"
         });
@@ -1042,9 +1188,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_verifier_preserves_legacy_market_tape_v1() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows[0].as_object_mut().unwrap().remove("websocket_streams");
+        rows[4]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_coverage_verified");
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("stream_coverage_verified_count");
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("all_stream_coverage_verified");
+        });
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        verify_binance_market_tape(vec![sealed]).unwrap();
+    }
+
+    #[test]
     fn strict_lob_verifier_rejects_manifest_without_continuity_contract() {
         let root = tempdir();
-        let (triplet, anchor) = write_triplet(root.path(), &valid_rows());
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
         let error =
@@ -1055,7 +1227,7 @@ mod tests {
     #[test]
     fn strict_lob_verifier_rejects_manifest_latency_not_derived_from_raw_rows() {
         let root = tempdir();
-        let rows = valid_rows();
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
         let (triplet, _) = write_triplet(root.path(), &rows);
         let valid_anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
         let sealed = seal_binance_market_tape_triplet(&triplet, &valid_anchor).unwrap();
@@ -1129,12 +1301,22 @@ mod tests {
         let mut sol_trade = trade_row(START_NS + 350_000_081, 20);
         sol_trade["frame"]["stream"] = json!("solusdt@aggTrade");
         sol_trade["frame"]["data"]["s"] = json!("SOLUSDT");
+        let mut sol_diff = depth_row(START_NS + 250_000_000, 201, 200);
+        sol_diff["frame"]["data"]["s"] = json!("SOLUSDT");
+        let sol_checkpoint = rows
+            .iter_mut()
+            .find(|row| row["type"] == "checkpoint" && row["symbol"] == "SOLUSDT")
+            .unwrap();
+        sol_checkpoint["last_update_id"] = json!(201);
+        sol_checkpoint["bridged"] = json!(true);
+        sol_checkpoint["bids"][0][1] = json!("2");
         let checkpoint = rows
             .iter()
             .position(|row| row["type"] == "checkpoint" && row["symbol"] == "BTCUSDT")
             .unwrap();
         rows[checkpoint]["received_at_ns"] = json!(START_NS + 350_000_000);
-        rows.insert(checkpoint, sol_trade);
+        rows.extend([sol_diff, sol_trade]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
         let (triplet, anchor) =
             write_triplet_for_symbols(root.path(), &rows, &["BTCUSDT", "SOLUSDT"]);
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
@@ -1286,51 +1468,138 @@ mod tests {
     }
 
     #[test]
-    fn every_declared_symbol_requires_an_aggregate_trade() {
+    fn verified_stream_coverage_accepts_a_static_declared_symbol() {
         let root = tempdir();
-        let rows = two_symbol_rows_without_sol_trade();
-        let (triplet, anchor) =
-            write_triplet_for_symbols(root.path(), &rows, &["BTCUSDT", "SOLUSDT"]);
+        let rows =
+            with_stream_coverage(two_symbol_rows_without_sol_trade(), &["BTCUSDT", "SOLUSDT"]);
+        let (triplet, _) = write_triplet_for_symbols(root.path(), &rows, &["BTCUSDT", "SOLUSDT"]);
+        let anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT", "SOLUSDT"]);
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
-        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
-        assert!(error.to_string().contains("aggregate trade"));
+        verify_binance_market_tape(vec![sealed]).unwrap_err();
+
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        let verified =
+            verify_binance_market_tape_with_required_lob_continuity(vec![sealed]).unwrap();
+        assert_eq!(verified.aggregate_trades().len(), 1);
+        assert_eq!(verified.replayed_books().len(), 2);
     }
 
     #[test]
-    fn aggregate_trade_coverage_can_span_segments() {
+    fn static_usdm_checkpoint_preserves_the_initial_overlap_bridge_across_segments() {
         let root = tempdir();
-        let first_rows = two_symbol_rows_without_sol_trade();
-        let mut sol_diff = depth_row(START_NS + 1_100_000_000, 202, 201);
+        let mut static_checkpoint = checkpoint_row(START_NS + 400_000_000, 100);
+        static_checkpoint["bridged"] = json!(false);
+        static_checkpoint["bids"][0][1] = json!("1");
+        let first_rows = with_stream_coverage(
+            vec![
+                valid_rows()[0].clone(),
+                valid_rows()[1].clone(),
+                trade_row(START_NS + 300_000_000, 10),
+                static_checkpoint,
+            ],
+            &["BTCUSDT"],
+        );
+        let mut overlap = depth_row(START_NS + 1_000_000_000, 105, 90);
+        overlap["frame"]["data"]["U"] = json!(95);
+        let second_rows = with_stream_coverage(
+            vec![
+                overlap,
+                trade_row(START_NS + 1_100_000_000, 11),
+                checkpoint_row(START_NS + 1_200_000_000, 105),
+            ],
+            &["BTCUSDT"],
+        );
+        let (first, _) = write_triplet(root.path(), &first_rows);
+        let first_anchor = add_lob_continuity(&first, &first_rows, &["BTCUSDT"]);
+        let (second, _) = write_triplet(root.path(), &second_rows);
+        let second_anchor = add_lob_continuity(&second, &second_rows, &["BTCUSDT"]);
+        let verified = verify_binance_market_tape_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(verified.replayed_books()[0].book.last_update_id, 105);
+    }
+
+    #[test]
+    fn session_and_exact_stream_coverage_must_match_declared_symbols() {
+        let root = tempdir();
+        let mut rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        rows.iter_mut()
+            .find(|row| row["type"] == "session_start")
+            .unwrap()["websocket_streams"] = json!(1);
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("stream counts"));
+
+        let mut rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        rows.iter_mut()
+            .find(|row| row["type"] == "stream_coverage")
+            .unwrap()["shards"][0][0] = json!("ethusdt@depth@100ms");
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("does not match declared symbols"));
+    }
+
+    #[test]
+    fn checkpoint_without_stream_coverage_never_returns_a_verified_handle() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows[4]["stream_coverage_verified"] = json!(false);
+        let rows = with_stream_coverage(rows, &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error =
+            verify_binance_market_tape_with_required_lob_continuity(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("checkpoint is not replay safe"));
+    }
+
+    #[test]
+    fn each_segment_requires_a_real_aggregate_trade() {
+        let root = tempdir();
+        let first_rows =
+            with_stream_coverage(two_symbol_rows_without_sol_trade(), &["BTCUSDT", "SOLUSDT"]);
+        let mut sol_diff = depth_row(START_NS + 1_100_000_000, 201, 200);
         sol_diff["frame"]["data"]["s"] = json!("SOLUSDT");
-        let mut sol_trade = trade_row(START_NS + 1_200_000_000, 20);
-        sol_trade["frame"]["stream"] = json!("solusdt@aggTrade");
-        sol_trade["frame"]["data"]["s"] = json!("SOLUSDT");
-        let mut sol_checkpoint = checkpoint_row(START_NS + 1_400_000_000, 202);
+        let mut sol_checkpoint = checkpoint_row(START_NS + 1_400_000_000, 201);
         sol_checkpoint["symbol"] = json!("SOLUSDT");
-        let second_rows = vec![
-            depth_row(START_NS + 1_000_000_000, 102, 101),
-            sol_diff,
-            sol_trade,
-            checkpoint_row(START_NS + 1_300_000_000, 102),
-            sol_checkpoint,
-        ];
-        let (first, first_anchor) =
+        let second_rows = with_stream_coverage(
+            vec![
+                depth_row(START_NS + 1_000_000_000, 102, 101),
+                sol_diff,
+                checkpoint_row(START_NS + 1_300_000_000, 102),
+                sol_checkpoint,
+            ],
+            &["BTCUSDT", "SOLUSDT"],
+        );
+        let (first, _) =
             write_triplet_for_symbols(root.path(), &first_rows, &["BTCUSDT", "SOLUSDT"]);
-        let (second, second_anchor) =
+        let first_anchor = add_lob_continuity(&first, &first_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (second, _) =
             write_triplet_for_symbols(root.path(), &second_rows, &["BTCUSDT", "SOLUSDT"]);
+        let second_anchor = add_lob_continuity(&second, &second_rows, &["BTCUSDT", "SOLUSDT"]);
         let sealed = vec![
             seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
             seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
         ];
 
-        let verified = verify_binance_market_tape(sealed).unwrap();
-        let trade_symbols = verified
-            .aggregate_trades()
-            .iter()
-            .map(|trade| trade.symbol.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(trade_symbols, BTreeSet::from(["BTCUSDT", "SOLUSDT"]));
+        let error = verify_binance_market_tape_with_required_lob_continuity(sealed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("segment is missing aggregate trades"),
+            "{error:#}"
+        );
     }
 
     #[test]
