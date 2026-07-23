@@ -316,6 +316,7 @@ jobs:
           )
           reference_control_assets=(
             binance-usdm-reference-collector-shadow@.service
+            binance-usdm-reference-shadow-gate.sh
             binance-usdm-reference-shadow-gate-policy.jq
           )
           (
