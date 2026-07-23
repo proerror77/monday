@@ -1076,10 +1076,15 @@ fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> 
 }
 
 fn segment_due_at(start_ns: u64, now_ns: u64, segment_seconds: u64) -> anyhow::Result<bool> {
-    Ok(
-        now_ns.saturating_sub(start_ns) >= segment_seconds * 1_000_000_000
-            || segment_partition(start_ns)? != segment_partition(now_ns)?,
-    )
+    let segment_ns = segment_seconds
+        .checked_mul(1_000_000_000)
+        .context("segment duration overflow")?;
+    let next_segment_boundary_ns = (start_ns / segment_ns)
+        .checked_add(1)
+        .and_then(|bucket| bucket.checked_mul(segment_ns))
+        .context("next segment boundary overflow")?;
+    Ok(now_ns >= next_segment_boundary_ns
+        || segment_partition(start_ns)? != segment_partition(now_ns)?)
 }
 
 fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow::Result<()> {
@@ -4117,5 +4122,20 @@ mod tests {
             }
         }
         assert!(rotated, "post-select maintenance must rotate a hot queue");
+    }
+
+    #[test]
+    fn segment_rotation_aligns_to_utc_boundaries() {
+        let minute_ns = 60 * 1_000_000_000_u64;
+        let start_ns = 49 * minute_ns + 58 * 1_000_000_000;
+
+        assert!(
+            !segment_due_at(start_ns, 49 * minute_ns + 59 * 1_000_000_000, 600).unwrap()
+        );
+        assert!(segment_due_at(start_ns, 50 * minute_ns, 600).unwrap());
+        assert!(
+            !segment_due_at(50 * minute_ns, 59 * minute_ns + 58 * 1_000_000_000, 600).unwrap()
+        );
+        assert!(segment_due_at(50 * minute_ns, 60 * minute_ns, 600).unwrap());
     }
 }
