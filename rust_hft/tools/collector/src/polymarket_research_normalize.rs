@@ -1,7 +1,8 @@
 use crate::polymarket_research_import::{ResearchSegmentValidationReport, TradeCompletionIdentity};
 use crate::polymarket_research_select::{
     decimal_text, json_strings, required, timestamp, utc_text, visit,
-    with_selected_research_contracts, ResearchSelectionConfig, SelectedContract, WINDOW_SECS,
+    with_event_local_selected_research_contracts, ResearchSelectionConfig, SelectedContract,
+    WINDOW_SECS,
 };
 use crate::polymarket_upload::{
     trade_record_ids_sha256, validate_canonical_trade, validate_market_settlement,
@@ -716,7 +717,7 @@ fn normalize_raw(
 pub fn normalize_polymarket_evidence(
     config: &PolymarketEvidenceConfig,
 ) -> Result<NormalizedPolymarketEvidence> {
-    with_selected_research_contracts(
+    with_event_local_selected_research_contracts(
         config,
         |inputs, market_path, reference_path, contracts, start, end| {
             normalize_raw(inputs, market_path, reference_path, contracts, start, end)
