@@ -908,19 +908,26 @@ canonical_uploaded_segments=$(jq -er \
 # Exercise the market-tape validation/upload/readback path with a deterministic,
 # closed fixture. A content-addressed rerun must verify the same remote triplet.
 market_fixture="$market_shadow_spool/market-updates.20000101T000003.ndjson"
-jq -cn '{sequence:0,recorded_at:"2000-01-01T00:00:00Z",update:{
-  kind:"event_discovered",event_id:"shadow-market-upload",symbol:"BTCUSDT",
-  up_token:"shadow-up",down_token:"shadow-down",end_time:"2000-01-01T00:05:00Z",
-  window_secs:300,price_to_beat:"100",resolved_up_won:null}}' >"$market_fixture"
-jq -cn '{sequence:1,recorded_at:"2000-01-01T00:00:01Z",update:{
-  kind:"quote",token_id:"shadow-up",bid:"0.49",ask:"0.51",
-  bid_size:"10",ask_size:"11",bid_levels:[{price:"0.49",size:"10"}],
-  ask_levels:[{price:"0.51",size:"11"}],ts:"2000-01-01T00:00:01Z"}}' \
-  >>"$market_fixture"
-jq -cn '{sequence:2,recorded_at:"2000-01-01T00:00:02Z",update:{
-  kind:"reference_price",symbol:"BTCUSDT",source:"binance",asset_class:"crypto",
-  price:"100",full_accuracy_value:null,is_carried_forward:false,
-  ts:"2000-01-01T00:00:02Z"}}' >>"$market_fixture"
+{
+  jq -cn '{sequence:0,recorded_at:"2000-01-01T00:00:00Z",update:{
+    kind:"event_discovered",event_id:"shadow-market-upload",symbol:"BTCUSDT",
+    up_token:"shadow-up",down_token:"shadow-down",end_time:"2000-01-01T00:05:00Z",
+    window_secs:300,price_to_beat:"100",resolved_up_won:null}}'
+  jq -cn '{sequence:1,recorded_at:"2000-01-01T00:00:01Z",update:{
+    kind:"quote",token_id:"shadow-up",bid:"0.49",ask:"0.51",
+    bid_size:"10",ask_size:"11",bid_levels:[{price:"0.49",size:"10"}],
+    ask_levels:[{price:"0.51",size:"11"}],request_status:"success",
+    collection_result:"executable",ts:"2000-01-01T00:00:01Z"}}'
+  jq -cn '{sequence:2,recorded_at:"2000-01-01T00:00:01Z",update:{
+    kind:"quote",token_id:"shadow-down",bid:"0.49",ask:"0.51",
+    bid_size:"10",ask_size:"11",bid_levels:[{price:"0.49",size:"10"}],
+    ask_levels:[{price:"0.51",size:"11"}],request_status:"success",
+    collection_result:"executable",ts:"2000-01-01T00:00:01Z"}}'
+  jq -cn '{sequence:3,recorded_at:"2000-01-01T00:00:02Z",update:{
+    kind:"reference_price",symbol:"BTCUSDT",source:"binance",asset_class:"crypto",
+    price:"100",full_accuracy_value:null,is_carried_forward:false,
+    ts:"2000-01-01T00:00:02Z"}}'
+} >"$market_fixture"
 chown hftcollector:hftcollector "$market_fixture"
 chmod 0640 "$market_fixture"
 sync "$market_fixture"
