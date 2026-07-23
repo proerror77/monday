@@ -13,5 +13,10 @@ grep -F -- 'artifact/binance-usdm-reference-collector' "$workflow" >/dev/null
 grep -F -- 'binance-usdm-reference-collector.sha256' "$workflow" >/dev/null
 grep -F -- 'monday.binance_usdm_reference_release.v1' "$workflow" >/dev/null
 grep -F -- 'binance-usdm-reference-release.json.sha256' "$workflow" >/dev/null
+grep -F -- '--bin binance-usdm-reference-artifact-verifier' "$dockerfile" >/dev/null
+grep -F -- '/usr/local/bin/binance-usdm-reference-artifact-verifier' "$dockerfile" >/dev/null
+grep -F -- 'artifact/binance-usdm-reference-artifact-verifier' "$workflow" >/dev/null
+grep -F -- 'binance-usdm-reference-artifact-verifier.sha256' "$workflow" >/dev/null
+grep -F -- 'verifier:{file:"binance-usdm-reference-artifact-verifier"' "$workflow" >/dev/null
 
 printf '%s\n' 'Binance USD-M reference release contract tests passed'
