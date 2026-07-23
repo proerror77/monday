@@ -5,8 +5,10 @@ use data::binance_market_tape::{
     DepthSourceClockSequenceValidator,
 };
 use data::binance_market_tape_artifact::{
-    seal_binance_market_tape_triplet, verify_binance_market_tape_with_required_trade_summaries,
-    BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor,
+    seal_binance_market_tape_triplet,
+    verify_binance_market_tape_with_required_trade_and_lob_summaries,
+    verify_binance_market_tape_with_required_trade_summaries, BinanceMarketTapeTriplet,
+    BinanceMarketTapeTrustAnchor,
 };
 use futures::StreamExt;
 use hft_collector::lob_archiver::{
@@ -51,6 +53,9 @@ struct Args {
 
     #[arg(long, requires = "verify_segment")]
     segment_manifest_sha256: Vec<String>,
+
+    #[arg(long, requires = "verify_segment")]
+    require_lob_continuity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -636,7 +641,11 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    let verified = verify_binance_market_tape_with_required_trade_summaries(sealed)?;
+    let verified = if args.require_lob_continuity {
+        verify_binance_market_tape_with_required_trade_and_lob_summaries(sealed)?
+    } else {
+        verify_binance_market_tape_with_required_trade_summaries(sealed)?
+    };
     println!(
         "strict market-tape verification: ok ({} segments)",
         verified.segments().len()
@@ -2031,6 +2040,25 @@ mod tests {
             &"b".repeat(64),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn strict_lob_continuity_is_an_explicit_segment_verifier_mode() {
+        let args = Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--require-lob-continuity",
+        ])
+        .unwrap();
+        assert!(args.require_lob_continuity);
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--require-lob-continuity",]).is_err()
+        );
     }
 
     #[tokio::test]

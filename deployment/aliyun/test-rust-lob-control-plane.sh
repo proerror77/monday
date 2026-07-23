@@ -25,7 +25,15 @@ grep -Fq 'strict_verifier_args+=' "$GATE"
 grep -Fq -- '--verify-segment' "$GATE"
 grep -Fq -- '--segment-content-sha256' "$GATE"
 grep -Fq -- '--segment-manifest-sha256' "$GATE"
+grep -Fq -- '--require-lob-continuity' "$GATE"
 grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"
+grep -Fq '.lob_continuity.contract == "binance.lob_continuity.v1"' "$GATE"
+grep -Fq 'jq -e --arg session_id "${observed_session[$market]}"' "$GATE"
+grep -Fq -- '--slurpfile manifest "$manifest_path"' "$GATE"
+if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
+  printf 'shadow gate passes the full-catalog LOB summary through argv\n' >&2
+  exit 1
+fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 
@@ -69,22 +77,40 @@ market_json=$(jq -cn \
     session_id:"session-1",oss_roundtrips:2,
     agg_trade_segments:2,agg_trade_count:2,
     strict_trade_summary_readback:true,
+    strict_lob_continuity_readback:true,lob_reconnect_boundaries:1,
+    min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
+    min_lob_bid_levels:1,min_lob_ask_levels:1,
     max_segment_gap_ns:0,
     oss_roundtrip_evidence:[
       {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
-       gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+       gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
+       lob_capture_session_id:"session-1",lob_reconnect_boundary:true,lob_sequence_gaps:0,
+       lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+       lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
+       lob_min_bid_levels:1,lob_min_ask_levels:1},
       {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
-       gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+       gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1,
+       lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
+       lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+       lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
+       lob_min_bid_levels:1,lob_min_ask_levels:1}
     ]}')
+usdm_market=$(jq -c '
+  .symbol_count = 500
+  | .snapshot_ready_count = 500
+  | .oss_roundtrip_evidence |= map(
+      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500)' \
+  <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
   --arg bundle "$bundle" \
   --arg source "$source_revision" \
   --argjson market "$market_json" \
-  '{schema:"monday.rust_lob_shadow_gate.v2",candidate_sha256:$artifact,
+  --argjson usdm_market "$usdm_market" \
+  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
-    markets:{spot:$market,usdm:($market + {symbol_count:500,snapshot_ready_count:500})}}' \
+    markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate.json"
 
 jq -e \
@@ -100,6 +126,17 @@ if jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
   printf 'gate policy accepted evidence from a different deployment bundle\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.oss_roundtrip_evidence[1].lob_capture_session_id = "session-2"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/mixed-lob-session.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/mixed-lob-session.json" >/dev/null; then
+  printf 'gate policy accepted LOB evidence across a reconnect boundary\n' >&2
   exit 1
 fi
 
