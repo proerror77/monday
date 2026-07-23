@@ -83,6 +83,7 @@ reject '.duration_seconds=3599' short-duration
 reject '.duration_seconds=3601' insufficient-artifact-span
 reject '.service.restart_count=1' restarted
 reject '.service.invocation_id_end=("0"*32)' replaced-invocation
+reject 'del(.service.invocation_id_start)' missing-invocation
 reject '.health.api_error_count=1' api-error
 reject '.health.total_artifact_errors=1' artifact-error
 reject '.artifacts[1].coverage.stale_open_interest=1' stale-oi
@@ -91,6 +92,7 @@ reject '.artifacts[1].coverage.active_contracts=399
   | .artifacts[1].coverage.mark_index_funding_observations=399
   | .artifacts[1].coverage.open_interest_observations=399' small-universe
 reject '.artifacts[1].max_staleness_ms=300000' relaxed-staleness
+reject 'del(.artifacts[1].max_staleness_ms)' missing-staleness
 reject '.artifacts[2].success_sha256=("9"*64)' bad-success
 reject '.artifacts[1].canonical_readback=false' no-readback
 reject '.artifacts[1].observed_at_ns=1700000200000000000' discontinuous
