@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -71,6 +72,7 @@ impl RecordingKind {
             (Self::SpotPrice, MarketUpdate::SpotPrice { .. })
                 | (Self::AggTrade, MarketUpdate::AggTrade { .. })
                 | (Self::Quote, MarketUpdate::Quote { .. })
+                | (Self::Quote, MarketUpdate::QuoteCollectionFailure { .. })
                 | (Self::L2, MarketUpdate::L2 { .. })
                 | (Self::L2Depth, MarketUpdate::L2Depth { .. })
                 | (Self::EventDiscovered, MarketUpdate::EventDiscovered { .. })
@@ -147,6 +149,57 @@ struct MarketUpdateLogWriter {
     rotation_retry_after: Option<DateTime<Utc>>,
 }
 
+fn polymarket_tradeable_price(price: Decimal) -> bool {
+    price > Decimal::new(2, 2) && price < Decimal::new(98, 2)
+}
+
+fn quote_collection_result(update: &MarketUpdate) -> Option<(&'static str, &'static str)> {
+    match update {
+        MarketUpdate::Quote {
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+            bid_levels,
+            ask_levels,
+            ..
+        } => {
+            let result = match (bid, ask, bid_size, ask_size) {
+                (None, None, None, None) if bid_levels.is_empty() && ask_levels.is_empty() => {
+                    "empty"
+                }
+                (None, None, None, None)
+                    if bid_levels.iter().chain(ask_levels).all(|level| {
+                        level.size > Decimal::ZERO
+                            && (Decimal::ZERO..=Decimal::ONE).contains(&level.price)
+                            && !polymarket_tradeable_price(level.price)
+                    }) =>
+                {
+                    "non_executable"
+                }
+                (Some(bid), Some(ask), Some(bid_size), Some(ask_size))
+                    if bid <= ask
+                        && polymarket_tradeable_price(*bid)
+                        && polymarket_tradeable_price(*ask)
+                        && *bid_size > Decimal::ZERO
+                        && *ask_size > Decimal::ZERO =>
+                {
+                    "executable"
+                }
+                (Some(price), None, Some(size), None) | (None, Some(price), None, Some(size))
+                    if polymarket_tradeable_price(*price) && *size > Decimal::ZERO =>
+                {
+                    "one_sided"
+                }
+                _ => "incomplete",
+            };
+            Some(("success", result))
+        }
+        MarketUpdate::QuoteCollectionFailure { .. } => Some(("failure", "api_failure")),
+        _ => None,
+    }
+}
+
 impl MarketUpdateLogWriter {
     fn create_with_limits(
         path: impl AsRef<Path>,
@@ -201,11 +254,20 @@ impl MarketUpdateLogWriter {
             return Ok(AppendOutcome::LimitReached);
         }
 
-        let record = RecordedMarketUpdate {
-            sequence: self.next_sequence,
-            recorded_at: Utc::now(),
-            update: update.clone(),
-        };
+        let collection_result = quote_collection_result(update);
+        let mut serialized_update = serde_json::to_value(update).map_err(io::Error::other)?;
+        if let Some((request_status, collection_result)) = collection_result {
+            let update = serialized_update.as_object_mut().ok_or_else(|| {
+                io::Error::other("serialized market update must be a JSON object")
+            })?;
+            update.insert("request_status".to_owned(), request_status.into());
+            update.insert("collection_result".to_owned(), collection_result.into());
+        }
+        let record = serde_json::json!({
+            "sequence": self.next_sequence,
+            "recorded_at": Utc::now(),
+            "update": serialized_update,
+        });
         let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
         line.push(b'\n');
 
@@ -337,6 +399,7 @@ pub struct RecordingFeed<F> {
     event_tokens: HashMap<String, [String; 2]>,
     quote_token_end_times: HashMap<String, DateTime<Utc>>,
     active_event_updates: HashMap<String, MarketUpdate>,
+    pending_failed_quote_tokens: HashMap<String, DateTime<Utc>>,
 }
 
 impl<F> RecordingFeed<F> {
@@ -376,6 +439,7 @@ impl<F> RecordingFeed<F> {
             event_tokens: HashMap::new(),
             quote_token_end_times: HashMap::new(),
             active_event_updates: HashMap::new(),
+            pending_failed_quote_tokens: HashMap::new(),
         })
     }
 
@@ -413,7 +477,8 @@ impl<F> RecordingFeed<F> {
                         }
                     }
                 }
-                MarketUpdate::Quote { token_id, ts, .. } => {
+                MarketUpdate::Quote { token_id, ts, .. }
+                | MarketUpdate::QuoteCollectionFailure { token_id, ts, .. } => {
                     if !self
                         .quote_token_end_times
                         .get(token_id.as_ref())
@@ -434,6 +499,39 @@ impl<F> RecordingFeed<F> {
                 .any(|kind| kind.matches(update))
         {
             return None;
+        }
+
+        match update {
+            MarketUpdate::QuoteCollectionFailure { token_id, ts, .. } => {
+                self.pending_failed_quote_tokens
+                    .insert(token_id.to_string(), *ts);
+            }
+            MarketUpdate::Quote {
+                token_id,
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                bid_levels,
+                ask_levels,
+                ts,
+            } => {
+                let matches_synthetic_pair = self
+                    .pending_failed_quote_tokens
+                    .remove(token_id.as_ref())
+                    .is_some_and(|failure_ts| failure_ts == *ts);
+                if matches_synthetic_pair
+                    && bid.is_none()
+                    && ask.is_none()
+                    && bid_size.is_none()
+                    && ask_size.is_none()
+                    && bid_levels.is_empty()
+                    && ask_levels.is_empty()
+                {
+                    return None;
+                }
+            }
+            _ => {}
         }
 
         let mut recorded = update.clone();
@@ -755,6 +853,137 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn recording_feed_keeps_failure_but_not_its_synthetic_empty_quote() {
+        let now = Utc::now();
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: "evt-failure".into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-failure".into(),
+            down_token: "down-failure".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let failure = MarketUpdate::QuoteCollectionFailure {
+            token_id: "up-failure".into(),
+            request_started_at: now,
+            http_status: None,
+            error_kind: "websocket_receive".into(),
+            ts: now + Duration::milliseconds(25),
+        };
+        let fail_closed_empty = MarketUpdate::Quote {
+            token_id: "up-failure".into(),
+            bid: None,
+            ask: None,
+            bid_size: None,
+            ask_size: None,
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(25),
+        };
+        let updates = vec![
+            discovered.clone(),
+            failure.clone(),
+            fail_closed_empty.clone(),
+        ];
+        let path = temp_log_path("failure-with-synthetic-empty");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                include_kinds: vec![RecordingKind::EventDiscovered, RecordingKind::Quote],
+                event_scoped_quotes: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        drop(feed);
+
+        let mut replay = RecordedFeed::from_path(&path).unwrap();
+        let mut recorded = Vec::new();
+        while let Some(update) = replay.next().await {
+            recorded.push(update);
+        }
+        assert_eq!(forwarded, updates);
+        assert_eq!(recorded, vec![discovered, failure]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn failure_cannot_suppress_a_later_genuine_empty_quote() {
+        let now = Utc::now();
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: "evt-real-empty".into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-real-empty".into(),
+            down_token: "down-real-empty".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let failure = MarketUpdate::QuoteCollectionFailure {
+            token_id: "up-real-empty".into(),
+            request_started_at: now,
+            http_status: None,
+            error_kind: "websocket_receive".into(),
+            ts: now + Duration::milliseconds(25),
+        };
+        let recovered = MarketUpdate::Quote {
+            token_id: "up-real-empty".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(25),
+        };
+        let genuine_empty = MarketUpdate::Quote {
+            token_id: "up-real-empty".into(),
+            bid: None,
+            ask: None,
+            bid_size: None,
+            ask_size: None,
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(25),
+        };
+        let updates = vec![discovered, failure, recovered, genuine_empty];
+        let path = temp_log_path("failure-before-real-empty");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                include_kinds: vec![RecordingKind::EventDiscovered, RecordingKind::Quote],
+                event_scoped_quotes: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        while feed.next().await.is_some() {}
+        drop(feed);
+
+        let rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3]["update"]["collection_result"], "empty");
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn market_update_writer_rotates_without_restarting_and_resets_sequence() {
         let path = temp_log_path("writer-in-process-rotation");
@@ -780,6 +1009,52 @@ mod tests {
         }
 
         let _ = fs::remove_file(rotated);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn writer_records_explicit_quote_collection_classification() {
+        let path = temp_log_path("writer-quote-classification");
+        let update = MarketUpdate::Quote {
+            token_id: "up-1".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: Utc::now(),
+        };
+        let mut writer =
+            MarketUpdateLogWriter::create_with_limits(&path, RecordingLimits::default(), None)
+                .unwrap();
+
+        assert_eq!(writer.append(&update).unwrap(), AppendOutcome::Written);
+        assert_eq!(
+            writer
+                .append(&MarketUpdate::QuoteCollectionFailure {
+                    token_id: "up-1".into(),
+                    request_started_at: Utc::now(),
+                    http_status: Some(503),
+                    error_kind: "http_status".into(),
+                    ts: Utc::now(),
+                })
+                .unwrap(),
+            AppendOutcome::Written
+        );
+        writer.flush().unwrap();
+        drop(writer);
+
+        let rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0]["update"]["request_status"], "success");
+        assert_eq!(rows[0]["update"]["collection_result"], "executable");
+        assert_eq!(rows[1]["update"]["request_status"], "failure");
+        assert_eq!(rows[1]["update"]["collection_result"], "api_failure");
+
         let _ = fs::remove_file(path);
     }
 

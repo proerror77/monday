@@ -1293,7 +1293,7 @@ fn print_data_breakdown(updates: &[MarketUpdate]) {
     for u in updates {
         match u {
             MarketUpdate::SpotPrice { .. } => spot_count += 1,
-            MarketUpdate::AggTrade { .. } => {}
+            MarketUpdate::AggTrade { .. } | MarketUpdate::QuoteCollectionFailure { .. } => {}
             MarketUpdate::Quote { .. } => quote_count += 1,
             MarketUpdate::EventDiscovered { .. } => event_discovered += 1,
             MarketUpdate::EventExpired { .. } => event_expired += 1,

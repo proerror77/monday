@@ -950,49 +950,48 @@ struct ClobBookState {
 }
 
 impl ClobBookState {
-    fn replace(&mut self, book: &BookUpdate) {
+    fn replace(&mut self, book: &BookUpdate) -> Result<(), String> {
+        if book.bids.iter().chain(&book.asks).any(|level| {
+            level.size <= Decimal::ZERO || !(Decimal::ZERO..=Decimal::ONE).contains(&level.price)
+        }) {
+            return Err("Polymarket book contains an invalid price or size".to_string());
+        }
         self.bids = book
             .bids
             .iter()
-            .filter(|level| {
-                level.size > Decimal::ZERO
-                    && level.price > Decimal::ZERO
-                    && level.price < Decimal::ONE
-            })
             .map(|level| (level.price, level.size))
             .collect();
         self.asks = book
             .asks
             .iter()
-            .filter(|level| {
-                level.size > Decimal::ZERO
-                    && level.price > Decimal::ZERO
-                    && level.price < Decimal::ONE
-            })
             .map(|level| (level.price, level.size))
             .collect();
         self.initialized = true;
+        Ok(())
+    }
+
+    fn validate_change(&self, entry: &PriceChangeBatchEntry) -> Result<(), String> {
+        let Some(size) = entry.size else {
+            return Err("Polymarket price change is missing size".to_string());
+        };
+        if size < Decimal::ZERO
+            || !(Decimal::ZERO..=Decimal::ONE).contains(&entry.price)
+            || !matches!(entry.side, Side::Buy | Side::Sell)
+        {
+            return Err("Polymarket price change contains an invalid field".to_string());
+        }
+        Ok(())
     }
 
     fn apply(&mut self, entry: &PriceChangeBatchEntry) {
-        let Some(size) = entry.size else {
-            self.bids.clear();
-            self.asks.clear();
-            self.initialized = false;
-            return;
-        };
+        let size = entry.size.expect("price change was validated");
         if !self.initialized {
             return;
         }
         let levels = match entry.side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
-            _ => {
-                self.bids.clear();
-                self.asks.clear();
-                self.initialized = false;
-                return;
-            }
+            _ => unreachable!("price change side was validated"),
         };
         if size > Decimal::ZERO {
             levels.insert(entry.price, size);
@@ -1031,29 +1030,47 @@ impl ClobBookState {
             Vec::new()
         };
         let bid = bid_levels
-            .first()
+            .iter()
+            .find(|level| pm_tradeable_price(level.price))
             .map(|level| level.price)
-            .or_else(|| entry.and_then(|change| change.best_bid));
+            .or_else(|| {
+                entry
+                    .and_then(|change| change.best_bid)
+                    .filter(|price| pm_tradeable_price(*price))
+            });
         let ask = ask_levels
-            .first()
+            .iter()
+            .find(|level| pm_tradeable_price(level.price))
             .map(|level| level.price)
-            .or_else(|| entry.and_then(|change| change.best_ask));
-        let bid_size = bid_levels.first().map(|level| level.size).or_else(|| {
-            entry.and_then(|change| {
-                (change.side == Side::Buy && Some(change.price) == bid)
-                    .then_some(change.size)
-                    .flatten()
-                    .filter(|size| *size > Decimal::ZERO)
-            })
-        });
-        let ask_size = ask_levels.first().map(|level| level.size).or_else(|| {
-            entry.and_then(|change| {
-                (change.side == Side::Sell && Some(change.price) == ask)
-                    .then_some(change.size)
-                    .flatten()
-                    .filter(|size| *size > Decimal::ZERO)
-            })
-        });
+            .or_else(|| {
+                entry
+                    .and_then(|change| change.best_ask)
+                    .filter(|price| pm_tradeable_price(*price))
+            });
+        let bid_size = bid_levels
+            .iter()
+            .find(|level| Some(level.price) == bid)
+            .map(|level| level.size)
+            .or_else(|| {
+                entry.and_then(|change| {
+                    (change.side == Side::Buy && Some(change.price) == bid)
+                        .then_some(change.size)
+                        .flatten()
+                        .filter(|size| *size > Decimal::ZERO)
+                })
+            });
+        let ask_size = ask_levels
+            .iter()
+            .find(|level| Some(level.price) == ask)
+            .map(|level| level.size)
+            .or_else(|| {
+                entry.and_then(|change| {
+                    (change.side == Side::Sell && Some(change.price) == ask)
+                        .then_some(change.size)
+                        .flatten()
+                        .filter(|size| *size > Decimal::ZERO)
+                })
+            });
         MarketUpdate::Quote {
             token_id: Arc::from(token_id),
             bid,
@@ -1070,13 +1087,11 @@ impl ClobBookState {
 fn market_update_from_clob_book(
     book: &BookUpdate,
     state: &mut ClobBookState,
-) -> Option<MarketUpdate> {
-    state.replace(book);
-    Some(state.quote(
-        book.asset_id.to_string(),
-        DateTime::from_timestamp_millis(book.timestamp)?,
-        None,
-    ))
+) -> Result<MarketUpdate, String> {
+    state.replace(book)?;
+    let ts = DateTime::from_timestamp_millis(book.timestamp)
+        .ok_or_else(|| "Polymarket book timestamp is out of range".to_string())?;
+    Ok(state.quote(book.asset_id.to_string(), ts, None))
 }
 
 fn market_updates_from_price_change(
@@ -1085,7 +1100,7 @@ fn market_updates_from_price_change(
     last_timestamp: &mut HashMap<String, i64>,
 ) -> Result<Vec<MarketUpdate>, String> {
     let Some(ts) = DateTime::from_timestamp_millis(change.timestamp) else {
-        return Ok(Vec::new());
+        return Err("Polymarket price-change timestamp is out of range".to_string());
     };
     let mut updated_tokens = Vec::new();
     let mut last_entries = HashMap::new();
@@ -1096,8 +1111,13 @@ fn market_updates_from_price_change(
             .get(&token_id)
             .is_some_and(|last| change.timestamp < *last)
         {
-            continue;
+            return Err("Polymarket price-change source time moved backwards".to_string());
         }
+        books.entry(token_id).or_default().validate_change(entry)?;
+    }
+
+    for entry in &change.price_changes {
+        let token_id = entry.asset_id.to_string();
         books.entry(token_id.clone()).or_default().apply(entry);
         last_timestamp.insert(token_id.clone(), change.timestamp);
         if last_entries.insert(token_id.clone(), entry).is_none() {
@@ -1126,20 +1146,35 @@ fn market_updates_from_price_change(
     Ok(updates)
 }
 
-fn send_empty_polymarket_quotes(tx: &broadcast::Sender<MarketUpdate>, token_ids: &[U256]) -> bool {
+fn send_quote_collection_failure_and_empty(
+    tx: &broadcast::Sender<MarketUpdate>,
+    token_ids: &[U256],
+    request_started_at: DateTime<Utc>,
+    error_kind: &str,
+) -> bool {
     let now = Utc::now();
     token_ids.iter().all(|token_id| {
-        tx.send(MarketUpdate::Quote {
-            token_id: Arc::from(token_id.to_string()),
-            bid: None,
-            ask: None,
-            bid_size: None,
-            ask_size: None,
-            bid_levels: Vec::new(),
-            ask_levels: Vec::new(),
+        let token_id: Arc<str> = Arc::from(token_id.to_string());
+        tx.send(MarketUpdate::QuoteCollectionFailure {
+            token_id: Arc::clone(&token_id),
+            request_started_at,
+            http_status: None,
+            error_kind: Arc::from(error_kind),
             ts: now,
         })
         .is_ok()
+            && tx
+                .send(MarketUpdate::Quote {
+                    token_id,
+                    bid: None,
+                    ask: None,
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels: Vec::new(),
+                    ask_levels: Vec::new(),
+                    ts: now,
+                })
+                .is_ok()
     })
 }
 
@@ -1159,14 +1194,13 @@ fn forward_clob_ws_payload(
                     .get(&token_id)
                     .is_some_and(|last| book.timestamp < *last)
                 {
-                    continue;
+                    return Err("Polymarket book source time moved backwards".to_string());
                 }
                 last_timestamp.insert(token_id.clone(), book.timestamp);
                 let state = books_by_token.entry(token_id).or_default();
-                if let Some(update) = market_update_from_clob_book(&book, state) {
-                    if tx.send(update).is_err() {
-                        return Ok(false);
-                    }
+                let update = market_update_from_clob_book(&book, state)?;
+                if tx.send(update).is_err() {
+                    return Ok(false);
                 }
             }
             WsMessage::PriceChange(change) => {
@@ -1206,6 +1240,7 @@ pub fn spawn_clob_ws_quote_feed_until(
             if stop_at.is_some_and(|deadline| Utc::now() >= deadline) {
                 return;
             }
+            let request_started_at = Utc::now();
 
             let (socket, _) = match connect_async(&endpoint).await {
                 Ok(connection) => connection,
@@ -1213,7 +1248,12 @@ pub fn spawn_clob_ws_quote_feed_until(
                     warn!(%error, %endpoint, "Polymarket hot-path WebSocket connect failed");
                     last_timestamp.clear();
                     books_by_token.clear();
-                    if !send_empty_polymarket_quotes(&tx, &token_ids) {
+                    if !send_quote_collection_failure_and_empty(
+                        &tx,
+                        &token_ids,
+                        request_started_at,
+                        "websocket_connect",
+                    ) {
                         return;
                     }
                     tokio::time::sleep(StdDuration::from_millis(250)).await;
@@ -1226,6 +1266,12 @@ pub fn spawn_clob_ws_quote_feed_until(
                     Ok(subscription) => subscription,
                     Err(error) => {
                         error!(%error, "Polymarket subscription serialization failed");
+                        let _ = send_quote_collection_failure_and_empty(
+                            &tx,
+                            &token_ids,
+                            request_started_at,
+                            "websocket_subscription_encode",
+                        );
                         return;
                     }
                 };
@@ -1233,7 +1279,12 @@ pub fn spawn_clob_ws_quote_feed_until(
                 warn!(%error, "Polymarket hot-path subscription send failed");
                 last_timestamp.clear();
                 books_by_token.clear();
-                if !send_empty_polymarket_quotes(&tx, &token_ids) {
+                if !send_quote_collection_failure_and_empty(
+                    &tx,
+                    &token_ids,
+                    request_started_at,
+                    "websocket_subscribe",
+                ) {
                     return;
                 }
                 tokio::time::sleep(StdDuration::from_millis(250)).await;
@@ -1255,7 +1306,7 @@ pub fn spawn_clob_ws_quote_feed_until(
             };
             tokio::pin!(stop);
 
-            loop {
+            let failure_kind = loop {
                 tokio::select! {
                     _ = &mut stop => return,
                     message = read.next() => match message {
@@ -1273,7 +1324,7 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path payload parse failed; reconnecting for a fresh snapshot");
-                                    break;
+                                    break "websocket_payload";
                                 }
                             }
                         }
@@ -1288,14 +1339,14 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path binary payload parse failed; reconnecting for a fresh snapshot");
-                                    break;
+                                    break "websocket_payload";
                                 }
                             }
                         }
                         Some(Ok(Message::Ping(payload))) => {
                             if let Err(error) = write.send(Message::Pong(payload)).await {
                                 warn!(%error, "Polymarket hot-path pong failed");
-                                break;
+                                break "websocket_pong";
                             }
                         }
                         Some(Ok(Message::Pong(_))) => {
@@ -1303,31 +1354,36 @@ pub fn spawn_clob_ws_quote_feed_until(
                         }
                         Some(Ok(Message::Close(frame))) => {
                             warn!(?frame, "Polymarket hot-path WebSocket closed");
-                            break;
+                            break "websocket_close";
                         }
                         Some(Ok(_)) => {}
                         Some(Err(error)) => {
                             warn!(%error, "Polymarket hot-path WebSocket receive failed");
-                            break;
+                            break "websocket_receive";
                         }
-                        None => break,
+                        None => break "websocket_eof",
                     },
                     _ = heartbeat.tick() => {
                         if last_pong.elapsed() > StdDuration::from_secs(6) {
                             warn!("Polymarket hot-path heartbeat timed out");
-                            break;
+                            break "websocket_heartbeat_timeout";
                         }
                         if let Err(error) = write.send(Message::Text("PING".into())).await {
                             warn!(%error, "Polymarket hot-path heartbeat send failed");
-                            break;
+                            break "websocket_heartbeat_send";
                         }
                     }
                 }
-            }
+            };
 
             last_timestamp.clear();
             books_by_token.clear();
-            if !send_empty_polymarket_quotes(&tx, &token_ids) {
+            if !send_quote_collection_failure_and_empty(
+                &tx,
+                &token_ids,
+                request_started_at,
+                failure_kind,
+            ) {
                 return;
             }
             tokio::time::sleep(StdDuration::from_millis(250)).await;
@@ -1925,7 +1981,8 @@ mod tests {
         book_quote_from_rest, db_polymarket_poll_intervals, equity_price_subscription,
         l2_updates_from_book, mark_db_event_expired_if_resolved, market_update_from_clob_book,
         market_updates_from_price_change, parse_agg_trade_msg, parse_equity_price_payload,
-        rtds_market_data_ws_config, ClobBookState, RestBook,
+        rtds_market_data_ws_config, send_quote_collection_failure_and_empty, ClobBookState,
+        RestBook, U256,
     };
     use chrono::Utc;
     use ploy_market_contracts::MarketUpdate;
@@ -2058,6 +2115,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_clob_price_change_timestamp_is_not_silently_dropped() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "9223372036854775807",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.53", "size": "4", "side": "SELL",
+                "hash": null, "best_bid": "0.51", "best_ask": "0.53"
+            }]
+        }))
+        .expect("syntactically valid price change");
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn clob_empty_book_tick_clears_stale_quote() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
@@ -2082,6 +2159,86 @@ mod tests {
                 ask_levels,
                 ..
             } if bid_levels.is_empty() && ask_levels.is_empty()
+        ));
+    }
+
+    #[test]
+    fn malformed_clob_snapshot_is_not_reclassified_as_empty() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600789",
+            "bids": [{"price": "0.49", "size": "-1"}],
+            "asks": [],
+            "hash": null
+        }))
+        .expect("syntactically valid CLOB book update");
+
+        assert!(market_update_from_clob_book(&book, &mut ClobBookState::default()).is_err());
+    }
+
+    #[test]
+    fn terminal_only_clob_levels_are_preserved_but_not_executable() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600789",
+            "bids": [{"price": "0.01", "size": "5"}],
+            "asks": [{"price": "0.99", "size": "6"}],
+            "hash": null
+        }))
+        .expect("valid terminal-only CLOB book update");
+
+        assert!(matches!(
+            market_update_from_clob_book(&book, &mut ClobBookState::default()).unwrap(),
+            MarketUpdate::Quote {
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
+                bid_levels,
+                ask_levels,
+                ..
+            } if bid_levels.len() == 1 && ask_levels.len() == 1
+        ));
+    }
+
+    #[test]
+    fn collection_failure_precedes_the_fail_closed_empty_quote() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let started_at = Utc::now() - chrono::Duration::milliseconds(25);
+
+        assert!(send_quote_collection_failure_and_empty(
+            &tx,
+            &[U256::from(7)],
+            started_at,
+            "websocket_receive",
+        ));
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::QuoteCollectionFailure {
+                token_id,
+                request_started_at,
+                http_status: None,
+                error_kind,
+                ..
+            } if token_id.as_ref() == "7"
+                && request_started_at == started_at
+                && error_kind.as_ref() == "websocket_receive"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
+                bid_levels,
+                ask_levels,
+                ..
+            } if token_id.as_ref() == "7" && bid_levels.is_empty() && ask_levels.is_empty()
         ));
     }
 
@@ -2208,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_clob_price_change_cannot_mutate_cached_book() {
+    fn stale_clob_price_change_fails_before_mutating_cached_book() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -2266,11 +2423,7 @@ mod tests {
             1,
             "distinct deltas sharing a wire millisecond must not be dropped"
         );
-        assert!(
-            market_updates_from_price_change(&stale, &mut books, &mut timestamps)
-                .expect("stale price change is ignored")
-                .is_empty()
-        );
+        assert!(market_updates_from_price_change(&stale, &mut books, &mut timestamps).is_err());
 
         let quote = books["7"].quote(
             "7".to_string(),

@@ -46,6 +46,15 @@ pub enum MarketUpdate {
         ts: DateTime<Utc>,
     },
 
+    /// A Polymarket quote collection attempt that did not produce a book.
+    QuoteCollectionFailure {
+        token_id: Arc<str>,
+        request_started_at: DateTime<Utc>,
+        http_status: Option<u16>,
+        error_kind: Arc<str>,
+        ts: DateTime<Utc>,
+    },
+
     /// CEX L2 orderbook summary.
     L2 {
         symbol: Arc<str>,
@@ -190,6 +199,7 @@ impl MarketUpdate {
             MarketUpdate::SpotPrice { ts, .. }
             | MarketUpdate::AggTrade { ts, .. }
             | MarketUpdate::Quote { ts, .. }
+            | MarketUpdate::QuoteCollectionFailure { ts, .. }
             | MarketUpdate::L2 { ts, .. }
             | MarketUpdate::L2Depth { ts, .. }
             | MarketUpdate::SportsState { ts, .. }
@@ -299,6 +309,16 @@ mod tests {
                     ask_size: None,
                     bid_levels: Vec::new(),
                     ask_levels: Vec::new(),
+                    ts: ts(),
+                },
+            ),
+            (
+                "quote_collection_failure",
+                MarketUpdate::QuoteCollectionFailure {
+                    token_id: Arc::from("token"),
+                    request_started_at: ts(),
+                    http_status: Some(503),
+                    error_kind: Arc::from("http_status"),
                     ts: ts(),
                 },
             ),
