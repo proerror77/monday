@@ -571,7 +571,41 @@ pub fn validate_prediction_snapshot_sources(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if !requirements.contains("all") {
+    let baseline = manifest.source_kind == crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND;
+    if baseline {
+        if requirements != BTreeSet::from([crate::POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT])
+            || !manifest
+                .quality_flags
+                .iter()
+                .any(|flag| flag == crate::BINANCE_SURFACES_OMITTED_QUALITY_FLAG)
+        {
+            return Err(
+                "Polymarket + Chainlink baseline must declare its exact reduced-authority profile"
+                    .to_string(),
+            );
+        }
+        for required in REQUIRED_BINANCE_SOURCE_SURFACES {
+            let surface = manifest
+                .source_surfaces
+                .iter()
+                .find(|surface| surface.name == required)
+                .ok_or_else(|| {
+                    format!(
+                        "Polymarket + Chainlink baseline is missing intentionally omitted surface {required}"
+                    )
+                })?;
+            if surface.role != "intentionally_omitted"
+                || surface.gate_category != "optional_context"
+                || surface.snapshot_sampled
+                || surface.sample_secs.is_some()
+                || surface.row_count != Some(0)
+            {
+                return Err(format!(
+                    "baseline Binance surface {required} must be intentionally omitted, optional, unsampled, and empty"
+                ));
+            }
+        }
+    } else if !requirements.contains("all") {
         let missing = REQUIRED_BINANCE_DATA_REQUIREMENTS
             .iter()
             .copied()
@@ -584,21 +618,23 @@ pub fn validate_prediction_snapshot_sources(
             ));
         }
     }
-    for required in REQUIRED_BINANCE_SOURCE_SURFACES {
-        let surface = manifest
-            .source_surfaces
-            .iter()
-            .find(|surface| surface.name == required)
-            .ok_or_else(|| {
-                format!("prediction snapshot is missing required Binance surface {required}")
-            })?;
-        if surface.gate_category != "required_for_prediction"
-            || !surface.snapshot_sampled
-            || surface.row_count.unwrap_or_default() == 0
-        {
-            return Err(format!(
-                "required Binance surface {required} must be sampled, prediction-gated, and non-empty"
-            ));
+    if !baseline {
+        for required in REQUIRED_BINANCE_SOURCE_SURFACES {
+            let surface = manifest
+                .source_surfaces
+                .iter()
+                .find(|surface| surface.name == required)
+                .ok_or_else(|| {
+                    format!("prediction snapshot is missing required Binance surface {required}")
+                })?;
+            if surface.gate_category != "required_for_prediction"
+                || !surface.snapshot_sampled
+                || surface.row_count.unwrap_or_default() == 0
+            {
+                return Err(format!(
+                    "required Binance surface {required} must be sampled, prediction-gated, and non-empty"
+                ));
+            }
         }
     }
     let chainlink = manifest
@@ -686,6 +722,8 @@ pub fn validate_prediction_snapshot_coverage(
     snapshot: &ResearchSnapshot,
     mission: &PredictionResearchMission,
 ) -> Result<(), String> {
+    let baseline =
+        snapshot.manifest.source_kind == crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND;
     let requested = mission
         .symbols
         .first()
@@ -800,7 +838,14 @@ pub fn validate_prediction_snapshot_coverage(
                 (row.up_token_id.as_str(), row.down_token_id.as_str()),
             );
         }
-        if !row.chainlink_reference_fresh
+        if baseline {
+            if !row.chainlink_reference_fresh || row.chainlink_prob_up.is_finite() {
+                return Err(format!(
+                    "baseline observation {} at {} must carry a fresh Chainlink opening reference without a fabricated continuous probability",
+                    row.event_id, row.tick_ts
+                ));
+            }
+        } else if !row.chainlink_reference_fresh
             || !row.chainlink_prob_up.is_finite()
             || !(0.0..=1.0).contains(&row.chainlink_prob_up)
         {
@@ -810,7 +855,56 @@ pub fn validate_prediction_snapshot_coverage(
             ));
         }
         chainlink_events.insert(row.event_id.as_str());
-        if !row.binance_spot_fresh
+        if baseline {
+            let unavailable_cex_features = [
+                row.signed_distance_to_beat,
+                row.abs_distance_to_beat,
+                row.drift_10s,
+                row.drift_30s,
+                row.flip_age_secs,
+                row.post_flip_drift,
+                row.sigma_horizon,
+                row.implied_sigma_horizon,
+                row.vol_gap,
+                row.distance_over_sigma,
+                row.model_prob_up,
+                row.model_edge_up,
+                row.obi,
+                row.spread_bps,
+                row.microprice_offset_bps,
+                row.bid_depth_near,
+                row.ask_depth_near,
+                row.depth_ratio,
+                row.depth_imbalance,
+                row.depth_far_ratio,
+                row.depth_acceleration,
+                row.obi_10,
+                row.cum_obi_delta_5m,
+                row.cum_depth_delta_5m,
+                row.cum_mprice_drift_5m,
+                row.cum_trade_imbalance_5m,
+                row.cex_bar_return_30s,
+                row.cex_bar_return_60s,
+                row.cex_bar_volume_ratio_30s,
+                row.cex_bar_volume_trend_3,
+                row.cex_signed_volume_ratio_30s,
+                row.cex_consecutive_up_bars,
+                row.cex_consecutive_down_bars,
+                row.cex_breakout_volume_score,
+            ];
+            if row.binance_spot_fresh
+                || row.binance_lob_fresh
+                || row.binance_agg_trade_fresh
+                || unavailable_cex_features
+                    .iter()
+                    .any(|value| value.is_finite())
+            {
+                return Err(format!(
+                    "baseline observation {} at {} exposes unavailable CEX-derived inputs",
+                    row.event_id, row.tick_ts
+                ));
+            }
+        } else if !row.binance_spot_fresh
             || !row.model_prob_up.is_finite()
             || !(0.0..=1.0).contains(&row.model_prob_up)
         {
@@ -819,29 +913,36 @@ pub fn validate_prediction_snapshot_coverage(
                 row.event_id, row.tick_ts
             ));
         }
-        binance_spot_events.insert(row.event_id.as_str());
-        if !row.binance_lob_fresh
-            || !row.obi.is_finite()
-            || !row.spread_bps.is_finite()
-            || !row.bid_depth_near.is_finite()
-            || !row.ask_depth_near.is_finite()
-            || row.bid_depth_near < 0.0
-            || row.ask_depth_near < 0.0
-            || row.bid_depth_near + row.ask_depth_near <= 0.0
+        if !baseline {
+            binance_spot_events.insert(row.event_id.as_str());
+        }
+        if !baseline
+            && (!row.binance_lob_fresh
+                || !row.obi.is_finite()
+                || !row.spread_bps.is_finite()
+                || !row.bid_depth_near.is_finite()
+                || !row.ask_depth_near.is_finite()
+                || row.bid_depth_near < 0.0
+                || row.ask_depth_near < 0.0
+                || row.bid_depth_near + row.ask_depth_near <= 0.0)
         {
             return Err(format!(
                 "snapshot observation {} at {} lacks fresh Binance L2 context",
                 row.event_id, row.tick_ts
             ));
         }
-        binance_lob_events.insert(row.event_id.as_str());
-        if !row.binance_agg_trade_fresh || !row.cum_trade_imbalance_5m.is_finite() {
+        if !baseline {
+            binance_lob_events.insert(row.event_id.as_str());
+        }
+        if !baseline && (!row.binance_agg_trade_fresh || !row.cum_trade_imbalance_5m.is_finite()) {
             return Err(format!(
                 "snapshot observation {} at {} lacks fresh Binance aggTrade context",
                 row.event_id, row.tick_ts
             ));
         }
-        binance_agg_trade_events.insert(row.event_id.as_str());
+        if !baseline {
+            binance_agg_trade_events.insert(row.event_id.as_str());
+        }
         if row.pm_up_bid.is_finite()
             || row.pm_up_ask.is_finite()
             || row.pm_down_bid.is_finite()
@@ -885,17 +986,17 @@ pub fn validate_prediction_snapshot_coverage(
                 "snapshot event {event_id} has no fresh Chainlink reference probability"
             ));
         }
-        if !binance_spot_events.contains(event_id) {
+        if !baseline && !binance_spot_events.contains(event_id) {
             return Err(format!(
                 "snapshot event {event_id} has no finite Binance spot probability context"
             ));
         }
-        if !binance_lob_events.contains(event_id) {
+        if !baseline && !binance_lob_events.contains(event_id) {
             return Err(format!(
                 "snapshot event {event_id} has no fresh Binance L2 context"
             ));
         }
-        if !binance_agg_trade_events.contains(event_id) {
+        if !baseline && !binance_agg_trade_events.contains(event_id) {
             return Err(format!(
                 "snapshot event {event_id} has no fresh Binance aggTrade context"
             ));
@@ -3865,6 +3966,38 @@ mod tests {
         }
     }
 
+    fn baseline_snapshot() -> ResearchSnapshot {
+        let tick_ts = Utc::now();
+        let mut manifest = snapshot_manifest();
+        manifest.generated_at = tick_ts + chrono::Duration::seconds(61);
+        manifest.source_kind = crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND.to_string();
+        manifest.data_requirements =
+            vec![crate::POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT.to_string()];
+        manifest.quality_flags = vec![crate::BINANCE_SURFACES_OMITTED_QUALITY_FLAG.to_string()];
+        for surface in &mut manifest.source_surfaces {
+            if surface.name.starts_with("binance_") {
+                surface.role = "intentionally_omitted".to_string();
+                surface.gate_category = "optional_context".to_string();
+                surface.snapshot_sampled = false;
+                surface.sample_secs = None;
+                surface.row_count = Some(0);
+            }
+        }
+        let mut observation = test_prediction_observation(tick_ts);
+        observation.binance_spot_fresh = false;
+        observation.binance_lob_fresh = false;
+        observation.binance_agg_trade_fresh = false;
+        crate::research_snapshot::clear_polymarket_chainlink_baseline_unavailable_features(
+            &mut observation,
+        );
+        ResearchSnapshot {
+            manifest,
+            observations: vec![observation],
+            deribit_snapshots: Vec::new(),
+            pm_book_snapshots: test_prediction_books(tick_ts),
+        }
+    }
+
     fn test_prediction_observation(tick_ts: chrono::DateTime<Utc>) -> crate::FactorObservation {
         crate::FactorObservation {
             event_id: "event-1".to_string(),
@@ -4192,6 +4325,37 @@ mod tests {
         assert!(validate_prediction_snapshot_sources(&unaudited)
             .expect_err("critical audit must fail")
             .contains("data_audit_status"));
+    }
+
+    #[test]
+    fn polymarket_chainlink_baseline_requires_explicit_omissions_and_nan_cex_features() {
+        let snapshot = baseline_snapshot();
+        validate_prediction_snapshot_sources(&snapshot.manifest)
+            .expect("explicit reduced-authority source contract");
+        validate_prediction_snapshot_coverage(&snapshot, &mission())
+            .expect("baseline coverage with independent token books");
+
+        let mut disguised_cex = snapshot.clone();
+        disguised_cex.observations[0].model_prob_up = 0.5;
+        assert!(
+            validate_prediction_snapshot_coverage(&disguised_cex, &mission())
+                .expect_err("finite CEX placeholder must fail before scoring")
+                .contains("unavailable CEX-derived")
+        );
+
+        let mut sampled_omission = snapshot;
+        let binance = sampled_omission
+            .manifest
+            .source_surfaces
+            .iter_mut()
+            .find(|surface| surface.name == "binance_price_ticks")
+            .expect("baseline Binance surface");
+        binance.snapshot_sampled = true;
+        assert!(
+            validate_prediction_snapshot_sources(&sampled_omission.manifest)
+                .expect_err("malformed omission marker must fail")
+                .contains("intentionally omitted")
+        );
     }
 
     #[test]

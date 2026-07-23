@@ -14,6 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ploy_research::factors_v2::SettlementProbabilityComponentProfile;
 use ploy_research::prediction_llm::OpenAiCompatibleProposalClient;
 use ploy_research::prediction_loop::{
     current_prediction_policy_snapshot_id, prediction_prior_for_blends, research_brief_snapshot_id,
@@ -23,7 +24,7 @@ use ploy_research::prediction_loop::{
 };
 use ploy_research::prediction_mcts::{PredictionMctsCandidate, PredictionMctsEvaluation};
 use ploy_research::prediction_mcts_run::{
-    run_or_resume_prediction_mcts, PredictionMctsRunEvaluator,
+    run_or_resume_prediction_mcts_with_component_profile, PredictionMctsRunEvaluator,
 };
 use ploy_research::{
     load_research_snapshot, normalized_underlying_symbol, PredictionResearchFeedback,
@@ -126,6 +127,11 @@ impl RustProcessEvaluator {
             .arg(&request.mission.mission_id)
             .arg("--expected-search-policy-snapshot-id")
             .arg(&request.mission.search_policy_snapshot_id);
+
+        if snapshot.manifest.source_kind == ploy_research::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        {
+            command.arg("--polymarket-chainlink-baseline");
+        }
 
         if let Some(prior) = request.prior.as_ref() {
             if prior.value.probability_blends.is_empty() {
@@ -757,6 +763,18 @@ fn main() {
         eprintln!("ERROR: {reason}");
         std::process::exit(2);
     });
+    let component_profile = if snapshot.manifest.source_kind
+        == ploy_research::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+    {
+        SettlementProbabilityComponentProfile::MarketMidpointOnly
+    } else {
+        SettlementProbabilityComponentProfile::FullSurface
+    };
+    if legacy_loop && component_profile == SettlementProbabilityComponentProfile::MarketMidpointOnly
+    {
+        eprintln!("ERROR: --legacy-loop does not implement the reduced-authority baseline");
+        std::process::exit(2);
+    }
     let timeout = Duration::from_secs(mission.search_budget.max_seconds.max(1));
     let mut client = LazyProposalClient::new(timeout);
     let mut evaluator = RustProcessEvaluator::new().unwrap_or_else(|reason| {
@@ -772,12 +790,13 @@ fn main() {
             &mut evaluator,
         )
     } else {
-        run_or_resume_prediction_mcts(
+        run_or_resume_prediction_mcts_with_component_profile(
             mission,
             Path::new(snapshot_dir),
             Path::new(output_dir),
             &mut client,
             &mut evaluator,
+            component_profile,
         )
     })
     .unwrap_or_else(|reason| {
@@ -853,7 +872,8 @@ mod tests {
                     stake_usd: 15.0,
                     require_official_settlement: true,
                     immutable_input: true,
-                    source_kind: "unit_test".to_string(),
+                    source_kind: ploy_research::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+                        .to_string(),
                     optimizer_data_dir: Some("unit-test".to_string()),
                     source_surfaces: Vec::new(),
                     input_artifacts: Vec::new(),
@@ -930,6 +950,9 @@ mod tests {
             window[0] == "--prediction-mcts-training-candidate-json"
                 && window[1] == candidate_path.to_string_lossy()
         }));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--polymarket-chainlink-baseline"));
         let selected_candidate_path = root.join("selected-candidate.json");
         let selected_request = PredictionEvaluationRequest {
             training_candidate_json: None,

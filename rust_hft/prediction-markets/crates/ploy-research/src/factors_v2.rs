@@ -421,6 +421,14 @@ pub struct FullDepthExecutionEventRow {
     pub settlement_pnl: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementProbabilityComponentProfile {
+    #[default]
+    FullSurface,
+    MarketMidpointOnly,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SettlementProbabilityReportOptions {
     pub bucket_count: usize,
@@ -428,6 +436,7 @@ pub struct SettlementProbabilityReportOptions {
     pub top_edge_quantile: f64,
     pub event_surface_min_bucket_observations: usize,
     pub event_surface_shrinkage_observations: usize,
+    pub component_profile: SettlementProbabilityComponentProfile,
 }
 
 impl Default for SettlementProbabilityReportOptions {
@@ -438,6 +447,7 @@ impl Default for SettlementProbabilityReportOptions {
             top_edge_quantile: 0.2,
             event_surface_min_bucket_observations: 10,
             event_surface_shrinkage_observations: 20,
+            component_profile: SettlementProbabilityComponentProfile::FullSurface,
         }
     }
 }
@@ -2868,12 +2878,13 @@ fn build_settlement_probability_report_with_surface<'a>(
     let typed_blends = validated_probability_blends(prior)
         .into_iter()
         .filter(|(_, blend)| {
-            blend.chainlink_digital_weight <= EPS || typed_chainlink_support_complete
+            probability_blend_allowed(options.component_profile, blend)
+                && (blend.chainlink_digital_weight <= EPS || typed_chainlink_support_complete)
         })
         .collect::<Vec<_>>();
     let mut by_model: BTreeMap<String, Vec<SettlementProbabilitySample>> = BTreeMap::new();
     for (row, win, pnl, conservative_pnl) in eligible_rows {
-        for (model, q) in settlement_probability_models(row) {
+        for (model, q) in settlement_probability_models(row, options.component_profile) {
             if model == "q_chainlink_digital" && !raw_chainlink_support_complete {
                 continue;
             }
@@ -2899,7 +2910,8 @@ fn build_settlement_probability_report_with_surface<'a>(
                 q,
             );
         }
-        if let Some(q) = settlement_probability_final_blend(row, event_q) {
+        if let Some(q) = settlement_probability_final_blend(row, event_q, options.component_profile)
+        {
             push_settlement_probability_sample(
                 &mut by_model,
                 "q_final_logit_blend",
@@ -2939,6 +2951,7 @@ fn normalize_settlement_probability_report_options(
         top_edge_quantile: options.top_edge_quantile.clamp(0.01, 1.0),
         event_surface_min_bucket_observations: options.event_surface_min_bucket_observations.max(1),
         event_surface_shrinkage_observations: options.event_surface_shrinkage_observations.max(1),
+        component_profile: options.component_profile,
     }
 }
 
@@ -3453,12 +3466,13 @@ fn settlement_verdict_model_samples(
     let typed_blends = validated_probability_blends(prior)
         .into_iter()
         .filter(|(_, blend)| {
-            blend.chainlink_digital_weight <= EPS || typed_chainlink_support_complete
+            probability_blend_allowed(options.component_profile, blend)
+                && (blend.chainlink_digital_weight <= EPS || typed_chainlink_support_complete)
         })
         .collect::<Vec<_>>();
     let mut by_model = BTreeMap::new();
     for (row, win) in eligible_rows {
-        for (model, q) in settlement_probability_models(row) {
+        for (model, q) in settlement_probability_models(row, options.component_profile) {
             if model == "q_chainlink_digital" && !raw_chainlink_support_complete {
                 continue;
             }
@@ -3468,7 +3482,8 @@ fn settlement_verdict_model_samples(
         if let Some(q) = event_q {
             push_settlement_verdict_sample(&mut by_model, "q_event_surface_empirical", win, q);
         }
-        if let Some(q) = settlement_probability_final_blend(row, event_q) {
+        if let Some(q) = settlement_probability_final_blend(row, event_q, options.component_profile)
+        {
             push_settlement_verdict_sample(&mut by_model, "q_final_logit_blend", win, q);
         }
         if prior.is_none_or(|prior| prediction_prior_matches_row(prior, row)) {
@@ -8937,11 +8952,17 @@ fn event_surface_distance_bucket(distance_z: f64) -> &'static str {
     }
 }
 
-fn settlement_probability_models(row: &FactorObservationV2) -> Vec<(&'static str, f64)> {
+fn settlement_probability_models(
+    row: &FactorObservationV2,
+    component_profile: SettlementProbabilityComponentProfile,
+) -> Vec<(&'static str, f64)> {
     let mut models = Vec::with_capacity(9);
     models.push(("q_naive_50_50", 0.5));
     if let Some(q) = settlement_market_midpoint_probability(row) {
         models.push(("q_market_midpoint", q));
+    }
+    if component_profile == SettlementProbabilityComponentProfile::MarketMidpointOnly {
+        return models;
     }
     if valid_probability(row.side_chainlink_prob) {
         models.push(("q_chainlink_digital", row.side_chainlink_prob));
@@ -8976,8 +8997,44 @@ fn settlement_probability_models(row: &FactorObservationV2) -> Vec<(&'static str
 fn settlement_probability_final_blend(
     row: &FactorObservationV2,
     event_surface_q: Option<f64>,
+    component_profile: SettlementProbabilityComponentProfile,
 ) -> Option<f64> {
-    settlement_probability_weighted_components(row, event_surface_q, 0.45, 0.0, 0.35, 0.20, 0.0)
+    match component_profile {
+        SettlementProbabilityComponentProfile::FullSurface => {
+            settlement_probability_weighted_components(
+                row,
+                event_surface_q,
+                0.45,
+                0.0,
+                0.35,
+                0.20,
+                0.0,
+            )
+        }
+        SettlementProbabilityComponentProfile::MarketMidpointOnly => {
+            settlement_probability_weighted_components(
+                row,
+                event_surface_q,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        }
+    }
+}
+
+fn probability_blend_allowed(
+    component_profile: SettlementProbabilityComponentProfile,
+    blend: &LlmProbabilityBlendSpec,
+) -> bool {
+    component_profile == SettlementProbabilityComponentProfile::FullSurface
+        || (blend.market_midpoint_weight > EPS
+            && blend.chainlink_digital_weight <= EPS
+            && blend.distance_lob_vol_weight <= EPS
+            && blend.event_surface_weight <= EPS
+            && blend.existing_model_weight <= EPS)
 }
 
 fn validated_probability_blends(
@@ -9040,6 +9097,29 @@ pub fn validate_prediction_research_prior(prior: &LlmPriorSpec) -> Result<(), &'
         }
         if !names.insert(blend.name.as_str()) {
             return Err("probability blend names must be unique");
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_prediction_research_prior_for_source_kind(
+    prior: &LlmPriorSpec,
+    source_kind: &str,
+) -> Result<(), &'static str> {
+    validate_prediction_research_prior(prior)?;
+    if source_kind != crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND {
+        return Ok(());
+    }
+    for blend in &prior.probability_blends {
+        if blend.market_midpoint_weight <= EPS
+            || blend.chainlink_digital_weight > EPS
+            || blend.distance_lob_vol_weight > EPS
+            || blend.event_surface_weight > EPS
+            || blend.existing_model_weight > EPS
+        {
+            return Err(
+                "Polymarket + Chainlink baseline allows only a positive market_midpoint weight",
+            );
         }
     }
     Ok(())
@@ -11222,6 +11302,7 @@ mod tests {
                 min_bucket_observations: 1,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
                 ..Default::default()
             },
             time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
@@ -11299,6 +11380,7 @@ mod tests {
                 min_bucket_observations: 1,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
                 ..Default::default()
             },
             ..Default::default()
@@ -11456,6 +11538,7 @@ mod tests {
                 top_edge_quantile: 0.5,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
             },
         );
 
@@ -11535,6 +11618,7 @@ mod tests {
                 top_edge_quantile: 0.5,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
             },
         );
 
@@ -11585,7 +11669,12 @@ mod tests {
         let market_q = settlement_market_midpoint_probability(first_row).unwrap();
         let distance_q = settlement_distance_lob_vol_probability(first_row).unwrap();
         let event_q = event_surface.predict(first_row).unwrap();
-        let final_q = settlement_probability_final_blend(first_row, Some(event_q)).unwrap();
+        let final_q = settlement_probability_final_blend(
+            first_row,
+            Some(event_q),
+            SettlementProbabilityComponentProfile::FullSurface,
+        )
+        .unwrap();
 
         assert!(valid_probability(final_q));
         assert!((final_q - market_q).abs() > 1e-6);
@@ -11600,6 +11689,7 @@ mod tests {
                 top_edge_quantile: 0.5,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
             },
         );
         assert!(report
@@ -11638,6 +11728,7 @@ mod tests {
                 top_edge_quantile: 1.0,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
                 ..Default::default()
             },
         );
@@ -11728,6 +11819,7 @@ mod tests {
                 top_edge_quantile: 0.5,
                 event_surface_min_bucket_observations: 1,
                 event_surface_shrinkage_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::FullSurface,
             },
         );
 
@@ -11960,6 +12052,53 @@ mod tests {
             Err("prediction prior may not contain factor mutations")
         );
         assert!(validated_probability_blends(Some(&formula)).is_empty());
+    }
+
+    #[test]
+    fn baseline_prior_rejects_every_component_without_verified_input_authority() {
+        let mut prior: crate::autofactor::LlmPriorSpec =
+            serde_json::from_value(serde_json::json!({
+                "target": "full_depth_settlement_executable_pnl",
+                "mission_id": "polymarket-btc-5m-baseline",
+                "data_snapshot_id": "sha256:baseline-data",
+                "prompt_snapshot_id": "sha256:baseline-prompt",
+                "search_policy_snapshot_id": "prediction-probability-blend-v1",
+                "symbols": ["BTC"],
+                "horizon": "5m",
+                "probability_blends": [{
+                    "name": "invalid_baseline",
+                    "hypothesis": "Unavailable CEX-derived context must not be renormalized away.",
+                    "market_midpoint_weight": 1.0,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 0.25,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                }]
+            }))
+            .expect("typed baseline prior");
+
+        assert!(validate_prediction_research_prior_for_source_kind(
+            &prior,
+            crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
+        )
+        .expect_err("unsupported baseline component must fail")
+        .contains("market_midpoint"));
+
+        prior.probability_blends[0].distance_lob_vol_weight = 0.0;
+        assert!(validate_prediction_research_prior_for_source_kind(
+            &prior,
+            crate::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
+        )
+        .is_ok());
+
+        let rows = build_factor_observations_v2(&[base_obs()], &FactorReviewOptions::default());
+        let models = settlement_probability_models(
+            &rows[0],
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        );
+        assert!(models
+            .iter()
+            .all(|(name, _)| { matches!(*name, "q_naive_50_50" | "q_market_midpoint") }));
     }
 
     #[test]

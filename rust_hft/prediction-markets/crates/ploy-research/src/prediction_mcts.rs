@@ -14,13 +14,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::autofactor::LlmProbabilityBlendSpec;
+use crate::factors_v2::SettlementProbabilityComponentProfile;
 use crate::prediction_loop::{
     current_prediction_policy_snapshot_id, validate_prediction_mission,
     validate_prediction_proposal, PredictionProposal, PredictionResearchMission,
     ProposedProbabilityBlend,
 };
 
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 const MUTATION_STEP: f64 = 0.25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +171,17 @@ impl WeightComponent {
     }
 }
 
+const MARKET_MIDPOINT_ONLY: [WeightComponent; 1] = [WeightComponent::MarketMidpoint];
+
+fn eligible_components(
+    profile: SettlementProbabilityComponentProfile,
+) -> &'static [WeightComponent] {
+    match profile {
+        SettlementProbabilityComponentProfile::FullSurface => &WeightComponent::ALL,
+        SettlementProbabilityComponentProfile::MarketMidpointOnly => &MARKET_MIDPOINT_ONLY,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ExpansionAction {
@@ -177,9 +189,10 @@ enum ExpansionAction {
     LlmAdvisor { blend: LlmProbabilityBlendSpec },
 }
 
-fn deterministic_actions() -> Vec<ExpansionAction> {
-    WeightComponent::ALL
-        .into_iter()
+fn deterministic_actions(profile: SettlementProbabilityComponentProfile) -> Vec<ExpansionAction> {
+    eligible_components(profile)
+        .iter()
+        .copied()
         .map(|component| ExpansionAction::Increase { component })
         .collect()
 }
@@ -236,6 +249,8 @@ struct PredictionMctsConfig {
     max_candidates: usize,
     baseline_blend_sha256: String,
     llm_advisor_sha256: Vec<String>,
+    #[serde(default)]
+    component_profile: SettlementProbabilityComponentProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,10 +320,13 @@ impl PredictionMctsCheckpoint {
                 let parent = &self.nodes[node.parent.expect("validated tree has a parent")];
                 let valid_source = match node.source {
                     PredictionExpansionSource::DeterministicMutation => {
-                        WeightComponent::ALL.into_iter().any(|component| {
-                            mutate_blend(&parent.blend, component, node.depth)
-                                .is_ok_and(|blend| blend == node.blend)
-                        })
+                        eligible_components(self.config.component_profile)
+                            .iter()
+                            .copied()
+                            .any(|component| {
+                                mutate_blend(&parent.blend, component, node.depth)
+                                    .is_ok_and(|blend| blend == node.blend)
+                            })
                     }
                     PredictionExpansionSource::LlmAdvisor => {
                         node.parent == Some(0)
@@ -324,6 +342,11 @@ impl PredictionMctsCheckpoint {
                 }
             }
             for action in &node.unexpanded_actions {
+                if let ExpansionAction::Increase { component } = action {
+                    if !eligible_components(self.config.component_profile).contains(component) {
+                        return Err("unauthorized prediction MCTS component action".to_string());
+                    }
+                }
                 if let ExpansionAction::LlmAdvisor { blend } = action {
                     if node_id != 0
                         || !self
@@ -423,6 +446,26 @@ impl PredictionMctsEngine {
         exploration: f64,
         max_depth: usize,
     ) -> Result<Self, String> {
+        Self::new_with_component_profile(
+            mission,
+            baseline,
+            llm_advice,
+            seed,
+            exploration,
+            max_depth,
+            SettlementProbabilityComponentProfile::FullSurface,
+        )
+    }
+
+    pub fn new_with_component_profile(
+        mission: &PredictionResearchMission,
+        baseline: ProposedProbabilityBlend,
+        llm_advice: Vec<ProposedProbabilityBlend>,
+        seed: u64,
+        exploration: f64,
+        max_depth: usize,
+        component_profile: SettlementProbabilityComponentProfile,
+    ) -> Result<Self, String> {
         let identity = PredictionMctsIdentity::from_mission(mission)?;
         if mission.search_budget.max_candidates == 0 {
             return Err("prediction MCTS requires a non-zero candidate budget".to_string());
@@ -435,6 +478,11 @@ impl PredictionMctsEngine {
         }
 
         let baseline = validate_single_proposal(baseline)?;
+        if !blend_allowed(component_profile, &baseline) {
+            return Err(
+                "prediction MCTS baseline uses an ineligible probability component".to_string(),
+            );
+        }
         let advisors = if llm_advice.is_empty() {
             Vec::new()
         } else {
@@ -445,7 +493,15 @@ impl PredictionMctsEngine {
                 mission.search_budget.max_candidates,
             )?
         };
-        let mut root_actions = deterministic_actions();
+        if advisors
+            .iter()
+            .any(|blend| !blend_allowed(component_profile, blend))
+        {
+            return Err(
+                "prediction MCTS advisor uses an ineligible probability component".to_string(),
+            );
+        }
+        let mut root_actions = deterministic_actions(component_profile);
         let llm_advisor_sha256 = advisors.iter().map(blend_digest).collect();
         root_actions.extend(
             advisors
@@ -463,6 +519,7 @@ impl PredictionMctsEngine {
                 max_candidates: mission.search_budget.max_candidates,
                 baseline_blend_sha256: blend_digest(&baseline),
                 llm_advisor_sha256,
+                component_profile,
             },
             rng: DeterministicRng::new(seed),
             nodes: vec![PredictionNode {
@@ -613,7 +670,7 @@ impl PredictionMctsEngine {
             parent: Some(parent_id),
             children: Vec::new(),
             unexpanded_actions: if depth < self.checkpoint.config.max_depth {
-                deterministic_actions()
+                deterministic_actions(self.checkpoint.config.component_profile)
             } else {
                 Vec::new()
             },
@@ -625,6 +682,18 @@ impl PredictionMctsEngine {
         self.checkpoint.nodes[parent_id].children.push(node_id);
         Ok(node_id)
     }
+}
+
+fn blend_allowed(
+    profile: SettlementProbabilityComponentProfile,
+    blend: &LlmProbabilityBlendSpec,
+) -> bool {
+    profile == SettlementProbabilityComponentProfile::FullSurface
+        || (blend.market_midpoint_weight > 0.0
+            && blend.chainlink_digital_weight == 0.0
+            && blend.distance_lob_vol_weight == 0.0
+            && blend.event_surface_weight == 0.0
+            && blend.existing_model_weight == 0.0)
 }
 
 fn validate_single_proposal(
@@ -751,6 +820,18 @@ mod tests {
         }
     }
 
+    fn market_midpoint_blend(name: &str) -> ProposedProbabilityBlend {
+        ProposedProbabilityBlend {
+            name: name.to_string(),
+            hypothesis: "market midpoint only".to_string(),
+            market_midpoint_weight: 1.0,
+            chainlink_digital_weight: 0.0,
+            distance_lob_vol_weight: 0.0,
+            event_surface_weight: 0.0,
+            existing_model_weight: 0.0,
+        }
+    }
+
     struct FakeEvaluator;
 
     impl PredictionTrainingEvaluator for FakeEvaluator {
@@ -785,6 +866,51 @@ mod tests {
                 }),
             })
         }
+    }
+
+    #[test]
+    fn market_midpoint_profile_never_expands_an_unsupported_component() {
+        let mut mission = mission();
+        mission.search_budget.max_candidates = 3;
+        mission.search_budget.max_llm_calls = 1;
+        mission.prompt_snapshot_id = research_brief_snapshot_id(&mission);
+        let mut engine = PredictionMctsEngine::new_with_component_profile(
+            &mission,
+            market_midpoint_blend("baseline"),
+            Vec::new(),
+            7,
+            1.4,
+            3,
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        )
+        .expect("market-midpoint-only engine");
+
+        for _ in 0..3 {
+            let candidate = engine.propose().expect("eligible deterministic candidate");
+            assert_eq!(candidate.probability_blend.chainlink_digital_weight, 0.0);
+            assert_eq!(candidate.probability_blend.distance_lob_vol_weight, 0.0);
+            assert_eq!(candidate.probability_blend.event_surface_weight, 0.0);
+            assert_eq!(candidate.probability_blend.existing_model_weight, 0.0);
+            let evaluation = FakeEvaluator
+                .evaluate_training(&candidate)
+                .expect("training evidence");
+            engine
+                .observe(&candidate.candidate_id, &evaluation)
+                .expect("observe eligible candidate");
+        }
+
+        let error = PredictionMctsEngine::new_with_component_profile(
+            &mission,
+            market_midpoint_blend("baseline"),
+            vec![blend("invalid_advisor")],
+            7,
+            1.4,
+            3,
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        )
+        .err()
+        .expect("unsupported advisor must fail");
+        assert!(error.contains("ineligible"));
     }
 
     #[test]
