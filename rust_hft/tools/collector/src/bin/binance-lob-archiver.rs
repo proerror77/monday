@@ -1,8 +1,12 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::Parser;
 use data::binance_market_tape::{
     AggregateTrade, AggregateTradeSequenceValidator, DepthSourceClock,
     DepthSourceClockSequenceValidator,
+};
+use data::binance_market_tape_artifact::{
+    seal_binance_market_tape_triplet, verify_binance_market_tape_with_required_trade_summaries,
+    BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor,
 };
 use futures::StreamExt;
 use hft_collector::lob_archiver::{
@@ -32,8 +36,21 @@ struct Args {
     #[arg(long)]
     self_test: bool,
 
-    #[arg(long, conflicts_with = "self_test")]
+    #[arg(long, conflicts_with_all = ["self_test", "verify_segment"])]
     upload_only: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["self_test", "upload_only"],
+        requires_all = ["segment_content_sha256", "segment_manifest_sha256"]
+    )]
+    verify_segment: Vec<PathBuf>,
+
+    #[arg(long, requires = "verify_segment")]
+    segment_content_sha256: Vec<String>,
+
+    #[arg(long, requires = "verify_segment")]
+    segment_manifest_sha256: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +566,9 @@ async fn main() -> anyhow::Result<()> {
     if args.upload_only {
         return upload_only(&UploadConfig::from_env()?).await;
     }
+    if !args.verify_segment.is_empty() {
+        return verify_segments(&args);
+    }
 
     let spool_dir = PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob"));
     std::fs::create_dir_all(&spool_dir)?;
@@ -579,6 +599,48 @@ async fn main() -> anyhow::Result<()> {
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
+    Ok(())
+}
+
+fn verify_segments(args: &Args) -> anyhow::Result<()> {
+    let count = args.verify_segment.len();
+    if count == 0
+        || args.segment_content_sha256.len() != count
+        || args.segment_manifest_sha256.len() != count
+    {
+        bail!(
+            "--verify-segment, --segment-content-sha256, and --segment-manifest-sha256 must have equal nonzero lengths"
+        );
+    }
+
+    let mut content_hashes = BTreeSet::new();
+    let mut sealed = Vec::with_capacity(count);
+    for ((path, content_sha256), manifest_sha256) in args
+        .verify_segment
+        .iter()
+        .zip(&args.segment_content_sha256)
+        .zip(&args.segment_manifest_sha256)
+    {
+        if !content_hashes.insert(content_sha256) {
+            bail!("duplicate market-tape segment supplied");
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("market-tape segment path has no UTF-8 file name")?;
+        let triplet = BinanceMarketTapeTriplet {
+            data: path.clone(),
+            manifest: path.with_file_name(format!("{file_name}.manifest.json")),
+            success: path.with_file_name(format!("{file_name}._SUCCESS")),
+        };
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
+        sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
+    }
+    let verified = verify_binance_market_tape_with_required_trade_summaries(sealed)?;
+    println!(
+        "strict market-tape verification: ok ({} segments)",
+        verified.segments().len()
+    );
     Ok(())
 }
 
@@ -1909,6 +1971,66 @@ mod tests {
             Args::try_parse_from(["binance-lob-archiver", "--upload-only", "--self-test",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn verify_segments_cli_requires_equal_explicit_trust_anchors() {
+        let args = Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part-1.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-segment",
+            "/tmp/part-2.jsonl.zst",
+            "--segment-content-sha256",
+            &"c".repeat(64),
+            "--segment-manifest-sha256",
+            &"d".repeat(64),
+        ])
+        .unwrap();
+        assert_eq!(args.verify_segment.len(), 2);
+        assert_eq!(args.segment_content_sha256.len(), 2);
+        assert_eq!(args.segment_manifest_sha256.len(), 2);
+
+        let unequal = Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-content-sha256",
+            &"b".repeat(64),
+            "--segment-manifest-sha256",
+            &"c".repeat(64),
+        ])
+        .unwrap();
+        assert!(verify_segments(&unequal)
+            .unwrap_err()
+            .to_string()
+            .contains("must have equal nonzero lengths"));
+
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--self-test",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+        ])
+        .is_err());
     }
 
     #[tokio::test]

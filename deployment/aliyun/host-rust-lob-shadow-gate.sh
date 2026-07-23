@@ -7,6 +7,7 @@ export LC_ALL=C
 readonly REQUIRED_DURATION_SECONDS=3600
 readonly HEALTH_SETTLE_SECONDS=360
 readonly MAX_HEALTH_SILENCE_SECONDS=90
+readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -606,9 +607,11 @@ verify_oss_round_trips() {
   local candidates="$tmp_dir/${market}-manifest-candidates.tsv"
   local index=0
   local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
-  local actual_digest bytes agg_trade_count manifest_agg_trade_count
+  local segment_dir manifest_path manifest_digest actual_manifest_digest
+  local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
   local previous_end_ns=0
   local round_trips='[]'
+  local -a strict_verifier_args=()
 
   manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
@@ -639,6 +642,9 @@ verify_oss_round_trips() {
     ((end_ns < gate_started_ns)) && continue
     jq -e \
       '.schema == "binance.market_tape.v1"
+        and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
+        and (.trade_summaries | type) == "object"
+        and (.trade_summaries | length) > 0
         and (.event_types.agg_trade | type) == "number"
         and .event_types.agg_trade == (.event_types.agg_trade | floor)
         and .event_types.agg_trade > 0' \
@@ -646,9 +652,11 @@ verify_oss_round_trips() {
       || die "$market has an incomplete market-tape manifest after gate start: $uri"
     file=$(jq -er '.file' "$manifest")
     digest=$(jq -er '.sha256' "$manifest")
+    manifest_digest=$(sha256sum "$manifest" | awk '{print $1}')
     manifest_agg_trade_count=$(jq -er '.event_types.agg_trade' "$manifest")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$start_ns" "$end_ns" "$uri" "$file" "$digest" "$manifest" "$manifest_agg_trade_count" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$start_ns" "$end_ns" "$uri" "$file" "$digest" "$manifest_digest" "$manifest" \
+      "$manifest_agg_trade_count" \
       >>"$candidates"
   done <"$uris"
 
@@ -657,19 +665,33 @@ verify_oss_round_trips() {
     || die "$market has fewer than two OSS manifests created after gate start"
 
   index=0
-  while IFS=$'\t' read -r start_ns end_ns uri file digest manifest manifest_agg_trade_count; do
+  while IFS=$'\t' read -r start_ns end_ns uri file digest manifest_digest manifest \
+    manifest_agg_trade_count; do
     index=$((index + 1))
     if ((previous_end_ns > 0 && start_ns < previous_end_ns)); then
       die "$market gate segments overlap at $uri"
     fi
+    gap_ns=0
+    if ((previous_end_ns > 0)); then
+      gap_ns=$((start_ns - previous_end_ns))
+      ((gap_ns <= MAX_SEGMENT_GAP_NS)) \
+        || die "$market gate segments exceed the continuity gap bound at $uri"
+    fi
     previous_end_ns=$end_ns
+    segment_dir="$tmp_dir/${market}-segment-${index}"
+    mkdir -m 0750 "$segment_dir"
     zst_uri="${uri%/*}/$file"
-    zst_path="$tmp_dir/${market}-${index}.jsonl.zst"
+    zst_path="$segment_dir/$file"
+    manifest_path="$segment_dir/${file}.manifest.json"
+    run_oss "$market" cp "$uri" "$manifest_path" --force --no-progress >/dev/null
+    actual_manifest_digest=$(sha256sum "$manifest_path" | awk '{print $1}')
+    [[ $actual_manifest_digest == "$manifest_digest" ]] \
+      || die "$market manifest changed between discovery and readback: $uri"
     run_oss "$market" cp "$zst_uri" "$zst_path" --force --no-progress >/dev/null
     actual_digest=$(sha256sum "$zst_path" | awk '{print $1}')
     [[ $actual_digest == "$digest" ]] || die "$market OSS round-trip digest mismatch: $zst_uri"
     success_uri="${uri%/*}/${file}._SUCCESS"
-    success_path="$tmp_dir/${market}-${index}._SUCCESS"
+    success_path="$segment_dir/${file}._SUCCESS"
     run_oss "$market" cp "$success_uri" "$success_path" --force --no-progress >/dev/null
     printf '%s\n' "$digest" | cmp -s - "$success_path" \
       || die "$market OSS success marker does not match segment SHA-256: $success_uri"
@@ -700,6 +722,11 @@ verify_oss_round_trips() {
       || die "$market segment has no valid aggregate trades: $zst_uri"
     [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
       || die "$market manifest aggregate-trade count does not match segment: $uri"
+    strict_verifier_args+=(
+      --verify-segment "$zst_path"
+      --segment-content-sha256 "$digest"
+      --segment-manifest-sha256 "$manifest_digest"
+    )
     bytes=$(stat -c '%s' "$zst_path")
     install -m 0640 "$manifest" "$evidence_dir/${market}-manifest-${index}.json"
     round_trip=$(jq -cn \
@@ -707,16 +734,22 @@ verify_oss_round_trips() {
       --arg data_uri "$zst_uri" \
       --arg success_uri "$success_uri" \
       --arg sha256 "$digest" \
+      --arg manifest_sha256 "$manifest_digest" \
       --argjson start_received_at_ns "$start_ns" \
       --argjson end_received_at_ns "$end_ns" \
+      --argjson gap_from_previous_ns "$gap_ns" \
       --argjson bytes "$bytes" \
       --argjson agg_trade_count "$agg_trade_count" \
       '{manifest_uri:$manifest_uri,data_uri:$data_uri,success_uri:$success_uri,sha256:$sha256,
+        manifest_sha256:$manifest_sha256,gap_from_previous_ns:$gap_from_previous_ns,
         start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,bytes:$bytes,
         agg_trade_count:$agg_trade_count}')
     round_trips=$(jq -cn --argjson values "$round_trips" --argjson value "$round_trip" \
       '$values + [$value]')
   done < <(sort -n -k1,1 "$candidates")
+
+  "$candidate_binary" "${strict_verifier_args[@]}" >/dev/null \
+    || die "$market strict aggregate-trade summary readback failed"
 
   printf '%s\n' "$round_trips"
 }
@@ -760,6 +793,8 @@ for market in "${markets[@]}"; do
       cpu_usage_ns:$cpu_usage_ns,cpu_quota_per_sec_us:$cpu_quota_per_sec_us,
       memory_peak_bytes:$memory_peak_bytes,memory_max_bytes:$memory_max_bytes,
       health_sha256:$health_sha256,
+      strict_trade_summary_readback:true,
+      max_segment_gap_ns:([$oss_round_trips[].gap_from_previous_ns] | max),
       oss_roundtrips:($oss_round_trips | length),
       agg_trade_segments:($oss_round_trips | length),
       agg_trade_count:([$oss_round_trips[].agg_trade_count] | add),

@@ -36,10 +36,22 @@ and .markets.spot.agg_trade_segments == .markets.spot.oss_roundtrips
 and (.markets.spot.agg_trade_count | type) == "number"
 and .markets.spot.agg_trade_count == (.markets.spot.agg_trade_count | floor)
 and .markets.spot.agg_trade_count > 0
+and .markets.spot.strict_trade_summary_readback == true
+and (.markets.spot.max_segment_gap_ns | type) == "number"
+and .markets.spot.max_segment_gap_ns == (.markets.spot.max_segment_gap_ns | floor)
+and .markets.spot.max_segment_gap_ns >= 0
+and .markets.spot.max_segment_gap_ns <= 90000000000
 and (.markets.spot.oss_roundtrip_evidence | type) == "array"
 and (.markets.spot.oss_roundtrip_evidence | length) == .markets.spot.oss_roundtrips
 and all(.markets.spot.oss_roundtrip_evidence[];
   (.success_uri | type) == "string" and (.success_uri | length) > 0
+  and (.sha256 | type) == "string"
+  and (.sha256 | test("^[a-f0-9]{64}$"))
+  and (.manifest_sha256 | type) == "string"
+  and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
+  and (.gap_from_previous_ns | type) == "number"
+  and .gap_from_previous_ns == (.gap_from_previous_ns | floor)
+  and .gap_from_previous_ns >= 0
   and (.start_received_at_ns | type) == "number"
   and .start_received_at_ns == (.start_received_at_ns | floor)
   and (.end_received_at_ns | type) == "number"
@@ -49,8 +61,12 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and .agg_trade_count == (.agg_trade_count | floor)
   and .agg_trade_count > 0)
 and (.markets.spot.oss_roundtrip_evidence as $round_trips
-  | all(range(1; ($round_trips | length));
-      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns))
+  | $round_trips[0].gap_from_previous_ns == 0
+  and .markets.spot.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
+  and all(range(1; ($round_trips | length));
+      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
+      and $round_trips[.].gap_from_previous_ns
+        == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
 and (.markets.usdm.symbol_count | type) == "number"
 and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
 and .markets.usdm.symbol_count >= 400
@@ -79,10 +95,22 @@ and .markets.usdm.agg_trade_segments == .markets.usdm.oss_roundtrips
 and (.markets.usdm.agg_trade_count | type) == "number"
 and .markets.usdm.agg_trade_count == (.markets.usdm.agg_trade_count | floor)
 and .markets.usdm.agg_trade_count > 0
+and .markets.usdm.strict_trade_summary_readback == true
+and (.markets.usdm.max_segment_gap_ns | type) == "number"
+and .markets.usdm.max_segment_gap_ns == (.markets.usdm.max_segment_gap_ns | floor)
+and .markets.usdm.max_segment_gap_ns >= 0
+and .markets.usdm.max_segment_gap_ns <= 90000000000
 and (.markets.usdm.oss_roundtrip_evidence | type) == "array"
 and (.markets.usdm.oss_roundtrip_evidence | length) == .markets.usdm.oss_roundtrips
 and all(.markets.usdm.oss_roundtrip_evidence[];
   (.success_uri | type) == "string" and (.success_uri | length) > 0
+  and (.sha256 | type) == "string"
+  and (.sha256 | test("^[a-f0-9]{64}$"))
+  and (.manifest_sha256 | type) == "string"
+  and (.manifest_sha256 | test("^[a-f0-9]{64}$"))
+  and (.gap_from_previous_ns | type) == "number"
+  and .gap_from_previous_ns == (.gap_from_previous_ns | floor)
+  and .gap_from_previous_ns >= 0
   and (.start_received_at_ns | type) == "number"
   and .start_received_at_ns == (.start_received_at_ns | floor)
   and (.end_received_at_ns | type) == "number"
@@ -92,5 +120,9 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and .agg_trade_count == (.agg_trade_count | floor)
   and .agg_trade_count > 0)
 and (.markets.usdm.oss_roundtrip_evidence as $round_trips
-  | all(range(1; ($round_trips | length));
-      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns))
+  | $round_trips[0].gap_from_previous_ns == 0
+  and .markets.usdm.max_segment_gap_ns == ([$round_trips[].gap_from_previous_ns] | max)
+  and all(range(1; ($round_trips | length));
+      $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
+      and $round_trips[.].gap_from_previous_ns
+        == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
