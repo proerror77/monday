@@ -8,6 +8,11 @@ and .symbol_count >= $minimum_symbols
 and (.snapshot_ready_count | type) == "number"
 and .snapshot_ready_count == (.snapshot_ready_count | floor)
 and .snapshot_ready_count == .symbol_count
+and .bridged_count == .symbol_count
+and .stream_coverage_verified_count == .symbol_count
+and .snapshot_only_symbols == []
+and .all_symbols_bridged == true
+and .all_stream_coverage_verified == true
 and .pending_upload_segments == 0
 and .queue_saturated == false
 and .disk_warning == false

@@ -408,8 +408,10 @@ health_passes() {
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
       and .bridged_count == .symbol_count
+      and .stream_coverage_verified_count == .symbol_count
       and .snapshot_only_symbols == []
       and .all_symbols_bridged == true
+      and .all_stream_coverage_verified == true
       and .queue_saturated == false
       and .disk_warning == false
       and .upload_warning == false
@@ -520,7 +522,7 @@ if [[ $test_only != true ]]; then
 fi
 
 declare -A observed_runtime_seconds cpu_usage_ns memory_peak_bytes health_sha256
-declare -A symbol_count snapshot_ready_count sequence_gaps
+declare -A symbol_count snapshot_ready_count stream_coverage_verified_count sequence_gaps
 now_monotonic_us=$(awk '{printf "%.0f\n", $1 * 1000000}' /proc/uptime)
 for market in "${markets[@]}"; do
   assert_candidate
@@ -559,6 +561,7 @@ for market in "${markets[@]}"; do
   health_sha256[$market]=$(sha256sum "$health_copy" | awk '{print $1}')
   symbol_count[$market]=$(jq -er '.symbol_count' "$health")
   snapshot_ready_count[$market]=$(jq -er '.snapshot_ready_count' "$health")
+  stream_coverage_verified_count[$market]=$(jq -er '.stream_coverage_verified_count' "$health")
   sequence_gaps[$market]=$(jq -er '.sequence_gaps' "$health")
 done
 
@@ -657,26 +660,36 @@ verify_oss_round_trips() {
         and .lob_continuity.declared_symbol_count == (.symbols | length)
         and .lob_continuity.covered_symbol_count == (.symbols | length)
         and .lob_continuity.missing_symbols == []
+        and .stream_coverage_verified_count == (.symbols | length)
+        and .all_stream_coverage_verified == true
         and (.lob_continuity.symbols | type) == "object"
         and (.lob_continuity.symbols | length) == (.symbols | length)
         and all(.lob_continuity.symbols[];
           .snapshot_seed_count > 0
-          and .diff_count > 0
           and .checkpoint_count > 0
-          and (.first_update_id | type) == "number"
-          and (.last_update_id | type) == "number"
-          and .last_update_id >= .first_update_id
-          and (.first_source_time_ms | type) == "number"
-          and (.last_source_time_ms | type) == "number"
-          and .last_source_time_ms >= .first_source_time_ms
+          and .stream_coverage_verified == true
+          and ((.diff_count > 0
+              and (.first_update_id | type) == "number"
+              and (.last_update_id | type) == "number"
+              and .last_update_id >= .first_update_id
+              and (.first_source_time_ms | type) == "number"
+              and (.last_source_time_ms | type) == "number"
+              and .last_source_time_ms >= .first_source_time_ms
+              and (.min_source_latency_ms | type) == "number"
+              and (.max_source_latency_ms | type) == "number"
+              and .min_source_latency_ms >= -1000
+              and .max_source_latency_ms <= 30000
+              and .max_source_latency_ms >= .min_source_latency_ms)
+            or (.diff_count == 0
+              and .first_update_id == null
+              and .last_update_id == null
+              and .first_source_time_ms == null
+              and .last_source_time_ms == null
+              and .min_source_latency_ms == null
+              and .max_source_latency_ms == null))
           and (.first_received_at_ns | type) == "number"
           and (.last_received_at_ns | type) == "number"
           and .last_received_at_ns >= .first_received_at_ns
-          and (.min_source_latency_ms | type) == "number"
-          and (.max_source_latency_ms | type) == "number"
-          and .min_source_latency_ms >= -1000
-          and .max_source_latency_ms <= 30000
-          and .max_source_latency_ms >= .min_source_latency_ms
           and (.min_bid_levels | type) == "number"
           and (.max_bid_levels | type) == "number"
           and .min_bid_levels > 0
@@ -792,8 +805,10 @@ verify_oss_round_trips() {
         lob_source_time_rollbacks:$lob_continuity.source_time_rollbacks,
         lob_declared_symbol_count:$lob_continuity.declared_symbol_count,
         lob_covered_symbol_count:$lob_continuity.covered_symbol_count,
-        lob_min_source_latency_ms:([$lob_continuity.symbols[].min_source_latency_ms] | min),
-        lob_max_source_latency_ms:([$lob_continuity.symbols[].max_source_latency_ms] | max),
+        stream_coverage_verified_count:$manifest[0].stream_coverage_verified_count,
+        all_stream_coverage_verified:$manifest[0].all_stream_coverage_verified,
+        lob_min_source_latency_ms:([$lob_continuity.symbols[].min_source_latency_ms | select(type == "number")] | min),
+        lob_max_source_latency_ms:([$lob_continuity.symbols[].max_source_latency_ms | select(type == "number")] | max),
         lob_min_bid_levels:([$lob_continuity.symbols[].min_bid_levels] | min),
         lob_min_ask_levels:([$lob_continuity.symbols[].min_ask_levels] | min)}')
     round_trips=$(jq -cn --argjson values "$round_trips" --argjson value "$round_trip" \
@@ -829,6 +844,7 @@ for market in "${markets[@]}"; do
     --arg health_sha256 "${health_sha256[$market]}" \
     --argjson symbol_count "${symbol_count[$market]}" \
     --argjson snapshot_ready_count "${snapshot_ready_count[$market]}" \
+    --argjson stream_coverage_verified_count "${stream_coverage_verified_count[$market]}" \
     --argjson sequence_gaps "${sequence_gaps[$market]}" \
     --argjson upload_failure_count "${initial_upload_failure_count[$market]}" \
     --argjson health_samples "${health_samples[$market]}" \
@@ -843,6 +859,8 @@ for market in "${markets[@]}"; do
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session_id,
       symbols_config:"ALL",catalog_sha256:$catalog_sha256,
       symbol_count:$symbol_count,snapshot_ready_count:$snapshot_ready_count,
+      stream_coverage_verified_count:$stream_coverage_verified_count,
+      all_stream_coverage_verified:($stream_coverage_verified_count == $symbol_count),
       sequence_gaps:$sequence_gaps,upload_failure_count:$upload_failure_count,
       health_samples:$health_samples,
       max_health_silence_seconds:$max_health_silence_seconds,

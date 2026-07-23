@@ -462,6 +462,18 @@ isolated spools below, and isolated OSS datasets:
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
 | USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
 
+Each session proves the exact expected depth and `aggTrade` subscription set on
+every WebSocket shard with `LIST_SUBSCRIPTIONS` before it requests snapshots.
+Every segment also retains the sorted stream list returned for each shard in a
+SHA-bound `stream_coverage` row, so canonical readback can recompute the exact
+depth-plus-`aggTrade` catalog instead of trusting a boolean alone. The resulting
+`binance.market_tape.v1` checkpoints, health, and manifests carry the derived
+coverage summary. A symbol that receives no depth or trade event during
+a segment is complete only when it has an unchanged two-sided snapshot-backed
+checkpoint and verified stream coverage; the collector never invents a diff or
+trade for a static symbol. Every segment must still contain at least one real
+`agg_trade` for its market dataset.
+
 ### 2. Run the one-hour full-catalog gate
 
 Start the gate through the same CLI wrapper:
@@ -482,7 +494,8 @@ these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
 - Spot has at least 1,000 symbols and USD-M at least 400;
-- every discovered symbol has a ready snapshot and sequence gaps remain zero;
+- every discovered symbol has a ready two-sided snapshot, exact WebSocket stream
+  coverage is verified, and sequence gaps remain zero;
 - neither session nor catalog membership changes, health never stops advancing
   for more than 120 seconds, and the persistent upload-failure count is unchanged;
 - queue, disk, and upload warnings are false, while the persistent upload-failure
@@ -492,7 +505,9 @@ these are true for the entire candidate run:
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
 - for each market, at least two manifests opened after health settles and the
   observation starts are downloaded from OSS with their data object and
-  reproduce the manifest SHA-256.
+  reproduce the manifest SHA-256; each manifest contains real aggregate trades,
+  complete checkpoint coverage, and either sequence-checked diffs or explicit
+  static-symbol evidence derived from the verified subscription set.
 
 A successful production gate writes:
 

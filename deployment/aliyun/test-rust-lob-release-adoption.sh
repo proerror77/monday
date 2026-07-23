@@ -138,7 +138,8 @@ setup_fixture() {
   gate_dir="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256/runs/gate-1"
   mkdir -p "$gate_dir"
   market=$(jq -cn \
-    '{symbol_count:1200,snapshot_ready_count:1200,sequence_gaps:0,
+    '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
+      stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
       upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
@@ -155,6 +156,7 @@ setup_fixture() {
          lob_capture_session_id:"shadow-session",lob_reconnect_boundary:false,
          lob_sequence_gaps:0,lob_source_time_rollbacks:0,
          lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+         stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
          lob_min_bid_levels:1,lob_min_ask_levels:1},
         {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",
@@ -164,14 +166,18 @@ setup_fixture() {
          lob_capture_session_id:"shadow-session",lob_reconnect_boundary:false,
          lob_sequence_gaps:0,lob_source_time_rollbacks:0,
          lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+         stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
          lob_min_bid_levels:1,lob_min_ask_levels:1}
       ]}')
   usdm_market=$(jq -c '
     .symbol_count = 500
     | .snapshot_ready_count = 500
+    | .bridged_count = 500
+    | .stream_coverage_verified_count = 500
     | .oss_roundtrip_evidence |= map(
-        .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500)' \
+        .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
+        | .stream_coverage_verified_count = 500)' \
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
@@ -189,11 +195,15 @@ setup_fixture() {
   jq -n --argjson now "$now_ns" \
     '{market:"spot",dataset:"spot_all",status:"synced",session_id:"prod-spot",
       updated_at_ns:$now,sequence_gaps:0,symbol_count:1357,snapshot_ready_count:1357,
+      bridged_count:1357,stream_coverage_verified_count:1357,snapshot_only_symbols:[],
+      all_symbols_bridged:true,all_stream_coverage_verified:true,
       pending_upload_segments:0,queue_saturated:false,disk_warning:false,
       upload_warning:false}' >"$DATA_ROOT/monday/spool/binance-lob/spot/health.json"
   jq -n --argjson now "$now_ns" \
     '{market:"usdm",dataset:"usdm_perpetual_all",status:"synced",session_id:"prod-usdm",
       updated_at_ns:$now,sequence_gaps:1,symbol_count:573,snapshot_ready_count:573,
+      bridged_count:573,stream_coverage_verified_count:573,snapshot_only_symbols:[],
+      all_symbols_bridged:true,all_stream_coverage_verified:true,
       pending_upload_segments:0,queue_saturated:false,disk_warning:false,
       upload_warning:false}' >"$DATA_ROOT/monday/spool/binance-lob/usdm/health.json"
   ln -s "$PRODUCTION_BINARY" "$PROC_ROOT/111/exe"
