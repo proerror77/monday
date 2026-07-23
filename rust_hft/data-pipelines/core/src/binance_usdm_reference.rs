@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::binance_market_tape::{MAX_SOURCE_DELAY_MS, MAX_SOURCE_LEAD_MS};
 
-pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v1";
+pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v2";
 pub const EXCHANGE_INFO_ENDPOINT: &str = "/fapi/v1/exchangeInfo";
 pub const SERVER_TIME_ENDPOINT: &str = "/fapi/v1/time";
 pub const PREMIUM_INDEX_ENDPOINT: &str = "/fapi/v1/premiumIndex";
@@ -29,6 +29,7 @@ pub struct ActivePerpetualContract {
     pub onboard_date_ms: u64,
     pub delivery_date_ms: u64,
     pub source_time_ms: u64,
+    pub source_clock_received_at_ns: u64,
     pub received_at_ns: u64,
     pub source_endpoint: String,
     pub source_clock_endpoint: String,
@@ -164,7 +165,11 @@ impl CompleteReferenceBatch {
 
 fn validate_contract(row: &ActivePerpetualContract) -> Result<()> {
     validate_symbol(&row.symbol)?;
+    validate_receive_clock(row.source_time_ms, row.source_clock_received_at_ns)?;
     validate_receive_clock(row.source_time_ms, row.received_at_ns)?;
+    if row.source_clock_received_at_ns > row.received_at_ns {
+        bail!("reference metadata precedes its source-clock receipt");
+    }
     if row.schema != REFERENCE_SCHEMA
         || row.source_endpoint != EXCHANGE_INFO_ENDPOINT
         || row.source_clock_endpoint != SERVER_TIME_ENDPOINT
@@ -259,9 +264,14 @@ impl ReferenceClockValidator {
 pub fn active_perpetual_contracts(
     exchange_info: &Value,
     source_time_ms: u64,
+    source_clock_received_at_ns: u64,
     received_at_ns: u64,
 ) -> Result<Vec<ActivePerpetualContract>> {
+    validate_receive_clock(source_time_ms, source_clock_received_at_ns)?;
     validate_receive_clock(source_time_ms, received_at_ns)?;
+    if source_clock_received_at_ns > received_at_ns {
+        bail!("exchangeInfo response precedes its source-clock receipt");
+    }
     let symbols = exchange_info
         .get("symbols")
         .and_then(Value::as_array)
@@ -291,6 +301,7 @@ pub fn active_perpetual_contracts(
             onboard_date_ms: required_u64(raw, "onboardDate", "exchangeInfo")?,
             delivery_date_ms: required_u64(raw, "deliveryDate", "exchangeInfo")?,
             source_time_ms,
+            source_clock_received_at_ns,
             received_at_ns,
             source_endpoint: EXCHANGE_INFO_ENDPOINT.to_owned(),
             source_clock_endpoint: SERVER_TIME_ENDPOINT.to_owned(),
@@ -471,6 +482,7 @@ mod tests {
     use std::str::FromStr;
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
+    const SOURCE_CLOCK_RECEIVED_NS: u64 = 1_700_000_000_400_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
 
     fn exchange_info() -> serde_json::Value {
@@ -513,8 +525,13 @@ mod tests {
 
     #[test]
     fn builds_complete_reference_batch_with_exact_basis_and_endpoint_identity() {
-        let contracts =
-            active_perpetual_contracts(&exchange_info(), SOURCE_MS, RECEIVED_NS).unwrap();
+        let contracts = active_perpetual_contracts(
+            &exchange_info(),
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap();
         let expected = contracts
             .iter()
             .map(|contract| contract.symbol.clone())
@@ -534,6 +551,18 @@ mod tests {
             batch.contracts()[0].source_clock_endpoint,
             SERVER_TIME_ENDPOINT
         );
+        assert_eq!(
+            batch.contracts()[0].source_clock_received_at_ns,
+            SOURCE_CLOCK_RECEIVED_NS
+        );
+        assert_eq!(batch.contracts()[0].schema, "binance.usdm_reference.v2");
+        let mut legacy_v1 = serde_json::to_value(&batch.contracts()[0]).unwrap();
+        legacy_v1["schema"] = json!("binance.usdm_reference.v1");
+        legacy_v1
+            .as_object_mut()
+            .unwrap()
+            .remove("source_clock_received_at_ns");
+        assert!(serde_json::from_value::<ActivePerpetualContract>(legacy_v1).is_err());
         let mark = &batch.mark_index_funding()[0];
         assert_eq!(mark.source_endpoint, PREMIUM_INDEX_ENDPOINT);
         assert_eq!(mark.basis, Decimal::ONE);
@@ -561,8 +590,13 @@ mod tests {
 
     #[test]
     fn complete_batch_rejects_missing_contract_observations() {
-        let contracts =
-            active_perpetual_contracts(&exchange_info(), SOURCE_MS, RECEIVED_NS).unwrap();
+        let contracts = active_perpetual_contracts(
+            &exchange_info(),
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap();
         let expected = BTreeSet::from(["BTCUSDT".to_owned()]);
         let marks =
             mark_index_funding_observations(&premium_index(), &expected, RECEIVED_NS).unwrap();
@@ -572,8 +606,13 @@ mod tests {
 
     #[test]
     fn complete_batch_rejects_tampered_source_identity_and_derived_basis() {
-        let contracts =
-            active_perpetual_contracts(&exchange_info(), SOURCE_MS, RECEIVED_NS).unwrap();
+        let contracts = active_perpetual_contracts(
+            &exchange_info(),
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap();
         let expected = BTreeSet::from(["BTCUSDT".to_owned()]);
         let marks =
             mark_index_funding_observations(&premium_index(), &expected, RECEIVED_NS).unwrap();
@@ -619,6 +658,16 @@ mod tests {
                 .to_string()
                 .contains("source clock leads received clock")
         );
+
+        assert!(active_perpetual_contracts(
+            &exchange_info(),
+            SOURCE_MS,
+            RECEIVED_NS + 1,
+            RECEIVED_NS,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("precedes its source-clock receipt"));
     }
 
     #[test]
@@ -629,12 +678,15 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(first_symbol);
-        assert!(
-            active_perpetual_contracts(&duplicate, SOURCE_MS, RECEIVED_NS)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate active perpetual contract")
-        );
+        assert!(active_perpetual_contracts(
+            &duplicate,
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate active perpetual contract"));
 
         let mut clocks = ReferenceClockValidator::default();
         clocks
