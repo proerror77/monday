@@ -1777,6 +1777,14 @@ mod tests {
     }
 
     #[test]
+    fn preserves_producer_quality_ratio_across_manifest_parse() {
+        let producer: Value = serde_json::from_str("0.9340463458110517").unwrap();
+        let rescanned = json!(1048_f64 / 1122_f64);
+
+        assert_eq!(producer, rescanned);
+    }
+
+    #[test]
     fn rejects_legacy_reference_manifest_when_rescan_finds_missing_metadata_context() {
         let reference = vec![row(0, trade()), row(1, metadata("market_settlement"))];
         let (_temp, config) = fixture_rows(&market_rows(), &reference);
