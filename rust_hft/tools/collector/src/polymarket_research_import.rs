@@ -833,12 +833,23 @@ mod tests {
                 json!({
                     "kind": "quote", "token_id": "up-token", "bid": "0.49", "ask": "0.51",
                     "bid_size": "10", "ask_size": "11",
+                    "request_status": "success", "collection_result": "executable",
                     "bid_levels": [{"price": "0.49", "size": "10"}],
                     "ask_levels": [{"price": "0.51", "size": "11"}], "ts": "2026-07-17T05:00:59Z",
                 }),
             ),
             row(
                 2,
+                json!({
+                    "kind": "quote", "token_id": "down-token", "bid": "0.48", "ask": "0.52",
+                    "bid_size": "12", "ask_size": "13",
+                    "request_status": "success", "collection_result": "executable",
+                    "bid_levels": [{"price": "0.48", "size": "12"}],
+                    "ask_levels": [{"price": "0.52", "size": "13"}], "ts": "2026-07-17T05:00:59Z",
+                }),
+            ),
+            row(
+                3,
                 json!({
                     "kind": "reference_price", "symbol": "btc/usd", "source": "chainlink",
                     "asset_class": "crypto", "price": "100", "full_accuracy_value": null,
@@ -1223,7 +1234,7 @@ mod tests {
         rejects(&config, "crosses its UTC-hour partition");
 
         let mut reference = reference_rows(true);
-        for mut record in market_rows().into_iter().take(2) {
+        for mut record in market_rows().into_iter().take(3) {
             record["sequence"] = json!(reference.len());
             reference.push(record);
         }
