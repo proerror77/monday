@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.91-bookworm AS builder
+
+WORKDIR /work
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    cmake \
+    mold \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+WORKDIR /work/prediction-markets
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/prediction-markets/target,sharing=locked \
+    if cargo tree --locked -p new-ploy-runner --features full -e features \
+      | grep -q 'live-execution'; then \
+      echo "new-ploy-runner full feature must not enable live-execution" >&2; \
+      exit 1; \
+    fi \
+    && cargo --config 'build.rustc-wrapper=""' build \
+      --release \
+      --locked \
+      -p new-ploy-runner \
+      --features full \
+    && install -D -m 0755 target/release/new-ploy-runner \
+      /out/bin/new-ploy-runner
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 recorder
+
+WORKDIR /work
+COPY --from=builder /out/bin/new-ploy-runner /usr/local/bin/new-ploy-runner
+COPY --chmod=0755 deployment/docker/polymarket-market-recorder-entrypoint.sh \
+    /usr/local/bin/polymarket-market-recorder-entrypoint
+
+USER recorder
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/polymarket-market-recorder-entrypoint"]
+CMD ["--help"]
