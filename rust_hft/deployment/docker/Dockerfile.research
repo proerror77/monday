@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -51,13 +51,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 research
-
-COPY --from=builder /out/bin/hft-backtest /usr/local/bin/hft-backtest
-COPY --from=builder /out/bin/alpha-harness /usr/local/bin/alpha-harness
-COPY --from=builder /out/bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
-COPY --from=builder /out/bin/monday-prediction-research /usr/local/bin/monday-prediction-research
-COPY --from=builder /out/bin/monday-prediction-evaluator /usr/local/bin/monday-prediction-evaluator
-COPY --from=builder /out/bin/monday-prediction-snapshot /usr/local/bin/monday-prediction-snapshot
 
 RUN mkdir -p /work/config /work/data /work/results \
     && chown -R research:research /work
@@ -70,3 +63,11 @@ ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
     MONDAY_PREDICTION_SNAPSHOT_BIN=/usr/local/bin/monday-prediction-snapshot
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]
+
+FROM runtime-base AS prebuilt
+
+COPY --chmod=0755 research-bin/ /usr/local/bin/
+
+FROM runtime-base AS runtime
+
+COPY --from=builder /out/bin/ /usr/local/bin/

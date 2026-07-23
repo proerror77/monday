@@ -121,9 +121,100 @@ jobs:
         run: >-
           "${HOME}/go/bin/actionlint" -color ../../.github/workflows/ploy-ci.yml
 
+  research-image-binaries:
+    name: Research image binaries
+    needs: image-smoke-scope
+    if: ${{ needs.image-smoke-scope.outputs.research_image_smoke == 'true' }}
+    runs-on: ubuntu-latest
+    container: rust:1.91-bookworm
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust_hft
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            clang \
+            cmake \
+            mold \
+            pkg-config \
+            protobuf-compiler \
+            sccache
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_hft
+          key: research-image-bookworm-${{ hashFiles('rust_hft/**/Cargo.lock') }}
+          cache-all-crates: true
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-
+
+      - name: Build research image binaries
+        run: |
+          set -euo pipefail
+          sccache --zero-stats
+          cargo build \
+            --release \
+            --locked \
+            -p hft-backtest \
+            -p alpha-harness
+          cargo build \
+            --release \
+            --locked \
+            -p hft-collector \
+            --bin lob-pit-materializer
+          CARGO_TARGET_DIR=target/prediction-markets \
+            cargo build \
+              --manifest-path prediction-markets/Cargo.toml \
+              --release \
+              --locked \
+              -p ploy-research \
+              --features db \
+              --bin monday-prediction-research \
+              --bin monday-prediction-evaluator \
+              --bin monday-prediction-snapshot
+          install -D -m 0755 target/release/hft-backtest research-bin/hft-backtest
+          install -D -m 0755 target/release/alpha-harness research-bin/alpha-harness
+          install -D -m 0755 target/release/lob-pit-materializer research-bin/lob-pit-materializer
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-bin/monday-prediction-research
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-bin/monday-prediction-evaluator
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-snapshot research-bin/monday-prediction-snapshot
+          test "$(find research-bin -maxdepth 1 -type f -perm -u+x | wc -l)" -eq 6
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Upload research image binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-image-binaries-${{ github.sha }}
+          path: rust_hft/research-bin/
+          if-no-files-found: error
+          retention-days: 1
+
   research-image-smoke:
     name: Research image smoke
-    needs: image-smoke-scope
+    needs:
+      - image-smoke-scope
+      - research-image-binaries
     if: ${{ needs.image-smoke-scope.outputs.research_image_smoke == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -134,11 +225,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Download research image binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: research-image-binaries-${{ github.sha }}
+          path: rust_hft/research-bin/
+
       - name: Build the unified research image
         uses: docker/build-push-action@v7
         with:
           context: rust_hft
           file: rust_hft/deployment/docker/Dockerfile.research
+          target: prebuilt
           load: true
           tags: monday-research-smoke:local
           cache-from: type=gha,scope=prediction-research-image
