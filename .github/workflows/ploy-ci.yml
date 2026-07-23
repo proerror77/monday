@@ -14,8 +14,10 @@ on:
       - "rust_hft/.dockerignore"
       - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
+      - ".github/workflows/acr-publish.yml"
       - ".github/workflows/ploy-ci.yml"
       - ".github/scripts/select-prediction-image-smoke.sh"
+      - ".github/scripts/test-acr-publish-workflow.sh"
       - ".github/scripts/test-select-prediction-image-smoke.sh"
   push:
     branches: [main]
@@ -30,8 +32,10 @@ on:
       - "rust_hft/.dockerignore"
       - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
+      - ".github/workflows/acr-publish.yml"
       - ".github/workflows/ploy-ci.yml"
       - ".github/scripts/select-prediction-image-smoke.sh"
+      - ".github/scripts/test-acr-publish-workflow.sh"
       - ".github/scripts/test-select-prediction-image-smoke.sh"
   workflow_dispatch:
 
@@ -119,7 +123,12 @@ jobs:
 
       - name: Run actionlint
         run: >-
-          "${HOME}/go/bin/actionlint" -color ../../.github/workflows/ploy-ci.yml
+          "${HOME}/go/bin/actionlint" -color
+          ../../.github/workflows/ploy-ci.yml
+          ../../.github/workflows/acr-publish.yml
+
+      - name: Test ACR publish workflow contract
+        run: ../../.github/scripts/test-acr-publish-workflow.sh
 
   research-image-binaries:
     name: Research image binaries
