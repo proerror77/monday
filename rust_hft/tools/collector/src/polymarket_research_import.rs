@@ -91,6 +91,13 @@ const MARKET_EVENT_TYPES: [&str; 4] = [
     "quote",
     "reference_price",
 ];
+const EVENT_LOCAL_MARKET_EVENT_TYPES: [&str; 5] = [
+    "event_discovered",
+    "event_expired",
+    "quote",
+    "quote_collection_failure",
+    "reference_price",
+];
 const REFERENCE_EVENT_TYPES: [&str; 4] = [
     "market_metadata",
     "polymarket_trade",
@@ -275,6 +282,7 @@ fn validate_triplet(
     scratch_name: &str,
     scratch: &Path,
     max_data_bytes: u64,
+    require_complete: bool,
 ) -> Result<ValidatedArtifact> {
     let sha_dir = triplet
         .data
@@ -363,12 +371,13 @@ fn validate_triplet(
             bail!("manifest {field} must be {expected}");
         }
     }
-    if manifest.get("canonical").and_then(Value::as_bool) != Some(true)
-        || manifest.get("segment_complete").and_then(Value::as_bool) != Some(true)
-        || manifest
-            .get("source_session_closed")
-            .and_then(Value::as_bool)
-            != Some(true)
+    if manifest
+        .get("source_session_closed")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || (require_complete
+            && (manifest.get("canonical").and_then(Value::as_bool) != Some(true)
+                || manifest.get("segment_complete").and_then(Value::as_bool) != Some(true)))
     {
         bail!("manifest must be canonical, segment-complete, and source-closed");
     }
@@ -665,7 +674,15 @@ fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
     output.sync_all()?;
     Ok(combined)
 }
-fn validate_market_policy(manifest: &Value) -> Result<()> {
+fn validate_market_policy(
+    manifest: &Value,
+    allow_disclosed_quote_collection_failures: bool,
+) -> Result<()> {
+    let allowed_event_types = if allow_disclosed_quote_collection_failures {
+        &EVENT_LOCAL_MARKET_EVENT_TYPES[..]
+    } else {
+        &MARKET_EVENT_TYPES[..]
+    };
     if manifest
         .get("venue_depth_complete")
         .and_then(Value::as_bool)
@@ -674,10 +691,14 @@ fn validate_market_policy(manifest: &Value) -> Result<()> {
             .get("event_context_complete")
             .and_then(Value::as_bool)
             != Some(true)
+        || manifest
+            .get("quote_quality_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
         || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
         || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(1_000)
         || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
-        || !has_only_event_types(manifest, &MARKET_EVENT_TYPES)
+        || !has_only_event_types(manifest, allowed_event_types)
         || manifest["event_types"]["quote"]
             .as_u64()
             .unwrap_or_default()
@@ -735,6 +756,7 @@ enum ReferenceHourPolicy {
 fn with_validated_research_segments_policy<T>(
     config: &ResearchSegmentValidationConfig,
     hour_policy: ReferenceHourPolicy,
+    allow_event_local_market_recovery: bool,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
     if config.references.is_empty() || config.references.len() > MAX_REFERENCE_SEGMENTS {
@@ -747,6 +769,7 @@ fn with_validated_research_segments_policy<T>(
         "market",
         &scratch.0,
         MAX_REFERENCE_SOURCE_BYTES,
+        !allow_event_local_market_recovery,
     )?;
     let mut references = Vec::<ValidatedArtifact>::with_capacity(config.references.len());
     let mut remaining_archive_bytes = MAX_REFERENCE_SOURCE_BYTES;
@@ -757,6 +780,7 @@ fn with_validated_research_segments_policy<T>(
             &format!("reference-{index}"),
             &scratch.0,
             remaining_archive_bytes,
+            true,
         )?;
         remaining_archive_bytes = remaining_archive_bytes
             .checked_sub(reference.identity.bytes)
@@ -790,7 +814,7 @@ fn with_validated_research_segments_policy<T>(
     if source_bytes > MAX_REFERENCE_SOURCE_BYTES {
         bail!("reference segment set exceeds source byte limit");
     }
-    validate_market_policy(&market.manifest)?;
+    validate_market_policy(&market.manifest, allow_event_local_market_recovery)?;
     let (market_raw, market_manifest) =
         decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
     let mut market_identity = market.identity.clone();
@@ -844,14 +868,24 @@ pub(crate) fn with_validated_research_segments<T>(
     config: &ResearchSegmentValidationConfig,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
-    with_validated_research_segments_policy(config, ReferenceHourPolicy::Consecutive, consume)
+    with_validated_research_segments_policy(
+        config,
+        ReferenceHourPolicy::Consecutive,
+        false,
+        consume,
+    )
 }
 
 pub(crate) fn with_event_local_validated_research_segments<T>(
     config: &ResearchSegmentValidationConfig,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
-    with_validated_research_segments_policy(config, ReferenceHourPolicy::Nondecreasing, consume)
+    with_validated_research_segments_policy(
+        config,
+        ReferenceHourPolicy::Nondecreasing,
+        true,
+        consume,
+    )
 }
 
 pub fn validate_research_segments(
@@ -1082,6 +1116,75 @@ mod tests {
 
     fn fixture(settlement: bool) -> (tempfile::TempDir, ResearchSegmentValidationConfig) {
         fixture_rows(&market_rows(), &reference_rows(settlement))
+    }
+
+    fn explicit_evidence_fixture(
+        market_rows: &[Value],
+    ) -> (
+        tempfile::TempDir,
+        crate::polymarket_research_normalize::PolymarketEvidenceConfig,
+    ) {
+        let mut reference = reference_rows(true);
+        reference.push(row(3, trade_completion()));
+        let (temp, segments) = fixture_rows(market_rows, &reference);
+        (
+            temp,
+            crate::polymarket_research_normalize::PolymarketEvidenceConfig {
+                segments,
+                event_start_gte: "2026-07-17T05:00:00Z".to_owned(),
+                event_start_lt: "2026-07-17T05:05:00Z".to_owned(),
+                market_ids: vec!["market-1".to_owned()],
+            },
+        )
+    }
+
+    fn quote_failure(sequence: u64) -> Value {
+        let mut failure = row(
+            sequence,
+            json!({
+                "kind": "quote_collection_failure",
+                "token_id": "up-token",
+                "request_status": "failure",
+                "collection_result": "api_failure",
+                "request_started_at": "2026-07-17T05:01:00.900Z",
+                "http_status": null,
+                "error_kind": "websocket_payload",
+                "ts": "2026-07-17T05:01:01Z",
+            }),
+        );
+        failure["recorded_at"] = json!("2026-07-17T05:01:01Z");
+        failure
+    }
+
+    fn quote_at(sequence: u64, token: &str, recorded_at: &str, source_at: &str) -> Value {
+        let mut quote = market_rows()[1].clone();
+        quote["sequence"] = json!(sequence);
+        quote["recorded_at"] = json!(recorded_at);
+        quote["update"]["token_id"] = json!(token);
+        quote["update"]["ts"] = json!(source_at);
+        quote
+    }
+
+    fn explicit_normalization_error(market_rows: &[Value]) -> String {
+        let (_temp, config) = explicit_evidence_fixture(market_rows);
+        crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn explicit_manifest_error(mutate: impl FnOnce(&mut Value)) -> String {
+        let (_temp, config) = explicit_evidence_fixture(&market_rows());
+        let path = &config.segments.market.manifest;
+        let mut manifest: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        mutate(&mut manifest);
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
+            .unwrap_err()
+            .to_string()
     }
 
     fn rejects(config: &ResearchSegmentValidationConfig, expected: &str) {
@@ -1391,6 +1494,112 @@ mod tests {
             trades[missing_trade["record_id"].as_str().unwrap()],
             "2026-07-17T07:02:00Z"
         );
+    }
+
+    #[test]
+    fn explicit_market_normalization_accepts_bounded_quote_recovery_without_weakening_strict_import(
+    ) {
+        let mut market_rows = market_rows();
+        market_rows.push(row(
+            4,
+            json!({
+                "kind": "event_discovered", "event_id": "unrelated-market", "symbol": "BTCUSDT",
+                "up_token": "unrelated-up", "down_token": "unrelated-down",
+                "end_time": "2026-07-17T05:10:00Z", "window_secs": 300,
+                "price_to_beat": "101", "resolved_up_won": null,
+            }),
+        ));
+        market_rows.push(row(
+            5,
+            json!({"kind": "event_expired", "event_id": "unrelated-market", "end_time": null}),
+        ));
+        market_rows.push(quote_failure(6));
+        market_rows.push(quote_at(
+            7,
+            "up-token",
+            "2026-07-17T05:01:02Z",
+            "2026-07-17T05:01:02Z",
+        ));
+
+        let (_temp, config) = explicit_evidence_fixture(&market_rows);
+
+        rejects(
+            &config.segments,
+            "manifest must be canonical, segment-complete, and source-closed",
+        );
+        let normalized =
+            crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
+                .expect("explicit selected-market recovery remains causally usable");
+
+        assert_eq!(normalized.report.market_ids, ["market-1"]);
+        assert_eq!(normalized.report.surface_counts["orderbook_snapshot"], 3);
+        let recovered_quote = std::str::from_utf8(&normalized.ndjson)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| row["surface"] == "orderbook_snapshot" && row["source_sequence"] == 7)
+            .expect("recovered quote remains in normalized evidence");
+        assert_eq!(recovered_quote["ts"], "2026-07-17T05:01:02Z");
+        assert_eq!(recovered_quote["recorded_at"], "2026-07-17T05:01:02Z");
+    }
+
+    #[test]
+    fn explicit_market_normalization_rejects_unbounded_or_missing_selected_token_coverage() {
+        let mut unresolved = market_rows();
+        unresolved.push(quote_failure(4));
+        assert!(explicit_normalization_error(&unresolved).contains("unresolved"));
+
+        let mut late_recovery = market_rows();
+        late_recovery.push(quote_failure(4));
+        late_recovery.push(quote_at(
+            5,
+            "up-token",
+            "2026-07-17T05:01:32Z",
+            "2026-07-17T05:01:32Z",
+        ));
+        assert!(explicit_normalization_error(&late_recovery).contains("over 30 seconds"));
+
+        let mut silent_gap = market_rows();
+        silent_gap.push(quote_at(
+            4,
+            "up-token",
+            "2026-07-17T05:01:31Z",
+            "2026-07-17T05:01:31Z",
+        ));
+        assert!(explicit_normalization_error(&silent_gap).contains("gap over 30 seconds"));
+
+        let mut missing_down = market_rows();
+        missing_down.remove(2);
+        missing_down[2]["sequence"] = json!(2);
+        assert!(explicit_normalization_error(&missing_down).contains("no causally available quote"));
+    }
+
+    #[test]
+    fn explicit_market_normalization_rejects_quote_quality_contradictions() {
+        let mut crossed = market_rows();
+        crossed[1]["update"]["bid"] = json!("0.60");
+        crossed[1]["update"]["ask"] = json!("0.50");
+        crossed[1]["update"]["bid_levels"][0]["price"] = json!("0.60");
+        crossed[1]["update"]["ask_levels"][0]["price"] = json!("0.50");
+        crossed[1]["update"]["collection_result"] = json!("incomplete");
+
+        assert!(explicit_normalization_error(&crossed).contains("full visible L2 records"));
+    }
+
+    #[test]
+    fn explicit_market_recovery_does_not_relax_segment_identity_or_depth() {
+        assert!(explicit_manifest_error(|manifest| {
+            manifest["source_session_closed"] = json!(false);
+        })
+        .contains("source-closed"));
+        assert!(explicit_manifest_error(|manifest| {
+            manifest["sequence_gaps"] = json!(1);
+        })
+        .contains("source identity or sequence declaration"));
+        assert!(explicit_manifest_error(|manifest| {
+            manifest["recording_policy"]["quote_depth_levels"] = json!(1);
+        })
+        .contains("full visible L2 records"));
     }
 
     #[test]
