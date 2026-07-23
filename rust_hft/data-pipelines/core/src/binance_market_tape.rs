@@ -1,6 +1,6 @@
 //! Shared contract for the immutable Binance market tape.
 
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -10,8 +10,278 @@ use serde_json::{Map, Value};
 pub const LEGACY_LOB_TAPE_SCHEMA: &str = "binance.lob_tape.v2";
 pub const MARKET_TAPE_SCHEMA: &str = "binance.market_tape.v1";
 pub const AGGREGATE_TRADE_SUMMARY_CONTRACT: &str = "binance.aggregate_trade_summary.v1";
+pub const LOB_CONTINUITY_SUMMARY_CONTRACT: &str = "binance.lob_continuity.v1";
 pub const MAX_SOURCE_LEAD_MS: u64 = 1_000;
 pub const MAX_SOURCE_DELAY_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LobContinuitySummary {
+    pub contract: String,
+    pub capture_session_id: String,
+    pub reconnect_boundary: bool,
+    pub sequence_gaps: u64,
+    pub source_time_rollbacks: u64,
+    pub declared_symbol_count: u64,
+    pub covered_symbol_count: u64,
+    pub missing_symbols: Vec<String>,
+    pub symbols: BTreeMap<String, SymbolLobContinuitySummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolLobContinuitySummary {
+    pub snapshot_seed_count: u64,
+    pub diff_count: u64,
+    pub checkpoint_count: u64,
+    pub first_update_id: Option<u64>,
+    pub last_update_id: Option<u64>,
+    pub first_source_time_ms: Option<u64>,
+    pub last_source_time_ms: Option<u64>,
+    pub first_received_at_ns: Option<u64>,
+    pub last_received_at_ns: Option<u64>,
+    pub min_source_latency_ms: Option<i64>,
+    pub max_source_latency_ms: Option<i64>,
+    pub min_bid_levels: Option<u64>,
+    pub max_bid_levels: Option<u64>,
+    pub min_ask_levels: Option<u64>,
+    pub max_ask_levels: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct LobContinuitySummaryBuilder {
+    declared_symbols: BTreeSet<String>,
+    capture_session_id: Option<String>,
+    reconnect_boundary: bool,
+    sequence_gaps: u64,
+    source_time_rollbacks: u64,
+    symbols: BTreeMap<String, SymbolLobContinuitySummary>,
+}
+
+impl LobContinuitySummaryBuilder {
+    pub fn new(symbols: impl IntoIterator<Item = String>) -> Result<Self> {
+        let declared_symbols = symbols.into_iter().collect::<BTreeSet<_>>();
+        if declared_symbols.is_empty()
+            || declared_symbols
+                .iter()
+                .any(|symbol| symbol.is_empty() || symbol != &symbol.to_ascii_uppercase())
+        {
+            anyhow::bail!("LOB continuity summary requires uppercase declared symbols");
+        }
+        Ok(Self {
+            symbols: declared_symbols
+                .iter()
+                .cloned()
+                .map(|symbol| (symbol, SymbolLobContinuitySummary::default()))
+                .collect(),
+            declared_symbols,
+            capture_session_id: None,
+            reconnect_boundary: false,
+            sequence_gaps: 0,
+            source_time_rollbacks: 0,
+        })
+    }
+
+    pub fn observe(&mut self, raw: &Map<String, Value>) -> Result<()> {
+        let event_type = raw
+            .get("type")
+            .and_then(Value::as_str)
+            .context("LOB continuity row is missing type")?;
+        if let Some(session_id) = raw.get("session_id").and_then(Value::as_str) {
+            if session_id.is_empty() {
+                anyhow::bail!("LOB continuity row has an empty session_id");
+            }
+            if self
+                .capture_session_id
+                .as_deref()
+                .is_some_and(|expected| expected != session_id)
+            {
+                anyhow::bail!("LOB continuity segment contains mixed session_id values");
+            }
+            self.capture_session_id
+                .get_or_insert_with(|| session_id.to_owned());
+        }
+        let received_at_ns = raw
+            .get("received_at_ns")
+            .and_then(Value::as_u64)
+            .context("LOB continuity row is missing received_at_ns")?;
+        match event_type {
+            "session_start" => self.reconnect_boundary = true,
+            "snapshot" => {
+                let symbol = self.row_symbol(raw)?;
+                let snapshot = raw
+                    .get("snapshot")
+                    .and_then(Value::as_object)
+                    .context("LOB continuity snapshot has no payload")?;
+                let (bid_levels, ask_levels) = book_depth(snapshot)?;
+                let summary = self.symbol_mut(&symbol)?;
+                summary.snapshot_seed_count = summary
+                    .snapshot_seed_count
+                    .checked_add(1)
+                    .context("LOB snapshot seed count overflow")?;
+                summary.observe_received_at(received_at_ns);
+                summary.observe_depth(bid_levels, ask_levels);
+            }
+            "diff" => {
+                let clock = DepthSourceClock::from_archived_event(raw, received_at_ns)?;
+                let summary = self.symbol_mut(&clock.symbol)?;
+                summary.diff_count = summary
+                    .diff_count
+                    .checked_add(1)
+                    .context("LOB diff count overflow")?;
+                summary.first_update_id.get_or_insert(clock.first_update_id);
+                summary.last_update_id = Some(clock.final_update_id);
+                summary
+                    .first_source_time_ms
+                    .get_or_insert(clock.event_time_ms);
+                summary.last_source_time_ms = Some(clock.event_time_ms);
+                summary.observe_received_at(received_at_ns);
+                summary.observe_latency(source_latency_ms(received_at_ns, clock.event_time_ms)?);
+            }
+            "checkpoint" => {
+                let symbol = self.row_symbol(raw)?;
+                let (bid_levels, ask_levels) = book_depth(raw)?;
+                let is_seed = raw.get("reason").and_then(Value::as_str) == Some("segment_open");
+                let summary = self.symbol_mut(&symbol)?;
+                if is_seed {
+                    summary.snapshot_seed_count = summary
+                        .snapshot_seed_count
+                        .checked_add(1)
+                        .context("LOB snapshot seed count overflow")?;
+                }
+                summary.checkpoint_count = summary
+                    .checkpoint_count
+                    .checked_add(1)
+                    .context("LOB checkpoint count overflow")?;
+                summary.observe_received_at(received_at_ns);
+                summary.observe_depth(bid_levels, ask_levels);
+            }
+            "sequence_gap" => {
+                self.sequence_gaps = self
+                    .sequence_gaps
+                    .checked_add(1)
+                    .context("LOB sequence gap count overflow")?;
+                if raw
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| error.contains("source-time rollback"))
+                {
+                    self.source_time_rollbacks = self
+                        .source_time_rollbacks
+                        .checked_add(1)
+                        .context("LOB source-time rollback count overflow")?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<LobContinuitySummary> {
+        let capture_session_id = self
+            .capture_session_id
+            .context("LOB continuity segment has no capture session")?;
+        let missing_symbols = self
+            .symbols
+            .iter()
+            .filter(|(_, summary)| {
+                summary.snapshot_seed_count == 0
+                    || summary.diff_count == 0
+                    || summary.checkpoint_count == 0
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect::<Vec<_>>();
+        let covered_symbol_count =
+            self.declared_symbols
+                .len()
+                .checked_sub(missing_symbols.len())
+                .context("LOB covered symbol count underflow")? as u64;
+        Ok(LobContinuitySummary {
+            contract: LOB_CONTINUITY_SUMMARY_CONTRACT.to_owned(),
+            capture_session_id,
+            reconnect_boundary: self.reconnect_boundary,
+            sequence_gaps: self.sequence_gaps,
+            source_time_rollbacks: self.source_time_rollbacks,
+            declared_symbol_count: self.declared_symbols.len() as u64,
+            covered_symbol_count,
+            missing_symbols,
+            symbols: self.symbols,
+        })
+    }
+
+    fn row_symbol(&self, raw: &Map<String, Value>) -> Result<String> {
+        let symbol = raw
+            .get("symbol")
+            .and_then(Value::as_str)
+            .context("LOB continuity row is missing symbol")?
+            .to_ascii_uppercase();
+        if !self.declared_symbols.contains(&symbol) {
+            anyhow::bail!("LOB continuity row symbol is outside its declared scope");
+        }
+        Ok(symbol)
+    }
+
+    fn symbol_mut(&mut self, symbol: &str) -> Result<&mut SymbolLobContinuitySummary> {
+        self.symbols
+            .get_mut(symbol)
+            .context("LOB continuity row symbol is outside its declared scope")
+    }
+}
+
+impl SymbolLobContinuitySummary {
+    fn observe_received_at(&mut self, received_at_ns: u64) {
+        self.first_received_at_ns.get_or_insert(received_at_ns);
+        self.last_received_at_ns = Some(received_at_ns);
+    }
+
+    fn observe_latency(&mut self, latency_ms: i64) {
+        self.min_source_latency_ms = Some(
+            self.min_source_latency_ms
+                .map_or(latency_ms, |current| current.min(latency_ms)),
+        );
+        self.max_source_latency_ms = Some(
+            self.max_source_latency_ms
+                .map_or(latency_ms, |current| current.max(latency_ms)),
+        );
+    }
+
+    fn observe_depth(&mut self, bid_levels: u64, ask_levels: u64) {
+        self.min_bid_levels = Some(
+            self.min_bid_levels
+                .map_or(bid_levels, |current| current.min(bid_levels)),
+        );
+        self.max_bid_levels = Some(
+            self.max_bid_levels
+                .map_or(bid_levels, |current| current.max(bid_levels)),
+        );
+        self.min_ask_levels = Some(
+            self.min_ask_levels
+                .map_or(ask_levels, |current| current.min(ask_levels)),
+        );
+        self.max_ask_levels = Some(
+            self.max_ask_levels
+                .map_or(ask_levels, |current| current.max(ask_levels)),
+        );
+    }
+}
+
+fn book_depth(raw: &Map<String, Value>) -> Result<(u64, u64)> {
+    let bids = raw
+        .get("bids")
+        .and_then(Value::as_array)
+        .context("LOB book is missing bids")?;
+    let asks = raw
+        .get("asks")
+        .and_then(Value::as_array)
+        .context("LOB book is missing asks")?;
+    Ok((bids.len() as u64, asks.len() as u64))
+}
+
+fn source_latency_ms(received_at_ns: u64, source_time_ms: u64) -> Result<i64> {
+    let received_at_ms = received_at_ns / 1_000_000;
+    let latency = i128::from(received_at_ms) - i128::from(source_time_ms);
+    i64::try_from(latency).context("LOB source latency exceeds its numeric range")
+}
 
 pub fn supported_schema(schema: &str) -> bool {
     matches!(schema, LEGACY_LOB_TAPE_SCHEMA | MARKET_TAPE_SCHEMA)
