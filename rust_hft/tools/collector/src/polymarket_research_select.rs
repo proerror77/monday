@@ -17,6 +17,7 @@ use url::Url;
 
 pub(crate) const SYMBOLS: [&str; 2] = ["BTCUSDT", "SOLUSDT"];
 pub(crate) const WINDOW_SECS: i64 = 300;
+const MAX_SELECTED_QUOTE_GAP_SECS: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ResearchSelectionConfig {
@@ -81,6 +82,113 @@ pub(crate) struct SelectedContract {
     pub discovery_recorded_at: String,
     pub discovery_sequence: u64,
     pub metadata: Option<SelectedMetadata>,
+}
+
+#[derive(Default)]
+struct SelectedTokenQuoteCoverage {
+    first_recorded_at: Option<DateTime<Utc>>,
+    last_recorded_at: Option<DateTime<Utc>>,
+    last_source_at: Option<DateTime<Utc>>,
+    pending_failure_at: Option<DateTime<Utc>>,
+}
+
+fn validate_selected_market_quote_coverage(
+    inputs: &ResearchSegmentValidationReport,
+    path: &Path,
+    contracts: &BTreeMap<String, SelectedContract>,
+) -> Result<()> {
+    let bound = Duration::seconds(MAX_SELECTED_QUOTE_GAP_SECS);
+    let segment_end = timestamp(&inputs.market.end_recorded_at, "market segment end")?;
+    let token_contracts = contracts
+        .values()
+        .flat_map(|contract| {
+            [
+                (contract.up_token.clone(), contract),
+                (contract.down_token.clone(), contract),
+            ]
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut coverage = token_contracts
+        .keys()
+        .cloned()
+        .map(|token| (token, SelectedTokenQuoteCoverage::default()))
+        .collect::<BTreeMap<_, _>>();
+
+    visit(path, |line, _, recorded_at, update| {
+        let Some(token) = update.get("token_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(contract) = token_contracts.get(token) else {
+            return Ok(());
+        };
+        let recorded_at = timestamp(recorded_at, "quote recorded_at")?;
+        if recorded_at < timestamp(&contract.discovery_recorded_at, "discovery recorded_at")?
+            || recorded_at >= contract.event_end
+        {
+            return Ok(());
+        }
+        let state = coverage
+            .get_mut(token)
+            .expect("selected token was initialized");
+        match update.get("kind").and_then(Value::as_str) {
+            Some("quote_collection_failure") => {
+                state.pending_failure_at.get_or_insert(recorded_at);
+            }
+            Some("quote") => {
+                let source_at = timestamp(required(update, "ts")?, "quote ts")?;
+                if source_at < contract.event_start || source_at >= contract.event_end {
+                    return Ok(());
+                }
+                if recorded_at - source_at > bound {
+                    bail!(
+                        "line {line}: selected token quote exceeds the 30-second freshness bound"
+                    );
+                }
+                if let Some(previous) = state.last_recorded_at {
+                    if recorded_at - previous > bound {
+                        bail!("line {line}: selected token has a quote availability gap over 30 seconds");
+                    }
+                }
+                if let Some(previous) = state.last_source_at {
+                    if source_at - previous > bound {
+                        bail!("line {line}: selected token has a quote source gap over 30 seconds");
+                    }
+                }
+                if let Some(failure) = state.pending_failure_at.take() {
+                    if recorded_at - failure > bound {
+                        bail!("line {line}: selected token quote recovery exceeds 30 seconds");
+                    }
+                }
+                state.first_recorded_at.get_or_insert(recorded_at);
+                state.last_recorded_at = Some(recorded_at);
+                state.last_source_at = Some(source_at);
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    for (token, contract) in token_contracts {
+        let state = &coverage[&token];
+        let discovery = timestamp(&contract.discovery_recorded_at, "discovery recorded_at")?;
+        let Some(first) = state.first_recorded_at else {
+            bail!("selected token {token} has no causally available quote");
+        };
+        let last = state
+            .last_recorded_at
+            .expect("first quote also sets last quote");
+        if first - discovery > bound {
+            bail!("selected token {token} first quote is more than 30 seconds after discovery");
+        }
+        if state.pending_failure_at.is_some() {
+            bail!("selected token {token} has an unresolved quote collection failure");
+        }
+        let coverage_end = segment_end.min(contract.event_end);
+        if coverage_end - last > bound {
+            bail!("selected token {token} ends with a quote availability gap over 30 seconds");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn timestamp(value: &str, field: &str) -> Result<DateTime<Utc>> {
@@ -412,6 +520,9 @@ fn with_selected_research_contracts_policy<T>(
     let selected =
         |inputs: &ResearchSegmentValidationReport, market_path: &Path, reference_path: &Path| {
             let mut contracts = discover(market_path, start, end, &market_ids)?;
+            if event_local {
+                validate_selected_market_quote_coverage(inputs, market_path, &contracts)?;
+            }
             enrich_metadata(reference_path, &mut contracts)?;
             consume(inputs, market_path, reference_path, &contracts, start, end)
         };
