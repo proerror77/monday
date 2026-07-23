@@ -445,29 +445,45 @@ fn validate_book(raw: &RawBook, contract: &Contract) -> Result<()> {
         probability(level.price, "orderbook level price")?;
         positive(level.size, "orderbook level size")?;
     }
-    if !top_matches_full_depth(raw.bid, raw.bid_size, &raw.bid_levels, true)
-        || !top_matches_full_depth(raw.ask, raw.ask_size, &raw.ask_levels, false)
+    if !top_matches_executable_depth(raw.bid, raw.bid_size, &raw.bid_levels, true)
+        || !top_matches_executable_depth(raw.ask, raw.ask_size, &raw.ask_levels, false)
     {
-        bail!("orderbook top of book disagrees with full depth");
+        bail!("orderbook top of book disagrees with executable full depth");
     }
     Ok(())
 }
 
-fn top_matches_full_depth(
+fn polymarket_tradeable_price(price: Decimal) -> bool {
+    price > Decimal::new(2, 2) && price < Decimal::new(98, 2)
+}
+
+fn top_matches_executable_depth(
     price: Option<Decimal>,
     size: Option<Decimal>,
     levels: &Option<Vec<RawBookLevel>>,
     is_bid: bool,
 ) -> bool {
     match (price.zip(size), levels.as_deref()) {
-        (None, Some([])) => true,
-        (Some((price, size)), Some(levels)) if !levels.is_empty() => {
+        (None, Some(levels)) => levels
+            .iter()
+            .all(|level| !polymarket_tradeable_price(level.price)),
+        (Some((price, size)), Some(levels)) => {
             let best_price = if is_bid {
-                levels.iter().map(|level| level.price).max()
+                levels
+                    .iter()
+                    .filter(|level| polymarket_tradeable_price(level.price))
+                    .map(|level| level.price)
+                    .max()
             } else {
-                levels.iter().map(|level| level.price).min()
-            }
-            .expect("non-empty depth has a best price");
+                levels
+                    .iter()
+                    .filter(|level| polymarket_tradeable_price(level.price))
+                    .map(|level| level.price)
+                    .min()
+            };
+            let Some(best_price) = best_price else {
+                return false;
+            };
             let mut best_levels = levels.iter().filter(|level| level.price == best_price);
             best_levels
                 .next()
@@ -853,6 +869,16 @@ mod tests {
         assert_rejected(&rows, "full depth");
 
         let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = json!("0.02");
+        book["bid_size"] = json!("700");
+        book["bid_levels"] = json!([
+            {"price":"0.4","size":"10"},
+            {"price":"0.02","size":"700"}
+        ]);
+        assert_rejected(&rows, "full depth");
+
+        let mut rows = valid_rows();
         row(&mut rows, "orderbook_snapshot", 0)["ask_size"] = json!("12");
         assert_rejected(&rows, "full depth");
 
@@ -872,6 +898,58 @@ mod tests {
         let mut rows = valid_rows();
         row(&mut rows, "orderbook_snapshot", 0)["bid_levels"] = json!([]);
         assert_rejected(&rows, "full depth");
+    }
+
+    #[test]
+    fn accepts_best_tradeable_top_while_preserving_boundary_depth() {
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = Value::Null;
+        book["bid_size"] = Value::Null;
+        book["bid_levels"] = json!([{"price":"0.01","size":"700"}]);
+        book["ask"] = json!("0.03");
+        book["ask_size"] = json!("11");
+        book["ask_levels"] = json!([
+            {"price":"0.02","size":"800"},
+            {"price":"0.03","size":"11"}
+        ]);
+        let book = row(&mut rows, "orderbook_snapshot", 1);
+        book["bid"] = json!("0.97");
+        book["bid_size"] = json!("11");
+        book["bid_levels"] = json!([
+            {"price":"0.98","size":"800"},
+            {"price":"0.97","size":"11"}
+        ]);
+        book["ask"] = Value::Null;
+        book["ask_size"] = Value::Null;
+        book["ask_levels"] = json!([{"price":"0.99","size":"700"}]);
+
+        verify_rows(&rows).unwrap();
+    }
+
+    #[test]
+    fn rejects_crossed_executable_top_even_when_depth_matches() {
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = json!("0.6");
+        book["bid_size"] = json!("10");
+        book["bid_levels"] = json!([{"price":"0.6","size":"10"}]);
+
+        assert_rejected(&rows, "crossed");
+    }
+
+    #[test]
+    fn accepts_absent_top_when_full_depth_has_only_boundary_levels() {
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = Value::Null;
+        book["bid_size"] = Value::Null;
+        book["bid_levels"] = json!([
+            {"price":"0.02","size":"700"},
+            {"price":"0.01","size":"900"}
+        ]);
+
+        verify_rows(&rows).unwrap();
     }
 
     #[test]
