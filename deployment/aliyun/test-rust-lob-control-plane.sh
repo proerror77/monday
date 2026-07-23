@@ -20,6 +20,15 @@ for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum; do
   }
 done
 
+grep -Fq '.trade_summary_contract == "binance.aggregate_trade_summary.v1"' "$GATE"
+grep -Fq 'strict_verifier_args+=' "$GATE"
+grep -Fq -- '--verify-segment' "$GATE"
+grep -Fq -- '--segment-content-sha256' "$GATE"
+grep -Fq -- '--segment-manifest-sha256' "$GATE"
+grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"
+grep -Fq 'manifest changed between discovery and readback' "$GATE"
+grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
+
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -59,9 +68,13 @@ market_json=$(jq -cn \
     catalog_sha256:$catalog,
     session_id:"session-1",oss_roundtrips:2,
     agg_trade_segments:2,agg_trade_count:2,
+    strict_trade_summary_readback:true,
+    max_segment_gap_ns:0,
     oss_roundtrip_evidence:[
-      {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
-      {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+      {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
+       gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+      {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
+       gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
     ]}')
 jq -n \
   --arg artifact "$artifact" \
@@ -87,6 +100,32 @@ if jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null; then
   printf 'gate policy accepted evidence from a different deployment bundle\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.oss_roundtrip_evidence[1] |=
+      (.start_received_at_ns = 90000000300
+       | .end_received_at_ns = 90000000400
+       | .gap_from_previous_ns = 90000000100)
+    | .markets.spot.max_segment_gap_ns = 90000000100' \
+  "$tmp_dir/gate.json" >"$tmp_dir/excessive-segment-gap.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/excessive-segment-gap.json" >/dev/null; then
+  printf 'gate policy accepted a segment gap over the continuity bound\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.spot.oss_roundtrip_evidence[0].manifest_sha256)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-manifest-anchor.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-manifest-anchor.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a manifest SHA anchor\n' >&2
   exit 1
 fi
 
@@ -150,6 +189,17 @@ if jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/zero-agg-trades.json" >/dev/null; then
   printf 'gate policy accepted zero aggregate trades\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.spot.strict_trade_summary_readback)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-trade-summary-readback.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-strict-trade-summary-readback.json" >/dev/null; then
+  printf 'gate policy accepted evidence without strict trade-summary readback\n' >&2
   exit 1
 fi
 
