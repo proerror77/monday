@@ -147,6 +147,7 @@ pub struct OrderBookState {
     snapshot_installed: bool,
     pub synced: bool,
     pub bridged: bool,
+    stream_coverage_verified: bool,
     pending: Vec<DepthDiff>,
 }
 
@@ -163,8 +164,17 @@ impl OrderBookState {
             snapshot_installed: false,
             synced: false,
             bridged: false,
+            stream_coverage_verified: false,
             pending: Vec::new(),
         }
+    }
+
+    pub fn verify_stream_coverage(&mut self) {
+        self.stream_coverage_verified = true;
+    }
+
+    pub fn continuity_complete(&self) -> bool {
+        self.synced && (self.bridged || (self.snapshot_installed && self.stream_coverage_verified))
     }
 
     pub fn last_update_id(&self) -> Option<u64> {
@@ -207,6 +217,10 @@ impl OrderBookState {
             .ok_or_else(|| anyhow::anyhow!("snapshot missing lastUpdateId"))?;
         self.bids = parse_snapshot_side(snapshot.get("bids"))?;
         self.asks = parse_snapshot_side(snapshot.get("asks"))?;
+        anyhow::ensure!(
+            !self.bids.is_empty() && !self.asks.is_empty(),
+            "snapshot must contain two non-empty book sides"
+        );
         self.sync.load_snapshot_for_replay(last_update_id);
         self.snapshot_installed = true;
         self.synced = true;
@@ -293,6 +307,7 @@ impl OrderBookState {
         self.snapshot_installed = false;
         self.synced = false;
         self.bridged = false;
+        self.stream_coverage_verified = false;
     }
 
     pub fn checkpoint(&self, session_id: &str) -> anyhow::Result<Checkpoint> {
@@ -305,6 +320,8 @@ impl OrderBookState {
             last_update_id,
             synced: self.synced,
             bridged: self.bridged,
+            continuity_complete: self.continuity_complete(),
+            stream_coverage_verified: self.stream_coverage_verified,
             bids: sorted_levels(&self.bids, true)?,
             asks: sorted_levels(&self.asks, false)?,
         })
@@ -312,7 +329,8 @@ impl OrderBookState {
 }
 
 fn parse_snapshot_side(value: Option<&Value>) -> anyhow::Result<HashMap<String, String>> {
-    let levels: Vec<[String; 2]> = serde_json::from_value(value.cloned().unwrap_or(json!([])))?;
+    let levels: Vec<[String; 2]> =
+        serde_json::from_value(value.cloned().context("snapshot side is missing")?)?;
     validate_levels(&levels)?;
     Ok(levels.into_iter().map(|[p, q]| (p, q)).collect())
 }
@@ -355,6 +373,8 @@ pub struct Checkpoint {
     pub last_update_id: u64,
     pub synced: bool,
     pub bridged: bool,
+    pub continuity_complete: bool,
+    pub stream_coverage_verified: bool,
     pub bids: Vec<[String; 2]>,
     pub asks: Vec<[String; 2]>,
 }
@@ -393,26 +413,31 @@ pub struct Segment {
     replay_safe: bool,
     snapshot_ready_symbols: BTreeSet<String>,
     bridged_symbols: BTreeSet<String>,
+    stream_coverage_verified_symbols: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadinessSummary {
     snapshot_ready_count: usize,
     bridged_count: usize,
+    stream_coverage_verified_count: usize,
     snapshot_only_symbols: Vec<String>,
     all_symbols_bridged: bool,
+    all_stream_coverage_verified: bool,
 }
 
 fn readiness_summary<'a>(
     symbol_count: usize,
-    states: impl Iterator<Item = (&'a str, bool, bool)>,
+    states: impl Iterator<Item = (&'a str, bool, bool, bool)>,
 ) -> ReadinessSummary {
     let mut snapshot_ready_count = 0;
     let mut bridged_count = 0;
+    let mut stream_coverage_verified_count = 0;
     let mut snapshot_only_symbols = Vec::new();
-    for (symbol, synced, bridged) in states {
+    for (symbol, synced, bridged, stream_coverage_verified) in states {
         snapshot_ready_count += usize::from(synced);
         bridged_count += usize::from(synced && bridged);
+        stream_coverage_verified_count += usize::from(stream_coverage_verified);
         if synced && !bridged {
             snapshot_only_symbols.push(symbol.to_owned());
         }
@@ -421,8 +446,11 @@ fn readiness_summary<'a>(
     ReadinessSummary {
         snapshot_ready_count,
         bridged_count,
+        stream_coverage_verified_count,
         snapshot_only_symbols,
         all_symbols_bridged: symbol_count > 0 && bridged_count == symbol_count,
+        all_stream_coverage_verified: symbol_count > 0
+            && stream_coverage_verified_count == symbol_count,
     }
 }
 
@@ -458,6 +486,7 @@ impl Segment {
             replay_safe: true,
             snapshot_ready_symbols: BTreeSet::new(),
             bridged_symbols: BTreeSet::new(),
+            stream_coverage_verified_symbols: BTreeSet::new(),
         })
     }
 
@@ -479,8 +508,16 @@ impl Segment {
                 if payload.get("synced").and_then(Value::as_bool) == Some(true) {
                     self.snapshot_ready_symbols.insert(symbol.to_owned());
                 }
-                if payload.get("bridged").and_then(Value::as_bool) == Some(true) {
+                if payload.get("continuity_complete").and_then(Value::as_bool) == Some(true) {
                     self.bridged_symbols.insert(symbol.to_owned());
+                }
+                if payload
+                    .get("stream_coverage_verified")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    self.stream_coverage_verified_symbols
+                        .insert(symbol.to_owned());
                 }
             }
         }
@@ -528,6 +565,7 @@ impl Segment {
                     symbol.as_str(),
                     self.snapshot_ready_symbols.contains(symbol),
                     self.bridged_symbols.contains(symbol),
+                    self.stream_coverage_verified_symbols.contains(symbol),
                 )
             }),
         );
@@ -613,8 +651,10 @@ fn finalize_segment(
         "has_replay_safe_checkpoint": has_replay_safe_checkpoint,
         "snapshot_ready_count": readiness.snapshot_ready_count,
         "bridged_count": readiness.bridged_count,
+        "stream_coverage_verified_count": readiness.stream_coverage_verified_count,
         "snapshot_only_symbols": readiness.snapshot_only_symbols,
         "all_symbols_bridged": readiness.all_symbols_bridged,
+        "all_stream_coverage_verified": readiness.all_stream_coverage_verified,
         "start_received_at_ns": start_ns,
         "end_received_at_ns": end_ns,
         "date": date,
@@ -820,7 +860,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                 config
                     .symbols
                     .iter()
-                    .map(|symbol| (symbol.as_str(), false, false)),
+                    .map(|symbol| (symbol.as_str(), false, false, false)),
             ),
         )?);
     }
@@ -887,6 +927,8 @@ pub fn write_health(
                 json!({
                     "synced": state.synced,
                     "bridged": state.bridged,
+                    "continuity_complete": state.continuity_complete(),
+                    "stream_coverage_verified": state.stream_coverage_verified,
                     "last_update_id": state.last_update_id(),
                     "bid_levels": state.bid_levels(),
                     "ask_levels": state.ask_levels(),
@@ -896,9 +938,14 @@ pub fn write_health(
         .collect::<BTreeMap<_, _>>();
     let readiness = readiness_summary(
         states.len(),
-        states
-            .iter()
-            .map(|(symbol, state)| (symbol.as_str(), state.synced, state.bridged)),
+        states.iter().map(|(symbol, state)| {
+            (
+                symbol.as_str(),
+                state.synced,
+                state.continuity_complete(),
+                state.stream_coverage_verified,
+            )
+        }),
     );
     atomic_write_json(
         &spool_dir.join("health.json"),
@@ -911,8 +958,10 @@ pub fn write_health(
             "symbol_count": states.len(),
             "snapshot_ready_count": readiness.snapshot_ready_count,
             "bridged_count": readiness.bridged_count,
+            "stream_coverage_verified_count": readiness.stream_coverage_verified_count,
             "snapshot_only_symbols": readiness.snapshot_only_symbols,
             "all_symbols_bridged": readiness.all_symbols_bridged,
+            "all_stream_coverage_verified": readiness.all_stream_coverage_verified,
             "session_id": session_id,
             "sequence_gaps": sequence_gaps,
             "pending_upload_segments": pending_upload_segments,
@@ -1195,6 +1244,24 @@ mod tests {
     }
 
     #[test]
+    fn verified_stream_coverage_seeds_static_book_without_fabricated_diff() {
+        let mut state = OrderBookState::new("BNSOLSOL", Market::Spot);
+        let mut budget = PendingBudget::new(10);
+
+        state.verify_stream_coverage();
+        state.install_snapshot(&snapshot(100), &mut budget).unwrap();
+
+        assert!(state.synced);
+        assert!(!state.bridged);
+        assert!(state.continuity_complete());
+        assert_eq!(state.last_update_id(), Some(100));
+        let checkpoint = state.checkpoint("session-static").unwrap();
+        assert!(checkpoint.stream_coverage_verified);
+        assert!(!checkpoint.bridged);
+        assert!(checkpoint.continuity_complete);
+    }
+
+    #[test]
     fn usdm_uses_pu_even_when_global_range_moved_past_snapshot() {
         let mut state = OrderBookState::new("1000SHIBUSDT", Market::Usdm);
         let mut budget = PendingBudget::new(10);
@@ -1210,6 +1277,35 @@ mod tests {
         assert!(state
             .apply_diff(diff("1000SHIBUSDT", 181, 182, Some(174)), &mut budget,)
             .is_err());
+    }
+
+    #[test]
+    fn verified_coverage_does_not_skip_usdm_initial_overlap_bridge() {
+        let mut state = OrderBookState::new("BTCUSDT", Market::Usdm);
+        let mut budget = PendingBudget::new(10);
+        state.verify_stream_coverage();
+        state.install_snapshot(&snapshot(100), &mut budget).unwrap();
+
+        assert!(!state.bridged);
+        state
+            .apply_diff(diff("BTCUSDT", 95, 105, Some(90)), &mut budget)
+            .unwrap();
+        assert!(state.bridged);
+        assert_eq!(state.last_update_id(), Some(105));
+    }
+
+    #[test]
+    fn snapshot_requires_two_present_non_empty_array_sides() {
+        let cases = [
+            json!({"lastUpdateId":100,"asks":[["101","1"]]}),
+            json!({"lastUpdateId":100,"bids":{},"asks":[["101","1"]]}),
+            json!({"lastUpdateId":100,"bids":[],"asks":[["101","1"]]}),
+        ];
+        for snapshot in cases {
+            let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+            let mut budget = PendingBudget::new(1);
+            assert!(state.install_snapshot(&snapshot, &mut budget).is_err());
+        }
     }
 
     #[test]
@@ -1480,6 +1576,7 @@ mod tests {
                     "last_update_id":101,
                     "synced":true,
                     "bridged":true,
+                    "continuity_complete":true,
                     "bids":[["100","2"]],
                     "asks":[["101","1"]],
                     "reason":"test",
@@ -1515,6 +1612,7 @@ mod tests {
                         "snapshot_seed_count":1,
                         "diff_count":1,
                         "checkpoint_count":1,
+                        "stream_coverage_verified":false,
                         "first_update_id":101,
                         "last_update_id":101,
                         "first_source_time_ms":diff_received_at_ns / 1_000_000,

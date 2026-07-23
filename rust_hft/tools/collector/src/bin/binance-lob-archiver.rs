@@ -10,7 +10,7 @@ use data::binance_market_tape_artifact::{
     verify_binance_market_tape_with_required_trade_summaries, BinanceMarketTapeTriplet,
     BinanceMarketTapeTrustAnchor,
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
@@ -20,6 +20,7 @@ use hft_collector::lob_archiver::{
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,6 +101,14 @@ const UPLOADED_CLEANUP_SCHEMA: &str = "monday.binance_lob.uploaded_cleanup.v1";
 const UPLOADED_CLEANUP_SUFFIX: &str = ".uploaded-cleanup.json";
 const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
 const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
+const SUBSCRIPTION_PROOF_ID: u64 = 1;
+const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone)]
+struct StreamShard {
+    url: String,
+    streams: BTreeSet<String>,
+}
 
 #[derive(Debug)]
 struct SpoolLock {
@@ -235,32 +244,48 @@ impl Config {
         }
     }
 
-    fn stream_urls(&self) -> Vec<String> {
+    fn stream_shards(&self) -> Vec<StreamShard> {
         self.active_symbols()
             .chunks(self.ws_shard_size)
             .flat_map(|symbols| {
-                let depth = symbols
+                let depth_streams = symbols
                     .iter()
                     .map(|symbol| format!("{}@depth@100ms", symbol.to_ascii_lowercase()))
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let aggregate_trades = symbols
+                    .collect::<BTreeSet<_>>();
+                let aggregate_trade_streams = symbols
                     .iter()
                     .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                    .collect::<BTreeSet<_>>();
+                let depth = depth_streams.iter().cloned().collect::<Vec<_>>().join("/");
+                let aggregate_trades = aggregate_trade_streams
+                    .iter()
+                    .cloned()
                     .collect::<Vec<_>>()
                     .join("/");
                 match self.market {
                     Market::Spot => vec![
-                        format!("wss://data-stream.binance.vision/stream?streams={depth}"),
-                        format!(
-                            "wss://data-stream.binance.vision/stream?streams={aggregate_trades}"
-                        ),
+                        StreamShard {
+                            url: format!("wss://data-stream.binance.vision/stream?streams={depth}"),
+                            streams: depth_streams,
+                        },
+                        StreamShard {
+                            url: format!(
+                                "wss://data-stream.binance.vision/stream?streams={aggregate_trades}"
+                            ),
+                            streams: aggregate_trade_streams,
+                        },
                     ],
                     Market::Usdm => vec![
-                        format!("wss://fstream.binance.com/public/stream?streams={depth}"),
-                        format!(
-                            "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
-                        ),
+                        StreamShard {
+                            url: format!("wss://fstream.binance.com/public/stream?streams={depth}"),
+                            streams: depth_streams,
+                        },
+                        StreamShard {
+                            url: format!(
+                                "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                            ),
+                            streams: aggregate_trade_streams,
+                        },
                     ],
                 }
             })
@@ -335,6 +360,9 @@ enum Event {
         reason: String,
     },
     InitialSnapshotsComplete,
+    StreamCoverageVerified {
+        shards: Vec<Vec<String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -360,14 +388,14 @@ struct ProcessState {
     sequence_gaps: u64,
     depth_source_clocks: DepthSourceClockSequenceValidator,
     aggregate_trades: AggregateTradeSequenceValidator,
-    aggregate_trade_history_trusted: bool,
-    aggregate_trade_symbols: BTreeSet<String>,
+    stream_coverage_trusted: bool,
+    stream_coverage_shards: Vec<Vec<String>>,
 }
 
 impl ProcessState {
-    fn new(aggregate_trade_history_trusted: bool) -> Self {
+    fn new(stream_coverage_trusted: bool) -> Self {
         Self {
-            aggregate_trade_history_trusted,
+            stream_coverage_trusted,
             ..Self::default()
         }
     }
@@ -665,7 +693,7 @@ async fn run_session(
     watchdog: ProcessWatchdog,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
-    let mut process_state = ProcessState::new(true);
+    let mut process_state = ProcessState::new(false);
     let active_symbols = config.active_symbols();
     if active_symbols.is_empty() {
         anyhow::bail!("no active symbols remain after runtime exclusions");
@@ -673,16 +701,21 @@ async fn run_session(
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    let stream_urls = config.stream_urls();
-    let expected_streams = stream_urls.len();
-    let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_streams);
-    for url in stream_urls {
+    let stream_shards = config.stream_shards();
+    let expected_shards = stream_shards.len();
+    let expected_streams = stream_shards
+        .iter()
+        .map(|shard| shard.streams.len())
+        .sum::<usize>();
+    let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_shards);
+    for shard in stream_shards {
         tasks.spawn(receive_url(
-            url,
+            shard,
             sender.clone(),
             stream_connected_tx.clone(),
             session_stop_rx.clone(),
             config.stall_timeout,
+            SUBSCRIPTION_PROOF_TIMEOUT,
             watchdog.clone(),
         ));
     }
@@ -692,7 +725,7 @@ async fn run_session(
         sender.clone(),
         session_stop_rx.clone(),
         stream_connected_rx,
-        expected_streams,
+        expected_shards,
     ));
     let mut states = active_symbols
         .iter()
@@ -706,7 +739,8 @@ async fn run_session(
             "session_id": session_id,
             "market": config.market.as_str(),
             "symbols": active_symbols.len(),
-            "websocket_shards": expected_streams,
+            "websocket_shards": expected_shards,
+            "websocket_streams": expected_streams,
         }),
         now_ns()?,
     )?;
@@ -965,7 +999,6 @@ fn process_event(
                 json!({"session_id":session_id,"frame":frame}),
                 trade.received_at_ns,
             )?;
-            process_state.aggregate_trade_symbols.insert(trade.symbol);
         }
         Event::Snapshot {
             received_at_ns,
@@ -1016,6 +1049,24 @@ fn process_event(
         Event::InitialSnapshotsComplete => {
             return Ok(ProcessAction::InitialSnapshotsComplete);
         }
+        Event::StreamCoverageVerified { shards } => {
+            let stream_count = validate_stream_coverage_shards(&shards, states)?;
+            let shard_count = shards.len();
+            info!(
+                shard_count,
+                stream_count, "websocket stream coverage verified"
+            );
+            segment.write(
+                "stream_coverage",
+                json!({"session_id":session_id,"shards":shards}),
+                now_ns()?,
+            )?;
+            process_state.stream_coverage_trusted = true;
+            process_state.stream_coverage_shards = shards;
+            for state in states.values_mut() {
+                state.verify_stream_coverage();
+            }
+        }
     }
     Ok(ProcessAction::None)
 }
@@ -1032,7 +1083,10 @@ fn segment_due_at(start_ns: u64, now_ns: u64, segment_seconds: u64) -> anyhow::R
 }
 
 fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow::Result<()> {
-    if !matches!(&event, Event::InitialSnapshotsComplete) {
+    if !matches!(
+        &event,
+        Event::InitialSnapshotsComplete | Event::StreamCoverageVerified { .. }
+    ) {
         segment.mark_replay_unsafe();
     }
     match event {
@@ -1077,7 +1131,57 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             now_ns()?,
         ),
         Event::InitialSnapshotsComplete => Ok(()),
+        Event::StreamCoverageVerified { shards } => segment.write(
+            "stream_coverage",
+            json!({"session_id":session_id,"shards":shards}),
+            now_ns()?,
+        ),
     }
+}
+
+fn validate_stream_coverage_shards(
+    shards: &[Vec<String>],
+    states: &HashMap<String, OrderBookState>,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        !shards.is_empty() && shards.iter().all(|shard| !shard.is_empty()),
+        "stream coverage has an empty websocket shard"
+    );
+    let stream_count = shards.iter().map(Vec::len).sum::<usize>();
+    let actual = shards.iter().flatten().cloned().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        actual.len() == stream_count,
+        "stream coverage contains duplicate streams"
+    );
+    let expected = states
+        .keys()
+        .flat_map(|symbol| {
+            let symbol = symbol.to_ascii_lowercase();
+            [
+                format!("{symbol}@depth@100ms"),
+                format!("{symbol}@aggTrade"),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        actual == expected,
+        "stream coverage does not match the active catalog"
+    );
+    Ok(stream_count)
+}
+
+fn write_stream_coverage(
+    segment: &mut Segment,
+    session_id: &str,
+    shards: &[Vec<String>],
+    received_at_ns: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!shards.is_empty(), "stream coverage evidence is empty");
+    segment.write(
+        "stream_coverage",
+        json!({"session_id":session_id,"shards":shards}),
+        received_at_ns,
+    )
 }
 
 fn rotate_segment(
@@ -1102,6 +1206,12 @@ fn rotate_segment(
     )?;
     let mut next = Segment::create(config.segment_config(), rotation_boundary_ns)?;
     if seed_next {
+        write_stream_coverage(
+            &mut next,
+            session_id,
+            &process_state.stream_coverage_shards,
+            rotation_boundary_ns,
+        )?;
         write_checkpoints(
             &mut next,
             states,
@@ -1122,12 +1232,10 @@ fn replay_checkpoint_ready(
     process_state: &ProcessState,
 ) -> bool {
     segment.is_replay_safe()
-        && process_state.aggregate_trade_history_trusted
+        && process_state.stream_coverage_trusted
+        && segment.event_count("agg_trade") > 0
         && !states.is_empty()
-        && states
-            .keys()
-            .all(|symbol| process_state.aggregate_trade_symbols.contains(symbol))
-        && states.values().all(|state| state.bridged)
+        && states.values().all(OrderBookState::continuity_complete)
 }
 
 fn write_checkpoints(
@@ -1203,22 +1311,69 @@ fn close_segment_at(
 }
 
 async fn receive_url(
-    url: String,
+    shard: StreamShard,
     sender: mpsc::Sender<Event>,
-    stream_connected: mpsc::Sender<()>,
+    stream_connected: mpsc::Sender<Vec<String>>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
+    subscription_proof_timeout: Duration,
     watchdog: ProcessWatchdog,
 ) -> anyhow::Result<TaskExit> {
-    let (mut websocket, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(&url))
+    let (mut websocket, _) =
+        tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url))
+            .await
+            .context("websocket connect timed out")??;
+    websocket
+        .send(Message::Text(
+            json!({"method":"LIST_SUBSCRIPTIONS","id":SUBSCRIPTION_PROOF_ID})
+                .to_string()
+                .into(),
+        ))
         .await
-        .context("websocket connect timed out")??;
-    // Establish every stream before requesting snapshots so updates emitted
-    // during each REST request remain buffered on an already-open connection.
-    stream_connected
-        .send(())
-        .await
-        .context("stream connection receiver dropped")?;
+        .context("failed to request websocket subscription proof")?;
+    let subscription_proof_deadline = tokio::time::Instant::now() + subscription_proof_timeout;
+    loop {
+        let message = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                changed?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+                return Ok(TaskExit::Stopped(None));
+            }
+            message = receive_before_subscription_proof_deadline(
+                subscription_proof_deadline,
+                websocket.next(),
+            ) => {
+                message?
+                    .ok_or_else(|| anyhow::anyhow!("websocket closed before subscription proof"))??
+            }
+        };
+        if let Message::Text(text) = message {
+            watchdog.mark_data();
+            let received_at_ns = now_ns()?;
+            let frame: Value = serde_json::from_str(&text)?;
+            if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
+                let listed = validate_subscription_listing(&frame, &shard.streams)?;
+                stream_connected
+                    .send(listed)
+                    .await
+                    .context("stream connection receiver dropped")?;
+                break;
+            }
+            let event = event_from_frame(frame, received_at_ns)?;
+            match receive_before_subscription_proof_deadline(
+                subscription_proof_deadline,
+                send_or_shutdown(&sender, event, &mut shutdown),
+            )
+            .await??
+            {
+                SendOutcome::Sent => {}
+                SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+            }
+        }
+    }
+    // Only verified exact stream coverage unlocks snapshot requests. Market
+    // events received while waiting for the proof were already buffered above.
     loop {
         let message = tokio::select! {
             biased;
@@ -1245,14 +1400,39 @@ async fn receive_url(
     }
 }
 
+async fn receive_before_subscription_proof_deadline<F, T>(
+    deadline: tokio::time::Instant,
+    next: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = T>,
+{
+    if tokio::time::Instant::now() >= deadline {
+        bail!("websocket subscription proof timed out");
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            bail!("websocket subscription proof timed out")
+        }
+        value = next => {
+            if tokio::time::Instant::now() >= deadline {
+                bail!("websocket subscription proof timed out");
+            }
+            Ok(value)
+        },
+    }
+}
+
 async fn produce_snapshots_after_streams_connect(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
-    mut stream_connected: mpsc::Receiver<()>,
-    expected_streams: usize,
+    mut stream_connected: mpsc::Receiver<Vec<String>>,
+    expected_shards: usize,
 ) -> anyhow::Result<TaskExit> {
-    for _ in 0..expected_streams {
+    let mut shards = Vec::with_capacity(expected_shards);
+    for _ in 0..expected_shards {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -1260,11 +1440,54 @@ async fn produce_snapshots_after_streams_connect(
                 return Ok(TaskExit::Stopped(None));
             }
             connected = stream_connected.recv() => {
-                connected.context("websocket producer stopped before connecting")?;
+                shards.push(connected.context("websocket producer stopped before connecting")?);
             }
         }
     }
+    shards.sort();
+    match send_or_shutdown(
+        &sender,
+        Event::StreamCoverageVerified { shards },
+        &mut shutdown,
+    )
+    .await?
+    {
+        SendOutcome::Sent => {}
+        SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+    }
     produce_snapshots(config, sender, shutdown).await
+}
+
+fn validate_subscription_listing(
+    frame: &Value,
+    expected: &BTreeSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID),
+        "subscription proof response has the wrong id"
+    );
+    let listed = frame
+        .get("result")
+        .and_then(Value::as_array)
+        .context("subscription proof response has no result array")?;
+    let actual = listed
+        .iter()
+        .map(|stream| {
+            stream
+                .as_str()
+                .map(str::to_owned)
+                .context("subscription proof contains a non-string stream")
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        actual.len() == listed.len(),
+        "subscription coverage mismatch: duplicate streams returned"
+    );
+    anyhow::ensure!(
+        &actual == expected,
+        "subscription coverage mismatch: expected={expected:?} actual={actual:?}"
+    );
+    Ok(actual.into_iter().collect())
 }
 
 fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> {
@@ -2510,33 +2733,178 @@ mod tests {
         .unwrap();
     }
 
+    fn trusted_process_state(symbols: &[String]) -> ProcessState {
+        let mut state = ProcessState::new(true);
+        state.stream_coverage_shards = vec![symbols
+            .iter()
+            .flat_map(|symbol| {
+                let symbol = symbol.to_ascii_lowercase();
+                [
+                    format!("{symbol}@depth@100ms"),
+                    format!("{symbol}@aggTrade"),
+                ]
+            })
+            .collect()];
+        state
+    }
+
     #[test]
     fn market_tape_subscribes_depth_and_aggregate_trades_separately() {
-        let spot = test_config("http://unused".into()).stream_urls();
+        let spot = test_config("http://unused".into()).stream_shards();
         assert_eq!(spot.len(), 2);
-        assert!(spot
-            .iter()
-            .any(|url| url.contains("btcusdt@depth@100ms") && !url.contains("btcusdt@aggTrade")));
-        assert!(spot
-            .iter()
-            .any(|url| url.contains("btcusdt@aggTrade") && !url.contains("btcusdt@depth")));
+        assert!(spot.iter().any(|shard| {
+            shard.streams.contains("btcusdt@depth@100ms")
+                && !shard.streams.contains("btcusdt@aggTrade")
+        }));
+        assert!(spot.iter().any(|shard| {
+            shard.streams.contains("btcusdt@aggTrade")
+                && !shard.streams.contains("btcusdt@depth@100ms")
+        }));
 
         let mut usdm_config = test_config("http://unused".into());
         usdm_config.market = Market::Usdm;
         usdm_config.dataset = "usdm_all".into();
-        let usdm = usdm_config.stream_urls();
-        assert!(usdm.iter().any(|url| {
-            url.starts_with("wss://fstream.binance.com/public/stream")
-                && url.contains("btcusdt@depth@100ms")
+        let usdm = usdm_config.stream_shards();
+        assert!(usdm.iter().any(|shard| {
+            shard
+                .url
+                .starts_with("wss://fstream.binance.com/public/stream")
+                && shard.streams.contains("btcusdt@depth@100ms")
         }));
-        assert!(usdm.iter().any(|url| {
-            url.starts_with("wss://fstream.binance.com/market/stream")
-                && url.contains("btcusdt@aggTrade")
+        assert!(usdm.iter().any(|shard| {
+            shard
+                .url
+                .starts_with("wss://fstream.binance.com/market/stream")
+                && shard.streams.contains("btcusdt@aggTrade")
         }));
         assert!(spot
             .iter()
             .chain(&usdm)
-            .all(|url| !url.contains("btcusdt@trade")));
+            .all(|shard| !shard.streams.contains("btcusdt@trade")));
+    }
+
+    #[test]
+    fn subscription_listing_requires_exact_stream_set() {
+        let expected = BTreeSet::from([
+            "bnsollsol@aggTrade".to_owned(),
+            "bnsollsol@depth@100ms".to_owned(),
+        ]);
+        let exact = json!({
+            "id":SUBSCRIPTION_PROOF_ID,
+            "result":["bnsollsol@depth@100ms","bnsollsol@aggTrade"]
+        });
+        validate_subscription_listing(&exact, &expected).unwrap();
+
+        let missing = json!({
+            "id":SUBSCRIPTION_PROOF_ID,
+            "result":["bnsollsol@aggTrade"]
+        });
+        assert!(validate_subscription_listing(&missing, &expected)
+            .unwrap_err()
+            .to_string()
+            .contains("subscription coverage mismatch"));
+
+        let extra = json!({
+            "id":SUBSCRIPTION_PROOF_ID,
+            "result":[
+                "bnsollsol@depth@100ms",
+                "bnsollsol@aggTrade",
+                "btcusdt@depth@100ms"
+            ]
+        });
+        assert!(validate_subscription_listing(&extra, &expected).is_err());
+        let string_id = json!({
+            "id":"1",
+            "result":["bnsollsol@depth@100ms","bnsollsol@aggTrade"]
+        });
+        assert!(validate_subscription_listing(&string_id, &expected).is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_proof_uses_one_absolute_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        receive_before_subscription_proof_deadline(
+            deadline,
+            tokio::time::sleep(Duration::from_millis(60)),
+        )
+        .await
+        .unwrap();
+
+        let error = receive_before_subscription_proof_deadline(
+            deadline,
+            tokio::time::sleep(Duration::from_millis(60)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("subscription proof timed out"));
+    }
+
+    #[tokio::test]
+    async fn expired_subscription_deadline_wins_over_a_ready_market_frame() {
+        let error = receive_before_subscription_proof_deadline(
+            tokio::time::Instant::now(),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("subscription proof timed out"));
+    }
+
+    #[tokio::test]
+    async fn subscription_proof_deadline_bounds_a_full_archive_queue() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request
+                .to_text()
+                .unwrap()
+                .contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "stream":"btcusdt@aggTrade",
+                        "data":{"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":1,"f":1,"l":1,"p":"100","q":"1","T":event_time_ms,"m":false}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.send(Event::InitialSnapshotsComplete).await.unwrap();
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let shard = StreamShard {
+            url: format!("ws://{address}"),
+            streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(250),
+            receive_url(
+                shard,
+                sender,
+                stream_connected,
+                shutdown,
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+                ProcessWatchdog::new_state(),
+            ),
+        )
+        .await
+        .expect("full archive queue bypassed subscription proof deadline")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("subscription proof timed out"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -2553,7 +2921,7 @@ mod tests {
         )]);
         let mut budget = PendingBudget::new(1);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         archive_first_btc_aggregate_trade(
             &config,
             &mut segment,
@@ -2562,7 +2930,6 @@ mod tests {
             &mut process_state,
         );
         assert_eq!(segment.event_count("agg_trade"), 1);
-        assert!(process_state.aggregate_trade_symbols.contains("BTCUSDT"));
         assert!(!states["BTCUSDT"].synced);
         drop(segment);
         std::fs::remove_dir_all(root).unwrap();
@@ -2618,7 +2985,7 @@ mod tests {
         let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
         let mut segment =
             Segment::create(config.segment_config(), 1_784_349_725_319_895_632).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         let received_at_ns = 1_784_349_725_538_670_685;
         let event = event_from_frame(
             json!({
@@ -2738,7 +3105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshots_wait_until_every_websocket_stream_is_connected() {
+    async fn snapshots_wait_until_every_websocket_subscription_set_is_verified() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicU64::new(0));
@@ -2768,7 +3135,10 @@ mod tests {
             2,
         ));
 
-        connected_tx.send(()).await.unwrap();
+        connected_tx
+            .send(vec!["btcusdt@depth@100ms".into()])
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), receiver.recv())
                 .await
@@ -2776,7 +3146,18 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
-        connected_tx.send(()).await.unwrap();
+        connected_tx
+            .send(vec!["btcusdt@aggTrade".into()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::StreamCoverageVerified { shards })
+                if shards == vec![
+                    vec!["btcusdt@aggTrade".to_owned()],
+                    vec!["btcusdt@depth@100ms".to_owned()]
+                ]
+        ));
         assert!(matches!(
             receiver.recv().await,
             Some(Event::Snapshot { .. })
@@ -2936,7 +3317,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         let mut budget = PendingBudget::new(10);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         let action = process_event(
             &config,
             &mut segment,
@@ -2961,7 +3342,7 @@ mod tests {
             &states,
             "session-1",
             "test",
-            &ProcessState::new(true),
+            &trusted_process_state(&config.symbols),
         )
         .unwrap()
         .unwrap();
@@ -3193,7 +3574,7 @@ mod tests {
         ));
 
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         archive_first_btc_aggregate_trade(
             &config,
             &mut segment,
@@ -3309,7 +3690,7 @@ mod tests {
             &states,
             "session-1",
             "test",
-            &ProcessState::new(true),
+            &trusted_process_state(&config.symbols),
         )
         .unwrap()
         .unwrap();
@@ -3333,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn single_symbol_trade_cannot_certify_multi_symbol_segment() {
+    fn verified_trade_stream_with_one_real_trade_certifies_static_symbols() {
         let root = tempfile::Builder::new()
             .prefix("monday-per-symbol-aggregate-trade-test-")
             .tempdir()
@@ -3345,6 +3726,7 @@ mod tests {
         let mut states = HashMap::new();
         for symbol in &config.symbols {
             let mut state = OrderBookState::new(symbol, Market::Spot);
+            state.verify_stream_coverage();
             state
                 .install_snapshot(
                     &json!({
@@ -3355,24 +3737,36 @@ mod tests {
                     &mut budget,
                 )
                 .unwrap();
-            state
-                .apply_diff(
-                    DepthDiff {
-                        symbol: symbol.clone(),
-                        first_update_id: 101,
-                        final_update_id: 101,
-                        previous_update_id: None,
-                        bids: vec![["100".into(), "2".into()]],
-                        asks: vec![],
-                    },
-                    &mut budget,
-                )
-                .unwrap();
+            if symbol == "BTCUSDT" {
+                state
+                    .apply_diff(
+                        DepthDiff {
+                            symbol: symbol.clone(),
+                            first_update_id: 101,
+                            final_update_id: 101,
+                            previous_update_id: None,
+                            bids: vec![["100".into(), "2".into()]],
+                            asks: vec![],
+                        },
+                        &mut budget,
+                    )
+                    .unwrap();
+            }
             states.insert(symbol.clone(), state);
         }
 
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let segment_start = segment.start_ns;
+        write_checkpoints(
+            &mut segment,
+            &states,
+            "session-1",
+            "segment_open",
+            true,
+            segment_start,
+        )
+        .unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
         archive_first_btc_aggregate_trade(
             &config,
             &mut segment,
@@ -3392,7 +3786,17 @@ mod tests {
         .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        assert!(manifest["trade_summaries"].get("ETHUSDT").is_none());
+        assert_eq!(manifest["lob_continuity"]["missing_symbols"], json!([]));
+        assert_eq!(
+            manifest["lob_continuity"]["symbols"]["ETHUSDT"]["diff_count"],
+            0
+        );
+        assert_eq!(
+            manifest["lob_continuity"]["symbols"]["ETHUSDT"]["stream_coverage_verified"],
+            true
+        );
 
         let output = Command::new("zstd")
             .args(["-q", "-d", "-c"])
@@ -3406,7 +3810,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .find(|event| event["type"] == "checkpoint" && event["symbol"] == "ETHUSDT")
             .unwrap();
-        assert_eq!(eth_checkpoint["replay_safe"], false);
+        assert_eq!(eth_checkpoint["replay_safe"], true);
     }
 
     #[test]
@@ -3443,7 +3847,7 @@ mod tests {
             )
             .unwrap();
         let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
-        let process_state = ProcessState::new(true);
+        let process_state = trusted_process_state(&config.symbols);
         let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
         let mut next = rotate_segment(
             segment,
@@ -3513,7 +3917,7 @@ mod tests {
             .unwrap();
         let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         archive_first_btc_aggregate_trade(
             &config,
             &mut segment,
@@ -3522,7 +3926,7 @@ mod tests {
             &mut process_state,
         );
 
-        let next = rotate_segment(
+        let mut next = rotate_segment(
             segment,
             &config,
             &states,
@@ -3532,6 +3936,26 @@ mod tests {
         )
         .unwrap();
         let next_start_ns = next.start_ns;
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000;
+        let trade = event_from_frame(
+            json!({
+                "stream": "btcusdt@aggTrade",
+                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":10,"f":12,"l":13,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+            }),
+            received_at_ns,
+        )
+        .unwrap();
+        process_event(
+            &config,
+            &mut next,
+            &mut states,
+            &mut budget,
+            "session-1",
+            trade,
+            &mut process_state,
+        )
+        .unwrap();
         let artifacts = close_segment(next, &config, &states, "session-1", "test", &process_state)
             .unwrap()
             .unwrap();
@@ -3609,7 +4033,7 @@ mod tests {
         )]);
         let mut budget = PendingBudget::new(1);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut process_state = ProcessState::new(true);
+        let mut process_state = trusted_process_state(&config.symbols);
         let received_at_ns = now_ns().unwrap();
         let event_time_ms = received_at_ns / 1_000_000 - 1;
         let event = event_from_frame(
@@ -3643,7 +4067,7 @@ mod tests {
             &states,
             "session-1",
             "test",
-            &ProcessState::new(true),
+            &trusted_process_state(&config.symbols),
         )
         .unwrap()
         .unwrap();
