@@ -1,13 +1,15 @@
 //! Shared contract for the immutable Binance market tape.
 
-use std::collections::HashMap;
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const LEGACY_LOB_TAPE_SCHEMA: &str = "binance.lob_tape.v2";
 pub const MARKET_TAPE_SCHEMA: &str = "binance.market_tape.v1";
+pub const AGGREGATE_TRADE_SUMMARY_CONTRACT: &str = "binance.aggregate_trade_summary.v1";
 pub const MAX_SOURCE_LEAD_MS: u64 = 1_000;
 pub const MAX_SOURCE_DELAY_MS: u64 = 30_000;
 
@@ -159,6 +161,198 @@ pub struct AggregateTrade {
     pub trade_time_ms: u64,
     pub is_buyer_maker: bool,
     pub received_at_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateTradeSummary {
+    pub aggregate_trade_count: u64,
+    pub venue_trade_count: u64,
+    pub base_volume: String,
+    pub quote_volume: String,
+    pub buyer_aggressor_base_volume: String,
+    pub buyer_aggressor_quote_volume: String,
+    pub seller_aggressor_base_volume: String,
+    pub seller_aggressor_quote_volume: String,
+    pub vwap: String,
+    pub first_event_time_ms: u64,
+    pub last_event_time_ms: u64,
+    pub first_trade_time_ms: u64,
+    pub last_trade_time_ms: u64,
+    pub first_received_at_ns: u64,
+    pub last_received_at_ns: u64,
+    pub first_aggregate_trade_id: u64,
+    pub last_aggregate_trade_id: u64,
+    pub first_trade_id: u64,
+    pub last_trade_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolTradeAccumulator {
+    aggregate_trade_count: u64,
+    venue_trade_count: u64,
+    base_volume: Decimal,
+    quote_volume: Decimal,
+    buyer_aggressor_base_volume: Decimal,
+    buyer_aggressor_quote_volume: Decimal,
+    seller_aggressor_base_volume: Decimal,
+    seller_aggressor_quote_volume: Decimal,
+    first_event_time_ms: u64,
+    last_event_time_ms: u64,
+    first_trade_time_ms: u64,
+    last_trade_time_ms: u64,
+    first_received_at_ns: u64,
+    last_received_at_ns: u64,
+    first_aggregate_trade_id: u64,
+    last_aggregate_trade_id: u64,
+    first_trade_id: u64,
+    last_trade_id: u64,
+}
+
+impl SymbolTradeAccumulator {
+    fn new(trade: &AggregateTrade) -> Result<Self> {
+        let quote_volume = trade
+            .price
+            .checked_mul(trade.quantity)
+            .context("aggregate trade quote volume overflow")?;
+        let venue_trade_count = trade
+            .last_trade_id
+            .checked_sub(trade.first_trade_id)
+            .and_then(|count| count.checked_add(1))
+            .context("aggregate trade venue trade count overflow")?;
+        let (buyer_base, buyer_quote, seller_base, seller_quote) = if trade.is_buyer_maker {
+            (Decimal::ZERO, Decimal::ZERO, trade.quantity, quote_volume)
+        } else {
+            (trade.quantity, quote_volume, Decimal::ZERO, Decimal::ZERO)
+        };
+        Ok(Self {
+            aggregate_trade_count: 1,
+            venue_trade_count,
+            base_volume: trade.quantity,
+            quote_volume,
+            buyer_aggressor_base_volume: buyer_base,
+            buyer_aggressor_quote_volume: buyer_quote,
+            seller_aggressor_base_volume: seller_base,
+            seller_aggressor_quote_volume: seller_quote,
+            first_event_time_ms: trade.event_time_ms,
+            last_event_time_ms: trade.event_time_ms,
+            first_trade_time_ms: trade.trade_time_ms,
+            last_trade_time_ms: trade.trade_time_ms,
+            first_received_at_ns: trade.received_at_ns,
+            last_received_at_ns: trade.received_at_ns,
+            first_aggregate_trade_id: trade.aggregate_trade_id,
+            last_aggregate_trade_id: trade.aggregate_trade_id,
+            first_trade_id: trade.first_trade_id,
+            last_trade_id: trade.last_trade_id,
+        })
+    }
+
+    fn observe(&mut self, trade: &AggregateTrade) -> Result<()> {
+        let quote_volume = trade
+            .price
+            .checked_mul(trade.quantity)
+            .context("aggregate trade quote volume overflow")?;
+        let venue_trade_count = trade
+            .last_trade_id
+            .checked_sub(trade.first_trade_id)
+            .and_then(|count| count.checked_add(1))
+            .context("aggregate trade venue trade count overflow")?;
+        self.aggregate_trade_count = self
+            .aggregate_trade_count
+            .checked_add(1)
+            .context("aggregate trade count overflow")?;
+        self.venue_trade_count = self
+            .venue_trade_count
+            .checked_add(venue_trade_count)
+            .context("venue trade count overflow")?;
+        self.base_volume = self
+            .base_volume
+            .checked_add(trade.quantity)
+            .context("aggregate trade base volume overflow")?;
+        self.quote_volume = self
+            .quote_volume
+            .checked_add(quote_volume)
+            .context("aggregate trade quote volume overflow")?;
+        let (base, quote) = if trade.is_buyer_maker {
+            (
+                &mut self.seller_aggressor_base_volume,
+                &mut self.seller_aggressor_quote_volume,
+            )
+        } else {
+            (
+                &mut self.buyer_aggressor_base_volume,
+                &mut self.buyer_aggressor_quote_volume,
+            )
+        };
+        *base = base
+            .checked_add(trade.quantity)
+            .context("aggregate trade aggressor base volume overflow")?;
+        *quote = quote
+            .checked_add(quote_volume)
+            .context("aggregate trade aggressor quote volume overflow")?;
+        self.last_event_time_ms = trade.event_time_ms;
+        self.last_trade_time_ms = trade.trade_time_ms;
+        self.last_received_at_ns = trade.received_at_ns;
+        self.last_aggregate_trade_id = trade.aggregate_trade_id;
+        self.last_trade_id = trade.last_trade_id;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AggregateTradeSummary> {
+        let vwap = self
+            .quote_volume
+            .checked_div(self.base_volume)
+            .context("aggregate trade VWAP division failed")?;
+        Ok(AggregateTradeSummary {
+            aggregate_trade_count: self.aggregate_trade_count,
+            venue_trade_count: self.venue_trade_count,
+            base_volume: decimal_string(self.base_volume),
+            quote_volume: decimal_string(self.quote_volume),
+            buyer_aggressor_base_volume: decimal_string(self.buyer_aggressor_base_volume),
+            buyer_aggressor_quote_volume: decimal_string(self.buyer_aggressor_quote_volume),
+            seller_aggressor_base_volume: decimal_string(self.seller_aggressor_base_volume),
+            seller_aggressor_quote_volume: decimal_string(self.seller_aggressor_quote_volume),
+            vwap: decimal_string(vwap),
+            first_event_time_ms: self.first_event_time_ms,
+            last_event_time_ms: self.last_event_time_ms,
+            first_trade_time_ms: self.first_trade_time_ms,
+            last_trade_time_ms: self.last_trade_time_ms,
+            first_received_at_ns: self.first_received_at_ns,
+            last_received_at_ns: self.last_received_at_ns,
+            first_aggregate_trade_id: self.first_aggregate_trade_id,
+            last_aggregate_trade_id: self.last_aggregate_trade_id,
+            first_trade_id: self.first_trade_id,
+            last_trade_id: self.last_trade_id,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AggregateTradeSummaryBuilder {
+    symbols: BTreeMap<String, SymbolTradeAccumulator>,
+}
+
+impl AggregateTradeSummaryBuilder {
+    pub fn observe(&mut self, trade: &AggregateTrade) -> Result<()> {
+        match self.symbols.entry(trade.symbol.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(SymbolTradeAccumulator::new(trade)?);
+            }
+            Entry::Occupied(mut entry) => entry.get_mut().observe(trade)?,
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<BTreeMap<String, AggregateTradeSummary>> {
+        self.symbols
+            .into_iter()
+            .map(|(symbol, summary)| Ok((symbol, summary.finish()?)))
+            .collect()
+    }
+}
+
+fn decimal_string(value: Decimal) -> String {
+    value.normalize().to_string()
 }
 
 impl AggregateTrade {

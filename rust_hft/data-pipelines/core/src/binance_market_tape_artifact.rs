@@ -18,8 +18,9 @@ use crate::binance_lob_replay::{
     Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use crate::binance_market_tape::{
-    event_type_allowed, AggregateTrade, AggregateTradeSequenceValidator, DepthSourceClock,
-    DepthSourceClockSequenceValidator, MARKET_TAPE_SCHEMA,
+    event_type_allowed, AggregateTrade, AggregateTradeSequenceValidator, AggregateTradeSummary,
+    AggregateTradeSummaryBuilder, DepthSourceClock, DepthSourceClockSequenceValidator,
+    AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
 };
 
 const REPLAY_SCOPE: &str =
@@ -85,6 +86,7 @@ pub struct BinanceMarketTapeSegmentIdentity {
     pub start_received_at_ns: u64,
     pub end_received_at_ns: u64,
     pub events: u64,
+    pub trade_summaries: BTreeMap<String, AggregateTradeSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +177,20 @@ pub fn seal_binance_market_tape_triplet(
 }
 
 pub fn verify_binance_market_tape(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_summary_requirement(sealed, false)
+}
+
+pub fn verify_binance_market_tape_with_required_trade_summaries(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_summary_requirement(sealed, true)
+}
+
+fn verify_binance_market_tape_with_summary_requirement(
     mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
+    require_trade_summaries: bool,
 ) -> Result<VerifiedBinanceMarketTape> {
     if sealed.is_empty() {
         bail!("market-tape segment set is empty");
@@ -237,6 +252,14 @@ pub fn verify_binance_market_tape(
             bail!("market-tape segments do not share one market/dataset/shard scope");
         }
         validate_manifest_quality(&segment.manifest)?;
+        let has_trade_summary_contract = segment.manifest.trade_summary_contract.as_deref()
+            == Some(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+        if require_trade_summaries && !has_trade_summary_contract {
+            bail!("market-tape segment is missing the aggregate-trade summary contract");
+        }
+        if has_trade_summary_contract != segment.manifest.trade_summaries.is_some() {
+            bail!("market-tape aggregate-trade summary contract is incomplete");
+        }
         if previous_segment_end_received_at_ns
             .is_some_and(|last| segment.manifest.start_received_at_ns < last)
         {
@@ -244,6 +267,7 @@ pub fn verify_binance_market_tape(
         }
         previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
         let mut counts = BTreeMap::<String, u64>::new();
+        let mut trade_summaries = AggregateTradeSummaryBuilder::default();
         let mut checkpoints = BTreeSet::new();
         let mut snapshot_seeds = BTreeSet::new();
         for (index, range) in segment.rows.iter().enumerate() {
@@ -330,6 +354,7 @@ pub fn verify_binance_market_tape(
                         received_at_ns,
                     )?;
                     aggregate_sequence.observe(&trade)?;
+                    trade_summaries.observe(&trade)?;
                     aggregate_trades.push(trade);
                 }
                 "session_start" => {
@@ -345,10 +370,19 @@ pub fn verify_binance_market_tape(
         {
             bail!("market-tape event counts do not match the manifest");
         }
+        let trade_summaries = trade_summaries.finish()?;
+        if segment
+            .manifest
+            .trade_summaries
+            .as_ref()
+            .is_some_and(|manifest| manifest != &trade_summaries)
+        {
+            bail!("market-tape trade summaries do not match raw aggregate trades");
+        }
         if checkpoints != symbols {
             bail!("market-tape segment is missing a replay-safe checkpoint");
         }
-        identities.push(segment.identity(market));
+        identities.push(segment.identity(market, trade_summaries));
     }
     let aggregate_trade_symbols = aggregate_trades
         .iter()
@@ -407,7 +441,11 @@ fn observe_receive_clock(
 }
 
 impl SealedBinanceMarketTapeTriplet {
-    fn identity(&self, market: Market) -> BinanceMarketTapeSegmentIdentity {
+    fn identity(
+        &self,
+        market: Market,
+        trade_summaries: BTreeMap<String, AggregateTradeSummary>,
+    ) -> BinanceMarketTapeSegmentIdentity {
         BinanceMarketTapeSegmentIdentity {
             market,
             file: self.manifest.file.clone(),
@@ -416,6 +454,7 @@ impl SealedBinanceMarketTapeTriplet {
             start_received_at_ns: self.manifest.start_received_at_ns,
             end_received_at_ns: self.manifest.end_received_at_ns,
             events: self.manifest.events,
+            trade_summaries,
         }
     }
 }
@@ -451,6 +490,8 @@ struct TapeManifest {
     sha256: String,
     trade_representation: String,
     price_surface_derivation: String,
+    trade_summary_contract: Option<String>,
+    trade_summaries: Option<BTreeMap<String, AggregateTradeSummary>>,
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<TapeManifest> {
@@ -491,6 +532,10 @@ fn validate_manifest_identity(
         || manifest.replay_scope != REPLAY_SCOPE
         || manifest.trade_representation != TRADE_REPRESENTATION
         || manifest.price_surface_derivation != PRICE_SURFACE_DERIVATION
+        || manifest
+            .trade_summary_contract
+            .as_deref()
+            .is_some_and(|contract| contract != AGGREGATE_TRADE_SUMMARY_CONTRACT)
         || manifest.venue_depth_complete
         || manifest.file != data_name
         || manifest.bytes != data_bytes as u64
@@ -797,6 +842,59 @@ mod tests {
         write_triplet_for_symbols(root, rows, &["BTCUSDT"])
     }
 
+    fn rewrite_manifest(
+        triplet: &BinanceMarketTapeTriplet,
+        update: impl FnOnce(&mut Value),
+    ) -> BinanceMarketTapeTrustAnchor {
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        update(&mut manifest);
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        fs::write(&triplet.manifest, &manifest_bytes).unwrap();
+        BinanceMarketTapeTrustAnchor::from_lower_hex(
+            manifest["sha256"].as_str().unwrap(),
+            &format!("{:x}", Sha256::digest(&manifest_bytes)),
+        )
+        .unwrap()
+    }
+
+    fn add_trade_summaries(
+        triplet: &BinanceMarketTapeTriplet,
+        summaries: Value,
+    ) -> BinanceMarketTapeTrustAnchor {
+        rewrite_manifest(triplet, |manifest| {
+            manifest["trade_summary_contract"] = json!(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+            manifest["trade_summaries"] = summaries;
+        })
+    }
+
+    fn one_trade_summary(base_volume: &str) -> Value {
+        json!({
+            "BTCUSDT":{
+                "aggregate_trade_count":1,
+                "venue_trade_count":1,
+                "base_volume":base_volume,
+                "quote_volume":"201",
+                "buyer_aggressor_base_volume":"2",
+                "buyer_aggressor_quote_volume":"201",
+                "seller_aggressor_base_volume":"0",
+                "seller_aggressor_quote_volume":"0",
+                "vwap":"100.5",
+                "first_event_time_ms":(START_NS + 300_000_000) / 1_000_000,
+                "last_event_time_ms":(START_NS + 300_000_000) / 1_000_000,
+                "first_trade_time_ms":(START_NS + 300_000_000) / 1_000_000,
+                "last_trade_time_ms":(START_NS + 300_000_000) / 1_000_000,
+                "first_received_at_ns":START_NS + 300_000_000,
+                "last_received_at_ns":START_NS + 300_000_000,
+                "first_aggregate_trade_id":10,
+                "last_aggregate_trade_id":10,
+                "first_trade_id":10,
+                "last_trade_id":10
+            }
+        })
+    }
+
     #[rustfmt::skip]
     fn write_triplet_for_symbols(root: &Path, rows: &[Value], symbols: &[&str]) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
         let root = fs::canonicalize(root).unwrap();
@@ -854,6 +952,57 @@ mod tests {
 
         let error = seal_binance_market_tape_triplet(&triplet, &external_anchor).unwrap_err();
         assert!(error.to_string().contains("trusted digest anchor"));
+    }
+
+    #[test]
+    fn verified_segment_exposes_manifest_matched_trade_summary() {
+        let root = tempdir();
+        let rows = valid_rows();
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let anchor = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified = verify_binance_market_tape(vec![sealed]).unwrap();
+        assert_eq!(
+            verified.segments()[0].trade_summaries["BTCUSDT"],
+            serde_json::from_value(one_trade_summary("2")["BTCUSDT"].clone()).unwrap()
+        );
+    }
+
+    #[test]
+    fn manifest_trade_summary_must_match_raw_aggregate_trades() {
+        let root = tempdir();
+        let rows = valid_rows();
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let anchor = add_trade_summaries(&triplet, one_trade_summary("999"));
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("trade summaries"));
+    }
+
+    #[test]
+    fn strict_summary_verifier_rejects_legacy_manifest_without_contract() {
+        let root = tempdir();
+        let (triplet, anchor) = write_triplet(root.path(), &valid_rows());
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error =
+            verify_binance_market_tape_with_required_trade_summaries(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("summary contract"));
+    }
+
+    #[test]
+    fn declared_summary_contract_requires_manifest_summaries() {
+        let root = tempdir();
+        let (triplet, _) = write_triplet(root.path(), &valid_rows());
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["trade_summary_contract"] = json!(AGGREGATE_TRADE_SUMMARY_CONTRACT);
+        });
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("contract is incomplete"));
     }
 
     #[test]
@@ -1120,6 +1269,10 @@ mod tests {
         );
         assert_eq!(verified.segments()[0].events, 5);
         assert_eq!(verified.aggregate_trades().len(), 1);
+        assert_eq!(
+            verified.segments()[0].trade_summaries["BTCUSDT"].quote_volume,
+            "201"
+        );
         assert_eq!(verified.replayed_books().len(), 1);
         assert_eq!(verified.replayed_books()[0].symbol, "BTCUSDT");
         assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
