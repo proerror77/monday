@@ -1,6 +1,6 @@
 use crate::polymarket_research_import::{
-    with_validated_research_segments, ResearchSegmentValidationConfig,
-    ResearchSegmentValidationReport,
+    with_event_local_validated_research_segments, with_validated_research_segments,
+    ResearchSegmentValidationConfig, ResearchSegmentValidationReport,
 };
 use crate::polymarket_upload::validate_market_metadata;
 use anyhow::{anyhow, bail, Context, Result};
@@ -396,8 +396,9 @@ fn enrich_metadata(path: &Path, contracts: &mut BTreeMap<String, SelectedContrac
     Ok(())
 }
 
-pub(crate) fn with_selected_research_contracts<T>(
+fn with_selected_research_contracts_policy<T>(
     config: &ResearchSelectionConfig,
+    event_local: bool,
     consume: impl FnOnce(
         &ResearchSegmentValidationReport,
         &Path,
@@ -408,17 +409,37 @@ pub(crate) fn with_selected_research_contracts<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     let (start, end, market_ids) = selection(config)?;
-    with_validated_research_segments(&config.segments, |inputs, market_path, reference_path| {
-        let mut contracts = discover(market_path, start, end, &market_ids)?;
-        enrich_metadata(reference_path, &mut contracts)?;
-        consume(inputs, market_path, reference_path, &contracts, start, end)
-    })
+    let selected =
+        |inputs: &ResearchSegmentValidationReport, market_path: &Path, reference_path: &Path| {
+            let mut contracts = discover(market_path, start, end, &market_ids)?;
+            enrich_metadata(reference_path, &mut contracts)?;
+            consume(inputs, market_path, reference_path, &contracts, start, end)
+        };
+    if event_local {
+        with_event_local_validated_research_segments(&config.segments, selected)
+    } else {
+        with_validated_research_segments(&config.segments, selected)
+    }
+}
+
+pub(crate) fn with_event_local_selected_research_contracts<T>(
+    config: &ResearchSelectionConfig,
+    consume: impl FnOnce(
+        &ResearchSegmentValidationReport,
+        &Path,
+        &Path,
+        &BTreeMap<String, SelectedContract>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) -> Result<T>,
+) -> Result<T> {
+    with_selected_research_contracts_policy(config, true, consume)
 }
 
 pub fn select_research_contracts(
     config: &ResearchSelectionConfig,
 ) -> Result<ResearchSelectionReport> {
-    with_selected_research_contracts(config, |inputs, _, _, contracts, start, end| {
+    with_selected_research_contracts_policy(config, false, |inputs, _, _, contracts, start, end| {
         let market_ids = contracts.keys().cloned().collect();
         let symbols = contracts
             .values()

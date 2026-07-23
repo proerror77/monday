@@ -726,8 +726,15 @@ fn validate_reference_policy(references: &[Value]) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn with_validated_research_segments<T>(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReferenceHourPolicy {
+    Consecutive,
+    Nondecreasing,
+}
+
+fn with_validated_research_segments_policy<T>(
     config: &ResearchSegmentValidationConfig,
+    hour_policy: ReferenceHourPolicy,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
     if config.references.is_empty() || config.references.len() > MAX_REFERENCE_SEGMENTS {
@@ -757,7 +764,10 @@ pub(crate) fn with_validated_research_segments<T>(
         if let Some(previous) = references.last() {
             let previous = segment_hour(&previous.identity)?;
             let current = segment_hour(&reference.identity)?;
-            if current < previous || current > previous + TimeDelta::hours(1) {
+            if current < previous
+                || (hour_policy == ReferenceHourPolicy::Consecutive
+                    && current > previous + TimeDelta::hours(1))
+            {
                 bail!("reference segments must be same or consecutive UTC hours");
             }
         }
@@ -828,6 +838,20 @@ pub(crate) fn with_validated_research_segments<T>(
         reject_superseded(&artifact.superseded_marker)?;
     }
     Ok(result)
+}
+
+pub(crate) fn with_validated_research_segments<T>(
+    config: &ResearchSegmentValidationConfig,
+    consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
+) -> Result<T> {
+    with_validated_research_segments_policy(config, ReferenceHourPolicy::Consecutive, consume)
+}
+
+pub(crate) fn with_event_local_validated_research_segments<T>(
+    config: &ResearchSegmentValidationConfig,
+    consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
+) -> Result<T> {
+    with_validated_research_segments_policy(config, ReferenceHourPolicy::Nondecreasing, consume)
 }
 
 pub fn validate_research_segments(
@@ -1299,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_trade_union_matches_later_completion_proof() {
+    fn event_local_trade_union_allows_sparse_reference_hours() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let market = triplet(&root, "crypto_expiry", &market_rows());
@@ -1324,7 +1348,7 @@ mod tests {
             ),
         ];
         for record in &mut second {
-            record["recorded_at"] = json!("2026-07-17T05:02:00Z");
+            record["recorded_at"] = json!("2026-07-17T07:02:00Z");
         }
         let second = triplet(&root, "crypto_expiry_reference", &second);
         let config = crate::polymarket_research_normalize::PolymarketEvidenceConfig {
@@ -1336,6 +1360,11 @@ mod tests {
             event_start_lt: "2026-07-17T05:05:00Z".to_owned(),
             market_ids: vec!["market-1".to_owned()],
         };
+
+        let error = crate::polymarket_research_select::select_research_contracts(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("same or consecutive UTC hours"));
 
         let normalized =
             crate::polymarket_research_normalize::normalize_polymarket_evidence(&config).unwrap();
@@ -1360,7 +1389,7 @@ mod tests {
         );
         assert_eq!(
             trades[missing_trade["record_id"].as_str().unwrap()],
-            "2026-07-17T05:02:00Z"
+            "2026-07-17T07:02:00Z"
         );
     }
 
