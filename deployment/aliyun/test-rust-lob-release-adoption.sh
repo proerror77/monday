@@ -144,7 +144,7 @@ setup_fixture() {
       session_id:"shadow-session",oss_roundtrips:2,
       agg_trade_segments:2,agg_trade_count:2,
       strict_trade_summary_readback:true,strict_lob_continuity_readback:true,
-      lob_reconnect_boundaries:1,
+      lob_reconnect_boundaries:0,
       min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
       min_lob_bid_levels:1,min_lob_ask_levels:1,max_segment_gap_ns:0,
       oss_roundtrip_evidence:[
@@ -152,7 +152,7 @@ setup_fixture() {
          sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
          manifest_sha256:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
          gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
-         lob_capture_session_id:"shadow-session",lob_reconnect_boundary:true,
+         lob_capture_session_id:"shadow-session",lob_reconnect_boundary:false,
          lob_sequence_gaps:0,lob_source_time_rollbacks:0,
          lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,

@@ -37,6 +37,47 @@ fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
+grep -Fq 'and .all_symbols_bridged == true' "$GATE"
+grep -Fq 'and .bridged_count == .symbol_count' "$GATE"
+grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
+grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
+grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
+grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
+
+observation_started_ns=1000000900
+same_second_warmup_start_ns=1000000100
+same_second_observation_start_ns=1000000950
+((same_second_warmup_start_ns < observation_started_ns)) || {
+  printf 'nanosecond cutoff admitted a same-second warmup segment\n' >&2
+  exit 1
+}
+
+for shadow_env in \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env" \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"; do
+  segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' "$shadow_env")
+  [[ $segment_seconds == 600 ]] || {
+    printf 'shadow segment cadence no longer guarantees two observation manifests: %s\n' \
+      "$shadow_env" >&2
+    exit 1
+  }
+  worst_case_first_start_ns=$((observation_started_ns + segment_seconds * 1000000000 - 1))
+  observation_deadline_ns=$((observation_started_ns + 3600 * 1000000000))
+  eligible_manifests=0
+  for ((start_ns = worst_case_first_start_ns;
+       start_ns < observation_deadline_ns;
+       start_ns += segment_seconds * 1000000000)); do
+    eligible_manifests=$((eligible_manifests + 1))
+  done
+  ((eligible_manifests >= 2)) || {
+    printf 'shadow cadence cannot produce two post-warmup manifests: %s\n' "$shadow_env" >&2
+    exit 1
+  }
+done
+((same_second_observation_start_ns >= observation_started_ns)) || {
+  printf 'nanosecond cutoff rejected a same-second observation segment\n' >&2
+  exit 1
+}
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -86,14 +127,14 @@ market_json=$(jq -cn \
     session_id:"session-1",oss_roundtrips:2,
     agg_trade_segments:2,agg_trade_count:2,
     strict_trade_summary_readback:true,
-    strict_lob_continuity_readback:true,lob_reconnect_boundaries:1,
+    strict_lob_continuity_readback:true,lob_reconnect_boundaries:0,
     min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
     min_lob_bid_levels:1,min_lob_ask_levels:1,
     max_segment_gap_ns:0,
     oss_roundtrip_evidence:[
       {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
        gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
-       lob_capture_session_id:"session-1",lob_reconnect_boundary:true,lob_sequence_gaps:0,
+       lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
        lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
        lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
        lob_min_bid_levels:1,lob_min_ask_levels:1},
@@ -127,6 +168,18 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq '.markets.spot.lob_reconnect_boundaries = 1
+    | .markets.spot.oss_roundtrip_evidence[0].lob_reconnect_boundary = true' \
+  "$tmp_dir/gate.json" >"$tmp_dir/pre-observation-reconnect.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/pre-observation-reconnect.json" >/dev/null; then
+  printf 'gate policy accepted a pre-observation reconnect boundary\n' >&2
+  exit 1
+fi
 
 wrong_bundle=$(printf 'e%.0s' {1..64})
 if jq -e \

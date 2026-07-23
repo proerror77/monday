@@ -40,7 +40,7 @@ and .markets.spot.agg_trade_count > 0
 and .markets.spot.strict_trade_summary_readback == true
 and .markets.spot.strict_lob_continuity_readback == true
 and (.markets.spot.lob_reconnect_boundaries | type) == "number"
-and .markets.spot.lob_reconnect_boundaries == 1
+and .markets.spot.lob_reconnect_boundaries == 0
 and (.markets.spot.min_lob_source_latency_ms | type) == "number"
 and .markets.spot.min_lob_source_latency_ms >= -1000
 and (.markets.spot.max_lob_source_latency_ms | type) == "number"
@@ -90,8 +90,7 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and .lob_min_ask_levels > 0)
 and (.markets.spot.oss_roundtrip_evidence as $round_trips
   | $round_trips[0].gap_from_previous_ns == 0
-  and $round_trips[0].lob_reconnect_boundary == true
-  and all($round_trips[1:][].lob_reconnect_boundary; . == false)
+  and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.spot.lob_reconnect_boundaries
     == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
   and .markets.spot.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
@@ -134,7 +133,7 @@ and .markets.usdm.agg_trade_count > 0
 and .markets.usdm.strict_trade_summary_readback == true
 and .markets.usdm.strict_lob_continuity_readback == true
 and (.markets.usdm.lob_reconnect_boundaries | type) == "number"
-and .markets.usdm.lob_reconnect_boundaries == 1
+and .markets.usdm.lob_reconnect_boundaries == 0
 and (.markets.usdm.min_lob_source_latency_ms | type) == "number"
 and .markets.usdm.min_lob_source_latency_ms >= -1000
 and (.markets.usdm.max_lob_source_latency_ms | type) == "number"
@@ -184,8 +183,7 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and .lob_min_ask_levels > 0)
 and (.markets.usdm.oss_roundtrip_evidence as $round_trips
   | $round_trips[0].gap_from_previous_ns == 0
-  and $round_trips[0].lob_reconnect_boundary == true
-  and all($round_trips[1:][].lob_reconnect_boundary; . == false)
+  and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.usdm.lob_reconnect_boundaries
     == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
   and .markets.usdm.min_lob_source_latency_ms == ([$round_trips[].lob_min_source_latency_ms] | min)
