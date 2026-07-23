@@ -396,17 +396,35 @@ mod tests {
     #[test]
     fn aggregates_complete_single_requested_symbol() {
         let start = base();
-        let btc_rows = event_rows("BTCUSDT", start, "btc-only");
-        let set = aggregate_verified_polymarket_evidence_for_symbols(
-            vec![verified(&btc_rows, start)],
-            &["BTCUSDT".to_string()],
-        )
-        .unwrap();
+        for symbol in REQUIRED_SYMBOLS {
+            let rows = event_rows(symbol, start, &format!("{symbol}-only"));
+            let set = aggregate_verified_polymarket_evidence_for_symbols(
+                vec![verified(&rows, start)],
+                &[symbol.to_string()],
+            )
+            .unwrap();
 
-        assert_eq!(set.contracts().count(), 1);
-        assert_eq!(set.books().count(), 2);
-        assert_eq!(set.references().count(), 1);
-        assert_eq!(set.settlements().count(), 1);
+            assert_eq!(set.contracts().count(), 1);
+            assert_eq!(set.books().count(), 2);
+            assert_eq!(set.references().count(), 1);
+            assert_eq!(set.settlements().count(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_requested_symbols() {
+        for (symbols, expected) in [
+            (vec![], "must not be empty"),
+            (
+                vec!["BTCUSDT".to_string(), "BTCUSDT".to_string()],
+                "contain a duplicate",
+            ),
+            (vec!["ETHUSDT".to_string()], "are unsupported"),
+        ] {
+            let error =
+                aggregate_verified_polymarket_evidence_for_symbols(vec![], &symbols).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]
