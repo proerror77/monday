@@ -349,6 +349,12 @@ enum ProcessAction {
     InitialSnapshotsComplete,
 }
 
+impl ProcessAction {
+    fn restarts_capture_session(&self) -> bool {
+        matches!(self, Self::Excluded)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProcessState {
     sequence_gaps: u64,
@@ -769,17 +775,9 @@ async fn run_session(
         }
 
         match pending_action {
+            action if action.restarts_capture_session() => break,
             ProcessAction::None => {}
-            ProcessAction::Excluded => {
-                segment = rotate_segment(
-                    segment,
-                    &config,
-                    &states,
-                    &session_id,
-                    "symbol_excluded",
-                    &process_state,
-                )?;
-            }
+            ProcessAction::Excluded => unreachable!("excluded action must restart the session"),
             ProcessAction::InitialSnapshotsComplete => {
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
             }
@@ -1326,6 +1324,28 @@ async fn produce_snapshots(
                 return Err(error);
             }
         };
+        if snapshot
+            .get("bids")
+            .and_then(Value::as_array)
+            .zip(snapshot.get("asks").and_then(Value::as_array))
+            .is_some_and(|(bids, asks)| bids.is_empty() || asks.is_empty())
+        {
+            let event = Event::ExcludeSymbol {
+                symbol: symbol.clone(),
+                reason: "one-sided initial snapshot is not replay-complete".to_owned(),
+            };
+            match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                SendOutcome::Sent => {
+                    if wait_or_shutdown(&mut shutdown, interval).await {
+                        return Ok(TaskExit::Stopped(None));
+                    }
+                    continue;
+                }
+                SendOutcome::Shutdown(event) => {
+                    return Ok(TaskExit::Stopped(Some(event)));
+                }
+            }
+        }
         let event = Event::Snapshot {
             received_at_ns: now_ns()?,
             symbol: symbol.clone(),
@@ -2728,8 +2748,13 @@ mod tests {
             let mut request = [0_u8; 2048];
             let _ = stream.read(&mut request).unwrap();
             server_requests.fetch_add(1, Ordering::SeqCst);
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}";
-            stream.write_all(response.as_bytes()).unwrap();
+            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
         });
         let config = Arc::new(test_config(format!("http://{address}")));
         let (sender, mut receiver) = mpsc::channel(8);
@@ -2744,9 +2769,11 @@ mod tests {
         ));
 
         connected_tx.send(()).await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(100), receiver.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err()
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         connected_tx.send(()).await.unwrap();
@@ -2772,12 +2799,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}";
+            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0_u8; 2048];
                 let _ = stream.read(&mut request).unwrap();
-                stream.write_all(response.as_bytes()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
             }
         });
         let mut config = test_config(format!("http://{address}"));
@@ -2805,6 +2837,66 @@ mod tests {
             TaskExit::Stopped(None)
         ));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_sided_initial_snapshot_is_explicitly_excluded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for body in [
+                r#"{"lastUpdateId":1,"bids":[],"asks":[["438.00","50.0"]]}"#,
+                r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.symbols = vec!["SCRIDR".into(), "BTCUSDT".into()];
+        config.snapshot_requests_per_second = 5.0;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let producer = tokio::spawn(produce_snapshots(Arc::new(config), sender, shutdown_rx));
+
+        match receiver.recv().await {
+            Some(Event::ExcludeSymbol { symbol, reason }) => {
+                assert_eq!(symbol, "SCRIDR");
+                assert!(reason.contains("one-sided initial snapshot"));
+            }
+            event => panic!("expected explicit one-sided exclusion, got {event:?}"),
+        }
+        let exclusion_received = Instant::now();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, .. }) if symbol == "BTCUSDT"
+        ));
+        assert!(exclusion_received.elapsed() >= Duration::from_millis(150));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_exclusion_requires_a_new_capture_session() {
+        assert!(ProcessAction::Excluded.restarts_capture_session());
+        assert!(!ProcessAction::None.restarts_capture_session());
+        assert!(!ProcessAction::InitialSnapshotsComplete.restarts_capture_session());
     }
 
     #[tokio::test]

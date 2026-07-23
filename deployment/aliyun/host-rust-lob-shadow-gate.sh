@@ -5,7 +5,7 @@ umask 027
 export LC_ALL=C
 
 readonly REQUIRED_DURATION_SECONDS=3600
-readonly HEALTH_SETTLE_SECONDS=360
+readonly HEALTH_SETTLE_SECONDS=2400
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
@@ -407,6 +407,9 @@ health_passes() {
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
+      and .bridged_count == .symbol_count
+      and .snapshot_only_symbols == []
+      and .all_symbols_bridged == true
       and .queue_saturated == false
       and .disk_warning == false
       and .upload_warning == false
@@ -485,6 +488,7 @@ validate_observation_sample() {
   health_samples[$market]=$((health_samples[$market] + sample_increment))
 }
 
+observation_started_ns=$(date +%s%N)
 observation_started_mono=$(monotonic_seconds)
 observation_deadline=$((observation_started_mono + gate_seconds))
 while (( $(monotonic_seconds) < observation_deadline )); do
@@ -639,7 +643,7 @@ verify_oss_round_trips() {
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
-    ((end_ns < gate_started_ns)) && continue
+    ((start_ns < observation_started_ns)) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
       '.schema == "binance.market_tape.v1"
         and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
@@ -800,12 +804,10 @@ verify_oss_round_trips() {
     || die "$market strict aggregate-trade and LOB continuity readback failed"
 
   jq -e --arg session_id "${observed_session[$market]}" '
-    (map(select(.lob_reconnect_boundary)) | length) == 1
-    and .[0].lob_reconnect_boundary == true
-    and all(.[1:][].lob_reconnect_boundary; . == false)
+    all(.[].lob_reconnect_boundary; . == false)
     and all(.[].lob_capture_session_id; . == $session_id)' \
     <<<"$round_trips" >/dev/null \
-    || die "$market LOB evidence crosses a capture-session boundary"
+    || die "$market LOB evidence crosses a capture-session or observation boundary"
 
   printf '%s\n' "$round_trips"
 }

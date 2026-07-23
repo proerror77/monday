@@ -490,8 +490,9 @@ these are true for the entire candidate run:
 - CPU accounting and peak memory stay inside the systemd limits;
 - after stop, the candidate's `--upload-only` drain leaves no partial,
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
-- for each market, at least two manifests created after gate start are downloaded
-  from OSS with their data object and reproduce the manifest SHA-256.
+- for each market, at least two manifests opened after health settles and the
+  observation starts are downloaded from OSS with their data object and
+  reproduce the manifest SHA-256.
 
 A successful production gate writes:
 
