@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+pub mod binance_usdm_reference_collector;
 pub mod feature_matrix;
 pub mod lob_archiver;
 pub mod polymarket_evidence_artifact;
