@@ -88,6 +88,10 @@ path = "src/bin/polymarket-raw-ops.rs"
 name = "binance-usdm-reference-collector"
 path = "src/bin/binance-usdm-reference-collector.rs"
 
+[[bin]]
+name = "binance-usdm-reference-artifact-verifier"
+path = "src/bin/binance-usdm-reference-artifact-verifier.rs"
+
 [lib]
 name = "hft_collector"
 path = "src/lib.rs"
