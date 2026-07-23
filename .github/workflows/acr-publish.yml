@@ -144,6 +144,17 @@ jobs:
           name: research-runner-binaries-${{ github.sha }}
           path: rust_hft/research-bin/
 
+      - name: Restore research runner binary modes
+        if: matrix.repository == 'research-runner'
+        run: |
+          chmod 0755 \
+            rust_hft/research-bin/hft-backtest \
+            rust_hft/research-bin/alpha-harness \
+            rust_hft/research-bin/lob-pit-materializer \
+            rust_hft/research-bin/monday-prediction-research \
+            rust_hft/research-bin/monday-prediction-evaluator \
+            rust_hft/research-bin/monday-prediction-snapshot
+
       - name: Verify research runner binary artifact
         if: matrix.repository == 'research-runner'
         run: |
