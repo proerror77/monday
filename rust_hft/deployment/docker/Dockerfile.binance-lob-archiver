@@ -19,11 +19,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --no-default-features \
     -p hft-collector \
     --bin binance-lob-archiver \
+    --bin binance-usdm-reference-collector \
     --bin polymarket-raw-ops \
     && install -D -m 0755 /work/target/release/binance-lob-archiver \
        /out/bin/binance-lob-archiver \
     && install -D -m 0755 /work/target/release/polymarket-raw-ops \
-       /out/bin/polymarket-raw-ops
+       /out/bin/polymarket-raw-ops \
+    && install -D -m 0755 /work/target/release/binance-usdm-reference-collector \
+       /out/bin/binance-usdm-reference-collector
 
 FROM debian:bookworm-slim AS aliyun-cli
 
@@ -58,6 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /out/bin/binance-lob-archiver /usr/local/bin/binance-lob-archiver
 COPY --from=builder /out/bin/polymarket-raw-ops /usr/local/bin/polymarket-raw-ops
+COPY --from=builder /out/bin/binance-usdm-reference-collector /usr/local/bin/binance-usdm-reference-collector
 COPY --from=aliyun-cli /usr/local/bin/aliyun /usr/local/bin/aliyun
 
 USER hftcollector
