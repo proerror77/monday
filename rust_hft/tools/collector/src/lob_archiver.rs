@@ -1,7 +1,11 @@
 pub use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
-use data::binance_market_tape::{event_type_allowed, supported_schema, LEGACY_LOB_TAPE_SCHEMA};
+use data::binance_market_tape::{
+    event_type_allowed, supported_schema, AggregateTrade, AggregateTradeSequenceValidator,
+    AggregateTradeSummary, AggregateTradeSummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
+    LEGACY_LOB_TAPE_SCHEMA,
+};
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
 use rust_decimal::Decimal;
@@ -384,6 +388,7 @@ pub struct Segment {
     path: PathBuf,
     writer: BufWriter<File>,
     counts: BTreeMap<String, u64>,
+    trade_summaries: AggregateTradeSummaryBuilder,
     replay_safe: bool,
     snapshot_ready_symbols: BTreeSet<String>,
     bridged_symbols: BTreeSet<String>,
@@ -448,6 +453,7 @@ impl Segment {
             path,
             writer: BufWriter::with_capacity(1024 * 1024, file),
             counts: BTreeMap::new(),
+            trade_summaries: AggregateTradeSummaryBuilder::default(),
             replay_safe: true,
             snapshot_ready_symbols: BTreeSet::new(),
             bridged_symbols: BTreeSet::new(),
@@ -479,6 +485,10 @@ impl Segment {
         }
         envelope.extend(payload.clone());
         envelope.insert("schema".to_owned(), RAW_SCHEMA.into());
+        if event_type == "agg_trade" {
+            let trade = AggregateTrade::from_archived_event(&envelope, received_at_ns)?;
+            self.trade_summaries.observe(&trade)?;
+        }
         serde_json::to_writer(&mut self.writer, &envelope)?;
         self.writer.write_all(b"\n")?;
         *self.counts.entry(event_type.to_owned()).or_default() += 1;
@@ -523,6 +533,7 @@ impl Segment {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         drop(self.writer);
+        let trade_summaries = self.trade_summaries.finish()?;
         if self.path.metadata()?.len() == 0 {
             fs::remove_file(self.path)?;
             return Ok(None);
@@ -531,6 +542,7 @@ impl Segment {
             &self.config,
             &self.path,
             self.counts,
+            trade_summaries,
             RAW_SCHEMA,
             self.start_ns,
             self.end_ns,
@@ -546,6 +558,7 @@ fn finalize_segment(
     config: &SegmentConfig,
     path: &Path,
     counts: BTreeMap<String, u64>,
+    trade_summaries: BTreeMap<String, AggregateTradeSummary>,
     schema: &str,
     start_ns: u64,
     end_ns: u64,
@@ -614,6 +627,14 @@ fn finalize_segment(
             "price_surface_derivation".to_owned(),
             "latest aggregate trade price".into(),
         );
+        metadata.insert(
+            "trade_summaries".to_owned(),
+            serde_json::to_value(trade_summaries)?,
+        );
+        metadata.insert(
+            "trade_summary_contract".to_owned(),
+            AGGREGATE_TRADE_SUMMARY_CONTRACT.into(),
+        );
     }
     let manifest = data.with_file_name(format!(
         "{}.manifest.json",
@@ -657,6 +678,8 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             continue;
         }
         let mut counts = BTreeMap::new();
+        let mut aggregate_trade_sequence = AggregateTradeSequenceValidator::default();
+        let mut trade_summaries = AggregateTradeSummaryBuilder::default();
         let mut start_ns = 0_u64;
         let mut end_ns = 0_u64;
         let mut offset = 0_usize;
@@ -715,6 +738,22 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                 quarantine = true;
                 break;
             }
+            if event_type == "agg_trade" {
+                let Some(raw) = event.as_object() else {
+                    quarantine = true;
+                    break;
+                };
+                let Ok(trade) = AggregateTrade::from_archived_event(raw, received) else {
+                    quarantine = true;
+                    break;
+                };
+                if aggregate_trade_sequence.observe(&trade).is_err()
+                    || trade_summaries.observe(&trade).is_err()
+                {
+                    quarantine = true;
+                    break;
+                }
+            }
             *counts.entry(event_type.to_owned()).or_default() += 1;
             offset += line.len();
         }
@@ -739,10 +778,12 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let schema = detected_schema
             .map(|(_, schema)| schema)
             .expect("non-empty recovered segment has a detected schema");
+        let trade_summaries = trade_summaries.finish()?;
         artifacts.push(finalize_segment(
             config,
             &path,
             counts,
+            trade_summaries,
             &schema,
             start_ns,
             end_ns,
@@ -1312,18 +1353,61 @@ mod tests {
                 segment.start_ns + 1,
             )
             .unwrap();
+        let first_trade_received_at_ns = segment.start_ns + 200_000_000;
         segment
             .write(
                 "agg_trade",
-                json!({"symbol":"BTCUSDT"}),
-                segment.start_ns + 2,
+                json!({
+                    "session_id":"session-1",
+                    "frame":{
+                        "stream":"btcusdt@aggTrade",
+                        "data":{
+                            "e":"aggTrade",
+                            "E":first_trade_received_at_ns / 1_000_000,
+                            "s":"BTCUSDT",
+                            "a":10,
+                            "p":"100",
+                            "q":"2",
+                            "f":10,
+                            "l":11,
+                            "T":first_trade_received_at_ns / 1_000_000,
+                            "m":false
+                        }
+                    }
+                }),
+                first_trade_received_at_ns,
+            )
+            .unwrap();
+        let last_trade_received_at_ns = segment.start_ns + 300_000_000;
+        segment
+            .write(
+                "agg_trade",
+                json!({
+                    "session_id":"session-1",
+                    "frame":{
+                        "stream":"btcusdt@aggTrade",
+                        "data":{
+                            "e":"aggTrade",
+                            "E":last_trade_received_at_ns / 1_000_000,
+                            "s":"BTCUSDT",
+                            "a":11,
+                            "p":"101",
+                            "q":"3",
+                            "f":12,
+                            "l":14,
+                            "T":last_trade_received_at_ns / 1_000_000,
+                            "m":true
+                        }
+                    }
+                }),
+                last_trade_received_at_ns,
             )
             .unwrap();
         segment
             .write(
                 "checkpoint",
                 json!({"symbol":"BTCUSDT", "synced":true, "bridged":true}),
-                segment.start_ns + 3,
+                segment.start_ns + 400_000_000,
             )
             .unwrap();
         let artifacts = segment.close().unwrap().unwrap();
@@ -1335,7 +1419,35 @@ mod tests {
         );
         assert_eq!(
             manifest["event_types"],
-            json!({"agg_trade":1,"checkpoint":1,"diff":1,"snapshot":1})
+            json!({"agg_trade":2,"checkpoint":1,"diff":1,"snapshot":1})
+        );
+        assert_eq!(
+            manifest["trade_summaries"]["BTCUSDT"],
+            json!({
+                "aggregate_trade_count":2,
+                "venue_trade_count":5,
+                "base_volume":"5",
+                "quote_volume":"503",
+                "buyer_aggressor_base_volume":"2",
+                "buyer_aggressor_quote_volume":"200",
+                "seller_aggressor_base_volume":"3",
+                "seller_aggressor_quote_volume":"303",
+                "vwap":"100.6",
+                "first_event_time_ms":first_trade_received_at_ns / 1_000_000,
+                "last_event_time_ms":last_trade_received_at_ns / 1_000_000,
+                "first_trade_time_ms":first_trade_received_at_ns / 1_000_000,
+                "last_trade_time_ms":last_trade_received_at_ns / 1_000_000,
+                "first_received_at_ns":first_trade_received_at_ns,
+                "last_received_at_ns":last_trade_received_at_ns,
+                "first_aggregate_trade_id":10,
+                "last_aggregate_trade_id":11,
+                "first_trade_id":10,
+                "last_trade_id":14
+            })
+        );
+        assert_eq!(
+            manifest["trade_summary_contract"],
+            data::binance_market_tape::AGGREGATE_TRADE_SUMMARY_CONTRACT
         );
         assert_eq!(
             manifest["replay_scope"],
@@ -1389,7 +1501,27 @@ mod tests {
             ),
             (
                 "current",
-                json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade"}),
+                json!({
+                    "schema":RAW_SCHEMA,
+                    "received_at_ns":start_ns,
+                    "type":"agg_trade",
+                    "session_id":"session-1",
+                    "frame":{
+                        "stream":"btcusdt@aggTrade",
+                        "data":{
+                            "e":"aggTrade",
+                            "E":start_ns / 1_000_000,
+                            "s":"BTCUSDT",
+                            "a":10,
+                            "p":"100.5",
+                            "q":"2",
+                            "f":10,
+                            "l":10,
+                            "T":start_ns / 1_000_000,
+                            "m":false
+                        }
+                    }
+                }),
                 RAW_SCHEMA,
                 "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
             ),
@@ -1411,6 +1543,10 @@ mod tests {
                 assert_eq!(
                     manifest["price_surface_derivation"],
                     "latest aggregate trade price"
+                );
+                assert_eq!(
+                    manifest["trade_summaries"]["BTCUSDT"]["aggregate_trade_count"],
+                    1
                 );
             } else {
                 assert!(manifest.get("trade_representation").is_none());
@@ -1440,6 +1576,25 @@ mod tests {
                 "incompatible",
                 vec![
                     json!({"schema":LEGACY_LOB_TAPE_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade"}),
+                ],
+            ),
+            (
+                "aggregate_gap",
+                vec![
+                    json!({
+                        "schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade",
+                        "session_id":"session-1","frame":{"stream":"btcusdt@aggTrade","data":{
+                            "e":"aggTrade","E":start_ns / 1_000_000,"s":"BTCUSDT","a":10,
+                            "p":"100","q":"1","f":10,"l":10,"T":start_ns / 1_000_000,"m":false
+                        }}
+                    }),
+                    json!({
+                        "schema":RAW_SCHEMA,"received_at_ns":start_ns + 1_000_000,"type":"agg_trade",
+                        "session_id":"session-1","frame":{"stream":"btcusdt@aggTrade","data":{
+                            "e":"aggTrade","E":start_ns / 1_000_000 + 1,"s":"BTCUSDT","a":12,
+                            "p":"101","q":"1","f":12,"l":12,"T":start_ns / 1_000_000 + 1,"m":true
+                        }}
+                    }),
                 ],
             ),
         ];
