@@ -10,9 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY prediction-markets/ prediction-markets/
+COPY . .
 WORKDIR /work/prediction-markets
-RUN if cargo tree --locked -p new-ploy-runner --features full -e features \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/prediction-markets/target,sharing=locked \
+    if cargo tree --locked -p new-ploy-runner --features full -e features \
       | grep -q 'live-execution'; then \
       echo "new-ploy-runner full feature must not enable live-execution" >&2; \
       exit 1; \
