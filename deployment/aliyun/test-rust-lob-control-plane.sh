@@ -40,6 +40,11 @@ grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
 grep -Fq 'and .all_symbols_bridged == true' "$GATE"
 grep -Fq 'and .bridged_count == .symbol_count' "$GATE"
 grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
+grep -Fq 'and .stream_coverage_verified_count == .symbol_count' "$GATE"
+grep -Fq 'and .all_stream_coverage_verified == true' "$GATE"
+grep -Fq 'or (.diff_count == 0' "$GATE"
+grep -Fq 'and .first_update_id == null' "$GATE"
+grep -Fq 'and .last_update_id == null' "$GATE"
 grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
 grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
@@ -121,7 +126,8 @@ catalog=$(printf 'd%.0s' {1..64})
 
 market_json=$(jq -cn \
   --arg catalog "$catalog" \
-  '{symbol_count:1200,snapshot_ready_count:1200,sequence_gaps:0,
+  '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
+    stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
     upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
     catalog_sha256:$catalog,
     session_id:"session-1",oss_roundtrips:2,
@@ -136,20 +142,25 @@ market_json=$(jq -cn \
        gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
        lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
        lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
        lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
        lob_min_bid_levels:1,lob_min_ask_levels:1},
       {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
        gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1,
        lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
        lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
+       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
        lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
        lob_min_bid_levels:1,lob_min_ask_levels:1}
     ]}')
 usdm_market=$(jq -c '
   .symbol_count = 500
   | .snapshot_ready_count = 500
+  | .bridged_count = 500
+  | .stream_coverage_verified_count = 500
   | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500)' \
+      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
+      | .stream_coverage_verified_count = 500)' \
   <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
@@ -168,6 +179,28 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq '.markets.spot.all_stream_coverage_verified = false' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unverified-stream-coverage.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/unverified-stream-coverage.json" >/dev/null; then
+  printf 'gate policy accepted unverified market stream coverage\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.oss_roundtrip_evidence[0].stream_coverage_verified_count = 1199' \
+  "$tmp_dir/gate.json" >"$tmp_dir/incomplete-segment-stream-coverage.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/incomplete-segment-stream-coverage.json" >/dev/null; then
+  printf 'gate policy accepted incomplete segment stream coverage\n' >&2
+  exit 1
+fi
 
 jq '.markets.spot.lob_reconnect_boundaries = 1
     | .markets.spot.oss_roundtrip_evidence[0].lob_reconnect_boundary = true' \
@@ -340,7 +373,9 @@ if jq -e \
 fi
 
 jq -n '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1200,
-  snapshot_ready_count:1200,pending_upload_segments:0,queue_saturated:false,
+  snapshot_ready_count:1200,bridged_count:1200,stream_coverage_verified_count:1200,
+  snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,
+  pending_upload_segments:0,queue_saturated:false,
   disk_warning:false,upload_warning:false,updated_at_ns:200,session_id:"new-session"}' \
   >"$tmp_dir/runtime-health.json"
 runtime_policy_accepts() {
@@ -363,7 +398,19 @@ if runtime_policy_accepts "$tmp_dir/runtime-health.json" new-session 100; then
   printf 'runtime policy accepted a stale session\n' >&2
   exit 1
 fi
-for field in symbol_count snapshot_ready_count; do
+jq '.all_stream_coverage_verified = false' \
+  "$tmp_dir/runtime-health.json" >"$tmp_dir/unverified-runtime-stream-coverage.json"
+if runtime_policy_accepts "$tmp_dir/unverified-runtime-stream-coverage.json" old-session 100; then
+  printf 'runtime policy accepted unverified stream coverage\n' >&2
+  exit 1
+fi
+jq '.stream_coverage_verified_count = 1199' \
+  "$tmp_dir/runtime-health.json" >"$tmp_dir/incomplete-runtime-stream-coverage.json"
+if runtime_policy_accepts "$tmp_dir/incomplete-runtime-stream-coverage.json" old-session 100; then
+  printf 'runtime policy accepted incomplete stream coverage\n' >&2
+  exit 1
+fi
+for field in symbol_count snapshot_ready_count bridged_count stream_coverage_verified_count; do
   jq --arg field "$field" '.[$field] = "1200"' \
     "$tmp_dir/runtime-health.json" >"$tmp_dir/quoted-count.json"
   if runtime_policy_accepts "$tmp_dir/quoted-count.json" old-session 100; then

@@ -13,6 +13,8 @@ and (.markets.spot.symbol_count | type) == "number"
 and .markets.spot.symbol_count == (.markets.spot.symbol_count | floor)
 and .markets.spot.symbol_count >= 1000
 and .markets.spot.snapshot_ready_count == .markets.spot.symbol_count
+and .markets.spot.stream_coverage_verified_count == .markets.spot.symbol_count
+and .markets.spot.all_stream_coverage_verified == true
 and .markets.spot.sequence_gaps == 0
 and (.markets.spot.upload_failure_count | type) == "number"
 and .markets.spot.upload_failure_count == (.markets.spot.upload_failure_count | floor)
@@ -79,6 +81,8 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and .lob_source_time_rollbacks == 0
   and .lob_declared_symbol_count == $gate.markets.spot.symbol_count
   and .lob_covered_symbol_count == $gate.markets.spot.symbol_count
+  and .stream_coverage_verified_count == $gate.markets.spot.symbol_count
+  and .all_stream_coverage_verified == true
   and (.lob_min_source_latency_ms | type) == "number"
   and .lob_min_source_latency_ms >= -1000
   and (.lob_max_source_latency_ms | type) == "number"
@@ -106,6 +110,8 @@ and (.markets.usdm.symbol_count | type) == "number"
 and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
 and .markets.usdm.symbol_count >= 400
 and .markets.usdm.snapshot_ready_count == .markets.usdm.symbol_count
+and .markets.usdm.stream_coverage_verified_count == .markets.usdm.symbol_count
+and .markets.usdm.all_stream_coverage_verified == true
 and .markets.usdm.sequence_gaps == 0
 and (.markets.usdm.upload_failure_count | type) == "number"
 and .markets.usdm.upload_failure_count == (.markets.usdm.upload_failure_count | floor)
@@ -172,6 +178,8 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and .lob_source_time_rollbacks == 0
   and .lob_declared_symbol_count == $gate.markets.usdm.symbol_count
   and .lob_covered_symbol_count == $gate.markets.usdm.symbol_count
+  and .stream_coverage_verified_count == $gate.markets.usdm.symbol_count
+  and .all_stream_coverage_verified == true
   and (.lob_min_source_latency_ms | type) == "number"
   and .lob_min_source_latency_ms >= -1000
   and (.lob_max_source_latency_ms | type) == "number"
