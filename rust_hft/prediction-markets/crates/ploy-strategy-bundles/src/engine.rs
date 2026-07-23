@@ -904,6 +904,7 @@ where
             MarketUpdate::SpotPrice { ts, .. }
             | MarketUpdate::AggTrade { ts, .. }
             | MarketUpdate::Quote { ts, .. }
+            | MarketUpdate::QuoteCollectionFailure { ts, .. }
             | MarketUpdate::L2 { ts, .. }
             | MarketUpdate::L2Depth { ts, .. }
             | MarketUpdate::SportsState { ts, .. }
