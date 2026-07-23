@@ -1,10 +1,11 @@
+use anyhow::Context;
 pub use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use data::binance_market_tape::{
     event_type_allowed, supported_schema, AggregateTrade, AggregateTradeSequenceValidator,
-    AggregateTradeSummary, AggregateTradeSummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
-    LEGACY_LOB_TAPE_SCHEMA,
+    AggregateTradeSummary, AggregateTradeSummaryBuilder, LobContinuitySummary,
+    LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT, LEGACY_LOB_TAPE_SCHEMA,
 };
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
@@ -14,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
@@ -570,6 +571,11 @@ fn finalize_segment(
         RAW_SCHEMA => "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
         _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
     };
+    let lob_continuity = if schema == RAW_SCHEMA {
+        Some(summarize_lob_continuity(path, config.symbols.clone())?)
+    } else {
+        None
+    };
     let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
     let mut command = Command::new("zstd");
@@ -635,6 +641,10 @@ fn finalize_segment(
             "trade_summary_contract".to_owned(),
             AGGREGATE_TRADE_SUMMARY_CONTRACT.into(),
         );
+        metadata.insert(
+            "lob_continuity".to_owned(),
+            serde_json::to_value(lob_continuity.context("market tape has no LOB summary")?)?,
+        );
     }
     let manifest = data.with_file_name(format!(
         "{}.manifest.json",
@@ -656,6 +666,23 @@ fn finalize_segment(
         success,
         sha256: digest,
     })
+}
+
+fn summarize_lob_continuity(
+    path: &Path,
+    symbols: Vec<String>,
+) -> anyhow::Result<LobContinuitySummary> {
+    let mut summary = LobContinuitySummaryBuilder::new(symbols)?;
+    for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        let raw: Value = serde_json::from_str(&line)
+            .with_context(|| format!("parse LOB continuity row {}", index + 1))?;
+        summary.observe(
+            raw.as_object()
+                .context("LOB continuity row must be an object")?,
+        )?;
+    }
+    summary.finish()
 }
 
 pub fn write_success_marker(data: &Path, digest: &str) -> anyhow::Result<PathBuf> {
@@ -1342,18 +1369,59 @@ mod tests {
             snapshot_limit: 100,
             zstd_timeout: Duration::from_secs(30),
         };
-        let mut segment = Segment::create(config, 1_700_000_000_000_000_000).unwrap();
+        let start_ns = 1_700_000_000_000_000_000;
+        let mut segment = Segment::create(config, start_ns).unwrap();
         segment
-            .write("snapshot", json!({"symbol":"BTCUSDT"}), segment.start_ns)
+            .write(
+                "session_start",
+                json!({
+                    "session_id":"session-1",
+                    "market":"spot",
+                    "symbols":1,
+                    "websocket_shards":1
+                }),
+                segment.start_ns,
+            )
             .unwrap();
         segment
             .write(
-                "diff",
-                json!({"symbol":"BTCUSDT","schema":"binance.market_tape.v999"}),
-                segment.start_ns + 1,
+                "snapshot",
+                json!({
+                    "session_id":"session-1",
+                    "symbol":"BTCUSDT",
+                    "request_started_at_ns":segment.start_ns + 50_000_000,
+                    "snapshot":{
+                        "lastUpdateId":100,
+                        "bids":[["100","1"]],
+                        "asks":[["101","1"]]
+                    }
+                }),
+                segment.start_ns + 100_000_000,
             )
             .unwrap();
-        let first_trade_received_at_ns = segment.start_ns + 200_000_000;
+        let diff_received_at_ns = segment.start_ns + 200_000_000;
+        segment
+            .write(
+                "diff",
+                json!({
+                    "session_id":"session-1",
+                    "frame":{
+                        "stream":"btcusdt@depth@100ms",
+                        "data":{
+                            "e":"depthUpdate",
+                            "E":diff_received_at_ns / 1_000_000,
+                            "s":"BTCUSDT",
+                            "U":101,
+                            "u":101,
+                            "b":[["100","2"]],
+                            "a":[]
+                        }
+                    }
+                }),
+                diff_received_at_ns,
+            )
+            .unwrap();
+        let first_trade_received_at_ns = segment.start_ns + 300_000_000;
         segment
             .write(
                 "agg_trade",
@@ -1378,7 +1446,7 @@ mod tests {
                 first_trade_received_at_ns,
             )
             .unwrap();
-        let last_trade_received_at_ns = segment.start_ns + 300_000_000;
+        let last_trade_received_at_ns = segment.start_ns + 400_000_000;
         segment
             .write(
                 "agg_trade",
@@ -1406,8 +1474,18 @@ mod tests {
         segment
             .write(
                 "checkpoint",
-                json!({"symbol":"BTCUSDT", "synced":true, "bridged":true}),
-                segment.start_ns + 400_000_000,
+                json!({
+                    "session_id":"session-1",
+                    "symbol":"BTCUSDT",
+                    "last_update_id":101,
+                    "synced":true,
+                    "bridged":true,
+                    "bids":[["100","2"]],
+                    "asks":[["101","1"]],
+                    "reason":"test",
+                    "replay_safe":true
+                }),
+                segment.start_ns + 500_000_000,
             )
             .unwrap();
         let artifacts = segment.close().unwrap().unwrap();
@@ -1419,7 +1497,39 @@ mod tests {
         );
         assert_eq!(
             manifest["event_types"],
-            json!({"agg_trade":2,"checkpoint":1,"diff":1,"snapshot":1})
+            json!({"agg_trade":2,"checkpoint":1,"diff":1,"session_start":1,"snapshot":1})
+        );
+        assert_eq!(
+            manifest["lob_continuity"],
+            json!({
+                "contract":"binance.lob_continuity.v1",
+                "capture_session_id":"session-1",
+                "reconnect_boundary":true,
+                "sequence_gaps":0,
+                "source_time_rollbacks":0,
+                "declared_symbol_count":1,
+                "covered_symbol_count":1,
+                "missing_symbols":[],
+                "symbols":{
+                    "BTCUSDT":{
+                        "snapshot_seed_count":1,
+                        "diff_count":1,
+                        "checkpoint_count":1,
+                        "first_update_id":101,
+                        "last_update_id":101,
+                        "first_source_time_ms":diff_received_at_ns / 1_000_000,
+                        "last_source_time_ms":diff_received_at_ns / 1_000_000,
+                        "first_received_at_ns":start_ns + 100_000_000,
+                        "last_received_at_ns":start_ns + 500_000_000,
+                        "min_source_latency_ms":0,
+                        "max_source_latency_ms":0,
+                        "min_bid_levels":1,
+                        "max_bid_levels":1,
+                        "min_ask_levels":1,
+                        "max_ask_levels":1
+                    }
+                }
+            })
         );
         assert_eq!(
             manifest["trade_summaries"]["BTCUSDT"],
@@ -1475,7 +1585,13 @@ mod tests {
             rows.iter()
                 .map(|row| row["type"].as_str().unwrap())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["agg_trade", "checkpoint", "diff", "snapshot"])
+            BTreeSet::from([
+                "agg_trade",
+                "checkpoint",
+                "diff",
+                "session_start",
+                "snapshot"
+            ])
         );
         assert!(!artifacts.success.exists());
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();

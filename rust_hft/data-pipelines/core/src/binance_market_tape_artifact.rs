@@ -20,7 +20,8 @@ use crate::binance_lob_replay::{
 use crate::binance_market_tape::{
     event_type_allowed, AggregateTrade, AggregateTradeSequenceValidator, AggregateTradeSummary,
     AggregateTradeSummaryBuilder, DepthSourceClock, DepthSourceClockSequenceValidator,
-    AGGREGATE_TRADE_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
+    LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
+    LOB_CONTINUITY_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
 };
 
 const REPLAY_SCOPE: &str =
@@ -179,18 +180,31 @@ pub fn seal_binance_market_tape_triplet(
 pub fn verify_binance_market_tape(
     sealed: Vec<SealedBinanceMarketTapeTriplet>,
 ) -> Result<VerifiedBinanceMarketTape> {
-    verify_binance_market_tape_with_summary_requirement(sealed, false)
+    verify_binance_market_tape_with_requirements(sealed, false, false)
 }
 
 pub fn verify_binance_market_tape_with_required_trade_summaries(
     sealed: Vec<SealedBinanceMarketTapeTriplet>,
 ) -> Result<VerifiedBinanceMarketTape> {
-    verify_binance_market_tape_with_summary_requirement(sealed, true)
+    verify_binance_market_tape_with_requirements(sealed, true, false)
 }
 
-fn verify_binance_market_tape_with_summary_requirement(
+pub fn verify_binance_market_tape_with_required_lob_continuity(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_requirements(sealed, false, true)
+}
+
+pub fn verify_binance_market_tape_with_required_trade_and_lob_summaries(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_requirements(sealed, true, true)
+}
+
+fn verify_binance_market_tape_with_requirements(
     mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
     require_trade_summaries: bool,
+    require_lob_continuity: bool,
 ) -> Result<VerifiedBinanceMarketTape> {
     if sealed.is_empty() {
         bail!("market-tape segment set is empty");
@@ -268,6 +282,7 @@ fn verify_binance_market_tape_with_summary_requirement(
         previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
         let mut counts = BTreeMap::<String, u64>::new();
         let mut trade_summaries = AggregateTradeSummaryBuilder::default();
+        let mut lob_continuity = LobContinuitySummaryBuilder::new(symbols.iter().cloned())?;
         let mut checkpoints = BTreeSet::new();
         let mut snapshot_seeds = BTreeSet::new();
         for (index, range) in segment.rows.iter().enumerate() {
@@ -278,6 +293,7 @@ fn verify_binance_market_tape_with_summary_requirement(
                 .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
             let (event_type, row_session_id, received_at_ns) =
                 validate_row(raw, &segment.manifest)?;
+            lob_continuity.observe(raw)?;
             if event_type == "session_start"
                 && highest_received_at_ns.is_some_and(|last| received_at_ns < last)
             {
@@ -381,6 +397,16 @@ fn verify_binance_market_tape_with_summary_requirement(
         }
         if checkpoints != symbols {
             bail!("market-tape segment is missing a replay-safe checkpoint");
+        }
+        let lob_continuity = lob_continuity.finish()?;
+        match segment.manifest.lob_continuity.as_ref() {
+            Some(manifest) if manifest != &lob_continuity => {
+                bail!("market-tape LOB continuity summary does not match raw rows")
+            }
+            None if require_lob_continuity => {
+                bail!("market-tape segment is missing the LOB continuity contract")
+            }
+            _ => {}
         }
         identities.push(segment.identity(market, trade_summaries));
     }
@@ -492,6 +518,8 @@ struct TapeManifest {
     price_surface_derivation: String,
     trade_summary_contract: Option<String>,
     trade_summaries: Option<BTreeMap<String, AggregateTradeSummary>>,
+    #[serde(default)]
+    lob_continuity: Option<LobContinuitySummary>,
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<TapeManifest> {
@@ -536,6 +564,10 @@ fn validate_manifest_identity(
             .trade_summary_contract
             .as_deref()
             .is_some_and(|contract| contract != AGGREGATE_TRADE_SUMMARY_CONTRACT)
+        || manifest
+            .lob_continuity
+            .as_ref()
+            .is_some_and(|summary| summary.contract != LOB_CONTINUITY_SUMMARY_CONTRACT)
         || manifest.venue_depth_complete
         || manifest.file != data_name
         || manifest.bytes != data_bytes as u64
@@ -869,6 +901,23 @@ mod tests {
         })
     }
 
+    fn add_lob_continuity(
+        triplet: &BinanceMarketTapeTriplet,
+        rows: &[Value],
+        symbols: &[&str],
+    ) -> BinanceMarketTapeTrustAnchor {
+        let mut summary =
+            LobContinuitySummaryBuilder::new(symbols.iter().map(|symbol| (*symbol).to_owned()))
+                .unwrap();
+        for row in rows {
+            summary.observe(row.as_object().unwrap()).unwrap();
+        }
+        let summary = summary.finish().unwrap();
+        rewrite_manifest(triplet, |manifest| {
+            manifest["lob_continuity"] = serde_json::to_value(summary).unwrap();
+        })
+    }
+
     fn one_trade_summary(base_volume: &str) -> Value {
         json!({
             "BTCUSDT":{
@@ -990,6 +1039,36 @@ mod tests {
         let error =
             verify_binance_market_tape_with_required_trade_summaries(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("summary contract"));
+    }
+
+    #[test]
+    fn strict_lob_verifier_rejects_manifest_without_continuity_contract() {
+        let root = tempdir();
+        let (triplet, anchor) = write_triplet(root.path(), &valid_rows());
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error =
+            verify_binance_market_tape_with_required_lob_continuity(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("LOB continuity contract"));
+    }
+
+    #[test]
+    fn strict_lob_verifier_rejects_manifest_latency_not_derived_from_raw_rows() {
+        let root = tempdir();
+        let rows = valid_rows();
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let valid_anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &valid_anchor).unwrap();
+        verify_binance_market_tape_with_required_lob_continuity(vec![sealed]).unwrap();
+
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["lob_continuity"]["symbols"]["BTCUSDT"]["max_source_latency_ms"] = json!(999);
+        });
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error =
+            verify_binance_market_tape_with_required_lob_continuity(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("does not match raw rows"));
     }
 
     #[test]
