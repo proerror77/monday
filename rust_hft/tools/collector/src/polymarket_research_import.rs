@@ -535,10 +535,31 @@ fn decompress_and_rescan(
                 _ => false,
             };
         if !authenticated_legacy_field && artifact.manifest.get(field) != Some(value) {
-            bail!("manifest field {field} does not match producer rescan");
+            bail!(
+                "manifest {} field {field} does not match producer rescan: producer={}; rescan={}",
+                artifact.identity.file,
+                bounded_rescan_value(artifact.manifest.get(field)),
+                bounded_rescan_value(Some(value)),
+            );
         }
     }
     Ok((raw, rescanned))
+}
+
+const MAX_RESCAN_DIAGNOSTIC_CHARS: usize = 512;
+
+fn bounded_rescan_value(value: Option<&Value>) -> String {
+    let raw = value.map_or_else(|| "<missing>".to_owned(), Value::to_string);
+    let mut chars = raw.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_RESCAN_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...<truncated>")
+    } else {
+        raw
+    }
 }
 
 fn refresh_trade_completions_from_rescan(
@@ -1731,9 +1752,27 @@ mod tests {
         )
         .unwrap();
 
-        rejects(
-            &config,
-            "manifest field trade_completions does not match producer rescan",
+        let error = validate_research_segments(&config).unwrap_err().to_string();
+        let reference_file = config.references[0]
+            .data
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(error.contains(reference_file.as_ref()), "{error:#}");
+        assert!(error.contains("field trade_completions"), "{error:#}");
+        assert!(error.contains("producer={}"), "{error:#}");
+        assert!(error.contains("rescan={\"market-1\":"), "{error:#}");
+    }
+
+    #[test]
+    fn bounds_producer_rescan_diagnostic_values() {
+        let value = json!("x".repeat(MAX_RESCAN_DIAGNOSTIC_CHARS + 1));
+        let diagnostic = bounded_rescan_value(Some(&value));
+
+        assert!(diagnostic.ends_with("...<truncated>"));
+        assert_eq!(
+            diagnostic.chars().count(),
+            MAX_RESCAN_DIAGNOSTIC_CHARS + "...<truncated>".chars().count()
         );
     }
 
