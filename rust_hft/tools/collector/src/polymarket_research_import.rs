@@ -552,7 +552,12 @@ fn segment_hour(identity: &SegmentIdentity) -> Result<DateTime<Utc>> {
         .context("invalid reference date/hour")
 }
 
-fn trade_merge_identity(update: &Value, line: usize) -> Result<(String, Vec<Value>)> {
+fn semantic_digest<'a>(values: impl IntoIterator<Item = Option<&'a Value>>) -> Result<[u8; 32]> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    Ok(Sha256::digest(serde_json::to_vec(&values)?).into())
+}
+
+fn trade_merge_identity(update: &Value, line: usize) -> Result<(String, [u8; 32])> {
     let update = update
         .as_object()
         .ok_or_else(|| anyhow!("line {line}: polymarket_trade update must be an object"))?;
@@ -569,14 +574,11 @@ fn trade_merge_identity(update: &Value, line: usize) -> Result<(String, Vec<Valu
     ];
     Ok((
         record_id,
-        fields
-            .into_iter()
-            .map(|field| update.get(field).cloned().unwrap_or(Value::Null))
-            .collect(),
+        semantic_digest(fields.into_iter().map(|field| update.get(field)))?,
     ))
 }
 
-fn settlement_merge_identity(update: &Value, line: usize) -> Result<(String, Vec<Value>)> {
+fn settlement_merge_identity(update: &Value, line: usize) -> Result<(String, [u8; 32])> {
     let update = update
         .as_object()
         .ok_or_else(|| anyhow!("line {line}: market_settlement update must be an object"))?;
@@ -590,7 +592,7 @@ fn settlement_merge_identity(update: &Value, line: usize) -> Result<(String, Vec
         .get("market")
         .and_then(Value::as_object)
         .expect("settlement validator checked market");
-    let mut identity = [
+    let fields = [
         "condition_id",
         "symbol",
         "market_window_secs",
@@ -598,16 +600,15 @@ fn settlement_merge_identity(update: &Value, line: usize) -> Result<(String, Vec
         "winning_outcome",
         "resolved_up_won",
         "resolution_source",
-    ]
-    .into_iter()
-    .map(|field| update.get(field).cloned().unwrap_or(Value::Null))
-    .collect::<Vec<_>>();
-    identity.extend(
-        ["conditionId", "clobTokenIds", "outcomes", "outcomePrices"]
-            .into_iter()
-            .map(|field| market.get(field).cloned().unwrap_or(Value::Null)),
+    ];
+    let identity = semantic_digest(
+        fields.into_iter().map(|field| update.get(field)).chain(
+            ["conditionId", "clobTokenIds", "outcomes", "outcomePrices"]
+                .into_iter()
+                .map(|field| market.get(field)),
+        ),
     );
-    Ok((market_id, identity))
+    Ok((market_id, identity?))
 }
 
 fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
@@ -617,8 +618,8 @@ fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
         .create_new(true)
         .mode(0o600)
         .open(&combined)?;
-    let mut trade_ids = BTreeMap::<String, (usize, Vec<Value>)>::new();
-    let mut settlements = BTreeMap::<String, (usize, Vec<Value>)>::new();
+    let mut trade_ids = BTreeMap::<String, (usize, [u8; 32])>::new();
+    let mut settlements = BTreeMap::<String, (usize, [u8; 32])>::new();
     for (segment, path) in paths.iter().enumerate() {
         for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
             let line = line?;
@@ -762,6 +763,11 @@ pub(crate) fn with_validated_research_segments<T>(
         }
         references.push(reference);
     }
+    references.sort_by_key(|reference| {
+        DateTime::parse_from_rfc3339(&reference.identity.start_recorded_at)
+            .expect("validated reference start_recorded_at")
+            .with_timezone(&Utc)
+    });
     let source_bytes = references.iter().try_fold(0_u64, |total, reference| {
         total
             .checked_add(
@@ -1234,7 +1240,7 @@ mod tests {
         let second = triplet(&root, "crypto_expiry_reference", &second);
         let config = ResearchSegmentValidationConfig {
             market,
-            references: vec![first, second],
+            references: vec![second, first],
         };
 
         let combined = with_validated_research_segments(&config, |_, _, references| {
