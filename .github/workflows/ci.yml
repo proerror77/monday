@@ -361,7 +361,7 @@ jobs:
           ../deployment/aliyun/test-rust-lob-release-adoption.sh
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh
-          cargo test -p hft-collector systemd_reference_resource_envelope_is_pinned --locked
+          cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
         if: needs.scope.outputs.focused == 'true'
