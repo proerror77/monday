@@ -3719,7 +3719,23 @@ mod tests {
         )]);
         let mut budget = PendingBudget::new(1);
         let mut process_state = trusted_process_state(&config.symbols);
-        process_state.mark_shard_disconnected(vec!["btcusdt@aggTrade".into()]);
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::StreamDisconnected {
+                    streams: vec!["btcusdt@aggTrade".into()],
+                    reason: "test".into(),
+                },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert!(!segment.is_replay_safe());
 
         assert_eq!(
             archive_first_btc_aggregate_trade(
