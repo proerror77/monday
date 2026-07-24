@@ -1394,8 +1394,7 @@ fn rotate_segment(
     process_state: &ProcessState,
 ) -> anyhow::Result<Segment> {
     let rotation_boundary_ns = now_ns()?;
-    let seed_next =
-        reason == "scheduled" && replay_checkpoint_ready(&segment, states, process_state);
+    let seed_next = reason == "scheduled" && replay_seed_ready(&segment, states, process_state);
     close_segment_at(
         segment,
         config,
@@ -1432,11 +1431,19 @@ fn replay_checkpoint_ready(
     states: &HashMap<String, OrderBookState>,
     process_state: &ProcessState,
 ) -> bool {
+    segment.is_replay_safe() && replay_seed_ready(segment, states, process_state)
+}
+
+fn replay_seed_ready(
+    segment: &Segment,
+    states: &HashMap<String, OrderBookState>,
+    process_state: &ProcessState,
+) -> bool {
     // A transport reconnect cannot seed a checkpoint until every affected
     // market stream has passed through the sequence validators.
     process_state.streams_healthy()
         && process_state.depth_streams_healthy()
-        && segment.is_replay_safe()
+        && process_state.sequence_gaps == 0
         && process_state.stream_coverage_trusted
         && segment.event_count("agg_trade") > 0
         && !states.is_empty()
@@ -4656,6 +4663,124 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .any(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open"));
+    }
+
+    #[test]
+    fn post_warmup_rotation_can_seed_after_an_incomplete_segment() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = tempfile::Builder::new()
+            .prefix("monday-post-warmup-seed-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        config.symbols = vec!["BTCUSDT".into()];
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut process_state = trusted_process_state(&config.symbols);
+        let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+
+        // The first rotation occurs before snapshots complete, so its output
+        // remains replay-unsafe and the next segment starts without a seed.
+        let mut next = rotate_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        let state = states.get_mut("BTCUSDT").unwrap();
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["102", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        state
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: None,
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        archive_first_btc_aggregate_trade(
+            &config,
+            &mut next,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+        );
+
+        let mut seeded = rotate_segment(
+            next,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        let seeded_start_ns = seeded.start_ns;
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000;
+        let trade = event_from_frame(
+            json!({
+                "stream": "btcusdt@aggTrade",
+                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":10,"f":12,"l":13,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+            }),
+            received_at_ns,
+        )
+        .unwrap();
+        process_event(
+            &config,
+            &mut seeded,
+            &mut states,
+            &mut budget,
+            "session-1",
+            trade,
+            &mut process_state,
+        )
+        .unwrap();
+        let artifacts = close_segment(seeded, &config, &states, "session-1", "test", &process_state)
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let opening = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open")
+            .expect("post-warmup rotation must seed the next segment");
+        assert_eq!(opening["received_at_ns"], seeded_start_ns);
+        assert_eq!(opening["replay_safe"], true);
     }
 
     #[test]
