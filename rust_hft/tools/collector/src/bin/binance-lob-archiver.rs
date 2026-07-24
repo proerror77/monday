@@ -368,6 +368,13 @@ enum Event {
     StreamCoverageVerified {
         shards: Vec<Vec<String>>,
     },
+    StreamDisconnected {
+        streams: Vec<String>,
+        reason: String,
+    },
+    StreamReconnected {
+        streams: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -395,6 +402,8 @@ struct ProcessState {
     aggregate_trades: AggregateTradeSequenceValidator,
     stream_coverage_trusted: bool,
     stream_coverage_shards: Vec<Vec<String>>,
+    reconnecting_shards: Vec<BTreeSet<String>>,
+    reconnecting_depth_shards: Vec<BTreeSet<String>>,
 }
 
 impl ProcessState {
@@ -402,6 +411,51 @@ impl ProcessState {
         Self {
             stream_coverage_trusted,
             ..Self::default()
+        }
+    }
+
+    fn streams_healthy(&self) -> bool {
+        self.reconnecting_shards.is_empty()
+    }
+
+    fn depth_streams_healthy(&self) -> bool {
+        self.reconnecting_depth_shards.is_empty()
+    }
+
+    fn mark_shard_disconnected(&mut self, streams: Vec<String>) {
+        let shard = streams.into_iter().collect::<BTreeSet<_>>();
+        if shard.is_empty() {
+            return;
+        }
+        if !self.reconnecting_shards.iter().any(|known| known == &shard) {
+            self.reconnecting_shards.push(shard.clone());
+        }
+        if shard.iter().any(|stream| stream.ends_with("@depth@100ms"))
+            && !self
+                .reconnecting_depth_shards
+                .iter()
+                .any(|known| known == &shard)
+        {
+            self.reconnecting_depth_shards.push(shard);
+        }
+    }
+
+    fn mark_stream_observed(&mut self, stream: &str) {
+        if let Some(index) = self
+            .reconnecting_shards
+            .iter()
+            .position(|shard| shard.contains(stream))
+        {
+            self.reconnecting_shards.remove(index);
+        }
+        if stream.ends_with("@depth@100ms") {
+            if let Some(index) = self
+                .reconnecting_depth_shards
+                .iter()
+                .position(|shard| shard.contains(stream))
+            {
+                self.reconnecting_depth_shards.remove(index);
+            }
         }
     }
 }
@@ -848,7 +902,11 @@ async fn run_session(
         }
 
         if last_health.elapsed() >= Duration::from_secs(30) {
-            let status = if states.values().all(|state| state.synced) {
+            let status = if !process_state.streams_healthy()
+                || !process_state.depth_streams_healthy()
+            {
+                "reconnecting"
+            } else if states.values().all(|state| state.synced) {
                 "synced"
             } else {
                 "syncing"
@@ -939,6 +997,10 @@ fn process_event(
             if config.is_excluded(&diff.symbol) {
                 return Ok(ProcessAction::None);
             }
+            let stream_name = format!(
+                "{}@depth@100ms",
+                diff.symbol.to_ascii_lowercase()
+            );
             if source_clock.symbol != diff.symbol {
                 anyhow::bail!("depth sequence and source-clock symbols disagree");
             }
@@ -976,6 +1038,7 @@ fn process_event(
                 )?;
                 return Err(error);
             }
+            process_state.mark_stream_observed(&stream_name);
         }
         Event::AggregateTrade { trade, frame } => {
             if config.is_excluded(&trade.symbol) {
@@ -1004,6 +1067,10 @@ fn process_event(
                 json!({"session_id":session_id,"frame":frame}),
                 trade.received_at_ns,
             )?;
+            process_state.mark_stream_observed(&format!(
+                "{}@aggTrade",
+                trade.symbol.to_ascii_lowercase()
+            ));
         }
         Event::Snapshot {
             received_at_ns,
@@ -1071,6 +1138,13 @@ fn process_event(
             for state in states.values_mut() {
                 state.verify_stream_coverage();
             }
+        }
+        Event::StreamDisconnected { streams, reason } => {
+            process_state.mark_shard_disconnected(streams);
+            info!(reason, "websocket shard reconnecting");
+        }
+        Event::StreamReconnected { streams } => {
+            info!(streams = ?streams, "websocket shard connection restored; awaiting market data");
         }
     }
     Ok(ProcessAction::None)
@@ -1146,6 +1220,7 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             json!({"session_id":session_id,"shards":shards}),
             now_ns()?,
         ),
+        Event::StreamDisconnected { .. } | Event::StreamReconnected { .. } => Ok(()),
     }
 }
 
@@ -1241,7 +1316,10 @@ fn replay_checkpoint_ready(
     states: &HashMap<String, OrderBookState>,
     process_state: &ProcessState,
 ) -> bool {
-    segment.is_replay_safe()
+    // A transport reconnect cannot seed a checkpoint until a post-reconnect
+    // market event has passed the sequence validators.
+    process_state.depth_streams_healthy()
+        && segment.is_replay_safe()
         && process_state.stream_coverage_trusted
         && segment.event_count("agg_trade") > 0
         && !states.is_empty()
@@ -1320,6 +1398,32 @@ fn close_segment_at(
     segment.close()
 }
 
+async fn send_stream_event(
+    sender: &mpsc::Sender<Event>,
+    event: Event,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<TaskExit>> {
+    match send_or_shutdown(sender, event, shutdown).await? {
+        SendOutcome::Sent => Ok(None),
+        SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
+    }
+}
+
+async fn wait_for_stream_reconnect(
+    shutdown: &mut watch::Receiver<bool>,
+    backoff: &mut u64,
+) -> anyhow::Result<bool> {
+    if *shutdown.borrow() {
+        return Ok(true);
+    }
+    let delay = *backoff;
+    *backoff = (*backoff * 2).min(30);
+    tokio::select! {
+        changed = shutdown.changed() => Ok(changed.is_err() || *shutdown.borrow()),
+        _ = tokio::time::sleep(Duration::from_secs(delay)) => Ok(false),
+    }
+}
+
 async fn receive_url(
     shard: StreamShard,
     sender: mpsc::Sender<Event>,
@@ -1329,83 +1433,189 @@ async fn receive_url(
     subscription_proof_timeout: Duration,
     watchdog: ProcessWatchdog,
 ) -> anyhow::Result<TaskExit> {
-    let (mut websocket, _) =
-        tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url))
-            .await
-            .context("websocket connect timed out")??;
-    websocket
-        .send(Message::Text(
-            json!({"method":"LIST_SUBSCRIPTIONS","id":SUBSCRIPTION_PROOF_ID})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .context("failed to request websocket subscription proof")?;
-    let subscription_proof_deadline = tokio::time::Instant::now() + subscription_proof_timeout;
+    let streams = shard.streams.iter().cloned().collect::<Vec<_>>();
+    let mut coverage_announced = false;
+    let mut reconnect_backoff = 1_u64;
+
     loop {
-        let message = tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                changed?;
-                let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+        let mut websocket =
+            match tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url)).await {
+                Ok(Ok((websocket, _))) => websocket,
+                Ok(Err(error)) if coverage_announced => {
+                    warn!(error = %error, "websocket reconnect failed");
+                    if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
+                        return Ok(TaskExit::Stopped(None));
+                    }
+                    continue;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) if coverage_announced => {
+                    warn!("websocket reconnect timed out");
+                    if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
+                        return Ok(TaskExit::Stopped(None));
+                    }
+                    continue;
+                }
+                Err(_) => return Err(anyhow::anyhow!("websocket connect timed out")),
+            };
+
+        if let Err(error) = websocket
+            .send(Message::Text(
+                json!({"method":"LIST_SUBSCRIPTIONS","id":SUBSCRIPTION_PROOF_ID})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+        {
+            if !coverage_announced {
+                return Err(error.into());
+            }
+            warn!(error = %error, "websocket subscription proof request failed");
+            if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
                 return Ok(TaskExit::Stopped(None));
             }
-            message = receive_before_subscription_proof_deadline(
-                subscription_proof_deadline,
-                websocket.next(),
-            ) => {
-                message?
-                    .ok_or_else(|| anyhow::anyhow!("websocket closed before subscription proof"))??
-            }
-        };
-        if let Message::Text(text) = message {
-            watchdog.mark_data();
-            let received_at_ns = now_ns()?;
-            let frame: Value = serde_json::from_str(&text)?;
-            if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
-                let listed = validate_subscription_listing(&frame, &shard.streams)?;
-                stream_connected
-                    .send(listed)
-                    .await
-                    .context("stream connection receiver dropped")?;
-                break;
-            }
-            let event = event_from_frame(frame, received_at_ns)?;
-            match receive_before_subscription_proof_deadline(
-                subscription_proof_deadline,
-                send_or_shutdown(&sender, event, &mut shutdown),
-            )
-            .await??
-            {
-                SendOutcome::Sent => {}
-                SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+            continue;
+        }
+
+        let subscription_proof_deadline = tokio::time::Instant::now() + subscription_proof_timeout;
+        let mut proof_failure = None;
+        loop {
+            let message = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    changed?;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+                    return Ok(TaskExit::Stopped(None));
+                }
+                message = receive_before_subscription_proof_deadline(
+                    subscription_proof_deadline,
+                    websocket.next(),
+                ) => match message {
+                    Ok(message) => match message {
+                        Some(message) => match message {
+                            Ok(message) => message,
+                            Err(error) => {
+                                proof_failure = Some(error.to_string());
+                                break;
+                            }
+                        },
+                        None => {
+                            proof_failure = Some("websocket closed before subscription proof".into());
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        proof_failure = Some(error.to_string());
+                        break;
+                    }
+                }
+            };
+            if let Message::Text(text) = message {
+                watchdog.mark_data();
+                let received_at_ns = now_ns()?;
+                let frame: Value = serde_json::from_str(&text)?;
+                if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
+                    let listed = validate_subscription_listing(&frame, &shard.streams)?;
+                    if coverage_announced {
+                        if let Some(exit) = send_stream_event(
+                            &sender,
+                            Event::StreamReconnected {
+                                streams: streams.clone(),
+                            },
+                            &mut shutdown,
+                        )
+                        .await?
+                        {
+                            return Ok(exit);
+                        }
+                    } else {
+                        stream_connected
+                            .send(listed)
+                            .await
+                            .context("stream connection receiver dropped")?;
+                        coverage_announced = true;
+                    }
+                    reconnect_backoff = 1;
+                    break;
+                }
+                let event = event_from_frame(frame, received_at_ns)?;
+                match receive_before_subscription_proof_deadline(
+                    subscription_proof_deadline,
+                    send_or_shutdown(&sender, event, &mut shutdown),
+                )
+                .await??
+                {
+                    SendOutcome::Sent => {}
+                    SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+                }
             }
         }
-    }
-    // Only verified exact stream coverage unlocks snapshot requests. Market
-    // events received while waiting for the proof were already buffered above.
-    loop {
-        let message = tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                changed?;
-                let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+        if let Some(reason) = proof_failure {
+            if !coverage_announced {
+                return Err(anyhow::anyhow!(reason));
+            }
+            warn!(reason, "websocket subscription proof failed; reconnecting");
+            if let Some(exit) = send_stream_event(
+                &sender,
+                Event::StreamDisconnected {
+                    streams: streams.clone(),
+                    reason,
+                },
+                &mut shutdown,
+            )
+            .await?
+            {
+                return Ok(exit);
+            }
+            if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
                 return Ok(TaskExit::Stopped(None));
             }
-            message = tokio::time::timeout(stall_timeout, websocket.next()) => {
-                message.context("websocket shard stalled")?
-                    .ok_or_else(|| anyhow::anyhow!("websocket closed"))??
+            continue;
+        }
+
+        // Only verified exact stream coverage unlocks snapshot requests. Market
+        // events received while waiting for the proof were already buffered above.
+        let reason = loop {
+            let message = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    changed?;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+                    return Ok(TaskExit::Stopped(None));
+                }
+                message = tokio::time::timeout(stall_timeout, websocket.next()) => match message {
+                    Ok(Some(Ok(message))) => message,
+                    Ok(Some(Err(error))) => break format!("websocket receive failed: {error}"),
+                    Ok(None) => break "websocket closed".into(),
+                    Err(_) => break format!("websocket shard stalled for {}s", stall_timeout.as_secs()),
+                }
+            };
+            if let Message::Text(text) = message {
+                watchdog.mark_data();
+                let received_at_ns = now_ns()?;
+                let frame = serde_json::from_str(&text)?;
+                let event = event_from_frame(frame, received_at_ns)?;
+                match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                    SendOutcome::Sent => {}
+                    SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+                }
             }
         };
-        if let Message::Text(text) = message {
-            watchdog.mark_data();
-            let received_at_ns = now_ns()?;
-            let frame = serde_json::from_str(&text)?;
-            let event = event_from_frame(frame, received_at_ns)?;
-            match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                SendOutcome::Sent => {}
-                SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
-            }
+        warn!(reason, "websocket shard disconnected; reconnecting");
+        if let Some(exit) = send_stream_event(
+            &sender,
+            Event::StreamDisconnected {
+                streams: streams.clone(),
+                reason,
+            },
+            &mut shutdown,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+        if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
+            return Ok(TaskExit::Stopped(None));
         }
     }
 }
@@ -2926,6 +3136,132 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn transient_websocket_close_is_reconnected_without_failing_the_stream_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let server = tokio::spawn(async move {
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "id": SUBSCRIPTION_PROOF_ID,
+                            "result": ["btcusdt@aggTrade", "btcusdt@depth@100ms"]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if connection == 0 {
+                    websocket.close(None).await.unwrap();
+                    continue;
+                }
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "stream": "btcusdt@aggTrade",
+                            "data": {
+                                "e": "aggTrade",
+                                "E": event_time_ms,
+                                "s": "BTCUSDT",
+                                "a": 1,
+                                "f": 1,
+                                "l": 1,
+                                "p": "100",
+                                "q": "1",
+                                "T": event_time_ms,
+                                "m": false
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                websocket
+                    .send(Message::Text(
+                        json!({
+                            "stream": "btcusdt@depth@100ms",
+                            "data": {
+                                "e": "depthUpdate",
+                                "E": event_time_ms,
+                                "T": event_time_ms,
+                                "s": "BTCUSDT",
+                                "U": 1,
+                                "u": 1,
+                                "b": [],
+                                "a": []
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let _ = websocket.next().await;
+            }
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let shard = StreamShard {
+            url: format!("ws://{address}"),
+            streams: BTreeSet::from([
+                "btcusdt@aggTrade".to_owned(),
+                "btcusdt@depth@100ms".to_owned(),
+            ]),
+        };
+
+        let task = tokio::spawn(receive_url(
+            shard,
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            ProcessWatchdog::new_state(),
+        ));
+        let mut saw_disconnect = false;
+        let mut saw_reconnect = false;
+        let mut saw_aggregate_trade = false;
+        let mut saw_depth = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match receiver.recv().await {
+                    Some(Event::AggregateTrade { .. }) if saw_reconnect => {
+                        saw_aggregate_trade = true;
+                    }
+                    Some(Event::Diff { .. }) if saw_reconnect => saw_depth = true,
+                    Some(Event::StreamDisconnected { .. }) => saw_disconnect = true,
+                    Some(Event::StreamReconnected { .. }) => saw_reconnect = true,
+                    Some(_) => {}
+                    None => panic!("stream task exited after the transient close"),
+                }
+                if saw_aggregate_trade && saw_depth {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("stream task did not reconnect after the transient close");
+        assert!(saw_disconnect);
+        assert!(saw_reconnect);
+        assert!(saw_aggregate_trade);
+        assert!(saw_depth);
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
     #[test]
     fn aggregate_trade_is_validated_and_archived_without_mutating_lob_state() {
         let root = env::temp_dir().join(format!(
@@ -3297,6 +3633,24 @@ mod tests {
         assert!(ProcessAction::Excluded.restarts_capture_session());
         assert!(!ProcessAction::None.restarts_capture_session());
         assert!(!ProcessAction::InitialSnapshotsComplete.restarts_capture_session());
+    }
+
+    #[test]
+    fn reconnecting_shard_stays_unhealthy_until_market_data_returns() {
+        let mut process_state = ProcessState::new(true);
+        process_state.mark_shard_disconnected(vec![
+            "btcusdt@depth@100ms".into(),
+            "btcusdt@aggTrade".into(),
+        ]);
+        assert!(!process_state.streams_healthy());
+
+        process_state.mark_stream_observed("btcusdt@aggTrade");
+        assert!(process_state.streams_healthy());
+        assert!(!process_state.depth_streams_healthy());
+
+        process_state.mark_stream_observed("btcusdt@depth@100ms");
+        assert!(process_state.streams_healthy());
+        assert!(process_state.depth_streams_healthy());
     }
 
     #[tokio::test]
@@ -3889,6 +4243,78 @@ mod tests {
         let artifacts = close_segment(next, &config, &states, "session-1", "test", &process_state)
             .unwrap()
             .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+    }
+
+    #[test]
+    fn reconnecting_shard_cannot_publish_a_replay_safe_checkpoint() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = tempfile::Builder::new()
+            .prefix("monday-reconnecting-shard-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut budget = PendingBudget::new(1);
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["102", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        state
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: None,
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        archive_first_btc_aggregate_trade(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+        );
+        process_state.mark_shard_disconnected(vec![
+            "btcusdt@depth@100ms".into(),
+            "btcusdt@aggTrade".into(),
+        ]);
+        process_state.mark_stream_observed("btcusdt@aggTrade");
+        assert!(process_state.streams_healthy());
+        assert!(!process_state.depth_streams_healthy());
+
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &process_state,
+        )
+        .unwrap()
+        .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["has_replay_safe_checkpoint"], false);
