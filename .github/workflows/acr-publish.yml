@@ -1,6 +1,9 @@
 name: Publish ACR Images
 
 on:
+  workflow_run:
+    workflows: ["Prediction Markets CI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       target:
@@ -15,8 +18,14 @@ on:
           - binance-lob-archiver
           - polymarket-evidence-compiler
           - polymarket-market-recorder
+      rebuild_research_runner:
+        description: Explicitly rebuild research binaries for a manual publish
+        required: true
+        default: false
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -25,19 +34,71 @@ concurrency:
 
 jobs:
   selector:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      publish_target: ${{ steps.source.outputs.publish_target }}
+      research_mode: ${{ steps.source.outputs.research_mode }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      artifact_run_id: ${{ steps.source.outputs.artifact_run_id }}
     steps:
+      - name: Checkout source selector
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Read authenticated source job results
+        id: source-jobs
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \
+            --jq '.jobs[] | [.name, .conclusion] | @tsv')
+          job_conclusion() {
+            local name=$1 matches
+            matches=$(awk -F '\t' -v name="$name" '$1 == name {print $2}' <<<"$jobs")
+            [[ -n "$matches" && "$matches" != *$'\n'* ]]
+            printf '%s\n' "$matches"
+          }
+          echo "binaries_conclusion=$(job_conclusion 'Research image binaries')" >> "$GITHUB_OUTPUT"
+          echo "smoke_conclusion=$(job_conclusion 'Research image smoke')" >> "$GITHUB_OUTPUT"
+
+      - name: Select authenticated publish source
+        id: source
+        env:
+          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}
+          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          PUBLISH_TARGET: ${{ inputs.target }}
+          REBUILD_RESEARCH_RUNNER: ${{ inputs.rebuild_research_runner }}
+          CURRENT_SHA: ${{ github.sha }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          .github/scripts/select-acr-publish-source.sh \
+            --event "$EVENT_NAME" \
+            --conclusion "$SOURCE_CONCLUSION" \
+            --source-event "$SOURCE_EVENT" \
+            --head-branch "$HEAD_BRANCH" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$SOURCE_RUN_ID" \
+            --binaries-conclusion "$BINARIES_CONCLUSION" \
+            --smoke-conclusion "$SMOKE_CONCLUSION" \
+            --target "$PUBLISH_TARGET" \
+            --rebuild "$REBUILD_RESEARCH_RUNNER" \
+            --current-sha "$CURRENT_SHA" \
+            --current-run-id "$CURRENT_RUN_ID"
+
       - name: Select publish targets
         id: select
         env:
-          TARGET: ${{ inputs.target }}
+          TARGET: ${{ steps.source.outputs.publish_target }}
         run: |
-          case "$TARGET" in
-            all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder) ;;
-            *) echo "Unsupported publish target: $TARGET" >&2; exit 1 ;;
-          esac
           matrix=$(jq -cn --arg target "$TARGET" '
             [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},
              {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime"},
@@ -49,7 +110,7 @@ jobs:
 
   research-runner-binaries:
     needs: selector
-    if: inputs.target == 'all' || inputs.target == 'research-runner'
+    if: needs.selector.outputs.research_mode == 'rebuild'
     runs-on: ubuntu-latest
     container: rust:1.91-bookworm
     defaults:
@@ -62,6 +123,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.selector.outputs.source_sha }}
 
       - name: Install build dependencies
         run: |
@@ -69,6 +132,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             clang \
             cmake \
+            jq \
             mold \
             pkg-config \
             protobuf-compiler \
@@ -106,26 +170,28 @@ jobs:
               --bin monday-prediction-research \
               --bin monday-prediction-evaluator \
               --bin monday-prediction-snapshot
-          install -D -m 0755 target/release/hft-backtest research-bin/hft-backtest
-          install -D -m 0755 target/release/alpha-harness research-bin/alpha-harness
-          install -D -m 0755 target/release/lob-pit-materializer research-bin/lob-pit-materializer
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-bin/monday-prediction-research
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-bin/monday-prediction-evaluator
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-snapshot research-bin/monday-prediction-snapshot
-          ../.github/scripts/verify-research-runner-binaries.sh research-bin
+          install -D -m 0755 target/release/hft-backtest research-release/research-bin/hft-backtest
+          install -D -m 0755 target/release/alpha-harness research-release/research-bin/alpha-harness
+          install -D -m 0755 target/release/lob-pit-materializer research-release/research-bin/lob-pit-materializer
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-release/research-bin/monday-prediction-research
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-release/research-bin/monday-prediction-evaluator
+          install -D -m 0755 target/prediction-markets/release/monday-prediction-snapshot research-release/research-bin/monday-prediction-snapshot
+          ../.github/scripts/research-image-release-artifact.sh create research-release \
+            "${{ needs.selector.outputs.source_sha }}" \
+            "${{ needs.selector.outputs.artifact_run_id }}" .
           sccache --show-stats
 
-      - name: Upload research runner binaries
+      - name: Upload manual research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: research-runner-binaries-${{ github.sha }}
-          path: rust_hft/research-bin/
+          name: research-image-release-${{ needs.selector.outputs.source_sha }}
+          path: rust_hft/research-release/
           if-no-files-found: error
           retention-days: 1
 
   publish:
     needs: [selector, research-runner-binaries]
-    if: always()
+    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -134,33 +200,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.selector.outputs.source_sha }}
 
-      - name: Require research runner binaries
-        if: matrix.repository == 'research-runner' && needs.research-runner-binaries.result != 'success'
-        run: exit 1
+      - name: Require selected research release source
+        if: matrix.repository == 'research-runner'
+        env:
+          RESEARCH_MODE: ${{ needs.selector.outputs.research_mode }}
+          REBUILD_RESULT: ${{ needs.research-runner-binaries.result }}
+        run: |
+          [[ "$RESEARCH_MODE" == artifact ]] || \
+            [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
 
       - name: Download research runner binaries
         if: matrix.repository == 'research-runner'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: research-runner-binaries-${{ github.sha }}
-          path: rust_hft/research-bin/
+          name: research-image-release-${{ needs.selector.outputs.source_sha }}
+          path: research-release/
+          run-id: ${{ needs.selector.outputs.artifact_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Restore research runner binary modes
         if: matrix.repository == 'research-runner'
         run: |
           chmod 0755 \
-            rust_hft/research-bin/hft-backtest \
-            rust_hft/research-bin/alpha-harness \
-            rust_hft/research-bin/lob-pit-materializer \
-            rust_hft/research-bin/monday-prediction-research \
-            rust_hft/research-bin/monday-prediction-evaluator \
-            rust_hft/research-bin/monday-prediction-snapshot
+            research-release/research-bin/hft-backtest \
+            research-release/research-bin/alpha-harness \
+            research-release/research-bin/lob-pit-materializer \
+            research-release/research-bin/monday-prediction-research \
+            research-release/research-bin/monday-prediction-evaluator \
+            research-release/research-bin/monday-prediction-snapshot
 
       - name: Verify research runner binary artifact
         if: matrix.repository == 'research-runner'
         run: |
-          .github/scripts/verify-research-runner-binaries.sh rust_hft/research-bin
+          .github/scripts/research-image-release-artifact.sh verify research-release \
+            "${{ needs.selector.outputs.source_sha }}" \
+            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft
+          mv research-release/research-bin rust_hft/research-bin
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -182,14 +260,14 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            SOURCE_REVISION=${{ github.sha }}
+            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
           tags: |
-            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ needs.selector.outputs.source_sha }}
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
           cache-to: type=gha,mode=max,scope=acr-${{ matrix.repository }}
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
 
       - name: Record immutable image
         run: |
@@ -199,7 +277,7 @@ jobs:
         if: matrix.repository == 'polymarket-evidence-compiler'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
           actual_source_revision=$(docker image inspect \
@@ -211,7 +289,7 @@ jobs:
         if: matrix.repository == 'polymarket-market-recorder'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
           actual_source_revision=$(docker image inspect \
@@ -230,7 +308,7 @@ jobs:
         if: matrix.repository == 'research-runner'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE"
@@ -295,7 +373,7 @@ jobs:
             control_archive_sha=$(sha256sum trading-ecs-control.tar.gz \
               | awk '{print $1}')
             jq -S -n \
-              --arg source_revision '${{ github.sha }}' \
+              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
               --arg published_repository "$published_repository" \
               --arg image_repository "$vpc_repository" \
               --arg image_digest "$IMAGE_DIGEST" \
@@ -346,7 +424,7 @@ jobs:
           chmod 0755 artifact/binance-usdm-reference-collector
           chmod 0755 artifact/binance-usdm-reference-artifact-verifier
           artifact/binance-lob-archiver --version \
-            | grep -Fqx 'binance-lob-archiver ${{ github.sha }}'
+            | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
@@ -404,7 +482,7 @@ jobs:
             reference_control_archive_sha=$(sha256sum \
               binance-usdm-reference-control.tar.gz | awk '{print $1}')
             jq -S -n \
-              --arg source_revision '${{ github.sha }}' \
+              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$reference_candidate_sha" \
               --arg verifier_sha256 "$reference_verifier_sha" \
               --arg control_manifest_sha256 "$reference_control_manifest_sha" \
@@ -424,7 +502,7 @@ jobs:
               binance-usdm-reference-control.tar.gz \
               > binance-usdm-reference-control.tar.gz.sha256
             jq -S -n \
-              --arg source_revision '${{ github.sha }}' \
+              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$candidate_sha" \
               --arg control_manifest_sha256 "$control_manifest_sha" \
               --arg control_archive_sha256 "$control_archive_sha" \

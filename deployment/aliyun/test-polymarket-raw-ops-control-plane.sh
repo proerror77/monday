@@ -44,7 +44,7 @@ cargo build --quiet --manifest-path "$RUST_MANIFEST" -p hft-collector \
 }
 grep -Fq 'polymarket-evidence-compiler' "$WORKFLOW"
 grep -Fq 'Dockerfile.polymarket-evidence-compiler' "$WORKFLOW"
-grep -Fq 'org.opencontainers.image.revision=${{ github.sha }}' "$WORKFLOW"
+grep -Fq 'org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$WORKFLOW"
 grep -Fq 'Verify Polymarket compiler source binding' "$WORKFLOW"
 grep -Fq '/usr/local/bin/polymarket-raw-ops' "$POLYMARKET_COMPILER_DOCKERFILE"
 if grep -Fq '/usr/local/bin/binance-lob-archiver' "$POLYMARKET_COMPILER_DOCKERFILE"; then
