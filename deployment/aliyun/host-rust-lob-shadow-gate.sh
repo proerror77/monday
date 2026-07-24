@@ -27,7 +27,8 @@ usage() {
     '' \
     'Production gates always observe at least 3600 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
-    'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.'
+    'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.' \
+    'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS.'
 }
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
@@ -109,6 +110,18 @@ if ((gate_seconds < REQUIRED_DURATION_SECONDS)); then
   [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
     || die 'short gates require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
   test_only=true
+fi
+health_settle_seconds=$HEALTH_SETTLE_SECONDS
+if [[ -n ${MONDAY_TEST_HEALTH_SETTLE_SECONDS:-} ]]; then
+  [[ $test_only == true ]] \
+    || die 'short health settles require a test-only gate'
+  [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
+    || die 'short health settles require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
+  [[ ${MONDAY_TEST_HEALTH_SETTLE_SECONDS} =~ ^[1-9][0-9]*$ ]] \
+    || die 'test health settle duration must be a positive integer'
+  ((MONDAY_TEST_HEALTH_SETTLE_SECONDS < HEALTH_SETTLE_SECONDS)) \
+    || die 'test health settle duration must be shorter than the formal settle duration'
+  health_settle_seconds=$MONDAY_TEST_HEALTH_SETTLE_SECONDS
 fi
 
 env_value() {
@@ -230,12 +243,14 @@ jq -n \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
   --arg deployment_source_revision "$deployment_source_revision" \
   --argjson requested_duration_seconds "$gate_seconds" \
+  --argjson health_settle_seconds "$health_settle_seconds" \
   --argjson test_only "$test_only" \
   '{schema:$schema,run_id:$run_id,created_at:$created_at,
     candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
-    requested_duration_seconds:$requested_duration_seconds,test_only:$test_only}' \
+    requested_duration_seconds:$requested_duration_seconds,
+    health_settle_seconds:$health_settle_seconds,test_only:$test_only}' \
   >"$evidence_dir/run.json"
 chmod 0640 "$evidence_dir/run.json"
 
@@ -429,7 +444,7 @@ health_catalog_sha256() {
     | sha256sum | awk '{print $1}'
 }
 
-settle_deadline=$(( $(monotonic_seconds) + HEALTH_SETTLE_SECONDS ))
+settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))
 while ! health_passes spot || ! health_passes usdm; do
   (( $(monotonic_seconds) < settle_deadline )) \
     || die 'shadow health did not reach the fail-closed gate before the settle deadline'
@@ -590,7 +605,7 @@ manifest_uris() {
   local listing=$2
   local prefix line token max_age_seconds
   prefix="oss://${oss_bucket[$market]}/lake/raw/venue=binance/market=${market}/dataset=${dataset[$market]}/shard=${shard_id[$market]}/"
-  max_age_seconds=$((gate_seconds + HEALTH_SETTLE_SECONDS + 3600))
+  max_age_seconds=$((gate_seconds + health_settle_seconds + 3600))
   run_oss "$market" ls "$prefix" --recursive --short-format \
     --max-age "${max_age_seconds}s" >"$listing"
   while IFS= read -r line; do
@@ -919,6 +934,7 @@ jq -n \
   --arg finished_at "$gate_finished_at" \
   --argjson required_duration_seconds "$REQUIRED_DURATION_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
+  --argjson health_settle_seconds "$health_settle_seconds" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
   --argjson checks_passed true \
@@ -931,6 +947,7 @@ jq -n \
     started_at:$started_at,finished_at:$finished_at,
     required_duration_seconds:$required_duration_seconds,
     requested_duration_seconds:$requested_duration_seconds,
+    health_settle_seconds:$health_settle_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,
     production_eligible:$production_eligible,passed:$passed,markets:$markets}' \
