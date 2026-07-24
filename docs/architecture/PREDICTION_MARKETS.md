@@ -61,19 +61,96 @@ The prediction-market lane also keeps data authority explicit:
 
 ### Polymarket event and model identity
 
-Crypto-expiry research is partitioned by `underlying x horizon`; each product
-family is a separate mission and model-selection problem. One immutable event
-root is one episode. It binds the event window and exact UP/DOWN token pair,
-while `market_id`, `condition_id`, and market slug remain audited aliases rather
-than competing training keys. The two outcome tokens retain independent LOB
-trajectories inside the episode; they are not two independent settlement
-labels.
+The continuously-ready path first serves BTC five-minute markets. Its binding
+identity hierarchy is:
 
-The settlement model emits one event probability `p_up` (`p_down = 1 - p_up`).
-Token repricing, fill probability, slippage, and markout belong to separate UP
-and DOWN execution heads and separate evaluator evidence. They may consume the
-event probability at the decision layer, but they cannot change the official
-settlement label or be promoted by settlement calibration alone.
+| Level | Canonical identity | Contract |
+| --- | --- | --- |
+| Product family | `symbol x event_horizon` (`BTC x 5m` first) | One Mission and model-selection problem; other symbols or horizons are different product families. |
+| Episode | `market_id` | One immutable event window and one official binary settlement. `condition_id` and market slug are audited aliases, not training keys. |
+| Instrument | `token_id` | Each selected episode binds exactly one `UP` token and one `DOWN` token. Their books, trades, fees, fills, slippage, and markouts never share instrument identity. |
+
+The settlement model emits one episode probability `p_up`
+(`p_down = 1 - p_up`). The two instruments are not two settlement labels.
+Token repricing, fill probability, slippage, and markout are instead independent
+UP-execution and DOWN-execution tasks. They may consume the corresponding
+settlement probability as a point-in-time feature, but cannot change the
+official settlement label or be accepted by settlement calibration alone.
+
+### Continuously-ready research contract
+
+A source-closed producer segment is only a candidate. An independent typed
+verifier that cannot write or repair producer evidence is the sole authority
+allowed to append a catalog classification. The verifier rehashes the producer
+artifacts and records its own binary, configuration, and policy identities.
+Producer success, collector health, object presence, and operator inspection
+cannot promote an episode to `ready`.
+
+| State | Meaning | Selectable for a cohort |
+| --- | --- | --- |
+| `ready` | The episode has one exact UP/DOWN token pair and all provenance, request outcomes, clocks, sequence, completion, task-surface, and snapshot-input evidence required by the verifier policy. | Yes, only for the verified supported tasks. |
+| `partial` | Authentic evidence exists but at least one required surface is incomplete or not yet closed. The verifier records reason codes and the supported subset, if any. | No. A new immutable producer revision may be verified independently; it does not rewrite this classification. |
+| `rejected` | Evidence is contradictory, non-derivable, corrupt, identity-mismatched, or outside the declared product/task contract. | No. Repair requires new producer evidence and a new verification receipt; the rejected receipt remains immutable. |
+
+Completeness is event-local. A `partial` or `rejected` sibling episode does not
+block another independently complete episode in the same product family from
+becoming `ready`. Conversely, evidence from a sibling must never fill the
+selected episode's gap.
+
+Catalog, snapshot, and execution handoffs authenticate identity by pinning and
+rehashing immutable content, not by trusting a mutable path or status field:
+
+| Handoff | Identity that must be bound by the next receipt |
+| --- | --- |
+| Producer evidence | Producer source revision, binary and configuration digests, schema identity, source-closed segment manifest, and artifact digests. |
+| Verifier receipt / ready catalog entry | Producer manifest digest; verifier binary, configuration, and policy digests; classification and reason codes; exact product, episode, UP token, DOWN token, supported-task, and coverage identities. |
+| Cohort manifest | Ordered ready-catalog entry digests, event-disjoint partition assignment, common-time boundary, label-availability cutoff, and causal projection rules. |
+| `ResearchSnapshot` | Cohort-manifest digest plus the digests of the exact evaluator-visible bytes. It is materialized and cached before Mission admission. |
+| Mission | Mission SHA over product family, typed task, run mode, authority profile, cohort partition, snapshot digest, task horizon where applicable, and all evaluator/search parameters. Raw collector paths are forbidden. |
+| Runtime image | Exact repository revision, release-binary digest, and immutable OCI image digest selected by the admitted Mission. A mutable tag is not an identity. |
+| Result receipt | Mission SHA, snapshot digest, image digest, lifecycle timestamps, and content digest of a create-once result bundle independently rehashed after publication. |
+
+The research objectives remain separate even when they consume the same
+authenticated snapshot:
+
+| Typed task | Allowed label | Required evidence |
+| --- | --- | --- |
+| `settlement_probability` | One official binary episode outcome: `UP` or `DOWN`. | Exact market contract, causal Chainlink opening/expiry observations, official resolved outcome and availability clock, plus event-disjoint Brier score, log loss, calibration, and settlement-PnL evidence. Token markouts and fills are not settlement labels. |
+| `up_execution` | UP-token fill outcome, realized execution price/slippage, or executable markout at an explicit 5, 10, 15, or 30 second horizon. | Only the bound UP token's point-in-time book/trades, request and sequence evidence, fees, latency, and declared fill/queue assumptions. Official settlement is not an execution label. |
+| `down_execution` | DOWN-token fill outcome, realized execution price/slippage, or executable markout at an explicit 5, 10, 15, or 30 second horizon. | Only the bound DOWN token's point-in-time book/trades, request and sequence evidence, fees, latency, and declared fill/queue assumptions. Official settlement is not an execution label. |
+
+`pipeline_smoke` and `research_trial` are both research-only authority profiles:
+
+| Run mode | Authority |
+| --- | --- |
+| `pipeline_smoke` | May prove producer-to-result schema compatibility, admission, cache use, evaluator start, publication, and digest readback with a minimal complete cohort. It cannot emit an alpha, generalization, promotion, or profitability verdict. |
+| `research_trial` | May run the typed evaluator and shared MCTS kernel only on event-disjoint train/validation/held-out cohorts. Held-out labels, metrics, and feedback cannot alter candidate search, fitting, selection, or stopping. It may publish research evidence, not activation authority. |
+
+Neither mode authorizes Paper, Shadow, Live, artifact promotion, strategy
+configuration changes, runtime enablement, or profitability claims. A Mission
+requesting any such authority is rejected before a Pod or Job is created.
+
+The [repository work-control policy](../../AGENTS.md) is binding here: one named
+write owner per branch, one independently reviewable and rollbackable change
+contract per PR, and read-only review until ownership is explicitly transferred.
+Prediction-market-specific mutable boundaries are also singular:
+
+- One named runtime controller may submit, replace, delete, deploy, or otherwise
+  mutate catalog and cloud runtime resources. All other agents and operators are
+  read-only until an explicit handoff.
+- One publisher owns create-once publication for an immutable object key. It may
+  not overwrite a snapshot or result identity; independent readback rehashes the
+  published bytes and does not confer branch or runtime control.
+
+#### Binding counterexamples
+
+| Counterexample | Required decision |
+| --- | --- |
+| A row claims the UP `token_id` but uses the DOWN book or trades. | Reject the episode or snapshot for token-book identity mismatch; complementary prices do not repair instrument provenance. |
+| A training observation can see a Chainlink tick after its decision time, or a training event crosses the Mission's common-time boundary. | Reject the cohort or snapshot for future-reference exposure. Causal projection and the label-availability cutoff are independently required. |
+| One episode is complete while an adjacent episode in the same collection segment is missing a book or request outcome. | Admit only the complete episode as `ready`; classify the adjacent episode `partial`. Never reject or repair across the sibling boundary. |
+| MCTS receives held-out labels, metrics, ranking, or natural-language feedback before search is sealed. | Invalidate the `research_trial`; held-out feedback is read-only final evaluation evidence. |
+| A snapshot, image tag, or result path resolves to bytes whose digest differs from the Mission or receipt, or the bytes can be overwritten in place. | Reject admission or readback. Publish new bytes under a new immutable digest; path continuity is not artifact identity. |
 
 Chainlink reference ticks have one physical source of truth and are projected
 point-in-time into each event window. To keep overlapping 5m/15m/1h events from
@@ -89,12 +166,15 @@ walk-forward evaluator, including the no-prior baseline turn. A missing or
 invalid boundary fails closed; generic factor and token-execution reviews do
 not inherit this settlement split implicitly.
 
-The current governed baseline remains BTC/SOL five-minute settlement research
-over the retained one-second full-visible-depth L2 snapshots. Fifteen-minute
-and one-hour missions require their own verified end-to-end data contracts
-before they can claim governed coverage. Full order-book update ticks are
-reserved for the later token microstructure/execution lane; they are not a
-prerequisite for the settlement baseline.
+The broader governed baseline remains BTC/SOL five-minute settlement research
+over the retained one-second full-visible-depth L2 snapshots. The
+continuously-ready catalog and Mission contract above admits only BTC
+five-minute episodes; SOL remains outside this path until a separate verified
+end-to-end contract admits it. Fifteen-minute and one-hour missions likewise
+require their own verified end-to-end data contracts before they can claim
+governed coverage. Full order-book update ticks are reserved for the later token
+microstructure/execution lane; they are not a prerequisite for the settlement
+baseline.
 
 The governed snapshot keeps Binance availability semantics separate from source
 time. Spot and L2 are bucket-selected by exchange time but replayed at
