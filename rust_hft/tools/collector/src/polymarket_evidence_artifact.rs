@@ -3,9 +3,11 @@ use crate::polymarket_research_normalize::{
     normalize_polymarket_evidence, NormalizedPolymarketEvidence, PolymarketEvidenceConfig,
     PolymarketEvidenceReport, EXPLICIT_MARKET_ID_SELECTION,
 };
+use crate::polymarket_research_select::semantic_index;
 use crate::polymarket_upload::ensure_canonical_directory;
-use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -32,14 +34,16 @@ const SURFACES: [&str; 5] = [
 const CONTENT_DIGEST_SEMANTICS: &str =
     "content_sha256 binds the published NDJSON bytes only; it is not a snapshot_contract_hash";
 const PUBLISHED_MODE: u32 = 0o444;
+const PRODUCER_VERIFIER_CONTRACT: &str = "monday.polymarket.normalized_evidence.v2";
 
 #[derive(Debug, Clone)]
 pub struct PolymarketEvidenceArtifactConfig {
     pub evidence: PolymarketEvidenceConfig,
     pub output_root: PathBuf,
+    pub qualification: PolymarketProducerQualificationConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedPolymarketEvidenceDigests {
     pub expected_content_sha256: String,
     pub expected_manifest_sha256: String,
@@ -53,6 +57,465 @@ pub struct PublishedPolymarketEvidence {
     pub success_path: PathBuf,
     pub published_digests: PublishedPolymarketEvidenceDigests,
     pub evidence: PolymarketEvidenceReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedPolymarketEvidenceBatch {
+    pub evidence: Vec<PublishedPolymarketEvidence>,
+    pub qualifications: Vec<PublishedPolymarketEventQualification>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredEvidenceSurface {
+    UpBook,
+    DownBook,
+    Trades,
+    Reference,
+    Settlement,
+}
+impl RequiredEvidenceSurface {
+    pub const ALL: [Self; 5] = [
+        Self::UpBook,
+        Self::DownBook,
+        Self::Trades,
+        Self::Reference,
+        Self::Settlement,
+    ];
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerRequestStatus {
+    Succeeded,
+    Failed,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerRequestOutcome {
+    pub surface: RequiredEvidenceSurface,
+    pub status: ProducerRequestStatus,
+    pub completed_at: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSurfaceStatus {
+    Complete,
+    Incomplete,
+    Contradictory,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerSourceClocks {
+    pub opened_at: String,
+    pub closed_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerSequenceState {
+    pub start: u64,
+    pub end: u64,
+    pub gaps: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketProducerProvenance {
+    pub source_sha: String,
+    pub image_digest: String,
+    pub configuration_sha256: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PolymarketEventQualificationInput {
+    pub market_id: String,
+    pub symbol: String,
+    pub event_start: String,
+    pub event_end: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    #[serde(skip)]
+    pub verified_token_ids: Option<[String; 2]>,
+    pub source_closed: bool,
+    pub up_book: EvidenceSurfaceStatus,
+    pub down_book: EvidenceSurfaceStatus,
+    pub trades: EvidenceSurfaceStatus,
+    pub reference: EvidenceSurfaceStatus,
+    pub settlement: EvidenceSurfaceStatus,
+    pub request_outcomes: Option<Vec<ProducerRequestOutcome>>,
+    pub source_clocks: Option<ProducerSourceClocks>,
+    pub sequence: ProducerSequenceState,
+    pub evidence_digests: PublishedPolymarketEvidenceDigests,
+    pub token_identity_matches: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolymarketProducerQualificationConfig {
+    pub producer: PolymarketProducerProvenance,
+    pub events: Vec<PolymarketEventQualificationInput>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketEventQualificationState {
+    Ready,
+    Partial,
+    Rejected,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketEventQualificationReason {
+    SourceStillOpen,
+    UpBookIncomplete,
+    DownBookIncomplete,
+    TradesIncomplete,
+    ReferenceIncomplete,
+    SettlementIncomplete,
+    ContradictoryEvidence,
+    MissingRequestOutcome,
+    FailedRequestWithCompleteEvidence,
+    MissingSourceClocks,
+    InvalidSourceClocks,
+    SequenceGap,
+    TokenIdentityMismatch,
+    InvalidProducerProvenance,
+    InvalidEvidenceDigest,
+    UnsupportedProductContract,
+    VerifierRejected,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolymarketEventQualificationRecord {
+    pub schema: &'static str,
+    pub verifier_contract: &'static str,
+    pub market_id: String,
+    pub symbol: String,
+    pub event_start: String,
+    pub event_end: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    pub verified_token_ids: Option<[String; 2]>,
+    pub state: PolymarketEventQualificationState,
+    pub reasons: Vec<PolymarketEventQualificationReason>,
+    pub retry: bool,
+    pub producer: PolymarketProducerProvenance,
+    pub source_closed: bool,
+    pub up_book: EvidenceSurfaceStatus,
+    pub down_book: EvidenceSurfaceStatus,
+    pub trades: EvidenceSurfaceStatus,
+    pub reference: EvidenceSurfaceStatus,
+    pub settlement: EvidenceSurfaceStatus,
+    pub request_outcomes: Option<Vec<ProducerRequestOutcome>>,
+    pub source_clocks: Option<ProducerSourceClocks>,
+    pub sequence: ProducerSequenceState,
+    pub evidence_digests: PublishedPolymarketEvidenceDigests,
+    pub token_identity_matches: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutablePublicationOutcome {
+    Published,
+    Unchanged,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedPolymarketEventQualification {
+    pub path: PathBuf,
+    pub outcome: ImmutablePublicationOutcome,
+    pub record: PolymarketEventQualificationRecord,
+}
+fn classify_polymarket_event(
+    input: &PolymarketEventQualificationInput,
+    producer: &PolymarketProducerProvenance,
+    verifier_rejected: bool,
+) -> PolymarketEventQualificationRecord {
+    let mut reasons = Vec::new();
+    let request_surfaces = input.request_outcomes.as_ref().map(|outcomes| {
+        outcomes
+            .iter()
+            .map(|outcome| outcome.surface)
+            .collect::<BTreeSet<_>>()
+    });
+    let mut permanent_failure = request_surfaces.as_ref().is_none_or(|surfaces| {
+        surfaces.len() != RequiredEvidenceSurface::ALL.len()
+            || input
+                .request_outcomes
+                .as_ref()
+                .is_none_or(|outcomes| outcomes.len() != surfaces.len())
+    });
+    if permanent_failure {
+        reasons.push(PolymarketEventQualificationReason::MissingRequestOutcome);
+    }
+    if input.request_outcomes.as_ref().is_some_and(|outcomes| {
+        outcomes.iter().any(|outcome| {
+            outcome.status == ProducerRequestStatus::Failed
+                && match outcome.surface {
+                    RequiredEvidenceSurface::UpBook => input.up_book,
+                    RequiredEvidenceSurface::DownBook => input.down_book,
+                    RequiredEvidenceSurface::Trades => input.trades,
+                    RequiredEvidenceSurface::Reference => input.reference,
+                    RequiredEvidenceSurface::Settlement => input.settlement,
+                } == EvidenceSurfaceStatus::Complete
+        })
+    }) {
+        reasons.push(PolymarketEventQualificationReason::FailedRequestWithCompleteEvidence);
+        permanent_failure = true;
+    }
+    if input.sequence.gaps != 0 || input.sequence.end < input.sequence.start {
+        reasons.push(PolymarketEventQualificationReason::SequenceGap);
+        permanent_failure = true;
+    }
+    if !input.token_identity_matches
+        || input.up_token_id.is_empty()
+        || input.down_token_id.is_empty()
+        || input.up_token_id == input.down_token_id
+    {
+        reasons.push(PolymarketEventQualificationReason::TokenIdentityMismatch);
+        permanent_failure = true;
+    }
+    match &input.source_clocks {
+        None => {
+            reasons.push(PolymarketEventQualificationReason::MissingSourceClocks);
+            permanent_failure = true;
+        }
+        Some(clocks) => {
+            let parsed = [
+                input.event_start.as_str(),
+                input.event_end.as_str(),
+                clocks.opened_at.as_str(),
+                clocks.closed_at.as_str(),
+            ]
+            .map(|value| {
+                DateTime::parse_from_rfc3339(value).map(|value| value.with_timezone(&Utc))
+            });
+            if let [Ok(event_start), Ok(event_end), Ok(opened_at), Ok(closed_at)] = parsed {
+                let request_clock_invalid =
+                    input.request_outcomes.as_ref().is_some_and(|outcomes| {
+                        outcomes.iter().any(|outcome| {
+                            DateTime::parse_from_rfc3339(&outcome.completed_at)
+                                .map(|completed_at| {
+                                    let completed_at = completed_at.with_timezone(&Utc);
+                                    completed_at < opened_at
+                                        || completed_at > closed_at
+                                        || (outcome.surface == RequiredEvidenceSurface::Settlement
+                                            && outcome.status == ProducerRequestStatus::Succeeded
+                                            && completed_at < event_end)
+                                })
+                                .unwrap_or(true)
+                        })
+                    });
+                if event_end <= event_start
+                    || opened_at > event_start
+                    || closed_at < event_end
+                    || request_clock_invalid
+                {
+                    reasons.push(PolymarketEventQualificationReason::InvalidSourceClocks);
+                    permanent_failure = true;
+                }
+                if !["BTCUSDT", "SOLUSDT"].contains(&input.symbol.as_str())
+                    || (event_end - event_start).num_seconds() != 300
+                {
+                    reasons.push(PolymarketEventQualificationReason::UnsupportedProductContract);
+                    permanent_failure = true;
+                }
+            } else {
+                reasons.push(PolymarketEventQualificationReason::InvalidSourceClocks);
+                permanent_failure = true;
+            }
+        }
+    }
+    if [
+        input.up_book,
+        input.down_book,
+        input.trades,
+        input.reference,
+        input.settlement,
+    ]
+    .contains(&EvidenceSurfaceStatus::Contradictory)
+    {
+        reasons.push(PolymarketEventQualificationReason::ContradictoryEvidence);
+        permanent_failure = true;
+    }
+    if !is_lower_hex(&producer.source_sha, 40)
+        || !producer
+            .image_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| is_lower_hex(digest, 64))
+        || !is_lower_hex(&producer.configuration_sha256, 64)
+    {
+        reasons.push(PolymarketEventQualificationReason::InvalidProducerProvenance);
+        permanent_failure = true;
+    }
+    if !is_lower_hex(&input.evidence_digests.expected_content_sha256, 64)
+        || !is_lower_hex(&input.evidence_digests.expected_manifest_sha256, 64)
+    {
+        reasons.push(PolymarketEventQualificationReason::InvalidEvidenceDigest);
+        permanent_failure = true;
+    }
+    if !input.source_closed {
+        reasons.push(PolymarketEventQualificationReason::SourceStillOpen);
+    }
+    for (status, reason) in [
+        (
+            input.up_book,
+            PolymarketEventQualificationReason::UpBookIncomplete,
+        ),
+        (
+            input.down_book,
+            PolymarketEventQualificationReason::DownBookIncomplete,
+        ),
+        (
+            input.trades,
+            PolymarketEventQualificationReason::TradesIncomplete,
+        ),
+        (
+            input.reference,
+            PolymarketEventQualificationReason::ReferenceIncomplete,
+        ),
+        (
+            input.settlement,
+            PolymarketEventQualificationReason::SettlementIncomplete,
+        ),
+    ] {
+        if status == EvidenceSurfaceStatus::Incomplete {
+            reasons.push(reason);
+        }
+    }
+    let state = if permanent_failure {
+        PolymarketEventQualificationState::Rejected
+    } else if reasons.is_empty() {
+        PolymarketEventQualificationState::Ready
+    } else {
+        PolymarketEventQualificationState::Partial
+    };
+    if verifier_rejected {
+        reasons.push(PolymarketEventQualificationReason::VerifierRejected);
+        permanent_failure = true;
+    }
+    let state = if permanent_failure {
+        PolymarketEventQualificationState::Rejected
+    } else {
+        state
+    };
+    let mut request_outcomes = input.request_outcomes.clone();
+    if let Some(outcomes) = &mut request_outcomes {
+        outcomes.sort_by_key(|outcome| outcome.surface);
+    }
+    PolymarketEventQualificationRecord {
+        schema: "monday.polymarket.event_qualification.v1",
+        verifier_contract: PRODUCER_VERIFIER_CONTRACT,
+        market_id: input.market_id.clone(),
+        symbol: input.symbol.clone(),
+        event_start: input.event_start.clone(),
+        event_end: input.event_end.clone(),
+        up_token_id: input.up_token_id.clone(),
+        down_token_id: input.down_token_id.clone(),
+        verified_token_ids: input.verified_token_ids.clone(),
+        state,
+        reasons,
+        retry: state == PolymarketEventQualificationState::Partial,
+        producer: producer.clone(),
+        source_closed: input.source_closed,
+        up_book: input.up_book,
+        down_book: input.down_book,
+        trades: input.trades,
+        reference: input.reference,
+        settlement: input.settlement,
+        request_outcomes,
+        source_clocks: input.source_clocks.clone(),
+        sequence: input.sequence.clone(),
+        evidence_digests: input.evidence_digests.clone(),
+        token_identity_matches: input.token_identity_matches,
+    }
+}
+
+fn is_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn publish_qualification_record(
+    output_root: &Path,
+    record: PolymarketEventQualificationRecord,
+) -> Result<PublishedPolymarketEventQualification> {
+    require_secure_publication_platform()?;
+    if record.market_id.is_empty()
+        || !record
+            .market_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("qualification market_id is not a safe immutable path identity");
+    }
+    ensure_canonical_directory(output_root)?;
+    let digest = &record.evidence_digests.expected_content_sha256;
+    let identity = if is_lower_hex(digest, 64) {
+        digest.clone()
+    } else {
+        hex::encode(Sha256::digest(digest.as_bytes()))
+    };
+    let directory_path = output_root.join(format!("sha256={identity}"));
+    ensure_canonical_directory(&directory_path)?;
+    let path = directory_path.join(format!(
+        "polymarket-event-qualification.{}.{}.json",
+        record.market_id, identity
+    ));
+    let mut bytes = serde_json::to_vec(&record)?;
+    bytes.push(b'\n');
+    let directory = bind_directory(&directory_path)?;
+    let outcome = if install_no_clobber(&directory_path, &directory, &path, &bytes)? {
+        ImmutablePublicationOutcome::Published
+    } else {
+        ImmutablePublicationOutcome::Unchanged
+    };
+    Ok(PublishedPolymarketEventQualification {
+        path,
+        outcome,
+        record,
+    })
+}
+
+fn verified_event_input(
+    evidence: &NormalizedPolymarketEvidence,
+    declared: &PolymarketEventQualificationInput,
+) -> Result<PolymarketEventQualificationInput> {
+    validate_dataset(evidence)?;
+    ensure!(
+        evidence.report.market_ids == [declared.market_id.clone()],
+        "event-local verifier result does not match its declared market"
+    );
+    let contract = evidence
+        .ndjson
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|row| row["surface"] == "market_contract")
+        .collect::<Vec<_>>();
+    ensure!(
+        contract.len() == 1,
+        "event-local verifier must emit one contract"
+    );
+    let contract = &contract[0];
+    let tokens: [String; 2] = serde_json::from_value(contract["source_token_ids"].clone())?;
+    let outcomes: [String; 2] = serde_json::from_value(contract["source_outcomes"].clone())?;
+    let up = semantic_index(&outcomes, true)?;
+    let down = semantic_index(&outcomes, false)?;
+    for (field, expected) in [
+        ("market_id", declared.market_id.as_str()),
+        ("symbol", declared.symbol.as_str()),
+        ("event_start", declared.event_start.as_str()),
+        ("event_end", declared.event_end.as_str()),
+    ] {
+        ensure!(
+            contract[field].as_str() == Some(expected),
+            "verified contract {field} does not match declaration"
+        );
+    }
+    let mut verified = declared.clone();
+    verified.token_identity_matches =
+        declared.up_token_id == tokens[up] && declared.down_token_id == tokens[down];
+    verified.verified_token_ids = Some([tokens[up].clone(), tokens[down].clone()]);
+    verified.source_closed = true;
+    verified.up_book = EvidenceSurfaceStatus::Complete;
+    verified.down_book = EvidenceSurfaceStatus::Complete;
+    verified.trades = EvidenceSurfaceStatus::Complete;
+    verified.reference = EvidenceSurfaceStatus::Complete;
+    verified.settlement = EvidenceSurfaceStatus::Complete;
+    verified.evidence_digests.expected_content_sha256 = evidence.report.content_sha256.clone();
+    Ok(verified)
 }
 
 #[derive(Serialize)]
@@ -413,8 +876,9 @@ fn link_anonymous(directory: &File, output: &File, name: &CString) -> Result<lib
 
 #[cfg(not(target_os = "linux"))]
 // Non-Linux builds remain available for development, but publication fails closed.
-fn install_no_clobber(_: &Path, _: &File, _: &Path, _: &[u8]) -> Result<()> {
-    require_secure_publication_platform()
+fn install_no_clobber(_: &Path, _: &File, _: &Path, _: &[u8]) -> Result<bool> {
+    require_secure_publication_platform()?;
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -423,9 +887,9 @@ fn install_no_clobber(
     directory: &File,
     path: &Path,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<bool> {
     if exact_or_missing(directory_path, directory, path, bytes)? {
-        return Ok(());
+        return Ok(false);
     }
     let name = component(path)?;
     verify_bound_directory(directory_path, directory)?;
@@ -436,12 +900,13 @@ fn install_no_clobber(
     output.sync_all()?;
     let temporary_identity = file_identity(&output.metadata()?);
     verify_bound_directory(directory_path, directory)?;
-    if link_anonymous(directory, &output, &name)? != 0 {
+    let created = if link_anonymous(directory, &output, &name)? != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EEXIST) {
             if !exact_or_missing(directory_path, directory, path, bytes)? {
                 bail!("immutable artifact target disappeared during publication");
             }
+            false
         } else {
             return Err(error.into());
         }
@@ -452,11 +917,15 @@ fn install_no_clobber(
             "artifact target is not the anonymous inode: {}",
             path.display()
         );
-    } else if !exact_or_missing(directory_path, directory, path, bytes)? {
-        bail!("immutable artifact target disappeared after publication");
-    }
+    } else {
+        if !exact_or_missing(directory_path, directory, path, bytes)? {
+            bail!("immutable artifact target disappeared after publication");
+        }
+        true
+    };
     directory.sync_all()?;
-    verify_bound_directory(directory_path, directory)
+    verify_bound_directory(directory_path, directory)?;
+    Ok(created)
 }
 
 fn publish_triplet(
@@ -541,10 +1010,84 @@ fn publish_normalized(
 
 pub fn publish_polymarket_evidence(
     config: &PolymarketEvidenceArtifactConfig,
-) -> Result<PublishedPolymarketEvidence> {
+) -> Result<PublishedPolymarketEvidenceBatch> {
+    publish_polymarket_evidence_with(config, normalize_polymarket_evidence)
+}
+
+fn retryable_infrastructure_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() != std::io::ErrorKind::InvalidData)
+    })
+}
+
+fn publish_polymarket_evidence_with(
+    config: &PolymarketEvidenceArtifactConfig,
+    mut normalize: impl FnMut(&PolymarketEvidenceConfig) -> Result<NormalizedPolymarketEvidence>,
+) -> Result<PublishedPolymarketEvidenceBatch> {
     require_secure_publication_platform()?;
-    let evidence = normalize_polymarket_evidence(&config.evidence)?;
-    publish_normalized(&config.output_root, evidence)
+    let declared = config
+        .qualification
+        .events
+        .iter()
+        .map(|event| (event.market_id.as_str(), event))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        declared.len() == config.qualification.events.len()
+            && declared.len() == config.evidence.market_ids.len()
+            && config
+                .evidence
+                .market_ids
+                .iter()
+                .all(|market_id| declared.contains_key(market_id.as_str())),
+        "qualification inputs must match the selected market IDs exactly"
+    );
+    let mut published_evidence = Vec::new();
+    let mut qualifications = Vec::new();
+    let mut infrastructure_failure = None;
+    for market_id in &config.evidence.market_ids {
+        let declared = declared[market_id.as_str()];
+        let declared_record =
+            classify_polymarket_event(declared, &config.qualification.producer, false);
+        if declared_record.state != PolymarketEventQualificationState::Ready {
+            qualifications.push(publish_qualification_record(
+                &config.output_root,
+                declared_record,
+            )?);
+            continue;
+        }
+        let mut event_config = config.evidence.clone();
+        event_config.market_ids = vec![market_id.clone()];
+        match normalize(&event_config).and_then(|evidence| {
+            let verified = verified_event_input(&evidence, declared)?;
+            Ok((evidence, verified))
+        }) {
+            Ok((evidence, mut verified)) => {
+                let published = publish_normalized(&config.output_root, evidence)?;
+                verified.evidence_digests = published.published_digests.clone();
+                let record =
+                    classify_polymarket_event(&verified, &config.qualification.producer, false);
+                qualifications.push(publish_qualification_record(&config.output_root, record)?);
+                published_evidence.push(published);
+            }
+            Err(error) if retryable_infrastructure_failure(&error) => {
+                infrastructure_failure.get_or_insert(error);
+            }
+            Err(_deterministic_failure) => {
+                let record =
+                    classify_polymarket_event(declared, &config.qualification.producer, true);
+                qualifications.push(publish_qualification_record(&config.output_root, record)?);
+            }
+        }
+    }
+    if let Some(error) = infrastructure_failure {
+        return Err(error.context("retryable event-local evidence verification failure"));
+    }
+    Ok(PublishedPolymarketEvidenceBatch {
+        evidence: published_evidence,
+        qualifications,
+    })
 }
 
 #[cfg(test)]
@@ -558,6 +1101,96 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
+    use PolymarketEventQualificationReason::*;
+    use PolymarketEventQualificationState::*;
+    fn complete_event(market_id: &str) -> PolymarketEventQualificationInput {
+        PolymarketEventQualificationInput {
+            market_id: market_id.to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            event_start: "2026-07-17T05:30:00Z".to_owned(),
+            event_end: "2026-07-17T05:35:00Z".to_owned(),
+            up_token_id: format!("{market_id}-up"),
+            down_token_id: format!("{market_id}-down"),
+            verified_token_ids: None,
+            source_closed: true,
+            up_book: EvidenceSurfaceStatus::Complete,
+            down_book: EvidenceSurfaceStatus::Complete,
+            trades: EvidenceSurfaceStatus::Complete,
+            reference: EvidenceSurfaceStatus::Complete,
+            settlement: EvidenceSurfaceStatus::Complete,
+            request_outcomes: Some(
+                RequiredEvidenceSurface::ALL
+                    .into_iter()
+                    .map(|surface| ProducerRequestOutcome {
+                        surface,
+                        status: ProducerRequestStatus::Succeeded,
+                        completed_at: "2026-07-17T05:36:00Z".to_owned(),
+                    })
+                    .collect(),
+            ),
+            source_clocks: Some(ProducerSourceClocks {
+                opened_at: "2026-07-17T05:29:59Z".to_owned(),
+                closed_at: "2026-07-17T05:36:00Z".to_owned(),
+            }),
+            sequence: ProducerSequenceState {
+                start: 1,
+                end: 7,
+                gaps: 0,
+            },
+            evidence_digests: PublishedPolymarketEvidenceDigests {
+                expected_content_sha256: "1".repeat(64),
+                expected_manifest_sha256: "2".repeat(64),
+            },
+            token_identity_matches: true,
+        }
+    }
+    fn producer_provenance() -> PolymarketProducerProvenance {
+        PolymarketProducerProvenance {
+            source_sha: "3".repeat(40),
+            image_digest: format!("sha256:{}", "4".repeat(64)),
+            configuration_sha256: "5".repeat(64),
+        }
+    }
+    fn assert_classification(
+        event: PolymarketEventQualificationInput,
+        verifier_rejected: bool,
+        state: PolymarketEventQualificationState,
+        reason: PolymarketEventQualificationReason,
+    ) {
+        let record = classify_polymarket_event(&event, &producer_provenance(), verifier_rejected);
+        assert_eq!(record.state, state);
+        assert!(record.reasons.contains(&reason));
+    }
+    #[test]
+    fn counterexamples_are_partial_or_terminal_without_synthesized_evidence() {
+        assert!(!retryable_infrastructure_failure(
+            &std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt evidence").into()
+        ));
+        assert!(retryable_infrastructure_failure(
+            &std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+        ));
+        let mut event = complete_event("market-1");
+        event.down_book = EvidenceSurfaceStatus::Incomplete;
+        event.request_outcomes.as_mut().unwrap()[1].status = ProducerRequestStatus::Failed;
+        assert_classification(event.clone(), false, Partial, DownBookIncomplete);
+        assert_classification(event, true, Rejected, VerifierRejected);
+        let mut event = complete_event("market-1");
+        event.request_outcomes = None;
+        assert_classification(event, false, Rejected, MissingRequestOutcome);
+        let mut event = complete_event("market-1");
+        event.sequence.gaps = 1;
+        assert_classification(event, false, Rejected, SequenceGap);
+        let mut event = complete_event("market-1");
+        event.token_identity_matches = false;
+        assert_classification(event, false, Rejected, TokenIdentityMismatch);
+        let mut event = complete_event("market-1");
+        event.settlement = EvidenceSurfaceStatus::Incomplete;
+        event.request_outcomes.as_mut().unwrap()[4].status = ProducerRequestStatus::Failed;
+        assert_classification(event, false, Partial, SettlementIncomplete);
+        let mut event = complete_event("market-1");
+        event.request_outcomes.as_mut().unwrap()[4].completed_at = "2026-07-17T05:34:59Z".into();
+        assert_classification(event, false, Rejected, InvalidSourceClocks);
+    }
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn publication_requires_linux_anonymous_temporary_files() {
@@ -631,7 +1264,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn published_result_returns_digests_for_the_exact_triplet() {
+    fn batch_qualifies_siblings_independently_and_returns_exact_triplet_digests() {
         fn segment(dataset: &str) -> SegmentIdentity {
             let is_reference = dataset == "crypto_expiry_reference";
             let trade_completions = if is_reference {
@@ -690,7 +1323,7 @@ mod tests {
             }
         }
 
-        let ndjson = b"{}\n{}\n{}\n{}\n{}\n".to_vec();
+        let ndjson = b"{\"surface\":\"market_contract\",\"market_id\":\"market-1\",\"symbol\":\"BTCUSDT\",\"event_start\":\"2026-07-17T05:30:00Z\",\"event_end\":\"2026-07-17T05:35:00Z\",\"source_token_ids\":[\"market-1-up\",\"market-1-down\"],\"source_outcomes\":[\"Up\",\"Down\"]}\n{}\n{}\n{}\n{}\n".to_vec();
         let content_sha256 = hex::encode(Sha256::digest(&ndjson));
         let evidence = NormalizedPolymarketEvidence {
             report: PolymarketEvidenceReport {
@@ -720,6 +1353,75 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
+        let mismatches: [fn(&mut PolymarketEventQualificationInput); 4] = [
+            |event| event.market_id = "market-2".into(),
+            |event| event.symbol = "SOLUSDT".into(),
+            |event| event.event_start = "2026-07-17T05:30:01Z".into(),
+            |event| event.event_end = "2026-07-17T05:35:01Z".into(),
+        ];
+        for mismatch in mismatches {
+            let mut mismatched = complete_event("market-1");
+            mismatch(&mut mismatched);
+            assert!(verified_event_input(&evidence, &mismatched).is_err());
+        }
+
+        let mut rejected = complete_event("market-rejected");
+        rejected.down_book = EvidenceSurfaceStatus::Contradictory;
+        let mut partial = complete_event("market-partial");
+        partial.down_book = EvidenceSurfaceStatus::Incomplete;
+        partial.request_outcomes.as_mut().unwrap()[1].status = ProducerRequestStatus::Failed;
+        let config = PolymarketEvidenceArtifactConfig {
+            evidence: PolymarketEvidenceConfig {
+                segments: crate::polymarket_research_import::ResearchSegmentValidationConfig {
+                    market: crate::polymarket_research_import::ArtifactTriplet {
+                        data: PathBuf::new(),
+                        manifest: PathBuf::new(),
+                        success: PathBuf::new(),
+                    },
+                    references: Vec::new(),
+                },
+                event_start_gte: "2026-07-17T05:30:00Z".into(),
+                event_start_lt: "2026-07-17T05:35:00Z".into(),
+                market_ids: vec![
+                    "market-rejected".into(),
+                    "market-partial".into(),
+                    "market-1".into(),
+                ],
+            },
+            output_root: root.clone(),
+            qualification: PolymarketProducerQualificationConfig {
+                producer: producer_provenance(),
+                events: vec![rejected, partial, complete_event("market-1")],
+            },
+        };
+        let run = || {
+            publish_polymarket_evidence_with(&config, |selection| {
+                if selection.market_ids == ["market-1"] {
+                    Ok(evidence.clone())
+                } else {
+                    panic!("declared non-ready event must not enter the verifier")
+                }
+            })
+        };
+        let first = run().unwrap();
+        let second = run().unwrap();
+        assert_eq!(
+            first.qualifications[0].record.state,
+            PolymarketEventQualificationState::Rejected
+        );
+        assert_eq!(
+            first.qualifications[1].record.state,
+            PolymarketEventQualificationState::Partial
+        );
+        assert!(first.qualifications[1].record.verified_token_ids.is_none());
+        assert_eq!(
+            first.qualifications[2].record.state,
+            PolymarketEventQualificationState::Ready
+        );
+        assert!(second
+            .qualifications
+            .iter()
+            .all(|published| published.outcome == ImmutablePublicationOutcome::Unchanged));
 
         let mut malformed = evidence.clone();
         malformed.report.market_ids = vec!["market 1".to_owned()];
