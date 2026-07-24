@@ -53,8 +53,8 @@ grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
 grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
-grep -Fq 'SOURCE_REVISION=${{ github.sha }}' "$ACR_WORKFLOW"
-grep -Fq "grep -Fqx 'binance-lob-archiver \${{ github.sha }}'" "$ACR_WORKFLOW"
+grep -Fq 'SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$ACR_WORKFLOW"
+grep -Fq "grep -Fqx 'binance-lob-archiver \${{ needs.selector.outputs.source_sha }}'" "$ACR_WORKFLOW"
 
 observation_started_ns=1000000900
 same_second_warmup_start_ns=1000000100

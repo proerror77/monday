@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1003,SC2016
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workflow="$script_dir/../workflows/acr-publish.yml"
+ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.research"
 verifier="$script_dir/verify-research-runner-binaries.sh"
 tmp_dir=$(mktemp -d)
@@ -10,20 +12,51 @@ trap 'rm -rf "$tmp_dir"' EXIT
 mode_restore_block=$(sed -n \
   '/^      - name: Restore research runner binary modes$/,/^      - name: Verify research runner binary artifact$/p' \
   "$workflow")
+source_command_block=$(sed -n \
+  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --current-run-id /p' \
+  "$workflow")
 
 grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},' "$workflow"
+grep -Fqx '  workflow_run:' "$workflow"
+grep -Fqx '    workflows: ["Prediction Markets CI"]' "$workflow"
+grep -Fqx '  actions: read' "$workflow"
+grep -Fqx '      rebuild_research_runner:' "$workflow"
+grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
+grep -Fqx '          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}' "$workflow"
+grep -Fqx '          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}' "$workflow"
+grep -Fqx '          .github/scripts/select-acr-publish-source.sh \' "$workflow"
+if grep -Fq '${{' <<<"$source_command_block"; then
+  printf 'source selector interpolates workflow context directly into shell\n' >&2
+  exit 1
+fi
 grep -Fqx '  research-runner-binaries:' "$workflow"
+grep -Fqx "    if: needs.selector.outputs.research_mode == 'rebuild'" "$workflow"
+grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none'" "$workflow"
 grep -Fqx '    container: rust:1.91-bookworm' "$workflow"
 grep -Fqx 'FROM debian:bookworm-slim AS runtime-base' "$dockerfile"
 grep -Fqx '    needs: [selector, research-runner-binaries]' "$workflow"
 grep -Fqx '      - name: Download research runner binaries' "$workflow"
+grep -Fqx '          name: research-image-release-${{ needs.selector.outputs.source_sha }}' "$workflow"
+grep -Fqx '          run-id: ${{ needs.selector.outputs.artifact_run_id }}' "$workflow"
+grep -Fqx '          github-token: ${{ github.token }}' "$workflow"
 grep -Fqx '      - name: Restore research runner binary modes' "$workflow"
 grep -Fqx '          target: ${{ matrix.target }}' "$workflow"
-grep -Fqx '          ../.github/scripts/verify-research-runner-binaries.sh research-bin' "$workflow"
-grep -Fqx '          .github/scripts/verify-research-runner-binaries.sh rust_hft/research-bin' "$workflow"
+grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create research-release \' "$workflow"
+grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$workflow"
+grep -Fqx '            "${{ needs.selector.outputs.source_sha }}" \' "$workflow"
+grep -Fqx '            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft' "$workflow"
+grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$workflow"
+grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
+
+grep -Fqx '          name: research-image-release-${{ github.sha }}' "$ploy_workflow"
+grep -Fqx '          retention-days: 1' "$ploy_workflow"
+test "$(grep -Fxc '            jq \' "$workflow")" -eq 1
+test "$(grep -Fxc '            jq \' "$ploy_workflow")" -eq 1
+grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create \' "$ploy_workflow"
+grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$ploy_workflow"
 
 for binary in hft-backtest alpha-harness lob-pit-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-  grep -Fq "rust_hft/research-bin/$binary" <<<"$mode_restore_block"
+  grep -Fq "research-release/research-bin/$binary" <<<"$mode_restore_block"
 done
 
 for binary in hft-backtest alpha-harness lob-pit-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
@@ -52,5 +85,7 @@ chmod +x "$tmp_dir/unexpected"
 if "$verifier" "$tmp_dir"; then
   exit 1
 fi
+
+"$script_dir/test-research-image-release-artifact.sh"
 
 printf 'ACR research-runner prebuilt contract tests passed\n'
