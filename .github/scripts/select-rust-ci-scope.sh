@@ -28,6 +28,60 @@ collector=false
 control=false
 focused=false
 toolchain=false
+jobs=
+research_image_relevant=false
+
+select_job() {
+  local job=$1
+  [[ ,$jobs, == *,$job,* ]] || jobs=${jobs:+$jobs,}$job
+}
+
+select_all_ci_jobs() {
+  select_job ci/rust
+  select_job ci/deployment-artifacts
+  select_job ci/polymarket-evidence-compiler-image
+  select_job ci/rust-hft-engine-fast-lane
+  select_job ci/node-install
+}
+
+select_all_rust_ci_jobs() {
+  select_job ci/rust
+  select_job ci/deployment-artifacts
+  select_job ci/polymarket-evidence-compiler-image
+  select_job ci/rust-hft-engine-fast-lane
+}
+
+select_all_ploy_jobs() {
+  research_image_relevant=true
+  [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+  select_job ploy/research-image-binaries
+  select_job ploy/research-image-smoke
+  select_job ploy/rust-format
+  select_job ploy/safety-scans
+  select_job ploy/audit
+  select_job ploy/rust-control-plane
+  select_job ploy/rust-runner-lean
+  select_job ploy/rust-runner-full
+  select_job ploy/rust-market-data
+  select_job ploy/rust-research-heavy
+  select_job ploy/frontend
+  select_job ploy/integration-regressions
+}
+
+select_research_image_jobs() {
+  research_image_relevant=true
+  [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+  select_job ploy/research-image-binaries
+  select_job ploy/research-image-smoke
+  select_job ploy/safety-scans
+}
+
+select_main_research_image_jobs() {
+  if [[ $event == push && $research_image_relevant == true ]]; then
+    select_job ploy/research-image-binaries
+    select_job ploy/research-image-smoke
+  fi
+}
 
 select_all() {
   loop=true
@@ -41,7 +95,13 @@ select_all() {
 }
 
 emit() {
+  local value
+  for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
+    [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
+  done
+  [[ $jobs =~ ^([a-z0-9/-]+(,[a-z0-9/-]+)*)?$ ]] || { printf 'invalid job selector output: %s\n' "$jobs" >&2; exit 1; }
   printf '%s\n' \
+    "jobs=,$jobs," \
     "loop=$loop" \
     "handoff=$handoff" \
     "json=$json" \
@@ -49,12 +109,16 @@ emit() {
     "collector=$collector" \
     "control=$control" \
     "focused=$focused" \
-    "toolchain=$toolchain" >>"$output"
+    "toolchain=$toolchain" \
+    'selection_complete=true' >>"$output"
 }
 
-# Branch pushes and manual runs retain the complete build/package contract.
-if [[ $event != pull_request ]]; then
+# Manual runs retain the complete build/package contract.
+if [[ $event == workflow_dispatch ]]; then
   select_all
+  select_all_ci_jobs
+  select_job ploy/workflow-lint
+  select_all_ploy_jobs
   emit
   exit 0
 fi
@@ -64,7 +128,7 @@ declare -a paths=()
 if [[ -n $changed_files ]]; then
   while IFS= read -r path; do paths+=("$path"); done <"$changed_files"
 else
-  [[ -n $base ]] || { printf '%s\n' '--base is required for pull requests' >&2; exit 2; }
+  [[ -n $base ]] || { printf '%s\n' '--base is required when changed files are not provided' >&2; exit 2; }
   while IFS= read -r -d '' path; do paths+=("$path"); done \
     < <(git diff --no-renames --name-only --diff-filter=ACMRD -z "$base...$head")
 fi
@@ -72,30 +136,142 @@ fi
 needs_metadata=false
 for path in "${paths[@]}"; do
   case "$path" in
-    rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/rust-toolchain*|rust_hft/.cargo/*|.cargo/*|.github/workflows/ci.yml|.github/scripts/select-rust-ci-scope.sh|.github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*)
+    .github/workflows/ploy-ci.yml)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/workflow-lint
+      select_all_ploy_jobs
+      continue
+      ;;
+    .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/workflow-lint
+      research_image_relevant=true
+      continue
+      ;;
+    rust_hft/deployment/docker/Dockerfile.research)
+      select_research_image_jobs
+      continue
+      ;;
+    rust_hft/.dockerignore)
+      select_job ci/deployment-artifacts
+      select_job ci/polymarket-evidence-compiler-image
+      select_research_image_jobs
+      continue
+      ;;
+    rust_hft/deployment/docker/Dockerfile.trading)
+      select_job ci/deployment-artifacts
+      continue
+      ;;
+    rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler)
+      select_job ci/polymarket-evidence-compiler-image
+      continue
+      ;;
+    rust_hft/deployment/docker/*)
       select_all
-      emit
-      exit 0
+      select_all_ci_jobs
+      select_all_ploy_jobs
+      continue
+      ;;
+    rust_hft/prediction-markets/ploy-frontend/*)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/safety-scans
+      select_job ploy/frontend
+      continue
+      ;;
+    rust_hft/prediction-markets/*.md)
+      continue
+      ;;
+    rust_hft/prediction-markets/Cargo.toml|rust_hft/prediction-markets/Cargo.lock)
+      select_all_ploy_jobs
+      continue
+      ;;
+    rust_hft/prediction-markets/*/Cargo.toml)
+      select_research_image_jobs
+      select_job ploy/audit
+      needs_metadata=true
+      ;;
+    rust_hft/*/Cargo.toml)
+      needs_metadata=true
+      ;;
+    rust_hft/Cargo.toml|rust_hft/Cargo.lock)
+      select_all
+      select_all_rust_ci_jobs
+      select_research_image_jobs
+      continue
+      ;;
+    rust_hft/rust-toolchain*|rust_hft/.cargo/*|.cargo/*)
+      select_all
+      select_all_rust_ci_jobs
+      select_all_ploy_jobs
+      continue
+      ;;
+    .github/workflows/ci.yml)
+      select_all
+      select_all_ci_jobs
+      continue
+      ;;
+    .github/scripts/select-rust-ci-scope.sh|.github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*)
+      select_all
+      select_all_ci_jobs
+      select_job ploy/workflow-lint
+      select_all_ploy_jobs
+      continue
+      ;;
+    package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|.nvmrc|.node-version)
+      select_job ci/node-install
+      continue
+      ;;
+    .github/workflows/*|.github/actions/*|.github/scripts/*)
+      select_all
+      select_all_ci_jobs
+      select_job ploy/workflow-lint
+      select_all_ploy_jobs
+      continue
+      ;;
+    docs/*|*.md|LICENSE*)
+      continue
+      ;;
+    rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
+      continue
+      ;;
+    rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
+      select_job ci/deployment-artifacts
+      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
+      continue
       ;;
     deployment/aliyun/*)
       control=true
       toolchain=true
+      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     rust_hft/*)
       needs_metadata=true
+      ;;
+    *)
+      if [[ $path != */* ]]; then
+        select_all
+        select_all_ci_jobs
+        select_all_ploy_jobs
+      fi
       ;;
   esac
 done
 
 if [[ $needs_metadata == false ]]; then
+  [[ $toolchain == true ]] && select_job ci/rust
+  select_main_research_image_jobs
   emit
   exit 0
 fi
 
 if [[ -z $metadata ]]; then
-  metadata=$(mktemp)
-  trap 'rm -f "$metadata"' EXIT
-  (cd "$repo_root/rust_hft" && cargo metadata --format-version 1 --no-deps --locked) >"$metadata"
+  metadata_dir=$(mktemp -d)
+  metadata="$metadata_dir/combined.json"
+  trap 'rm -rf "$metadata_dir"' EXIT
+  (cd "$repo_root/rust_hft" && cargo metadata --format-version 1 --no-deps --locked) >"$metadata_dir/rust-hft.json"
+  (cd "$repo_root/rust_hft/prediction-markets" && cargo metadata --format-version 1 --no-deps --locked) >"$metadata_dir/prediction-markets.json"
+  jq -s '{packages: [.[].packages[]]}' \
+    "$metadata_dir/rust-hft.json" "$metadata_dir/prediction-markets.json" >"$metadata"
 fi
 
 declare -a package_names=() package_dirs=() package_dependencies=()
@@ -112,6 +288,14 @@ mark_affected() { is_affected "$1" || affected+="$1"$'\n'; }
 
 for path in "${paths[@]}"; do
   [[ $path == rust_hft/* ]] || continue
+  case "$path" in
+    rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
+    rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.toml|\
+    rust_hft/prediction-markets/Cargo.lock|rust_hft/prediction-markets/ploy-frontend/*|\
+    rust_hft/prediction-markets/*.md|rust_hft/rust-toolchain*|rust_hft/.cargo/*)
+      continue
+      ;;
+  esac
   owner=
   owner_length=0
   for ((index = 0; index < ${#package_names[@]}; index++)); do
@@ -122,10 +306,18 @@ for path in "${paths[@]}"; do
       owner_length=${#directory}
     fi
   done
+  if [[ $owner == ploy ]]; then
+    select_all_ploy_jobs
+    continue
+  fi
   if [[ -z $owner || $owner == rust-hft-workspace ]]; then
     select_all
-    emit
-    exit 0
+    if [[ $path == rust_hft/prediction-markets/* ]]; then
+      select_all_ploy_jobs
+    else
+      select_all_rust_ci_jobs
+    fi
+    continue
   fi
   mark_affected "$owner"
 done
@@ -170,6 +362,18 @@ select_if_affected() {
   done
 }
 
+select_job_if_affected() {
+  local job=$1
+  shift
+  local package
+  for package in "$@"; do
+    if is_affected "$package"; then
+      select_job "$job"
+      return
+    fi
+  done
+}
+
 select_if_affected loop alpha-domain alpha-store alpha-engine alpha-onnx-evaluator \
   alpha-harness hft-harnessctl hft-research-ml
 select_if_affected handoff hft-live
@@ -180,5 +384,43 @@ select_if_affected focused hft-live hft-paper hft-all-in-one
 
 # Collector source and its host controls are one release boundary.
 if [[ $collector == true ]]; then control=true; fi
+
+if [[ $toolchain == true ]]; then select_job ci/rust; fi
+if [[ $collector == true ]]; then select_job ci/polymarket-evidence-compiler-image; fi
+select_job_if_affected ci/deployment-artifacts hft-live
+select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine
+
+prediction_package_affected=false
+for ((index = 0; index < ${#package_names[@]}; index++)); do
+  if [[ ${package_dirs[$index]} == rust_hft/prediction-markets* ]] && is_affected "${package_names[$index]}"; then
+    prediction_package_affected=true
+    break
+  fi
+done
+if [[ $prediction_package_affected == true ]]; then
+  research_image_relevant=true
+  [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+  select_job ploy/rust-format
+  select_job ploy/safety-scans
+fi
+select_job_if_affected ploy/rust-control-plane ploy-agent-sidecar ploy-daemon-host new-ployd \
+  ployctl ploy-control-client ploytui ploy-deployments ploy-operator-contracts ploy-platform \
+  ploy-platform-runtime ploy-trading
+select_job_if_affected ploy/rust-runner-lean ploy-strategy-bundles ploy-market-data \
+  ploy-strategy-runtime ploy-replay
+select_job_if_affected ploy/rust-runner-full new-ploy-runner ploy-backtest ploy-runner-host \
+  ploy-strategy-runtime ploy-strategy-bundles ploy-connectivity
+select_job_if_affected ploy/rust-market-data ploy-market-data
+select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research ploy-market-data
+select_job_if_affected ploy/frontend ploy-operator-contracts
+select_job_if_affected ploy/integration-regressions ploy
+
+if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
+  research_image_relevant=true
+fi
+if [[ $event == pull_request ]] && is_affected hft-backtest; then
+  select_job ploy/research-image-binaries
+fi
+select_main_research_image_jobs
 
 emit
