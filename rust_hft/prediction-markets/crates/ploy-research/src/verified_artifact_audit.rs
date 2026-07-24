@@ -33,12 +33,19 @@ pub(crate) fn usable_polymarket_reference(
     reference: &PolymarketEvidenceReference,
     maximum_source_delay_secs: i64,
 ) -> bool {
+    let maximum_source_delay = Duration::seconds(maximum_source_delay_secs);
+    let Some(earliest_source_time) = contract
+        .event_start
+        .checked_sub_signed(maximum_source_delay)
+    else {
+        return false;
+    };
     reference.market_id == contract.market_id
-        && reference.source_time < contract.event_start
+        && reference.source_time >= earliest_source_time
+        && reference.source_time < contract.event_end
         && !reference.is_carried_forward
         && reference.available_at >= reference.source_time
-        && reference.available_at - reference.source_time
-            <= Duration::seconds(maximum_source_delay_secs)
+        && reference.available_at - reference.source_time <= maximum_source_delay
 }
 
 pub(crate) fn usable_polymarket_book(
@@ -650,6 +657,56 @@ mod tests {
         assert_eq!(*actual_gap, max_gap_secs);
         let actual_rejected = (*source_delay_rejected_rows, *invalid_payload_rows);
         assert_eq!(actual_rejected, rejected_rows);
+    }
+
+    #[test]
+    fn projection_reference_gate_matches_the_declared_event_local_window() {
+        let contract = contract();
+        let reference_at = |source_time: DateTime<Utc>| PolymarketEvidenceReference {
+            market_id: contract.market_id.clone(),
+            source_time,
+            price: contract.price_to_beat,
+            is_carried_forward: false,
+            available_at: source_time + Duration::seconds(1),
+        };
+
+        assert!(!usable_polymarket_reference(
+            &contract,
+            &reference_at(contract.event_start - Duration::seconds(31)),
+            30,
+        ));
+        assert!(usable_polymarket_reference(
+            &contract,
+            &reference_at(contract.event_start - Duration::seconds(30)),
+            30,
+        ));
+        assert!(usable_polymarket_reference(
+            &contract,
+            &reference_at(contract.event_start),
+            30,
+        ));
+        assert!(usable_polymarket_reference(
+            &contract,
+            &reference_at(contract.event_end - Duration::seconds(1)),
+            30,
+        ));
+        assert!(!usable_polymarket_reference(
+            &contract,
+            &reference_at(contract.event_end),
+            30,
+        ));
+
+        let mut carried = reference_at(contract.event_start);
+        carried.is_carried_forward = true;
+        assert!(!usable_polymarket_reference(&contract, &carried, 30));
+
+        let mut delayed = reference_at(contract.event_start);
+        delayed.available_at = delayed.source_time + Duration::seconds(31);
+        assert!(!usable_polymarket_reference(&contract, &delayed, 30));
+
+        let mut non_causal = reference_at(contract.event_start);
+        non_causal.available_at = non_causal.source_time - Duration::seconds(1);
+        assert!(!usable_polymarket_reference(&contract, &non_causal, 30));
     }
 
     #[test]
