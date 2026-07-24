@@ -3,7 +3,7 @@ use super::{
         parse_row, RawBook, RawBookLevel, RawContract, RawReference, RawRow, RawSettlement,
         RawTrade, RowContext, ROW_SCHEMA,
     },
-    SealedPolymarketEvidenceTriplet,
+    SealedPolymarketEvidenceCandidateTriplet, SealedPolymarketEvidenceTriplet,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -113,6 +113,26 @@ pub struct VerifiedPolymarketEvidence {
     settlements: Vec<PolymarketEvidenceSettlement>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolymarketCandidateSurfaceCoverage {
+    pub up_book: u64,
+    pub down_book: u64,
+    pub trades: u64,
+    pub reference: u64,
+    pub settlement: u64,
+}
+
+#[derive(Debug)]
+pub struct VerifiedPolymarketEvidenceCandidate {
+    identity: PolymarketEvidenceIdentity,
+    contracts: Vec<PolymarketEvidenceContract>,
+    books: Vec<PolymarketEvidenceBook>,
+    references: Vec<PolymarketEvidenceReference>,
+    trades: Vec<PolymarketEvidenceTrade>,
+    settlements: Vec<PolymarketEvidenceSettlement>,
+    coverage: PolymarketCandidateSurfaceCoverage,
+}
+
 impl VerifiedPolymarketEvidence {
     pub fn identity(&self) -> &PolymarketEvidenceIdentity {
         &self.identity
@@ -136,6 +156,36 @@ impl VerifiedPolymarketEvidence {
 
     pub fn settlements(&self) -> &[PolymarketEvidenceSettlement] {
         &self.settlements
+    }
+}
+
+impl VerifiedPolymarketEvidenceCandidate {
+    pub fn identity(&self) -> &PolymarketEvidenceIdentity {
+        &self.identity
+    }
+
+    pub fn contracts(&self) -> &[PolymarketEvidenceContract] {
+        &self.contracts
+    }
+
+    pub fn books(&self) -> &[PolymarketEvidenceBook] {
+        &self.books
+    }
+
+    pub fn references(&self) -> &[PolymarketEvidenceReference] {
+        &self.references
+    }
+
+    pub fn trades(&self) -> &[PolymarketEvidenceTrade] {
+        &self.trades
+    }
+
+    pub fn settlements(&self) -> &[PolymarketEvidenceSettlement] {
+        &self.settlements
+    }
+
+    pub fn coverage(&self) -> PolymarketCandidateSurfaceCoverage {
+        self.coverage
     }
 }
 
@@ -226,6 +276,8 @@ impl Contract {
 #[derive(Default)]
 struct Coverage {
     books: BTreeSet<BinaryOutcomeSide>,
+    up_book: u64,
+    down_book: u64,
     references: u64,
     trades: u64,
     settlement: bool,
@@ -243,9 +295,83 @@ pub fn verify_polymarket_evidence(
         event_start_gte: lower,
         event_start_lt: upper,
     };
+    let parsed = verify_rows(sealed.framed_rows(), lower, upper, identity.events, true)?;
+    Ok(VerifiedPolymarketEvidence {
+        identity,
+        contracts: parsed
+            .contracts
+            .into_values()
+            .map(|contract| contract.projection)
+            .collect(),
+        books: parsed.books,
+        references: parsed.references,
+        trades: parsed.trades,
+        settlements: parsed.settlements,
+    })
+}
+
+pub fn verify_polymarket_evidence_candidate(
+    sealed: SealedPolymarketEvidenceCandidateTriplet,
+) -> Result<VerifiedPolymarketEvidenceCandidate> {
+    let (lower, upper) = sealed.selection_bounds()?;
+    let identity = PolymarketEvidenceIdentity {
+        content_sha256: sealed.content_sha256().to_owned(),
+        manifest_sha256: sealed.manifest_sha256().to_owned(),
+        rows: sealed.rows(),
+        events: sealed.events(),
+        event_start_gte: lower,
+        event_start_lt: upper,
+    };
+    let parsed = verify_rows(sealed.framed_rows(), lower, upper, identity.events, false)?;
+    let market_id = parsed
+        .contracts
+        .keys()
+        .next()
+        .ok_or_else(|| anyhow!("candidate evidence has no market contract"))?;
+    let event = parsed
+        .coverage
+        .get(market_id)
+        .ok_or_else(|| anyhow!("candidate market has no evidence coverage"))?;
+    Ok(VerifiedPolymarketEvidenceCandidate {
+        identity,
+        contracts: parsed
+            .contracts
+            .into_values()
+            .map(|contract| contract.projection)
+            .collect(),
+        books: parsed.books,
+        references: parsed.references,
+        trades: parsed.trades,
+        settlements: parsed.settlements,
+        coverage: PolymarketCandidateSurfaceCoverage {
+            up_book: event.up_book,
+            down_book: event.down_book,
+            trades: event.trades,
+            reference: event.references,
+            settlement: u64::from(event.settlement),
+        },
+    })
+}
+
+struct ParsedEvidence {
+    contracts: BTreeMap<String, Contract>,
+    books: Vec<PolymarketEvidenceBook>,
+    references: Vec<PolymarketEvidenceReference>,
+    trades: Vec<PolymarketEvidenceTrade>,
+    settlements: Vec<PolymarketEvidenceSettlement>,
+    coverage: BTreeMap<String, Coverage>,
+}
+
+fn verify_rows<'a>(
+    frames: impl IntoIterator<Item = &'a [u8]>,
+    lower: DateTime<Utc>,
+    upper: DateTime<Utc>,
+    events: u64,
+    require_complete: bool,
+) -> Result<ParsedEvidence> {
     let mut contracts = BTreeMap::new();
-    let mut deferred = Vec::with_capacity(usize::try_from(sealed.rows())?);
-    for (index, frame) in sealed.framed_rows().enumerate() {
+    let mut deferred = Vec::new();
+    for (index, frame) in frames.into_iter().enumerate() {
         let row = parse_row(frame).with_context(|| format!("verify evidence row {}", index + 1))?;
         match row {
             RawRow::Contract(raw) => {
@@ -258,7 +384,7 @@ pub fn verify_polymarket_evidence(
             row => deferred.push(row),
         }
     }
-    if u64::try_from(contracts.len())? != identity.events {
+    if u64::try_from(contracts.len())? != events {
         bail!("market contract count does not match sealed event count");
     }
     validate_unique_contract_identities(&contracts)?;
@@ -280,6 +406,13 @@ pub fn verify_polymarket_evidence(
                     .or_default()
                     .books
                     .insert(side);
+                let event = coverage
+                    .get_mut(&raw.context.market_id)
+                    .expect("book coverage entry");
+                match side {
+                    BinaryOutcomeSide::Up => event.up_book += 1,
+                    BinaryOutcomeSide::Down => event.down_book += 1,
+                }
                 books.push(PolymarketEvidenceBook {
                     market_id: raw.context.market_id,
                     token_id: raw.token_id,
@@ -343,30 +476,28 @@ pub fn verify_polymarket_evidence(
             RawRow::Contract(_) => unreachable!("contracts were separated in the first pass"),
         }
     }
-    let expected_books = BTreeSet::from([BinaryOutcomeSide::Up, BinaryOutcomeSide::Down]);
-    for market_id in contracts.keys() {
-        let event = coverage
-            .get(market_id)
-            .ok_or_else(|| anyhow!("market has no evidence"))?;
-        if event.books != expected_books
-            || event.references == 0
-            || event.trades == 0
-            || !event.settlement
-        {
-            bail!("market {market_id} is missing one or more required evidence surfaces");
+    if require_complete {
+        let expected_books = BTreeSet::from([BinaryOutcomeSide::Up, BinaryOutcomeSide::Down]);
+        for market_id in contracts.keys() {
+            let event = coverage
+                .get(market_id)
+                .ok_or_else(|| anyhow!("market has no evidence"))?;
+            if event.books != expected_books
+                || event.references == 0
+                || event.trades == 0
+                || !event.settlement
+            {
+                bail!("market {market_id} is missing one or more required evidence surfaces");
+            }
         }
     }
-
-    Ok(VerifiedPolymarketEvidence {
-        identity,
-        contracts: contracts
-            .into_values()
-            .map(|contract| contract.projection)
-            .collect(),
+    Ok(ParsedEvidence {
+        contracts,
         books,
         references,
         trades,
         settlements,
+        coverage,
     })
 }
 
@@ -644,8 +775,12 @@ fn nonempty(value: &str, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::polymarket_evidence::{artifact::tests, seal_polymarket_evidence_triplet};
+    use crate::polymarket_evidence::{
+        artifact::tests, seal_polymarket_evidence_candidate_triplet,
+        seal_polymarket_evidence_triplet, PolymarketEvidenceTrustAnchor,
+    };
     use serde_json::{json, Value};
+    use sha2::Digest;
     use std::fs;
 
     #[rustfmt::skip]
@@ -733,6 +868,146 @@ mod tests {
     fn assert_rejected(rows: &[Value], message: &str) {
         let error = format!("{:#}", verify_rows(rows).unwrap_err());
         assert!(error.contains(message), "{error}");
+    }
+
+    fn candidate_triplet(
+        rows: &[Value],
+    ) -> (
+        tempfile::TempDir,
+        crate::polymarket_evidence::PolymarketEvidenceTriplet,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = tests::write_triplet_rows(&temp, rows);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["schema"] = json!("monday.polymarket.candidate_evidence_artifact.v1");
+        manifest.as_object_mut().unwrap().remove("events");
+        manifest["contract_rows"] = json!(1);
+        manifest["surface_counts"] = json!({
+            "down_book": rows.iter().filter(|row| row["surface"] == "orderbook_snapshot" && row["token_id"] == "down-token").count(),
+            "reference": rows.iter().filter(|row| row["surface"] == "chainlink_reference").count(),
+            "settlement": rows.iter().filter(|row| row["surface"] == "official_settlement_evidence").count(),
+            "trades": rows.iter().filter(|row| row["surface"] == "polymarket_trade").count(),
+            "up_book": rows.iter().filter(|row| row["surface"] == "orderbook_snapshot" && row["token_id"] == "up-token").count(),
+        });
+        manifest["evidence_scope"] = json!("untrusted producer candidate only; not Ready, execution authorization, or evaluator labels");
+        manifest["recording_semantics"]["trades"] = json!("canonical v2 records when present; a collector completion proof is verified when present but may be absent");
+        manifest["trust_boundary"] = json!("untrusted producer candidate carrier only; not Ready, an execution authorization, evaluator labels, or a snapshot_contract_hash");
+        manifest["market_ids"] = json!(["market-1"]);
+        manifest["symbols"] = json!(["BTCUSDT"]);
+        manifest["event_selection"] =
+            json!("explicit market_ids constrained to [event_start_gte,event_start_lt)");
+        manifest["rows"] = json!(rows.len());
+        tests::rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        (temp, triplet)
+    }
+
+    #[test]
+    fn candidate_verification_reports_event_local_surface_coverage() {
+        let rows = valid_rows()
+            .into_iter()
+            .filter(|row| {
+                row["surface"] == "market_contract"
+                    || (row["surface"] == "orderbook_snapshot" && row["token_id"] == "up-token")
+            })
+            .collect::<Vec<_>>();
+        let (_temp, triplet) = candidate_triplet(&rows);
+        let sealed =
+            seal_polymarket_evidence_candidate_triplet(&triplet, &tests::trust(&triplet)).unwrap();
+        let verified = verify_polymarket_evidence_candidate(sealed).unwrap();
+        assert_eq!(verified.contracts().len(), 1);
+        assert_eq!(verified.coverage().up_book, 1);
+        assert_eq!(verified.coverage().down_book, 0);
+        assert_eq!(verified.coverage().reference, 0);
+        assert_eq!(verified.coverage().trades, 0);
+        assert_eq!(verified.coverage().settlement, 0);
+    }
+
+    #[test]
+    fn complete_candidate_reports_all_five_surfaces() {
+        let rows = valid_rows();
+        let (_temp, triplet) = candidate_triplet(&rows);
+        let sealed =
+            seal_polymarket_evidence_candidate_triplet(&triplet, &tests::trust(&triplet)).unwrap();
+        let verified = verify_polymarket_evidence_candidate(sealed).unwrap();
+        assert_eq!(
+            verified.coverage(),
+            PolymarketCandidateSurfaceCoverage {
+                up_book: 1,
+                down_book: 1,
+                trades: 1,
+                reference: 1,
+                settlement: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn candidate_verification_rejects_corrupt_present_surface() {
+        let mut rows = valid_rows()
+            .into_iter()
+            .filter(|row| {
+                row["surface"] == "market_contract"
+                    || (row["surface"] == "orderbook_snapshot" && row["token_id"] == "up-token")
+            })
+            .collect::<Vec<_>>();
+        rows[1]["bid"] = json!("0.7");
+        let (_temp, triplet) = candidate_triplet(&rows);
+        let sealed =
+            seal_polymarket_evidence_candidate_triplet(&triplet, &tests::trust(&triplet)).unwrap();
+        let error = verify_polymarket_evidence_candidate(sealed).unwrap_err();
+        assert!(error.to_string().contains("orderbook"), "{error:#}");
+    }
+
+    #[test]
+    fn candidate_verification_allows_present_trades_without_completion_proof() {
+        let rows = valid_rows()
+            .into_iter()
+            .filter(|row| {
+                row["surface"] == "market_contract"
+                    || row["surface"] == "polymarket_trade"
+                    || (row["surface"] == "orderbook_snapshot" && row["token_id"] == "up-token")
+            })
+            .collect::<Vec<_>>();
+        let (_temp, triplet) = candidate_triplet(&rows);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["validated_inputs"]["reference"]
+            .as_object_mut()
+            .unwrap()
+            .remove("trade_completions");
+        tests::rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        let sealed =
+            seal_polymarket_evidence_candidate_triplet(&triplet, &tests::trust(&triplet)).unwrap();
+        let verified = verify_polymarket_evidence_candidate(sealed).unwrap();
+        assert_eq!(verified.coverage().trades, 1);
+    }
+
+    #[test]
+    fn candidate_verification_rejects_wrong_trust_anchor() {
+        let rows = valid_rows()
+            .into_iter()
+            .filter(|row| row["surface"] == "market_contract")
+            .collect::<Vec<_>>();
+        let (_temp, triplet) = candidate_triplet(&rows);
+        let manifest_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(fs::read(&triplet.manifest).unwrap())
+        );
+        let wrong = "0".repeat(64);
+        let trust =
+            PolymarketEvidenceTrustAnchor::from_lower_hex(&wrong, &manifest_digest).unwrap();
+        let error = seal_polymarket_evidence_candidate_triplet(&triplet, &trust).unwrap_err();
+        assert!(
+            error.to_string().contains("trusted digest anchor"),
+            "{error:#}"
+        );
     }
 
     #[test]

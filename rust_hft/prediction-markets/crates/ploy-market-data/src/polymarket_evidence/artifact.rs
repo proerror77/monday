@@ -32,6 +32,13 @@ const EXPLICIT_EVENT_SELECTION: &str =
     "explicit market_ids constrained to [event_start_gte,event_start_lt)";
 const EVIDENCE_SCOPE: &str =
     "immutable collector evidence only; not an execution authorization or evaluator label artifact";
+const CANDIDATE_MANIFEST_SCHEMA: &str = "monday.polymarket.candidate_evidence_artifact.v1";
+const CANDIDATE_EVIDENCE_SCOPE: &str =
+    "untrusted producer candidate only; not Ready, execution authorization, or evaluator labels";
+const CANDIDATE_TRUST_BOUNDARY: &str =
+    "untrusted producer candidate carrier only; not Ready, an execution authorization, evaluator labels, or a snapshot_contract_hash";
+const CANDIDATE_TRADE_SEMANTICS: &str =
+    "canonical v2 records when present; a collector completion proof is verified when present but may be absent";
 const DIGEST_SEMANTICS: &str =
     "content_sha256 binds the published NDJSON bytes only; it is not a snapshot_contract_hash";
 const TRUST_BOUNDARY: &str = "typed collector staging evidence only; not an evaluator label snapshot or snapshot_contract_hash; validated staged triplets and adjacent local supersession markers; omitted remote-prefix markers are not proven absent";
@@ -75,6 +82,14 @@ pub struct SealedPolymarketEvidenceTriplet {
     frames: Vec<Range<usize>>,
 }
 
+#[derive(Debug)]
+pub struct SealedPolymarketEvidenceCandidateTriplet {
+    manifest: CandidateEvidenceManifest,
+    manifest_sha256: String,
+    data: Vec<u8>,
+    frames: Vec<Range<usize>>,
+}
+
 impl SealedPolymarketEvidenceTriplet {
     pub fn content_sha256(&self) -> &str {
         &self.manifest.content_sha256
@@ -94,6 +109,35 @@ impl SealedPolymarketEvidenceTriplet {
 
     pub fn events(&self) -> u64 {
         self.manifest.events
+    }
+
+    pub(super) fn framed_rows(&self) -> impl Iterator<Item = &[u8]> {
+        self.frames.iter().map(|frame| &self.data[frame.clone()])
+    }
+
+    pub(super) fn selection_bounds(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+        Ok((
+            parse_time(&self.manifest.event_start_gte, "event_start_gte")?,
+            parse_time(&self.manifest.event_start_lt, "event_start_lt")?,
+        ))
+    }
+}
+
+impl SealedPolymarketEvidenceCandidateTriplet {
+    pub(super) fn content_sha256(&self) -> &str {
+        &self.manifest.content_sha256
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    pub(super) fn rows(&self) -> u64 {
+        self.frames.len() as u64
+    }
+
+    pub(super) fn events(&self) -> u64 {
+        self.manifest.market_ids.len() as u64
     }
 
     pub(super) fn framed_rows(&self) -> impl Iterator<Item = &[u8]> {
@@ -131,6 +175,36 @@ struct EvidenceManifest {
     recording_semantics: RecordingSemantics,
     trust_boundary: String,
     validated_inputs: ValidatedInputs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateEvidenceManifest {
+    schema: String,
+    file: String,
+    format: String,
+    content_sha256: String,
+    content_bytes: u64,
+    rows: u64,
+    contract_rows: u64,
+    surface_counts: BTreeMap<String, u64>,
+    event_start_gte: String,
+    event_start_lt: String,
+    market_ids: Vec<String>,
+    symbols: Vec<String>,
+    window_secs: u64,
+    event_selection: String,
+    evidence_scope: String,
+    content_digest_semantics: String,
+    recording_semantics: RecordingSemantics,
+    trust_boundary: String,
+    validated_inputs: ValidatedInputs,
+}
+
+struct AuthenticatedTripletBytes {
+    data: Vec<u8>,
+    manifest: Vec<u8>,
+    success: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -271,6 +345,82 @@ fn seal_with_hook(
     trust: &PolymarketEvidenceTrustAnchor,
     after_open: impl FnOnce() -> Result<()>,
 ) -> Result<SealedPolymarketEvidenceTriplet> {
+    let authenticated = read_authenticated_triplet(triplet, trust, after_open)?;
+    let data_bytes = authenticated.data;
+    let manifest_bytes = authenticated.manifest;
+    let success_bytes = authenticated.success;
+
+    let parsed = parse_manifest(&manifest_bytes)?;
+    let explicit_selection = validate_manifest(&parsed, triplet, &success_bytes)?;
+    let trade_completions = validated_reference_trade_completions(&parsed.validated_inputs)?;
+    if u64::try_from(data_bytes.len())? != parsed.content_bytes
+        || format!("{:x}", Sha256::digest(&data_bytes)) != parsed.content_sha256
+    {
+        bail!("evidence data bytes do not match the manifest identity");
+    }
+    if parse_digest(&parsed.content_sha256, "content_sha256")? != trust.expected_content_sha256 {
+        bail!("evidence manifest content digest does not match the trusted anchor");
+    }
+    let frames = frame_ndjson(
+        &data_bytes,
+        &parsed.surface_counts,
+        &trade_completions,
+        explicit_selection.as_ref(),
+        true,
+    )?;
+    if u64::try_from(frames.len())? != parsed.rows {
+        bail!("evidence NDJSON row count does not match the manifest");
+    }
+    Ok(SealedPolymarketEvidenceTriplet {
+        manifest: parsed,
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+        data: data_bytes,
+        frames,
+    })
+}
+
+pub fn seal_polymarket_evidence_candidate_triplet(
+    triplet: &PolymarketEvidenceTriplet,
+    trust: &PolymarketEvidenceTrustAnchor,
+) -> Result<SealedPolymarketEvidenceCandidateTriplet> {
+    let authenticated = read_authenticated_triplet(triplet, trust, || Ok(()))?;
+    let parsed = parse_candidate_manifest(&authenticated.manifest)?;
+    validate_candidate_manifest(&parsed, triplet, &authenticated.success)?;
+    if u64::try_from(authenticated.data.len())? != parsed.content_bytes
+        || format!("{:x}", Sha256::digest(&authenticated.data)) != parsed.content_sha256
+    {
+        bail!("candidate evidence data bytes do not match the manifest identity");
+    }
+    let mut expected_counts = candidate_row_counts(&parsed.surface_counts, parsed.contract_rows)?;
+    expected_counts.retain(|_, count| *count > 0);
+    let trade_completions = candidate_trade_completions(&parsed.validated_inputs)?;
+    let selection = ExplicitSelection {
+        market_ids: parsed.market_ids.iter().cloned().collect(),
+        symbols: parsed.symbols.iter().cloned().collect(),
+    };
+    let frames = frame_ndjson(
+        &authenticated.data,
+        &expected_counts,
+        &trade_completions,
+        Some(&selection),
+        false,
+    )?;
+    if u64::try_from(frames.len())? != parsed.rows {
+        bail!("candidate evidence NDJSON row count does not match the manifest");
+    }
+    Ok(SealedPolymarketEvidenceCandidateTriplet {
+        manifest: parsed,
+        manifest_sha256: format!("{:x}", Sha256::digest(&authenticated.manifest)),
+        data: authenticated.data,
+        frames,
+    })
+}
+
+fn read_authenticated_triplet(
+    triplet: &PolymarketEvidenceTriplet,
+    trust: &PolymarketEvidenceTrustAnchor,
+    after_open: impl FnOnce() -> Result<()>,
+) -> Result<AuthenticatedTripletBytes> {
     let parent = common_canonical_parent(triplet)?;
     let directory = bind_directory(&parent)?;
     let mut data = BoundFile::open(&directory, &triplet.data, MAX_DATA_BYTES)?;
@@ -289,32 +439,10 @@ fn seal_with_hook(
     {
         bail!("evidence bytes do not match the trusted digest anchor");
     }
-
-    let parsed = parse_manifest(&manifest_bytes)?;
-    let explicit_selection = validate_manifest(&parsed, triplet, &success_bytes)?;
-    let trade_completions = validated_reference_trade_completions(&parsed.validated_inputs)?;
-    if u64::try_from(data_bytes.len())? != parsed.content_bytes
-        || format!("{:x}", Sha256::digest(&data_bytes)) != parsed.content_sha256
-    {
-        bail!("evidence data bytes do not match the manifest identity");
-    }
-    if parse_digest(&parsed.content_sha256, "content_sha256")? != trust.expected_content_sha256 {
-        bail!("evidence manifest content digest does not match the trusted anchor");
-    }
-    let frames = frame_ndjson(
-        &data_bytes,
-        &parsed.surface_counts,
-        &trade_completions,
-        explicit_selection.as_ref(),
-    )?;
-    if u64::try_from(frames.len())? != parsed.rows {
-        bail!("evidence NDJSON row count does not match the manifest");
-    }
-    Ok(SealedPolymarketEvidenceTriplet {
-        manifest: parsed,
-        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+    Ok(AuthenticatedTripletBytes {
         data: data_bytes,
-        frames,
+        manifest: manifest_bytes,
+        success: success_bytes,
     })
 }
 
@@ -489,6 +617,140 @@ fn parse_manifest(bytes: &[u8]) -> Result<EvidenceManifest> {
         bail!("evidence manifest must be one JSON line ending in one newline");
     }
     serde_json::from_slice(bytes).context("parse evidence manifest")
+}
+
+fn parse_candidate_manifest(bytes: &[u8]) -> Result<CandidateEvidenceManifest> {
+    if bytes.is_empty()
+        || bytes.last() != Some(&b'\n')
+        || bytes[..bytes.len() - 1].contains(&b'\n')
+        || bytes.contains(&b'\r')
+    {
+        bail!("candidate evidence manifest must be one JSON line ending in one newline");
+    }
+    serde_json::from_slice(bytes).context("parse candidate evidence manifest")
+}
+
+fn validate_candidate_manifest(
+    manifest: &CandidateEvidenceManifest,
+    triplet: &PolymarketEvidenceTriplet,
+    success: &[u8],
+) -> Result<()> {
+    let orderbook = &manifest.recording_semantics.orderbook;
+    let keys = manifest
+        .surface_counts
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_keys =
+        BTreeSet::from(["down_book", "reference", "settlement", "trades", "up_book"]);
+    let surface_rows = manifest
+        .surface_counts
+        .values()
+        .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+        .ok_or_else(|| anyhow!("candidate evidence surface count overflow"))?;
+    let expected_rows = manifest
+        .contract_rows
+        .checked_add(surface_rows)
+        .ok_or_else(|| anyhow!("candidate evidence row count overflow"))?;
+    if manifest.schema != CANDIDATE_MANIFEST_SCHEMA
+        || manifest.format != "ndjson"
+        || manifest.window_secs != 300
+        || manifest.event_selection != EXPLICIT_EVENT_SELECTION
+        || manifest.evidence_scope != CANDIDATE_EVIDENCE_SCOPE
+        || manifest.content_digest_semantics != DIGEST_SEMANTICS
+        || manifest.trust_boundary != CANDIDATE_TRUST_BOUNDARY
+        || manifest.recording_semantics.trades != CANDIDATE_TRADE_SEMANTICS
+        || manifest.recording_semantics.references != REFERENCE_SEMANTICS
+        || manifest.recording_semantics.settlement != SETTLEMENT_SEMANTICS
+        || manifest.recording_semantics.availability_clock != AVAILABILITY_SEMANTICS
+        || orderbook.level != "L2"
+        || orderbook.depth != "full visible depth as received"
+        || orderbook.quote_sample_ms != 1_000
+        || !orderbook.venue_depth_complete
+        || orderbook.temporal_updates_complete
+        || orderbook.l3_order_ids_available
+        || orderbook.queue_position_modeled
+        || orderbook.endogenous_impact_modeled
+        || orderbook.capacity_modeled
+        || keys != expected_keys
+        || manifest.rows != expected_rows
+        || manifest.market_ids.len() != 1
+        || manifest.market_ids.len() != manifest.market_ids.iter().collect::<BTreeSet<_>>().len()
+        || manifest
+            .market_ids
+            .iter()
+            .any(|market_id| market_id.is_empty() || market_id.chars().any(char::is_whitespace))
+        || manifest.symbols.is_empty()
+        || manifest.symbols.len() != manifest.symbols.iter().collect::<BTreeSet<_>>().len()
+        || manifest
+            .symbols
+            .iter()
+            .any(|symbol| !SYMBOLS.contains(&symbol.as_str()))
+        || manifest.contract_rows != 1
+    {
+        bail!("unsupported immutable candidate evidence manifest contract");
+    }
+    parse_digest(&manifest.content_sha256, "content_sha256")?;
+    let lower = parse_time(&manifest.event_start_gte, "event_start_gte")?;
+    let upper = parse_time(&manifest.event_start_lt, "event_start_lt")?;
+    if lower >= upper || success != format!("{}\n", manifest.content_sha256).as_bytes() {
+        bail!("candidate evidence manifest identity is inconsistent");
+    }
+    let name = triplet
+        .data
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("candidate evidence data name is not UTF-8"))?;
+    if manifest.file != name
+        || triplet
+            .data
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            != Some(format!("sha256={}", manifest.content_sha256).as_str())
+        || triplet.manifest.file_name().and_then(OsStr::to_str)
+            != Some(format!("{name}.manifest.json").as_str())
+        || triplet.success.file_name().and_then(OsStr::to_str)
+            != Some(format!("{name}._SUCCESS").as_str())
+    {
+        bail!("candidate evidence file names or _SUCCESS marker do not match the manifest");
+    }
+    Ok(())
+}
+
+fn candidate_row_counts(
+    surface_counts: &BTreeMap<String, u64>,
+    contract_rows: u64,
+) -> Result<BTreeMap<String, u64>> {
+    let mut counts = BTreeMap::new();
+    counts.insert("market_contract".to_owned(), contract_rows);
+    counts.insert(
+        "orderbook_snapshot".to_owned(),
+        surface_counts["up_book"]
+            .checked_add(surface_counts["down_book"])
+            .context("candidate orderbook count overflow")?,
+    );
+    counts.insert(
+        "chainlink_reference".to_owned(),
+        surface_counts["reference"],
+    );
+    counts.insert("polymarket_trade".to_owned(), surface_counts["trades"]);
+    counts.insert(
+        "official_settlement_evidence".to_owned(),
+        surface_counts["settlement"],
+    );
+    Ok(counts)
+}
+
+fn candidate_trade_completions(
+    inputs: &ValidatedInputs,
+) -> Result<BTreeMap<String, TradeCompletionIdentity>> {
+    match inputs {
+        ValidatedInputs::V1(inputs) if inputs.reference.trade_completions.is_empty() => {
+            Ok(BTreeMap::new())
+        }
+        _ => validated_reference_trade_completions(inputs),
+    }
 }
 
 fn validate_manifest(
@@ -966,6 +1228,7 @@ fn frame_ndjson(
     expected_counts: &BTreeMap<String, u64>,
     trade_completions: &BTreeMap<String, TradeCompletionIdentity>,
     explicit_selection: Option<&ExplicitSelection>,
+    require_trade_completions: bool,
 ) -> Result<Vec<Range<usize>>> {
     if bytes.is_empty() || bytes.last() != Some(&b'\n') || bytes.contains(&b'\r') {
         bail!("evidence data must be non-empty newline-terminated NDJSON");
@@ -1053,9 +1316,12 @@ fn frame_ndjson(
         }
     }
     for (market_id, (condition_id, symbol, window_secs)) in market_contexts {
-        let completion = trade_completions.get(&market_id).ok_or_else(|| {
-            anyhow!("evidence trade rows do not match event-local completion proof")
-        })?;
+        let Some(completion) = trade_completions.get(&market_id) else {
+            if require_trade_completions {
+                bail!("evidence trade rows do not match event-local completion proof");
+            }
+            continue;
+        };
         if completion.condition_id != condition_id
             || completion.symbol != symbol
             || completion.market_window_secs != window_secs
@@ -1074,7 +1340,7 @@ fn frame_ndjson(
             bail!("evidence trade rows do not match event-local completion proof");
         }
     }
-    if !trade_record_ids.is_empty() {
+    if require_trade_completions && !trade_record_ids.is_empty() {
         bail!("evidence trade rows do not match event-local completion proof");
     }
     Ok(frames)
@@ -1224,6 +1490,42 @@ pub(super) mod tests {
         PolymarketEvidenceTriplet { data, manifest, success }
     }
 
+    fn write_candidate_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
+        let rows = [json!({
+            "schema": ROW_SCHEMA,
+            "surface": "market_contract",
+            "market_id": "market-1",
+            "condition_id": "condition-1",
+            "symbol": "BTCUSDT",
+            "window_secs": 300
+        })];
+        let triplet = write_triplet_rows(temp, &rows);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("events");
+        manifest["schema"] = json!(CANDIDATE_MANIFEST_SCHEMA);
+        manifest["contract_rows"] = json!(1);
+        manifest["surface_counts"] = json!({
+            "down_book": 0,
+            "reference": 0,
+            "settlement": 0,
+            "trades": 0,
+            "up_book": 0
+        });
+        manifest["evidence_scope"] = json!(CANDIDATE_EVIDENCE_SCOPE);
+        manifest["recording_semantics"]["trades"] = json!(CANDIDATE_TRADE_SEMANTICS);
+        manifest["trust_boundary"] = json!(CANDIDATE_TRUST_BOUNDARY);
+        manifest["market_ids"] = json!(["market-1"]);
+        manifest["symbols"] = json!(["BTCUSDT"]);
+        manifest["event_selection"] = json!(EXPLICIT_EVENT_SELECTION);
+        manifest["rows"] = json!(1);
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        triplet
+    }
+
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
@@ -1266,6 +1568,13 @@ pub(super) mod tests {
         );
 
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn seals_authenticated_candidate_triplet_with_missing_surfaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_candidate_triplet(&temp);
+        assert!(seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet)).is_ok());
     }
 
     #[test]
@@ -1851,7 +2160,7 @@ pub(super) mod tests {
     #[test]
     #[rustfmt::skip]
     fn rejects_noncanonical_or_nonregular_data() {
-        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new(), &BTreeMap::new(), None).is_err());
+        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new(), &BTreeMap::new(), None, true).is_err());
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
         let fifo_anchor = trust(&triplet);
