@@ -28,7 +28,26 @@ usage() {
     'Production gates always observe at least 3600 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
     'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.' \
-    'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS.'
+    'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS only' \
+    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 2400 seconds;' \
+    'otherwise the policy check fails.'
+}
+
+resolve_health_settle_seconds() {
+  health_settle_seconds=$HEALTH_SETTLE_SECONDS
+  if [[ -n ${MONDAY_TEST_HEALTH_SETTLE_SECONDS:-} ]]; then
+    [[ $test_only == true ]] \
+      || die 'short health settles require a test-only gate'
+    [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
+      || die 'short health settles require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
+    [[ ${MONDAY_TEST_HEALTH_SETTLE_SECONDS} =~ ^[1-9][0-9]*$ ]] \
+      || die 'test health settle duration must be a positive integer'
+    (( ${#MONDAY_TEST_HEALTH_SETTLE_SECONDS} <= ${#HEALTH_SETTLE_SECONDS} )) \
+      || die 'test health settle duration is too large'
+    ((MONDAY_TEST_HEALTH_SETTLE_SECONDS < HEALTH_SETTLE_SECONDS)) \
+      || die 'test health settle duration must be shorter than the formal settle duration'
+    health_settle_seconds=$MONDAY_TEST_HEALTH_SETTLE_SECONDS
+  fi
 }
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
@@ -111,18 +130,7 @@ if ((gate_seconds < REQUIRED_DURATION_SECONDS)); then
     || die 'short gates require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
   test_only=true
 fi
-health_settle_seconds=$HEALTH_SETTLE_SECONDS
-if [[ -n ${MONDAY_TEST_HEALTH_SETTLE_SECONDS:-} ]]; then
-  [[ $test_only == true ]] \
-    || die 'short health settles require a test-only gate'
-  [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
-    || die 'short health settles require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
-  [[ ${MONDAY_TEST_HEALTH_SETTLE_SECONDS} =~ ^[1-9][0-9]*$ ]] \
-    || die 'test health settle duration must be a positive integer'
-  ((MONDAY_TEST_HEALTH_SETTLE_SECONDS < HEALTH_SETTLE_SECONDS)) \
-    || die 'test health settle duration must be shorter than the formal settle duration'
-  health_settle_seconds=$MONDAY_TEST_HEALTH_SETTLE_SECONDS
-fi
+resolve_health_settle_seconds
 
 env_value() {
   local file=$1
