@@ -339,7 +339,10 @@ fn verify_binance_market_tape_with_requirements(
                     if event_type == "snapshot" {
                         snapshot_seeds.insert(symbol.clone());
                     } else {
-                        if identities.is_empty() && !snapshot_seeds.contains(&symbol) {
+                        if identities.is_empty()
+                            && !snapshot_seeds.contains(&symbol)
+                            && !require_lob_continuity
+                        {
                             bail!(
                                 "first market-tape segment checkpoint cannot establish replay \
                                  state before a snapshot seed"
@@ -1450,6 +1453,28 @@ mod tests {
 
         let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("snapshot seed"));
+    }
+
+    #[test]
+    fn first_segment_replay_safe_checkpoint_seeds_replay() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.retain(|row| !matches!(row["type"].as_str(), Some("snapshot") | Some("diff")));
+        let rows = with_stream_coverage(rows, &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let _ = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let anchor = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified =
+            verify_binance_market_tape_with_required_trade_and_lob_summaries(vec![sealed]).unwrap();
+        assert!(matches!(
+            verified.replayed_books()[0].events(),
+            [
+                ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot { .. }),
+                ReplayedBinanceBookEvent::Checkpoint { .. },
+            ]
+        ));
     }
 
     #[test]
