@@ -895,6 +895,27 @@ async fn run_session(
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
         if segment_due(&segment, config.segment_seconds)? {
+            let rotation_action = match drain_events_before_segment_rotation(
+                &config,
+                &mut receiver,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &session_id,
+                &mut process_state,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if rotation_action.restarts_capture_session() {
+                break;
+            }
+            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+            }
             segment = rotate_segment(
                 segment,
                 &config,
@@ -1167,6 +1188,38 @@ fn process_event(
         }
     }
     Ok(ProcessAction::None)
+}
+
+fn drain_events_before_segment_rotation(
+    config: &Config,
+    receiver: &mut mpsc::Receiver<Event>,
+    segment: &mut Segment,
+    states: &mut HashMap<String, OrderBookState>,
+    budget: &mut PendingBudget,
+    session_id: &str,
+    process_state: &mut ProcessState,
+) -> anyhow::Result<ProcessAction> {
+    let mut saw_initial_snapshots_complete = false;
+    while let Ok(event) = receiver.try_recv() {
+        let action = process_event(
+            config,
+            segment,
+            states,
+            budget,
+            session_id,
+            event,
+            process_state,
+        )?;
+        if action.restarts_capture_session() {
+            return Ok(action);
+        }
+        saw_initial_snapshots_complete |= matches!(action, ProcessAction::InitialSnapshotsComplete);
+    }
+    Ok(if saw_initial_snapshots_complete {
+        ProcessAction::InitialSnapshotsComplete
+    } else {
+        ProcessAction::None
+    })
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
@@ -4666,6 +4719,46 @@ mod tests {
             }
         }
         assert!(rotated, "post-select maintenance must rotate a hot queue");
+    }
+
+    #[tokio::test]
+    async fn rotation_drain_processes_queued_events_before_segment_boundary() {
+        let root = env::temp_dir().join(format!("monday-rotation-drain-test-{}", now_ns().unwrap()));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = config
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
+            .collect::<HashMap<_, _>>();
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Event::StreamDisconnected {
+                streams: vec!["btcusdt@depth@100ms".into()],
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let action = drain_events_before_segment_rotation(
+            &config,
+            &mut receiver,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            &mut process_state,
+        )
+        .unwrap();
+
+        assert_eq!(action, ProcessAction::None);
+        assert!(receiver.try_recv().is_err());
+        assert!(!segment.is_replay_safe());
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

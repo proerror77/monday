@@ -405,6 +405,7 @@ pub struct SegmentConfig {
 pub struct Segment {
     config: SegmentConfig,
     pub start_ns: u64,
+    manifest_start_ns: u64,
     pub end_ns: u64,
     path: PathBuf,
     writer: BufWriter<File>,
@@ -478,7 +479,8 @@ impl Segment {
         Ok(Self {
             config,
             start_ns,
-            end_ns: start_ns,
+            manifest_start_ns: start_ns,
+            end_ns: 0,
             path,
             writer: BufWriter::with_capacity(1024 * 1024, file),
             counts: BTreeMap::new(),
@@ -496,6 +498,7 @@ impl Segment {
         payload: Value,
         received_at_ns: u64,
     ) -> anyhow::Result<()> {
+        self.manifest_start_ns = self.manifest_start_ns.min(received_at_ns);
         self.end_ns = self.end_ns.max(received_at_ns);
         let mut envelope = serde_json::Map::new();
         envelope.insert("received_at_ns".to_owned(), received_at_ns.into());
@@ -583,7 +586,7 @@ impl Segment {
             self.counts,
             trade_summaries,
             RAW_SCHEMA,
-            self.start_ns,
+            self.manifest_start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
             readiness,
@@ -1476,7 +1479,7 @@ mod tests {
                     "symbols":1,
                     "websocket_shards":1
                 }),
-                segment.start_ns,
+                segment.start_ns - 1,
             )
             .unwrap();
         segment
@@ -1592,6 +1595,7 @@ mod tests {
             manifest["schema"],
             data::binance_market_tape::MARKET_TAPE_SCHEMA
         );
+        assert_eq!(manifest["start_received_at_ns"], json!(start_ns - 1));
         assert_eq!(
             manifest["event_types"],
             json!({"agg_trade":2,"checkpoint":1,"diff":1,"session_start":1,"snapshot":1})
