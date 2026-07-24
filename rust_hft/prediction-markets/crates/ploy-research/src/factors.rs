@@ -3202,6 +3202,84 @@ mod tests {
     }
 
     #[test]
+    fn in_event_chainlink_refreshes_factors_without_replacing_preopen_strike() {
+        let start = Utc.timestamp_opt(1_000, 0).unwrap();
+        let end = start + chrono::Duration::seconds(300);
+        let first_book = Utc.timestamp_opt(1_031, 255_606_000).unwrap();
+        let decision = Utc.timestamp_opt(1_031, 255_751_000).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::from(999)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::from(100),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(1_000, 846_409_000).unwrap()),
+                ts: Utc.timestamp_opt(999, 0).unwrap(),
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::from(105),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(1_030, 273_895_000).unwrap()),
+                ts: Utc.timestamp_opt(1_029, 0).unwrap(),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::from(10)),
+                ask_size: Some(Decimal::from(10)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: first_book,
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("down"),
+                bid: Some(Decimal::new(54, 2)),
+                ask: Some(Decimal::new(55, 2)),
+                bid_size: Some(Decimal::from(10)),
+                ask_size: Some(Decimal::from(10)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: decision,
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::from(101),
+                ts: decision,
+            },
+        ];
+
+        let rows = build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
+            &updates,
+            &[],
+            &[],
+            30,
+            10,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].chainlink_reference_fresh);
+        assert!((rows[0].signed_distance_to_beat - 0.01).abs() < 1e-12);
+        assert!(rows[0].chainlink_prob_up.is_finite());
+    }
+
+    #[test]
     fn factor_builders_defer_only_unresolved_outcomes() {
         let end = Utc.timestamp_opt(1000, 0).unwrap();
         let updates = vec![

@@ -381,6 +381,40 @@ mod tests {
     }
 
     #[test]
+    fn projects_fresh_in_event_chainlink_ticks_for_factor_freshness() {
+        let mut fixture = rows();
+        let mut in_event_reference = fixture[3].clone();
+        in_event_reference["ts"] = json!("2026-07-17T05:30:30Z");
+        in_event_reference["received_at"] = json!("2026-07-17T05:30:31Z");
+        in_event_reference["recorded_at"] = json!("2026-07-17T05:30:31Z");
+        in_event_reference["available_at"] = json!("2026-07-17T05:30:31Z");
+        in_event_reference["source_sequence"] = json!(8);
+        in_event_reference["price"] = json!("63010");
+        fixture.push(in_event_reference);
+
+        let evidence = verified(&fixture);
+        let projected = project_verified_polymarket_evidence(&evidence, 1, 30).unwrap();
+        let clocks = projected
+            .updates
+            .iter()
+            .filter_map(|update| match update {
+                MarketUpdate::ReferencePrice {
+                    ts, received_at, ..
+                } => Some((*ts, received_at.unwrap())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            clocks,
+            vec![
+                (time("2026-07-17T05:29:55Z"), time("2026-07-17T05:29:57Z")),
+                (time("2026-07-17T05:30:30Z"), time("2026-07-17T05:30:31Z")),
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_delayed_rows_before_sampling() {
         let mut fixture = rows();
         let mut delayed_book = fixture[1].clone();

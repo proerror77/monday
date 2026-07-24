@@ -46,6 +46,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Bind selected-event trades to an event-local collector completion proof from raw tape through sealed research evidence.
 - [x] Project verified Polymarket evidence into availability-safe research carriers without replaying discovery metadata or settlement labels before observation.
 - [ ] Wire the verified-artifact ResearchSnapshot adapter into the snapshot CLI and complete its cloud alpha-harness E2E.
+- [ ] Project causally valid in-event Chainlink ticks without allowing them to replace the pre-open five-minute strike (#304).
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
   Monday binaries; remove runtime `cargo run --example` and research-policy
   coupling to the legacy OMS/runtime workspace.
