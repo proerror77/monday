@@ -1,7 +1,9 @@
 use crate::polymarket_research_import::ResearchSegmentValidationReport;
 use crate::polymarket_research_normalize::{
-    normalize_polymarket_evidence, NormalizedPolymarketEvidence, PolymarketEvidenceConfig,
-    PolymarketEvidenceReport, EXPLICIT_MARKET_ID_SELECTION,
+    normalize_polymarket_candidate_evidence, normalize_polymarket_evidence,
+    NormalizedPolymarketCandidateEvidence, NormalizedPolymarketEvidence,
+    PolymarketCandidateEvidenceReport, PolymarketEvidenceConfig, PolymarketEvidenceReport,
+    EXPLICIT_MARKET_ID_SELECTION,
 };
 use crate::polymarket_research_select::semantic_index;
 use crate::polymarket_upload::ensure_canonical_directory;
@@ -30,11 +32,13 @@ const SURFACES: [&str; 5] = [
     "polymarket_trade",
     "official_settlement_evidence",
 ];
+const CANDIDATE_SURFACES: [&str; 5] = ["down_book", "reference", "settlement", "trades", "up_book"];
 
 const CONTENT_DIGEST_SEMANTICS: &str =
     "content_sha256 binds the published NDJSON bytes only; it is not a snapshot_contract_hash";
 const PUBLISHED_MODE: u32 = 0o444;
 const PRODUCER_VERIFIER_CONTRACT: &str = "monday.polymarket.normalized_evidence.v2";
+const CANDIDATE_VERIFIER_CONTRACT: &str = "monday.polymarket.normalized_candidate_evidence.v1";
 
 #[derive(Debug, Clone)]
 pub struct PolymarketEvidenceArtifactConfig {
@@ -60,8 +64,20 @@ pub struct PublishedPolymarketEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedPolymarketCandidateEvidence {
+    pub schema: &'static str,
+    pub outcome: ImmutablePublicationOutcome,
+    pub data_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub success_path: PathBuf,
+    pub published_digests: PublishedPolymarketEvidenceDigests,
+    pub evidence: PolymarketCandidateEvidenceReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublishedPolymarketEvidenceBatch {
     pub evidence: Vec<PublishedPolymarketEvidence>,
+    pub candidates: Vec<PublishedPolymarketCandidateEvidence>,
     pub qualifications: Vec<PublishedPolymarketEventQualification>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -173,6 +189,7 @@ pub enum PolymarketEventQualificationReason {
     InvalidEvidenceDigest,
     UnsupportedProductContract,
     VerifierRejected,
+    IndependentVerificationRequired,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolymarketEventQualificationRecord {
@@ -518,6 +535,49 @@ fn verified_event_input(
     Ok(verified)
 }
 
+fn candidate_event_input(
+    evidence: &NormalizedPolymarketCandidateEvidence,
+    declared: &PolymarketEventQualificationInput,
+) -> Result<PolymarketEventQualificationInput> {
+    validate_candidate_dataset(evidence)?;
+    ensure!(
+        evidence.report.market_ids == [declared.market_id.clone()],
+        "event-local candidate does not match its declared market"
+    );
+    let contracts = evidence
+        .ndjson
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|row| row["surface"] == "market_contract")
+        .collect::<Vec<_>>();
+    ensure!(contracts.len() == 1, "candidate must emit one contract");
+    let contract = &contracts[0];
+    for (field, expected) in [
+        ("market_id", declared.market_id.as_str()),
+        ("symbol", declared.symbol.as_str()),
+        ("event_start", declared.event_start.as_str()),
+        ("event_end", declared.event_end.as_str()),
+    ] {
+        ensure!(
+            contract[field].as_str() == Some(expected),
+            "candidate contract {field} does not match declaration"
+        );
+    }
+    let tokens: [String; 2] = serde_json::from_value(contract["source_token_ids"].clone())?;
+    let outcomes: [String; 2] = serde_json::from_value(contract["source_outcomes"].clone())?;
+    let up = semantic_index(&outcomes, true)?;
+    let down = semantic_index(&outcomes, false)?;
+    let mut candidate = declared.clone();
+    candidate.token_identity_matches =
+        candidate.up_token_id == tokens[up] && candidate.down_token_id == tokens[down];
+    candidate.verified_token_ids = Some([tokens[up].clone(), tokens[down].clone()]);
+    candidate.evidence_digests.expected_content_sha256 = evidence.report.content_sha256.clone();
+    Ok(candidate)
+}
+
 #[derive(Serialize)]
 struct OrderBookSemantics {
     level: &'static str,
@@ -653,6 +713,64 @@ fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u
         trust_boundary: report.trust_boundary,
         validated_inputs: &report.validated_inputs,
     };
+    let mut bytes = serde_json::to_vec(&manifest)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn validate_candidate_dataset(dataset: &NormalizedPolymarketCandidateEvidence) -> Result<()> {
+    let report = &dataset.report;
+    let rows = u64::try_from(dataset.ndjson.iter().filter(|byte| **byte == b'\n').count())?;
+    if report.schema != "monday.polymarket.normalized_candidate_evidence.v1"
+        || report.content_sha256 != hex::encode(Sha256::digest(&dataset.ndjson))
+        || report.content_bytes != u64::try_from(dataset.ndjson.len())?
+        || report.contract_rows != 1
+        || report.rows != rows
+        || report.rows != report.contract_rows + report.surface_counts.values().sum::<u64>()
+        || report.market_ids.len() != 1
+        || report.market_ids[0].is_empty()
+        || report.market_ids[0].chars().any(char::is_whitespace)
+        || report.symbols.len() != 1
+        || !["BTCUSDT", "SOLUSDT"].contains(&report.symbols[0].as_str())
+        || report.window_secs != 300
+        || report.event_selection != EXPLICIT_MARKET_ID_SELECTION
+        || report.surface_counts.len() != CANDIDATE_SURFACES.len()
+        || CANDIDATE_SURFACES
+            .iter()
+            .any(|surface| !report.surface_counts.contains_key(*surface))
+    {
+        bail!("normalized polymarket candidate identity is inconsistent");
+    }
+    Ok(())
+}
+
+fn candidate_manifest_bytes(
+    report: &PolymarketCandidateEvidenceReport,
+    file: &str,
+) -> Result<Vec<u8>> {
+    let mut semantics = recording_semantics();
+    semantics.trades = "canonical v2 records when present; a collector completion proof is verified when present but may be absent";
+    let manifest = serde_json::json!({
+        "schema": "monday.polymarket.candidate_evidence_artifact.v1",
+        "file": file,
+        "format": "ndjson",
+        "content_sha256": report.content_sha256,
+        "content_bytes": report.content_bytes,
+        "rows": report.rows,
+        "contract_rows": report.contract_rows,
+        "surface_counts": report.surface_counts,
+        "event_start_gte": report.event_start_gte,
+        "event_start_lt": report.event_start_lt,
+        "market_ids": report.market_ids,
+        "symbols": report.symbols,
+        "window_secs": report.window_secs,
+        "event_selection": report.event_selection,
+        "evidence_scope": "untrusted producer candidate only; not Ready, execution authorization, or evaluator labels",
+        "content_digest_semantics": CONTENT_DIGEST_SEMANTICS,
+        "recording_semantics": semantics,
+        "trust_boundary": report.trust_boundary,
+        "validated_inputs": report.validated_inputs,
+    });
     let mut bytes = serde_json::to_vec(&manifest)?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -933,7 +1051,7 @@ fn publish_triplet(
     manifest_path: &Path,
     success_path: &Path,
     bytes: &ArtifactBytes<'_>,
-) -> Result<()> {
+) -> Result<ImmutablePublicationOutcome> {
     require_secure_publication_platform()?;
     let directory_path = data_path
         .parent()
@@ -952,7 +1070,7 @@ fn publish_triplet(
         bail!("pre-existing _SUCCESS marker is missing its immutable payload");
     }
     if success_exists {
-        return Ok(());
+        return Ok(ImmutablePublicationOutcome::Unchanged);
     }
     install_no_clobber(directory_path, &directory, data_path, bytes.data)?;
     install_no_clobber(directory_path, &directory, manifest_path, bytes.manifest)?;
@@ -966,7 +1084,7 @@ fn publish_triplet(
     if !exact_or_missing(directory_path, &directory, success_path, bytes.success)? {
         bail!("artifact success marker disappeared after publication");
     }
-    Ok(())
+    Ok(ImmutablePublicationOutcome::Published)
 }
 
 fn publish_normalized(
@@ -985,7 +1103,7 @@ fn publish_normalized(
     let manifest = manifest_bytes(&evidence.report, &data_name)?;
     let manifest_sha256 = hex::encode(Sha256::digest(&manifest));
     let success = format!("{digest}\n");
-    publish_triplet(
+    let _ = publish_triplet(
         &data_path,
         &manifest_path,
         &success_path,
@@ -1008,10 +1126,54 @@ fn publish_normalized(
     })
 }
 
+fn publish_candidate_normalized(
+    output_root: &Path,
+    evidence: NormalizedPolymarketCandidateEvidence,
+) -> Result<PublishedPolymarketCandidateEvidence> {
+    validate_candidate_dataset(&evidence)?;
+    ensure_canonical_directory(output_root)?;
+    let digest = &evidence.report.content_sha256;
+    let directory = output_root.join(format!("sha256={digest}"));
+    ensure_canonical_directory(&directory)?;
+    let data_name = format!("polymarket-candidate-evidence-5m.{digest}.ndjson");
+    let data_path = directory.join(&data_name);
+    let manifest_path = directory.join(format!("{data_name}.manifest.json"));
+    let success_path = directory.join(format!("{data_name}._SUCCESS"));
+    let manifest = candidate_manifest_bytes(&evidence.report, &data_name)?;
+    let published_digests = PublishedPolymarketEvidenceDigests {
+        expected_content_sha256: digest.clone(),
+        expected_manifest_sha256: hex::encode(Sha256::digest(&manifest)),
+    };
+    let success = format!("{digest}\n");
+    let outcome = publish_triplet(
+        &data_path,
+        &manifest_path,
+        &success_path,
+        &ArtifactBytes {
+            data: &evidence.ndjson,
+            manifest: &manifest,
+            success: success.as_bytes(),
+        },
+    )?;
+    Ok(PublishedPolymarketCandidateEvidence {
+        schema: "monday.polymarket.published_candidate_evidence.v1",
+        outcome,
+        data_path,
+        manifest_path,
+        success_path,
+        published_digests,
+        evidence: evidence.report,
+    })
+}
+
 pub fn publish_polymarket_evidence(
     config: &PolymarketEvidenceArtifactConfig,
 ) -> Result<PublishedPolymarketEvidenceBatch> {
-    publish_polymarket_evidence_with(config, normalize_polymarket_evidence)
+    publish_polymarket_evidence_with(
+        config,
+        normalize_polymarket_evidence,
+        normalize_polymarket_candidate_evidence,
+    )
 }
 
 fn retryable_infrastructure_failure(error: &anyhow::Error) -> bool {
@@ -1025,6 +1187,9 @@ fn retryable_infrastructure_failure(error: &anyhow::Error) -> bool {
 fn publish_polymarket_evidence_with(
     config: &PolymarketEvidenceArtifactConfig,
     mut normalize: impl FnMut(&PolymarketEvidenceConfig) -> Result<NormalizedPolymarketEvidence>,
+    mut normalize_candidate: impl FnMut(
+        &PolymarketEvidenceConfig,
+    ) -> Result<NormalizedPolymarketCandidateEvidence>,
 ) -> Result<PublishedPolymarketEvidenceBatch> {
     require_secure_publication_platform()?;
     let declared = config
@@ -1044,6 +1209,7 @@ fn publish_polymarket_evidence_with(
         "qualification inputs must match the selected market IDs exactly"
     );
     let mut published_evidence = Vec::new();
+    let mut published_candidates = Vec::new();
     let mut qualifications = Vec::new();
     let mut infrastructure_failure = None;
     for market_id in &config.evidence.market_ids {
@@ -1051,10 +1217,48 @@ fn publish_polymarket_evidence_with(
         let declared_record =
             classify_polymarket_event(declared, &config.qualification.producer, false);
         if declared_record.state != PolymarketEventQualificationState::Ready {
-            qualifications.push(publish_qualification_record(
-                &config.output_root,
-                declared_record,
-            )?);
+            if !declared.source_closed {
+                qualifications.push(publish_qualification_record(
+                    &config.output_root,
+                    declared_record,
+                )?);
+                continue;
+            }
+            let mut event_config = config.evidence.clone();
+            event_config.market_ids = vec![market_id.clone()];
+            match normalize_candidate(&event_config).and_then(|evidence| {
+                let candidate = candidate_event_input(&evidence, declared)?;
+                Ok((evidence, candidate))
+            }) {
+                Ok((evidence, mut candidate)) => {
+                    let published = publish_candidate_normalized(&config.output_root, evidence)?;
+                    candidate.evidence_digests = published.published_digests.clone();
+                    let mut record = classify_polymarket_event(
+                        &candidate,
+                        &config.qualification.producer,
+                        false,
+                    );
+                    if record.state == PolymarketEventQualificationState::Ready {
+                        record.state = PolymarketEventQualificationState::Partial;
+                        record.reasons = vec![
+                            PolymarketEventQualificationReason::IndependentVerificationRequired,
+                        ];
+                        record.retry = true;
+                    }
+                    record.verifier_contract = CANDIDATE_VERIFIER_CONTRACT;
+                    qualifications.push(publish_qualification_record(&config.output_root, record)?);
+                    published_candidates.push(published);
+                }
+                Err(error) if retryable_infrastructure_failure(&error) => {
+                    infrastructure_failure.get_or_insert(error);
+                }
+                Err(_deterministic_failure) => {
+                    let mut record =
+                        classify_polymarket_event(declared, &config.qualification.producer, true);
+                    record.verifier_contract = CANDIDATE_VERIFIER_CONTRACT;
+                    qualifications.push(publish_qualification_record(&config.output_root, record)?);
+                }
+            }
             continue;
         }
         let mut event_config = config.evidence.clone();
@@ -1086,6 +1290,7 @@ fn publish_polymarket_evidence_with(
     }
     Ok(PublishedPolymarketEvidenceBatch {
         evidence: published_evidence,
+        candidates: published_candidates,
         qualifications,
     })
 }
@@ -1151,6 +1356,66 @@ mod tests {
             configuration_sha256: "5".repeat(64),
         }
     }
+    #[cfg(target_os = "linux")]
+    fn candidate_evidence(market_id: &str) -> NormalizedPolymarketCandidateEvidence {
+        fn segment(dataset: &str) -> SegmentIdentity {
+            SegmentIdentity {
+                schema: "monday.polymarket.raw.v1".into(),
+                venue: "polymarket".into(),
+                dataset: dataset.into(),
+                date: "2026-07-17".into(),
+                hour: "05".into(),
+                file: format!("{dataset}.ndjson.zst"),
+                bytes: 1,
+                sha256: "0".repeat(64),
+                events: 1,
+                start_sequence: 1,
+                end_sequence: 1,
+                sequence_gaps: 0,
+                start_recorded_at: "2026-07-17T05:30:00Z".into(),
+                end_recorded_at: "2026-07-17T05:35:00Z".into(),
+                source_file: format!("{dataset}.ndjson"),
+                replay_scope: "fixture".into(),
+                recording_policy: serde_json::json!({}),
+                record_id_versions: serde_json::json!([]),
+                event_types: BTreeMap::new(),
+                trade_completions: BTreeMap::new(),
+            }
+        }
+        let ndjson = format!(
+            "{{\"schema\":\"monday.polymarket.evidence_row.v1\",\"surface\":\"market_contract\",\"market_id\":\"{market_id}\",\"symbol\":\"BTCUSDT\",\"event_start\":\"2026-07-17T05:30:00Z\",\"event_end\":\"2026-07-17T05:35:00Z\",\"source_token_ids\":[\"{market_id}-up\",\"{market_id}-down\"],\"source_outcomes\":[\"Up\",\"Down\"]}}\n{{\"schema\":\"monday.polymarket.evidence_row.v1\",\"surface\":\"orderbook_snapshot\",\"market_id\":\"{market_id}\",\"token_id\":\"{market_id}-up\"}}\n"
+        )
+        .into_bytes();
+        NormalizedPolymarketCandidateEvidence {
+            report: PolymarketCandidateEvidenceReport {
+                schema: "monday.polymarket.normalized_candidate_evidence.v1",
+                content_sha256: hex::encode(Sha256::digest(&ndjson)),
+                content_bytes: u64::try_from(ndjson.len()).unwrap(),
+                rows: 2,
+                contract_rows: 1,
+                surface_counts: BTreeMap::from([
+                    ("down_book".into(), 0),
+                    ("reference".into(), 0),
+                    ("settlement".into(), 0),
+                    ("trades".into(), 0),
+                    ("up_book".into(), 1),
+                ]),
+                event_start_gte: "2026-07-17T05:30:00Z".into(),
+                event_start_lt: "2026-07-17T05:35:00Z".into(),
+                market_ids: vec![market_id.into()],
+                symbols: vec!["BTCUSDT".into()],
+                window_secs: 300,
+                event_selection: EXPLICIT_MARKET_ID_SELECTION,
+                trust_boundary: "untrusted producer candidate",
+                validated_inputs: ResearchSegmentValidationReport {
+                    schema: "monday.polymarket.research_segment_validation.v2",
+                    market: segment("crypto_expiry"),
+                    references: vec![segment("crypto_expiry_reference")],
+                },
+            },
+            ndjson,
+        }
+    }
     fn assert_classification(
         event: PolymarketEventQualificationInput,
         verifier_rejected: bool,
@@ -1190,6 +1455,92 @@ mod tests {
         let mut event = complete_event("market-1");
         event.request_outcomes.as_mut().unwrap()[4].completed_at = "2026-07-17T05:34:59Z".into();
         assert_classification(event, false, Rejected, InvalidSourceClocks);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_closed_partial_events_publish_candidate_triplets_without_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut partial = complete_event("market-partial");
+        partial.down_book = EvidenceSurfaceStatus::Incomplete;
+        partial.request_outcomes.as_mut().unwrap()[1].status = ProducerRequestStatus::Failed;
+        let mut config = PolymarketEvidenceArtifactConfig {
+            evidence: PolymarketEvidenceConfig {
+                segments: crate::polymarket_research_import::ResearchSegmentValidationConfig {
+                    market: crate::polymarket_research_import::ArtifactTriplet {
+                        data: PathBuf::new(),
+                        manifest: PathBuf::new(),
+                        success: PathBuf::new(),
+                    },
+                    references: Vec::new(),
+                },
+                event_start_gte: "2026-07-17T05:30:00Z".into(),
+                event_start_lt: "2026-07-17T05:35:00Z".into(),
+                market_ids: vec![partial.market_id.clone()],
+            },
+            output_root: root,
+            qualification: PolymarketProducerQualificationConfig {
+                producer: producer_provenance(),
+                events: vec![partial],
+            },
+        };
+
+        let result = publish_polymarket_evidence_with(
+            &config,
+            |_| panic!("partial candidate must not enter complete normalization"),
+            |selection| Ok(candidate_evidence(&selection.market_ids[0])),
+        )
+        .unwrap();
+
+        assert_eq!(result.qualifications[0].record.state, Partial);
+        assert_eq!(
+            result.qualifications[0].record.evidence_digests,
+            result.candidates[0].published_digests
+        );
+        assert_eq!(result.candidates[0].evidence.surface_counts["down_book"], 0);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&result.candidates[0].manifest_path).unwrap())
+                .unwrap();
+        assert!(manifest["recording_semantics"]["trades"]
+            .as_str()
+            .unwrap()
+            .contains("may be absent"));
+
+        let mut repaired = complete_event("market-repaired");
+        repaired.token_identity_matches = false;
+        config.evidence.market_ids = vec![repaired.market_id.clone()];
+        config.qualification.events = vec![repaired];
+        let result = publish_polymarket_evidence_with(
+            &config,
+            |_| unreachable!(),
+            |selection| Ok(candidate_evidence(&selection.market_ids[0])),
+        )
+        .unwrap();
+        assert_eq!(result.qualifications[0].record.state, Partial);
+        assert_eq!(
+            result.qualifications[0].record.reasons,
+            [IndependentVerificationRequired]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_triplets_are_event_local_and_no_clobber() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let first = publish_candidate_normalized(&root, candidate_evidence("market-1")).unwrap();
+        let replay = publish_candidate_normalized(&root, candidate_evidence("market-1")).unwrap();
+        let sibling = publish_candidate_normalized(&root, candidate_evidence("market-2")).unwrap();
+        assert_eq!(first.outcome, ImmutablePublicationOutcome::Published);
+        assert_eq!(replay.outcome, ImmutablePublicationOutcome::Unchanged);
+        assert_eq!(first.evidence.market_ids, ["market-1"]);
+        assert_eq!(sibling.evidence.market_ids, ["market-2"]);
+        assert_ne!(first.data_path, sibling.data_path);
+
+        fs::set_permissions(&first.data_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&first.data_path, b"conflict\n").unwrap();
+        assert!(publish_candidate_normalized(&root, candidate_evidence("market-1")).is_err());
     }
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -1395,13 +1746,17 @@ mod tests {
             },
         };
         let run = || {
-            publish_polymarket_evidence_with(&config, |selection| {
-                if selection.market_ids == ["market-1"] {
-                    Ok(evidence.clone())
-                } else {
-                    panic!("declared non-ready event must not enter the verifier")
-                }
-            })
+            publish_polymarket_evidence_with(
+                &config,
+                |selection| {
+                    if selection.market_ids == ["market-1"] {
+                        Ok(evidence.clone())
+                    } else {
+                        panic!("declared non-ready event must not enter the verifier")
+                    }
+                },
+                |selection| Ok(candidate_evidence(&selection.market_ids[0])),
+            )
         };
         let first = run().unwrap();
         let second = run().unwrap();
@@ -1413,7 +1768,7 @@ mod tests {
             first.qualifications[1].record.state,
             PolymarketEventQualificationState::Partial
         );
-        assert!(first.qualifications[1].record.verified_token_ids.is_none());
+        assert!(first.qualifications[1].record.verified_token_ids.is_some());
         assert_eq!(
             first.qualifications[2].record.state,
             PolymarketEventQualificationState::Ready

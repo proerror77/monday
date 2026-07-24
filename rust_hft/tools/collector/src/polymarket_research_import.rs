@@ -698,6 +698,7 @@ fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
 fn validate_market_policy(
     manifest: &Value,
     allow_disclosed_quote_collection_failures: bool,
+    require_evidence_surfaces: bool,
 ) -> Result<()> {
     let allowed_event_types = if allow_disclosed_quote_collection_failures {
         &EVENT_LOCAL_MARKET_EVENT_TYPES[..]
@@ -720,20 +721,21 @@ fn validate_market_policy(
         || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(1_000)
         || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
         || !has_only_event_types(manifest, allowed_event_types)
-        || manifest["event_types"]["quote"]
-            .as_u64()
-            .unwrap_or_default()
-            == 0
-        || manifest["event_types"]["reference_price"]
-            .as_u64()
-            .unwrap_or_default()
-            == 0
+        || (require_evidence_surfaces
+            && (manifest["event_types"]["quote"]
+                .as_u64()
+                .unwrap_or_default()
+                == 0
+                || manifest["event_types"]["reference_price"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    == 0))
     {
         bail!("primary market segment must contain only event-scoped full visible L2 records");
     }
     Ok(())
 }
-fn validate_reference_policy(references: &[Value]) -> Result<()> {
+fn validate_reference_policy(references: &[Value], require_evidence_surfaces: bool) -> Result<()> {
     let mut event_types = BTreeMap::<String, u64>::new();
     for manifest in references {
         let versions = &manifest["record_id_versions"];
@@ -760,7 +762,12 @@ fn validate_reference_policy(references: &[Value]) -> Result<()> {
                 .context("reference event count overflow")?;
         }
     }
-    if ["market_metadata", "polymarket_trade", "market_settlement"]
+    let required = if require_evidence_surfaces {
+        &["market_metadata", "polymarket_trade", "market_settlement"][..]
+    } else {
+        &["market_metadata"][..]
+    };
+    if required
         .iter()
         .any(|kind| event_types.get(*kind).copied().unwrap_or_default() == 0)
     {
@@ -778,6 +785,7 @@ fn with_validated_research_segments_policy<T>(
     config: &ResearchSegmentValidationConfig,
     hour_policy: ReferenceHourPolicy,
     allow_event_local_market_recovery: bool,
+    require_evidence_surfaces: bool,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
     if config.references.is_empty() || config.references.len() > MAX_REFERENCE_SEGMENTS {
@@ -835,7 +843,11 @@ fn with_validated_research_segments_policy<T>(
     if source_bytes > MAX_REFERENCE_SOURCE_BYTES {
         bail!("reference segment set exceeds source byte limit");
     }
-    validate_market_policy(&market.manifest, allow_event_local_market_recovery)?;
+    validate_market_policy(
+        &market.manifest,
+        allow_event_local_market_recovery,
+        require_evidence_surfaces,
+    )?;
     let (market_raw, market_manifest) =
         decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
     let mut market_identity = market.identity.clone();
@@ -855,7 +867,7 @@ fn with_validated_research_segments_policy<T>(
         .iter()
         .map(|(_, manifest)| manifest.clone())
         .collect::<Vec<_>>();
-    validate_reference_policy(&reference_manifests)?;
+    validate_reference_policy(&reference_manifests, require_evidence_surfaces)?;
     let reference_raws = rescanned_references
         .iter()
         .map(|(path, _)| path.clone())
@@ -893,6 +905,7 @@ pub(crate) fn with_validated_research_segments<T>(
         config,
         ReferenceHourPolicy::Consecutive,
         false,
+        true,
         consume,
     )
 }
@@ -905,6 +918,20 @@ pub(crate) fn with_event_local_validated_research_segments<T>(
         config,
         ReferenceHourPolicy::Nondecreasing,
         true,
+        true,
+        consume,
+    )
+}
+
+pub(crate) fn with_candidate_validated_research_segments<T>(
+    config: &ResearchSegmentValidationConfig,
+    consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
+) -> Result<T> {
+    with_validated_research_segments_policy(
+        config,
+        ReferenceHourPolicy::Nondecreasing,
+        true,
+        false,
         consume,
     )
 }
@@ -1191,6 +1218,52 @@ mod tests {
         crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn candidate_normalization_preserves_zero_missing_surfaces_without_rows() {
+        let base = market_rows();
+        let mut market = vec![base[0].clone(), base[1].clone()];
+        market.push(row(
+            2,
+            json!({
+                "kind": "event_discovered", "event_id": "market-sibling", "symbol": "BTCUSDT",
+                "up_token": "sibling-up", "down_token": "sibling-down",
+                "end_time": "2026-07-17T05:05:00Z", "window_secs": 300,
+                "price_to_beat": "100", "resolved_up_won": null,
+            }),
+        ));
+        let mut sibling_quote = base[2].clone();
+        sibling_quote["sequence"] = json!(3);
+        sibling_quote["update"]["token_id"] = json!("sibling-down");
+        market.push(sibling_quote);
+        let (_temp, segments) = fixture_rows(&market, &[row(0, metadata("market_metadata"))]);
+        let config = crate::polymarket_research_normalize::PolymarketEvidenceConfig {
+            segments,
+            event_start_gte: "2026-07-17T05:00:00Z".to_owned(),
+            event_start_lt: "2026-07-17T05:05:00Z".to_owned(),
+            market_ids: vec!["market-1".to_owned()],
+        };
+
+        assert!(
+            crate::polymarket_research_normalize::normalize_polymarket_evidence(&config).is_err()
+        );
+        let candidate =
+            crate::polymarket_research_normalize::normalize_polymarket_candidate_evidence(&config)
+                .unwrap();
+
+        assert_eq!(candidate.report.market_ids, ["market-1"]);
+        assert_eq!(candidate.report.surface_counts["up_book"], 1);
+        for surface in ["down_book", "trades", "reference", "settlement"] {
+            assert_eq!(candidate.report.surface_counts[surface], 0);
+        }
+        assert!(candidate
+            .report
+            .trust_boundary
+            .starts_with("untrusted producer candidate"));
+        let rows = std::str::from_utf8(&candidate.ndjson).unwrap();
+        assert!(!rows.contains("market-sibling"));
+        assert!(!rows.contains("sibling-down"));
     }
 
     fn explicit_manifest_error(mutate: impl FnOnce(&mut Value)) -> String {
@@ -1492,6 +1565,10 @@ mod tests {
 
         let normalized =
             crate::polymarket_research_normalize::normalize_polymarket_evidence(&config).unwrap();
+        assert!(normalized
+            .report
+            .trust_boundary
+            .starts_with("typed collector staging evidence only"));
         let trades = String::from_utf8(normalized.ndjson)
             .unwrap()
             .lines()

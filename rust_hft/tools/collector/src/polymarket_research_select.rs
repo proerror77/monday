@@ -1,6 +1,7 @@
 use crate::polymarket_research_import::{
-    with_event_local_validated_research_segments, with_validated_research_segments,
-    ResearchSegmentValidationConfig, ResearchSegmentValidationReport,
+    with_candidate_validated_research_segments, with_event_local_validated_research_segments,
+    with_validated_research_segments, ResearchSegmentValidationConfig,
+    ResearchSegmentValidationReport,
 };
 use crate::polymarket_upload::validate_market_metadata;
 use anyhow::{anyhow, bail, Context, Result};
@@ -507,6 +508,7 @@ fn enrich_metadata(path: &Path, contracts: &mut BTreeMap<String, SelectedContrac
 fn with_selected_research_contracts_policy<T>(
     config: &ResearchSelectionConfig,
     event_local: bool,
+    require_quote_coverage: bool,
     consume: impl FnOnce(
         &ResearchSegmentValidationReport,
         &Path,
@@ -520,14 +522,16 @@ fn with_selected_research_contracts_policy<T>(
     let selected =
         |inputs: &ResearchSegmentValidationReport, market_path: &Path, reference_path: &Path| {
             let mut contracts = discover(market_path, start, end, &market_ids)?;
-            if event_local {
+            if require_quote_coverage {
                 validate_selected_market_quote_coverage(inputs, market_path, &contracts)?;
             }
             enrich_metadata(reference_path, &mut contracts)?;
             consume(inputs, market_path, reference_path, &contracts, start, end)
         };
-    if event_local {
+    if require_quote_coverage {
         with_event_local_validated_research_segments(&config.segments, selected)
+    } else if event_local {
+        with_candidate_validated_research_segments(&config.segments, selected)
     } else {
         with_validated_research_segments(&config.segments, selected)
     }
@@ -544,54 +548,73 @@ pub(crate) fn with_event_local_selected_research_contracts<T>(
         DateTime<Utc>,
     ) -> Result<T>,
 ) -> Result<T> {
-    with_selected_research_contracts_policy(config, true, consume)
+    with_selected_research_contracts_policy(config, true, true, consume)
+}
+
+pub(crate) fn with_candidate_selected_research_contracts<T>(
+    config: &ResearchSelectionConfig,
+    consume: impl FnOnce(
+        &ResearchSegmentValidationReport,
+        &Path,
+        &Path,
+        &BTreeMap<String, SelectedContract>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) -> Result<T>,
+) -> Result<T> {
+    with_selected_research_contracts_policy(config, true, false, consume)
 }
 
 pub fn select_research_contracts(
     config: &ResearchSelectionConfig,
 ) -> Result<ResearchSelectionReport> {
-    with_selected_research_contracts_policy(config, false, |inputs, _, _, contracts, start, end| {
-        let market_ids = contracts.keys().cloned().collect();
-        let symbols = contracts
-            .values()
-            .map(|contract| contract.symbol.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let contracts = contracts
-            .values()
-            .map(|contract| {
-                let metadata = contract.metadata.as_ref().expect("metadata was enriched");
-                SelectedResearchContract {
-                    market_id: contract.market_id.clone(),
-                    condition_id: metadata.condition_id.clone(),
-                    symbol: contract.symbol.clone(),
-                    event_start: utc_text(contract.event_start),
-                    event_end: utc_text(contract.event_end),
-                    up_token_id: contract.up_token.clone(),
-                    down_token_id: contract.down_token.clone(),
-                    price_to_beat: contract.price_to_beat.clone(),
-                    resolution_source: metadata.resolution_source.clone(),
-                    discovery_recorded_at: contract.discovery_recorded_at.clone(),
-                    metadata_retrieved_at: metadata.retrieved_at.clone(),
-                    metadata_recorded_at: metadata.recorded_at.clone(),
-                    discovery_source_sequence: contract.discovery_sequence,
-                    metadata_source_sequence: metadata.sequence,
-                    raw_market: metadata.raw_market.clone(),
-                }
+    with_selected_research_contracts_policy(
+        config,
+        false,
+        false,
+        |inputs, _, _, contracts, start, end| {
+            let market_ids = contracts.keys().cloned().collect();
+            let symbols = contracts
+                .values()
+                .map(|contract| contract.symbol.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let contracts = contracts
+                .values()
+                .map(|contract| {
+                    let metadata = contract.metadata.as_ref().expect("metadata was enriched");
+                    SelectedResearchContract {
+                        market_id: contract.market_id.clone(),
+                        condition_id: metadata.condition_id.clone(),
+                        symbol: contract.symbol.clone(),
+                        event_start: utc_text(contract.event_start),
+                        event_end: utc_text(contract.event_end),
+                        up_token_id: contract.up_token.clone(),
+                        down_token_id: contract.down_token.clone(),
+                        price_to_beat: contract.price_to_beat.clone(),
+                        resolution_source: metadata.resolution_source.clone(),
+                        discovery_recorded_at: contract.discovery_recorded_at.clone(),
+                        metadata_retrieved_at: metadata.retrieved_at.clone(),
+                        metadata_recorded_at: metadata.recorded_at.clone(),
+                        discovery_source_sequence: contract.discovery_sequence,
+                        metadata_source_sequence: metadata.sequence,
+                        raw_market: metadata.raw_market.clone(),
+                    }
+                })
+                .collect();
+            Ok(ResearchSelectionReport {
+                schema: "monday.polymarket.research_selection.v2",
+                event_start_gte: utc_text(start),
+                event_start_lt: utc_text(end),
+                market_ids,
+                symbols,
+                window_secs: WINDOW_SECS as u64,
+                contracts,
+                validated_inputs: inputs.clone(),
             })
-            .collect();
-        Ok(ResearchSelectionReport {
-            schema: "monday.polymarket.research_selection.v2",
-            event_start_gte: utc_text(start),
-            event_start_lt: utc_text(end),
-            market_ids,
-            symbols,
-            window_secs: WINDOW_SECS as u64,
-            contracts,
-            validated_inputs: inputs.clone(),
-        })
-    })
+        },
+    )
 }
 
 #[cfg(test)]
