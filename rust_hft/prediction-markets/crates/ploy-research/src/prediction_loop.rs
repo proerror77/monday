@@ -234,7 +234,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 38] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 39] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -292,6 +292,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 38] {
         (
             "crates/ploy-research/src/prediction_loop.rs",
             include_bytes!("prediction_loop.rs"),
+        ),
+        (
+            "crates/ploy-research/src/prediction_mission_v3.rs",
+            include_bytes!("prediction_mission_v3.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_mcts.rs",
@@ -449,12 +453,19 @@ pub fn validate_prediction_mission(
             "mission.search_policy_snapshot_id does not match the current Rust proposer/evaluator policy; expected {current_policy_snapshot_id}"
         ));
     }
-    if mission.search_budget.max_seconds == 0 {
+    validate_prediction_search_budget(&mission.search_budget)?;
+    Ok(())
+}
+
+pub(crate) fn validate_prediction_search_budget(
+    search_budget: &PredictionSearchBudget,
+) -> Result<(), String> {
+    if search_budget.max_seconds == 0 {
         return Err("mission.search_budget.max_seconds must be positive".to_string());
     }
     let baseline_only_budget =
-        mission.search_budget.max_candidates == 0 && mission.search_budget.max_llm_calls == 0;
-    if (mission.search_budget.max_candidates == 0 || mission.search_budget.max_llm_calls == 0)
+        search_budget.max_candidates == 0 && search_budget.max_llm_calls == 0;
+    if (search_budget.max_candidates == 0 || search_budget.max_llm_calls == 0)
         && !baseline_only_budget
     {
         return Err(
@@ -462,9 +473,9 @@ pub fn validate_prediction_mission(
                 .to_string(),
         );
     }
-    if mission.search_budget.max_candidates > MAX_GOVERNED_CANDIDATES
-        || mission.search_budget.max_llm_calls > MAX_GOVERNED_LLM_CALLS
-        || mission.search_budget.max_seconds > MAX_GOVERNED_SECONDS
+    if search_budget.max_candidates > MAX_GOVERNED_CANDIDATES
+        || search_budget.max_llm_calls > MAX_GOVERNED_LLM_CALLS
+        || search_budget.max_seconds > MAX_GOVERNED_SECONDS
     {
         return Err(format!(
             "mission.search_budget exceeds governed maxima: candidates<={MAX_GOVERNED_CANDIDATES}, calls<={MAX_GOVERNED_LLM_CALLS}, seconds<={MAX_GOVERNED_SECONDS}"
@@ -538,7 +549,7 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
-fn validate_sha256_id(value: &str, field: &str) -> Result<(), String> {
+pub(crate) fn validate_sha256_id(value: &str, field: &str) -> Result<(), String> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(format!("{field} must use sha256:<64 lowercase hex>"));
     };

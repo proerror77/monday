@@ -20,6 +20,7 @@ pub mod prediction_loop;
 mod prediction_loop_fs;
 pub mod prediction_mcts;
 pub mod prediction_mcts_run;
+pub mod prediction_mission_v3;
 mod prediction_policy_identity;
 #[cfg(feature = "strategy-runtime")]
 pub mod replay;

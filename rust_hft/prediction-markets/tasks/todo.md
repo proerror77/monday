@@ -38,6 +38,9 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 ### Unified Monday prediction research control plane (2026-07-16)
 
+- [x] Add the versioned Mission v3 typed task, authority, immutable identity,
+  and fail-closed checkpoint/admission contract without reinterpreting v2
+  artifacts (#321).
 - [x] Build the prediction data audit directly from externally verified artifacts.
 - [x] Aggregate non-overlapping Polymarket evidence artifacts while requiring every member to remain BTC/SOL slot-complete; allow gaps between event-local cohorts.
 - [x] Verify sealed Polymarket evidence into semantic read-only typed projections.
