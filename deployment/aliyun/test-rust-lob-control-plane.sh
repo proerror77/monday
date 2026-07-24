@@ -8,6 +8,8 @@ CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
+COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
+ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
 # shellcheck disable=SC1091
@@ -49,6 +51,10 @@ grep -Fq 'and .last_update_id == null' "$GATE"
 grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
 grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
+grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
+grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
+grep -Fq 'SOURCE_REVISION=${{ github.sha }}' "$ACR_WORKFLOW"
+grep -Fq "grep -Fqx 'binance-lob-archiver \${{ github.sha }}'" "$ACR_WORKFLOW"
 
 observation_started_ns=1000000900
 same_second_warmup_start_ns=1000000100
