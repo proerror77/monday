@@ -113,13 +113,20 @@ pub struct VerifiedPolymarketEvidence {
     settlements: Vec<PolymarketEvidenceSettlement>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PolymarketCandidateSurfaceCoverage {
     pub up_book: u64,
     pub down_book: u64,
     pub trades: u64,
     pub reference: u64,
     pub settlement: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PolymarketEvidenceSequence {
+    pub start: u64,
+    pub end: u64,
+    pub gaps: u64,
 }
 
 #[derive(Debug)]
@@ -131,6 +138,8 @@ pub struct VerifiedPolymarketEvidenceCandidate {
     trades: Vec<PolymarketEvidenceTrade>,
     settlements: Vec<PolymarketEvidenceSettlement>,
     coverage: PolymarketCandidateSurfaceCoverage,
+    sequence: PolymarketEvidenceSequence,
+    success_sha256: String,
 }
 
 impl VerifiedPolymarketEvidence {
@@ -186,6 +195,14 @@ impl VerifiedPolymarketEvidenceCandidate {
 
     pub fn coverage(&self) -> PolymarketCandidateSurfaceCoverage {
         self.coverage
+    }
+
+    pub fn sequence(&self) -> PolymarketEvidenceSequence {
+        self.sequence
+    }
+
+    pub fn success_sha256(&self) -> &str {
+        &self.success_sha256
     }
 }
 
@@ -322,6 +339,8 @@ pub fn verify_polymarket_evidence_candidate(
         event_start_gte: lower,
         event_start_lt: upper,
     };
+    let sequence = verified_sequence(sealed.framed_rows())?;
+    let success_sha256 = sealed.success_sha256().to_owned();
     let parsed = verify_rows(sealed.framed_rows(), lower, upper, identity.events, false)?;
     let market_id = parsed
         .contracts
@@ -350,6 +369,47 @@ pub fn verify_polymarket_evidence_candidate(
             reference: event.references,
             settlement: u64::from(event.settlement),
         },
+        sequence,
+        success_sha256,
+    })
+}
+
+fn verified_sequence<'a>(
+    frames: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<PolymarketEvidenceSequence> {
+    let mut values = BTreeSet::new();
+    for frame in frames {
+        match parse_row(frame)? {
+            RawRow::Contract(row) => {
+                values.insert(row.discovery_source_sequence);
+                values.insert(row.metadata_source_sequence);
+            }
+            RawRow::Book(row) => {
+                values.insert(row.source_sequence);
+            }
+            RawRow::Reference(row) => {
+                values.insert(row.source_sequence);
+            }
+            RawRow::Trade(row) => {
+                values.insert(row.source_sequence);
+            }
+            RawRow::Settlement(row) => {
+                values.insert(row.source_sequence);
+            }
+        }
+    }
+    let start = *values
+        .first()
+        .ok_or_else(|| anyhow!("candidate has no source sequence"))?;
+    let end = *values.last().expect("non-empty source sequence");
+    let expected = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| anyhow!("candidate source sequence overflows"))?;
+    Ok(PolymarketEvidenceSequence {
+        start,
+        end,
+        gaps: expected.saturating_sub(u64::try_from(values.len())?),
     })
 }
 
@@ -773,7 +833,7 @@ fn nonempty(value: &str, label: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::polymarket_evidence::{
         artifact::tests, seal_polymarket_evidence_candidate_triplet,
@@ -784,7 +844,7 @@ mod tests {
     use std::fs;
 
     #[rustfmt::skip]
-    fn valid_rows() -> Vec<Value> {
+    pub(in crate::polymarket_evidence) fn valid_rows() -> Vec<Value> {
         let context = json!({"schema":ROW_SCHEMA,"market_id":"market-1","condition_id":"condition-1","symbol":"BTCUSDT","event_start":"2026-07-17T05:30:00Z","event_end":"2026-07-17T05:35:00Z","window_secs":300});
         let row = |surface: &str, fields: Value| { let mut value=context.clone(); value["surface"]=json!(surface); value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone()); value };
         vec![
@@ -870,7 +930,7 @@ mod tests {
         assert!(error.contains(message), "{error}");
     }
 
-    fn candidate_triplet(
+    pub(in crate::polymarket_evidence) fn candidate_triplet(
         rows: &[Value],
     ) -> (
         tempfile::TempDir,

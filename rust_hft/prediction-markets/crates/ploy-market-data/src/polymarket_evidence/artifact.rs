@@ -65,12 +65,38 @@ pub struct PolymarketEvidenceTrustAnchor {
     expected_manifest_sha256: [u8; 32],
 }
 
+/// A digest-pinned producer carrier opened through the same bound-file rules as
+/// evidence artifacts. The path is intentionally not retained after reading.
+#[derive(Debug)]
+pub struct AuthenticatedPolymarketEvidenceObject {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl AuthenticatedPolymarketEvidenceObject {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 impl PolymarketEvidenceTrustAnchor {
     pub fn from_lower_hex(content: &str, manifest: &str) -> Result<Self> {
         Ok(Self {
             expected_content_sha256: parse_digest(content, "expected content SHA-256")?,
             expected_manifest_sha256: parse_digest(manifest, "expected manifest SHA-256")?,
         })
+    }
+
+    pub fn expected_content_sha256(&self) -> String {
+        hex_digest(self.expected_content_sha256)
+    }
+
+    pub fn expected_manifest_sha256(&self) -> String {
+        hex_digest(self.expected_manifest_sha256)
     }
 }
 
@@ -86,6 +112,7 @@ pub struct SealedPolymarketEvidenceTriplet {
 pub struct SealedPolymarketEvidenceCandidateTriplet {
     manifest: CandidateEvidenceManifest,
     manifest_sha256: String,
+    success_sha256: String,
     data: Vec<u8>,
     frames: Vec<Range<usize>>,
 }
@@ -130,6 +157,10 @@ impl SealedPolymarketEvidenceCandidateTriplet {
 
     pub(super) fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    pub(super) fn success_sha256(&self) -> &str {
+        &self.success_sha256
     }
 
     pub(super) fn rows(&self) -> u64 {
@@ -411,8 +442,45 @@ pub fn seal_polymarket_evidence_candidate_triplet(
     Ok(SealedPolymarketEvidenceCandidateTriplet {
         manifest: parsed,
         manifest_sha256: format!("{:x}", Sha256::digest(&authenticated.manifest)),
+        success_sha256: format!("{:x}", Sha256::digest(&authenticated.success)),
         data: authenticated.data,
         frames,
+    })
+}
+
+pub fn authenticate_polymarket_evidence_object(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<AuthenticatedPolymarketEvidenceObject> {
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("evidence object path must be absolute and canonical");
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("evidence object path has no parent"))?;
+    let canonical = fs::canonicalize(parent).context("canonicalize evidence object directory")?;
+    if canonical != parent {
+        bail!("evidence object directory must be an absolute canonical path");
+    }
+    let expected = parse_digest(expected_sha256, "expected object SHA-256")?;
+    let directory = bind_directory(&canonical)?;
+    let mut file = BoundFile::open(&directory, path, MAX_MANIFEST_BYTES)?;
+    let bytes = file.read_bounded(MAX_MANIFEST_BYTES)?;
+    file.verify(&directory)?;
+    verify_bound_directory(&canonical, &directory)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
+        bail!("evidence object bytes do not match the trusted digest anchor");
+    }
+    Ok(AuthenticatedPolymarketEvidenceObject {
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        bytes,
     })
 }
 
@@ -1215,6 +1283,10 @@ fn parse_digest(value: &str, label: &str) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
     }
     Ok(digest)
+}
+
+fn hex_digest(value: [u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn parse_time(value: &str, label: &str) -> Result<DateTime<Utc>> {
