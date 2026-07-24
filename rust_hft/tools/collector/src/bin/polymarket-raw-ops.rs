@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hft_collector::polymarket_evidence_artifact::{
     publish_polymarket_evidence, PolymarketEvidenceArtifactConfig,
+    PolymarketProducerQualificationConfig,
 };
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
@@ -14,6 +15,7 @@ use hft_collector::polymarket_research_import::{
 use hft_collector::polymarket_research_normalize::PolymarketEvidenceConfig;
 use hft_collector::polymarket_upload::{run_upload, UploadConfig};
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -139,6 +141,9 @@ enum Command {
         market_ids: Vec<String>,
         #[arg(long)]
         output_root: PathBuf,
+        /// Producer provenance and event-local request/clock/sequence evidence JSON.
+        #[arg(long)]
+        qualification: PathBuf,
     },
 }
 
@@ -311,7 +316,10 @@ async fn main() -> Result<()> {
             event_start_lt,
             market_ids,
             output_root,
+            qualification,
         } => {
+            let qualification: PolymarketProducerQualificationConfig =
+                serde_json::from_slice(&fs::read(qualification)?)?;
             let report = publish_polymarket_evidence(&PolymarketEvidenceArtifactConfig {
                 evidence: PolymarketEvidenceConfig {
                     segments: ResearchSegmentValidationConfig {
@@ -331,6 +339,7 @@ async fn main() -> Result<()> {
                     market_ids,
                 },
                 output_root,
+                qualification,
             })?;
             println!("{}", serde_json::to_string(&report)?);
             Ok(())
@@ -411,6 +420,8 @@ mod tests {
             "2026-07-17T05:40:00Z",
             "--output-root",
             "/tmp/output",
+            "--qualification",
+            "/tmp/qualification.json",
         ];
         assert!(Cli::try_parse_from(required).is_err());
 
@@ -437,6 +448,8 @@ mod tests {
             "2985854",
             "--output-root",
             "/tmp/output",
+            "--qualification",
+            "/tmp/qualification.json",
         ])
         .expect("episode-scoped publisher CLI must parse")
         .command;
