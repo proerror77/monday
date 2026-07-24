@@ -3085,12 +3085,23 @@ mod tests {
         budget: &mut PendingBudget,
         process_state: &mut ProcessState,
     ) -> ProcessAction {
+        archive_btc_aggregate_trade(config, segment, states, budget, process_state, 9)
+    }
+
+    fn archive_btc_aggregate_trade(
+        config: &Config,
+        segment: &mut Segment,
+        states: &mut HashMap<String, OrderBookState>,
+        budget: &mut PendingBudget,
+        process_state: &mut ProcessState,
+        aggregate_trade_id: u64,
+    ) -> ProcessAction {
         let received_at_ns = now_ns().unwrap();
         let event_time_ms = received_at_ns / 1_000_000 - 1;
         let event = event_from_frame(
             json!({
                 "stream": "btcusdt@aggTrade",
-                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":9,"f":10,"l":11,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":aggregate_trade_id,"f":aggregate_trade_id,"l":aggregate_trade_id,"p":"101","q":"0.2","T":event_time_ms,"m":true}
             }),
             received_at_ns,
         )
@@ -4632,13 +4643,22 @@ mod tests {
         assert_eq!(opening["replay_safe"], true);
         assert_eq!(opening["bridged"], true);
 
-        let gap_segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut gap_segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        archive_btc_aggregate_trade(
+            &config,
+            &mut gap_segment,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+            11,
+        );
+        process_state.sequence_gaps = 1;
         let after_gap = rotate_segment(
             gap_segment,
             &config,
             &states,
             "session-1",
-            "sequence_gap",
+            "scheduled",
             &process_state,
         )
         .unwrap();
@@ -4699,6 +4719,7 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        assert!(!next.is_replay_safe());
         let state = states.get_mut("BTCUSDT").unwrap();
         state
             .install_snapshot(
