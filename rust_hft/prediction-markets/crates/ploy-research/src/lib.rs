@@ -7,6 +7,7 @@ pub mod backtesting;
 pub mod dataset;
 #[cfg(feature = "db")]
 pub mod deribit;
+pub mod event_cohort_partition;
 pub mod event_ml;
 pub mod factors;
 pub mod factors_new;
@@ -51,6 +52,10 @@ pub use dataset::{
 pub use deribit::{
     load_deribit_feature_snapshots, load_deribit_feature_snapshots_with_timings,
     DeribitFeatureLoadResult,
+};
+pub use event_cohort_partition::{
+    EventCohortExclusion, EventCohortExclusionReason, EventCohortPartition,
+    EVENT_COHORT_PARTITION_VERSION,
 };
 pub use event_ml::{
     build_event_ml_strategy_handoff, build_walk_forward_report, canonical_event_ml_architecture,
@@ -132,8 +137,8 @@ pub use autofactor::{
     AutoFactorDecision, AutoFactorError, AutoFactorMatrix, AutoFactorOptions, AutoFactorReport,
     AutoFactorRuntimeContractCatalog, AutoFactorRuntimeFormulaBlocker,
     AutoFactorRuntimeInputContract, AutoFactorTargetContract, AutoFactorV2Target, FactorExpr,
-    LlmMutationSpec, LlmPriorSpec, LlmProbabilityBlendSpec, NamedFactorExpr, RepricePilotMetrics,
-    RepricePilotSelection,
+    LlmMutationSpec, LlmPriorSpec, LlmProbabilityBlendSpec, NamedFactorExpr,
+    RepriceEventCohortSplit, RepricePilotMetrics, RepricePilotSelection,
 };
 pub use backtest::{run_binary_backtest, BacktestMetrics, SimulatedFill};
 pub use factors_new::{

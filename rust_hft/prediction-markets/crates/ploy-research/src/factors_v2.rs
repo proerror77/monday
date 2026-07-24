@@ -5,6 +5,7 @@ use ploy_market_contracts::Regime;
 use serde::{Deserialize, Serialize};
 
 use crate::autofactor::{LlmPriorSpec, LlmProbabilityBlendSpec};
+use crate::event_cohort_partition::EventCohortPartition;
 use crate::factors::{
     normalized_underlying_symbol, pearson_ic, spearman_ic, FactorObservation,
     ResearchPmBookSnapshot,
@@ -464,10 +465,11 @@ pub struct SettlementProbabilityWalkForwardOptions {
 
 /// Mission-pinned outer train/validation boundary for settlement research.
 /// Generic factor and token-execution reviews leave this unset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementProbabilityTimeCohort {
     boundary: DateTime<Utc>,
     event_window_secs: i64,
+    partition: Option<EventCohortPartition>,
 }
 
 impl SettlementProbabilityTimeCohort {
@@ -481,7 +483,28 @@ impl SettlementProbabilityTimeCohort {
         Ok(Self {
             boundary,
             event_window_secs,
+            partition: None,
         })
+    }
+
+    pub fn with_partition(mut self, partition: EventCohortPartition) -> Result<Self, String> {
+        if partition.common_time_boundary_ms() != self.boundary.timestamp_millis() {
+            return Err("event cohort partition boundary differs from settlement cohort".into());
+        }
+        self.partition = Some(partition);
+        Ok(self)
+    }
+
+    pub fn partition(&self) -> Option<&EventCohortPartition> {
+        self.partition.as_ref()
+    }
+
+    pub fn boundary(&self) -> DateTime<Utc> {
+        self.boundary
+    }
+
+    pub fn event_window_secs(&self) -> i64 {
+        self.event_window_secs
     }
 }
 
@@ -3115,64 +3138,70 @@ pub fn walk_forward_settlement_probability_report_with_prior(
 }
 
 /// Build search reward evidence from the mission-pinned training cohort only.
-/// Held-out rows are used solely to establish the first decision timestamp;
-/// their labels, probabilities, execution, and metrics are never evaluated.
+/// The caller must prefilter rows with the attached partition; held-out rows
+/// and labels never enter this search-facing API.
 pub fn build_settlement_training_probability_report_with_prior(
     rows: &[FactorObservationV2],
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     prior: Option<&LlmPriorSpec>,
     options: SettlementProbabilityWalkForwardOptions,
-) -> SettlementTrainingProbabilityReport {
-    let Some(cohort) = options.time_cohort else {
-        return SettlementTrainingProbabilityReport {
-            training_cohort_id: "missing-time-cohort".to_string(),
-            event_count: 0,
-            baselines: Vec::new(),
-        };
+) -> Result<SettlementTrainingProbabilityReport, String> {
+    let Some(cohort) = options.time_cohort.as_ref() else {
+        return Err("settlement training requires a time cohort".into());
     };
-    let cohort_id = format!(
-        "settlement-training-before-{}-{}s",
-        cohort.boundary.timestamp_millis(),
-        cohort.event_window_secs
-    );
+    let Some(partition) = cohort.partition() else {
+        return Err("settlement training requires an event cohort partition".into());
+    };
+    if rows
+        .iter()
+        .any(|row| !partition.contains_train_market(&row.event_id))
+    {
+        return Err("settlement training received a non-training event".into());
+    }
+    let cohort_id = partition.digest().to_string();
     let Some(bounds) = settlement_walk_forward_window_bounds(start, end, &options)
         .into_iter()
         .next()
     else {
-        return SettlementTrainingProbabilityReport {
+        return Ok(SettlementTrainingProbabilityReport {
             training_cohort_id: cohort_id,
             event_count: 0,
             baselines: Vec::new(),
-        };
+        });
     };
     let mut rows = rows.to_vec();
     rows.sort_by_key(|row| row.tick_ts);
-    let event_ends = event_ends_for_walk_forward(&rows, Some(&cohort));
+    let event_ends = event_ends_for_walk_forward(&rows, Some(cohort));
     let label_observation_times = official_label_observation_times(&rows);
-    let (training, _) = event_disjoint_walk_forward_slices(
-        &rows,
-        &event_ends,
-        &label_observation_times,
-        Some(&cohort),
-        (
-            bounds.train_start,
-            bounds.train_end,
-            bounds.test_start,
-            bounds.test_end,
-        ),
-    );
+    let training = walk_forward_time_slice(&rows, bounds.train_start, bounds.train_end)
+        .iter()
+        .filter(|row| {
+            event_ends
+                .get(row.event_id.as_str())
+                .and_then(Option::as_ref)
+                .is_some_and(|event_end| {
+                    *event_end >= bounds.train_start && *event_end < bounds.train_end
+                })
+        })
+        .filter(|row| {
+            label_observation_times
+                .get(row.event_id.as_str())
+                .and_then(Option::as_ref)
+                .is_some_and(|observed_at| *observed_at <= cohort.boundary)
+        })
+        .collect::<Vec<_>>();
     let event_count = training
         .iter()
         .map(|row| row.event_id.as_str())
         .collect::<HashSet<_>>()
         .len();
     if training.len() < options.walk_forward.review.min_observations {
-        return SettlementTrainingProbabilityReport {
+        return Ok(SettlementTrainingProbabilityReport {
             training_cohort_id: cohort_id,
             event_count,
             baselines: Vec::new(),
-        };
+        });
     }
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
@@ -3182,11 +3211,11 @@ pub fn build_settlement_training_probability_report_with_prior(
         prior,
         probability_options,
     );
-    SettlementTrainingProbabilityReport {
+    Ok(SettlementTrainingProbabilityReport {
         training_cohort_id: cohort_id,
         event_count,
         baselines: report.baselines,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3203,7 +3232,7 @@ fn settlement_walk_forward_window_bounds(
     end: DateTime<Utc>,
     options: &SettlementProbabilityWalkForwardOptions,
 ) -> Vec<ProbabilityWalkForwardWindowBounds> {
-    if let Some(cohort) = options.time_cohort {
+    if let Some(cohort) = options.time_cohort.as_ref() {
         if !(start < cohort.boundary && cohort.boundary < end) {
             return Vec::new();
         }
@@ -4256,7 +4285,7 @@ pub fn format_settlement_probability_walk_forward_report(
         report.options.max_test_log_loss,
         report.options.max_test_expected_calibration_error,
     ));
-    if let Some(cohort) = report.options.time_cohort {
+    if let Some(cohort) = report.options.time_cohort.as_ref() {
         out.push_str(&format!(
             "mission_time_cohort_boundary={} event_window_secs={} crossing_events=purged\n",
             cohort.boundary.to_rfc3339(),
@@ -7828,6 +7857,13 @@ fn event_disjoint_walk_forward_slices<'a>(
     bounds: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>),
 ) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
     let (train_start, train_end, test_start, test_end) = bounds;
+    let partition = match time_cohort {
+        Some(cohort) => match cohort.partition() {
+            Some(partition) => Some(partition),
+            None => return (Vec::new(), Vec::new()),
+        },
+        None => None,
+    };
     let train = walk_forward_time_slice(rows, train_start, train_end);
     let test = walk_forward_time_slice(rows, test_start, test_end);
     let ends_in = |row: &&FactorObservationV2, start, end| {
@@ -7841,16 +7877,9 @@ fn event_disjoint_walk_forward_slices<'a>(
         .iter()
         .filter(|row| ends_in(row, test_start, test_end))
         .filter(|row| {
-            time_cohort.is_none_or(|cohort| {
-                event_ends
-                    .get(row.event_id.as_str())
-                    .and_then(Option::as_ref)
-                    .and_then(|event_end| {
-                        Duration::try_seconds(cohort.event_window_secs)
-                            .and_then(|window| event_end.checked_sub_signed(window))
-                    })
-                    .is_some_and(|event_start| event_start >= cohort.boundary)
-            })
+            partition
+                .as_ref()
+                .is_none_or(|partition| partition.contains_held_out_market(&row.event_id))
         })
         .collect::<Vec<_>>();
     let Some(first_test_decision) = test_rows.iter().map(|row| row.tick_ts).min() else {
@@ -7860,12 +7889,9 @@ fn event_disjoint_walk_forward_slices<'a>(
         .iter()
         .filter(|row| ends_in(row, train_start, train_end))
         .filter(|row| {
-            time_cohort.is_none_or(|cohort| {
-                event_ends
-                    .get(row.event_id.as_str())
-                    .and_then(Option::as_ref)
-                    .is_some_and(|event_end| *event_end < cohort.boundary)
-            })
+            partition
+                .as_ref()
+                .is_none_or(|partition| partition.contains_train_market(&row.event_id))
         })
         .filter(|row| {
             let event_id = row.event_id.as_str();
@@ -11288,6 +11314,7 @@ mod tests {
     }
 
     fn governed_time_cohort_options(
+        rows: &[FactorObservationV2],
         boundary: DateTime<Utc>,
     ) -> SettlementProbabilityWalkForwardOptions {
         SettlementProbabilityWalkForwardOptions {
@@ -11305,7 +11332,7 @@ mod tests {
                 component_profile: SettlementProbabilityComponentProfile::FullSurface,
                 ..Default::default()
             },
-            time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+            time_cohort: Some(test_time_cohort(rows, boundary)),
             ..Default::default()
         }
     }
@@ -11320,19 +11347,30 @@ mod tests {
             rows,
             start,
             end,
-            governed_time_cohort_options(boundary),
+            governed_time_cohort_options(rows, boundary),
         );
         let verdict = walk_forward_settlement_verdict_report_with_prior(
             rows,
             start,
             end,
             None,
-            governed_time_cohort_options(boundary),
+            governed_time_cohort_options(rows, boundary),
         );
         assert!(probability.windows.is_empty());
         assert!(probability.aggregates.is_empty());
         assert!(verdict.windows.is_empty());
         assert!(verdict.aggregates.is_empty());
+    }
+
+    fn test_time_cohort(
+        rows: &[FactorObservationV2],
+        boundary: DateTime<Utc>,
+    ) -> SettlementProbabilityTimeCohort {
+        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+        EventCohortPartition::from_test_observations(rows, boundary.timestamp_millis(), 300)
+            .map_or(cohort.clone(), |partition| {
+                cohort.with_partition(partition).unwrap()
+            })
     }
 
     fn short_settlement_time_cohort_case() -> (
@@ -12537,7 +12575,7 @@ mod tests {
         rows.sort_by_key(|row| row.tick_ts);
         let event_ends = canonical_event_ends(&rows);
         let label_observation_times = official_label_observation_times(&rows);
-        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+        let cohort = test_time_cohort(&rows, boundary);
 
         let (train, test) = event_disjoint_walk_forward_slices(
             &rows,
@@ -12621,7 +12659,7 @@ mod tests {
         let lossy_event_end = inferred_event_end(held_out_row).unwrap();
         assert!(lossy_event_end < held_out_end);
         assert!(lossy_event_end - Duration::seconds(300) < boundary);
-        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+        let cohort = test_time_cohort(&rows, boundary);
         let (train, test) = event_disjoint_walk_forward_slices(
             &rows,
             &canonical_event_ends(&rows),
@@ -12653,7 +12691,7 @@ mod tests {
             &rows,
             boundary - Duration::minutes(15),
             boundary + Duration::minutes(10),
-            governed_time_cohort_options(boundary),
+            governed_time_cohort_options(&rows, boundary),
         );
         assert!(!probability.windows.is_empty());
         assert!(probability
@@ -12665,7 +12703,7 @@ mod tests {
             boundary - Duration::minutes(15),
             boundary + Duration::minutes(10),
             None,
-            governed_time_cohort_options(boundary),
+            governed_time_cohort_options(&rows, boundary),
         );
         assert!(!verdict.windows.is_empty());
         assert!(verdict.windows.iter().all(|window| window.test_n == 1));
@@ -12695,14 +12733,6 @@ mod tests {
         missing.event_end_ts = None;
         let mut missing_rows = vec![train_row.clone(), missing];
         make_settlement_probability_eligible(&mut missing_rows);
-        let (legacy_train, legacy_test) = event_disjoint_walk_forward_slices(
-            &missing_rows,
-            &inferred_event_ends(&missing_rows),
-            &official_label_observation_times(&missing_rows),
-            Some(&cohort),
-            bounds,
-        );
-        assert_eq!((legacy_train.len(), legacy_test.len()), (1, 1));
         let (train, test) = event_disjoint_walk_forward_slices(
             &missing_rows,
             &event_ends_for_walk_forward(&missing_rows, Some(&cohort)),
@@ -12724,14 +12754,6 @@ mod tests {
         second.event_end_ts = Some(boundary + Duration::minutes(6));
         let mut conflicting_rows = vec![train_row, first, second];
         make_settlement_probability_eligible(&mut conflicting_rows);
-        let (legacy_train, legacy_test) = event_disjoint_walk_forward_slices(
-            &conflicting_rows,
-            &inferred_event_ends(&conflicting_rows),
-            &official_label_observation_times(&conflicting_rows),
-            Some(&cohort),
-            bounds,
-        );
-        assert_eq!((legacy_train.len(), legacy_test.len()), (1, 2));
         let (train, test) = event_disjoint_walk_forward_slices(
             &conflicting_rows,
             &event_ends_for_walk_forward(&conflicting_rows, Some(&cohort)),
@@ -12765,7 +12787,7 @@ mod tests {
             end,
             None,
             SettlementProbabilityWalkForwardOptions {
-                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                time_cohort: Some(test_time_cohort(&rows, boundary)),
                 ..options
             },
         );
@@ -12798,21 +12820,30 @@ mod tests {
     fn settlement_training_report_never_scores_the_held_out_event() {
         let (start, boundary, end, rows, options) = short_settlement_time_cohort_case();
         let options = SettlementProbabilityWalkForwardOptions {
-            time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+            time_cohort: Some(test_time_cohort(&rows, boundary)),
             ..options
         };
+        let partition = options.time_cohort.as_ref().unwrap().partition().unwrap();
+        let training_rows = rows
+            .iter()
+            .filter(|row| partition.contains_train_market(&row.event_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let partition_digest = partition.digest().to_string();
         let report = build_settlement_training_probability_report_with_prior(
-            &rows, start, end, None, options,
-        );
+            &training_rows,
+            start,
+            end,
+            None,
+            options,
+        )
+        .unwrap();
 
         assert_eq!(report.event_count, 1);
         assert!(report.baselines.iter().all(|baseline| baseline.n == 1));
         assert_eq!(
-            report.training_cohort_id,
-            format!(
-                "settlement-training-before-{}-300s",
-                boundary.timestamp_millis()
-            )
+            report.training_cohort_id, partition_digest,
+            "settlement search must expose the shared immutable partition digest"
         );
     }
 
@@ -12837,7 +12868,7 @@ mod tests {
             end,
             None,
             SettlementProbabilityWalkForwardOptions {
-                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                time_cohort: Some(test_time_cohort(&rows, boundary)),
                 ..options
             },
         );
@@ -12870,7 +12901,7 @@ mod tests {
             ("after end", end + Duration::seconds(1)),
         ] {
             let options = SettlementProbabilityWalkForwardOptions {
-                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                time_cohort: Some(test_time_cohort(&rows, boundary)),
                 ..options.clone()
             };
             let probability = walk_forward_settlement_probability_report_with_prior(

@@ -166,6 +166,10 @@ walk-forward evaluator, including the no-prior baseline turn. A missing or
 invalid boundary fails closed; generic factor and token-execution reviews do
 not inherit this settlement split implicitly.
 
+Authenticated event metadata is assigned once to a content-addressed
+`EventCohortPartition` shared by settlement, UP, and DOWN tasks. Crossing events
+are excluded whole; held-out rows and labels remain inaccessible during search.
+
 The broader governed baseline remains BTC/SOL five-minute settlement research
 over the retained one-second full-visible-depth L2 snapshots. The
 continuously-ready catalog and Mission contract above admits only BTC

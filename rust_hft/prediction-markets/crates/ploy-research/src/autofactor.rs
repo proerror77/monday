@@ -3,10 +3,13 @@ use std::error::Error;
 use std::fmt;
 use std::sync::OnceLock;
 
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::Datelike;
+#[cfg(test)]
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::event_cohort_partition::EventCohortPartition;
 use crate::factors::{pearson_ic, spearman_ic};
 use crate::factors_v2::{FactorObservationV2, ReviewSide};
 
@@ -1174,6 +1177,13 @@ pub struct RepricePilotMetrics {
     pub positive_event_ratio: f64,
 }
 
+#[derive(Debug)]
+pub struct RepriceEventCohortSplit<'a> {
+    pub partition: &'a EventCohortPartition,
+    pub train: Vec<&'a FactorObservationV2>,
+    pub held_out: Vec<&'a FactorObservationV2>,
+}
+
 /// Split complete five-minute market episodes at `boundary`.
 ///
 /// The verified Polymarket projection carries its exact `market_id` through
@@ -1181,27 +1191,16 @@ pub struct RepricePilotMetrics {
 /// Each episode must carry one stable Up token and one stable Down token.
 /// Events crossing the boundary and events without one consistent canonical
 /// end are excluded.
-pub fn split_reprice_rows_by_event_cohort(
-    rows: &[FactorObservationV2],
-    boundary: DateTime<Utc>,
-) -> Result<(Vec<&FactorObservationV2>, Vec<&FactorObservationV2>), AutoFactorError> {
-    let mut event_ends: BTreeMap<&str, Option<DateTime<Utc>>> = BTreeMap::new();
+pub fn split_reprice_rows_by_event_cohort<'a>(
+    rows: &'a [FactorObservationV2],
+    partition: &'a EventCohortPartition,
+) -> Result<RepriceEventCohortSplit<'a>, AutoFactorError> {
     let mut event_tokens: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
     for row in rows {
         if row.event_id.trim().is_empty() || row.pm_token_id.trim().is_empty() {
             return Err(AutoFactorError::IdentityMismatch(
                 "reprice pilot requires a non-empty market_id event_id and token id".to_string(),
             ));
-        }
-        match event_ends.entry(row.event_id.as_str()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(row.event_end_ts);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if *entry.get() != row.event_end_ts {
-                    entry.insert(None);
-                }
-            }
         }
         let tokens = event_tokens.entry(row.event_id.as_str()).or_default();
         match row.side {
@@ -1221,27 +1220,31 @@ pub fn split_reprice_rows_by_event_cohort(
         }
     }
 
-    let window = Duration::seconds(300);
+    if rows.iter().any(|row| {
+        !partition.contains_train_market(&row.event_id)
+            && !partition.contains_held_out_market(&row.event_id)
+            && !partition
+                .crossing_excluded()
+                .iter()
+                .any(|event| event.market_id == row.event_id)
+    }) {
+        return Err(AutoFactorError::IdentityMismatch(
+            "reprice row market_id is absent from the shared partition".into(),
+        ));
+    }
     let train = rows
         .iter()
-        .filter(|row| {
-            event_ends
-                .get(row.event_id.as_str())
-                .and_then(Option::as_ref)
-                .is_some_and(|event_end| *event_end < boundary)
-        })
+        .filter(|row| partition.contains_train_market(&row.event_id))
         .collect();
-    let test = rows
+    let held_out = rows
         .iter()
-        .filter(|row| {
-            event_ends
-                .get(row.event_id.as_str())
-                .and_then(Option::as_ref)
-                .and_then(|event_end| event_end.checked_sub_signed(window))
-                .is_some_and(|event_start| event_start >= boundary)
-        })
+        .filter(|row| partition.contains_held_out_market(&row.event_id))
         .collect();
-    Ok((train, test))
+    Ok(RepriceEventCohortSplit {
+        partition,
+        train,
+        held_out,
+    })
 }
 
 /// Fit one factor's threshold using training rows only. `target` must be a
@@ -3586,15 +3589,12 @@ mod tests {
                 -1.0,
             ),
         ];
-        let excluded_rows = [
-            row(
-                "crossing",
-                Some(boundary + Duration::seconds(1)),
-                50.0,
-                50.0,
-            ),
-            row("missing-end", None, 60.0, 60.0),
-        ];
+        let excluded_rows = [row(
+            "crossing",
+            Some(boundary + Duration::seconds(1)),
+            50.0,
+            50.0,
+        )];
         let mut rows = train_rows
             .into_iter()
             .chain(test_rows)
@@ -3610,6 +3610,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         rows.extend(down_rows);
+        let partition =
+            EventCohortPartition::from_test_observations(&rows, boundary.timestamp_millis(), 300)
+                .unwrap();
         assert!(split_reprice_rows_by_event_cohort(
             &[row(
                 "unpaired-market",
@@ -3617,21 +3620,24 @@ mod tests {
                 1.0,
                 1.0,
             )],
-            boundary,
+            &partition,
         )
         .expect_err("a market episode without both tokens must fail closed")
         .to_string()
         .contains("exactly one Up and one Down token"));
 
-        let (train, test) =
-            split_reprice_rows_by_event_cohort(&rows, boundary).expect("paired market episodes");
+        let split =
+            split_reprice_rows_by_event_cohort(&rows, &partition).expect("paired market episodes");
+        assert_eq!(split.partition.digest(), partition.digest());
+        let train = &split.train;
+        let test = &split.held_out;
         assert_eq!(train.len(), 8);
         assert_eq!(test.len(), 4);
         assert!(train.iter().all(|row| row.event_id.starts_with("train")));
         assert!(test.iter().all(|row| row.event_id.starts_with("test")));
 
-        let train = train.into_iter().cloned().collect::<Vec<_>>();
-        let test = test.into_iter().cloned().collect::<Vec<_>>();
+        let train = train.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
+        let test = test.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
         let reports = mine_domain_autofactors_from_v2(
             &train,
             target,

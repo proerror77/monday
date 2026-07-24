@@ -43,8 +43,8 @@ use ploy_research::{
     write_alpha_search_artifacts_with_state_and_runtime_feedback,
     write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
     AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions,
-    AutoFactorV2Target, FactorComboV1Options, FactorObservation, FactorObservationV2,
-    FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
+    AutoFactorV2Target, EventCohortPartition, FactorComboV1Options, FactorObservation,
+    FactorObservationV2, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
     LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
     MetaLabelWalkForwardOptions, RepricePilotMetrics, RepricePilotSelection, RepricingIcOptions,
@@ -127,6 +127,7 @@ struct RepricePilotSearchArtifact {
 #[derive(Clone, serde::Serialize)]
 struct RepricePilotEpisodeCohorts {
     key: &'static str,
+    partition_digest: String,
     train_market_ids: Vec<String>,
     test_market_ids: Vec<String>,
 }
@@ -443,7 +444,7 @@ fn sorted_distinct_reprice_pilot_market_ids<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_reprice_pilot_10s(
     rows: &[FactorObservationV2],
-    boundary: DateTime<Utc>,
+    partition: &EventCohortPartition,
     alpha_search_output_dir: &Path,
     report_output_dir: &Path,
     snapshot_hash: &str,
@@ -458,10 +459,18 @@ fn run_reprice_pilot_10s(
     min_observations: usize,
     min_full_depth_entry_fill_rate: f64,
 ) -> Result<[PathBuf; 2], String> {
-    let (train_refs, test_refs) = split_reprice_rows_by_event_cohort(rows, boundary)
+    let split = split_reprice_rows_by_event_cohort(rows, partition)
         .map_err(|error| format!("validate reprice market episodes: {error}"))?;
-    let train_rows = train_refs.into_iter().cloned().collect::<Vec<_>>();
-    let test_rows = test_refs.into_iter().cloned().collect::<Vec<_>>();
+    let train_rows = split
+        .train
+        .iter()
+        .map(|row| (*row).clone())
+        .collect::<Vec<_>>();
+    let test_rows = split
+        .held_out
+        .iter()
+        .map(|row| (*row).clone())
+        .collect::<Vec<_>>();
     let excluded_rows = rows
         .len()
         .saturating_sub(train_rows.len().saturating_add(test_rows.len()));
@@ -474,6 +483,7 @@ fn run_reprice_pilot_10s(
     }
     let episode_cohorts = RepricePilotEpisodeCohorts {
         key: "polymarket market_id carried as FactorObservationV2.event_id",
+        partition_digest: split.partition.digest().to_string(),
         train_market_ids: sorted_distinct_reprice_pilot_market_ids(
             train_rows.iter().map(|row| row.event_id.as_str()),
         ),
@@ -1524,10 +1534,11 @@ async fn main() {
     let snapshot_source_kind: String;
     let settlement_component_profile: SettlementProbabilityComponentProfile;
     let include_deribit: bool;
-    let (observations, deribit_snapshots, all_pm_book_snapshots): (
+    let (observations, deribit_snapshots, all_pm_book_snapshots, event_cohort_partition): (
         Vec<FactorObservation>,
         Vec<_>,
         Vec<_>,
+        Option<EventCohortPartition>,
     ) = {
         let started = std::time::Instant::now();
         let snapshot =
@@ -1590,6 +1601,18 @@ async fn main() {
         );
         snapshot_data_audit_status = snapshot.manifest.data_audit_status.clone();
         include_deribit = snapshot.manifest.include_deribit;
+        let event_cohort_partition = settlement_time_cohort
+            .as_ref()
+            .map(|cohort| {
+                EventCohortPartition::from_verified_snapshot(
+                    &snapshot,
+                    &symbols,
+                    cohort.event_window_secs(),
+                    cohort.boundary().timestamp_millis(),
+                )
+            })
+            .transpose()
+            .unwrap_or_else(|reason| panic!("verified snapshot cohort invalid: {reason}"));
         snapshot_provenance = format!(
             "# Snapshot\nsnapshot_schema={}\nsnapshot_hash={}\nsnapshot_contract_hash={}\nsnapshot_generated_at={}\nsnapshot_optimizer_data_dir={}\nsnapshot_data_requirements={}\nsnapshot_data_audit_status={}\nsnapshot_data_audit_report={}\nsnapshot_include_deribit={}\n",
             snapshot.manifest.schema_version,
@@ -1652,7 +1675,21 @@ async fn main() {
             deribit_snapshots.len(),
             pm_book_snapshots.len()
         );
-        (observations, deribit_snapshots, pm_book_snapshots)
+        (
+            observations,
+            deribit_snapshots,
+            pm_book_snapshots,
+            event_cohort_partition,
+        )
+    };
+    let settlement_time_cohort = match (settlement_time_cohort, &event_cohort_partition) {
+        (Some(cohort), Some(partition)) => Some(
+            cohort
+                .with_partition(partition.clone())
+                .unwrap_or_else(|reason| panic!("attach event cohort partition: {reason}")),
+        ),
+        (None, None) => None,
+        _ => panic!("time cohort and event cohort partition must be present together"),
     };
 
     if report_output_dir.is_some() {
@@ -1745,8 +1782,16 @@ async fn main() {
         let prior = governed_prediction_prior
             .filter(|prior| prior.probability_blends.len() == 1)
             .expect("training candidate prior was validated");
+        let partition = event_cohort_partition
+            .as_ref()
+            .expect("prediction MCTS training requires the verified event partition");
+        let training_rows = autofactor_rows
+            .iter()
+            .filter(|row| partition.contains_train_market(&row.event_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let training = build_settlement_training_probability_report_with_prior(
-            &autofactor_rows,
+            &training_rows,
             start,
             end,
             Some(prior),
@@ -1757,10 +1802,11 @@ async fn main() {
                     component_profile: settlement_component_profile,
                     ..Default::default()
                 },
-                time_cohort: settlement_time_cohort,
+                time_cohort: settlement_time_cohort.clone(),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap_or_else(|reason| panic!("build settlement training evidence: {reason}"));
         let model = format!("q_llm_{}", candidate.probability_blend.name);
         let metrics = training
             .baselines
@@ -1800,14 +1846,13 @@ async fn main() {
     if reprice_pilot_10s {
         let boundary_ms = time_cohort_boundary_ms
             .expect("--reprice-pilot-10s validated --time-cohort-boundary-ms");
-        let boundary = Utc
-            .timestamp_millis_opt(boundary_ms)
-            .single()
-            .expect("--reprice-pilot-10s validated time cohort boundary");
+        let partition = event_cohort_partition
+            .as_ref()
+            .expect("reprice pilot requires the verified event partition");
         println!("{snapshot_provenance}");
         let paths = run_reprice_pilot_10s(
             &autofactor_rows,
-            boundary,
+            partition,
             Path::new(
                 alpha_search_output_dir
                     .as_deref()
