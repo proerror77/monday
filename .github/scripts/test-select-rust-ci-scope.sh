@@ -151,4 +151,25 @@ rename="$tmp_dir/rename.out"
   --head HEAD --metadata "$fixtures/metadata.fixture" --output "$rename")
 for flag in loop collector control toolchain; do assert_flag "$rename" "$flag" true; done
 
+gate="$script_dir/verify-ci-gate.sh"
+printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' | \
+  bash "$gate"
+if printf '%s' '{"selector":{"result":"failure"}}' | bash "$gate" >/dev/null 2>&1; then
+  echo 'CI gate accepted a failed selected job' >&2
+  exit 1
+fi
+if printf '%s' '{"selector":{"result":"cancelled"}}' | bash "$gate" >/dev/null 2>&1; then
+  echo 'CI gate accepted a cancelled selected job' >&2
+  exit 1
+fi
+
+grep -Fqx '  ci-gate:' "$ci_workflow"
+grep -Fqx '    name: Monorepo CI gate' "$ci_workflow"
+grep -Fqx '      - uses: actions/checkout@v4' "$ci_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ci_workflow"
+grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
+grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
+grep -Fqx '      - uses: actions/checkout@v4' "$ploy_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ploy_workflow"
+
 printf 'rust CI scope selector tests passed\n'

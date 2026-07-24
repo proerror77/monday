@@ -8,8 +8,6 @@ on:
       - "rust_hft/prediction-markets/**"
   pull_request:
     branches: [main, develop]
-    paths-ignore:
-      - "rust_hft/prediction-markets/**"
 
 permissions:
   contents: read
@@ -552,3 +550,23 @@ jobs:
       - name: Skip Node install
         if: steps.node-lock.outputs.manager == 'none'
         run: echo "No root Node lockfile found; skipping Node install."
+
+  ci-gate:
+    name: Monorepo CI gate
+    needs:
+      - selector
+      - scope
+      - rust
+      - deployment_artifacts
+      - polymarket_evidence_compiler_image
+      - rust_hft_engine_fast_lane
+      - node_install
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require selected jobs to pass
+        working-directory: .
+        env:
+          GATE_NEEDS: ${{ toJson(needs) }}
+        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh

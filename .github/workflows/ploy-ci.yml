@@ -3,14 +3,6 @@ name: Prediction Markets CI
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "rust_hft/**"
-      - ".cargo/**"
-      - "deployment/aliyun/research/**"
-      - ".github/workflows/**"
-      - ".github/actions/**"
-      - ".github/scripts/**"
-      - "*"
   push:
     branches: [main]
     paths:
@@ -1048,3 +1040,32 @@ jobs:
             cat /tmp/sccache-stats.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  prediction-markets-gate:
+    name: Prediction Markets CI gate
+    needs:
+      - image-smoke-selector
+      - image-smoke-scope
+      - commit-hygiene
+      - workflow-lint
+      - research-image-binaries
+      - research-image-smoke
+      - rust-format
+      - safety-scans
+      - audit
+      - rust-control-plane
+      - rust-runner-lean
+      - rust-runner-full
+      - rust-market-data
+      - rust-research-heavy
+      - frontend
+      - integration-regressions
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require selected jobs to pass
+        working-directory: .
+        env:
+          GATE_NEEDS: ${{ toJson(needs) }}
+        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh
