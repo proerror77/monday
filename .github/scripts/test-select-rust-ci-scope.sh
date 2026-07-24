@@ -109,6 +109,8 @@ grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMP
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),\$ ]] &&" "$ci_workflow"
 grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
+grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
+grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
@@ -150,5 +152,26 @@ rename="$tmp_dir/rename.out"
 (cd "$rename_repo" && "$selector" --event pull_request --base "$rename_base" \
   --head HEAD --metadata "$fixtures/metadata.fixture" --output "$rename")
 for flag in loop collector control toolchain; do assert_flag "$rename" "$flag" true; done
+
+gate="$script_dir/verify-ci-gate.sh"
+printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' | \
+  bash "$gate"
+if printf '%s' '{"selector":{"result":"failure"}}' | bash "$gate" >/dev/null 2>&1; then
+  echo 'CI gate accepted a failed selected job' >&2
+  exit 1
+fi
+if printf '%s' '{"selector":{"result":"cancelled"}}' | bash "$gate" >/dev/null 2>&1; then
+  echo 'CI gate accepted a cancelled selected job' >&2
+  exit 1
+fi
+
+grep -Fqx '  ci-gate:' "$ci_workflow"
+grep -Fqx '    name: Monorepo CI gate' "$ci_workflow"
+grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ci_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ci_workflow"
+grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
+grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
+grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ploy_workflow"
 
 printf 'rust CI scope selector tests passed\n'
