@@ -125,3 +125,19 @@ test, not only workspace compilation.
 - Runtime, deployment, and collector cutover commands require one named
   controller. Other tasks may inspect them read-only until control is handed
   over explicitly.
+
+## Branch and Worktree Lifecycle
+
+- Keep GitHub's `delete_branch_on_merge` enabled. After verifying a merge,
+  confirm that the remote head branch is gone; delete it manually only if
+  auto-delete did not run. Then use `git fetch --prune` to remove stale local
+  tracking refs without touching local branches or worktrees.
+- A closed-but-unmerged PR is not cleanup-safe by default. First classify it as
+  superseded, intentionally abandoned, or work to resume; only the first two
+  may be deleted with explicit authorization.
+- Before deleting a local branch or worktree, record its PR state, HEAD,
+  upstream/push state, and whether its worktree is clean. A dirty worktree
+  must be reviewed and either committed as its own contract, explicitly kept,
+  or explicitly discarded; never delete it merely to reduce branch count.
+- After a cleanup pass, report active, dirty, and prunable worktrees plus the
+  local and remote branch counts.
