@@ -19,8 +19,99 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  selector:
+    name: CI job selector
+    runs-on: ubuntu-latest
+    outputs:
+      jobs: ${{ steps.scope.outputs.jobs }}
+      loop: ${{ steps.scope.outputs.loop }}
+      handoff: ${{ steps.scope.outputs.handoff }}
+      json: ${{ steps.scope.outputs.json }}
+      ondo: ${{ steps.scope.outputs.ondo }}
+      collector: ${{ steps.scope.outputs.collector }}
+      control: ${{ steps.scope.outputs.control }}
+      focused: ${{ steps.scope.outputs.focused }}
+      toolchain: ${{ steps.scope.outputs.toolchain }}
+      selection_complete: ${{ steps.scope.outputs.selection_complete }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select CI jobs
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          .github/scripts/test-select-rust-ci-scope.sh
+          .github/scripts/select-rust-ci-scope.sh \
+            --event "${{ github.event_name }}" \
+            --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}"
+
+  scope:
+    name: CI job scope
+    needs: selector
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      jobs: ${{ steps.scope.outputs.jobs }}
+      loop: ${{ steps.scope.outputs.loop }}
+      handoff: ${{ steps.scope.outputs.handoff }}
+      json: ${{ steps.scope.outputs.json }}
+      ondo: ${{ steps.scope.outputs.ondo }}
+      collector: ${{ steps.scope.outputs.collector }}
+      control: ${{ steps.scope.outputs.control }}
+      focused: ${{ steps.scope.outputs.focused }}
+      toolchain: ${{ steps.scope.outputs.toolchain }}
+    steps:
+      - name: Resolve selector result
+        id: scope
+        env:
+          SELECTOR_RESULT: ${{ needs.selector.result }}
+          SELECTED_JOBS: ${{ needs.selector.outputs.jobs }}
+          SELECTED_LOOP: ${{ needs.selector.outputs.loop }}
+          SELECTED_HANDOFF: ${{ needs.selector.outputs.handoff }}
+          SELECTED_JSON: ${{ needs.selector.outputs.json }}
+          SELECTED_ONDO: ${{ needs.selector.outputs.ondo }}
+          SELECTED_COLLECTOR: ${{ needs.selector.outputs.collector }}
+          SELECTED_CONTROL: ${{ needs.selector.outputs.control }}
+          SELECTED_FOCUSED: ${{ needs.selector.outputs.focused }}
+          SELECTED_TOOLCHAIN: ${{ needs.selector.outputs.toolchain }}
+          SELECTED_COMPLETE: ${{ needs.selector.outputs.selection_complete }}
+        run: |
+          if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
+             [[ "$SELECTED_JOBS" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),$ ]] &&
+             [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
+            printf '%s\n' \
+              "jobs=$SELECTED_JOBS" \
+              "loop=$SELECTED_LOOP" \
+              "handoff=$SELECTED_HANDOFF" \
+              "json=$SELECTED_JSON" \
+              "ondo=$SELECTED_ONDO" \
+              "collector=$SELECTED_COLLECTOR" \
+              "control=$SELECTED_CONTROL" \
+              "focused=$SELECTED_FOCUSED" \
+              "toolchain=$SELECTED_TOOLCHAIN"
+          else
+            printf '%s\n' \
+              'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
+              'loop=true' \
+              'handoff=true' \
+              'json=true' \
+              'ondo=true' \
+              'collector=true' \
+              'control=true' \
+              'focused=true' \
+              'toolchain=true'
+          fi >> "$GITHUB_OUTPUT"
+
   rust:
     name: Rust Workspace
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -33,19 +124,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Select Rust validation scope
-        id: scope
-        working-directory: .
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          .github/scripts/test-select-rust-ci-scope.sh
-          .github/scripts/select-rust-ci-scope.sh \
-            --event "${{ github.event_name }}" \
-            --base "${BASE_SHA}" \
-            --head "${HEAD_SHA}"
 
       - name: Enforce Monday module layout
         working-directory: .
@@ -199,24 +277,24 @@ jobs:
           fi
 
       - name: Setup Rust toolchain
-        if: steps.scope.outputs.toolchain == 'true'
+        if: needs.scope.outputs.toolchain == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Install Linux build tools
-        if: steps.scope.outputs.toolchain == 'true'
+        if: needs.scope.outputs.toolchain == 'true'
         run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler shellcheck
 
       - name: Record cache dimensions
-        if: steps.scope.outputs.toolchain == 'true'
+        if: needs.scope.outputs.toolchain == 'true'
         id: cache-info
         shell: bash
         run: |
           echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
-        if: steps.scope.outputs.toolchain == 'true'
+        if: needs.scope.outputs.toolchain == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -226,7 +304,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Format Loop Engineer packages
-        if: steps.scope.outputs.loop == 'true'
+        if: needs.scope.outputs.loop == 'true'
         run: |
           cargo fmt --check --package alpha-domain
           cargo fmt --check --package alpha-store
@@ -237,11 +315,11 @@ jobs:
           cargo fmt --check --package hft-research-ml
 
       - name: Test Loop Engineer packages
-        if: steps.scope.outputs.loop == 'true'
+        if: needs.scope.outputs.loop == 'true'
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
 
       - name: Verify signed runtime handoff
-        if: steps.scope.outputs.handoff == 'true'
+        if: needs.scope.outputs.handoff == 'true'
         run: |
           cargo test -p hft-live --no-default-features --test deployment_envelope --locked
           cargo test -p hft-live --no-default-features --test deployment_artifacts --locked
@@ -249,7 +327,7 @@ jobs:
           cargo test -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts --locked
 
       - name: Check JSON feature matrix
-        if: steps.scope.outputs.json == 'true'
+        if: needs.scope.outputs.json == 'true'
         run: |
           cargo test -p hft-integration --no-default-features --locked
           cargo test -p hft-integration --no-default-features --features json-simd --locked
@@ -259,21 +337,21 @@ jobs:
           cargo check -p hft-live --features clickhouse,redis,grpc --locked
 
       - name: Verify Ondo Perps feature boundary
-        if: steps.scope.outputs.ondo == 'true'
+        if: needs.scope.outputs.ondo == 'true'
         run: |
           cargo test -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --locked
           cargo clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
           cargo check -p hft-live --features ondo-perps --locked
 
       - name: Verify governed data collector
-        if: steps.scope.outputs.collector == 'true'
+        if: needs.scope.outputs.collector == 'true'
         run: |
           cargo check -p hft-collector --locked
           cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
           cargo test -p hft-collector --features collector-binance --locked
 
       - name: Verify collector release control plane
-        if: steps.scope.outputs.control == 'true'
+        if: needs.scope.outputs.control == 'true'
         run: |
           for script in ../deployment/aliyun/*.sh; do
             bash -n "$script"
@@ -286,7 +364,7 @@ jobs:
           cargo test -p hft-collector systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
-        if: steps.scope.outputs.focused == 'true'
+        if: needs.scope.outputs.focused == 'true'
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked
 
       - name: Package binaries (if present)
@@ -310,6 +388,8 @@ jobs:
 
   deployment_artifacts:
     name: Production Image And Kubernetes Contract
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/deployment-artifacts,') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -341,6 +421,8 @@ jobs:
 
   polymarket_evidence_compiler_image:
     name: Polymarket Evidence Compiler Image
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/polymarket-evidence-compiler-image,') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -368,6 +450,8 @@ jobs:
 
   rust_hft_engine_fast_lane:
     name: Rust HFT Engine Fast Lane
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust-hft-engine-fast-lane,') }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -416,6 +500,8 @@ jobs:
 
   node_install:
     name: Node Install (root)
+    needs: scope
+    if: ${{ contains(needs.scope.outputs.jobs, ',ci/node-install,') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

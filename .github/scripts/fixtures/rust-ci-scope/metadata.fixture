@@ -9,6 +9,17 @@
     { "name": "hft-live", "manifest_path": "rust_hft/apps/live/Cargo.toml", "dependencies": [] },
     { "name": "hft-integration", "manifest_path": "rust_hft/market-core/integration/Cargo.toml", "dependencies": [] },
     { "name": "hft-data-adapter-ondo-perps", "manifest_path": "rust_hft/data-pipelines/adapters/adapter-ondo-perps/Cargo.toml", "dependencies": [] },
-    { "name": "hft-paper", "manifest_path": "rust_hft/apps/paper/Cargo.toml", "dependencies": [] }
+    { "name": "hft-paper", "manifest_path": "rust_hft/apps/paper/Cargo.toml", "dependencies": [] },
+    { "name": "hft-backtest", "manifest_path": "rust_hft/apps/backtest/Cargo.toml", "dependencies": [] },
+    { "name": "ploy-market-contracts", "manifest_path": "rust_hft/prediction-markets/crates/ploy-market-contracts/Cargo.toml", "dependencies": [] },
+    { "name": "ploy-operator-contracts", "manifest_path": "rust_hft/prediction-markets/crates/ploy-operator-contracts/Cargo.toml", "dependencies": [{ "name": "ploy-market-contracts", "path": "../ploy-market-contracts" }] },
+    { "name": "ploy-feed-loaders", "manifest_path": "rust_hft/prediction-markets/crates/ploy-feed-loaders/Cargo.toml", "dependencies": [{ "name": "ploy-market-contracts", "path": "../ploy-market-contracts" }] },
+    { "name": "ploy-market-data", "manifest_path": "rust_hft/prediction-markets/crates/ploy-market-data/Cargo.toml", "dependencies": [{ "name": "ploy-market-contracts", "path": "../ploy-market-contracts" }] },
+    { "name": "ploy-strategy-bundles", "manifest_path": "rust_hft/prediction-markets/crates/ploy-strategy-bundles/Cargo.toml", "dependencies": [{ "name": "ploy-market-contracts", "path": "../ploy-market-contracts" }] },
+    { "name": "ploy-agent-sidecar", "manifest_path": "rust_hft/prediction-markets/apps/ploy-agent-sidecar/Cargo.toml", "dependencies": [{ "name": "ploy-operator-contracts", "path": "../../crates/ploy-operator-contracts" }] },
+    { "name": "ploy-replay", "manifest_path": "rust_hft/prediction-markets/apps/ploy-replay/Cargo.toml", "dependencies": [{ "name": "ploy-market-data", "path": "../../crates/ploy-market-data" }] },
+    { "name": "new-ploy-runner", "manifest_path": "rust_hft/prediction-markets/apps/new-ploy-runner/Cargo.toml", "dependencies": [{ "name": "ploy-strategy-bundles", "path": "../../crates/ploy-strategy-bundles" }] },
+    { "name": "ploy-research", "manifest_path": "rust_hft/prediction-markets/crates/ploy-research/Cargo.toml", "dependencies": [{ "name": "ploy-feed-loaders", "path": "../ploy-feed-loaders" }] },
+    { "name": "ploy", "manifest_path": "rust_hft/prediction-markets/Cargo.toml", "dependencies": [{ "name": "ploy-operator-contracts", "path": "crates/ploy-operator-contracts" }] }
   ]
 }

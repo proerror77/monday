@@ -1,1 +1,1 @@
-docs/reports/example.md
+rust_hft/prediction-markets/docs/architecture.md

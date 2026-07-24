@@ -4,39 +4,23 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "rust_hft/prediction-markets/**"
-      - "rust_hft/alpha-harness/**"
-      - "rust_hft/**/Cargo.toml"
-      - "rust_hft/**/Cargo.lock"
-      - "rust_hft/**/rust-toolchain*"
-      - "rust_hft/.cargo/**"
+      - "rust_hft/**"
       - ".cargo/**"
-      - "rust_hft/.dockerignore"
-      - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
-      - ".github/workflows/acr-publish.yml"
-      - ".github/workflows/ploy-ci.yml"
-      - ".github/scripts/select-prediction-image-smoke.sh"
-      - ".github/scripts/test-acr-publish-workflow.sh"
-      - ".github/scripts/test-select-prediction-image-smoke.sh"
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/scripts/**"
+      - "*"
   push:
     branches: [main]
     paths:
-      - "rust_hft/prediction-markets/**"
-      - "rust_hft/alpha-harness/**"
-      - "rust_hft/**/Cargo.toml"
-      - "rust_hft/**/Cargo.lock"
-      - "rust_hft/**/rust-toolchain*"
-      - "rust_hft/.cargo/**"
+      - "rust_hft/**"
       - ".cargo/**"
-      - "rust_hft/.dockerignore"
-      - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
-      - ".github/workflows/acr-publish.yml"
-      - ".github/workflows/ploy-ci.yml"
-      - ".github/scripts/select-prediction-image-smoke.sh"
-      - ".github/scripts/test-acr-publish-workflow.sh"
-      - ".github/scripts/test-select-prediction-image-smoke.sh"
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/scripts/**"
+      - "*"
   workflow_dispatch:
 
 concurrency:
@@ -57,36 +41,62 @@ env:
   SCCACHE_CACHE_SIZE: 10G
 
 jobs:
-  image-smoke-scope:
-    name: Research image smoke scope
+  image-smoke-selector:
+    name: CI job selector
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      research_image_smoke: ${{ steps.scope.outputs.research_image_smoke }}
+      jobs: ${{ steps.scope.outputs.jobs }}
+      selection_complete: ${{ steps.scope.outputs.selection_complete }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Test image smoke selector
-        run: ../../.github/scripts/test-select-prediction-image-smoke.sh
+      - name: Test CI job selector
+        run: ../../.github/scripts/test-select-rust-ci-scope.sh
 
-      - name: Select full image smoke
+      - name: Select CI jobs
         id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: >-
-          ../../.github/scripts/select-prediction-image-smoke.sh
+          ../../.github/scripts/select-rust-ci-scope.sh
           --event "${GITHUB_EVENT_NAME}"
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
 
+  image-smoke-scope:
+    name: Research image smoke scope
+    needs: image-smoke-selector
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      jobs: ${{ steps.scope.outputs.jobs }}
+    steps:
+      - name: Resolve selector result
+        id: scope
+        working-directory: .
+        env:
+          SELECTOR_RESULT: ${{ needs.image-smoke-selector.result }}
+          SELECTED_JOBS: ${{ needs.image-smoke-selector.outputs.jobs }}
+          SELECTED_COMPLETE: ${{ needs.image-smoke-selector.outputs.selection_complete }}
+        run: |
+          if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
+             [[ "$SELECTED_JOBS" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),$ ]]; then
+            printf 'jobs=%s\n' "$SELECTED_JOBS"
+          else
+            printf '%s\n' 'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,'
+          fi >> "$GITHUB_OUTPUT"
+
   commit-hygiene:
     name: Commit hygiene
+    needs: image-smoke-scope
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && contains(needs.image-smoke-scope.outputs.jobs, ',ploy/commit-hygiene,') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -112,6 +122,8 @@ jobs:
 
   workflow-lint:
     name: Workflow lint
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/workflow-lint,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -133,7 +145,7 @@ jobs:
   research-image-binaries:
     name: Research image binaries
     needs: image-smoke-scope
-    if: ${{ needs.image-smoke-scope.outputs.research_image_smoke == 'true' }}
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
     runs-on: ubuntu-latest
     container: rust:1.91-bookworm
     timeout-minutes: 30
@@ -224,7 +236,7 @@ jobs:
     needs:
       - image-smoke-scope
       - research-image-binaries
-    if: ${{ needs.image-smoke-scope.outputs.research_image_smoke == 'true' }}
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-smoke,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -265,6 +277,8 @@ jobs:
 
   rust-format:
     name: Rust formatting
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-format,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -292,6 +306,8 @@ jobs:
 
   safety-scans:
     name: Retired route and SSH safety scans
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/safety-scans,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -442,6 +458,8 @@ jobs:
 
   audit:
     name: Dependency audit
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/audit,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
@@ -465,6 +483,8 @@ jobs:
 
   rust-control-plane:
     name: Rust control-plane/core
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-control-plane,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -573,6 +593,8 @@ jobs:
 
   rust-runner-lean:
     name: Rust runner lean replay/backtest
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-runner-lean,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 18
     steps:
@@ -631,6 +653,8 @@ jobs:
 
   rust-runner-full:
     name: Rust runner full/default (live execution disabled)
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-runner-full,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -707,6 +731,8 @@ jobs:
 
   rust-market-data:
     name: Rust market-data ops
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-market-data,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 18
     steps:
@@ -762,6 +788,8 @@ jobs:
 
   rust-research-heavy:
     name: Rust research heavy features
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -873,6 +901,8 @@ jobs:
 
   frontend:
     name: Frontend
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/frontend,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -922,6 +952,8 @@ jobs:
 
   integration-regressions:
     name: Rust integration regressions
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/integration-regressions,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
