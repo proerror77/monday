@@ -33,8 +33,13 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
+const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
+    Some(revision) => revision,
+    None => "unbound-source-revision",
+};
+
 #[derive(Debug, Parser)]
-#[command(name = "binance-lob-archiver")]
+#[command(name = "binance-lob-archiver", version = BUILD_SOURCE_REVISION)]
 struct Args {
     #[arg(long)]
     self_test: bool,
@@ -2215,9 +2220,18 @@ fn self_test() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Barrier;
+
+    #[test]
+    fn version_reports_bound_source_revision() {
+        let error = Args::try_parse_from(["binance-lob-archiver", "--version"])
+            .expect_err("--version must exit after displaying build identity");
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(BUILD_SOURCE_REVISION));
+    }
 
     #[test]
     fn upload_only_cli_is_explicit_and_exclusive() {

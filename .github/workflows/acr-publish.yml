@@ -181,6 +181,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
+          build-args: |
+            SOURCE_REVISION=${{ github.sha }}
           tags: |
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
@@ -343,6 +345,8 @@ jobs:
           chmod 0755 artifact/polymarket-raw-ops
           chmod 0755 artifact/binance-usdm-reference-collector
           chmod 0755 artifact/binance-usdm-reference-artifact-verifier
+          artifact/binance-lob-archiver --version \
+            | grep -Fqx 'binance-lob-archiver ${{ github.sha }}'
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
