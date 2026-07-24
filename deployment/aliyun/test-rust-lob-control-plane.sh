@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Dynamically sourced production functions consume fixture globals and mocks.
-# shellcheck disable=SC2016,SC2034,SC2317,SC2329
+# shellcheck disable=SC1090,SC2016,SC2034,SC2154,SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -45,7 +45,23 @@ grep -Fq 'fewer than two replay-safe complete OSS manifests' "$GATE"
 grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=2400' "$GATE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
+grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS' "$GATE"
+grep -Fq 'short health settles require a test-only gate' "$GATE"
+grep -Fq 'test health settle duration is too large' "$GATE"
+grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS < HEALTH_SETTLE_SECONDS' "$GATE"
+grep -Fq 'health_settle_seconds=$HEALTH_SETTLE_SECONDS' "$GATE"
+grep -Fq 'settle_deadline=$(( $(monotonic_seconds) + health_settle_seconds ))' "$GATE"
+grep -Fq 'max_age_seconds=$((gate_seconds + health_settle_seconds + 3600))' "$GATE"
+[[ $(grep -Fc -- '--argjson health_settle_seconds "$health_settle_seconds"' "$GATE") -eq 2 ]] || {
+  printf 'run and final gate evidence do not both record the effective health settle duration\n' >&2
+  exit 1
+}
+[[ $(grep -Fc 'health_settle_seconds:$health_settle_seconds' "$GATE") -eq 2 ]] || {
+  printf 'run and final gate evidence do not both expose the effective health settle duration\n' >&2
+  exit 1
+}
 grep -Fq 'and .all_symbols_bridged == true' "$GATE"
 grep -Fq 'and .bridged_count == .symbol_count' "$GATE"
 grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
@@ -99,6 +115,43 @@ done
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+health_settle_body="$tmp_dir/resolve-health-settle.sh"
+sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
+resolve_health_settle() (
+  HEALTH_SETTLE_SECONDS=2400
+  gate_seconds=$1
+  test_only=$2
+  MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=$3
+  MONDAY_TEST_HEALTH_SETTLE_SECONDS=$4
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  # shellcheck disable=SC1090
+  . "$health_settle_body"
+  resolve_health_settle_seconds
+  printf '%s\n' "$health_settle_seconds"
+)
+[[ $(resolve_health_settle 1800 true 1 60) == 60 ]] || {
+  printf 'authorized short health settle was not applied\n' >&2
+  exit 1
+}
+[[ $(resolve_health_settle 1800 true 1 '') == 2400 ]] || {
+  printf 'test-only gate without an override did not keep the formal settle\n' >&2
+  exit 1
+}
+for fixture in \
+  '3600 false 1 60' \
+  '1800 true 0 60' \
+  '1800 true 1 invalid' \
+  '1800 true 1 2400' \
+  '1800 true 1 2401' \
+  "1800 true 1 $(printf '9%.0s' {1..100})"; do
+  read -r fixture_gate fixture_test fixture_auth fixture_value <<<"$fixture"
+  if resolve_health_settle "$fixture_gate" "$fixture_test" "$fixture_auth" \
+    "$fixture_value" >/dev/null 2>&1; then
+    printf 'invalid short health settle fixture was accepted: %s\n' "$fixture" >&2
+    exit 1
+  fi
+done
 
 safe_candidates="$tmp_dir/safe-candidates.tsv"
 unsafe_candidates="$tmp_dir/unsafe-candidates.tsv"
