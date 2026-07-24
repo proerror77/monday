@@ -1,8 +1,8 @@
 use super::{
     authenticate_polymarket_evidence_object, seal_polymarket_evidence_candidate_triplet,
     verify_polymarket_evidence_candidate, PolymarketCandidateSurfaceCoverage,
-    PolymarketEvidenceContract, PolymarketEvidenceSequence, PolymarketEvidenceTriplet,
-    PolymarketEvidenceTrustAnchor, VerifiedPolymarketEvidenceCandidate,
+    PolymarketEvidenceContract, PolymarketEvidenceSequence, PolymarketEvidenceTradeCompletion,
+    PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor, VerifiedPolymarketEvidenceCandidate,
 };
 use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Utc};
@@ -18,10 +18,10 @@ const BTC_5M_SECS: i64 = 300;
 /// Paths and mutable version strings are deliberately not accepted as identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolymarketCatalogVerifier {
-    pub source_sha256: String,
-    pub binary_sha256: String,
-    pub configuration_sha256: String,
-    pub policy_sha256: String,
+    source_sha256: String,
+    binary_sha256: String,
+    configuration_sha256: String,
+    policy_sha256: String,
 }
 
 impl PolymarketCatalogVerifier {
@@ -99,6 +99,7 @@ pub struct PolymarketCatalogReceipt {
     pub down_token_id: Option<String>,
     pub sequence: Option<PolymarketEvidenceSequence>,
     pub coverage: Option<PolymarketCandidateSurfaceCoverage>,
+    pub trade_completion: Option<PolymarketEvidenceTradeCompletion>,
     pub availability: Option<PolymarketEvidenceAvailability>,
     pub state: PolymarketCatalogReceiptState,
     pub reasons: Vec<PolymarketCatalogReason>,
@@ -158,7 +159,26 @@ impl PolymarketReadyEventCatalog {
         };
         let mut receipt =
             match serde_json::from_slice::<ProducerQualification>(qualification.bytes()) {
-                Ok(carrier) => classify(&carrier, &evidence, qualification.sha256(), verifier)?,
+                Ok(carrier) if carrier.market_id != market_id => rejected_from_evidence(
+                    &evidence,
+                    qualification.sha256(),
+                    verifier,
+                    PolymarketCatalogReason::QualificationMismatch,
+                ),
+                Ok(carrier) => classify(
+                    &carrier,
+                    &evidence,
+                    qualification.sha256(),
+                    verifier.clone(),
+                )
+                .unwrap_or_else(|_| {
+                    rejected_from_evidence(
+                        &evidence,
+                        qualification.sha256(),
+                        verifier,
+                        PolymarketCatalogReason::QualificationVerificationFailed,
+                    )
+                }),
                 Err(_) => rejected_from_evidence(
                     &evidence,
                     qualification.sha256(),
@@ -245,7 +265,7 @@ struct ProducerIdentity {
     configuration_sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProducerSurface {
     Complete,
@@ -318,7 +338,6 @@ fn classify(
     if carrier.sequence.start != sequence.start
         || carrier.sequence.end != sequence.end
         || carrier.sequence.gaps != sequence.gaps
-        || sequence.gaps != 0
     {
         reasons.push(PolymarketCatalogReason::SequenceMismatch);
     }
@@ -329,6 +348,9 @@ fn classify(
         || coverage.reference == 0
         || coverage.settlement == 0
     {
+        reasons.push(PolymarketCatalogReason::IncompleteEvidence);
+    }
+    if evidence.trade_completion().is_none() {
         reasons.push(PolymarketCatalogReason::IncompleteEvidence);
     }
     let rejected = reasons
@@ -355,6 +377,7 @@ fn classify(
         down_token_id: Some(contract.down_token_id.clone()),
         sequence: Some(sequence),
         coverage: Some(coverage),
+        trade_completion: evidence.trade_completion().cloned(),
         availability: Some(availability(evidence)),
         state,
         reasons,
@@ -387,6 +410,7 @@ fn rejected_receipt(
         down_token_id: None,
         sequence: None,
         coverage: None,
+        trade_completion: None,
         availability: None,
         state: PolymarketCatalogReceiptState::Rejected,
         reasons: vec![reason],
@@ -420,6 +444,7 @@ fn rejected_from_evidence(
     receipt.success_sha256 = Some(evidence.success_sha256().to_owned());
     receipt.sequence = Some(evidence.sequence());
     receipt.coverage = Some(evidence.coverage());
+    receipt.trade_completion = evidence.trade_completion().cloned();
     receipt.availability = Some(availability(evidence));
     receipt
 }
@@ -486,11 +511,11 @@ fn carrier_matches(
         && carrier.source_clocks.as_ref().is_some_and(|clocks| {
             clocks.opened_at <= contract.event_start && clocks.closed_at >= contract.event_end
         })
-        && matches!(carrier.up_book, ProducerSurface::Complete)
-        && matches!(carrier.down_book, ProducerSurface::Complete)
-        && matches!(carrier.trades, ProducerSurface::Complete)
-        && matches!(carrier.reference, ProducerSurface::Complete)
-        && matches!(carrier.settlement, ProducerSurface::Complete)
+        && surface_matches(carrier.up_book, evidence.coverage().up_book)
+        && surface_matches(carrier.down_book, evidence.coverage().down_book)
+        && surface_matches(carrier.trades, evidence.coverage().trades)
+        && surface_matches(carrier.reference, evidence.coverage().reference)
+        && surface_matches(carrier.settlement, evidence.coverage().settlement)
         && carrier.request_outcomes.as_ref().is_some_and(|outcomes| {
             outcomes.len() == 5
                 && outcomes.iter().all(|outcome| {
@@ -521,7 +546,14 @@ fn carrier_matches(
             .producer
             .source_sha
             .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn surface_matches(surface: ProducerSurface, coverage: u64) -> bool {
+    matches!(
+        (surface, coverage > 0),
+        (ProducerSurface::Complete, true) | (ProducerSurface::Incomplete, false)
+    )
 }
 
 fn receipt_digest(receipt: &PolymarketCatalogReceipt) -> Result<String> {
@@ -539,6 +571,7 @@ fn receipt_digest(receipt: &PolymarketCatalogReceipt) -> Result<String> {
         down_token_id: &'a Option<String>,
         sequence: &'a Option<PolymarketEvidenceSequence>,
         coverage: &'a Option<PolymarketCandidateSurfaceCoverage>,
+        trade_completion: &'a Option<PolymarketEvidenceTradeCompletion>,
         availability: &'a Option<PolymarketEvidenceAvailability>,
         state: PolymarketCatalogReceiptState,
         reasons: &'a [PolymarketCatalogReason],
@@ -557,6 +590,7 @@ fn receipt_digest(receipt: &PolymarketCatalogReceipt) -> Result<String> {
         down_token_id: &receipt.down_token_id,
         sequence: &receipt.sequence,
         coverage: &receipt.coverage,
+        trade_completion: &receipt.trade_completion,
         availability: &receipt.availability,
         state: receipt.state,
         reasons: &receipt.reasons,
@@ -576,7 +610,7 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::polymarket_evidence::{artifact::tests, verified::tests as verified_tests};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -656,6 +690,118 @@ mod tests {
                 .ready_for(PolymarketResearchTask::Btc5mBacktest)
                 .len(),
             1
+        );
+
+        let cross_wired = catalog
+            .verify_and_append(
+                "market-other",
+                &triplet,
+                &tests::trust(&triplet),
+                &ready_path,
+                &ready_anchor,
+                verifier.clone(),
+            )
+            .unwrap();
+        assert_eq!(cross_wired.state, PolymarketCatalogReceiptState::Rejected);
+        assert_eq!(
+            cross_wired.reasons,
+            vec![PolymarketCatalogReason::QualificationMismatch]
+        );
+
+        let malformed_path = triplet
+            .data
+            .parent()
+            .unwrap()
+            .join("qualification-malformed.json");
+        qualification(&malformed_path, &triplet, "BTCUSDT", "up-token");
+        let mut malformed: Value =
+            serde_json::from_slice(&fs::read(&malformed_path).unwrap()).unwrap();
+        malformed["schema"] = json!("unsupported");
+        tests::rewrite_read_only(
+            &malformed_path,
+            format!("{}\n", serde_json::to_string(&malformed).unwrap()),
+        );
+        let malformed = catalog
+            .verify_and_append(
+                "market-1",
+                &triplet,
+                &tests::trust(&triplet),
+                &malformed_path,
+                &digest(&malformed_path),
+                verifier.clone(),
+            )
+            .unwrap();
+        assert_eq!(malformed.state, PolymarketCatalogReceiptState::Rejected);
+        assert_eq!(
+            malformed.reasons,
+            vec![PolymarketCatalogReason::QualificationVerificationFailed]
+        );
+
+        let (_incomplete_temp, incomplete_triplet) = verified_tests::candidate_triplet(&rows);
+        let mut incomplete_manifest: Value =
+            serde_json::from_slice(&fs::read(&incomplete_triplet.manifest).unwrap()).unwrap();
+        incomplete_manifest["validated_inputs"]["reference"]["trade_completions"] = json!({});
+        tests::rewrite_read_only(
+            &incomplete_triplet.manifest,
+            format!("{}\n", serde_json::to_string(&incomplete_manifest).unwrap()),
+        );
+        let incomplete_path = incomplete_triplet
+            .data
+            .parent()
+            .unwrap()
+            .join("qualification-no-trade-completion.json");
+        let incomplete_anchor =
+            qualification(&incomplete_path, &incomplete_triplet, "BTCUSDT", "up-token");
+        let incomplete = catalog
+            .verify_and_append(
+                "market-1",
+                &incomplete_triplet,
+                &tests::trust(&incomplete_triplet),
+                &incomplete_path,
+                &incomplete_anchor,
+                verifier.clone(),
+            )
+            .unwrap();
+        assert_eq!(incomplete.state, PolymarketCatalogReceiptState::Partial);
+        assert!(incomplete.trade_completion.is_none());
+
+        let surface_rows = rows
+            .iter()
+            .filter(|row| row["surface"] != "polymarket_trade")
+            .cloned()
+            .collect::<Vec<_>>();
+        let (_surface_temp, surface_triplet) = verified_tests::candidate_triplet(&surface_rows);
+        let surface_path = surface_triplet
+            .data
+            .parent()
+            .unwrap()
+            .join("qualification-incomplete-trades.json");
+        qualification(&surface_path, &surface_triplet, "BTCUSDT", "up-token");
+        let mut surface_carrier: Value =
+            serde_json::from_slice(&fs::read(&surface_path).unwrap()).unwrap();
+        surface_carrier["trades"] = json!("incomplete");
+        surface_carrier["sequence"]["gaps"] = json!(1);
+        tests::rewrite_read_only(
+            &surface_path,
+            format!("{}\n", serde_json::to_string(&surface_carrier).unwrap()),
+        );
+        let surface_partial = catalog
+            .verify_and_append(
+                "market-1",
+                &surface_triplet,
+                &tests::trust(&surface_triplet),
+                &surface_path,
+                &digest(&surface_path),
+                verifier.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            surface_partial.state,
+            PolymarketCatalogReceiptState::Partial
+        );
+        assert_eq!(
+            surface_partial.reasons,
+            vec![PolymarketCatalogReason::IncompleteEvidence]
         );
 
         let rejected_path = triplet

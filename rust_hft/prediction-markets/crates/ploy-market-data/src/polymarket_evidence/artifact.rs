@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,6 +113,7 @@ pub struct SealedPolymarketEvidenceCandidateTriplet {
     manifest: CandidateEvidenceManifest,
     manifest_sha256: String,
     success_sha256: String,
+    trade_completions: BTreeMap<String, PolymarketEvidenceTradeCompletion>,
     data: Vec<u8>,
     frames: Vec<Range<usize>>,
 }
@@ -161,6 +162,13 @@ impl SealedPolymarketEvidenceCandidateTriplet {
 
     pub(super) fn success_sha256(&self) -> &str {
         &self.success_sha256
+    }
+
+    pub(super) fn trade_completion(
+        &self,
+        market_id: &str,
+    ) -> Option<&PolymarketEvidenceTradeCompletion> {
+        self.trade_completions.get(market_id)
     }
 
     pub(super) fn rows(&self) -> u64 {
@@ -312,6 +320,12 @@ struct SegmentIdentity {
     trade_completions: BTreeMap<String, TradeCompletionIdentity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolymarketEvidenceTradeCompletion {
+    pub trade_count: u64,
+    pub trade_record_ids_sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TradeCompletionIdentity {
@@ -325,6 +339,15 @@ struct TradeCompletionIdentity {
     completeness_basis: String,
     finalization_lag_secs: u64,
     stable_polls_required: u64,
+}
+
+impl From<&TradeCompletionIdentity> for PolymarketEvidenceTradeCompletion {
+    fn from(value: &TradeCompletionIdentity) -> Self {
+        Self {
+            trade_count: value.trade_count,
+            trade_record_ids_sha256: value.trade_record_ids_sha256.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -443,6 +466,10 @@ pub fn seal_polymarket_evidence_candidate_triplet(
         manifest: parsed,
         manifest_sha256: format!("{:x}", Sha256::digest(&authenticated.manifest)),
         success_sha256: format!("{:x}", Sha256::digest(&authenticated.success)),
+        trade_completions: trade_completions
+            .iter()
+            .map(|(market_id, completion)| (market_id.clone(), completion.into()))
+            .collect(),
         data: authenticated.data,
         frames,
     })

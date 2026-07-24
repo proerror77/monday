@@ -3,7 +3,8 @@ use super::{
         parse_row, RawBook, RawBookLevel, RawContract, RawReference, RawRow, RawSettlement,
         RawTrade, RowContext, ROW_SCHEMA,
     },
-    SealedPolymarketEvidenceCandidateTriplet, SealedPolymarketEvidenceTriplet,
+    PolymarketEvidenceTradeCompletion, SealedPolymarketEvidenceCandidateTriplet,
+    SealedPolymarketEvidenceTriplet,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -139,6 +140,7 @@ pub struct VerifiedPolymarketEvidenceCandidate {
     settlements: Vec<PolymarketEvidenceSettlement>,
     coverage: PolymarketCandidateSurfaceCoverage,
     sequence: PolymarketEvidenceSequence,
+    trade_completion: Option<PolymarketEvidenceTradeCompletion>,
     success_sha256: String,
 }
 
@@ -199,6 +201,10 @@ impl VerifiedPolymarketEvidenceCandidate {
 
     pub fn sequence(&self) -> PolymarketEvidenceSequence {
         self.sequence
+    }
+
+    pub fn trade_completion(&self) -> Option<&PolymarketEvidenceTradeCompletion> {
+        self.trade_completion.as_ref()
     }
 
     pub fn success_sha256(&self) -> &str {
@@ -351,6 +357,7 @@ pub fn verify_polymarket_evidence_candidate(
         .coverage
         .get(market_id)
         .ok_or_else(|| anyhow!("candidate market has no evidence coverage"))?;
+    let trade_completion = sealed.trade_completion(market_id).cloned();
     Ok(VerifiedPolymarketEvidenceCandidate {
         identity,
         contracts: parsed
@@ -370,6 +377,7 @@ pub fn verify_polymarket_evidence_candidate(
             settlement: u64::from(event.settlement),
         },
         sequence,
+        trade_completion,
         success_sha256,
     })
 }
