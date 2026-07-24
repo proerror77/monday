@@ -15,7 +15,7 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
     write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
-    SegmentConfig, SendOutcome, RAW_SCHEMA,
+    SegmentConfig, SendOutcome, ACTIVE_SENDS, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -895,6 +895,56 @@ async fn run_session(
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
         if segment_due(&segment, config.segment_seconds)? {
+            let queued_events = receiver.len();
+            let rotation_action = match drain_events_before_segment_rotation(
+                &config,
+                &mut receiver,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &session_id,
+                &mut process_state,
+                queued_events,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if rotation_action.restarts_capture_session() {
+                break;
+            }
+            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+            }
+            if let Err(error) = wait_for_active_sends_before_rotation().await {
+                failure = Some(error);
+                break;
+            }
+            let queued_after_sends = receiver.len();
+            let rotation_action = match drain_events_before_segment_rotation(
+                &config,
+                &mut receiver,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &session_id,
+                &mut process_state,
+                queued_after_sends,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if rotation_action.restarts_capture_session() {
+                break;
+            }
+            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+            }
             segment = rotate_segment(
                 segment,
                 &config,
@@ -1167,6 +1217,53 @@ fn process_event(
         }
     }
     Ok(ProcessAction::None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_events_before_segment_rotation(
+    config: &Config,
+    receiver: &mut mpsc::Receiver<Event>,
+    segment: &mut Segment,
+    states: &mut HashMap<String, OrderBookState>,
+    budget: &mut PendingBudget,
+    session_id: &str,
+    process_state: &mut ProcessState,
+    queued_events: usize,
+) -> anyhow::Result<ProcessAction> {
+    let mut saw_initial_snapshots_complete = false;
+    for _ in 0..queued_events {
+        let Ok(event) = receiver.try_recv() else {
+            break;
+        };
+        let action = process_event(
+            config,
+            segment,
+            states,
+            budget,
+            session_id,
+            event,
+            process_state,
+        )?;
+        if action.restarts_capture_session() {
+            return Ok(action);
+        }
+        saw_initial_snapshots_complete |= matches!(action, ProcessAction::InitialSnapshotsComplete);
+    }
+    Ok(if saw_initial_snapshots_complete {
+        ProcessAction::InitialSnapshotsComplete
+    } else {
+        ProcessAction::None
+    })
+}
+
+async fn wait_for_active_sends_before_rotation() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ACTIVE_SENDS.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("collector senders did not quiesce before rotation"))
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
@@ -4666,6 +4763,79 @@ mod tests {
             }
         }
         assert!(rotated, "post-select maintenance must rotate a hot queue");
+    }
+
+    #[tokio::test]
+    async fn rotation_drain_processes_queued_events_before_segment_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = config
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
+            .collect::<HashMap<_, _>>();
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        sender
+            .send(Event::StreamDisconnected {
+                streams: vec!["btcusdt@depth@100ms".into()],
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        let blocked_sender = sender.clone();
+        let blocked_task = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            send_or_shutdown(
+                &blocked_sender,
+                Event::StreamReconnected {
+                    streams: vec!["btcusdt@depth@100ms".into()],
+                },
+                &mut shutdown_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(ACTIVE_SENDS.load(Ordering::Acquire) > 0);
+
+        let action = drain_events_before_segment_rotation(
+            &config,
+            &mut receiver,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            &mut process_state,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(action, ProcessAction::None);
+        wait_for_active_sends_before_rotation().await.unwrap();
+        let queued_after_sends = receiver.len();
+        let action = drain_events_before_segment_rotation(
+            &config,
+            &mut receiver,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            &mut process_state,
+            queued_after_sends,
+        )
+        .unwrap();
+        assert_eq!(action, ProcessAction::None);
+        assert!(matches!(
+            blocked_task.await.unwrap().unwrap(),
+            SendOutcome::Sent
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(!segment.is_replay_safe());
+        drop(segment);
     }
 
     #[test]

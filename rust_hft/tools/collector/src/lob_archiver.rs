@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
@@ -405,6 +406,7 @@ pub struct SegmentConfig {
 pub struct Segment {
     config: SegmentConfig,
     pub start_ns: u64,
+    manifest_start_ns: u64,
     pub end_ns: u64,
     path: PathBuf,
     writer: BufWriter<File>,
@@ -478,7 +480,8 @@ impl Segment {
         Ok(Self {
             config,
             start_ns,
-            end_ns: start_ns,
+            manifest_start_ns: start_ns,
+            end_ns: 0,
             path,
             writer: BufWriter::with_capacity(1024 * 1024, file),
             counts: BTreeMap::new(),
@@ -496,6 +499,7 @@ impl Segment {
         payload: Value,
         received_at_ns: u64,
     ) -> anyhow::Result<()> {
+        self.manifest_start_ns = self.manifest_start_ns.min(received_at_ns);
         self.end_ns = self.end_ns.max(received_at_ns);
         let mut envelope = serde_json::Map::new();
         envelope.insert("received_at_ns".to_owned(), received_at_ns.into());
@@ -584,6 +588,7 @@ impl Segment {
             trade_summaries,
             RAW_SCHEMA,
             self.start_ns,
+            self.manifest_start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
             readiness,
@@ -599,6 +604,7 @@ fn finalize_segment(
     counts: BTreeMap<String, u64>,
     trade_summaries: BTreeMap<String, AggregateTradeSummary>,
     schema: &str,
+    identity_start_ns: u64,
     start_ns: u64,
     end_ns: u64,
     has_replay_safe_checkpoint: bool,
@@ -614,7 +620,7 @@ fn finalize_segment(
     } else {
         None
     };
-    let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
+    let data = path.with_file_name(format!("part-{identity_start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
     let mut command = Command::new("zstd");
     command
@@ -631,7 +637,7 @@ fn finalize_segment(
     sync_parent(&data)?;
 
     let digest = sha256_file(&data)?;
-    let (date, hour) = segment_partition(start_ns)?;
+    let (date, hour) = segment_partition(identity_start_ns)?;
     let events: u64 = counts.values().sum();
     let mut metadata = json!({
         "schema": schema,
@@ -853,6 +859,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             trade_summaries,
             &schema,
             start_ns,
+            start_ns,
             end_ns,
             false,
             readiness_summary(
@@ -1039,6 +1046,23 @@ pub enum SendOutcome<T> {
     Shutdown(T),
 }
 
+pub static ACTIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveSendGuard;
+
+impl ActiveSendGuard {
+    fn acquire() -> Self {
+        ACTIVE_SENDS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveSendGuard {
+    fn drop(&mut self) {
+        ACTIVE_SENDS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Lossless backpressure that remains cancellable when the bounded queue is full.
 pub async fn send_or_shutdown<T>(
     sender: &mpsc::Sender<T>,
@@ -1048,6 +1072,7 @@ pub async fn send_or_shutdown<T>(
     if *shutdown.borrow() {
         return Ok(SendOutcome::Shutdown(item));
     }
+    let _active_send = ActiveSendGuard::acquire();
     tokio::select! {
         biased;
         changed = shutdown.changed() => {
@@ -1356,8 +1381,22 @@ mod tests {
         assert!(!task.is_finished());
         shutdown_tx.send(true).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), SendOutcome::Shutdown(2));
+        assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        sender.send(3_u64).await.unwrap();
+        let blocked_sender = sender.clone();
+        let (_abort_shutdown_tx, abort_shutdown_rx) = watch::channel(false);
+        let aborted = tokio::spawn(async move {
+            let mut shutdown_rx = abort_shutdown_rx;
+            send_or_shutdown(&blocked_sender, 4, &mut shutdown_rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(ACTIVE_SENDS.load(Ordering::Acquire) > 0);
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
     }
 
     #[cfg(unix)]
@@ -1476,7 +1515,7 @@ mod tests {
                     "symbols":1,
                     "websocket_shards":1
                 }),
-                segment.start_ns,
+                segment.start_ns - 1,
             )
             .unwrap();
         segment
@@ -1592,6 +1631,7 @@ mod tests {
             manifest["schema"],
             data::binance_market_tape::MARKET_TAPE_SCHEMA
         );
+        assert_eq!(manifest["start_received_at_ns"], json!(start_ns - 1));
         assert_eq!(
             manifest["event_types"],
             json!({"agg_trade":2,"checkpoint":1,"diff":1,"session_start":1,"snapshot":1})
