@@ -4767,9 +4767,9 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_drain_processes_queued_events_before_segment_boundary() {
-        let root = env::temp_dir().join(format!("monday-rotation-drain-test-{}", now_ns().unwrap()));
+        let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
-        config.spool_dir = root.clone();
+        config.spool_dir = root.path().to_path_buf();
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
         let mut states = config
             .symbols
@@ -4836,7 +4836,6 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert!(!segment.is_replay_safe());
         drop(segment);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

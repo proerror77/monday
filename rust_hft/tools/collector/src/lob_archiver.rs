@@ -1048,6 +1048,21 @@ pub enum SendOutcome<T> {
 
 pub static ACTIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
 
+struct ActiveSendGuard;
+
+impl ActiveSendGuard {
+    fn acquire() -> Self {
+        ACTIVE_SENDS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveSendGuard {
+    fn drop(&mut self) {
+        ACTIVE_SENDS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Lossless backpressure that remains cancellable when the bounded queue is full.
 pub async fn send_or_shutdown<T>(
     sender: &mpsc::Sender<T>,
@@ -1057,8 +1072,8 @@ pub async fn send_or_shutdown<T>(
     if *shutdown.borrow() {
         return Ok(SendOutcome::Shutdown(item));
     }
-    ACTIVE_SENDS.fetch_add(1, Ordering::AcqRel);
-    let result = tokio::select! {
+    let _active_send = ActiveSendGuard::acquire();
+    tokio::select! {
         biased;
         changed = shutdown.changed() => {
             changed.map_err(|_| anyhow::anyhow!("shutdown channel closed"))?;
@@ -1072,9 +1087,7 @@ pub async fn send_or_shutdown<T>(
                 })
                 .map_err(|_| anyhow::anyhow!("archive queue closed"))
         }
-    };
-    ACTIVE_SENDS.fetch_sub(1, Ordering::AcqRel);
-    result
+    }
 }
 
 pub fn segment_partition(timestamp_ns: u64) -> anyhow::Result<(String, String)> {
@@ -1371,6 +1384,19 @@ mod tests {
         assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        sender.send(3_u64).await.unwrap();
+        let blocked_sender = sender.clone();
+        let (_abort_shutdown_tx, abort_shutdown_rx) = watch::channel(false);
+        let aborted = tokio::spawn(async move {
+            let mut shutdown_rx = abort_shutdown_rx;
+            send_or_shutdown(&blocked_sender, 4, &mut shutdown_rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(ACTIVE_SENDS.load(Ordering::Acquire) > 0);
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
     }
 
     #[cfg(unix)]
