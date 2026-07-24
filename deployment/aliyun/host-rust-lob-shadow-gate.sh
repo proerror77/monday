@@ -732,7 +732,7 @@ verify_oss_round_trips() {
     fi
     previous_end_ns=$end_ns
     segment_dir="$tmp_dir/${market}-segment-${index}"
-    mkdir -m 0750 "$segment_dir"
+    install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"
     zst_uri="${uri%/*}/$file"
     zst_path="$segment_dir/$file"
     manifest_path="$segment_dir/${file}.manifest.json"

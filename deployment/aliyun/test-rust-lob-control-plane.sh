@@ -35,6 +35,7 @@ if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
   exit 1
 fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
+grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
 grep -Fq 'and .all_symbols_bridged == true' "$GATE"
