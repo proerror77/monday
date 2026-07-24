@@ -1219,6 +1219,7 @@ fn process_event(
     Ok(ProcessAction::None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_events_before_segment_rotation(
     config: &Config,
     receiver: &mut mpsc::Receiver<Event>,
