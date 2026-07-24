@@ -4778,6 +4778,7 @@ mod tests {
         let mut budget = PendingBudget::new(config.max_pending_diffs);
         let mut process_state = ProcessState::new(false);
         let (sender, mut receiver) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         sender
             .send(Event::StreamDisconnected {
                 streams: vec!["btcusdt@depth@100ms".into()],
@@ -4785,6 +4786,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let blocked_sender = sender.clone();
+        let blocked_task = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            send_or_shutdown(
+                &blocked_sender,
+                Event::StreamReconnected {
+                    streams: vec!["btcusdt@depth@100ms".into()],
+                },
+                &mut shutdown_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(ACTIVE_SENDS.load(Ordering::Acquire) > 0);
 
         let action = drain_events_before_segment_rotation(
             &config,
@@ -4799,6 +4814,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(action, ProcessAction::None);
+        wait_for_active_sends_before_rotation().await.unwrap();
+        let queued_after_sends = receiver.len();
+        let action = drain_events_before_segment_rotation(
+            &config,
+            &mut receiver,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            &mut process_state,
+            queued_after_sends,
+        )
+        .unwrap();
+        assert_eq!(action, ProcessAction::None);
+        assert!(matches!(
+            blocked_task.await.unwrap().unwrap(),
+            SendOutcome::Sent
+        ));
         assert!(receiver.try_recv().is_err());
         assert!(!segment.is_replay_safe());
         drop(segment);
