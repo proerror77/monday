@@ -1,8 +1,8 @@
 use crate::polymarket_research_import::{ResearchSegmentValidationReport, TradeCompletionIdentity};
 use crate::polymarket_research_select::{
     decimal_text, json_strings, required, timestamp, utc_text, visit,
-    with_event_local_selected_research_contracts, ResearchSelectionConfig, SelectedContract,
-    WINDOW_SECS,
+    with_candidate_selected_research_contracts, with_event_local_selected_research_contracts,
+    ResearchSelectionConfig, SelectedContract, WINDOW_SECS,
 };
 use crate::polymarket_upload::{
     trade_record_ids_sha256, validate_canonical_trade, validate_market_settlement,
@@ -21,6 +21,7 @@ const CHAINLINK_OPEN_LOOKBACK_SECS: i64 = 30;
 pub(crate) const EXPLICIT_MARKET_ID_SELECTION: &str =
     "explicit market_ids constrained to [event_start_gte,event_start_lt)";
 const EVIDENCE_TRUST_BOUNDARY: &str = "typed collector staging evidence only; not an evaluator label snapshot or snapshot_contract_hash; validated staged triplets and adjacent local supersession markers; omitted remote-prefix markers are not proven absent";
+const CANDIDATE_EVIDENCE_TRUST_BOUNDARY: &str = "untrusted producer candidate carrier only; not Ready, an execution authorization, evaluator labels, or a snapshot_contract_hash";
 
 pub type PolymarketEvidenceConfig = ResearchSelectionConfig;
 
@@ -46,6 +47,30 @@ pub struct PolymarketEvidenceReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedPolymarketEvidence {
     pub report: PolymarketEvidenceReport,
+    pub ndjson: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolymarketCandidateEvidenceReport {
+    pub schema: &'static str,
+    pub content_sha256: String,
+    pub content_bytes: u64,
+    pub rows: u64,
+    pub contract_rows: u64,
+    pub surface_counts: BTreeMap<String, u64>,
+    pub event_start_gte: String,
+    pub event_start_lt: String,
+    pub market_ids: Vec<String>,
+    pub symbols: Vec<String>,
+    pub window_secs: u64,
+    pub event_selection: &'static str,
+    pub trust_boundary: &'static str,
+    pub validated_inputs: ResearchSegmentValidationReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedPolymarketCandidateEvidence {
+    pub report: PolymarketCandidateEvidenceReport,
     pub ndjson: Vec<u8>,
 }
 
@@ -569,6 +594,35 @@ fn encode_rows(mut rows: Vec<Row>) -> Result<(Vec<u8>, BTreeMap<String, u64>)> {
     Ok((ndjson, surface_counts))
 }
 
+fn candidate_surface_counts(
+    rows: &[Row],
+    contract: &SelectedContract,
+) -> Result<BTreeMap<String, u64>> {
+    let mut counts = BTreeMap::from([
+        ("down_book".to_owned(), 0),
+        ("reference".to_owned(), 0),
+        ("settlement".to_owned(), 0),
+        ("trades".to_owned(), 0),
+        ("up_book".to_owned(), 0),
+    ]);
+    for row in rows {
+        let key = match row.value["surface"].as_str() {
+            Some("orderbook_snapshot") => match row.value["token_id"].as_str() {
+                Some(token) if token == contract.up_token => "up_book",
+                Some(token) if token == contract.down_token => "down_book",
+                _ => bail!("candidate orderbook row has an unknown token"),
+            },
+            Some("chainlink_reference") => "reference",
+            Some("polymarket_trade") => "trades",
+            Some("official_settlement_evidence") => "settlement",
+            Some("market_contract") => continue,
+            _ => bail!("candidate row has an unknown surface"),
+        };
+        *counts.get_mut(key).expect("all candidate surfaces exist") += 1;
+    }
+    Ok(counts)
+}
+
 fn has_all_surfaces(
     contract: &SelectedContract,
     quote_tokens: &BTreeMap<String, BTreeSet<String>>,
@@ -644,6 +698,23 @@ fn validate_event_local_trade_completions(
     Ok(())
 }
 
+fn validate_present_event_local_trade_completions(
+    completions: &BTreeMap<String, TradeCompletionIdentity>,
+    contracts: &BTreeMap<String, SelectedContract>,
+    trade_record_ids: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    for contract in contracts.values() {
+        if let Some(completion) = completions.get(&contract.market_id) {
+            validate_event_local_trade_completions(
+                &BTreeMap::from([(contract.market_id.clone(), completion.clone())]),
+                contracts,
+                trade_record_ids,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_raw(
     inputs: &ResearchSegmentValidationReport,
     market_path: &Path,
@@ -714,6 +785,60 @@ fn normalize_raw(
     })
 }
 
+fn normalize_candidate_raw(
+    inputs: &ResearchSegmentValidationReport,
+    market_path: &Path,
+    reference_path: &Path,
+    contracts: &BTreeMap<String, SelectedContract>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<NormalizedPolymarketCandidateEvidence> {
+    let contract = contracts
+        .values()
+        .next()
+        .filter(|_| contracts.len() == 1)
+        .ok_or_else(|| anyhow!("candidate evidence requires exactly one market"))?;
+    let (trades, settlements) = reference_records(reference_path, contracts)?;
+    let completions = aggregated_trade_completions(inputs)?;
+    let mut rows = Vec::new();
+    let mut trade_counts = BTreeMap::new();
+    let mut settled = BTreeMap::new();
+    let mut quote_tokens = BTreeMap::new();
+    let mut references = BTreeMap::new();
+    contract_rows(contracts, &mut rows)?;
+    trade_rows(trades, contracts, &mut rows, &mut trade_counts)?;
+    validate_present_event_local_trade_completions(&completions, contracts, &trade_counts)?;
+    settlement_rows(settlements, contracts, &mut rows, &mut settled)?;
+    market_rows(
+        market_path,
+        contracts,
+        &mut rows,
+        &mut quote_tokens,
+        &mut references,
+    )?;
+    let surface_counts = candidate_surface_counts(&rows, contract)?;
+    let (ndjson, _) = encode_rows(rows)?;
+    Ok(NormalizedPolymarketCandidateEvidence {
+        report: PolymarketCandidateEvidenceReport {
+            schema: "monday.polymarket.normalized_candidate_evidence.v1",
+            content_sha256: hex::encode(Sha256::digest(&ndjson)),
+            content_bytes: u64::try_from(ndjson.len())?,
+            rows: 1 + surface_counts.values().sum::<u64>(),
+            contract_rows: 1,
+            surface_counts,
+            event_start_gte: utc_text(start),
+            event_start_lt: utc_text(end),
+            market_ids: vec![contract.market_id.clone()],
+            symbols: vec![contract.symbol.clone()],
+            window_secs: WINDOW_SECS as u64,
+            event_selection: EXPLICIT_MARKET_ID_SELECTION,
+            trust_boundary: CANDIDATE_EVIDENCE_TRUST_BOUNDARY,
+            validated_inputs: inputs.clone(),
+        },
+        ndjson,
+    })
+}
+
 pub fn normalize_polymarket_evidence(
     config: &PolymarketEvidenceConfig,
 ) -> Result<NormalizedPolymarketEvidence> {
@@ -721,6 +846,17 @@ pub fn normalize_polymarket_evidence(
         config,
         |inputs, market_path, reference_path, contracts, start, end| {
             normalize_raw(inputs, market_path, reference_path, contracts, start, end)
+        },
+    )
+}
+
+pub fn normalize_polymarket_candidate_evidence(
+    config: &PolymarketEvidenceConfig,
+) -> Result<NormalizedPolymarketCandidateEvidence> {
+    with_candidate_selected_research_contracts(
+        config,
+        |inputs, market_path, reference_path, contracts, start, end| {
+            normalize_candidate_raw(inputs, market_path, reference_path, contracts, start, end)
         },
     )
 }
