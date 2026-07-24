@@ -108,6 +108,7 @@ const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
 const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
 const SUBSCRIPTION_PROOF_ID: u64 = 1;
 const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_RECONNECT_PROOF_BUFFERED_EVENTS: usize = 16_384;
 
 #[derive(Debug, Clone)]
 struct StreamShard {
@@ -387,11 +388,12 @@ enum ProcessAction {
     None,
     Excluded,
     InitialSnapshotsComplete,
+    RestartSession,
 }
 
 impl ProcessAction {
     fn restarts_capture_session(&self) -> bool {
-        matches!(self, Self::Excluded)
+        matches!(self, Self::Excluded | Self::RestartSession)
     }
 }
 
@@ -430,13 +432,18 @@ impl ProcessState {
         if !self.reconnecting_shards.iter().any(|known| known == &shard) {
             self.reconnecting_shards.push(shard.clone());
         }
-        if shard.iter().any(|stream| stream.ends_with("@depth@100ms"))
+        let depth_streams = shard
+            .iter()
+            .filter(|stream| stream.ends_with("@depth@100ms"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !depth_streams.is_empty()
             && !self
                 .reconnecting_depth_shards
                 .iter()
-                .any(|known| known == &shard)
+                .any(|known| known == &depth_streams)
         {
-            self.reconnecting_depth_shards.push(shard);
+            self.reconnecting_depth_shards.push(depth_streams);
         }
     }
 
@@ -446,7 +453,10 @@ impl ProcessState {
             .iter()
             .position(|shard| shard.contains(stream))
         {
-            self.reconnecting_shards.remove(index);
+            self.reconnecting_shards[index].remove(stream);
+            if self.reconnecting_shards[index].is_empty() {
+                self.reconnecting_shards.remove(index);
+            }
         }
         if stream.ends_with("@depth@100ms") {
             if let Some(index) = self
@@ -454,7 +464,10 @@ impl ProcessState {
                 .iter()
                 .position(|shard| shard.contains(stream))
             {
-                self.reconnecting_depth_shards.remove(index);
+                self.reconnecting_depth_shards[index].remove(stream);
+                if self.reconnecting_depth_shards[index].is_empty() {
+                    self.reconnecting_depth_shards.remove(index);
+                }
             }
         }
     }
@@ -871,6 +884,9 @@ async fn run_session(
             action if action.restarts_capture_session() => break,
             ProcessAction::None => {}
             ProcessAction::Excluded => unreachable!("excluded action must restart the session"),
+            ProcessAction::RestartSession => {
+                unreachable!("recovered reconnect must restart the session")
+            }
             ProcessAction::InitialSnapshotsComplete => {
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
             }
@@ -902,15 +918,14 @@ async fn run_session(
         }
 
         if last_health.elapsed() >= Duration::from_secs(30) {
-            let status = if !process_state.streams_healthy()
-                || !process_state.depth_streams_healthy()
-            {
-                "reconnecting"
-            } else if states.values().all(|state| state.synced) {
-                "synced"
-            } else {
-                "syncing"
-            };
+            let status =
+                if !process_state.streams_healthy() || !process_state.depth_streams_healthy() {
+                    "reconnecting"
+                } else if states.values().all(|state| state.synced) {
+                    "synced"
+                } else {
+                    "syncing"
+                };
             write_health(
                 &config.spool_dir,
                 config.market,
@@ -997,10 +1012,7 @@ fn process_event(
             if config.is_excluded(&diff.symbol) {
                 return Ok(ProcessAction::None);
             }
-            let stream_name = format!(
-                "{}@depth@100ms",
-                diff.symbol.to_ascii_lowercase()
-            );
+            let stream_name = format!("{}@depth@100ms", diff.symbol.to_ascii_lowercase());
             if source_clock.symbol != diff.symbol {
                 anyhow::bail!("depth sequence and source-clock symbols disagree");
             }
@@ -1038,7 +1050,11 @@ fn process_event(
                 )?;
                 return Err(error);
             }
+            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
         }
         Event::AggregateTrade { trade, frame } => {
             if config.is_excluded(&trade.symbol) {
@@ -1067,10 +1083,12 @@ fn process_event(
                 json!({"session_id":session_id,"frame":frame}),
                 trade.received_at_ns,
             )?;
-            process_state.mark_stream_observed(&format!(
-                "{}@aggTrade",
-                trade.symbol.to_ascii_lowercase()
-            ));
+            let stream_name = format!("{}@aggTrade", trade.symbol.to_ascii_lowercase());
+            let reconnecting_before = !process_state.streams_healthy();
+            process_state.mark_stream_observed(&stream_name);
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
         }
         Event::Snapshot {
             received_at_ns,
@@ -1141,6 +1159,7 @@ fn process_event(
         }
         Event::StreamDisconnected { streams, reason } => {
             process_state.mark_shard_disconnected(streams);
+            segment.mark_replay_unsafe();
             info!(reason, "websocket shard reconnecting");
         }
         Event::StreamReconnected { streams } => {
@@ -1316,9 +1335,10 @@ fn replay_checkpoint_ready(
     states: &HashMap<String, OrderBookState>,
     process_state: &ProcessState,
 ) -> bool {
-    // A transport reconnect cannot seed a checkpoint until a post-reconnect
-    // market event has passed the sequence validators.
-    process_state.depth_streams_healthy()
+    // A transport reconnect cannot seed a checkpoint until every affected
+    // market stream has passed through the sequence validators.
+    process_state.streams_healthy()
+        && process_state.depth_streams_healthy()
         && segment.is_replay_safe()
         && process_state.stream_coverage_trusted
         && segment.event_count("agg_trade") > 0
@@ -1479,6 +1499,7 @@ async fn receive_url(
 
         let subscription_proof_deadline = tokio::time::Instant::now() + subscription_proof_timeout;
         let mut proof_failure = None;
+        let mut proof_events = Vec::new();
         loop {
             let message = tokio::select! {
                 biased;
@@ -1535,18 +1556,38 @@ async fn receive_url(
                             .context("stream connection receiver dropped")?;
                         coverage_announced = true;
                     }
+                    for event in proof_events.drain(..) {
+                        match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                            SendOutcome::Sent => {}
+                            SendOutcome::Shutdown(event) => {
+                                return Ok(TaskExit::Stopped(Some(event)));
+                            }
+                        }
+                    }
                     reconnect_backoff = 1;
                     break;
                 }
                 let event = event_from_frame(frame, received_at_ns)?;
-                match receive_before_subscription_proof_deadline(
-                    subscription_proof_deadline,
-                    send_or_shutdown(&sender, event, &mut shutdown),
-                )
-                .await??
-                {
-                    SendOutcome::Sent => {}
-                    SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+                if coverage_announced {
+                    if proof_events.len() >= MAX_RECONNECT_PROOF_BUFFERED_EVENTS {
+                        anyhow::bail!(
+                            "websocket reconnect proof buffer exceeded {} events",
+                            MAX_RECONNECT_PROOF_BUFFERED_EVENTS
+                        );
+                    }
+                    proof_events.push(event);
+                } else {
+                    match receive_before_subscription_proof_deadline(
+                        subscription_proof_deadline,
+                        send_or_shutdown(&sender, event, &mut shutdown),
+                    )
+                    .await??
+                    {
+                        SendOutcome::Sent => {}
+                        SendOutcome::Shutdown(event) => {
+                            return Ok(TaskExit::Stopped(Some(event)));
+                        }
+                    }
                 }
             }
         }
@@ -2939,7 +2980,7 @@ mod tests {
         states: &mut HashMap<String, OrderBookState>,
         budget: &mut PendingBudget,
         process_state: &mut ProcessState,
-    ) {
+    ) -> ProcessAction {
         let received_at_ns = now_ns().unwrap();
         let event_time_ms = received_at_ns / 1_000_000 - 1;
         let event = event_from_frame(
@@ -2959,7 +3000,7 @@ mod tests {
             event,
             process_state,
         )
-        .unwrap();
+        .unwrap()
     }
 
     fn trusted_process_state(symbols: &[String]) -> ProcessState {
@@ -3147,6 +3188,30 @@ mod tests {
                 let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let request = websocket.next().await.unwrap().unwrap();
                 assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                if connection == 1 {
+                    websocket
+                        .send(Message::Text(
+                            json!({
+                                "stream": "btcusdt@aggTrade",
+                                "data": {
+                                    "e": "aggTrade",
+                                    "E": event_time_ms,
+                                    "s": "BTCUSDT",
+                                    "a": 1,
+                                    "f": 1,
+                                    "l": 1,
+                                    "p": "100",
+                                    "q": "1",
+                                    "T": event_time_ms,
+                                    "m": false
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
                 websocket
                     .send(Message::Text(
                         json!({
@@ -3162,28 +3227,6 @@ mod tests {
                     websocket.close(None).await.unwrap();
                     continue;
                 }
-                websocket
-                    .send(Message::Text(
-                        json!({
-                            "stream": "btcusdt@aggTrade",
-                            "data": {
-                                "e": "aggTrade",
-                                "E": event_time_ms,
-                                "s": "BTCUSDT",
-                                "a": 1,
-                                "f": 1,
-                                "l": 1,
-                                "p": "100",
-                                "q": "1",
-                                "T": event_time_ms,
-                                "m": false
-                            }
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
                 websocket
                     .send(Message::Text(
                         json!({
@@ -3631,6 +3674,7 @@ mod tests {
     #[test]
     fn runtime_exclusion_requires_a_new_capture_session() {
         assert!(ProcessAction::Excluded.restarts_capture_session());
+        assert!(ProcessAction::RestartSession.restarts_capture_session());
         assert!(!ProcessAction::None.restarts_capture_session());
         assert!(!ProcessAction::InitialSnapshotsComplete.restarts_capture_session());
     }
@@ -3640,17 +3684,53 @@ mod tests {
         let mut process_state = ProcessState::new(true);
         process_state.mark_shard_disconnected(vec![
             "btcusdt@depth@100ms".into(),
+            "ethusdt@depth@100ms".into(),
             "btcusdt@aggTrade".into(),
+            "ethusdt@aggTrade".into(),
         ]);
         assert!(!process_state.streams_healthy());
+        assert!(!process_state.depth_streams_healthy());
 
         process_state.mark_stream_observed("btcusdt@aggTrade");
-        assert!(process_state.streams_healthy());
+        assert!(!process_state.streams_healthy());
         assert!(!process_state.depth_streams_healthy());
 
         process_state.mark_stream_observed("btcusdt@depth@100ms");
+        assert!(!process_state.streams_healthy());
+        assert!(!process_state.depth_streams_healthy());
+
+        process_state.mark_stream_observed("ethusdt@aggTrade");
+        assert!(!process_state.streams_healthy());
+
+        process_state.mark_stream_observed("ethusdt@depth@100ms");
         assert!(process_state.streams_healthy());
         assert!(process_state.depth_streams_healthy());
+    }
+
+    #[test]
+    fn aggregate_trade_reconnect_requires_a_new_capture_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut process_state = trusted_process_state(&config.symbols);
+        process_state.mark_shard_disconnected(vec!["btcusdt@aggTrade".into()]);
+
+        assert_eq!(
+            archive_first_btc_aggregate_trade(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &mut process_state,
+            ),
+            ProcessAction::RestartSession
+        );
     }
 
     #[tokio::test]
@@ -4302,8 +4382,16 @@ mod tests {
             "btcusdt@aggTrade".into(),
         ]);
         process_state.mark_stream_observed("btcusdt@aggTrade");
-        assert!(process_state.streams_healthy());
+        assert!(!process_state.streams_healthy());
         assert!(!process_state.depth_streams_healthy());
+
+        let mut aggregate_only_disconnect = trusted_process_state(&config.symbols);
+        aggregate_only_disconnect.mark_shard_disconnected(vec!["btcusdt@aggTrade".into()]);
+        assert!(!replay_checkpoint_ready(
+            &segment,
+            &states,
+            &aggregate_only_disconnect
+        ));
 
         let artifacts = close_segment(
             segment,
