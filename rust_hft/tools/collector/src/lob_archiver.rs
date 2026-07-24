@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
@@ -586,6 +587,7 @@ impl Segment {
             self.counts,
             trade_summaries,
             RAW_SCHEMA,
+            self.start_ns,
             self.manifest_start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
@@ -602,6 +604,7 @@ fn finalize_segment(
     counts: BTreeMap<String, u64>,
     trade_summaries: BTreeMap<String, AggregateTradeSummary>,
     schema: &str,
+    identity_start_ns: u64,
     start_ns: u64,
     end_ns: u64,
     has_replay_safe_checkpoint: bool,
@@ -617,7 +620,7 @@ fn finalize_segment(
     } else {
         None
     };
-    let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
+    let data = path.with_file_name(format!("part-{identity_start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
     let mut command = Command::new("zstd");
     command
@@ -634,7 +637,7 @@ fn finalize_segment(
     sync_parent(&data)?;
 
     let digest = sha256_file(&data)?;
-    let (date, hour) = segment_partition(start_ns)?;
+    let (date, hour) = segment_partition(identity_start_ns)?;
     let events: u64 = counts.values().sum();
     let mut metadata = json!({
         "schema": schema,
@@ -856,6 +859,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             trade_summaries,
             &schema,
             start_ns,
+            start_ns,
             end_ns,
             false,
             readiness_summary(
@@ -1042,6 +1046,8 @@ pub enum SendOutcome<T> {
     Shutdown(T),
 }
 
+pub static ACTIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
+
 /// Lossless backpressure that remains cancellable when the bounded queue is full.
 pub async fn send_or_shutdown<T>(
     sender: &mpsc::Sender<T>,
@@ -1051,7 +1057,8 @@ pub async fn send_or_shutdown<T>(
     if *shutdown.borrow() {
         return Ok(SendOutcome::Shutdown(item));
     }
-    tokio::select! {
+    ACTIVE_SENDS.fetch_add(1, Ordering::AcqRel);
+    let result = tokio::select! {
         biased;
         changed = shutdown.changed() => {
             changed.map_err(|_| anyhow::anyhow!("shutdown channel closed"))?;
@@ -1065,7 +1072,9 @@ pub async fn send_or_shutdown<T>(
                 })
                 .map_err(|_| anyhow::anyhow!("archive queue closed"))
         }
-    }
+    };
+    ACTIVE_SENDS.fetch_sub(1, Ordering::AcqRel);
+    result
 }
 
 pub fn segment_partition(timestamp_ns: u64) -> anyhow::Result<(String, String)> {
@@ -1359,6 +1368,7 @@ mod tests {
         assert!(!task.is_finished());
         shutdown_tx.send(true).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), SendOutcome::Shutdown(2));
+        assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     }

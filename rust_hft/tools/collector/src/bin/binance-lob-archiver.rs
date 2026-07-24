@@ -15,7 +15,7 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
     write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
-    SegmentConfig, SendOutcome, RAW_SCHEMA,
+    SegmentConfig, SendOutcome, ACTIVE_SENDS, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -895,6 +895,7 @@ async fn run_session(
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
         if segment_due(&segment, config.segment_seconds)? {
+            let queued_events = receiver.len();
             let rotation_action = match drain_events_before_segment_rotation(
                 &config,
                 &mut receiver,
@@ -903,6 +904,34 @@ async fn run_session(
                 &mut budget,
                 &session_id,
                 &mut process_state,
+                queued_events,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if rotation_action.restarts_capture_session() {
+                break;
+            }
+            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+            }
+            if let Err(error) = wait_for_active_sends_before_rotation().await {
+                failure = Some(error);
+                break;
+            }
+            let queued_after_sends = receiver.len();
+            let rotation_action = match drain_events_before_segment_rotation(
+                &config,
+                &mut receiver,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &session_id,
+                &mut process_state,
+                queued_after_sends,
             ) {
                 Ok(action) => action,
                 Err(error) => {
@@ -1198,9 +1227,13 @@ fn drain_events_before_segment_rotation(
     budget: &mut PendingBudget,
     session_id: &str,
     process_state: &mut ProcessState,
+    queued_events: usize,
 ) -> anyhow::Result<ProcessAction> {
     let mut saw_initial_snapshots_complete = false;
-    while let Ok(event) = receiver.try_recv() {
+    for _ in 0..queued_events {
+        let Ok(event) = receiver.try_recv() else {
+            break;
+        };
         let action = process_event(
             config,
             segment,
@@ -1220,6 +1253,16 @@ fn drain_events_before_segment_rotation(
     } else {
         ProcessAction::None
     })
+}
+
+async fn wait_for_active_sends_before_rotation() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ACTIVE_SENDS.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("collector senders did not quiesce before rotation"))
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
@@ -4751,6 +4794,7 @@ mod tests {
             &mut budget,
             "session-1",
             &mut process_state,
+            1,
         )
         .unwrap();
 
