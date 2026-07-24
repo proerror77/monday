@@ -109,6 +109,8 @@ grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMP
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),\$ ]] &&" "$ci_workflow"
 grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
+grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
+grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
