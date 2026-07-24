@@ -12,10 +12,11 @@ COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.bi
 ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
-# shellcheck disable=SC1091
-. "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
+# shellcheck disable=SC1090,SC1091
+. "$LIB"
 
-for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum; do
+for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing test dependency: %s\n' "$command" >&2
     exit 2
@@ -37,6 +38,11 @@ if grep -Fq -- '--argjson lob_continuity' "$GATE"; then
   exit 1
 fi
 grep -Fq 'manifest changed between discovery and readback' "$GATE"
+grep -Fq 'has_replay_safe_checkpoint' "$GATE"
+grep -Fq 'unsafe_candidates' "$GATE"
+grep -Fq 'monday_validate_replay_safe_manifest_order' "$GATE"
+grep -Fq 'fewer than two replay-safe complete OSS manifests' "$GATE"
+grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
@@ -93,6 +99,37 @@ done
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+safe_candidates="$tmp_dir/safe-candidates.tsv"
+unsafe_candidates="$tmp_dir/unsafe-candidates.tsv"
+printf '100\t200\tsafe-1\n200\t300\tsafe-2\n' >"$safe_candidates"
+printf '300\t360\tunsafe-tail\n' >"$unsafe_candidates"
+monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates"
+
+printf '100\t200\tsafe-1\n300\t400\tsafe-2\n' >"$safe_candidates"
+printf '200\t300\tunsafe-middle\n' >"$unsafe_candidates"
+if monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates" \
+  2>/dev/null; then
+  printf 'replay-unsafe middle manifest was accepted\n' >&2
+  exit 1
+fi
+
+printf '100\t200\tsafe-1\n' >"$safe_candidates"
+printf '150\t250\tunsafe-overlap\n' >"$unsafe_candidates"
+if monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates" \
+  2>/dev/null; then
+  printf 'replay-unsafe overlapping manifest was accepted\n' >&2
+  exit 1
+fi
+
+printf '100\t200\tsafe-1\n' >"$safe_candidates"
+printf '200\t300\tunsafe-tail\n' >"$unsafe_candidates"
+monday_validate_replay_safe_manifest_order test "$safe_candidates" "$unsafe_candidates"
+safe_manifest_count=$(wc -l <"$safe_candidates" | tr -d ' ')
+((safe_manifest_count < 2)) || {
+  printf 'trailing replay-unsafe fixture incorrectly counted as a second safe manifest\n' >&2
+  exit 1
+}
 
 last_updated_ns=1
 last_advance_mono=0

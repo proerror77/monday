@@ -612,8 +612,10 @@ verify_oss_round_trips() {
   local listing="$tmp_dir/${market}-oss-list.txt"
   local uris="$tmp_dir/${market}-manifest-uris.txt"
   local candidates="$tmp_dir/${market}-manifest-candidates.tsv"
+  local unsafe_candidates="$tmp_dir/${market}-manifest-unsafe.tsv"
   local index=0
   local uri manifest start_ns end_ns file digest zst_uri zst_path success_uri success_path
+  local manifest_replay_safe
   local segment_dir manifest_path manifest_digest actual_manifest_digest
   local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
   local previous_end_ns=0
@@ -622,6 +624,7 @@ verify_oss_round_trips() {
 
   manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
+  : >"$unsafe_candidates"
   while IFS= read -r uri; do
     [[ -n $uri ]] || continue
     manifest="$tmp_dir/${market}-scan-$index.json"
@@ -703,6 +706,13 @@ verify_oss_round_trips() {
         and .event_types.agg_trade > 0' \
       "$manifest" >/dev/null \
       || die "$market has an incomplete market-tape manifest after gate start: $uri"
+    jq -e '.has_replay_safe_checkpoint | type == "boolean"' "$manifest" >/dev/null \
+      || die "$market manifest has no replay-safety decision: $uri"
+    manifest_replay_safe=$(jq -r '.has_replay_safe_checkpoint' "$manifest")
+    if [[ $manifest_replay_safe != true ]]; then
+      printf '%s\t%s\t%s\n' "$start_ns" "$end_ns" "$uri" >>"$unsafe_candidates"
+      continue
+    fi
     file=$(jq -er '.file' "$manifest")
     digest=$(jq -er '.sha256' "$manifest")
     manifest_digest=$(sha256sum "$manifest" | awk '{print $1}')
@@ -713,9 +723,12 @@ verify_oss_round_trips() {
       >>"$candidates"
   done <"$uris"
 
+  monday_validate_replay_safe_manifest_order "$market" "$candidates" "$unsafe_candidates" \
+    || die "$market replay-safe manifest ordering check failed"
+
   candidate_count=$(wc -l <"$candidates" | tr -d ' ')
   ((candidate_count >= 2)) \
-    || die "$market has fewer than two OSS manifests created after gate start"
+    || die "$market has fewer than two replay-safe complete OSS manifests after gate start"
 
   index=0
   while IFS=$'\t' read -r start_ns end_ns uri file digest manifest_digest manifest \
