@@ -941,6 +941,7 @@ async fn run_session(
             let barriers = match await_rotation_barriers(
                 &config,
                 &mut receiver,
+                &mut tasks,
                 &mut segment,
                 &mut states,
                 &mut budget,
@@ -1267,6 +1268,7 @@ fn process_event(
 async fn await_rotation_barriers(
     config: &Config,
     receiver: &mut mpsc::Receiver<Event>,
+    tasks: &mut JoinSet<anyhow::Result<TaskExit>>,
     segment: &mut Segment,
     states: &mut HashMap<String, OrderBookState>,
     budget: &mut PendingBudget,
@@ -1282,15 +1284,45 @@ async fn await_rotation_barriers(
     let mut acknowledged = BTreeSet::new();
     let mut saw_initial_snapshots_complete = false;
     while acknowledged.len() < expected_producers {
-        let event = tokio::time::timeout_at(deadline, receiver.recv())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        let event = tokio::select! {
+            event = receiver.recv() => {
+                event.context("archive queue closed while waiting for segment rotation barriers")?
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
+                        process_event(
+                            config,
+                            segment,
+                            states,
+                            budget,
+                            session_id,
+                            event,
+                            process_state,
+                        )?;
+                        return Err(anyhow::anyhow!(
+                            "collector producer stopped unexpectedly while awaiting segment rotation barrier"
+                        ));
+                    }
+                    Some(Ok(Ok(TaskExit::Stopped(None)))) => {
+                        return Err(anyhow::anyhow!(
+                            "collector producer stopped unexpectedly while awaiting segment rotation barrier"
+                        ));
+                    }
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(anyhow::anyhow!(
+                        "collector producer set emptied while awaiting segment rotation barrier"
+                    )),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(anyhow::anyhow!(
                     "collector producers did not acknowledge segment rotation epoch {epoch} within {}s",
                     acknowledgement_timeout.as_secs()
-                )
-            })?
-            .context("archive queue closed while waiting for segment rotation barriers")?;
+                ));
+            }
+        };
         match event {
             Event::RotationBarrier {
                 producer_id,
@@ -2289,7 +2321,10 @@ async fn produce_snapshots(
         .build()?;
     let interval = Duration::from_secs_f64(1.0 / config.snapshot_requests_per_second.max(0.1));
     'symbols: for symbol in config.active_symbols() {
-        let (started, snapshot) = loop {
+        let started = now_ns()?;
+        let mut attempt = 0_usize;
+        let mut retry_deadline = None;
+        let snapshot = loop {
             if let Some(exit) = acknowledge_rotation_pause(
                 producer_id,
                 &sender,
@@ -2305,19 +2340,48 @@ async fn produce_snapshots(
             if *shutdown.borrow() {
                 return Ok(TaskExit::Stopped(None));
             }
-            let started = now_ns()?;
-            let mut fetch_shutdown = shutdown.clone();
+            if let Some(deadline) = retry_deadline {
+                match wait_for_rotation_or_shutdown(
+                    tokio::time::sleep_until(deadline),
+                    &mut shutdown,
+                    &mut rotation_pause,
+                )
+                .await?
+                {
+                    ProducerWait::Ready(()) => retry_deadline = None,
+                    ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+                    ProducerWait::PauseRequested => {
+                        if let Some(exit) = acknowledge_rotation_pause(
+                            producer_id,
+                            &sender,
+                            &mut rotation_pause,
+                            &mut rotation_resume,
+                            &mut last_pause_epoch,
+                            &mut shutdown,
+                        )
+                        .await?
+                        {
+                            return Ok(exit);
+                        }
+                        continue;
+                    }
+                }
+            }
             match wait_for_rotation_or_shutdown(
-                fetch_snapshot(&client, &config, &symbol, &mut fetch_shutdown),
+                fetch_snapshot_attempt(&client, &config, &symbol, attempt),
                 &mut shutdown,
                 &mut rotation_pause,
             )
             .await?
             {
-                ProducerWait::Ready(Ok(Some(snapshot))) => break (started, snapshot),
-                ProducerWait::Ready(Ok(None)) | ProducerWait::Stopped => {
-                    return Ok(TaskExit::Stopped(None));
+                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Snapshot(snapshot))) => {
+                    break snapshot;
                 }
+                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Retry(delay))) => {
+                    attempt += 1;
+                    retry_deadline = Some(tokio::time::Instant::now() + delay);
+                }
+                ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
                 ProducerWait::PauseRequested => {
                     if let Some(exit) = acknowledge_rotation_pause(
                         producer_id,
@@ -2459,68 +2523,88 @@ async fn produce_snapshots(
     }
 }
 
+enum SnapshotFetchAttempt {
+    Snapshot(Value),
+    Retry(Duration),
+}
+
+async fn fetch_snapshot_attempt(
+    client: &reqwest::Client,
+    config: &Config,
+    symbol: &str,
+    attempt: usize,
+) -> anyhow::Result<SnapshotFetchAttempt> {
+    let path = match config.market {
+        Market::Spot => "/api/v3/depth",
+        Market::Usdm => "/fapi/v1/depth",
+    };
+    let limit = config.snapshot_limit.to_string();
+    let response = client
+        .get(format!("{}{path}", config.rest_base))
+        .query(&[("symbol", symbol), ("limit", limit.as_str())])
+        .send()
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        let snapshot = response.json::<Value>().await?;
+        if snapshot
+            .get("lastUpdateId")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
+        }
+        return Ok(SnapshotFetchAttempt::Snapshot(snapshot));
+    }
+    let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    if !retryable || attempt + 1 == config.snapshot_retry_attempts {
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|payload| payload["code"].as_i64())
+                == Some(-1121)
+        {
+            return Err(SnapshotUnavailable {
+                symbol: symbol.to_owned(),
+                status,
+            }
+            .into());
+        }
+        anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
+    }
+    let delay = snapshot_retry_delay(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        attempt,
+    );
+    warn!(%symbol, %status, ?delay, "snapshot request retrying");
+    Ok(SnapshotFetchAttempt::Retry(delay))
+}
+
+#[cfg(test)]
 async fn fetch_snapshot(
     client: &reqwest::Client,
     config: &Config,
     symbol: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Option<Value>> {
-    let path = match config.market {
-        Market::Spot => "/api/v3/depth",
-        Market::Usdm => "/fapi/v1/depth",
-    };
-    let limit = config.snapshot_limit.to_string();
     for attempt in 0..config.snapshot_retry_attempts {
-        let response = client
-            .get(format!("{}{path}", config.rest_base))
-            .query(&[("symbol", symbol), ("limit", limit.as_str())])
-            .send()
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            let snapshot = response.json::<Value>().await?;
-            if snapshot
-                .get("lastUpdateId")
-                .and_then(Value::as_u64)
-                .is_none()
-            {
-                anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
-            }
-            return Ok(Some(snapshot));
-        }
-        let retryable =
-            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-        if !retryable || attempt + 1 == config.snapshot_retry_attempts {
-            let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::BAD_REQUEST
-                && serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|payload| payload["code"].as_i64())
-                    == Some(-1121)
-            {
-                return Err(SnapshotUnavailable {
-                    symbol: symbol.to_owned(),
-                    status,
+        match fetch_snapshot_attempt(client, config, symbol, attempt).await? {
+            SnapshotFetchAttempt::Snapshot(snapshot) => return Ok(Some(snapshot)),
+            SnapshotFetchAttempt::Retry(delay) => {
+                if wait_or_shutdown(shutdown, delay).await {
+                    return Ok(None);
                 }
-                .into());
             }
-            anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
-        }
-        let delay = snapshot_retry_delay(
-            response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            attempt,
-        );
-        warn!(%symbol, %status, ?delay, "snapshot request retrying");
-        if wait_or_shutdown(shutdown, delay).await {
-            return Ok(None);
         }
     }
     unreachable!("snapshot_retry_attempts is at least one")
 }
 
+#[cfg(test)]
 async fn wait_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
     if *shutdown.borrow() {
         return true;
@@ -4759,6 +4843,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_during_snapshot_backoff_preserves_retry_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+        let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            assert!(first.read(&mut request).await.unwrap() > 0);
+            first
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            first_response_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert!(second.read(&mut request).await.unwrap() > 0);
+            let _ = second_request_tx.send(());
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.snapshot_requests_per_second = 1_000.0;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
+
+        first_response_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_request_rx)
+                .await
+                .is_err(),
+            "snapshot retry ignored Retry-After after a rotation pause"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn pause_during_snapshot_interval_acknowledges_rotation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -5956,6 +6115,7 @@ mod tests {
         let mut budget = PendingBudget::new(config.max_pending_diffs);
         let mut process_state = ProcessState::new(false);
         let (sender, mut receiver) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, mut pause_rx) = watch::channel(0_u64);
         let (resume_tx, mut resume_rx) = watch::channel(0_u64);
@@ -6006,6 +6166,7 @@ mod tests {
             await_rotation_barriers(
                 &config,
                 &mut receiver,
+                &mut tasks,
                 &mut segment,
                 &mut states,
                 &mut budget,
@@ -6046,6 +6207,44 @@ mod tests {
         assert!(blocked_task.await.unwrap().unwrap().is_none());
         drop(next_segment);
         drop(closing_segment);
+    }
+
+    #[tokio::test]
+    async fn rotation_barrier_observes_unexpected_producer_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = config
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
+            .collect::<HashMap<_, _>>();
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { Ok::<_, anyhow::Error>(TaskExit::Stopped(None)) });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut tasks,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                &mut process_state,
+                1,
+                1,
+            ),
+        )
+        .await
+        .expect("rotation barrier wait must observe an exited producer");
+        assert!(result.is_err());
+        assert!(tasks.is_empty());
     }
 
     #[test]
