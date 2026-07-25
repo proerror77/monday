@@ -4689,7 +4689,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 2048];
-            first.read(&mut request).await.unwrap();
+            assert!(first.read(&mut request).await.unwrap() > 0);
             let _ = first_request_tx.send(());
             let first_reader = tokio::spawn(async move {
                 let mut ignored = [0_u8; 1];
@@ -4697,7 +4697,7 @@ mod tests {
             });
             let (mut second, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 2048];
-            second.read(&mut request).await.unwrap();
+            assert!(second.read(&mut request).await.unwrap() > 0);
             let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
             second
                 .write_all(
