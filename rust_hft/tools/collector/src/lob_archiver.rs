@@ -499,6 +499,11 @@ impl Segment {
         payload: Value,
         received_at_ns: u64,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            received_at_ns >= self.start_ns,
+            "event received at {received_at_ns} predates its start boundary {}",
+            self.start_ns
+        );
         self.manifest_start_ns = self.manifest_start_ns.min(received_at_ns);
         self.end_ns = self.end_ns.max(received_at_ns);
         let mut envelope = serde_json::Map::new();
@@ -1488,6 +1493,25 @@ mod tests {
     }
 
     #[test]
+    fn segment_rejects_event_that_predates_its_start_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let start_ns = 1_700_000_000_000_000_000;
+        let mut segment = Segment::create(recovery_config(root.clone()), start_ns).unwrap();
+
+        let error = segment
+            .write(
+                "session_start",
+                json!({"session_id":"session-1"}),
+                start_ns - 1,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("predates its start boundary"));
+        drop(segment);
+    }
+
+    #[test]
     fn segment_declares_complete_market_tape_surface() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
@@ -1515,7 +1539,7 @@ mod tests {
                     "symbols":1,
                     "websocket_shards":1
                 }),
-                segment.start_ns - 1,
+                segment.start_ns,
             )
             .unwrap();
         segment
@@ -1631,7 +1655,7 @@ mod tests {
             manifest["schema"],
             data::binance_market_tape::MARKET_TAPE_SCHEMA
         );
-        assert_eq!(manifest["start_received_at_ns"], json!(start_ns - 1));
+        assert_eq!(manifest["start_received_at_ns"], json!(start_ns));
         assert_eq!(
             manifest["event_types"],
             json!({"agg_trade":2,"checkpoint":1,"diff":1,"session_start":1,"snapshot":1})

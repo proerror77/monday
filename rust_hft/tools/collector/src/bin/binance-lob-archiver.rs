@@ -15,7 +15,7 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
     write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
-    SegmentConfig, SendOutcome, ACTIVE_SENDS, RAW_SCHEMA,
+    SegmentConfig, SendOutcome, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -376,6 +376,10 @@ enum Event {
     StreamReconnected {
         streams: Vec<String>,
     },
+    RotationBarrier {
+        producer_id: usize,
+        epoch: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -395,6 +399,18 @@ impl ProcessAction {
     fn restarts_capture_session(&self) -> bool {
         matches!(self, Self::Excluded | Self::RestartSession)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RotationBarrierResult {
+    Ready { initial_snapshots_complete: bool },
+    RestartSession,
+}
+
+enum ProducerWait<T> {
+    Ready(T),
+    PauseRequested,
+    Stopped,
 }
 
 #[derive(Debug, Default)]
@@ -771,16 +787,22 @@ async fn run_session(
         anyhow::bail!("no active symbols remain after runtime exclusions");
     }
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
+    let (rotation_pause_tx, rotation_pause_rx) = watch::channel(0_u64);
+    let (rotation_resume_tx, rotation_resume_rx) = watch::channel(0_u64);
+    let mut rotation_epoch = 0_u64;
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
     let stream_shards = config.stream_shards();
     let expected_shards = stream_shards.len();
+    let expected_rotation_producers = expected_shards
+        .checked_add(1)
+        .context("rotation producer count overflow")?;
     let expected_streams = stream_shards
         .iter()
         .map(|shard| shard.streams.len())
         .sum::<usize>();
     let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_shards);
-    for shard in stream_shards {
+    for (producer_id, shard) in stream_shards.into_iter().enumerate() {
         tasks.spawn(receive_url(
             shard,
             sender.clone(),
@@ -789,6 +811,9 @@ async fn run_session(
             config.stall_timeout,
             SUBSCRIPTION_PROOF_TIMEOUT,
             watchdog.clone(),
+            producer_id,
+            rotation_pause_rx.clone(),
+            rotation_resume_rx.clone(),
         ));
     }
     drop(stream_connected_tx);
@@ -798,6 +823,9 @@ async fn run_session(
         session_stop_rx.clone(),
         stream_connected_rx,
         expected_shards,
+        expected_shards,
+        rotation_pause_rx.clone(),
+        rotation_resume_rx.clone(),
     ));
     let mut states = active_symbols
         .iter()
@@ -895,64 +923,78 @@ async fn run_session(
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
         if segment_due(&segment, config.segment_seconds)? {
-            let queued_events = receiver.len();
-            let rotation_action = match drain_events_before_segment_rotation(
+            // Each producer emits its barrier after every event whose receive
+            // timestamp it has already captured on that producer's sender.
+            rotation_epoch = match rotation_epoch.checked_add(1) {
+                Some(epoch) => epoch,
+                None => {
+                    failure = Some(anyhow::anyhow!("segment rotation epoch overflow"));
+                    break;
+                }
+            };
+            if rotation_pause_tx.send(rotation_epoch).is_err() {
+                failure = Some(anyhow::anyhow!(
+                    "collector producers stopped before segment rotation"
+                ));
+                break;
+            }
+            let barriers = match await_rotation_barriers(
                 &config,
                 &mut receiver,
+                &mut tasks,
                 &mut segment,
                 &mut states,
                 &mut budget,
                 &session_id,
                 &mut process_state,
-                queued_events,
-            ) {
-                Ok(action) => action,
+                expected_rotation_producers,
+                rotation_epoch,
+            )
+            .await
+            {
+                Ok(result) => result,
                 Err(error) => {
+                    let _ = rotation_resume_tx.send(rotation_epoch);
                     failure = Some(error);
                     break;
                 }
             };
-            if rotation_action.restarts_capture_session() {
-                break;
-            }
-            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
+            let initial_snapshots_complete = match barriers {
+                RotationBarrierResult::Ready {
+                    initial_snapshots_complete,
+                } => initial_snapshots_complete,
+                RotationBarrierResult::RestartSession => {
+                    let _ = rotation_resume_tx.send(rotation_epoch);
+                    break;
+                }
+            };
+            if initial_snapshots_complete {
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
             }
-            if let Err(error) = wait_for_active_sends_before_rotation().await {
-                failure = Some(error);
-                break;
-            }
-            let queued_after_sends = receiver.len();
-            let rotation_action = match drain_events_before_segment_rotation(
-                &config,
-                &mut receiver,
+            let next_segment = match begin_segment_rotation(
                 &mut segment,
-                &mut states,
-                &mut budget,
-                &session_id,
-                &mut process_state,
-                queued_after_sends,
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            };
-            if rotation_action.restarts_capture_session() {
-                break;
-            }
-            if matches!(rotation_action, ProcessAction::InitialSnapshotsComplete) {
-                sync_deadline = Some(Instant::now() + config.sync_timeout);
-            }
-            segment = rotate_segment(
-                segment,
                 &config,
                 &states,
                 &session_id,
                 "scheduled",
                 &process_state,
-            )?;
+            ) {
+                Ok(next_segment) => next_segment,
+                Err(error) => {
+                    let _ = rotation_resume_tx.send(rotation_epoch);
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if let Err(error) = finish_segment_rotation(
+                &mut segment,
+                next_segment,
+                &rotation_resume_tx,
+                rotation_epoch,
+            ) {
+                failure = Some(error);
+                break;
+            }
         }
 
         if states.values().all(|state| state.synced) {
@@ -1215,55 +1257,111 @@ fn process_event(
         Event::StreamReconnected { streams } => {
             info!(streams = ?streams, "websocket shard connection restored; awaiting market data");
         }
+        Event::RotationBarrier { .. } => {
+            anyhow::bail!("rotation barrier reached normal event processing");
+        }
     }
     Ok(ProcessAction::None)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_events_before_segment_rotation(
+async fn await_rotation_barriers(
     config: &Config,
     receiver: &mut mpsc::Receiver<Event>,
+    tasks: &mut JoinSet<anyhow::Result<TaskExit>>,
     segment: &mut Segment,
     states: &mut HashMap<String, OrderBookState>,
     budget: &mut PendingBudget,
     session_id: &str,
     process_state: &mut ProcessState,
-    queued_events: usize,
-) -> anyhow::Result<ProcessAction> {
+    expected_producers: usize,
+    epoch: u64,
+) -> anyhow::Result<RotationBarrierResult> {
+    let acknowledgement_timeout = config
+        .stall_timeout
+        .max(SUBSCRIPTION_PROOF_TIMEOUT.saturating_add(Duration::from_secs(1)));
+    let deadline = tokio::time::Instant::now() + acknowledgement_timeout;
+    let mut acknowledged = BTreeSet::new();
     let mut saw_initial_snapshots_complete = false;
-    for _ in 0..queued_events {
-        let Ok(event) = receiver.try_recv() else {
-            break;
+    while acknowledged.len() < expected_producers {
+        let event = tokio::select! {
+            event = receiver.recv() => {
+                event.context("archive queue closed while waiting for segment rotation barriers")?
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
+                        process_event(
+                            config,
+                            segment,
+                            states,
+                            budget,
+                            session_id,
+                            event,
+                            process_state,
+                        )?;
+                        return Err(anyhow::anyhow!(
+                            "collector producer stopped unexpectedly while awaiting segment rotation barrier"
+                        ));
+                    }
+                    Some(Ok(Ok(TaskExit::Stopped(None)))) => {
+                        return Err(anyhow::anyhow!(
+                            "collector producer stopped unexpectedly while awaiting segment rotation barrier"
+                        ));
+                    }
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(anyhow::anyhow!(
+                        "collector producer set emptied while awaiting segment rotation barrier"
+                    )),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(anyhow::anyhow!(
+                    "collector producers did not acknowledge segment rotation epoch {epoch} within {}s",
+                    acknowledgement_timeout.as_secs()
+                ));
+            }
         };
-        let action = process_event(
-            config,
-            segment,
-            states,
-            budget,
-            session_id,
-            event,
-            process_state,
-        )?;
-        if action.restarts_capture_session() {
-            return Ok(action);
+        match event {
+            Event::RotationBarrier {
+                producer_id,
+                epoch: event_epoch,
+            } => {
+                anyhow::ensure!(
+                    event_epoch == epoch,
+                    "rotation barrier epoch mismatch: expected {epoch}, received {event_epoch}"
+                );
+                anyhow::ensure!(
+                    producer_id < expected_producers,
+                    "rotation barrier producer {producer_id} is outside expected range 0..{expected_producers}"
+                );
+                anyhow::ensure!(
+                    acknowledged.insert(producer_id),
+                    "duplicate rotation barrier from producer {producer_id} for epoch {epoch}"
+                );
+            }
+            event => {
+                let action = process_event(
+                    config,
+                    segment,
+                    states,
+                    budget,
+                    session_id,
+                    event,
+                    process_state,
+                )?;
+                if action.restarts_capture_session() {
+                    return Ok(RotationBarrierResult::RestartSession);
+                }
+                saw_initial_snapshots_complete |=
+                    matches!(action, ProcessAction::InitialSnapshotsComplete);
+            }
         }
-        saw_initial_snapshots_complete |= matches!(action, ProcessAction::InitialSnapshotsComplete);
     }
-    Ok(if saw_initial_snapshots_complete {
-        ProcessAction::InitialSnapshotsComplete
-    } else {
-        ProcessAction::None
+    Ok(RotationBarrierResult::Ready {
+        initial_snapshots_complete: saw_initial_snapshots_complete,
     })
-}
-
-async fn wait_for_active_sends_before_rotation() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while ACTIVE_SENDS.load(Ordering::Acquire) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("collector senders did not quiesce before rotation"))
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
@@ -1336,7 +1434,9 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             json!({"session_id":session_id,"shards":shards}),
             now_ns()?,
         ),
-        Event::StreamDisconnected { .. } | Event::StreamReconnected { .. } => Ok(()),
+        Event::StreamDisconnected { .. }
+        | Event::StreamReconnected { .. }
+        | Event::RotationBarrier { .. } => Ok(()),
     }
 }
 
@@ -1385,8 +1485,8 @@ fn write_stream_coverage(
     )
 }
 
-fn rotate_segment(
-    segment: Segment,
+fn begin_segment_rotation(
+    segment: &mut Segment,
     config: &Config,
     states: &HashMap<String, OrderBookState>,
     session_id: &str,
@@ -1394,8 +1494,8 @@ fn rotate_segment(
     process_state: &ProcessState,
 ) -> anyhow::Result<Segment> {
     let rotation_boundary_ns = now_ns()?;
-    let seed_next = reason == "scheduled" && replay_seed_ready(&segment, states, process_state);
-    close_segment_at(
+    let seed_next = reason == "scheduled" && replay_seed_ready(segment, states, process_state);
+    prepare_segment_for_close(
         segment,
         config,
         states,
@@ -1423,6 +1523,40 @@ fn rotate_segment(
     } else {
         next.mark_replay_unsafe();
     }
+    Ok(next)
+}
+
+fn finish_segment_rotation(
+    segment: &mut Segment,
+    next_segment: Segment,
+    rotation_resume_tx: &watch::Sender<u64>,
+    rotation_epoch: u64,
+) -> anyhow::Result<()> {
+    let closing_segment = std::mem::replace(segment, next_segment);
+    let _ = rotation_resume_tx.send(rotation_epoch);
+    closing_segment.close()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn rotate_segment(
+    segment: Segment,
+    config: &Config,
+    states: &HashMap<String, OrderBookState>,
+    session_id: &str,
+    reason: &str,
+    process_state: &ProcessState,
+) -> anyhow::Result<Segment> {
+    let mut closing_segment = segment;
+    let next = begin_segment_rotation(
+        &mut closing_segment,
+        config,
+        states,
+        session_id,
+        reason,
+        process_state,
+    )?;
+    closing_segment.close()?;
     Ok(next)
 }
 
@@ -1497,19 +1631,41 @@ fn close_segment_at(
     process_state: &ProcessState,
     checkpoint_received_at_ns: u64,
 ) -> anyhow::Result<Option<hft_collector::lob_archiver::SegmentArtifacts>> {
+    prepare_segment_for_close(
+        &mut segment,
+        config,
+        states,
+        session_id,
+        reason,
+        process_state,
+        checkpoint_received_at_ns,
+    )?;
+    segment.close()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_segment_for_close(
+    segment: &mut Segment,
+    config: &Config,
+    states: &HashMap<String, OrderBookState>,
+    session_id: &str,
+    reason: &str,
+    process_state: &ProcessState,
+    checkpoint_received_at_ns: u64,
+) -> anyhow::Result<()> {
     let catalog = config.segment_config();
     segment.update_catalog(
         catalog.symbols,
         catalog.security_token_symbols,
         catalog.excluded_symbols,
     );
-    if !replay_checkpoint_ready(&segment, states, process_state) {
+    if !replay_checkpoint_ready(segment, states, process_state) {
         segment.mark_replay_unsafe();
     }
     if states.values().all(|state| state.synced) {
         let checkpoint_replay_safe = segment.is_replay_safe();
         write_checkpoints(
-            &mut segment,
+            segment,
             states,
             session_id,
             reason,
@@ -1519,7 +1675,7 @@ fn close_segment_at(
     } else {
         segment.mark_replay_unsafe();
     }
-    segment.close()
+    Ok(())
 }
 
 async fn send_stream_event(
@@ -1533,21 +1689,120 @@ async fn send_stream_event(
     }
 }
 
-async fn wait_for_stream_reconnect(
+async fn acknowledge_rotation_pause(
+    producer_id: usize,
+    sender: &mpsc::Sender<Event>,
+    rotation_pause: &mut watch::Receiver<u64>,
+    rotation_resume: &mut watch::Receiver<u64>,
+    last_pause_epoch: &mut u64,
     shutdown: &mut watch::Receiver<bool>,
-    backoff: &mut u64,
-) -> anyhow::Result<bool> {
-    if *shutdown.borrow() {
-        return Ok(true);
+) -> anyhow::Result<Option<TaskExit>> {
+    let epoch = *rotation_pause.borrow_and_update();
+    if epoch <= *last_pause_epoch {
+        return Ok(None);
     }
-    let delay = *backoff;
-    *backoff = (*backoff * 2).min(30);
-    tokio::select! {
-        changed = shutdown.changed() => Ok(changed.is_err() || *shutdown.borrow()),
-        _ = tokio::time::sleep(Duration::from_secs(delay)) => Ok(false),
+    *last_pause_epoch = epoch;
+    // The controller waits for every marker before setting the next boundary.
+    match send_or_shutdown(
+        sender,
+        Event::RotationBarrier { producer_id, epoch },
+        shutdown,
+    )
+    .await?
+    {
+        SendOutcome::Sent => {}
+        SendOutcome::Shutdown(event) => return Ok(Some(TaskExit::Stopped(Some(event)))),
+    }
+    loop {
+        if *rotation_resume.borrow_and_update() >= epoch {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(Some(TaskExit::Stopped(None)));
+                }
+            }
+            changed = rotation_resume.changed() => {
+                changed.context("segment rotation controller stopped before producer resume")?;
+            }
+        }
     }
 }
 
+async fn wait_for_rotation_or_shutdown<T>(
+    wait: impl Future<Output = T>,
+    shutdown: &mut watch::Receiver<bool>,
+    rotation_pause: &mut watch::Receiver<u64>,
+) -> anyhow::Result<ProducerWait<T>> {
+    if *shutdown.borrow() {
+        return Ok(ProducerWait::Stopped);
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                Ok(ProducerWait::Stopped)
+            } else {
+                anyhow::bail!("shutdown watch changed without shutdown")
+            }
+        }
+        changed = rotation_pause.changed() => {
+            changed.context("segment rotation controller stopped before producer pause")?;
+            Ok(ProducerWait::PauseRequested)
+        }
+        value = wait => Ok(ProducerWait::Ready(value)),
+    }
+}
+
+async fn wait_for_stream_reconnect(
+    sender: &mpsc::Sender<Event>,
+    producer_id: usize,
+    rotation_pause: &mut watch::Receiver<u64>,
+    rotation_resume: &mut watch::Receiver<u64>,
+    last_pause_epoch: &mut u64,
+    shutdown: &mut watch::Receiver<bool>,
+    backoff: &mut u64,
+) -> anyhow::Result<Option<TaskExit>> {
+    if let Some(exit) = acknowledge_rotation_pause(
+        producer_id,
+        sender,
+        rotation_pause,
+        rotation_resume,
+        last_pause_epoch,
+        shutdown,
+    )
+    .await?
+    {
+        return Ok(Some(exit));
+    }
+    let delay = *backoff;
+    *backoff = (*backoff * 2).min(30);
+    match wait_for_rotation_or_shutdown(
+        tokio::time::sleep(Duration::from_secs(delay)),
+        shutdown,
+        rotation_pause,
+    )
+    .await?
+    {
+        ProducerWait::Ready(()) => Ok(None),
+        ProducerWait::Stopped => Ok(Some(TaskExit::Stopped(None))),
+        ProducerWait::PauseRequested => {
+            acknowledge_rotation_pause(
+                producer_id,
+                sender,
+                rotation_pause,
+                rotation_resume,
+                last_pause_epoch,
+                shutdown,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn receive_url(
     shard: StreamShard,
     sender: mpsc::Sender<Event>,
@@ -1556,32 +1811,105 @@ async fn receive_url(
     stall_timeout: Duration,
     subscription_proof_timeout: Duration,
     watchdog: ProcessWatchdog,
+    producer_id: usize,
+    mut rotation_pause: watch::Receiver<u64>,
+    mut rotation_resume: watch::Receiver<u64>,
 ) -> anyhow::Result<TaskExit> {
     let streams = shard.streams.iter().cloned().collect::<Vec<_>>();
     let mut coverage_announced = false;
     let mut reconnect_backoff = 1_u64;
+    let mut last_pause_epoch = 0_u64;
 
     loop {
-        let mut websocket =
-            match tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url)).await {
-                Ok(Ok((websocket, _))) => websocket,
-                Ok(Err(error)) if coverage_announced => {
-                    warn!(error = %error, "websocket reconnect failed");
-                    if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
-                        return Ok(TaskExit::Stopped(None));
-                    }
-                    continue;
+        if let Some(exit) = acknowledge_rotation_pause(
+            producer_id,
+            &sender,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &mut shutdown,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+        let connection = match wait_for_rotation_or_shutdown(
+            tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url)),
+            &mut shutdown,
+            &mut rotation_pause,
+        )
+        .await?
+        {
+            ProducerWait::Ready(connection) => connection,
+            ProducerWait::PauseRequested => {
+                if let Some(exit) = acknowledge_rotation_pause(
+                    producer_id,
+                    &sender,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                )
+                .await?
+                {
+                    return Ok(exit);
                 }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) if coverage_announced => {
-                    warn!("websocket reconnect timed out");
-                    if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
-                        return Ok(TaskExit::Stopped(None));
-                    }
-                    continue;
+                continue;
+            }
+            ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+        };
+        let mut websocket = match connection {
+            Ok(Ok((websocket, _))) => websocket,
+            Ok(Err(error)) if coverage_announced => {
+                warn!(error = %error, "websocket reconnect failed");
+                if let Some(exit) = wait_for_stream_reconnect(
+                    &sender,
+                    producer_id,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                    &mut reconnect_backoff,
+                )
+                .await?
+                {
+                    return Ok(exit);
                 }
-                Err(_) => return Err(anyhow::anyhow!("websocket connect timed out")),
-            };
+                continue;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) if coverage_announced => {
+                warn!("websocket reconnect timed out");
+                if let Some(exit) = wait_for_stream_reconnect(
+                    &sender,
+                    producer_id,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                    &mut reconnect_backoff,
+                )
+                .await?
+                {
+                    return Ok(exit);
+                }
+                continue;
+            }
+            Err(_) => return Err(anyhow::anyhow!("websocket connect timed out")),
+        };
+
+        if let Some(exit) = acknowledge_rotation_pause(
+            producer_id,
+            &sender,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &mut shutdown,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
 
         if let Err(error) = websocket
             .send(Message::Text(
@@ -1595,27 +1923,38 @@ async fn receive_url(
                 return Err(error.into());
             }
             warn!(error = %error, "websocket subscription proof request failed");
-            if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
-                return Ok(TaskExit::Stopped(None));
+            if let Some(exit) = wait_for_stream_reconnect(
+                &sender,
+                producer_id,
+                &mut rotation_pause,
+                &mut rotation_resume,
+                &mut last_pause_epoch,
+                &mut shutdown,
+                &mut reconnect_backoff,
+            )
+            .await?
+            {
+                return Ok(exit);
             }
             continue;
         }
 
-        let subscription_proof_deadline = tokio::time::Instant::now() + subscription_proof_timeout;
+        let mut subscription_proof_deadline =
+            tokio::time::Instant::now() + subscription_proof_timeout;
         let mut proof_failure = None;
         let mut proof_events = Vec::new();
         loop {
-            let message = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    changed?;
-                    let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
-                    return Ok(TaskExit::Stopped(None));
-                }
-                message = receive_before_subscription_proof_deadline(
+            let message = match wait_for_rotation_or_shutdown(
+                receive_before_subscription_proof_deadline(
                     subscription_proof_deadline,
                     websocket.next(),
-                ) => match message {
+                ),
+                &mut shutdown,
+                &mut rotation_pause,
+            )
+            .await?
+            {
+                ProducerWait::Ready(message) => match message {
                     Ok(message) => match message {
                         Some(message) => match message {
                             Ok(message) => message,
@@ -1625,7 +1964,8 @@ async fn receive_url(
                             }
                         },
                         None => {
-                            proof_failure = Some("websocket closed before subscription proof".into());
+                            proof_failure =
+                                Some("websocket closed before subscription proof".into());
                             break;
                         }
                     },
@@ -1633,6 +1973,30 @@ async fn receive_url(
                         proof_failure = Some(error.to_string());
                         break;
                     }
+                },
+                ProducerWait::PauseRequested => {
+                    if proof_events.is_empty() {
+                        if let Some(exit) = acknowledge_rotation_pause(
+                            producer_id,
+                            &sender,
+                            &mut rotation_pause,
+                            &mut rotation_resume,
+                            &mut last_pause_epoch,
+                            &mut shutdown,
+                        )
+                        .await?
+                        {
+                            return Ok(exit);
+                        }
+                        subscription_proof_deadline =
+                            tokio::time::Instant::now() + subscription_proof_timeout;
+                    }
+                    continue;
+                }
+                ProducerWait::Stopped => {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
+                    return Ok(TaskExit::Stopped(None));
                 }
             };
             if let Message::Text(text) = message {
@@ -1712,8 +2076,18 @@ async fn receive_url(
             {
                 return Ok(exit);
             }
-            if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
-                return Ok(TaskExit::Stopped(None));
+            if let Some(exit) = wait_for_stream_reconnect(
+                &sender,
+                producer_id,
+                &mut rotation_pause,
+                &mut rotation_resume,
+                &mut last_pause_epoch,
+                &mut shutdown,
+                &mut reconnect_backoff,
+            )
+            .await?
+            {
+                return Ok(exit);
             }
             continue;
         }
@@ -1721,12 +2095,28 @@ async fn receive_url(
         // Only verified exact stream coverage unlocks snapshot requests. Market
         // events received while waiting for the proof were already buffered above.
         let reason = loop {
+            if let Some(exit) = acknowledge_rotation_pause(
+                producer_id,
+                &sender,
+                &mut rotation_pause,
+                &mut rotation_resume,
+                &mut last_pause_epoch,
+                &mut shutdown,
+            )
+            .await?
+            {
+                return Ok(exit);
+            }
             let message = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     changed?;
                     let _ = tokio::time::timeout(Duration::from_secs(5), websocket.close(None)).await;
                     return Ok(TaskExit::Stopped(None));
+                }
+                changed = rotation_pause.changed() => {
+                    changed.context("segment rotation controller stopped before producer pause")?;
+                    continue;
                 }
                 message = tokio::time::timeout(stall_timeout, websocket.next()) => match message {
                     Ok(Some(Ok(message))) => message,
@@ -1738,8 +2128,7 @@ async fn receive_url(
             if let Message::Text(text) = message {
                 watchdog.mark_data();
                 let received_at_ns = now_ns()?;
-                let frame = serde_json::from_str(&text)?;
-                let event = event_from_frame(frame, received_at_ns)?;
+                let event = event_from_frame(serde_json::from_str(&text)?, received_at_ns)?;
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {}
                     SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
@@ -1759,8 +2148,18 @@ async fn receive_url(
         {
             return Ok(exit);
         }
-        if wait_for_stream_reconnect(&mut shutdown, &mut reconnect_backoff).await? {
-            return Ok(TaskExit::Stopped(None));
+        if let Some(exit) = wait_for_stream_reconnect(
+            &sender,
+            producer_id,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &mut shutdown,
+            &mut reconnect_backoff,
+        )
+        .await?
+        {
+            return Ok(exit);
         }
     }
 }
@@ -1789,20 +2188,40 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn produce_snapshots_after_streams_connect(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
     mut stream_connected: mpsc::Receiver<Vec<String>>,
     expected_shards: usize,
+    producer_id: usize,
+    mut rotation_pause: watch::Receiver<u64>,
+    mut rotation_resume: watch::Receiver<u64>,
 ) -> anyhow::Result<TaskExit> {
     let mut shards = Vec::with_capacity(expected_shards);
-    for _ in 0..expected_shards {
+    let mut last_pause_epoch = 0_u64;
+    while shards.len() < expected_shards {
+        if let Some(exit) = acknowledge_rotation_pause(
+            producer_id,
+            &sender,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &mut shutdown,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 changed?;
                 return Ok(TaskExit::Stopped(None));
+            }
+            changed = rotation_pause.changed() => {
+                changed.context("segment rotation controller stopped before snapshot producer pause")?;
             }
             connected = stream_connected.recv() => {
                 shards.push(connected.context("websocket producer stopped before connecting")?);
@@ -1820,7 +2239,16 @@ async fn produce_snapshots_after_streams_connect(
         SendOutcome::Sent => {}
         SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
     }
-    produce_snapshots(config, sender, shutdown).await
+    produce_snapshots(
+        config,
+        sender,
+        shutdown,
+        producer_id,
+        rotation_pause,
+        rotation_resume,
+        last_pause_epoch,
+    )
+    .await
 }
 
 fn validate_subscription_listing(
@@ -1883,33 +2311,106 @@ async fn produce_snapshots(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
+    producer_id: usize,
+    mut rotation_pause: watch::Receiver<u64>,
+    mut rotation_resume: watch::Receiver<u64>,
+    mut last_pause_epoch: u64,
 ) -> anyhow::Result<TaskExit> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
     let interval = Duration::from_secs_f64(1.0 / config.snapshot_requests_per_second.max(0.1));
-    for symbol in config.active_symbols() {
-        if *shutdown.borrow() {
-            return Ok(TaskExit::Stopped(None));
-        }
+    'symbols: for symbol in config.active_symbols() {
         let started = now_ns()?;
-        let snapshot = match fetch_snapshot(&client, &config, &symbol, &mut shutdown).await {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return Ok(TaskExit::Stopped(None)),
-            Err(error) => {
-                if error.downcast_ref::<SnapshotUnavailable>().is_some() {
-                    let event = Event::ExcludeSymbol {
-                        symbol: symbol.clone(),
-                        reason: error.to_string(),
-                    };
-                    match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                        SendOutcome::Sent => continue,
-                        SendOutcome::Shutdown(event) => {
-                            return Ok(TaskExit::Stopped(Some(event)));
+        let mut attempt = 0_usize;
+        let mut retry_deadline = None;
+        let snapshot = loop {
+            if let Some(exit) = acknowledge_rotation_pause(
+                producer_id,
+                &sender,
+                &mut rotation_pause,
+                &mut rotation_resume,
+                &mut last_pause_epoch,
+                &mut shutdown,
+            )
+            .await?
+            {
+                return Ok(exit);
+            }
+            if *shutdown.borrow() {
+                return Ok(TaskExit::Stopped(None));
+            }
+            if let Some(deadline) = retry_deadline {
+                match wait_for_rotation_or_shutdown(
+                    tokio::time::sleep_until(deadline),
+                    &mut shutdown,
+                    &mut rotation_pause,
+                )
+                .await?
+                {
+                    ProducerWait::Ready(()) => retry_deadline = None,
+                    ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+                    ProducerWait::PauseRequested => {
+                        if let Some(exit) = acknowledge_rotation_pause(
+                            producer_id,
+                            &sender,
+                            &mut rotation_pause,
+                            &mut rotation_resume,
+                            &mut last_pause_epoch,
+                            &mut shutdown,
+                        )
+                        .await?
+                        {
+                            return Ok(exit);
                         }
+                        continue;
                     }
                 }
-                return Err(error);
+            }
+            match wait_for_rotation_or_shutdown(
+                fetch_snapshot_attempt(&client, &config, &symbol, attempt),
+                &mut shutdown,
+                &mut rotation_pause,
+            )
+            .await?
+            {
+                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Snapshot(snapshot))) => {
+                    break snapshot;
+                }
+                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Retry(delay))) => {
+                    attempt += 1;
+                    retry_deadline = Some(tokio::time::Instant::now() + delay);
+                }
+                ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+                ProducerWait::PauseRequested => {
+                    if let Some(exit) = acknowledge_rotation_pause(
+                        producer_id,
+                        &sender,
+                        &mut rotation_pause,
+                        &mut rotation_resume,
+                        &mut last_pause_epoch,
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
+                }
+                ProducerWait::Ready(Err(error)) => {
+                    if error.downcast_ref::<SnapshotUnavailable>().is_some() {
+                        let event = Event::ExcludeSymbol {
+                            symbol: symbol.clone(),
+                            reason: error.to_string(),
+                        };
+                        match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                            SendOutcome::Sent => continue 'symbols,
+                            SendOutcome::Shutdown(event) => {
+                                return Ok(TaskExit::Stopped(Some(event)));
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
             }
         };
         if snapshot
@@ -1924,18 +2425,40 @@ async fn produce_snapshots(
             };
             match send_or_shutdown(&sender, event, &mut shutdown).await? {
                 SendOutcome::Sent => {
-                    if wait_or_shutdown(&mut shutdown, interval).await {
-                        return Ok(TaskExit::Stopped(None));
+                    match wait_for_rotation_or_shutdown(
+                        tokio::time::sleep(interval),
+                        &mut shutdown,
+                        &mut rotation_pause,
+                    )
+                    .await?
+                    {
+                        ProducerWait::Ready(()) => continue 'symbols,
+                        ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+                        ProducerWait::PauseRequested => {
+                            if let Some(exit) = acknowledge_rotation_pause(
+                                producer_id,
+                                &sender,
+                                &mut rotation_pause,
+                                &mut rotation_resume,
+                                &mut last_pause_epoch,
+                                &mut shutdown,
+                            )
+                            .await?
+                            {
+                                return Ok(exit);
+                            }
+                            continue 'symbols;
+                        }
                     }
-                    continue;
                 }
                 SendOutcome::Shutdown(event) => {
                     return Ok(TaskExit::Stopped(Some(event)));
                 }
             }
         }
+        let received_at_ns = now_ns()?;
         let event = Event::Snapshot {
-            received_at_ns: now_ns()?,
+            received_at_ns,
             symbol: symbol.clone(),
             request_started_at_ns: started,
             snapshot,
@@ -1944,8 +2467,29 @@ async fn produce_snapshots(
             SendOutcome::Sent => {}
             SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
         }
-        if wait_or_shutdown(&mut shutdown, interval).await {
-            return Ok(TaskExit::Stopped(None));
+        match wait_for_rotation_or_shutdown(
+            tokio::time::sleep(interval),
+            &mut shutdown,
+            &mut rotation_pause,
+        )
+        .await?
+        {
+            ProducerWait::Ready(()) => {}
+            ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+            ProducerWait::PauseRequested => {
+                if let Some(exit) = acknowledge_rotation_pause(
+                    producer_id,
+                    &sender,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                )
+                .await?
+                {
+                    return Ok(exit);
+                }
+            }
         }
     }
     match send_or_shutdown(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
@@ -1953,72 +2497,114 @@ async fn produce_snapshots(
         SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
     }
     // Keep the producer alive so a normal completion is not mistaken for a session failure.
-    shutdown.changed().await?;
-    Ok(TaskExit::Stopped(None))
+    loop {
+        if let Some(exit) = acknowledge_rotation_pause(
+            producer_id,
+            &sender,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &mut shutdown,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                changed?;
+                return Ok(TaskExit::Stopped(None));
+            }
+            changed = rotation_pause.changed() => {
+                changed.context("segment rotation controller stopped before snapshot producer pause")?;
+            }
+        }
+    }
 }
 
+enum SnapshotFetchAttempt {
+    Snapshot(Value),
+    Retry(Duration),
+}
+
+async fn fetch_snapshot_attempt(
+    client: &reqwest::Client,
+    config: &Config,
+    symbol: &str,
+    attempt: usize,
+) -> anyhow::Result<SnapshotFetchAttempt> {
+    let path = match config.market {
+        Market::Spot => "/api/v3/depth",
+        Market::Usdm => "/fapi/v1/depth",
+    };
+    let limit = config.snapshot_limit.to_string();
+    let response = client
+        .get(format!("{}{path}", config.rest_base))
+        .query(&[("symbol", symbol), ("limit", limit.as_str())])
+        .send()
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        let snapshot = response.json::<Value>().await?;
+        if snapshot
+            .get("lastUpdateId")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
+        }
+        return Ok(SnapshotFetchAttempt::Snapshot(snapshot));
+    }
+    let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    if !retryable || attempt + 1 == config.snapshot_retry_attempts {
+        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|payload| payload["code"].as_i64())
+                == Some(-1121)
+        {
+            return Err(SnapshotUnavailable {
+                symbol: symbol.to_owned(),
+                status,
+            }
+            .into());
+        }
+        anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
+    }
+    let delay = snapshot_retry_delay(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        attempt,
+    );
+    warn!(%symbol, %status, ?delay, "snapshot request retrying");
+    Ok(SnapshotFetchAttempt::Retry(delay))
+}
+
+#[cfg(test)]
 async fn fetch_snapshot(
     client: &reqwest::Client,
     config: &Config,
     symbol: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Option<Value>> {
-    let path = match config.market {
-        Market::Spot => "/api/v3/depth",
-        Market::Usdm => "/fapi/v1/depth",
-    };
-    let limit = config.snapshot_limit.to_string();
     for attempt in 0..config.snapshot_retry_attempts {
-        let response = client
-            .get(format!("{}{path}", config.rest_base))
-            .query(&[("symbol", symbol), ("limit", limit.as_str())])
-            .send()
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            let snapshot = response.json::<Value>().await?;
-            if snapshot
-                .get("lastUpdateId")
-                .and_then(Value::as_u64)
-                .is_none()
-            {
-                anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
-            }
-            return Ok(Some(snapshot));
-        }
-        let retryable =
-            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-        if !retryable || attempt + 1 == config.snapshot_retry_attempts {
-            let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::BAD_REQUEST
-                && serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|payload| payload["code"].as_i64())
-                    == Some(-1121)
-            {
-                return Err(SnapshotUnavailable {
-                    symbol: symbol.to_owned(),
-                    status,
+        match fetch_snapshot_attempt(client, config, symbol, attempt).await? {
+            SnapshotFetchAttempt::Snapshot(snapshot) => return Ok(Some(snapshot)),
+            SnapshotFetchAttempt::Retry(delay) => {
+                if wait_or_shutdown(shutdown, delay).await {
+                    return Ok(None);
                 }
-                .into());
             }
-            anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
-        }
-        let delay = snapshot_retry_delay(
-            response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            attempt,
-        );
-        warn!(%symbol, %status, ?delay, "snapshot request retrying");
-        if wait_or_shutdown(shutdown, delay).await {
-            return Ok(None);
         }
     }
     unreachable!("snapshot_retry_attempts is at least one")
 }
 
+#[cfg(test)]
 async fn wait_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
     if *shutdown.borrow() {
         return true;
@@ -3237,9 +3823,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_proof_deadline_bounds_a_full_archive_queue() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let event_time_ms = now_ns().unwrap() / 1_000_000;
         let server = tokio::spawn(async move {
@@ -3267,6 +3851,8 @@ mod tests {
         sender.send(Event::InitialSnapshotsComplete).await.unwrap();
         let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let shard = StreamShard {
             url: format!("ws://{address}"),
             streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
@@ -3282,6 +3868,9 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_millis(50),
                 ProcessWatchdog::new_state(),
+                0,
+                pause_rx,
+                resume_rx,
             ),
         )
         .await
@@ -3368,6 +3957,8 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(8);
         let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
         let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let shard = StreamShard {
             url: format!("ws://{address}"),
             streams: BTreeSet::from([
@@ -3384,6 +3975,9 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(50),
             ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
         ));
         let mut saw_disconnect = false;
         let mut saw_reconnect = false;
@@ -3418,6 +4012,362 @@ mod tests {
             TaskExit::Stopped(None)
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_during_websocket_connect_acknowledges_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let (sender, mut receiver) = mpsc::channel(2);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+        accepted_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pause_during_subscription_proof_acknowledges_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            let _ = proof_tx.send(());
+            let _ = websocket.next().await;
+        });
+        let (sender, mut receiver) = mpsc::channel(2);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+        proof_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_reconnect_proof_event_drains_before_rotation_barrier() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (market_frame_tx, market_frame_rx) = tokio::sync::oneshot::channel();
+        let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": SUBSCRIPTION_PROOF_ID,
+                        "result": ["btcusdt@aggTrade", "btcusdt@depth@100ms"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "stream": "btcusdt@aggTrade",
+                        "data": {
+                            "e": "aggTrade",
+                            "E": event_time_ms,
+                            "s": "BTCUSDT",
+                            "a": 1,
+                            "f": 1,
+                            "l": 1,
+                            "p": "100",
+                            "q": "1",
+                            "T": event_time_ms,
+                            "m": false
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            market_frame_tx.send(()).unwrap();
+            proof_rx.await.unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": SUBSCRIPTION_PROOF_ID,
+                        "result": ["btcusdt@aggTrade", "btcusdt@depth@100ms"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from([
+                    "btcusdt@aggTrade".to_owned(),
+                    "btcusdt@depth@100ms".to_owned(),
+                ]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_secs(20),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        market_frame_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pause_tx.send(1).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "rotation barrier acknowledged before the buffered proof event was verified"
+        );
+        proof_tx.send(()).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::StreamReconnected { .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::AggregateTrade { .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_reconnect_proof_timeout_acknowledges_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let event_time_ms = now_ns().unwrap() / 1_000_000;
+        let (market_frame_tx, market_frame_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": SUBSCRIPTION_PROOF_ID,
+                        "result": ["btcusdt@aggTrade", "btcusdt@depth@100ms"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "stream": "btcusdt@aggTrade",
+                        "data": {
+                            "e": "aggTrade",
+                            "E": event_time_ms,
+                            "s": "BTCUSDT",
+                            "a": 1,
+                            "f": 1,
+                            "l": 1,
+                            "p": "100",
+                            "q": "1",
+                            "T": event_time_ms,
+                            "m": false
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            market_frame_tx.send(()).unwrap();
+            let _ = websocket.next().await;
+        });
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let task = tokio::spawn(receive_url(
+            StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from([
+                    "btcusdt@aggTrade".to_owned(),
+                    "btcusdt@depth@100ms".to_owned(),
+                ]),
+            },
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_millis(400),
+            ProcessWatchdog::new_state(),
+            0,
+            pause_rx,
+            resume_rx,
+        ));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        market_frame_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        pause_tx.send(1).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "rotation barrier acknowledged before the buffered proof event timed out"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -3640,12 +4590,17 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (connected_tx, connected_rx) = mpsc::channel(2);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let producer = tokio::spawn(produce_snapshots_after_streams_connect(
             config,
             sender,
             shutdown_rx,
             connected_rx,
             2,
+            2,
+            pause_rx,
+            resume_rx,
         ));
 
         connected_tx
@@ -3711,7 +4666,17 @@ mod tests {
         config.snapshot_requests_per_second = 1_000.0;
         let (sender, mut receiver) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let producer = tokio::spawn(produce_snapshots(Arc::new(config), sender, shutdown_rx));
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
 
         assert!(matches!(
             receiver.recv().await,
@@ -3758,8 +4723,18 @@ mod tests {
         config.snapshot_requests_per_second = 5.0;
         let (sender, mut receiver) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
 
-        let producer = tokio::spawn(produce_snapshots(Arc::new(config), sender, shutdown_rx));
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
 
         match receiver.recv().await {
             Some(Event::ExcludeSymbol { symbol, reason }) => {
@@ -3774,6 +4749,221 @@ mod tests {
             Some(Event::Snapshot { symbol, .. }) if symbol == "BTCUSDT"
         ));
         assert!(exclusion_received.elapsed() >= Duration::from_millis(150));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_during_snapshot_fetch_acknowledges_rotation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            assert!(first.read(&mut request).await.unwrap() > 0);
+            let _ = first_request_tx.send(());
+            let first_reader = tokio::spawn(async move {
+                let mut ignored = [0_u8; 1];
+                let _ = first.read(&mut ignored).await;
+            });
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            assert!(second.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
+            second
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first_reader.abort();
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.snapshot_requests_per_second = 1_000.0;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
+
+        first_request_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, .. }) if symbol == "BTCUSDT"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_during_snapshot_backoff_preserves_retry_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+        let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            assert!(first.read(&mut request).await.unwrap() > 0);
+            first
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            first_response_tx.send(()).unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert!(second.read(&mut request).await.unwrap() > 0);
+            let _ = second_request_tx.send(());
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.snapshot_requests_per_second = 1_000.0;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
+
+        first_response_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), second_request_rx)
+                .await
+                .is_err(),
+            "snapshot retry ignored Retry-After after a rotation pause"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn pause_during_snapshot_interval_acknowledges_rotation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.snapshot_requests_per_second = 0.1;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+        ));
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, .. }) if symbol == "BTCUSDT"
+        ));
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
         assert!(matches!(
             receiver.recv().await,
             Some(Event::InitialSnapshotsComplete)
@@ -4912,7 +6102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_drain_processes_queued_events_before_segment_boundary() {
+    async fn rotation_barriers_drain_captured_events_before_segment_boundary() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
         config.spool_dir = root.path().to_path_buf();
@@ -4925,7 +6115,11 @@ mod tests {
         let mut budget = PendingBudget::new(config.max_pending_diffs);
         let mut process_state = ProcessState::new(false);
         let (sender, mut receiver) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, mut pause_rx) = watch::channel(0_u64);
+        let (resume_tx, mut resume_rx) = watch::channel(0_u64);
+        let (captured_at_tx, captured_at_rx) = tokio::sync::oneshot::channel();
         sender
             .send(Event::StreamDisconnected {
                 streams: vec!["btcusdt@depth@100ms".into()],
@@ -4936,52 +6130,149 @@ mod tests {
         let blocked_sender = sender.clone();
         let blocked_task = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
+            let received_at_ns = now_ns()?;
+            captured_at_tx.send(received_at_ns).unwrap();
             send_or_shutdown(
                 &blocked_sender,
-                Event::StreamReconnected {
-                    streams: vec!["btcusdt@depth@100ms".into()],
+                Event::Snapshot {
+                    received_at_ns,
+                    symbol: "BTCUSDT".into(),
+                    request_started_at_ns: received_at_ns,
+                    snapshot: json!({
+                        "lastUpdateId": 1,
+                        "bids": [["100", "1"]],
+                        "asks": [["101", "1"]]
+                    }),
                 },
+                &mut shutdown_rx,
+            )
+            .await?;
+            let mut last_pause_epoch = 0;
+            acknowledge_rotation_pause(
+                0,
+                &blocked_sender,
+                &mut pause_rx,
+                &mut resume_rx,
+                &mut last_pause_epoch,
                 &mut shutdown_rx,
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(ACTIVE_SENDS.load(Ordering::Acquire) > 0);
+        let captured_at_ns = captured_at_rx.await.unwrap();
+        pause_tx.send(1).unwrap();
 
-        let action = drain_events_before_segment_rotation(
-            &config,
-            &mut receiver,
-            &mut segment,
-            &mut states,
-            &mut budget,
-            "session-1",
-            &mut process_state,
-            1,
+        let barriers = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut tasks,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                &mut process_state,
+                1,
+                1,
+            ),
         )
+        .await
+        .expect("rotation barriers deadlocked on a full archive queue")
         .unwrap();
 
-        assert_eq!(action, ProcessAction::None);
-        wait_for_active_sends_before_rotation().await.unwrap();
-        let queued_after_sends = receiver.len();
-        let action = drain_events_before_segment_rotation(
-            &config,
-            &mut receiver,
-            &mut segment,
-            &mut states,
-            &mut budget,
-            "session-1",
-            &mut process_state,
-            queued_after_sends,
-        )
-        .unwrap();
-        assert_eq!(action, ProcessAction::None);
-        assert!(matches!(
-            blocked_task.await.unwrap().unwrap(),
-            SendOutcome::Sent
-        ));
+        assert_eq!(
+            barriers,
+            RotationBarrierResult::Ready {
+                initial_snapshots_complete: false
+            }
+        );
+        assert!(captured_at_ns < now_ns().unwrap());
+        assert_eq!(segment.event_count("snapshot"), 1);
         assert!(receiver.try_recv().is_err());
         assert!(!segment.is_replay_safe());
-        drop(segment);
+        let mut closing_segment = segment;
+        let next_segment = begin_segment_rotation(
+            &mut closing_segment,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        assert!(captured_at_ns <= next_segment.start_ns);
+        tokio::task::yield_now().await;
+        assert!(!blocked_task.is_finished());
+        resume_tx.send(1).unwrap();
+        assert!(blocked_task.await.unwrap().unwrap().is_none());
+        drop(next_segment);
+        drop(closing_segment);
+    }
+
+    #[tokio::test]
+    async fn rotation_barrier_observes_unexpected_producer_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = config
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
+            .collect::<HashMap<_, _>>();
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { Ok::<_, anyhow::Error>(TaskExit::Stopped(None)) });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut tasks,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                &mut process_state,
+                1,
+                1,
+            ),
+        )
+        .await
+        .expect("rotation barrier wait must observe an exited producer");
+        assert!(result.is_err());
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn failed_rotation_close_leaves_next_segment_for_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let start_ns = now_ns().unwrap();
+        let mut segment = Segment::create(config.segment_config(), start_ns).unwrap();
+        segment
+            .write("session_start", json!({"session_id":"session-1"}), start_ns)
+            .unwrap();
+        let (date, hour) = segment_partition(start_ns).unwrap();
+        std::fs::remove_file(
+            root.path()
+                .join(format!("date={date}"))
+                .join(format!("hour={hour}"))
+                .join(format!("part-{start_ns}.jsonl.part")),
+        )
+        .unwrap();
+        let next_segment = Segment::create(config.segment_config(), start_ns + 1).unwrap();
+        let (resume_tx, mut resume_rx) = watch::channel(0_u64);
+
+        assert!(finish_segment_rotation(&mut segment, next_segment, &resume_tx, 1).is_err());
+        assert_eq!(*resume_rx.borrow_and_update(), 1);
+
+        segment.mark_replay_unsafe();
+        assert!(segment.close().unwrap().is_none());
     }
 
     #[test]
