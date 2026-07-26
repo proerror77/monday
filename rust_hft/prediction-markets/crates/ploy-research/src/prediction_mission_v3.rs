@@ -306,9 +306,7 @@ pub fn authenticate_prediction_mission_v3_inputs(
         ),
         snapshot_contract_id: AuthenticatedDigest(snapshot.snapshot_contract_id().to_string()),
         snapshot_hash: AuthenticatedDigest(snapshot.snapshot_hash().to_string()),
-        search_policy_snapshot_id: AuthenticatedDigest(
-            snapshot.causal_projection_policy_id().to_string(),
-        ),
+        search_policy_snapshot_id: AuthenticatedDigest(current_policy),
         source_kind: snapshot.source_kind().to_string(),
     })
 }

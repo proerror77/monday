@@ -21,7 +21,8 @@ use crate::prediction_loop::{
     PredictionResearchMission, ProposedProbabilityBlend,
 };
 use crate::prediction_mission_v3::{
-    AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionProductSymbol,
+    prediction_mission_v3_sha256, validate_prediction_mission_v3, AdmittedPredictionMissionV3,
+    AdmittedPredictionTask, PredictionProductSymbol, PredictionResearchMissionV3,
 };
 
 const CHECKPOINT_VERSION: u32 = 3;
@@ -700,9 +701,65 @@ impl PredictionMctsEngine {
         max_depth: usize,
         component_profile: SettlementProbabilityComponentProfile,
     ) -> Result<Self, String> {
+        identity.reject_unadmitted_legacy_bridge()?;
+        Self::new_core(
+            mission,
+            identity,
+            baseline,
+            llm_advice,
+            seed,
+            exploration,
+            max_depth,
+            component_profile,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_admitted_mission(
+        mission: &PredictionResearchMissionV3,
+        admitted: &AdmittedPredictionMissionV3,
+        bridge: &PredictionResearchMission,
+        baseline: ProposedProbabilityBlend,
+        llm_advice: Vec<ProposedProbabilityBlend>,
+        seed: u64,
+        exploration: f64,
+        max_depth: usize,
+        component_profile: SettlementProbabilityComponentProfile,
+    ) -> Result<Self, String> {
+        validate_prediction_mission_v3(mission)?;
+        if prediction_mission_v3_sha256(mission)? != admitted.mission_sha256
+            || mission.search_budget != bridge.search_budget
+            || mission.search_policy_snapshot_id != current_prediction_policy_snapshot_id()
+            || admitted.search_policy_snapshot_id != mission.search_policy_snapshot_id
+            || bridge.search_policy_snapshot_id != mission.search_policy_snapshot_id
+        {
+            return Err("admitted Mission v4 does not match its MCTS bridge".to_string());
+        }
+        Self::new_core(
+            bridge,
+            PredictionMctsIdentity::from_admitted_mission(admitted)?,
+            baseline,
+            llm_advice,
+            seed,
+            exploration,
+            max_depth,
+            component_profile,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_core(
+        mission: &PredictionResearchMission,
+        identity: PredictionMctsIdentity,
+        baseline: ProposedProbabilityBlend,
+        llm_advice: Vec<ProposedProbabilityBlend>,
+        seed: u64,
+        exploration: f64,
+        max_depth: usize,
+        component_profile: SettlementProbabilityComponentProfile,
+    ) -> Result<Self, String> {
         validate_prediction_mission(mission, &current_prediction_policy_snapshot_id())?;
         identity.validate()?;
-        identity.reject_unadmitted_legacy_bridge()?;
         if identity.mission_id != mission.mission_id
             || identity.data_snapshot_id != mission.data_snapshot_id
         {
@@ -818,6 +875,19 @@ impl PredictionMctsEngine {
             });
         }
         Err("prediction MCTS could not produce a novel candidate".to_string())
+    }
+
+    pub(crate) fn has_expandable_candidate(&self) -> Result<bool, String> {
+        if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
+            return Ok(false);
+        }
+        Ok(select_expandable(
+            &self.checkpoint.nodes,
+            0,
+            self.checkpoint.config.exploration,
+        )
+        .map_err(|error| error.to_string())?
+        .is_some())
     }
 
     pub fn evaluate_and_observe<E: PredictionTrainingEvaluator>(
