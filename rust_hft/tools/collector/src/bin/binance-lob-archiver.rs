@@ -2008,6 +2008,7 @@ async fn receive_url(
                     }
                 },
                 ProducerWait::PauseRequested => {
+                    let buffered_proof_interrupted = !proof_events.is_empty();
                     if let Some(exit) = acknowledge_rotation_pause(
                         producer_id,
                         &sender,
@@ -2020,10 +2021,13 @@ async fn receive_url(
                     {
                         return Ok(exit);
                     }
-                    if proof_events.is_empty() {
-                        subscription_proof_deadline =
-                            tokio::time::Instant::now() + subscription_proof_timeout;
+                    if buffered_proof_interrupted {
+                        proof_failure =
+                            Some("segment rotation interrupted buffered subscription proof".into());
+                        break;
                     }
+                    subscription_proof_deadline =
+                        tokio::time::Instant::now() + subscription_proof_timeout;
                     continue;
                 }
                 ProducerWait::Stopped => {
@@ -4179,7 +4183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_reconnect_proof_event_acknowledges_rotation() {
+    async fn buffered_reconnect_proof_event_is_abandoned_after_rotation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let event_time_ms = now_ns().unwrap() / 1_000_000;
@@ -4289,12 +4293,10 @@ mod tests {
         resume_tx.send(1).unwrap();
         proof_tx.send(()).unwrap();
         assert!(matches!(
-            receiver.recv().await,
-            Some(Event::StreamReconnected { .. })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(Event::AggregateTrade { .. })
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
         ));
         shutdown_tx.send(true).unwrap();
         assert!(matches!(
