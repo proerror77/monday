@@ -4,6 +4,7 @@
 //! scoring. Factor review, walk-forward, and optimizer jobs should consume the
 //! resulting immutable snapshot artifacts instead of rebuilding raw joins.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,10 +24,14 @@ use ploy_market_data::polymarket_evidence::{
 use ploy_research::prediction_mission_v3::{
     parse_prediction_mission_json, validate_prediction_mission_v3, ParsedPredictionMission,
 };
-use ploy_research::prediction_mission_v3::{PredictionMissionTask, PredictionTaskKind};
+use ploy_research::prediction_mission_v3::{
+    PredictionAuthorityProfile, PredictionMissionCapability, PredictionMissionTask,
+    PredictionRunMode, PredictionTaskKind,
+};
 use ploy_research::research_snapshot::{
     admit_cached_authenticated_research_snapshot, authenticate_ready_event_cohort,
     AuthenticatedSnapshotMaterializationRequest, ResearchSnapshotInputArtifact,
+    POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
 };
 use ploy_research::{
     build_research_snapshot_from_database,
@@ -160,21 +165,28 @@ fn snapshot_admission_protocol_response(
         },
     );
     match admission {
-        Ok(snapshot) => serde_json::json!({
-            "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
-            "status": "admitted",
-            "snapshot_contract_id": snapshot.snapshot_contract_id(),
-            "snapshot_digest": snapshot.snapshot_hash(),
-            "partition_digest": partition_digest,
-            "policy_identity": policy_identity,
-            "task_capability": BTC_5M_BACKTEST_CAPABILITY,
-            "task": request.task,
-            "cohort_partition_id": request.cohort_partition_id,
-            "cohort_manifest_id": cohort.manifest_id(),
-            "immutable_image_identity": request.compiler_image_identity,
-        }),
+        Ok(snapshot) if is_supported_snapshot_authority(snapshot.source_kind()) => {
+            serde_json::json!({
+                "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+                "status": "admitted",
+                "snapshot_contract_id": snapshot.snapshot_contract_id(),
+                "snapshot_digest": snapshot.snapshot_hash(),
+                "partition_digest": partition_digest,
+                "policy_identity": policy_identity,
+                "task_capability": BTC_5M_BACKTEST_CAPABILITY,
+                "task": request.task,
+                "cohort_partition_id": request.cohort_partition_id,
+                "cohort_manifest_id": cohort.manifest_id(),
+                "immutable_image_identity": request.compiler_image_identity,
+            })
+        }
+        Ok(_) => snapshot_admission_rejection("authority_mismatch"),
         Err(rejection) => snapshot_admission_rejection(rejection.code()),
     }
+}
+
+fn is_supported_snapshot_authority(source_kind: &str) -> bool {
+    source_kind == POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
 }
 
 fn is_supported_btc_5m_task(task: &PredictionMissionTask) -> bool {
@@ -195,6 +207,15 @@ fn validate_mission_admission_identity(
         return Err("invalid_mission");
     };
     validate_prediction_mission_v3(&mission).map_err(|_| "invalid_mission")?;
+    if mission.run_mode != PredictionRunMode::PipelineSmoke {
+        return Err("unsupported_run_mode");
+    }
+    if mission.authority_profile != PredictionAuthorityProfile::PolymarketChainlinkBaseline
+        || mission.required_capabilities
+            != BTreeSet::from([PredictionMissionCapability::PolymarketChainlink])
+    {
+        return Err("authority_mismatch");
+    }
     if mission.mission_id != request.mission_id
         || mission.task != request.task
         || mission.cohort_manifest_id != cohort_manifest_id
@@ -924,6 +945,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_admission_accepts_only_the_baseline_snapshot_authority() {
+        assert!(super::is_supported_snapshot_authority(
+            ploy_research::research_snapshot::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        ));
+        assert!(!super::is_supported_snapshot_authority(
+            "verified_immutable_artifacts"
+        ));
+    }
+
+    #[test]
     fn snapshot_admission_protocol_rejects_a_verified_artifact_with_the_wrong_partition() {
         let root = tempfile::tempdir().expect("create catalog root");
         let catalog = PolymarketReadyEventCatalog::default();
@@ -1004,7 +1035,7 @@ mod tests {
             "side": "up",
             "prediction_horizon_secs": 10,
         });
-        let mut task_mismatched_request = request;
+        let mut task_mismatched_request = request.clone();
         task_mismatched_request.mission_json = task_mismatched.to_string();
         assert_eq!(
             super::validate_mission_admission_identity(
@@ -1013,6 +1044,36 @@ mod tests {
                 &cohort_manifest_id,
             ),
             Err("mission_mismatch")
+        );
+
+        let mut research_trial = serde_json::from_str::<serde_json::Value>(&request.mission_json)
+            .expect("parse mission");
+        research_trial["run_mode"] = serde_json::json!("research_trial");
+        let mut research_trial_request = request.clone();
+        research_trial_request.mission_json = research_trial.to_string();
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &research_trial_request,
+                &policy_identity,
+                &cohort_manifest_id,
+            ),
+            Err("unsupported_run_mode")
+        );
+
+        let mut binance = serde_json::from_str::<serde_json::Value>(&request.mission_json)
+            .expect("parse mission");
+        binance["authority_profile"] = serde_json::json!("polymarket_chainlink_binance");
+        binance["required_capabilities"] =
+            serde_json::json!(["polymarket_chainlink", "binance_context"]);
+        let mut binance_request = request;
+        binance_request.mission_json = binance.to_string();
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &binance_request,
+                &policy_identity,
+                &cohort_manifest_id,
+            ),
+            Err("authority_mismatch")
         );
     }
 

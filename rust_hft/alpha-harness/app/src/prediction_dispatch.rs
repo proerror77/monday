@@ -726,7 +726,8 @@ fn admit_submission_before_deadline(
                 .context("write snapshot admission request"),
         );
     });
-    let write_result = match write_receiver.recv_timeout(remaining_admission_time(
+    let write_result = match write_receiver.recv_timeout(remaining_admission_time_or_reap(
+        &mut child,
         deadline,
         "snapshot admission sibling request",
     )?) {
@@ -755,7 +756,8 @@ fn admit_submission_before_deadline(
     let reader = thread::spawn(move || {
         let _ = sender.send(read_bounded_admission_response(stdout));
     });
-    let output = match receiver.recv_timeout(remaining_admission_time(
+    let output = match receiver.recv_timeout(remaining_admission_time_or_reap(
+        &mut child,
         deadline,
         "snapshot admission sibling response",
     )?) {
@@ -865,6 +867,20 @@ fn remaining_admission_time(deadline: Instant, phase: &str) -> anyhow::Result<Du
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .with_context(|| format!("{phase} exhausted snapshot admission timeout"))
+}
+
+fn remaining_admission_time_or_reap(
+    child: &mut Child,
+    deadline: Instant,
+    phase: &str,
+) -> anyhow::Result<Duration> {
+    match remaining_admission_time(deadline, phase) {
+        Ok(remaining) => Ok(remaining),
+        Err(error) => {
+            terminate_admission_child(child);
+            Err(error)
+        }
+    }
 }
 
 fn read_bounded_admission_response(mut reader: impl Read) -> anyhow::Result<Vec<u8>> {
@@ -1892,6 +1908,28 @@ mod tests {
             .expect_err("response-stalling sibling must be killed and reaped");
 
         assert!(error.to_string().contains("did not exit"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_admission_deadline_kills_and_reaps_the_sibling() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start deadline-exhausted sibling");
+
+        let error = remaining_admission_time_or_reap(
+            &mut child,
+            Instant::now(),
+            "snapshot admission sibling response",
+        )
+        .expect_err("an exhausted deadline must terminate the sibling");
+
+        assert!(error.to_string().contains("exhausted"), "{error:#}");
+        assert!(child.try_wait().expect("poll reaped sibling").is_some());
     }
 
     #[test]
