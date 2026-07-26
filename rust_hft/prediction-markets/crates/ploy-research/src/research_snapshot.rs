@@ -509,7 +509,7 @@ where
     })?);
     let snapshot_dir = request.cache_root.join(format!("sha256={cache_key}"));
     if snapshot_dir.exists() {
-        return admit_cached_authenticated_snapshot(cohort, request, snapshot_dir);
+        return admit_cached_authenticated_snapshot_at(cohort, request, snapshot_dir);
     }
 
     let mut snapshot =
@@ -541,7 +541,7 @@ where
         match fs::rename(&staging_dir, &snapshot_dir) {
             Ok(()) => admitted_snapshot(cohort, &staged_snapshot, snapshot_dir.clone()),
             Err(_) if snapshot_dir.exists() => {
-                admit_cached_authenticated_snapshot(cohort, request, snapshot_dir.clone())
+                admit_cached_authenticated_snapshot_at(cohort, request, snapshot_dir.clone())
             }
             Err(error) => Err(
                 AuthenticatedResearchSnapshotRejection::MaterializationFailed {
@@ -566,7 +566,37 @@ where
     published
 }
 
-fn admit_cached_authenticated_snapshot(
+/// Admit only an existing, sealed cache entry. This read-only entrypoint is
+/// the sibling-process boundary; it never builds a snapshot from caller data.
+pub fn admit_cached_authenticated_research_snapshot(
+    cohort: &AuthenticatedReadyEventCohort,
+    request: &AuthenticatedSnapshotMaterializationRequest,
+) -> std::result::Result<AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection> {
+    let key = AuthenticatedSnapshotCacheKey {
+        schema_version: AUTHENTICATED_SNAPSHOT_CACHE_VERSION,
+        cohort_manifest_id: &cohort.manifest_id,
+        partition_digest: &cohort.partition_digest,
+        causal_projection_policy_id: &cohort.causal_projection_policy_id,
+        compiler_source_identity: &request.compiler_source_identity,
+        compiler_image_identity: &request.compiler_image_identity,
+        build_input_identity: &request.build_input_identity,
+        research_snapshot_schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+    };
+    let cache_key = sha256_hex(&canonical_json_bytes(&key).map_err(|reason| {
+        AuthenticatedResearchSnapshotRejection::MaterializationFailed { reason }
+    })?);
+    let snapshot_dir = request.cache_root.join(format!("sha256={cache_key}"));
+    if !snapshot_dir.exists() {
+        return Err(
+            AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+                reason: "authenticated snapshot cache entry is missing".to_string(),
+            },
+        );
+    }
+    admit_cached_authenticated_snapshot_at(cohort, request, snapshot_dir)
+}
+
+fn admit_cached_authenticated_snapshot_at(
     cohort: &AuthenticatedReadyEventCohort,
     request: &AuthenticatedSnapshotMaterializationRequest,
     snapshot_dir: PathBuf,
@@ -583,6 +613,22 @@ fn admit_cached_authenticated_snapshot(
     })?;
     validate_authenticated_snapshot(&snapshot, cohort, request, true)?;
     admitted_snapshot(cohort, &snapshot, snapshot_dir)
+}
+
+impl AuthenticatedResearchSnapshotRejection {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CatalogPartitionMismatch { .. } => "catalog_partition_mismatch",
+            Self::InsufficientCohort { .. } => "insufficient_cohort",
+            Self::UnsupportedTask { .. } => "unsupported_task",
+            Self::PartialOrRejectedEvent { .. } => "partial_or_rejected_event",
+            Self::FutureReferenceExposure { .. } => "future_reference_exposure",
+            Self::TokenMismatch { .. } => "token_mismatch",
+            Self::CorruptCachedSnapshot { .. } => "corrupt_cached_snapshot",
+            Self::MaterializationFailed { .. } => "materialization_failed",
+            Self::SnapshotRejected { .. } => "snapshot_rejected",
+        }
+    }
 }
 
 fn create_authenticated_snapshot_staging_dir(
@@ -4911,6 +4957,30 @@ mod tests {
             materialize_authenticated_research_snapshot(&cohort, &request, || {
                 panic!("corrupt cache must reject before rebuilding")
             }),
+            Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn cached_admission_rejects_missing_or_corrupt_entries_without_building() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = authenticated_test_request(cache.path().to_path_buf());
+
+        assert!(matches!(
+            admit_cached_authenticated_research_snapshot(&cohort, &request),
+            Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
+        ));
+
+        let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("materialize cache fixture");
+        std::fs::remove_file(admitted.snapshot_dir().join("observations.json"))
+            .expect("corrupt cache fixture");
+
+        assert!(matches!(
+            admit_cached_authenticated_research_snapshot(&cohort, &request),
             Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
         ));
     }

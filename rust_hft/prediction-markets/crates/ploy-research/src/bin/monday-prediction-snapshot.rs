@@ -4,6 +4,7 @@
 //! scoring. Factor review, walk-forward, and optimizer jobs should consume the
 //! resulting immutable snapshot artifacts instead of rebuilding raw joins.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,13 +20,18 @@ use ploy_market_data::polymarket_evidence::{
     verify_polymarket_evidence, PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor,
     VerifiedPolymarketEvidence, VerifiedPolymarketEvidenceSet,
 };
-use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
+use ploy_research::research_snapshot::{
+    admit_cached_authenticated_research_snapshot, authenticate_ready_event_cohort,
+    AuthenticatedSnapshotMaterializationRequest, ResearchSnapshotInputArtifact,
+};
 use ploy_research::{
     build_research_snapshot_from_database,
     build_research_snapshot_from_polymarket_chainlink_baseline,
-    build_research_snapshot_from_verified_artifacts, write_research_snapshot,
-    ResearchSnapshotBuildOptions, VerifiedArtifactSnapshotBuildOptions,
+    build_research_snapshot_from_verified_artifacts, read_catalog_partition_artifact,
+    write_research_snapshot, CatalogPartitionArtifactRef, ResearchSnapshotBuildOptions,
+    VerifiedArtifactSnapshotBuildOptions,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 
@@ -46,6 +52,155 @@ const VERIFIED_MODE_FORBIDDEN_FLAGS: [&str; 7] = [
     "--pm-book-archive-dir",
     "--skip-deribit",
 ];
+const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v1";
+const SNAPSHOT_ADMISSION_REQUEST_MAX_BYTES: u64 = 16 * 1024;
+const BTC_5M_BACKTEST_CAPABILITY: &str = "btc_5m_backtest";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotAdmissionRequest {
+    schema_version: String,
+    catalog_partition_artifact: CatalogPartitionArtifactRef,
+    compiler_source_identity: String,
+    compiler_image_identity: String,
+    build_input_identity: String,
+    task_capability: String,
+}
+
+struct SnapshotAdmissionRoots {
+    catalog_root: PathBuf,
+    cache_root: PathBuf,
+}
+
+fn snapshot_admission_rejection(rejection: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+        "status": "rejected",
+        "rejection": rejection,
+    })
+}
+
+fn is_immutable_sha256_identity(identity: &str) -> bool {
+    identity.len() == "sha256:".len() + 64
+        && identity.starts_with("sha256:")
+        && identity["sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn snapshot_admission_protocol_response(
+    input: &[u8],
+    roots: &SnapshotAdmissionRoots,
+) -> serde_json::Value {
+    let request: SnapshotAdmissionRequest = match serde_json::from_slice(input) {
+        Ok(request) => request,
+        Err(_) => return snapshot_admission_rejection("invalid_request"),
+    };
+    if request.schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION {
+        return snapshot_admission_rejection("unsupported_version");
+    }
+    if request.task_capability != BTC_5M_BACKTEST_CAPABILITY {
+        return snapshot_admission_rejection("unsupported_task");
+    }
+    for identity in [
+        &request.compiler_source_identity,
+        &request.compiler_image_identity,
+        &request.build_input_identity,
+    ] {
+        if !is_immutable_sha256_identity(identity) {
+            return snapshot_admission_rejection("invalid_identity");
+        }
+    }
+    let artifact = match read_catalog_partition_artifact(
+        &roots.catalog_root,
+        &request.catalog_partition_artifact,
+    ) {
+        Ok(artifact) => artifact,
+        Err(_) => return snapshot_admission_rejection("catalog_partition_unavailable"),
+    };
+    let partition_digest = artifact.partition().digest().to_string();
+    let policy_identity = artifact
+        .partition()
+        .causal_projection_policy_id()
+        .to_string();
+    let cohort = match authenticate_ready_event_cohort(artifact.catalog(), artifact.partition()) {
+        Ok(cohort) => cohort,
+        Err(rejection) => return snapshot_admission_rejection(rejection.code()),
+    };
+    let admission = admit_cached_authenticated_research_snapshot(
+        &cohort,
+        &AuthenticatedSnapshotMaterializationRequest {
+            cache_root: roots.cache_root.clone(),
+            compiler_source_identity: request.compiler_source_identity,
+            compiler_image_identity: request.compiler_image_identity.clone(),
+            build_input_identity: request.build_input_identity,
+        },
+    );
+    match admission {
+        Ok(snapshot) => serde_json::json!({
+            "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+            "status": "admitted",
+            "snapshot_contract_id": snapshot.snapshot_contract_id(),
+            "snapshot_digest": snapshot.snapshot_hash(),
+            "partition_digest": partition_digest,
+            "policy_identity": policy_identity,
+            "task_capability": BTC_5M_BACKTEST_CAPABILITY,
+            "immutable_image_identity": request.compiler_image_identity,
+        }),
+        Err(rejection) => snapshot_admission_rejection(rejection.code()),
+    }
+}
+
+fn snapshot_admission_protocol_from_reader(
+    reader: impl Read,
+    roots: &SnapshotAdmissionRoots,
+) -> serde_json::Value {
+    let mut input = Vec::new();
+    if reader
+        .take(SNAPSHOT_ADMISSION_REQUEST_MAX_BYTES + 1)
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > SNAPSHOT_ADMISSION_REQUEST_MAX_BYTES
+    {
+        return snapshot_admission_rejection("invalid_request");
+    }
+    snapshot_admission_protocol_response(&input, roots)
+}
+
+fn write_snapshot_admission_protocol_response(
+    args: &[String],
+    input: impl Read,
+    output: impl Write,
+    roots: &SnapshotAdmissionRoots,
+) -> anyhow::Result<()> {
+    let response = if args.len() == 2 {
+        snapshot_admission_protocol_from_reader(input, roots)
+    } else {
+        snapshot_admission_rejection("invalid_request")
+    };
+    write_snapshot_admission_response(&response, output)
+}
+
+fn write_snapshot_admission_response(
+    response: &serde_json::Value,
+    mut output: impl Write,
+) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut output, &response)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn snapshot_admission_roots_from_env() -> Option<SnapshotAdmissionRoots> {
+    let catalog_root = std::env::var("MONDAY_PREDICTION_CATALOG_ROOT").ok()?;
+    let cache_root = std::env::var("MONDAY_PREDICTION_SNAPSHOT_CACHE_ROOT").ok()?;
+    if catalog_root.trim().is_empty() || cache_root.trim().is_empty() {
+        return None;
+    }
+    Some(SnapshotAdmissionRoots {
+        catalog_root: catalog_root.into(),
+        cache_root: cache_root.into(),
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AnchoredArtifact {
@@ -389,6 +544,22 @@ fn validated_data_audit(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--admit-authenticated-snapshot") {
+        let Some(roots) = snapshot_admission_roots_from_env() else {
+            println!(
+                "{}",
+                serde_json::to_string(&snapshot_admission_rejection("cache_unavailable"))?
+            );
+            return Ok(());
+        };
+        write_snapshot_admission_protocol_response(
+            &args,
+            std::io::stdin(),
+            std::io::stdout(),
+            &roots,
+        )?;
+        return Ok(());
+    }
     if flag_present(&args, "--verify-polymarket-evidence") {
         return verify_polymarket_only(&args);
     }
@@ -585,6 +756,152 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{parse_polymarket_verify_args, parse_verified_artifact_args, validated_data_audit};
     use chrono::{TimeZone, Utc};
+
+    fn admission_request() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "monday.prediction.snapshot_admission.v1",
+            "catalog_partition_artifact": {
+                "path": "catalog/catalog-partition-deadbeef.json",
+                "artifact_sha256": format!("sha256:{}", "1".repeat(64)),
+                "payload_sha256": format!("sha256:{}", "2".repeat(64)),
+            },
+            "compiler_source_identity": format!("sha256:{}", "3".repeat(64)),
+            "compiler_image_identity": format!("sha256:{}", "4".repeat(64)),
+            "build_input_identity": format!("sha256:{}", "5".repeat(64)),
+            "task_capability": "btc_5m_backtest",
+        })
+    }
+
+    fn admission_roots() -> super::SnapshotAdmissionRoots {
+        super::SnapshotAdmissionRoots {
+            catalog_root: "/immutable/catalog-root".into(),
+            cache_root: "/immutable/cache-root".into(),
+        }
+    }
+
+    #[test]
+    fn snapshot_admission_protocol_rejects_unknown_or_mutable_requests_before_io() {
+        let roots = admission_roots();
+        let malformed = super::snapshot_admission_protocol_response(b"not json", &roots);
+        assert_eq!(malformed["status"], "rejected");
+        assert_eq!(malformed["rejection"], "invalid_request");
+
+        let mut unknown = admission_request();
+        unknown["extra"] = serde_json::json!(true);
+        let unknown = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&unknown)
+                .expect("serialize unknown-field request")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(unknown["status"], "rejected");
+        assert_eq!(unknown["rejection"], "invalid_request");
+
+        let mut mutable = admission_request();
+        mutable["compiler_image_identity"] = serde_json::json!("latest");
+        let mutable = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&mutable)
+                .expect("serialize mutable-identity request")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(mutable["status"], "rejected");
+        assert_eq!(mutable["rejection"], "invalid_identity");
+
+        let mut unsupported = admission_request();
+        unsupported["task_capability"] = serde_json::json!("sol_5m_backtest");
+        let unsupported = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&unsupported)
+                .expect("serialize unsupported-task request")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(unsupported["status"], "rejected");
+        assert_eq!(unsupported["rejection"], "unsupported_task");
+
+        let missing_partition = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&admission_request())
+                .expect("serialize missing-partition request")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(missing_partition["status"], "rejected");
+        assert_eq!(
+            missing_partition["rejection"],
+            "catalog_partition_unavailable"
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_protocol_writes_one_json_line_without_extra_output() {
+        let args = vec![
+            "monday-prediction-snapshot".to_string(),
+            "--admit-authenticated-snapshot".to_string(),
+        ];
+        let mut output = Vec::new();
+        let roots = admission_roots();
+        super::write_snapshot_admission_protocol_response(
+            &args,
+            &b"not json"[..],
+            &mut output,
+            &roots,
+        )
+        .expect("write protocol rejection");
+        let stdout = String::from_utf8(output).expect("UTF-8 JSON output");
+        assert_eq!(stdout.lines().count(), 1);
+        let response: serde_json::Value = serde_json::from_str(stdout.trim_end())
+            .expect("one JSON response without a prefix or suffix");
+        assert_eq!(response["rejection"], "invalid_request");
+
+        let mut extra_output = Vec::new();
+        super::write_snapshot_admission_protocol_response(
+            &[args[0].clone(), args[1].clone(), "unexpected".to_string()],
+            &b"{}"[..],
+            &mut extra_output,
+            &roots,
+        )
+        .expect("write extra-argument rejection");
+        assert_eq!(String::from_utf8(extra_output).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn snapshot_admission_protocol_success_wire_has_only_admitted_identities() {
+        let response = serde_json::json!({
+            "schema_version": super::SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+            "status": "admitted",
+            "snapshot_contract_id": format!("sha256:{}", "a".repeat(64)),
+            "snapshot_digest": format!("sha256:{}", "b".repeat(64)),
+            "partition_digest": format!("sha256:{}", "c".repeat(64)),
+            "policy_identity": format!("sha256:{}", "d".repeat(64)),
+            "task_capability": "btc_5m_backtest",
+            "immutable_image_identity": format!("sha256:{}", "e".repeat(64)),
+        });
+        let mut output = Vec::new();
+        super::write_snapshot_admission_response(&response, &mut output)
+            .expect("write admitted response");
+        let stdout = String::from_utf8(output).expect("UTF-8 JSON output");
+        assert_eq!(stdout.lines().count(), 1);
+        let response: serde_json::Value =
+            serde_json::from_str(stdout.trim_end()).expect("one admitted JSON response");
+        assert_eq!(
+            response["schema_version"],
+            super::SNAPSHOT_ADMISSION_SCHEMA_VERSION
+        );
+        assert_eq!(response["task_capability"], "btc_5m_backtest");
+        for field in [
+            "snapshot_contract_id",
+            "snapshot_digest",
+            "partition_digest",
+            "policy_identity",
+            "immutable_image_identity",
+        ] {
+            assert!(response[field]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:")));
+        }
+        assert!(response.get("snapshot_dir").is_none());
+        assert!(response.get("handle").is_none());
+    }
 
     fn digest(byte: char) -> String {
         byte.to_string().repeat(64)
