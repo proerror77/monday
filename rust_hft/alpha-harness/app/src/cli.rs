@@ -148,6 +148,10 @@ pub struct PredictionExecuteArgs {
     pub snapshot_url: String,
     #[arg(long)]
     pub snapshot_sha256: String,
+    #[arg(long)]
+    pub snapshot_contract_id: String,
+    #[arg(long)]
+    pub snapshot_digest: String,
     /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
     #[arg(long)]
     pub snapshot_cache_dir: Option<PathBuf>,
@@ -801,6 +805,10 @@ mod tests {
             root.path().join("missing-snapshot.zip").into_os_string(),
             OsString::from("--snapshot-sha256"),
             OsString::from("b".repeat(64)),
+            OsString::from("--snapshot-contract-id"),
+            OsString::from(format!("sha256:{}", "c".repeat(64))),
+            OsString::from("--snapshot-digest"),
+            OsString::from("0123456789abcdef"),
             OsString::from("--result-put-url"),
             root.path().join("results.zip").into_os_string(),
         ])
@@ -981,6 +989,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "snapshot.zip",
             "--snapshot-sha256",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--snapshot-contract-id",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--snapshot-digest",
+            "0123456789abcdef",
             "--resume-url",
             "previous-results.zip",
             "--resume-sha256",

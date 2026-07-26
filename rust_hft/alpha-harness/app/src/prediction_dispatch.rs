@@ -13,11 +13,11 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Write},
-    path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    path::{Component, Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
@@ -39,6 +39,7 @@ struct PredictionSubmission {
     mission_sha256: String,
     snapshot_url: String,
     snapshot_sha256: String,
+    snapshot_contract_id: String,
     result_put_url: String,
     llm_secret_name: String,
     #[serde(default)]
@@ -503,12 +504,14 @@ fn validate_submission(submission: PredictionSubmission) -> anyhow::Result<Valid
     validate_dns_label("attempt id", &submission.attempt_id)?;
     validate_identifier("mission id", &submission.mission_id)?;
     validate_identifier("evaluator version", &submission.evaluator_version)?;
+    validate_task_capability(&submission.task_capability)?;
     validate_dns_label("LLM secret name", &submission.llm_secret_name)?;
     if submission.resource_profile != RESOURCE_PROFILE {
         bail!("prediction resource profile must be {RESOURCE_PROFILE}");
     }
     let mission_sha256 = normalized_sha256("mission", &submission.mission_sha256)?;
     let snapshot_sha256 = normalized_sha256("snapshot", &submission.snapshot_sha256)?;
+    immutable_sha256_identity("snapshot contract", &submission.snapshot_contract_id)?;
     let image_digest = image_digest(&submission.image)?;
     let mission_object = canonical_https_object("mission", &submission.mission_url)?;
     let snapshot_object = canonical_https_object("snapshot", &submission.snapshot_url)?;
@@ -587,20 +590,9 @@ fn admit_submission_with_timeout(
             .catalog_partition_artifact
             .payload_sha256,
     )?;
-    if validated
-        .submission
-        .catalog_partition_artifact
-        .path
-        .is_empty()
-        || validated
-            .submission
-            .catalog_partition_artifact
-            .path
-            .chars()
-            .any(char::is_control)
-    {
-        bail!("catalog partition artifact path is invalid");
-    }
+    validate_catalog_partition_artifact_path(
+        &validated.submission.catalog_partition_artifact.path,
+    )?;
     let request = SnapshotAdmissionRequest {
         schema_version: SNAPSHOT_ADMISSION_SCHEMA_VERSION,
         catalog_partition_artifact: &CatalogPartitionArtifactRef {
@@ -642,26 +634,21 @@ fn admit_submission_with_timeout(
     let output = match receiver.recv_timeout(timeout) {
         Ok(output) => output,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
+            terminate_admission_child(&mut child);
             bail!(
                 "snapshot admission sibling timed out after {} seconds",
                 timeout.as_secs()
             );
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_admission_child(&mut child);
             bail!("snapshot admission sibling response reader failed");
         }
     };
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("snapshot admission sibling response reader panicked"))?;
-    let status = child
-        .wait()
-        .context("wait for snapshot admission sibling")?;
+    let status = wait_for_admission_child_exit(&mut child, timeout)?;
     let output = output?;
     if !status.success() {
         bail!("snapshot admission sibling exited unsuccessfully");
@@ -675,6 +662,35 @@ fn admit_submission_with_timeout(
         }
         SnapshotAdmissionDecision::Rejected(rejection) => {
             Ok(AdmissionDecision::Rejected(rejection))
+        }
+    }
+}
+
+fn terminate_admission_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_admission_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_admission_child(child);
+                bail!(
+                    "snapshot admission sibling did not exit within {} seconds after responding",
+                    timeout.as_secs()
+                );
+            }
+            Err(error) => {
+                terminate_admission_child(child);
+                return Err(error).context("poll snapshot admission sibling exit");
+            }
         }
     }
 }
@@ -731,9 +747,9 @@ fn parse_snapshot_admission_response(
         } => {
             if schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION
                 || task_capability != validated.submission.task_capability
+                || snapshot_contract_id != validated.submission.snapshot_contract_id
                 || immutable_image_identity != format!("sha256:{}", validated.image_digest)
-                || immutable_sha256_identity("admitted snapshot digest", &snapshot_digest)?
-                    != format!("sha256:{}", validated.snapshot_sha256)
+                || validate_snapshot_digest(&snapshot_digest).is_err()
             {
                 bail!("snapshot admission response does not bind the submitted immutable identity");
             }
@@ -772,6 +788,17 @@ fn immutable_sha256_identity(label: &str, value: &str) -> anyhow::Result<String>
         bail!("{label} must use sha256:<64 lowercase hex>");
     }
     Ok(value.to_owned())
+}
+
+fn validate_snapshot_digest(value: &str) -> anyhow::Result<()> {
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("admitted snapshot digest must be exactly 16 lowercase ASCII hex characters");
+    }
+    Ok(())
 }
 
 fn render_admitted_submission(
@@ -879,11 +906,13 @@ fn render_validated_submission(
                                     "--mission-sha256", "$(MISSION_SHA256)",
                                     "--snapshot-url", "$(SNAPSHOT_URL)",
                                     "--snapshot-sha256", "$(SNAPSHOT_SHA256)",
+                                    "--snapshot-contract-id", "$(SNAPSHOT_CONTRACT_ID)",
+                                    "--snapshot-digest", "$(SNAPSHOT_DIGEST)",
                                     "--resume-url", "$(RESUME_URL)",
                                     "--resume-sha256", "$(RESUME_SHA256)",
                                     "--result-put-url", "$(RESULT_PUT_URL)"
                                 ],
-                                "env": prediction_environment(&validated),
+                                "env": prediction_environment(&validated, &admission),
                                 "resources": {
                                     "requests": { "cpu": "3500m", "memory": "8Gi" },
                                     "limits": { "cpu": "3500m", "memory": "12Gi" },
@@ -916,7 +945,7 @@ fn render_validated_submission(
     })
 }
 
-fn prediction_environment(validated: &ValidatedSubmission) -> Value {
+fn prediction_environment(validated: &ValidatedSubmission, admission: &SnapshotAdmission) -> Value {
     let secret_ref = |key: &str| {
         json!({
             "name": validated.secret_name,
@@ -931,6 +960,8 @@ fn prediction_environment(validated: &ValidatedSubmission) -> Value {
         { "name": "RESUME_SHA256", "valueFrom": { "secretKeyRef": secret_ref("resume-sha256") } },
         { "name": "MISSION_SHA256", "value": validated.mission_sha256 },
         { "name": "SNAPSHOT_SHA256", "value": validated.snapshot_sha256 },
+        { "name": "SNAPSHOT_CONTRACT_ID", "value": admission.snapshot_contract_id },
+        { "name": "SNAPSHOT_DIGEST", "value": admission.snapshot_digest },
         { "name": "MONDAY_PREDICTION_LLM_BASE_URL", "valueFrom": { "secretKeyRef": { "name": validated.submission.llm_secret_name, "key": "base-url" } } },
         { "name": "MONDAY_PREDICTION_LLM_MODEL", "valueFrom": { "secretKeyRef": { "name": validated.submission.llm_secret_name, "key": "model" } } },
         { "name": "MONDAY_PREDICTION_LLM_API_KEY", "valueFrom": { "secretKeyRef": { "name": validated.submission.llm_secret_name, "key": "api-key", "optional": true } } },
@@ -983,6 +1014,54 @@ fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         bail!("{label} is invalid");
+    }
+    Ok(())
+}
+
+fn validate_task_capability(value: &str) -> anyhow::Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 63
+        || !bytes[0].is_ascii_lowercase()
+        || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        bail!("task capability must be a lowercase safe identifier");
+    }
+    Ok(())
+}
+
+fn validate_catalog_partition_artifact_path(value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    let has_windows_prefix = value.as_bytes().get(1) == Some(&b':')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || path.is_absolute()
+        || has_windows_prefix
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("catalog partition artifact path is invalid");
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("catalog partition artifact path must end in a UTF-8 filename")?;
+    let suffix = name
+        .strip_prefix("catalog-partition-")
+        .and_then(|name| name.strip_suffix(".json"));
+    if suffix.is_none_or(str::is_empty) {
+        bail!("catalog partition artifact path must name catalog-partition-*.json");
     }
     Ok(())
 }
@@ -1186,6 +1265,16 @@ mod tests {
             job["metadata"]["annotations"]["research.monday/partition-digest"],
             format!("sha256:{}", "e".repeat(64))
         );
+        let container = &job["spec"]["template"]["spec"]["containers"][0];
+        assert!(container["args"]
+            .as_array()
+            .is_some_and(|args| args.contains(&json!("--snapshot-contract-id"))));
+        assert!(container["env"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| {
+                value["name"] == "SNAPSHOT_CONTRACT_ID"
+                    && value["value"] == format!("sha256:{}", "1".repeat(64))
+            })));
         assert!(rendered.job_name.starts_with("prediction-"));
     }
 
@@ -1294,6 +1383,7 @@ mod tests {
                 "mission_sha256": "c".repeat(64),
                 "snapshot_url": "https://oss-internal/snapshots/snapshot.zip?signature=x",
                 "snapshot_sha256": "d".repeat(64),
+                "snapshot_contract_id": format!("sha256:{}", "1".repeat(64)),
                 "result_put_url": "https://oss-internal/results/btc-5m-attempt-001/results.zip?signature=x",
                 "llm_secret_name": "monday-prediction-llm",
                 "catalog_partition_artifact": {
@@ -1351,7 +1441,7 @@ mod tests {
             "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
             "status": "admitted",
             "snapshot_contract_id": format!("sha256:{}", "1".repeat(64)),
-            "snapshot_digest": format!("sha256:{}", "d".repeat(64)),
+            "snapshot_digest": "0123456789abcdef",
             "partition_digest": format!("sha256:{}", "e".repeat(64)),
             "policy_identity": format!("sha256:{}", "f".repeat(64)),
             "task_capability": "btc_5m_backtest",
@@ -1382,12 +1472,18 @@ mod tests {
         }))
         .expect("serialize rejected response");
         extra_output.extend_from_slice(b"\nextra");
-        let mut mismatched =
+        let mut invalid_digest =
             serde_json::from_slice::<Value>(&admitted).expect("parse admitted response");
-        mismatched["snapshot_digest"] = json!(format!("sha256:{}", "e".repeat(64)));
-        let mut mismatched = serde_json::to_vec(&mismatched).expect("serialize mismatch");
-        mismatched.push(b'\n');
-        for output in [admitted, extra_output, mismatched] {
+        invalid_digest["snapshot_digest"] = json!("0123456789abcdeg");
+        let mut invalid_digest = serde_json::to_vec(&invalid_digest).expect("serialize mismatch");
+        invalid_digest.push(b'\n');
+        let mut contract_mismatch =
+            serde_json::from_slice::<Value>(&admitted).expect("parse admitted response");
+        contract_mismatch["snapshot_contract_id"] = json!(format!("sha256:{}", "2".repeat(64)));
+        let mut contract_mismatch =
+            serde_json::to_vec(&contract_mismatch).expect("serialize contract mismatch");
+        contract_mismatch.push(b'\n');
+        for output in [admitted, extra_output, invalid_digest, contract_mismatch] {
             assert!(parse_snapshot_admission_response(&output, &validated).is_err());
         }
     }
@@ -1407,12 +1503,84 @@ mod tests {
         let error = admit_submission_with_timeout(
             validate_submission(valid_submission()).expect("valid submission"),
             &sibling,
-            Duration::from_millis(10),
+            Duration::from_millis(100),
         )
         .err()
         .expect("stalled sibling must time out");
 
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_timeout_does_not_join_a_reader_held_by_a_descendant() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create inherited-stdout timeout root");
+        let sibling = root.path().join("monday-prediction-snapshot");
+        std::fs::write(&sibling, "#!/bin/sh\ncat >/dev/null\nsleep 1 &\nexit 0\n")
+            .expect("write descendant-stalling sibling");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
+            .expect("make descendant-stalling sibling executable");
+
+        let started = Instant::now();
+        let error = admit_submission_with_timeout(
+            validate_submission(valid_submission()).expect("valid submission"),
+            &sibling,
+            Duration::from_millis(10),
+        )
+        .err()
+        .expect("inherited stdout must time out without joining its reader");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_exit_wait_kills_a_sibling_that_does_not_exit_after_response() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start response-stalling sibling");
+        let error = wait_for_admission_child_exit(&mut child, Duration::from_millis(10))
+            .expect_err("response-stalling sibling must be killed and reaped");
+
+        assert!(error.to_string().contains("did not exit"), "{error:#}");
+    }
+
+    #[test]
+    fn validates_catalog_partition_artifact_path_and_task_capability() {
+        for path in [
+            "catalog/catalog-partition-deadbeef.json",
+            "nested/catalog/catalog-partition-deadbeef.json",
+        ] {
+            validate_catalog_partition_artifact_path(path).expect("valid relative catalog path");
+        }
+        for path in [
+            "",
+            "/catalog/catalog-partition-deadbeef.json",
+            "../catalog-partition-deadbeef.json",
+            "C:\\catalog\\catalog-partition-deadbeef.json",
+            "catalog/other.json",
+            "catalog/catalog-partition-.json",
+            "catalog/catalog-partition-deadbeef.json\n",
+        ] {
+            assert!(
+                validate_catalog_partition_artifact_path(path).is_err(),
+                "{path}"
+            );
+        }
+        validate_task_capability("btc_5m_backtest").expect("supported syntax");
+        for capability in ["", "BTC_5m_backtest", "btc 5m", "btc/5m", "_btc_5m"] {
+            assert!(
+                validate_task_capability(capability).is_err(),
+                "{capability}"
+            );
+        }
     }
 
     #[test]
@@ -1494,6 +1662,7 @@ mod tests {
             mission_sha256: "c".repeat(64),
             snapshot_url: "https://oss-internal/snapshots/snapshot.zip?signature=x".to_owned(),
             snapshot_sha256: "d".repeat(64),
+            snapshot_contract_id: format!("sha256:{}", "1".repeat(64)),
             result_put_url:
                 "https://oss-internal/results/btc-5m-attempt-001/results.zip?signature=x".to_owned(),
             llm_secret_name: "monday-prediction-llm".to_owned(),
@@ -1514,8 +1683,8 @@ mod tests {
         AdmittedSubmission {
             validated: validate_submission(submission).expect("valid test submission"),
             admission: SnapshotAdmission {
-                snapshot_contract_id: format!("sha256:{}", "3".repeat(64)),
-                snapshot_digest: format!("sha256:{}", "d".repeat(64)),
+                snapshot_contract_id: format!("sha256:{}", "1".repeat(64)),
+                snapshot_digest: "0123456789abcdef".to_owned(),
                 partition_digest: format!("sha256:{}", "e".repeat(64)),
                 policy_identity: format!("sha256:{}", "f".repeat(64)),
                 task_capability: "btc_5m_backtest".to_owned(),
