@@ -917,9 +917,13 @@ fn validate_authenticated_snapshot(
             );
         }
         let sides = books.entry(member.market_id.as_str()).or_default();
-        match (book.token_id.as_str(), book.side.as_str()) {
-            (token, "UP") if token == member.up_token_id => sides.0 = true,
-            (token, "DOWN") if token == member.down_token_id => sides.1 = true,
+        match book.token_id.as_str() {
+            token if token == member.up_token_id && book.side.eq_ignore_ascii_case("up") => {
+                sides.0 = true
+            }
+            token if token == member.down_token_id && book.side.eq_ignore_ascii_case("down") => {
+                sides.1 = true
+            }
             _ => {
                 return Err(AuthenticatedResearchSnapshotRejection::TokenMismatch {
                     reason: format!("snapshot book token identity mismatches {}", book.event_id),
@@ -4942,6 +4946,21 @@ mod tests {
             }),
             Err(AuthenticatedResearchSnapshotRejection::SnapshotRejected { .. })
         ));
+    }
+
+    #[test]
+    fn authenticated_snapshot_accepts_case_insensitive_book_sides() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = authenticated_test_request(cache.path().to_path_buf());
+
+        materialize_authenticated_research_snapshot(&cohort, &request, || {
+            let mut snapshot = authenticated_test_snapshot();
+            snapshot.pm_book_snapshots[0].side = "up".to_string();
+            snapshot.pm_book_snapshots[1].side = "DoWn".to_string();
+            Ok(snapshot)
+        })
+        .expect("case-insensitive book sides preserve authenticated token binding");
     }
 
     #[test]
