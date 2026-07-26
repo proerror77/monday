@@ -19,9 +19,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
+    Some(revision) => revision,
+    None => "unbound-source-revision",
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "polymarket-raw-ops",
+    version = BUILD_SOURCE_REVISION,
     about = "Fail-closed Polymarket reference collection and raw tape archival"
 )]
 struct Cli {
@@ -350,6 +356,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_version_is_bound_to_the_build_source_revision() {
+        let expected = option_env!("MONDAY_SOURCE_REVISION").unwrap_or("unbound-source-revision");
+        assert_eq!(Cli::command().get_version(), Some(expected));
+    }
 
     #[test]
     fn collect_reference_cli_uses_the_library_discovery_capacity_default() {

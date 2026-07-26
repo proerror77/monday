@@ -425,6 +425,8 @@ jobs:
           chmod 0755 artifact/binance-usdm-reference-artifact-verifier
           artifact/binance-lob-archiver --version \
             | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
+          artifact/polymarket-raw-ops --version \
+            | grep -Fqx 'polymarket-raw-ops ${{ needs.selector.outputs.source_sha }}'
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
