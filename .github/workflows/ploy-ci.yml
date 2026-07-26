@@ -942,7 +942,28 @@ jobs:
           npm run contracts:check --prefix ploy-frontend
           npm run lint --prefix ploy-frontend
           npm run build --prefix ploy-frontend
-          npm audit --omit=dev --audit-level=moderate --prefix ploy-frontend
+          if rg -n -i 'rsc' ploy-frontend/src; then
+            echo "frontend must not use RSC APIs while GHSA-qwww-vcr4-c8h2 is excepted" >&2
+            exit 1
+          fi
+          audit_report="$(mktemp)"
+          if ! npm audit --omit=dev --audit-level=moderate --json --prefix ploy-frontend > "$audit_report"; then
+            node - "$audit_report" <<'NODE'
+          const report = JSON.parse(require('node:fs').readFileSync(process.argv[2], 'utf8'));
+          const ignored = 'https://github.com/advisories/GHSA-qwww-vcr4-c8h2';
+          const rank = { low: 1, moderate: 2, high: 3, critical: 4 };
+          const advisories = Object.values(report.vulnerabilities ?? {}).flatMap((vulnerability) =>
+            vulnerability.via.filter((via) => typeof via !== 'string'),
+          );
+          const unexpected = advisories.filter((advisory) =>
+            rank[advisory.severity] >= rank.moderate && advisory.url !== ignored,
+          );
+          if (unexpected.length || !advisories.some((advisory) => advisory.url === ignored)) {
+            console.error(JSON.stringify(unexpected.length ? unexpected : advisories, null, 2));
+            process.exit(1);
+          }
+          NODE
+          fi
           oversized_chunks="$(find ploy-frontend/dist/assets -type f -name '*.js' -size +500k -print)"
           if [ -n "${oversized_chunks}" ]; then
             echo "frontend JavaScript chunks exceed 500 KiB:" >&2
