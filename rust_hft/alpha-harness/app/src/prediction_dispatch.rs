@@ -3,7 +3,7 @@ use crate::{
         print_json, PredictionDispatchRenderArgs, PredictionDispatchStatusArgs,
         PredictionDispatchSubmitArgs,
     },
-    mission_runner::normalized_sha256,
+    mission_runner::{configured_sibling_binary, normalized_sha256},
 };
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -11,16 +11,21 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
     fs::File,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
+const MAX_ADMISSION_RESPONSE_BYTES: u64 = 16 * 1024;
+const SNAPSHOT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_PROFILE: &str = "standard-v1";
 const ACTIVE_DEADLINE_SECONDS: u64 = 1800;
+const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +45,55 @@ struct PredictionSubmission {
     resume_url: Option<String>,
     #[serde(default)]
     resume_sha256: Option<String>,
+    catalog_partition_artifact: CatalogPartitionArtifactRef,
+    compiler_source_identity: String,
+    build_input_identity: String,
+    task_capability: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogPartitionArtifactRef {
+    path: String,
+    artifact_sha256: String,
+    payload_sha256: String,
+}
+
+#[derive(Serialize)]
+struct SnapshotAdmissionRequest<'a> {
+    schema_version: &'static str,
+    catalog_partition_artifact: &'a CatalogPartitionArtifactRef,
+    compiler_source_identity: &'a str,
+    compiler_image_identity: String,
+    build_input_identity: &'a str,
+    task_capability: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase", deny_unknown_fields)]
+enum SnapshotAdmissionResponse {
+    Admitted {
+        schema_version: String,
+        snapshot_contract_id: String,
+        snapshot_digest: String,
+        partition_digest: String,
+        policy_identity: String,
+        task_capability: String,
+        immutable_image_identity: String,
+    },
+    Rejected {
+        schema_version: String,
+        rejection: String,
+    },
+}
+
+struct SnapshotAdmission {
+    snapshot_contract_id: String,
+    snapshot_digest: String,
+    partition_digest: String,
+    policy_identity: String,
+    task_capability: String,
+    immutable_image_identity: String,
 }
 
 struct ValidatedSubmission {
@@ -55,6 +109,21 @@ struct ValidatedSubmission {
     result_identity_label: String,
     job_name: String,
     secret_name: String,
+}
+
+struct AdmittedSubmission {
+    validated: ValidatedSubmission,
+    admission: SnapshotAdmission,
+}
+
+enum AdmissionDecision {
+    Admitted(Box<AdmittedSubmission>),
+    Rejected(String),
+}
+
+enum SnapshotAdmissionDecision {
+    Admitted(SnapshotAdmission),
+    Rejected(String),
 }
 
 #[derive(Debug)]
@@ -167,7 +236,16 @@ struct PredictionStatus {
 
 pub fn render(args: PredictionDispatchRenderArgs) -> anyhow::Result<()> {
     let submission = load_submission(&args.submission)?;
-    let rendered = render_submission(submission, &args.namespace)?;
+    let validated = validate_submission(submission)?;
+    let sibling = configured_sibling_binary(
+        "MONDAY_PREDICTION_SNAPSHOT_BIN",
+        "monday-prediction-snapshot",
+    )?;
+    let admitted = match admit_submission(validated, &sibling)? {
+        AdmissionDecision::Admitted(admitted) => *admitted,
+        AdmissionDecision::Rejected(rejection) => return report_admission_rejection(&rejection),
+    };
+    let rendered = render_admitted_submission(admitted, &args.namespace)?;
     print_json(&json!({
         "job_name": rendered.job_name,
         "secret_name": rendered.secret_name,
@@ -180,15 +258,46 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let submission = load_submission(&args.submission)?;
     let validated = validate_submission(submission)?;
+    let sibling = configured_sibling_binary(
+        "MONDAY_PREDICTION_SNAPSHOT_BIN",
+        "monday-prediction-snapshot",
+    )?;
+    submit_validated_submission(args, validated, &sibling, &kubectl_binary())
+}
+
+#[cfg(test)]
+fn submit_with_binaries(
+    args: PredictionDispatchSubmitArgs,
+    sibling: &Path,
+    kubectl: &Path,
+) -> anyhow::Result<()> {
+    validate_cluster_target(&args.context, &args.namespace)?;
+    let submission = load_submission(&args.submission)?;
+    let validated = validate_submission(submission)?;
+    submit_validated_submission(args, validated, sibling, kubectl)
+}
+
+fn submit_validated_submission(
+    args: PredictionDispatchSubmitArgs,
+    validated: ValidatedSubmission,
+    sibling: &Path,
+    kubectl: &Path,
+) -> anyhow::Result<()> {
+    let admitted = match admit_submission(validated, sibling)? {
+        AdmissionDecision::Admitted(admitted) => *admitted,
+        AdmissionDecision::Rejected(rejection) => return report_admission_rejection(&rejection),
+    };
     let existing = existing_result_jobs(
+        kubectl,
         &args.context,
         &args.namespace,
-        &validated.result_identity_label,
+        &admitted.validated.result_identity_label,
     )?;
     ensure_result_available(&existing)?;
-    let rendered = render_validated_submission(validated, &args.namespace)?;
+    let rendered = render_admitted_submission(admitted, &args.namespace)?;
     let secret_body = serde_json::to_vec(&rendered.manifest["items"][0])?;
     let output = kubectl_with_input(
+        kubectl,
         &args.context,
         &args.namespace,
         ["create", "-f", "-"],
@@ -197,6 +306,7 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
     ensure_kubectl_success(output, "create immutable prediction input Secret")?;
     let job_body = serde_json::to_vec(&rendered.manifest["items"][1])?;
     let output = kubectl_with_input(
+        kubectl,
         &args.context,
         &args.namespace,
         ["create", "-f", "-"],
@@ -206,6 +316,7 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
         ensure_kubectl_success(output, "create immutable prediction research Job")
     {
         let readback = existing_result_jobs(
+            kubectl,
             &args.context,
             &args.namespace,
             &rendered.result_identity_sha256[..32],
@@ -217,7 +328,7 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
         ) {
             Some(true) => true,
             Some(false) => {
-                delete_input_secret(&args.context, &args.namespace, &rendered.secret_name)?;
+                delete_input_secret(kubectl, &args.context, &args.namespace, &rendered.secret_name)?;
                 return Err(error);
             }
             None => return Err(error.context(match readback {
@@ -240,9 +351,11 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
 }
 
 pub fn status(args: PredictionDispatchStatusArgs) -> anyhow::Result<()> {
+    let kubectl = kubectl_binary();
     validate_cluster_target(&args.context, &args.namespace)?;
     validate_dns_label("prediction Job name", &args.job_name)?;
     let job = kubectl_json(
+        &kubectl,
         &args.context,
         &args.namespace,
         ["get", "job", &args.job_name, "-o", "json"],
@@ -251,6 +364,7 @@ pub fn status(args: PredictionDispatchStatusArgs) -> anyhow::Result<()> {
     let job_uid = status_job_uid(&job)?;
     let selector = format!("batch.kubernetes.io/controller-uid={job_uid}");
     let pods = kubectl_json(
+        &kubectl,
         &args.context,
         &args.namespace,
         ["get", "pods", "-l", &selector, "-o", "json"],
@@ -439,18 +553,241 @@ fn validate_submission(submission: PredictionSubmission) -> anyhow::Result<Valid
     })
 }
 
-fn render_submission(
-    submission: PredictionSubmission,
+fn admit_submission(
+    validated: ValidatedSubmission,
+    sibling: &Path,
+) -> anyhow::Result<AdmissionDecision> {
+    admit_submission_with_timeout(validated, sibling, SNAPSHOT_ADMISSION_TIMEOUT)
+}
+
+fn admit_submission_with_timeout(
+    validated: ValidatedSubmission,
+    sibling: &Path,
+    timeout: Duration,
+) -> anyhow::Result<AdmissionDecision> {
+    let compiler_source_identity = immutable_sha256_identity(
+        "compiler source identity",
+        &validated.submission.compiler_source_identity,
+    )?;
+    let build_input_identity = immutable_sha256_identity(
+        "build input identity",
+        &validated.submission.build_input_identity,
+    )?;
+    let artifact_sha256 = immutable_sha256_identity(
+        "catalog partition artifact",
+        &validated
+            .submission
+            .catalog_partition_artifact
+            .artifact_sha256,
+    )?;
+    let payload_sha256 = immutable_sha256_identity(
+        "catalog partition payload",
+        &validated
+            .submission
+            .catalog_partition_artifact
+            .payload_sha256,
+    )?;
+    if validated
+        .submission
+        .catalog_partition_artifact
+        .path
+        .is_empty()
+        || validated
+            .submission
+            .catalog_partition_artifact
+            .path
+            .chars()
+            .any(char::is_control)
+    {
+        bail!("catalog partition artifact path is invalid");
+    }
+    let request = SnapshotAdmissionRequest {
+        schema_version: SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+        catalog_partition_artifact: &CatalogPartitionArtifactRef {
+            path: validated.submission.catalog_partition_artifact.path.clone(),
+            artifact_sha256,
+            payload_sha256,
+        },
+        compiler_source_identity: &compiler_source_identity,
+        compiler_image_identity: format!("sha256:{}", validated.image_digest),
+        build_input_identity: &build_input_identity,
+        task_capability: &validated.submission.task_capability,
+    };
+    let request = serde_json::to_vec(&request).context("serialize snapshot admission request")?;
+    let mut child = Command::new(sibling)
+        .arg("--admit-authenticated-snapshot")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start snapshot admission sibling {}", sibling.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("snapshot admission sibling stdin is unavailable")?;
+    if let Err(error) = stdin.write_all(&request) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("write snapshot admission request");
+    }
+    drop(stdin);
+    let stdout = child
+        .stdout
+        .take()
+        .context("snapshot admission sibling stdout is unavailable")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let _ = sender.send(read_bounded_admission_response(stdout));
+    });
+    let output = match receiver.recv_timeout(timeout) {
+        Ok(output) => output,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!(
+                "snapshot admission sibling timed out after {} seconds",
+                timeout.as_secs()
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("snapshot admission sibling response reader failed");
+        }
+    };
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("snapshot admission sibling response reader panicked"))?;
+    let status = child
+        .wait()
+        .context("wait for snapshot admission sibling")?;
+    let output = output?;
+    if !status.success() {
+        bail!("snapshot admission sibling exited unsuccessfully");
+    }
+    match parse_snapshot_admission_response(&output, &validated)? {
+        SnapshotAdmissionDecision::Admitted(admission) => {
+            Ok(AdmissionDecision::Admitted(Box::new(AdmittedSubmission {
+                validated,
+                admission,
+            })))
+        }
+        SnapshotAdmissionDecision::Rejected(rejection) => {
+            Ok(AdmissionDecision::Rejected(rejection))
+        }
+    }
+}
+
+fn read_bounded_admission_response(mut reader: impl Read) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut exceeded = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_ADMISSION_RESPONSE_BYTES.saturating_add(1) as usize - output.len();
+        let copied = read.min(remaining);
+        output.extend_from_slice(&buffer[..copied]);
+        exceeded |= copied < read || output.len() as u64 > MAX_ADMISSION_RESPONSE_BYTES;
+    }
+    if exceeded {
+        bail!("snapshot admission response exceeds {MAX_ADMISSION_RESPONSE_BYTES} bytes");
+    }
+    Ok(output)
+}
+
+fn parse_snapshot_admission_response(
+    output: &[u8],
+    validated: &ValidatedSubmission,
+) -> anyhow::Result<SnapshotAdmissionDecision> {
+    let output = std::str::from_utf8(output).context("snapshot admission response is not UTF-8")?;
+    let response = output
+        .strip_suffix('\n')
+        .filter(|line| !line.is_empty() && !line.contains('\n'))
+        .context("snapshot admission response must be exactly one non-empty JSON line")?;
+    let response: SnapshotAdmissionResponse =
+        serde_json::from_str(response).context("snapshot admission response is invalid")?;
+    match response {
+        SnapshotAdmissionResponse::Rejected {
+            schema_version,
+            rejection,
+        } => {
+            if schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION || rejection.is_empty() {
+                bail!("snapshot admission response is invalid");
+            }
+            Ok(SnapshotAdmissionDecision::Rejected(rejection))
+        }
+        SnapshotAdmissionResponse::Admitted {
+            schema_version,
+            snapshot_contract_id,
+            snapshot_digest,
+            partition_digest,
+            policy_identity,
+            task_capability,
+            immutable_image_identity,
+        } => {
+            if schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION
+                || task_capability != validated.submission.task_capability
+                || immutable_image_identity != format!("sha256:{}", validated.image_digest)
+                || immutable_sha256_identity("admitted snapshot digest", &snapshot_digest)?
+                    != format!("sha256:{}", validated.snapshot_sha256)
+            {
+                bail!("snapshot admission response does not bind the submitted immutable identity");
+            }
+            Ok(SnapshotAdmissionDecision::Admitted(SnapshotAdmission {
+                snapshot_contract_id: immutable_sha256_identity(
+                    "admitted snapshot contract",
+                    &snapshot_contract_id,
+                )?,
+                snapshot_digest,
+                partition_digest: immutable_sha256_identity(
+                    "admitted partition",
+                    &partition_digest,
+                )?,
+                policy_identity: immutable_sha256_identity("admitted policy", &policy_identity)?,
+                task_capability,
+                immutable_image_identity,
+            }))
+        }
+    }
+}
+
+fn report_admission_rejection(rejection: &str) -> anyhow::Result<()> {
+    print_json(&json!({
+        "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+        "status": "rejected",
+        "rejection": rejection,
+    }))?;
+    bail!("snapshot admission rejected: {rejection}")
+}
+
+fn immutable_sha256_identity(label: &str, value: &str) -> anyhow::Result<String> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .with_context(|| format!("{label} must use sha256:<64 lowercase hex>"))?;
+    if value != format!("sha256:{digest}") || digest != normalized_sha256(label, digest)? {
+        bail!("{label} must use sha256:<64 lowercase hex>");
+    }
+    Ok(value.to_owned())
+}
+
+fn render_admitted_submission(
+    admitted: AdmittedSubmission,
     namespace: &str,
 ) -> anyhow::Result<RenderedSubmission> {
     validate_dns_label("namespace", namespace)?;
-    render_validated_submission(validate_submission(submission)?, namespace)
+    render_validated_submission(admitted, namespace)
 }
 
 fn render_validated_submission(
-    validated: ValidatedSubmission,
+    admitted: AdmittedSubmission,
     namespace: &str,
 ) -> anyhow::Result<RenderedSubmission> {
+    let admission = admitted.admission;
+    let validated = admitted.validated;
     let resume_url = validated.submission.resume_url.as_deref().unwrap_or("");
     let resume_sha256 = validated.resume_sha256.as_deref().unwrap_or("");
     let labels = json!({
@@ -465,6 +802,12 @@ fn render_validated_submission(
         "research.monday/mission-object": validated.mission_object,
         "research.monday/snapshot-sha256": validated.snapshot_sha256,
         "research.monday/snapshot-object": validated.snapshot_object,
+        "research.monday/snapshot-contract-id": admission.snapshot_contract_id,
+        "research.monday/admitted-snapshot-digest": admission.snapshot_digest,
+        "research.monday/partition-digest": admission.partition_digest,
+        "research.monday/policy-identity": admission.policy_identity,
+        "research.monday/task-capability": admission.task_capability,
+        "research.monday/admitted-image-identity": admission.immutable_image_identity,
         "research.monday/result-object": validated.result_object,
         "research.monday/result-identity-sha256": validated.result_identity_sha256,
         "research.monday/image-digest": validated.image_digest,
@@ -668,17 +1011,21 @@ fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn kubectl_binary() -> OsString {
-    std::env::var_os("MONDAY_KUBECTL_BIN").unwrap_or_else(|| OsString::from("kubectl"))
+fn kubectl_binary() -> PathBuf {
+    std::env::var_os("MONDAY_KUBECTL_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("kubectl"))
 }
 
 fn existing_result_jobs(
+    kubectl: &Path,
     context: &str,
     namespace: &str,
     result_identity_label: &str,
 ) -> anyhow::Result<Vec<(String, Value)>> {
     let selector = format!("research.monday/result-id={result_identity_label}");
     let jobs = kubectl_json(
+        kubectl,
         context,
         namespace,
         ["get", "jobs", "-l", selector.as_str(), "-o", "json"],
@@ -728,12 +1075,13 @@ fn create_failure_recovered(
 }
 
 fn kubectl_json<const N: usize>(
+    kubectl: &Path,
     context: &str,
     namespace: &str,
     args: [&str; N],
     action: &str,
 ) -> anyhow::Result<Value> {
-    let output = Command::new(kubectl_binary())
+    let output = Command::new(kubectl)
         .arg("--context")
         .arg(context)
         .arg("--namespace")
@@ -746,12 +1094,13 @@ fn kubectl_json<const N: usize>(
 }
 
 fn kubectl_with_input<const N: usize>(
+    kubectl: &Path,
     context: &str,
     namespace: &str,
     args: [&str; N],
     input: &[u8],
 ) -> anyhow::Result<Output> {
-    let mut child = Command::new(kubectl_binary())
+    let mut child = Command::new(kubectl)
         .arg("--context")
         .arg(context)
         .arg("--namespace")
@@ -770,8 +1119,13 @@ fn kubectl_with_input<const N: usize>(
     child.wait_with_output().context("wait for kubectl")
 }
 
-fn delete_input_secret(context: &str, namespace: &str, secret_name: &str) -> anyhow::Result<()> {
-    let output = Command::new(kubectl_binary())
+fn delete_input_secret(
+    kubectl: &Path,
+    context: &str,
+    namespace: &str,
+    secret_name: &str,
+) -> anyhow::Result<()> {
+    let output = Command::new(kubectl)
         .arg("--context")
         .arg(context)
         .arg("--namespace")
@@ -799,8 +1153,11 @@ mod tests {
 
     #[test]
     fn renders_the_blessed_immutable_prediction_job() {
-        let rendered = render_submission(valid_submission(), "monday-research")
-            .expect("valid immutable submission must render");
+        let rendered = render_admitted_submission(
+            admitted_submission_for_test(valid_submission()),
+            "monday-research",
+        )
+        .expect("valid immutable submission must render");
         let secret = &rendered.manifest["items"][0];
         let job = &rendered.manifest["items"][1];
 
@@ -825,6 +1182,10 @@ mod tests {
             job["metadata"]["annotations"]["research.monday/result-identity-sha256"],
             rendered.result_identity_sha256
         );
+        assert_eq!(
+            job["metadata"]["annotations"]["research.monday/partition-digest"],
+            format!("sha256:{}", "e".repeat(64))
+        );
         assert!(rendered.job_name.starts_with("prediction-"));
     }
 
@@ -836,7 +1197,7 @@ mod tests {
         ] {
             let mut submission = valid_submission();
             submission.image = image;
-            assert!(render_submission(submission, "monday-research").is_err());
+            assert!(validate_submission(submission).is_err());
         }
     }
 
@@ -845,8 +1206,9 @@ mod tests {
         let mut submission = valid_submission();
         submission.snapshot_sha256.clear();
 
-        let error = render_submission(submission, "monday-research")
-            .expect_err("snapshot without an authenticated digest must fail");
+        let error = validate_submission(submission)
+            .err()
+            .expect("snapshot without an authenticated digest must fail");
 
         assert!(error.to_string().contains("snapshot SHA256 is invalid"));
     }
@@ -865,8 +1227,9 @@ mod tests {
         submission.result_put_url =
             "https://oss-internal/results/latest/results.zip?signature=x".to_owned();
 
-        let error = render_submission(submission, "monday-research")
-            .expect_err("mutable output identity must fail before Job creation");
+        let error = validate_submission(submission)
+            .err()
+            .expect("mutable output identity must fail before Job creation");
 
         assert!(error.to_string().contains("exact attempt id"));
     }
@@ -879,7 +1242,7 @@ mod tests {
         ] {
             let mut submission = valid_submission();
             submission.mission_url = url.to_owned();
-            assert!(render_submission(submission, "monday-research").is_err());
+            assert!(validate_submission(submission).is_err());
         }
     }
 
@@ -889,8 +1252,9 @@ mod tests {
         submission.resume_url =
             Some("https://oss-internal/results/prior.zip?signature=x".to_owned());
 
-        let error = render_submission(submission, "monday-research")
-            .expect_err("incomplete resume pair must fail");
+        let error = validate_submission(submission)
+            .err()
+            .expect("incomplete resume pair must fail");
 
         assert!(error.to_string().contains("must be supplied together"));
     }
@@ -909,6 +1273,146 @@ mod tests {
             let actual = create_failure_recovered(jobs, "job", &annotations);
             assert_eq!(actual, expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_sibling_admission_never_reaches_kubectl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create dispatch test root");
+        let submission = root.path().join("submission.json");
+        std::fs::write(
+            &submission,
+            serde_json::to_vec(&json!({
+                "attempt_id": "btc-5m-attempt-001",
+                "mission_id": "btc-5m-mission-001",
+                "image": format!("registry/research-runner@sha256:{}", "a".repeat(64)),
+                "evaluator_version": format!("sha256:{}", "b".repeat(64)),
+                "resource_profile": RESOURCE_PROFILE,
+                "mission_url": "https://oss-internal/missions/mission.json?signature=x",
+                "mission_sha256": "c".repeat(64),
+                "snapshot_url": "https://oss-internal/snapshots/snapshot.zip?signature=x",
+                "snapshot_sha256": "d".repeat(64),
+                "result_put_url": "https://oss-internal/results/btc-5m-attempt-001/results.zip?signature=x",
+                "llm_secret_name": "monday-prediction-llm",
+                "catalog_partition_artifact": {
+                    "path": "catalog/catalog-partition-deadbeef.json",
+                    "artifact_sha256": format!("sha256:{}", "e".repeat(64)),
+                    "payload_sha256": format!("sha256:{}", "f".repeat(64)),
+                },
+                "compiler_source_identity": format!("sha256:{}", "1".repeat(64)),
+                "build_input_identity": format!("sha256:{}", "2".repeat(64)),
+                "task_capability": "btc_5m_backtest",
+            }))
+            .expect("serialize submission"),
+        )
+        .expect("write submission");
+        let sibling = root.path().join("monday-prediction-snapshot");
+        std::fs::write(
+            &sibling,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"schema_version\":\"monday.prediction.snapshot_admission.v1\",\"status\":\"rejected\",\"rejection\":\"unsupported_task\"}'\n",
+        )
+        .expect("write sibling");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
+            .expect("make sibling executable");
+        let kubectl = root.path().join("kubectl");
+        let kubectl_log = root.path().join("kubectl-called");
+        std::fs::write(
+            &kubectl,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", kubectl_log.display()),
+        )
+        .expect("write kubectl sentinel");
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700))
+            .expect("make kubectl sentinel executable");
+
+        let error = submit_with_binaries(
+            PredictionDispatchSubmitArgs {
+                submission,
+                context: "ack".to_owned(),
+                namespace: "monday-research".to_owned(),
+            },
+            &sibling,
+            &kubectl,
+        )
+        .expect_err("rejected admission must fail dispatch after reporting a typed result");
+
+        assert!(error.to_string().contains("unsupported_task"));
+        assert!(
+            !kubectl_log.exists(),
+            "rejection must occur before any Kubernetes read or write"
+        );
+    }
+
+    #[test]
+    fn admission_response_must_be_one_line_and_bind_submission_identities() {
+        let validated = validate_submission(valid_submission()).expect("valid submission");
+        let admitted = serde_json::to_vec(&json!({
+            "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+            "status": "admitted",
+            "snapshot_contract_id": format!("sha256:{}", "1".repeat(64)),
+            "snapshot_digest": format!("sha256:{}", "d".repeat(64)),
+            "partition_digest": format!("sha256:{}", "e".repeat(64)),
+            "policy_identity": format!("sha256:{}", "f".repeat(64)),
+            "task_capability": "btc_5m_backtest",
+            "immutable_image_identity": format!("sha256:{}", "a".repeat(64)),
+        }))
+        .expect("serialize admitted response");
+        let mut one_line = admitted.clone();
+        one_line.push(b'\n');
+        assert!(parse_snapshot_admission_response(&one_line, &validated).is_ok());
+
+        let rejected = serde_json::to_vec(&json!({
+            "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+            "status": "rejected",
+            "rejection": "unsupported_task",
+        }))
+        .expect("serialize rejected response");
+        let mut rejected = rejected;
+        rejected.push(b'\n');
+        assert!(matches!(
+            parse_snapshot_admission_response(&rejected, &validated),
+            Ok(SnapshotAdmissionDecision::Rejected(reason)) if reason == "unsupported_task"
+        ));
+
+        let mut extra_output = serde_json::to_vec(&json!({
+            "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
+            "status": "rejected",
+            "rejection": "unsupported_task",
+        }))
+        .expect("serialize rejected response");
+        extra_output.extend_from_slice(b"\nextra");
+        let mut mismatched =
+            serde_json::from_slice::<Value>(&admitted).expect("parse admitted response");
+        mismatched["snapshot_digest"] = json!(format!("sha256:{}", "e".repeat(64)));
+        let mut mismatched = serde_json::to_vec(&mismatched).expect("serialize mismatch");
+        mismatched.push(b'\n');
+        for output in [admitted, extra_output, mismatched] {
+            assert!(parse_snapshot_admission_response(&output, &validated).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_timeout_kills_a_stalled_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create admission timeout root");
+        let sibling = root.path().join("monday-prediction-snapshot");
+        std::fs::write(&sibling, "#!/bin/sh\ncat >/dev/null\nsleep 1\n")
+            .expect("write stalled sibling");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
+            .expect("make stalled sibling executable");
+
+        let error = admit_submission_with_timeout(
+            validate_submission(valid_submission()).expect("valid submission"),
+            &sibling,
+            Duration::from_millis(10),
+        )
+        .err()
+        .expect("stalled sibling must time out");
+
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
@@ -995,6 +1499,28 @@ mod tests {
             llm_secret_name: "monday-prediction-llm".to_owned(),
             resume_url: None,
             resume_sha256: None,
+            catalog_partition_artifact: CatalogPartitionArtifactRef {
+                path: "catalog/catalog-partition-deadbeef.json".to_owned(),
+                artifact_sha256: format!("sha256:{}", "e".repeat(64)),
+                payload_sha256: format!("sha256:{}", "f".repeat(64)),
+            },
+            compiler_source_identity: format!("sha256:{}", "1".repeat(64)),
+            build_input_identity: format!("sha256:{}", "2".repeat(64)),
+            task_capability: "btc_5m_backtest".to_owned(),
+        }
+    }
+
+    fn admitted_submission_for_test(submission: PredictionSubmission) -> AdmittedSubmission {
+        AdmittedSubmission {
+            validated: validate_submission(submission).expect("valid test submission"),
+            admission: SnapshotAdmission {
+                snapshot_contract_id: format!("sha256:{}", "3".repeat(64)),
+                snapshot_digest: format!("sha256:{}", "d".repeat(64)),
+                partition_digest: format!("sha256:{}", "e".repeat(64)),
+                policy_identity: format!("sha256:{}", "f".repeat(64)),
+                task_capability: "btc_5m_backtest".to_owned(),
+                immutable_image_identity: format!("sha256:{}", "a".repeat(64)),
+            },
         }
     }
 }
