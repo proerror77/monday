@@ -32,6 +32,13 @@ struct PredictionMissionIdentity {
     search_policy_snapshot_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PredictionSnapshotIdentity {
+    schema_version: String,
+    snapshot_hash: String,
+    snapshot_contract_hash: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PredictionExecutionEvidence<'a> {
     lane: &'static str,
@@ -104,6 +111,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
             )
         })?;
     extract_archive(&snapshot_archive, snapshot_dir.path(), None)?;
+    verify_admitted_snapshot_identity(&args, &mission, snapshot_dir.path())?;
 
     let resume_bundle_sha256 = if let Some((resume_url, resume_sha256)) = resume_source(&args)? {
         let resume_archive = input_dir.join("resume.zip");
@@ -176,6 +184,8 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
             args.mission_sha256.as_str(),
             args.snapshot_url.as_str(),
             args.snapshot_sha256.as_str(),
+            args.snapshot_contract_id.as_str(),
+            args.snapshot_digest.as_str(),
             args.result_put_url.as_str(),
         ]
         .iter()
@@ -183,6 +193,8 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
     {
         bail!("prediction execution paths, URLs, and hashes are required");
     }
+    immutable_sha256_identity("prediction snapshot contract", &args.snapshot_contract_id)?;
+    validate_snapshot_digest(&args.snapshot_digest)?;
     resume_source(args)?;
     Ok(())
 }
@@ -250,6 +262,47 @@ fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Res
         || mission.search_policy_snapshot_id.trim().is_empty()
     {
         bail!("prediction mission identity or lane is invalid");
+    }
+    Ok(())
+}
+
+fn verify_admitted_snapshot_identity(
+    args: &PredictionExecuteArgs,
+    mission: &PredictionMissionIdentity,
+    snapshot_dir: &Path,
+) -> anyhow::Result<()> {
+    let snapshot: PredictionSnapshotIdentity = serde_json::from_slice(
+        &std::fs::read(snapshot_dir.join("manifest.json"))
+            .context("read extracted prediction snapshot manifest")?,
+    )
+    .context("prediction snapshot manifest identity is invalid JSON")?;
+    if snapshot.schema_version != "research_snapshot_v2"
+        || mission.data_snapshot_id != args.snapshot_contract_id
+        || snapshot.snapshot_contract_hash != args.snapshot_contract_id
+        || snapshot.snapshot_hash != args.snapshot_digest
+    {
+        bail!("prediction mission, admitted snapshot contract, and snapshot manifest do not match");
+    }
+    Ok(())
+}
+
+fn immutable_sha256_identity(label: &str, value: &str) -> anyhow::Result<()> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .with_context(|| format!("{label} must use sha256:<64 lowercase hex>"))?;
+    if value != format!("sha256:{digest}") || digest != normalized_sha256(label, digest)? {
+        bail!("{label} must use sha256:<64 lowercase hex>");
+    }
+    Ok(())
+}
+
+fn validate_snapshot_digest(value: &str) -> anyhow::Result<()> {
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("prediction snapshot digest must be exactly 16 lowercase ASCII hex characters");
     }
     Ok(())
 }
@@ -362,6 +415,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("prediction snapshot archive SHA256 mismatch"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_admitted_contract_mismatch_before_starting_runner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = execute_fixture("admitted-contract-mismatch");
+        let marker = fixture.root.join("runner-started");
+        let runner = fixture.root.join("must-not-start");
+        std::fs::write(&runner, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut args = fixture.args;
+        args.snapshot_contract_id = format!("sha256:{}", "2".repeat(64));
+
+        let error = execute_with_runner(args, &runner)
+            .expect_err("mismatched admitted contract must prevent runner execution");
+
+        assert!(error.to_string().contains(
+            "prediction mission, admitted snapshot contract, and snapshot manifest do not match"
+        ));
+        assert!(!marker.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -558,7 +634,7 @@ mod tests {
         let resumed_runner = fixture.root.join("resumed-runner");
         std::fs::write(
             &resumed_runner,
-            "#!/bin/sh\ntest \"$(cat \"$2/manifest.json\")\" = '{}' || exit 4\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+            "#!/bin/sh\ntest -f \"$2/manifest.json\" || exit 4\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&resumed_runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -691,10 +767,12 @@ mod tests {
     fn execute_fixture(name: &str) -> ExecuteFixture {
         let root = temporary_root(name);
         let mission_path = root.join("mission.json");
+        let snapshot_contract_id = format!("sha256:{}", "1".repeat(64));
+        let snapshot_digest = "0123456789abcdef";
         let mission = serde_json::json!({
             "mission_id": "prediction-test",
             "lane": "prediction_market",
-            "data_snapshot_id": "sha256:snapshot-contract",
+            "data_snapshot_id": snapshot_contract_id,
             "search_policy_snapshot_id": "sha256:evaluator-version"
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
@@ -704,7 +782,17 @@ mod tests {
         archive
             .start_file("manifest.json", SimpleFileOptions::default())
             .unwrap();
-        archive.write_all(b"{}\n").unwrap();
+        archive
+            .write_all(
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "research_snapshot_v2",
+                    "snapshot_hash": snapshot_digest,
+                    "snapshot_contract_hash": snapshot_contract_id,
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
         archive.finish().unwrap();
         let result_path = root.join("published.zip");
         let args = PredictionExecuteArgs {
@@ -713,6 +801,8 @@ mod tests {
             mission_sha256: format!("{:x}", Sha256::digest(&mission_bytes)),
             snapshot_url: snapshot_path.to_string_lossy().into_owned(),
             snapshot_sha256: sha256_file(&snapshot_path).unwrap(),
+            snapshot_contract_id,
+            snapshot_digest: snapshot_digest.to_owned(),
             snapshot_cache_dir: None,
             resume_url: None,
             resume_sha256: None,
