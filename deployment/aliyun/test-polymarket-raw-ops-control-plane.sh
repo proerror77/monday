@@ -1414,14 +1414,14 @@ jq '.malformed_trade_rows = 1' "$tmp_dir/transient-legacy-health.json" \
 [[ $(legacy_health_sample_state \
   "$tmp_dir/fatal-legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == fatal ]]
 [[ $(legacy_health_transition clean '' 0 240) == advance: ]]
-first_transient=$(legacy_health_transition transient_api_error '' 0 240)
-[[ $first_transient == wait:0 ]]
+startup_transient=$(legacy_health_transition transient_api_error '' 0 240)
+[[ $startup_transient == wait:0 ]]
 [[ $(legacy_health_transition transient_api_error \
-  "${first_transient#*:}" 240 240) == wait:0 ]]
-[[ $(legacy_health_transition clean "${first_transient#*:}" 240 240) == advance: ]]
+  "${startup_transient#*:}" 240 240) == wait:0 ]]
+[[ $(legacy_health_transition clean "${startup_transient#*:}" 240 240) == advance: ]]
 [[ $(legacy_health_transition transient_api_error \
-  "${first_transient#*:}" 241 240) == expired:0 ]]
-[[ $(legacy_health_transition clean "${first_transient#*:}" 241 240) == expired:0 ]]
+  "${startup_transient#*:}" 241 240) == expired:0 ]]
+[[ $(legacy_health_transition clean "${startup_transient#*:}" 241 240) == expired:0 ]]
 [[ $(legacy_health_transition fatal '' 0 240) == fatal: ]]
 
 jq -n '{
@@ -1532,11 +1532,19 @@ cutover_health_silence_seconds=$(
 grep -Fq 'legacy_health_state=$(legacy_health_sample_state' "$GATE"
 grep -Fq '"$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}"' \
   "$GATE"
-grep -Fq '      "$baseline_mode")' "$GATE"
+grep -Fq '    "$baseline_mode")' "$GATE"
 grep -Fq 'legacy_health_result=$(legacy_health_transition' "$GATE"
 grep -Fq '"$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")' "$GATE"
 grep -Fq 'legacy_health_decision=${legacy_health_result%%:*}' "$GATE"
 grep -Fq 'legacy_api_error_started_at=${legacy_health_result#*:}' "$GATE"
+legacy_transition_line=$(grep -nF \
+  'legacy_health_result=$(legacy_health_transition' "$GATE" | cut -d: -f1)
+health_settle_line=$(grep -nF \
+  '  if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE" | cut -d: -f1)
+if ((legacy_transition_line >= health_settle_line)); then
+  printf 'legacy health recovery budget starts after the shadow settle delay\n' >&2
+  exit 1
+fi
 grep -Fq 'if [[ $legacy_health_decision == advance ]]; then' "$GATE"
 grep -Fq '&& [[ $legacy_health_decision == advance ]]; then' \
   "$GATE"

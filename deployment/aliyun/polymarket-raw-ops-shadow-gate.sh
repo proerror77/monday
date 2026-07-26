@@ -767,6 +767,34 @@ while :; do
   elapsed=$((now_uptime - start_uptime))
   verify_baseline_identity \
     || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
+  legacy_health="$LEGACY_SPOOL/health.json"
+  [[ -f $legacy_health && ! -L $legacy_health ]] \
+    || die "$baseline_label health is missing"
+  legacy_health_state=$(legacy_health_sample_state \
+    "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
+    "$baseline_mode")
+  legacy_health_result=$(legacy_health_transition \
+    "$legacy_health_state" "$legacy_api_error_started_at" \
+    "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+  legacy_health_decision=${legacy_health_result%%:*}
+  legacy_api_error_started_at=${legacy_health_result#*:}
+  case "$legacy_health_decision" in
+    advance|wait)
+      ;;
+    expired)
+      die "$baseline_label API errors did not recover within the health budget"
+      ;;
+    *)
+      die "$baseline_label health is not fail-closed clean during shadow"
+      ;;
+  esac
+  current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
+  if [[ $current_legacy_health != "$last_legacy_health" ]]; then
+    last_legacy_health=$current_legacy_health
+    last_legacy_health_change=$now_uptime
+  fi
+  ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
+    || die "$baseline_label health stopped advancing during shadow"
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
   [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
@@ -790,35 +818,6 @@ while :; do
     fi
     ((now_uptime - last_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die 'Rust shadow health stopped advancing'
-
-    legacy_health="$LEGACY_SPOOL/health.json"
-    [[ -f $legacy_health && ! -L $legacy_health ]] \
-      || die "$baseline_label health is missing"
-    legacy_health_state=$(legacy_health_sample_state \
-      "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
-      "$baseline_mode")
-    legacy_health_result=$(legacy_health_transition \
-      "$legacy_health_state" "$legacy_api_error_started_at" \
-      "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
-    legacy_health_decision=${legacy_health_result%%:*}
-    legacy_api_error_started_at=${legacy_health_result#*:}
-    case "$legacy_health_decision" in
-      advance|wait)
-        ;;
-      expired)
-        die "$baseline_label API errors did not recover within the health budget"
-        ;;
-      *)
-        die "$baseline_label health is not fail-closed clean during shadow"
-        ;;
-    esac
-    current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
-    if [[ $current_legacy_health != "$last_legacy_health" ]]; then
-      last_legacy_health=$current_legacy_health
-      last_legacy_health_change=$now_uptime
-    fi
-    ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
-      || die "$baseline_label health stopped advancing during shadow"
 
     rust_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
       "$health") || die 'Rust health has no last_success_at'
