@@ -130,6 +130,11 @@ Neither mode authorizes Paper, Shadow, Live, artifact promotion, strategy
 configuration changes, runtime enablement, or profitability claims. A Mission
 requesting any such authority is rejected before a Pod or Job is created.
 
+A `pipeline_smoke` completion uses `monday.prediction.pipeline_smoke.result.v1`
+and binds the content digest of its one
+`monday.prediction.pipeline_smoke.v1` evaluator report; the runner rehashes that
+report after immutable result-bundle readback before accepting the completion.
+
 The [repository work-control policy](../../AGENTS.md) is binding here: one named
 write owner per branch, one independently reviewable and rollbackable change
 contract per PR, and read-only review until ownership is explicitly transferred.

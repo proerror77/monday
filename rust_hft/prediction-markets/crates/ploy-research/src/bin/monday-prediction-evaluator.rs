@@ -117,6 +117,19 @@ struct FullDepthExecutionArtifact<'a> {
 }
 
 #[derive(serde::Serialize)]
+struct PipelineSmokeReport<'a> {
+    schema_version: &'static str,
+    status: &'static str,
+    scope: &'static str,
+    mission_id: &'a str,
+    task: &'a str,
+    snapshot_hash: &'a str,
+    snapshot_contract_id: &'a str,
+    search_policy_snapshot_id: &'a str,
+    claims_excluded: [&'static str; 6],
+}
+
+#[derive(serde::Serialize)]
 struct RepricePilotSearchArtifact {
     summary: AlphaSearchArtifactSummary,
     formula_mcts_checkpoint_sha256: String,
@@ -305,6 +318,38 @@ fn write_content_addressed_report<T: serde::Serialize>(
     cleanup.map_err(|error| format!("remove report lock {}: {error}", lock_path.display()))?;
     directory_sync.map_err(|error| format!("sync report directory: {error}"))?;
     Ok(output_path)
+}
+
+fn write_pipeline_smoke_report(
+    report_output_dir: &Path,
+    mission_id: &str,
+    task: &str,
+    snapshot_hash: &str,
+    snapshot_contract_id: &str,
+    search_policy_snapshot_id: &str,
+) -> Result<PathBuf, String> {
+    write_content_addressed_report(
+        report_output_dir,
+        "pipeline-smoke",
+        &PipelineSmokeReport {
+            schema_version: "monday.prediction.pipeline_smoke.v1",
+            status: "completed",
+            scope: "pipeline_compatibility_only",
+            mission_id,
+            task,
+            snapshot_hash,
+            snapshot_contract_id,
+            search_policy_snapshot_id,
+            claims_excluded: [
+                "alpha",
+                "profitability",
+                "paper",
+                "shadow",
+                "live",
+                "promotion",
+            ],
+        },
+    )
 }
 
 fn write_report_set<S: serde::Serialize, U: serde::Serialize, D: serde::Serialize>(
@@ -612,6 +657,96 @@ fn flag_present(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+#[derive(Debug)]
+struct PipelineSmokeArgs {
+    task: String,
+    snapshot_dir: String,
+    mission_id: String,
+    snapshot_hash: String,
+    snapshot_contract_id: String,
+    search_policy_snapshot_id: String,
+    report_output_dir: String,
+}
+
+fn validate_pipeline_smoke_args(args: &[String]) -> Result<PipelineSmokeArgs, String> {
+    const FLAGS: [&str; 7] = [
+        "--pipeline-smoke-task",
+        "--snapshot-dir",
+        "--mission-id",
+        "--snapshot-hash",
+        "--snapshot-contract-id",
+        "--expected-search-policy-snapshot-id",
+        "--report-output-dir",
+    ];
+    if args.len() != 1 + FLAGS.len() * 2
+        || args
+            .iter()
+            .filter(|value| value.starts_with("--"))
+            .any(|flag| !FLAGS.contains(&flag.as_str()))
+    {
+        return Err(
+            "--pipeline-smoke-task only accepts its typed snapshot/report arguments".into(),
+        );
+    }
+    let value = |flag: &str| -> Result<String, String> {
+        let matches = args
+            .windows(2)
+            .filter(|window| window[0] == flag)
+            .map(|window| window[1].trim())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [value] if !value.is_empty() && !value.starts_with("--") => Ok((*value).to_string()),
+            _ => Err(format!("--pipeline-smoke-task requires exactly one {flag}")),
+        }
+    };
+    let parsed = PipelineSmokeArgs {
+        task: value("--pipeline-smoke-task")?,
+        snapshot_dir: value("--snapshot-dir")?,
+        mission_id: value("--mission-id")?,
+        snapshot_hash: value("--snapshot-hash")?,
+        snapshot_contract_id: value("--snapshot-contract-id")?,
+        search_policy_snapshot_id: value("--expected-search-policy-snapshot-id")?,
+        report_output_dir: value("--report-output-dir")?,
+    };
+    if parsed.task != "settlement_probability" {
+        return Err("--pipeline-smoke-task is not an admitted typed task".into());
+    }
+    Ok(parsed)
+}
+
+fn run_pipeline_smoke(args: &[String]) -> Result<(), String> {
+    let args = validate_pipeline_smoke_args(args)?;
+    let snapshot = load_research_snapshot(Path::new(&args.snapshot_dir))
+        .map_err(|error| format!("load pipeline smoke snapshot: {error:#}"))?;
+    let actual_snapshot_hash = snapshot
+        .manifest
+        .snapshot_hash
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "pipeline smoke snapshot is missing snapshot_hash".to_string())?;
+    if actual_snapshot_hash != args.snapshot_hash {
+        return Err("pipeline smoke snapshot hash does not match admitted digest".into());
+    }
+    validate_prediction_snapshot_contract_id(
+        &args.snapshot_contract_id,
+        snapshot.manifest.snapshot_contract_hash.as_deref(),
+    )?;
+    validate_expected_prediction_policy(Some(&args.search_policy_snapshot_id), None)?;
+    let path = write_pipeline_smoke_report(
+        Path::new(&args.report_output_dir),
+        &args.mission_id,
+        &args.task,
+        &args.snapshot_hash,
+        &args.snapshot_contract_id,
+        &args.search_policy_snapshot_id,
+    )?;
+    eprintln!(
+        "pipeline smoke compatibility report written {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn prediction_underlying_symbol(raw: &str) -> String {
     let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
     for quote in ["USDT", "USDC", "USD"] {
@@ -866,9 +1001,10 @@ mod tests {
     use super::{
         parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
         settlement_time_cohort_from_args, sorted_distinct_reprice_pilot_market_ids,
-        validate_expected_prediction_policy, validate_prediction_snapshot_contract_id,
-        validate_prediction_snapshot_profile, validate_report_observation_count,
-        validate_reprice_pilot_config, validate_time_cohort_range, write_report_set,
+        validate_expected_prediction_policy, validate_pipeline_smoke_args,
+        validate_prediction_snapshot_contract_id, validate_prediction_snapshot_profile,
+        validate_report_observation_count, validate_reprice_pilot_config,
+        validate_time_cohort_range, write_pipeline_smoke_report, write_report_set,
         ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
@@ -1191,6 +1327,119 @@ mod tests {
         assert!(validate_report_observation_count(Some("reports"), 1).is_ok());
         assert!(validate_report_observation_count(None, 0).is_ok());
     }
+
+    #[test]
+    fn pipeline_smoke_report_is_content_addressed_and_excludes_activation_claims() {
+        let root = tempfile::tempdir().expect("create private temporary report directory");
+        let path = write_pipeline_smoke_report(
+            root.path(),
+            "mission-1",
+            "settlement_probability",
+            "0123456789abcdef",
+            "sha256:contract",
+            "sha256:policy",
+        )
+        .expect("write mechanical compatibility report");
+
+        let bytes = fs::read(&path).expect("read pipeline smoke report");
+        let report: serde_json::Value = serde_json::from_slice(&bytes).expect("parse report");
+        assert_eq!(report["status"], "completed");
+        assert_eq!(report["task"], "settlement_probability");
+        assert_eq!(
+            report["claims_excluded"],
+            serde_json::json!([
+                "alpha",
+                "profitability",
+                "paper",
+                "shadow",
+                "live",
+                "promotion"
+            ])
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(format!("pipeline-smoke-{:x}.json", Sha256::digest(&bytes)).as_str())
+        );
+    }
+
+    #[test]
+    fn pipeline_smoke_rejects_any_non_smoke_evaluator_flag() {
+        let args = vec![
+            "monday-prediction-evaluator".to_string(),
+            "--pipeline-smoke-task".to_string(),
+            "settlement_probability".to_string(),
+            "--snapshot-dir".to_string(),
+            "snapshot".to_string(),
+            "--mission-id".to_string(),
+            "mission".to_string(),
+            "--snapshot-hash".to_string(),
+            "0123456789abcdef".to_string(),
+            "--snapshot-contract-id".to_string(),
+            "sha256:contract".to_string(),
+            "--expected-search-policy-snapshot-id".to_string(),
+            "sha256:policy".to_string(),
+            "--report-output-dir".to_string(),
+            "reports".to_string(),
+            "--prediction-mcts-selected-candidate-json".to_string(),
+            "candidate.json".to_string(),
+        ];
+
+        assert!(validate_pipeline_smoke_args(&args)
+            .expect_err("pipeline smoke must reject MCTS input")
+            .contains("only accepts"));
+    }
+
+    #[test]
+    fn pipeline_smoke_rejects_execution_tasks_until_their_admission_capability_exists() {
+        let args = vec![
+            "monday-prediction-evaluator".to_string(),
+            "--pipeline-smoke-task".to_string(),
+            "up_execution:10".to_string(),
+            "--snapshot-dir".to_string(),
+            "snapshot".to_string(),
+            "--mission-id".to_string(),
+            "mission".to_string(),
+            "--snapshot-hash".to_string(),
+            "0123456789abcdef".to_string(),
+            "--snapshot-contract-id".to_string(),
+            "sha256:contract".to_string(),
+            "--expected-search-policy-snapshot-id".to_string(),
+            "sha256:policy".to_string(),
+            "--report-output-dir".to_string(),
+            "reports".to_string(),
+        ];
+
+        assert!(validate_pipeline_smoke_args(&args)
+            .expect_err("unsupported execution task must fail closed")
+            .contains("not an admitted typed task"));
+    }
+
+    #[test]
+    fn pipeline_smoke_rejects_promotion_flags() {
+        let args = vec![
+            "monday-prediction-evaluator".to_string(),
+            "--pipeline-smoke-task".to_string(),
+            "settlement_probability".to_string(),
+            "--snapshot-dir".to_string(),
+            "snapshot".to_string(),
+            "--mission-id".to_string(),
+            "mission".to_string(),
+            "--snapshot-hash".to_string(),
+            "0123456789abcdef".to_string(),
+            "--snapshot-contract-id".to_string(),
+            "sha256:contract".to_string(),
+            "--expected-search-policy-snapshot-id".to_string(),
+            "sha256:policy".to_string(),
+            "--report-output-dir".to_string(),
+            "reports".to_string(),
+            "--promote".to_string(),
+            "paper".to_string(),
+        ];
+
+        assert!(validate_pipeline_smoke_args(&args)
+            .expect_err("pipeline smoke must reject promotion")
+            .contains("only accepts"));
+    }
 }
 
 fn alpha_search_plan_factor_names(path: &str) -> Vec<String> {
@@ -1317,6 +1566,13 @@ fn filter_autofactor_reports(
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if flag_present(&args, "--pipeline-smoke-task") {
+        run_pipeline_smoke(&args).unwrap_or_else(|reason| {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(2);
+        });
+        return;
+    }
     if flag_value(&args, "--db-url").is_some() {
         eprintln!("ERROR: direct DB factor walk-forward has been removed; pass --snapshot-dir");
         std::process::exit(2);

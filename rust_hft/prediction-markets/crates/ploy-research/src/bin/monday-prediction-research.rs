@@ -26,6 +26,10 @@ use ploy_research::prediction_mcts::{PredictionMctsCandidate, PredictionMctsEval
 use ploy_research::prediction_mcts_run::{
     run_or_resume_prediction_mcts_with_component_profile, PredictionMctsRunEvaluator,
 };
+use ploy_research::prediction_mission_v3::{
+    parse_prediction_mission_json, validate_prediction_mission_v3, ParsedPredictionMission,
+    PredictionResearchMissionV3, PredictionRunMode, PredictionTaskKind,
+};
 use ploy_research::{
     load_research_snapshot, normalized_underlying_symbol, PredictionResearchFeedback,
 };
@@ -43,6 +47,25 @@ fn usage() -> ! {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+#[derive(serde::Serialize)]
+struct PipelineSmokeSummary {
+    schema_version: &'static str,
+    status: &'static str,
+    mission_id: String,
+    task: String,
+    snapshot_contract_id: String,
+    snapshot_digest: String,
+    search_policy_snapshot_id: String,
+    evaluator_report_sha256: String,
+}
+
+fn pipeline_smoke_task(mission: &PredictionResearchMissionV3) -> Result<String, String> {
+    match (mission.task.kind, mission.task.prediction_horizon_secs) {
+        (PredictionTaskKind::SettlementProbability, None) => Ok("settlement_probability".into()),
+        _ => Err("pipeline smoke Mission v3 task is not admitted".into()),
+    }
 }
 
 struct RustProcessEvaluator {
@@ -155,6 +178,182 @@ impl RustProcessEvaluator {
         }
         Ok(command)
     }
+
+    fn pipeline_smoke_command(
+        &self,
+        mission: &PredictionResearchMissionV3,
+        task: &str,
+        snapshot_dir: &Path,
+        snapshot_hash: &str,
+        report_output_dir: &Path,
+    ) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("--pipeline-smoke-task")
+            .arg(task)
+            .arg("--snapshot-dir")
+            .arg(snapshot_dir)
+            .arg("--mission-id")
+            .arg(&mission.mission_id)
+            .arg("--snapshot-hash")
+            .arg(snapshot_hash)
+            .arg("--snapshot-contract-id")
+            .arg(&mission.snapshot_contract_id)
+            .arg("--expected-search-policy-snapshot-id")
+            .arg(&mission.search_policy_snapshot_id)
+            .arg("--report-output-dir")
+            .arg(report_output_dir);
+        command
+    }
+}
+
+fn run_pipeline_smoke_evaluator(mut command: Command, timeout: Duration) -> Result<(), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_evaluator_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn pipeline smoke evaluator: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("pipeline smoke evaluator exited with {status}"))
+            }
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = terminate_evaluator_group(&mut child);
+                return Err(format!(
+                    "pipeline smoke evaluator exceeded {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            Err(error) => {
+                let _ = terminate_evaluator_group(&mut child);
+                return Err(format!("poll pipeline smoke evaluator: {error}"));
+            }
+        }
+    }
+}
+
+fn read_pipeline_smoke_report(
+    report_dir: &Path,
+    mission: &PredictionResearchMissionV3,
+    task: &str,
+    snapshot_hash: &str,
+) -> Result<String, String> {
+    let matches = fs::read_dir(report_dir)
+        .map_err(|error| format!("read pipeline smoke report directory: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pipeline-smoke-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    let [path] = matches.as_slice() else {
+        return Err(format!(
+            "expected exactly one pipeline smoke report, found {}",
+            matches.len()
+        ));
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| format!("read pipeline smoke report {}: {error}", path.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if !path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&digest))
+    {
+        return Err("pipeline smoke report is not content-addressed".into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse pipeline smoke report: {error}"))?;
+    if report["schema_version"] != "monday.prediction.pipeline_smoke.v1"
+        || report["status"] != "completed"
+        || report["scope"] != "pipeline_compatibility_only"
+        || report["mission_id"] != mission.mission_id
+        || report["task"] != task
+        || report["snapshot_hash"] != snapshot_hash
+        || report["snapshot_contract_id"] != mission.snapshot_contract_id
+        || report["search_policy_snapshot_id"] != mission.search_policy_snapshot_id
+        || report["claims_excluded"]
+            != serde_json::json!([
+                "alpha",
+                "profitability",
+                "paper",
+                "shadow",
+                "live",
+                "promotion"
+            ])
+    {
+        return Err(
+            "pipeline smoke report does not bind its mechanical compatibility identity".into(),
+        );
+    }
+    Ok(digest)
+}
+
+fn run_pipeline_smoke(
+    mission_path: &Path,
+    snapshot_dir: &Path,
+    output_dir: &Path,
+) -> Result<PipelineSmokeSummary, String> {
+    let bytes = fs::read(mission_path).map_err(|error| {
+        format!(
+            "read pipeline smoke Mission v3 {}: {error}",
+            mission_path.display()
+        )
+    })?;
+    let mission = match parse_prediction_mission_json(&bytes)? {
+        ParsedPredictionMission::V3(mission) => mission,
+        ParsedPredictionMission::V2(_) => return Err("pipeline smoke requires Mission v3".into()),
+    };
+    validate_prediction_mission_v3(&mission)?;
+    if mission.run_mode != PredictionRunMode::PipelineSmoke {
+        return Err("pipeline smoke requires run_mode pipeline_smoke".into());
+    }
+    if mission.search_policy_snapshot_id != current_prediction_policy_snapshot_id() {
+        return Err("pipeline smoke Mission v3 has a stale evaluator policy identity".into());
+    }
+    let task = pipeline_smoke_task(&mission)?;
+    let snapshot = load_research_snapshot(snapshot_dir)
+        .map_err(|error| format!("load pipeline smoke snapshot: {error:#}"))?;
+    let snapshot_hash = snapshot
+        .manifest
+        .snapshot_hash
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "pipeline smoke snapshot is missing snapshot_hash".to_string())?;
+    if snapshot.manifest.snapshot_contract_hash.as_deref() != Some(&mission.snapshot_contract_id) {
+        return Err("pipeline smoke snapshot contract does not match Mission v3".into());
+    }
+    fs::create_dir_all(output_dir)
+        .map_err(|error| format!("create pipeline smoke output directory: {error}"))?;
+    let report_dir = output_dir.join("reports");
+    let evaluator = RustProcessEvaluator::new()?;
+    let command =
+        evaluator.pipeline_smoke_command(&mission, &task, snapshot_dir, snapshot_hash, &report_dir);
+    run_pipeline_smoke_evaluator(
+        command,
+        Duration::from_secs(mission.search_budget.max_seconds.max(1)),
+    )?;
+    let evaluator_report_sha256 =
+        read_pipeline_smoke_report(&report_dir, &mission, &task, snapshot_hash)?;
+    Ok(PipelineSmokeSummary {
+        schema_version: "monday.prediction.pipeline_smoke.result.v1",
+        status: "completed",
+        mission_id: mission.mission_id,
+        task,
+        snapshot_contract_id: mission.snapshot_contract_id,
+        snapshot_digest: snapshot_hash.to_owned(),
+        search_policy_snapshot_id: mission.search_policy_snapshot_id,
+        evaluator_report_sha256,
+    })
 }
 
 impl PredictionEvaluator for RustProcessEvaluator {
@@ -743,6 +942,24 @@ fn main() {
         println!("{}", research_brief_snapshot_id(&mission));
         return;
     }
+    if let [flag, mission_path, snapshot_dir, output_dir] = args.as_slice() {
+        if flag == "--pipeline-smoke" {
+            let summary = run_pipeline_smoke(
+                Path::new(mission_path),
+                Path::new(snapshot_dir),
+                Path::new(output_dir),
+            )
+            .unwrap_or_else(|reason| {
+                eprintln!("ERROR: {reason}");
+                std::process::exit(2);
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).expect("serialize pipeline smoke summary")
+            );
+            return;
+        }
+    }
     let (legacy_loop, mission_path, snapshot_dir, output_dir) = match args.as_slice() {
         [mission_path, snapshot_dir, output_dir] => (false, mission_path, snapshot_dir, output_dir),
         [flag, mission_path, snapshot_dir, output_dir] if flag == "--legacy-loop" => {
@@ -971,5 +1188,33 @@ mod tests {
                 && window[1] == selected_candidate_path.to_string_lossy()
         }));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pipeline_smoke_task_rejects_unadmitted_execution_variants() {
+        let base = serde_json::json!({
+            "schema_version": "prediction_research_mission.v3",
+            "mission_id": "btc-5m-smoke",
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "run_mode": "pipeline_smoke",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": format!("sha256:{}", "1".repeat(64)),
+            "snapshot_contract_id": format!("sha256:{}", "2".repeat(64)),
+            "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
+            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+        });
+        let mut settlement = base.clone();
+        settlement["task"] = serde_json::json!({"kind": "settlement_probability"});
+        let settlement = serde_json::from_value::<PredictionResearchMissionV3>(settlement).unwrap();
+        assert_eq!(
+            pipeline_smoke_task(&settlement).unwrap(),
+            "settlement_probability"
+        );
+
+        let mut up = base;
+        up["task"] = serde_json::json!({"kind": "up_execution", "side": "up", "prediction_horizon_secs": 10});
+        let up = serde_json::from_value::<PredictionResearchMissionV3>(up).unwrap();
+        assert!(pipeline_smoke_task(&up).is_err());
     }
 }
