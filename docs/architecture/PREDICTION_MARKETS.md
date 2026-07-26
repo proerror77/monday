@@ -196,8 +196,8 @@ source; the aggregate is the bounded research view.
 LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
 lab-only Formula proposer for derivatives missions. The prediction-market module
 keeps the versioned `prediction_research_mission.v2` JSON brief on its existing
-LoopRun path and admits `prediction_research_mission.v3` only through typed,
-authenticated task and input identities. Mission v3 has no implicit v2 mapping or
+LoopRun path and admits `prediction_research_mission.v4` only through typed,
+authenticated task and input identities. Mission v4 has no implicit v2 mapping or
 resume path; Issue #320 owns construction of its opaque admission handle after
 independent cohort, snapshot, and policy readback. The module retains its existing
 `LlmPriorSpec` and does not import the alpha-harness Rust domain or loop runtime.

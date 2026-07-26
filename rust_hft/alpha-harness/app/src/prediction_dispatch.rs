@@ -640,7 +640,7 @@ fn admit_submission_with_timeout(
     let deadline = Instant::now() + timeout;
     let mission_json = read_verified_mission_for_admission(
         &validated,
-        remaining_admission_time(deadline, "immutable Mission v3 fetch")?,
+        remaining_admission_time(deadline, "immutable Mission v4 fetch")?,
     )?;
     admit_submission_before_deadline(validated, sibling, deadline, &mission_json)
 }
@@ -799,9 +799,9 @@ fn admit_submission_before_deadline(
 
 fn mission_is_pipeline_smoke(mission_json: &str) -> anyhow::Result<bool> {
     let mission: Value = serde_json::from_str(mission_json)
-        .context("parse SHA-verified Mission v3 execution mode")?;
+        .context("parse SHA-verified Mission v4 execution mode")?;
     Ok(mission.get("schema_version").and_then(Value::as_str)
-        == Some("prediction_research_mission.v3")
+        == Some("prediction_research_mission.v4")
         && mission.get("run_mode").and_then(Value::as_str) == Some("pipeline_smoke"))
 }
 
@@ -821,12 +821,12 @@ fn read_verified_mission_for_admission(
         &mission_path,
         MAX_ADMISSION_MISSION_BYTES,
     )
-    .context("fetch bounded immutable Mission v3 for admission")?;
+    .context("fetch bounded immutable Mission v4 for admission")?;
     if mission_sha256 != validated.mission_sha256 {
-        bail!("prediction Mission v3 SHA256 mismatch before snapshot admission");
+        bail!("prediction Mission v4 SHA256 mismatch before snapshot admission");
     }
     std::fs::read_to_string(&mission_path)
-        .context("Mission v3 must be valid UTF-8 JSON for snapshot admission")
+        .context("Mission v4 must be valid UTF-8 JSON for snapshot admission")
 }
 
 fn terminate_admission_child(child: &mut Child) {
@@ -1117,6 +1117,7 @@ fn render_validated_submission(
                                     "--snapshot-sha256", "$(SNAPSHOT_SHA256)",
                                     "--snapshot-contract-id", "$(SNAPSHOT_CONTRACT_ID)",
                                     "--snapshot-digest", "$(SNAPSHOT_DIGEST)",
+                                    "--cohort-manifest-id", "$(COHORT_MANIFEST_ID)",
                                     "--partition-digest", "$(PARTITION_DIGEST)",
                                     "--policy-identity", "$(POLICY_IDENTITY)",
                                     "--task-capability", "$(TASK_CAPABILITY)",
@@ -1181,6 +1182,7 @@ fn prediction_environment(
         json!({ "name": "SNAPSHOT_SHA256", "value": validated.snapshot_sha256 }),
         json!({ "name": "SNAPSHOT_CONTRACT_ID", "value": admission.snapshot_contract_id }),
         json!({ "name": "SNAPSHOT_DIGEST", "value": admission.snapshot_digest }),
+        json!({ "name": "COHORT_MANIFEST_ID", "value": admission.cohort_manifest_id }),
         json!({ "name": "PARTITION_DIGEST", "value": admission.partition_digest }),
         json!({ "name": "POLICY_IDENTITY", "value": admission.policy_identity }),
         json!({ "name": "TASK_CAPABILITY", "value": admission.task_capability }),

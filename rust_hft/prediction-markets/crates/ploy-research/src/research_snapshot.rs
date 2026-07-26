@@ -5142,7 +5142,7 @@ mod tests {
         })
         .expect("sealed snapshot handle");
         let mission = PredictionResearchMissionV3 {
-            schema_version: "prediction_research_mission.v3".to_string(),
+            schema_version: "prediction_research_mission.v4".to_string(),
             mission_id: "sealed-snapshot-handoff".to_string(),
             product: PredictionProductIdentity {
                 symbol: PredictionProductSymbol::Btc,

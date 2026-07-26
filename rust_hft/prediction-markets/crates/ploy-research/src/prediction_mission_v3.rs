@@ -11,7 +11,10 @@ use crate::research_snapshot::{
     AuthenticatedResearchSnapshot, POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
 };
 
-pub const PREDICTION_MISSION_V3_SCHEMA_VERSION: &str = "prediction_research_mission.v3";
+// The sealed identity fields are wire-incompatible with the former v3 Mission
+// document. Keep the adapter name stable for its #324 consumer, but require a
+// distinct wire version instead of silently reinterpreting legacy Missions.
+pub const PREDICTION_MISSION_V3_SCHEMA_VERSION: &str = "prediction_research_mission.v4";
 pub const PREDICTION_MISSION_V3_CHECKPOINT_SCHEMA_VERSION: &str =
     "prediction_research_checkpoint.v4";
 
@@ -183,7 +186,7 @@ pub fn parse_prediction_mission_json(bytes: &[u8]) -> Result<ParsedPredictionMis
             .map_err(|error| format!("parse prediction Mission v2: {error}")),
         PREDICTION_MISSION_V3_SCHEMA_VERSION => serde_json::from_value(value)
             .map(ParsedPredictionMission::V3)
-            .map_err(|error| format!("parse prediction Mission v3: {error}")),
+            .map_err(|error| format!("parse prediction Mission v4: {error}")),
         other => Err(format!(
             "unsupported prediction mission schema_version {other}"
         )),
@@ -211,7 +214,7 @@ pub fn validate_prediction_mission_v3(mission: &PredictionResearchMissionV3) -> 
     if mission.product.symbol != PredictionProductSymbol::Btc
         || mission.product.event_horizon_secs != 300
     {
-        return Err("Mission v3 currently supports only BTC x 300 seconds".to_string());
+        return Err("Mission v4 currently supports only BTC x 300 seconds".to_string());
     }
     validate_task(&mission.task)?;
     validate_sha256_id(&mission.cohort_manifest_id, "mission.cohort_manifest_id")?;
@@ -250,7 +253,7 @@ pub fn validate_prediction_mission_v3(mission: &PredictionResearchMissionV3) -> 
     Ok(())
 }
 
-/// Seal a Mission v3 admission request to the identities independently read
+/// Seal a Mission v4 admission request to the identities independently read
 /// from a verified snapshot cache entry. Callers can provide a Mission, but
 /// cannot manufacture the resulting admission evidence from raw strings.
 pub fn authenticate_prediction_mission_v3_inputs(
@@ -262,7 +265,7 @@ pub fn authenticate_prediction_mission_v3_inputs(
         || snapshot.source_kind() != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
     {
         return Err(
-            "authenticated snapshot source does not match Mission v3 authority profile".to_string(),
+            "authenticated snapshot source does not match Mission v4 authority profile".to_string(),
         );
     }
     let current_policy = current_prediction_policy_snapshot_id();
@@ -331,19 +334,19 @@ pub fn admit_prediction_mission_v3(
 ) -> Result<AdmittedPredictionMissionV3, String> {
     validate_prediction_mission_v3(mission)?;
     if authenticated.task != mission.task {
-        return Err("authenticated task does not match Mission v3".to_string());
+        return Err("authenticated task does not match Mission v4".to_string());
     }
     if authenticated.authority_profile != mission.authority_profile {
-        return Err("authenticated authority profile does not match Mission v3".to_string());
+        return Err("authenticated authority profile does not match Mission v4".to_string());
     }
     if authenticated.capabilities != mission.required_capabilities {
-        return Err("authenticated capabilities do not match Mission v3".to_string());
+        return Err("authenticated capabilities do not match Mission v4".to_string());
     }
     if mission.authority_profile != PredictionAuthorityProfile::PolymarketChainlinkBaseline
         || authenticated.source_kind != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
     {
         return Err(
-            "authenticated snapshot source does not match Mission v3 authority profile".to_string(),
+            "authenticated snapshot source does not match Mission v4 authority profile".to_string(),
         );
     }
     for (actual, expected, field) in [
@@ -380,7 +383,7 @@ pub fn admit_prediction_mission_v3(
     ] {
         if actual != expected {
             return Err(format!(
-                "authenticated {field} identity does not match Mission v3"
+                "authenticated {field} identity does not match Mission v4"
             ));
         }
     }
@@ -395,7 +398,7 @@ pub fn admit_prediction_mission_v3(
             || checkpoint.snapshot_hash != mission.snapshot_hash
             || checkpoint.search_policy_snapshot_id != mission.search_policy_snapshot_id
         {
-            return Err("checkpoint identity does not match Mission v3".to_string());
+            return Err("checkpoint identity does not match Mission v4".to_string());
         }
     }
     Ok(AdmittedPredictionMissionV3 {
@@ -455,7 +458,7 @@ mod tests {
 
     fn settlement_mission() -> serde_json::Value {
         serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-settlement",
             "product": { "symbol": "BTC", "event_horizon_secs": 300 },
             "task": { "kind": "settlement_probability" },

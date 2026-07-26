@@ -33,19 +33,22 @@ struct PredictionMissionV2Identity {
 }
 
 #[derive(Debug, Deserialize)]
-struct PredictionMissionV3Identity {
+struct PredictionMissionV4Identity {
     schema_version: String,
     mission_id: String,
     run_mode: String,
     cohort_manifest_id: String,
+    partition_digest: String,
+    causal_projection_policy_id: String,
     snapshot_contract_id: String,
+    snapshot_hash: String,
     search_policy_snapshot_id: String,
 }
 
 #[derive(Debug)]
 enum PredictionMissionIdentity {
     V2(PredictionMissionV2Identity),
-    PipelineSmoke(PredictionMissionV3Identity),
+    PipelineSmoke(PredictionMissionV4Identity),
 }
 
 impl PredictionMissionIdentity {
@@ -73,6 +76,18 @@ impl PredictionMissionIdentity {
     fn is_pipeline_smoke(&self) -> bool {
         matches!(self, Self::PipelineSmoke(_))
     }
+
+    fn matches_admitted_pipeline_identity(&self, args: &PredictionExecuteArgs) -> bool {
+        match self {
+            Self::V2(_) => true,
+            Self::PipelineSmoke(mission) => {
+                mission.cohort_manifest_id == args.cohort_manifest_id
+                    && mission.partition_digest == args.partition_digest
+                    && mission.causal_projection_policy_id == args.policy_identity
+                    && mission.snapshot_hash == args.snapshot_digest
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +95,7 @@ struct PredictionSnapshotIdentity {
     schema_version: String,
     snapshot_hash: String,
     snapshot_contract_hash: String,
+    source_kind: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +218,22 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         .arg(&mission_path)
         .arg(snapshot_dir.path())
         .arg(&results_dir)
+        .args(if mission.is_pipeline_smoke() {
+            vec![
+                "--admitted-cohort-manifest-id",
+                args.cohort_manifest_id.as_str(),
+                "--admitted-partition-digest",
+                args.partition_digest.as_str(),
+                "--admitted-policy-identity",
+                args.policy_identity.as_str(),
+                "--admitted-snapshot-contract-id",
+                args.snapshot_contract_id.as_str(),
+                "--admitted-snapshot-digest",
+                args.snapshot_digest.as_str(),
+            ]
+        } else {
+            Vec::new()
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.reopen()?))
         .stderr(Stdio::from(stderr.reopen()?))
@@ -356,6 +388,7 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
             args.snapshot_sha256.as_str(),
             args.snapshot_contract_id.as_str(),
             args.snapshot_digest.as_str(),
+            args.cohort_manifest_id.as_str(),
             args.partition_digest.as_str(),
             args.policy_identity.as_str(),
             args.task_capability.as_str(),
@@ -369,6 +402,7 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
         bail!("prediction execution paths, URLs, and hashes are required");
     }
     immutable_sha256_identity("prediction snapshot contract", &args.snapshot_contract_id)?;
+    immutable_sha256_identity("prediction cohort manifest", &args.cohort_manifest_id)?;
     immutable_sha256_identity("prediction partition", &args.partition_digest)?;
     immutable_sha256_identity("prediction policy", &args.policy_identity)?;
     immutable_sha256_identity("prediction image", &args.image_identity)?;
@@ -444,9 +478,9 @@ fn parse_prediction_mission_identity(path: &Path) -> anyhow::Result<PredictionMi
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if schema_version == "prediction_research_mission.v3" {
-        let mission = serde_json::from_value::<PredictionMissionV3Identity>(value)
-            .context("prediction Mission v3 identity is invalid")?;
+    if schema_version == "prediction_research_mission.v4" {
+        let mission = serde_json::from_value::<PredictionMissionV4Identity>(value)
+            .context("prediction Mission v4 identity is invalid")?;
         let identity = PredictionMissionIdentity::PipelineSmoke(mission);
         validate_mission_identity(&identity)?;
         return Ok(identity);
@@ -469,11 +503,14 @@ fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Res
             Ok(())
         }
         PredictionMissionIdentity::PipelineSmoke(mission)
-            if mission.schema_version == "prediction_research_mission.v3"
+            if mission.schema_version == "prediction_research_mission.v4"
                 && mission.run_mode == "pipeline_smoke"
                 && !mission.mission_id.trim().is_empty()
                 && !mission.cohort_manifest_id.trim().is_empty()
+                && !mission.partition_digest.trim().is_empty()
+                && !mission.causal_projection_policy_id.trim().is_empty()
                 && !mission.snapshot_contract_id.trim().is_empty()
+                && !mission.snapshot_hash.trim().is_empty()
                 && !mission.search_policy_snapshot_id.trim().is_empty() =>
         {
             Ok(())
@@ -496,7 +533,10 @@ fn verify_admitted_snapshot_identity(
         || mission.snapshot_contract_id() != args.snapshot_contract_id
         || snapshot.snapshot_contract_hash != args.snapshot_contract_id
         || snapshot.snapshot_hash != args.snapshot_digest
-        || (mission.is_pipeline_smoke() && mission.policy_identity() != args.policy_identity)
+        || (mission.is_pipeline_smoke()
+            && (mission.policy_identity() != args.policy_identity
+                || !mission.matches_admitted_pipeline_identity(args)
+                || snapshot.source_kind != "polymarket_chainlink_baseline"))
     {
         bail!("prediction mission, admitted snapshot contract, and snapshot manifest do not match");
     }
@@ -831,21 +871,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn execute_routes_a_v3_pipeline_smoke_mission_without_the_v2_runner_shape() {
+    fn execute_routes_a_v4_pipeline_smoke_mission_without_the_v2_runner_shape() {
         use std::os::unix::fs::PermissionsExt;
 
         let mut fixture = execute_fixture("pipeline-smoke");
         let mission = serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-smoke",
             "product": {"symbol": "BTC", "event_horizon_secs": 300},
             "task": {"kind": "settlement_probability"},
             "run_mode": "pipeline_smoke",
             "authority_profile": "polymarket_chainlink_baseline",
             "required_capabilities": ["polymarket_chainlink"],
-            "cohort_manifest_id": format!("sha256:{}", "2".repeat(64)),
+            "cohort_manifest_id": fixture.args.cohort_manifest_id.clone(),
+            "partition_digest": fixture.args.partition_digest.clone(),
+            "causal_projection_policy_id": fixture.args.policy_identity.clone(),
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
-            "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
+            "snapshot_hash": fixture.args.snapshot_digest.clone(),
+            "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
             "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
@@ -866,7 +909,12 @@ mod tests {
         std::fs::write(
             &runner,
             format!(
-                "#!/bin/sh\ntest \"$1\" = '--pipeline-smoke' || exit 2\nmkdir -p \"$4/reports\"\ncp '{}' \"$4/reports/pipeline-smoke-{}.json\"\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\ntest \"$1\" = '--pipeline-smoke' || exit 2\ntest \"$5\" = '--admitted-cohort-manifest-id' || exit 2\ntest \"$6\" = '{}' || exit 2\ntest \"$7\" = '--admitted-partition-digest' || exit 2\ntest \"$8\" = '{}' || exit 2\ntest \"$9\" = '--admitted-policy-identity' || exit 2\ntest \"${{10}}\" = '{}' || exit 2\ntest \"${{11}}\" = '--admitted-snapshot-contract-id' || exit 2\ntest \"${{12}}\" = '{}' || exit 2\ntest \"${{13}}\" = '--admitted-snapshot-digest' || exit 2\ntest \"${{14}}\" = '{}' || exit 2\nmkdir -p \"$4/reports\"\ncp '{}' \"$4/reports/pipeline-smoke-{}.json\"\nprintf '%s\\n' '{}'\n",
+                fixture.args.cohort_manifest_id.as_str(),
+                fixture.args.partition_digest.as_str(),
+                fixture.args.policy_identity.as_str(),
+                fixture.args.snapshot_contract_id.as_str(),
+                fixture.args.snapshot_digest.as_str(),
                 evaluator_report_path.display(),
                 evaluator_report_sha256,
                 serde_json::json!({
@@ -892,21 +940,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn execute_rejects_pipeline_smoke_completion_with_wrong_report_digest() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut fixture = execute_fixture("pipeline-smoke-report-digest");
+    fn execute_rejects_forged_pipeline_partition_before_starting_the_runner() {
+        let mut fixture = execute_fixture("pipeline-smoke-forged-partition");
         let mission = serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-smoke",
             "product": {"symbol": "BTC", "event_horizon_secs": 300},
             "task": {"kind": "settlement_probability"},
             "run_mode": "pipeline_smoke",
             "authority_profile": "polymarket_chainlink_baseline",
             "required_capabilities": ["polymarket_chainlink"],
-            "cohort_manifest_id": format!("sha256:{}", "2".repeat(64)),
+            "cohort_manifest_id": fixture.args.cohort_manifest_id.clone(),
+            "partition_digest": format!("sha256:{}", "f".repeat(64)),
+            "causal_projection_policy_id": fixture.args.policy_identity.clone(),
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
-            "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
+            "snapshot_hash": fixture.args.snapshot_digest.clone(),
+            "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
+            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+        });
+        let mission_bytes = serde_json::to_vec(&mission).unwrap();
+        let mission_path = fixture.root.join("pipeline-smoke-forged-mission.json");
+        std::fs::write(&mission_path, &mission_bytes).unwrap();
+        fixture.args.mission_url = mission_path.to_string_lossy().into_owned();
+        fixture.args.mission_sha256 = format!("{:x}", Sha256::digest(&mission_bytes));
+
+        let runner = fixture.root.join("must-not-run");
+        let error = execute_with_runner(fixture.args, &runner)
+            .expect_err("a forged partition digest must fail closed");
+        assert!(error.to_string().contains(
+            "prediction mission, admitted snapshot contract, and snapshot manifest do not match"
+        ));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_pipeline_smoke_completion_with_wrong_report_digest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = execute_fixture("pipeline-smoke-report-digest");
+        let mission = serde_json::json!({
+            "schema_version": "prediction_research_mission.v4",
+            "mission_id": "btc-5m-smoke",
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "task": {"kind": "settlement_probability"},
+            "run_mode": "pipeline_smoke",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": fixture.args.cohort_manifest_id.clone(),
+            "partition_digest": fixture.args.partition_digest.clone(),
+            "causal_projection_policy_id": fixture.args.policy_identity.clone(),
+            "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
+            "snapshot_hash": fixture.args.snapshot_digest.clone(),
+            "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
             "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
@@ -1173,6 +1259,7 @@ mod tests {
                     "schema_version": "research_snapshot_v2",
                     "snapshot_hash": snapshot_digest,
                     "snapshot_contract_hash": snapshot_contract_id,
+                    "source_kind": "polymarket_chainlink_baseline",
                 }))
                 .unwrap()
                 .as_bytes(),
@@ -1188,6 +1275,7 @@ mod tests {
             snapshot_sha256: sha256_file(&snapshot_path).unwrap(),
             snapshot_contract_id,
             snapshot_digest: snapshot_digest.to_owned(),
+            cohort_manifest_id: format!("sha256:{}", "5".repeat(64)),
             partition_digest: format!("sha256:{}", "2".repeat(64)),
             policy_identity: format!("sha256:{}", "3".repeat(64)),
             task_capability: "btc_5m_backtest".to_owned(),

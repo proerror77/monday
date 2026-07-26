@@ -996,7 +996,7 @@ mod tests {
         let mut request = admission_request();
         request["mission_json"] = serde_json::Value::String(
             serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-mission-001",
             "product": {"symbol": "BTC", "event_horizon_secs": 300},
             "task": {"kind": "settlement_probability"},
