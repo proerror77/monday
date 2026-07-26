@@ -381,7 +381,7 @@ fn full_depth_execution_artifact<'a>(
     conservative_execution_event_rows: &'a [FullDepthExecutionEventRow],
 ) -> FullDepthExecutionArtifact<'a> {
     FullDepthExecutionArtifact {
-        schema_version: "monday.polymarket.full_depth_execution.v1",
+        schema_version: "monday.polymarket.full_depth_execution.v2",
         non_finite_floats: "null",
         context,
         side,
@@ -486,9 +486,10 @@ fn sorted_distinct_reprice_pilot_market_ids<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_reprice_pilot_10s(
+fn run_reprice_pilot(
     rows: &[FactorObservationV2],
     boundary: DateTime<Utc>,
+    horizon_secs: i64,
     alpha_search_output_dir: &Path,
     report_output_dir: &Path,
     snapshot_hash: &str,
@@ -550,7 +551,11 @@ fn run_reprice_pilot_10s(
         ..Default::default()
     };
     let run_side = |side| -> Result<PathBuf, String> {
-        let target = AutoFactorV2Target::FullDepthRepricePnl10s(side);
+        let target = match horizon_secs {
+            10 => AutoFactorV2Target::FullDepthRepricePnl10s(side),
+            15 => AutoFactorV2Target::FullDepthRepricePnl15s(side),
+            _ => return Err(format!("unsupported reprice pilot horizon {horizon_secs}s")),
+        };
         let train_side = train_rows
             .iter()
             .filter(|row| row.side == side)
@@ -631,7 +636,7 @@ fn run_reprice_pilot_10s(
             selection: &selection,
             test: &test,
         };
-        let prefix = format!("reprice-10s-{}", side.as_str());
+        let prefix = format!("reprice-{horizon_secs}s-{}", side.as_str());
         let path = write_content_addressed_report(report_output_dir, &prefix, &artifact)?;
         eprintln!(
             "reprice pilot evidence written target={} side={} train_rows={} test_rows={} selected_test_decisions={} path={}",
@@ -1688,10 +1693,18 @@ async fn main() {
         panic!("prediction MCTS evaluator accepts exactly one candidate stage");
     }
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
-    let reprice_pilot_10s = flag_present(&args, "--reprice-pilot-10s");
+    let reprice_pilot_horizon_secs = match (
+        flag_present(&args, "--reprice-pilot-10s"),
+        flag_present(&args, "--reprice-pilot-15s"),
+    ) {
+        (false, false) => None,
+        (true, false) => Some(10),
+        (false, true) => Some(15),
+        (true, true) => panic!("prediction evaluator accepts exactly one reprice pilot horizon"),
+    };
     let settlement_time_cohort = settlement_time_cohort_from_args(
         &args,
-        expected_prediction_policy.is_some() || reprice_pilot_10s,
+        expected_prediction_policy.is_some() || reprice_pilot_horizon_secs.is_some(),
         start,
         end,
         event_window_secs,
@@ -1701,7 +1714,7 @@ async fn main() {
         raw.parse::<i64>()
             .expect("validated --time-cohort-boundary-ms")
     });
-    if reprice_pilot_10s {
+    if reprice_pilot_horizon_secs.is_some() {
         validate_reprice_pilot_config(
             &args,
             &RepricePilotConfig {
@@ -2053,7 +2066,7 @@ async fn main() {
         );
         return;
     }
-    if reprice_pilot_10s {
+    if let Some(horizon_secs) = reprice_pilot_horizon_secs {
         let boundary_ms = time_cohort_boundary_ms
             .expect("--reprice-pilot-10s validated --time-cohort-boundary-ms");
         let boundary = Utc
@@ -2061,9 +2074,10 @@ async fn main() {
             .single()
             .expect("--reprice-pilot-10s validated time cohort boundary");
         println!("{snapshot_provenance}");
-        let paths = run_reprice_pilot_10s(
+        let paths = run_reprice_pilot(
             &autofactor_rows,
             boundary,
+            horizon_secs,
             Path::new(
                 alpha_search_output_dir
                     .as_deref()
@@ -2361,6 +2375,8 @@ async fn main() {
     for target in [
         AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up),
         AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
+        AutoFactorV2Target::FullDepthRepricePnl15s(ReviewSide::Up),
+        AutoFactorV2Target::FullDepthRepricePnl15s(ReviewSide::Down),
         AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Up),
         AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Down),
         AutoFactorV2Target::FullDepthSettlementExecutablePnl,

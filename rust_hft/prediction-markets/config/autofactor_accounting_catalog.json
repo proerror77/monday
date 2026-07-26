@@ -37,6 +37,24 @@
       "official_settlement_required": false,
       "full_depth_entry_required": true
     },
+    "reprice_pnl_15s": {
+      "horizon": "15s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "quote_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": false
+    },
+    "full_depth_reprice_pnl_15s": {
+      "horizon": "15s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "full_depth_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": true
+    },
     "reprice_pnl_30s": {
       "horizon": "30s",
       "accounting_lane": "repricing",

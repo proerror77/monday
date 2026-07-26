@@ -540,7 +540,7 @@ fn review_side_field(value: &Value, key: &str, path: &Path) -> Result<Option<Rev
 fn is_side_bound_repricing_target(target: &str) -> bool {
     matches!(
         target,
-        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_15s" | "full_depth_reprice_pnl_30s"
     )
 }
 
@@ -2026,6 +2026,12 @@ mod tests {
         )
         .is_ok());
         assert!(validate_alpha_zoo_export_identity("full_depth_reprice_pnl_10s", None).is_err());
+        assert!(validate_alpha_zoo_export_identity(
+            "full_depth_reprice_pnl_15s",
+            Some(ReviewSide::Down)
+        )
+        .is_ok());
+        assert!(validate_alpha_zoo_export_identity("full_depth_reprice_pnl_15s", None).is_err());
         assert!(validate_alpha_zoo_export_identity(
             "full_depth_settlement_executable_pnl",
             Some(ReviewSide::Down)

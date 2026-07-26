@@ -456,8 +456,10 @@ pub struct AutoFactorReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutoFactorV2Target {
     RepricePnl10s,
+    RepricePnl15s,
     RepricePnl30s,
     FullDepthRepricePnl10s(ReviewSide),
+    FullDepthRepricePnl15s(ReviewSide),
     FullDepthRepricePnl30s(ReviewSide),
     SettlementExecutablePnl,
     FullDepthSettlementExecutablePnl,
@@ -468,8 +470,10 @@ impl AutoFactorV2Target {
     pub fn as_str(self) -> &'static str {
         match self {
             AutoFactorV2Target::RepricePnl10s => "reprice_pnl_10s",
+            AutoFactorV2Target::RepricePnl15s => "reprice_pnl_15s",
             AutoFactorV2Target::RepricePnl30s => "reprice_pnl_30s",
             AutoFactorV2Target::FullDepthRepricePnl10s(_) => "full_depth_reprice_pnl_10s",
+            AutoFactorV2Target::FullDepthRepricePnl15s(_) => "full_depth_reprice_pnl_15s",
             AutoFactorV2Target::FullDepthRepricePnl30s(_) => "full_depth_reprice_pnl_30s",
             AutoFactorV2Target::SettlementExecutablePnl => "settlement_executable_pnl",
             AutoFactorV2Target::FullDepthSettlementExecutablePnl => {
@@ -483,7 +487,9 @@ impl AutoFactorV2Target {
 
     pub fn review_side(self) -> Option<ReviewSide> {
         match self {
-            Self::FullDepthRepricePnl10s(side) | Self::FullDepthRepricePnl30s(side) => Some(side),
+            Self::FullDepthRepricePnl10s(side)
+            | Self::FullDepthRepricePnl15s(side)
+            | Self::FullDepthRepricePnl30s(side) => Some(side),
             _ => None,
         }
     }
@@ -491,14 +497,19 @@ impl AutoFactorV2Target {
     fn label(self, row: &FactorObservationV2) -> f64 {
         match self {
             AutoFactorV2Target::RepricePnl10s => row.label_future_exit_pnl_10s,
+            AutoFactorV2Target::RepricePnl15s => row.label_future_exit_pnl_15s,
             AutoFactorV2Target::RepricePnl30s => row.label_future_exit_pnl_30s,
             AutoFactorV2Target::FullDepthRepricePnl10s(side) if row.side == side => {
                 row.label_future_exit_full_depth_pnl_10s
+            }
+            AutoFactorV2Target::FullDepthRepricePnl15s(side) if row.side == side => {
+                row.label_future_exit_full_depth_pnl_15s
             }
             AutoFactorV2Target::FullDepthRepricePnl30s(side) if row.side == side => {
                 row.label_future_exit_full_depth_pnl_30s
             }
             AutoFactorV2Target::FullDepthRepricePnl10s(_)
+            | AutoFactorV2Target::FullDepthRepricePnl15s(_)
             | AutoFactorV2Target::FullDepthRepricePnl30s(_) => None,
             AutoFactorV2Target::SettlementExecutablePnl => row.label_executable_pnl_15u,
             AutoFactorV2Target::FullDepthSettlementExecutablePnl => {
@@ -3529,26 +3540,32 @@ mod tests {
             label_conservative_entry_fillable: true,
             label_future_exit_bid_change_5s: Some(score * 0.001),
             label_future_exit_bid_change_10s: Some(score * 0.002),
+            label_future_exit_bid_change_15s: Some(score * 0.0025),
             label_future_exit_bid_change_30s: Some(score * 0.003),
             label_future_exit_bid_change_60s: Some(score * 0.004),
             label_future_exit_pnl_5s: Some(score * 0.05),
             label_future_exit_pnl_10s: Some(score * 0.10),
+            label_future_exit_pnl_15s: Some(score * 0.15),
             label_future_exit_pnl_30s: Some(score * 0.20),
             label_future_exit_pnl_60s: Some(score * 0.30),
             label_future_exit_full_depth_pnl_5s: Some(score * 0.04),
             label_future_exit_full_depth_pnl_10s: Some(score * 0.08),
+            label_future_exit_full_depth_pnl_15s: Some(score * 0.12),
             label_future_exit_full_depth_pnl_30s: Some(score * 0.16),
             label_future_exit_full_depth_pnl_60s: Some(score * 0.24),
             label_future_exit_full_depth_value_5s: Some(15.0 + score * 0.04),
             label_future_exit_full_depth_value_10s: Some(15.0 + score * 0.08),
+            label_future_exit_full_depth_value_15s: Some(15.0 + score * 0.12),
             label_future_exit_full_depth_value_30s: Some(15.0 + score * 0.16),
             label_future_exit_full_depth_value_60s: Some(15.0 + score * 0.24),
             label_future_exit_fillable_5s: Some(1.0),
             label_future_exit_fillable_10s: Some(1.0),
+            label_future_exit_fillable_15s: Some(1.0),
             label_future_exit_fillable_30s: Some(1.0),
             label_future_exit_fillable_60s: Some(1.0),
             label_future_exit_full_depth_fillable_5s: Some(1.0),
             label_future_exit_full_depth_fillable_10s: Some(1.0),
+            label_future_exit_full_depth_fillable_15s: Some(1.0),
             label_future_exit_full_depth_fillable_30s: Some(1.0),
             label_future_exit_full_depth_fillable_60s: Some(1.0),
         }
@@ -4511,6 +4528,9 @@ mod tests {
         for target in ["reprice_pnl_10s", "full_depth_reprice_pnl_10s"] {
             assert_eq!(autofactor_target_horizon(target), "10s");
         }
+        for target in ["reprice_pnl_15s", "full_depth_reprice_pnl_15s"] {
+            assert_eq!(autofactor_target_horizon(target), "15s");
+        }
         for target in ["reprice_pnl_30s", "full_depth_reprice_pnl_30s"] {
             assert_eq!(autofactor_target_horizon(target), "30s");
         }
@@ -4536,6 +4556,13 @@ mod tests {
         assert!(contract.full_depth_entry_required);
         assert_eq!(autofactor_target_horizon("experimental_target"), "unknown");
         assert!(autofactor_target_contract("experimental_target").is_none());
+    }
+
+    #[test]
+    fn fifteen_second_full_depth_target_keeps_the_requested_side() {
+        let target = AutoFactorV2Target::FullDepthRepricePnl15s(ReviewSide::Down);
+        assert_eq!(target.as_str(), "full_depth_reprice_pnl_15s");
+        assert_eq!(target.review_side(), Some(ReviewSide::Down));
     }
 
     #[test]
