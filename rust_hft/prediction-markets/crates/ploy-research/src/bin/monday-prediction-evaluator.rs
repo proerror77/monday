@@ -14,7 +14,8 @@ use ploy_research::prediction_loop::{
     current_prediction_policy_snapshot_id, validate_prediction_snapshot_sources,
 };
 use ploy_research::prediction_mcts::{
-    PredictionMctsCandidate, PredictionMctsEvaluation, SettlementTrainingEvidence,
+    PredictionMctsCandidate, PredictionMctsEvaluation, PredictionMctsTrainingEvidence,
+    SettlementTrainingEvidence,
 };
 use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
@@ -2037,17 +2038,17 @@ async fn main() {
             .find(|row| row.model == model)
             .unwrap_or_else(|| panic!("prediction MCTS training produced no candidate metrics"));
         let evidence = PredictionMctsEvaluation {
-            training_settlement: SettlementTrainingEvidence {
-                candidate_id: candidate.candidate_id.clone(),
-                identity: candidate.identity.clone(),
-                probability_blend_sha256: candidate.probability_blend_sha256.clone(),
-                training_cohort_id: training.training_cohort_id,
-                event_count: training.event_count,
-                mean_brier_score: metrics.brier_score,
-                mean_log_loss: metrics.log_loss,
-            },
-            held_out_settlement: None,
-            execution: None,
+            training: PredictionMctsTrainingEvidence::SettlementProbability(
+                SettlementTrainingEvidence {
+                    candidate_id: candidate.candidate_id.clone(),
+                    identity: candidate.identity.clone(),
+                    probability_blend_sha256: candidate.probability_blend_sha256.clone(),
+                    training_cohort_id: training.training_cohort_id,
+                    event_count: training.event_count,
+                    mean_brier_score: metrics.brier_score,
+                    mean_log_loss: metrics.log_loss,
+                },
+            ),
         };
         let output_dir = report_output_dir
             .as_deref()

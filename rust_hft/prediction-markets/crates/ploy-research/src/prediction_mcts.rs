@@ -17,11 +17,14 @@ use crate::autofactor::LlmProbabilityBlendSpec;
 use crate::factors_v2::SettlementProbabilityComponentProfile;
 use crate::prediction_loop::{
     current_prediction_policy_snapshot_id, validate_prediction_mission,
-    validate_prediction_proposal, PredictionProposal, PredictionResearchMission,
-    ProposedProbabilityBlend,
+    validate_prediction_proposal, validate_sha256_id, PredictionProposal,
+    PredictionResearchMission, ProposedProbabilityBlend,
+};
+use crate::prediction_mission_v3::{
+    AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionProductSymbol,
 };
 
-const CHECKPOINT_VERSION: u32 = 2;
+const CHECKPOINT_VERSION: u32 = 3;
 const MUTATION_STEP: f64 = 0.25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +34,35 @@ pub struct PredictionMctsIdentity {
     pub data_snapshot_id: String,
     pub symbol: String,
     pub horizon: String,
+    #[serde(default)]
+    pub task: PredictionMctsTask,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_mission: Option<PredictionMctsSealedMissionIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMctsTask {
+    #[default]
+    SettlementProbability,
+    UpExecution {
+        prediction_horizon_secs: u32,
+    },
+    DownExecution {
+        prediction_horizon_secs: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PredictionMctsSealedMissionIdentity {
+    mission_sha256: String,
+    cohort_manifest_id: String,
+    partition_digest: String,
+    causal_projection_policy_id: String,
+    snapshot_contract_id: String,
+    snapshot_hash: String,
+    search_policy_snapshot_id: String,
 }
 
 impl PredictionMctsIdentity {
@@ -41,10 +73,58 @@ impl PredictionMctsIdentity {
             data_snapshot_id: mission.data_snapshot_id.clone(),
             symbol: mission.symbols[0].clone(),
             horizon: mission.horizon.clone(),
+            task: PredictionMctsTask::SettlementProbability,
+            sealed_mission: None,
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_admitted_mission(
+        mission: &AdmittedPredictionMissionV3,
+    ) -> Result<Self, String> {
+        let task = match mission.task {
+            AdmittedPredictionTask::SettlementProbability => {
+                PredictionMctsTask::SettlementProbability
+            }
+            AdmittedPredictionTask::UpExecution {
+                prediction_horizon_secs,
+            } => PredictionMctsTask::UpExecution {
+                prediction_horizon_secs,
+            },
+            AdmittedPredictionTask::DownExecution {
+                prediction_horizon_secs,
+            } => PredictionMctsTask::DownExecution {
+                prediction_horizon_secs,
+            },
+        };
+        let identity = Self {
+            mission_id: mission.mission_id.clone(),
+            data_snapshot_id: mission.snapshot_contract_id.clone(),
+            symbol: match mission.product.symbol {
+                PredictionProductSymbol::Btc => "BTC",
+            }
+            .to_string(),
+            horizon: match mission.product.event_horizon_secs {
+                300 => "5m",
+                other => return Err(format!("unsupported Mission v4 event horizon {other}s")),
+            }
+            .to_string(),
+            task,
+            sealed_mission: Some(PredictionMctsSealedMissionIdentity {
+                mission_sha256: mission.mission_sha256.clone(),
+                cohort_manifest_id: mission.cohort_manifest_id.clone(),
+                partition_digest: mission.partition_digest.clone(),
+                causal_projection_policy_id: mission.causal_projection_policy_id.clone(),
+                snapshot_contract_id: mission.snapshot_contract_id.clone(),
+                snapshot_hash: mission.snapshot_hash.clone(),
+                search_policy_snapshot_id: mission.search_policy_snapshot_id.clone(),
+            }),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.mission_id.trim().is_empty()
             || self.mission_id.trim() != self.mission_id
             || !matches!(self.symbol.as_str(), "BTC" | "SOL")
@@ -53,6 +133,62 @@ impl PredictionMctsIdentity {
             || self.data_snapshot_id.len() != 71
         {
             return Err("invalid prediction MCTS identity".to_string());
+        }
+        match self.task {
+            PredictionMctsTask::SettlementProbability => {}
+            PredictionMctsTask::UpExecution {
+                prediction_horizon_secs,
+            }
+            | PredictionMctsTask::DownExecution {
+                prediction_horizon_secs,
+            } if matches!(prediction_horizon_secs, 5 | 10 | 15 | 30) => {}
+            _ => return Err("invalid prediction MCTS task identity".to_string()),
+        }
+        match &self.sealed_mission {
+            None if self.task != PredictionMctsTask::SettlementProbability => {
+                return Err("execution MCTS identity requires a sealed Mission v4".to_string())
+            }
+            None => {}
+            Some(sealed) => {
+                for (value, field) in [
+                    (&sealed.mission_sha256, "sealed mission"),
+                    (&sealed.cohort_manifest_id, "sealed cohort manifest"),
+                    (&sealed.partition_digest, "sealed partition"),
+                    (
+                        &sealed.causal_projection_policy_id,
+                        "sealed causal projection policy",
+                    ),
+                    (&sealed.snapshot_contract_id, "sealed snapshot contract"),
+                    (&sealed.search_policy_snapshot_id, "sealed search policy"),
+                ] {
+                    validate_sha256_id(value, field)?;
+                }
+                if sealed.snapshot_contract_id != self.data_snapshot_id
+                    || sealed.snapshot_hash.len() != 16
+                    || !sealed
+                        .snapshot_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("sealed prediction MCTS identity is inconsistent".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sealed_mission_sha256(&self) -> Option<&str> {
+        self.sealed_mission
+            .as_ref()
+            .map(|sealed| sealed.mission_sha256.as_str())
+    }
+
+    pub(crate) fn reject_unadmitted_legacy_bridge(&self) -> Result<(), String> {
+        if self.sealed_mission.is_some() {
+            return Err(
+                "sealed prediction MCTS identity requires an authenticated Mission v4 runner"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -106,32 +242,106 @@ impl SettlementTrainingEvidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HeldOutSettlementEvidence {
+pub struct ExecutionTrainingEvidence {
+    pub candidate_id: String,
+    pub identity: PredictionMctsIdentity,
+    pub probability_blend_sha256: String,
+    pub training_cohort_id: String,
     pub event_count: usize,
-    pub mean_brier_score: f64,
-    pub mean_log_loss: f64,
+    pub prediction_horizon_secs: u32,
+    pub mean_fill_rate: f64,
+    pub mean_fee_usd: f64,
+    pub mean_entry_slippage_bps: f64,
+    pub mean_exit_slippage_bps: f64,
+    pub mean_capacity_usd: f64,
+    pub mean_reprice_pnl: f64,
+}
+
+impl ExecutionTrainingEvidence {
+    fn reward(&self) -> Result<f64, String> {
+        if self.training_cohort_id.trim().is_empty()
+            || self.training_cohort_id.trim() != self.training_cohort_id
+            || self.event_count == 0
+            || !matches!(self.prediction_horizon_secs, 5 | 10 | 15 | 30)
+            || !self.mean_fill_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.mean_fill_rate)
+            || !self.mean_fee_usd.is_finite()
+            || self.mean_fee_usd < 0.0
+            || !self.mean_entry_slippage_bps.is_finite()
+            || !self.mean_exit_slippage_bps.is_finite()
+            || !self.mean_capacity_usd.is_finite()
+            || self.mean_capacity_usd < 0.0
+            || !self.mean_reprice_pnl.is_finite()
+        {
+            return Err("invalid training-cohort execution evidence".to_string());
+        }
+        Ok(self.mean_reprice_pnl)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TokenExecutionEvidence {
-    pub fill_rate: f64,
-    pub mean_slippage_bps: f64,
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PredictionMctsTrainingEvidence {
+    SettlementProbability(SettlementTrainingEvidence),
+    UpExecution(ExecutionTrainingEvidence),
+    DownExecution(ExecutionTrainingEvidence),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PredictionExecutionEvidence {
-    pub up: TokenExecutionEvidence,
-    pub down: TokenExecutionEvidence,
+impl PredictionMctsTrainingEvidence {
+    pub(crate) fn candidate_id(&self) -> &str {
+        match self {
+            Self::SettlementProbability(evidence) => &evidence.candidate_id,
+            Self::UpExecution(evidence) | Self::DownExecution(evidence) => &evidence.candidate_id,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &PredictionMctsIdentity {
+        match self {
+            Self::SettlementProbability(evidence) => &evidence.identity,
+            Self::UpExecution(evidence) | Self::DownExecution(evidence) => &evidence.identity,
+        }
+    }
+
+    pub(crate) fn probability_blend_sha256(&self) -> &str {
+        match self {
+            Self::SettlementProbability(evidence) => &evidence.probability_blend_sha256,
+            Self::UpExecution(evidence) | Self::DownExecution(evidence) => {
+                &evidence.probability_blend_sha256
+            }
+        }
+    }
+
+    pub(crate) fn reward(&self) -> Result<f64, String> {
+        match self {
+            Self::SettlementProbability(evidence) => evidence.reward(),
+            Self::UpExecution(evidence) | Self::DownExecution(evidence) => evidence.reward(),
+        }
+    }
+
+    pub(crate) fn matches_task(&self, task: PredictionMctsTask) -> bool {
+        match (task, self) {
+            (PredictionMctsTask::SettlementProbability, Self::SettlementProbability(_)) => true,
+            (
+                PredictionMctsTask::UpExecution {
+                    prediction_horizon_secs: expected,
+                },
+                Self::UpExecution(evidence),
+            ) => expected == evidence.prediction_horizon_secs,
+            (
+                PredictionMctsTask::DownExecution {
+                    prediction_horizon_secs: expected,
+                },
+                Self::DownExecution(evidence),
+            ) => expected == evidence.prediction_horizon_secs,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredictionMctsEvaluation {
-    pub training_settlement: SettlementTrainingEvidence,
-    pub held_out_settlement: Option<HeldOutSettlementEvidence>,
-    pub execution: Option<PredictionExecutionEvidence>,
+    pub training: PredictionMctsTrainingEvidence,
 }
 
 pub trait PredictionTrainingEvaluator {
@@ -467,6 +677,37 @@ impl PredictionMctsEngine {
         component_profile: SettlementProbabilityComponentProfile,
     ) -> Result<Self, String> {
         let identity = PredictionMctsIdentity::from_mission(mission)?;
+        Self::new_with_identity_and_component_profile(
+            mission,
+            identity,
+            baseline,
+            llm_advice,
+            seed,
+            exploration,
+            max_depth,
+            component_profile,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_identity_and_component_profile(
+        mission: &PredictionResearchMission,
+        identity: PredictionMctsIdentity,
+        baseline: ProposedProbabilityBlend,
+        llm_advice: Vec<ProposedProbabilityBlend>,
+        seed: u64,
+        exploration: f64,
+        max_depth: usize,
+        component_profile: SettlementProbabilityComponentProfile,
+    ) -> Result<Self, String> {
+        validate_prediction_mission(mission, &current_prediction_policy_snapshot_id())?;
+        identity.validate()?;
+        identity.reject_unadmitted_legacy_bridge()?;
+        if identity.mission_id != mission.mission_id
+            || identity.data_snapshot_id != mission.data_snapshot_id
+        {
+            return Err("prediction MCTS identity does not match its legacy bridge mission".into());
+        }
         if mission.search_budget.max_candidates == 0 {
             return Err("prediction MCTS requires a non-zero candidate budget".to_string());
         }
@@ -614,13 +855,16 @@ impl PredictionMctsEngine {
             .get(candidate_id)
             .ok_or_else(|| "unknown prediction MCTS candidate".to_string())?;
         let expected_blend_sha256 = blend_digest(&self.checkpoint.nodes[node_id].blend);
-        if evaluation.training_settlement.candidate_id != candidate_id
-            || evaluation.training_settlement.identity != self.checkpoint.config.identity
-            || evaluation.training_settlement.probability_blend_sha256 != expected_blend_sha256
+        if !evaluation
+            .training
+            .matches_task(self.checkpoint.config.identity.task)
+            || evaluation.training.candidate_id() != candidate_id
+            || evaluation.training.identity() != &self.checkpoint.config.identity
+            || evaluation.training.probability_blend_sha256() != expected_blend_sha256
         {
             return Err("training evidence identity does not match the candidate".to_string());
         }
-        let reward = evaluation.training_settlement.reward()?;
+        let reward = evaluation.training.reward()?;
         backpropagate(&mut self.checkpoint.nodes, 0, node_id, reward)
             .map_err(|error| format!("prediction MCTS backpropagation failed: {error}"))?;
         self.checkpoint.pending.remove(candidate_id);
@@ -840,30 +1084,17 @@ mod tests {
             candidate: &PredictionMctsCandidate,
         ) -> Result<PredictionMctsEvaluation, String> {
             Ok(PredictionMctsEvaluation {
-                training_settlement: SettlementTrainingEvidence {
-                    candidate_id: candidate.candidate_id.clone(),
-                    identity: candidate.identity.clone(),
-                    probability_blend_sha256: candidate.probability_blend_sha256.clone(),
-                    training_cohort_id: "train-cohort-0".to_string(),
-                    event_count: 12,
-                    mean_brier_score: 0.2,
-                    mean_log_loss: 0.3,
-                },
-                held_out_settlement: Some(HeldOutSettlementEvidence {
-                    event_count: 4,
-                    mean_brier_score: 0.9,
-                    mean_log_loss: 2.0,
-                }),
-                execution: Some(PredictionExecutionEvidence {
-                    up: TokenExecutionEvidence {
-                        fill_rate: 0.8,
-                        mean_slippage_bps: 4.0,
+                training: PredictionMctsTrainingEvidence::SettlementProbability(
+                    SettlementTrainingEvidence {
+                        candidate_id: candidate.candidate_id.clone(),
+                        identity: candidate.identity.clone(),
+                        probability_blend_sha256: candidate.probability_blend_sha256.clone(),
+                        training_cohort_id: "train-cohort-0".to_string(),
+                        event_count: 12,
+                        mean_brier_score: 0.2,
+                        mean_log_loss: 0.3,
                     },
-                    down: TokenExecutionEvidence {
-                        fill_rate: 0.7,
-                        mean_slippage_bps: 5.0,
-                    },
-                }),
+                ),
             })
         }
     }
@@ -929,8 +1160,10 @@ mod tests {
         let evaluation = engine
             .evaluate_and_observe(&FakeEvaluator, &candidate)
             .unwrap();
-        assert!(evaluation.held_out_settlement.is_some());
-        assert!(evaluation.execution.is_some());
+        assert!(matches!(
+            evaluation.training,
+            PredictionMctsTrainingEvidence::SettlementProbability(_)
+        ));
         assert_eq!(engine.checkpoint.nodes[0].visits, 1);
         assert_eq!(engine.checkpoint.nodes[0].total_reward, -0.5);
 
@@ -942,6 +1175,72 @@ mod tests {
         let actual = restored.propose().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(restored.checkpoint.nodes, engine.checkpoint.nodes);
+    }
+
+    #[test]
+    fn sealed_v4_identity_binds_the_execution_side_and_admission_digests() {
+        use crate::prediction_mission_v3::{
+            AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionAuthorityProfile,
+            PredictionProductIdentity, PredictionProductSymbol, PredictionRunMode,
+        };
+
+        let admitted = AdmittedPredictionMissionV3 {
+            mission_id: "btc-5m-up".to_string(),
+            mission_sha256: format!("sha256:{}", "1".repeat(64)),
+            product: PredictionProductIdentity {
+                symbol: PredictionProductSymbol::Btc,
+                event_horizon_secs: 300,
+            },
+            task: AdmittedPredictionTask::UpExecution {
+                prediction_horizon_secs: 15,
+            },
+            run_mode: PredictionRunMode::ResearchTrial,
+            authority_profile: PredictionAuthorityProfile::PolymarketChainlinkBaseline,
+            cohort_manifest_id: format!("sha256:{}", "2".repeat(64)),
+            partition_digest: format!("sha256:{}", "3".repeat(64)),
+            causal_projection_policy_id: format!("sha256:{}", "4".repeat(64)),
+            snapshot_contract_id: format!("sha256:{}", "5".repeat(64)),
+            snapshot_hash: "6".repeat(16),
+            search_policy_snapshot_id: format!("sha256:{}", "7".repeat(64)),
+        };
+
+        let identity = PredictionMctsIdentity::from_admitted_mission(&admitted)
+            .expect("admitted Mission v4 becomes a sealed MCTS identity");
+
+        assert_eq!(
+            identity.task,
+            PredictionMctsTask::UpExecution {
+                prediction_horizon_secs: 15
+            }
+        );
+        assert_eq!(identity.symbol, "BTC");
+        assert_eq!(identity.horizon, "5m");
+        assert_eq!(
+            identity
+                .sealed_mission
+                .as_ref()
+                .expect("v4 identity carries sealed admission")
+                .partition_digest,
+            admitted.partition_digest
+        );
+
+        let mut legacy_bridge = mission();
+        legacy_bridge.mission_id = admitted.mission_id.clone();
+        legacy_bridge.data_snapshot_id = admitted.snapshot_contract_id.clone();
+        legacy_bridge.prompt_snapshot_id = research_brief_snapshot_id(&legacy_bridge);
+        let error = PredictionMctsEngine::new_with_identity_and_component_profile(
+            &legacy_bridge,
+            identity.clone(),
+            market_midpoint_blend("baseline"),
+            Vec::new(),
+            7,
+            1.4,
+            3,
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        )
+        .err()
+        .expect("sealed identity cannot consume an unadmitted legacy bridge");
+        assert!(error.contains("authenticated Mission v4 runner"));
     }
 
     #[test]
@@ -961,10 +1260,22 @@ mod tests {
         let restored: PredictionMctsCheckpoint = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(restored, checkpoint);
+        let mut old = checkpoint;
+        old.version = 2;
+        let mut resumed = PredictionMctsEngine::new(
+            &mission,
+            blend("baseline"),
+            vec![blend("advisor")],
+            7,
+            1.4,
+            3,
+        )
+        .unwrap();
+        assert!(resumed.restore_checkpoint(old).is_err());
     }
 
     #[test]
-    fn held_out_and_execution_outputs_cannot_change_reward() {
+    fn training_evidence_is_the_only_observation_surface() {
         let mission = mission();
         let mut left =
             PredictionMctsEngine::new(&mission, blend("baseline"), vec![], 9, 1.4, 2).unwrap();
@@ -973,31 +1284,55 @@ mod tests {
         let left_candidate = left.propose().unwrap();
         let right_candidate = right.propose().unwrap();
         assert_eq!(left_candidate, right_candidate);
-        let mut left_evaluation = FakeEvaluator.evaluate_training(&left_candidate).unwrap();
-        let mut right_evaluation = left_evaluation.clone();
-        left_evaluation.held_out_settlement = None;
-        left_evaluation.execution = None;
-        right_evaluation.held_out_settlement = Some(HeldOutSettlementEvidence {
-            event_count: 1,
-            mean_brier_score: f64::NAN,
-            mean_log_loss: f64::INFINITY,
-        });
-        right_evaluation.execution = Some(PredictionExecutionEvidence {
-            up: TokenExecutionEvidence {
-                fill_rate: f64::NAN,
-                mean_slippage_bps: f64::INFINITY,
-            },
-            down: TokenExecutionEvidence {
-                fill_rate: -1.0,
-                mean_slippage_bps: -1.0,
-            },
-        });
+        let left_evaluation = FakeEvaluator.evaluate_training(&left_candidate).unwrap();
+        let right_evaluation = left_evaluation.clone();
         left.observe(&left_candidate.candidate_id, &left_evaluation)
             .unwrap();
         right
             .observe(&right_candidate.candidate_id, &right_evaluation)
             .unwrap();
         assert_eq!(left.checkpoint().unwrap(), right.checkpoint().unwrap());
+    }
+
+    #[test]
+    fn settlement_candidate_rejects_execution_metric_substitution() {
+        let mission = mission();
+        let mut engine =
+            PredictionMctsEngine::new(&mission, blend("baseline"), vec![], 9, 1.4, 2).unwrap();
+        let candidate = engine.propose().unwrap();
+        let before = engine.checkpoint().unwrap();
+        let evaluation = PredictionMctsEvaluation {
+            training: PredictionMctsTrainingEvidence::UpExecution(ExecutionTrainingEvidence {
+                candidate_id: candidate.candidate_id.clone(),
+                identity: candidate.identity.clone(),
+                probability_blend_sha256: candidate.probability_blend_sha256.clone(),
+                training_cohort_id: "train-before-boundary".to_string(),
+                event_count: 12,
+                prediction_horizon_secs: 15,
+                mean_fill_rate: 0.8,
+                mean_fee_usd: 0.01,
+                mean_entry_slippage_bps: 1.0,
+                mean_exit_slippage_bps: 2.0,
+                mean_capacity_usd: 15.0,
+                mean_reprice_pnl: 0.2,
+            }),
+        };
+
+        assert!(evaluation
+            .training
+            .matches_task(PredictionMctsTask::UpExecution {
+                prediction_horizon_secs: 15,
+            }));
+        assert!(!evaluation
+            .training
+            .matches_task(PredictionMctsTask::DownExecution {
+                prediction_horizon_secs: 15,
+            }));
+
+        assert!(engine
+            .observe(&candidate.candidate_id, &evaluation)
+            .is_err());
+        assert_eq!(engine.checkpoint().unwrap(), before);
     }
 
     #[test]
@@ -1019,8 +1354,12 @@ mod tests {
         let candidate = engine.propose().unwrap();
         let before = engine.checkpoint().unwrap();
         let mut evaluation = FakeEvaluator.evaluate_training(&candidate).unwrap();
-        evaluation.training_settlement.identity.data_snapshot_id =
-            format!("sha256:{}", "2".repeat(64));
+        match &mut evaluation.training {
+            PredictionMctsTrainingEvidence::SettlementProbability(evidence) => {
+                evidence.identity.data_snapshot_id = format!("sha256:{}", "2".repeat(64));
+            }
+            _ => panic!("fake evaluator produces settlement evidence"),
+        }
         assert!(engine
             .observe(&candidate.candidate_id, &evaluation)
             .is_err());
