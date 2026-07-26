@@ -87,18 +87,20 @@ pub use polymarket_evidence_projection::{
 };
 #[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
-#[cfg(feature = "db")]
-pub use research_snapshot::{build_research_snapshot_from_database, ResearchSnapshotBuildOptions};
 pub use research_snapshot::{
-    build_research_snapshot_from_polymarket_chainlink_baseline,
+    authenticate_ready_event_cohort, build_research_snapshot_from_polymarket_chainlink_baseline,
     build_research_snapshot_from_verified_artifacts, load_research_snapshot,
-    validate_snapshot_request, validate_snapshot_request_coverage, write_research_snapshot,
-    ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
-    ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
-    ResearchSnapshotRowCounts, VerifiedArtifactSnapshotBuildOptions,
+    materialize_authenticated_research_snapshot, validate_snapshot_request,
+    validate_snapshot_request_coverage, write_research_snapshot, AuthenticatedReadyEventCohort,
+    AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection,
+    AuthenticatedSnapshotMaterializationRequest, ResearchSnapshot, ResearchSnapshotArtifacts,
+    ResearchSnapshotManifest, ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource,
+    ResearchSnapshotRequest, ResearchSnapshotRowCounts, VerifiedArtifactSnapshotBuildOptions,
     BINANCE_SURFACES_OMITTED_QUALITY_FLAG, POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
     POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
 };
+#[cfg(feature = "db")]
+pub use research_snapshot::{build_research_snapshot_from_database, ResearchSnapshotBuildOptions};
 pub use verified_binance_projection::{
     project_verified_binance_market_tape, VerifiedBinanceResearchProjection,
     VerifiedBinanceResearchSurfaceCounts,
