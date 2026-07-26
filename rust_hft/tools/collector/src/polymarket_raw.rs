@@ -443,6 +443,51 @@ fn remaining_trade_poll_budget(
     max_requests_per_cycle.saturating_sub(selected_market_details)
 }
 
+fn shared_market_detail_budget(
+    max_requests_per_cycle: usize,
+    max_concurrent_requests: usize,
+    priority_trades: usize,
+) -> usize {
+    max_concurrent_requests.min(
+        max_requests_per_cycle
+            .saturating_sub(priority_trades)
+            / 2,
+    )
+}
+
+fn trade_poll_candidates(
+    targets: &BTreeMap<String, (Value, TargetMarket)>,
+    state: &CollectorState,
+    priority_cutoff: DateTime<Utc>,
+) -> Vec<TradePollCandidate> {
+    targets
+        .iter()
+        .filter_map(|(market_id, (market, _))| {
+            let tracked = state.markets.get(market_id)?;
+            let condition_id = market
+                .get("conditionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if condition_id.is_empty() || tracked.trade_complete {
+                return None;
+            }
+            let end_time = market
+                .get("endDate")
+                .and_then(parse_datetime)
+                .or_else(|| parse_optional_datetime(tracked.end_time.as_deref()));
+            Some(TradePollCandidate {
+                market_id: market_id.clone(),
+                priority: tracked.trade_failure_since.is_some()
+                    || end_time.is_none_or(|end| end >= priority_cutoff),
+                last_success_at: parse_optional_datetime(
+                    tracked.last_trade_success_at.as_deref(),
+                ),
+                end_time,
+            })
+        })
+        .collect()
+}
+
 fn target_processing_chunks<'a>(
     target_ids: impl IntoIterator<Item = &'a String>,
     selected: &BTreeSet<String>,
@@ -2211,10 +2256,17 @@ impl ReferenceCollector {
         let target_ids = targets.keys().cloned().collect::<BTreeSet<_>>();
         validate_requested_market_ids(&self.config.market_ids, &target_ids)?;
         let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
-        let market_detail_budget = self
-            .config
-            .max_trade_polls_per_cycle
-            .min(self.config.max_concurrent_trade_polls);
+        let priority_cutoff = now - TimeDelta::seconds(self.config.trade_finalization_lag_secs);
+        let priority_trade_markets_before_market_details =
+            trade_poll_candidates(&targets, &next_state, priority_cutoff)
+                .iter()
+                .filter(|candidate| candidate.priority)
+                .count();
+        let market_detail_budget = shared_market_detail_budget(
+            self.config.max_trade_polls_per_cycle,
+            self.config.max_concurrent_trade_polls,
+            priority_trade_markets_before_market_details,
+        );
         let market_detail_plan =
             plan_market_detail_fetches(&next_state.markets, &target_ids, now, market_detail_budget);
         let fetcher = &*self;
@@ -2290,34 +2342,8 @@ impl ReferenceCollector {
             self.config.max_trade_polls_per_cycle,
             market_detail_plan.selected.len(),
         );
-        let priority_cutoff = now - TimeDelta::seconds(self.config.trade_finalization_lag_secs);
         let trade_poll_plan = plan_trade_polls(
-            targets
-                .iter()
-                .filter_map(|(market_id, (market, _))| {
-                    let tracked = next_state.markets.get(market_id)?;
-                    let condition_id = market
-                        .get("conditionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if condition_id.is_empty() || tracked.trade_complete {
-                        return None;
-                    }
-                    let end_time = market
-                        .get("endDate")
-                        .and_then(parse_datetime)
-                        .or_else(|| parse_optional_datetime(tracked.end_time.as_deref()));
-                    Some(TradePollCandidate {
-                        market_id: market_id.clone(),
-                        priority: tracked.trade_failure_since.is_some()
-                            || end_time.is_none_or(|end| end >= priority_cutoff),
-                        last_success_at: parse_optional_datetime(
-                            tracked.last_trade_success_at.as_deref(),
-                        ),
-                        end_time,
-                    })
-                })
-                .collect(),
+            trade_poll_candidates(&targets, &next_state, priority_cutoff),
             trade_poll_budget,
         );
         let target_count = targets.len();
@@ -2578,6 +2604,7 @@ impl ReferenceCollector {
             "record_types": record_types,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
+            "priority_trade_markets_before_market_details": priority_trade_markets_before_market_details,
             "trade_poll_budget_after_market_details": trade_poll_budget,
             "trade_poll_concurrency": self.config.max_concurrent_trade_polls,
             "trade_request_spacing_ms": u64::try_from(self.config.per_market_delay.as_millis()).unwrap_or(u64::MAX),
@@ -3858,7 +3885,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_recovery_shares_one_request_budget() {
+    fn stale_recovery_preserves_priority_trades_within_one_request_budget() {
         let now = fixed_time("2026-07-17T05:00:00Z");
         let tracked = |market_id: &str| {
             (
@@ -3872,9 +3899,12 @@ mod tests {
             )
         };
         let markets = BTreeMap::from([tracked("stale-a"), tracked("stale-b"), tracked("stale-c")]);
-        let detail_plan = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        let priority_trades_before_details = 2;
+        let detail_budget = shared_market_detail_budget(4, 2, priority_trades_before_details);
+        let detail_plan =
+            plan_market_detail_fetches(&markets, &BTreeSet::new(), now, detail_budget);
         let trade_plan = plan_trade_polls(
-            (0..4)
+            (0..priority_trades_before_details + detail_plan.selected.len())
                 .map(|index| TradePollCandidate {
                     market_id: format!("trade-{index}"),
                     priority: true,
@@ -3885,10 +3915,13 @@ mod tests {
             remaining_trade_poll_budget(4, detail_plan.selected.len()),
         );
 
-        assert_eq!(detail_plan.selected.len(), 2);
-        assert_eq!(detail_plan.deferred, 1);
-        assert_eq!(trade_plan.selected.len(), 2);
+        assert_eq!(detail_budget, 1);
+        assert_eq!(detail_plan.selected.len(), 1);
+        assert_eq!(detail_plan.deferred, 2);
+        assert_eq!(trade_plan.selected.len(), 3);
+        assert_eq!(trade_plan.priority_deferred, 0);
         assert_eq!(detail_plan.selected.len() + trade_plan.selected.len(), 4);
+        assert_eq!(shared_market_detail_budget(4, 2, 4), 0);
     }
 
     #[test]
