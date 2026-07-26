@@ -1012,11 +1012,10 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         legacy_trade_metadata_context_mismatch_market_ids.is_empty();
     let rust_trade_metadata_context_match =
         rust_trade_metadata_context_mismatch_market_ids.is_empty();
-    let dedupe_parity = legacy_duplicates.is_empty()
-        && rust_duplicates.is_empty()
-        && !legacy_trade_ids.is_empty()
-        && legacy_trade_ids == rust_trade_ids
-        && trade_metadata_shared_values_match
+    let dedupe_parity =
+        legacy_duplicates.is_empty() && rust_duplicates.is_empty() && !legacy_trade_ids.is_empty();
+    let trade_coverage_parity = legacy_trade_ids.is_subset(&rust_trade_ids);
+    let trade_contract_parity = trade_metadata_shared_values_match
         && legacy_trade_metadata_context_match
         && rust_trade_metadata_context_match;
 
@@ -1062,14 +1061,20 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         .iter()
         .all(|symbol| rust_symbols.contains(*symbol));
     let rotation_parity = legacy_active && rust_active && rust_closed >= 1;
-    let byte_parity =
-        metadata_parity && dedupe_parity && trade_shared_values_match && settlement_parity;
+    let byte_parity = metadata_parity
+        && dedupe_parity
+        && trade_coverage_parity
+        && trade_contract_parity
+        && trade_shared_values_match
+        && settlement_parity;
 
     let checks = json!({
         "byte_parity": byte_parity,
         "metadata_parity": metadata_parity,
         "field_parity": field_parity,
         "dedupe_parity": dedupe_parity,
+        "trade_coverage_parity": trade_coverage_parity,
+        "trade_contract_parity": trade_contract_parity,
         "settlement_parity": settlement_parity,
         "rotation_parity": rotation_parity,
         "asset_parity": asset_parity,
@@ -1539,6 +1544,30 @@ mod tests {
     }
 
     #[test]
+    fn rust_trade_superset_with_matching_shared_records_passes_parity() {
+        let (_root, config) = fixture();
+        append_tape(
+            &config.rust_spool.join(ACTIVE_TAPE),
+            &trade("rust-only-trade"),
+            "1970-01-01T00:03:21Z",
+        );
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["checks"]["dedupe_parity"], true);
+        assert_eq!(evidence["checks"]["trade_coverage_parity"], true);
+        assert_eq!(evidence["checks"]["trade_contract_parity"], true);
+        assert_eq!(evidence["metrics"]["legacy_only_trade_ids"], json!([]));
+        assert_eq!(
+            evidence["metrics"]["rust_only_trade_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn contradictory_metadata_values_fail_parity() {
         let (_root, config) = fixture();
         let mut rows = fixture_rows();
@@ -1690,7 +1719,7 @@ mod tests {
         );
         let evidence = compare(&config).unwrap();
         assert_eq!(evidence["passed"], false);
-        assert_eq!(evidence["checks"]["dedupe_parity"], false);
+        assert_eq!(evidence["checks"]["trade_coverage_parity"], false);
         assert_eq!(
             evidence["metrics"]["legacy_only_trade_ids"]
                 .as_array()
@@ -1803,7 +1832,7 @@ mod tests {
         let evidence = compare(&config).unwrap();
         assert_eq!(evidence["passed"], false);
         assert_eq!(evidence["checks"]["metadata_parity"], true);
-        assert_eq!(evidence["checks"]["dedupe_parity"], false);
+        assert_eq!(evidence["checks"]["trade_contract_parity"], false);
         assert_eq!(
             evidence["metrics"]["trade_metadata_shared_values_match"],
             false

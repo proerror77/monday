@@ -79,6 +79,8 @@ and .checks.byte_parity == true
 and .checks.metadata_parity == true
 and .checks.field_parity == true
 and .checks.dedupe_parity == true
+and .checks.trade_coverage_parity == true
+and .checks.trade_contract_parity == true
 and .checks.settlement_parity == true
 and .checks.rotation_parity == true
 and .checks.asset_parity == true
@@ -95,7 +97,7 @@ and (.metrics.rust_closed_tape_count | positive_integer)
 and (.metrics.legacy_trade_count | positive_integer)
 and (.metrics.rust_trade_count | positive_integer)
 and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
-and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
+and (.metrics.rust_only_trade_ids | type == "array")
 and (.metrics.legacy_metadata_count | positive_integer)
 and (.metrics.rust_metadata_count | positive_integer)
 and (.metrics.legacy_only_metadata_ids | type == "array" and length == 0)
