@@ -926,7 +926,9 @@ fi
 
 markets_json='{}'
 for market in "${markets[@]}"; do
-  round_trips=$(verify_oss_round_trips "$market")
+  round_trips_path="$tmp_dir/${market}-round-trips.json"
+  verify_oss_round_trips "$market" >"$round_trips_path"
+  round_trips=$(<"$round_trips_path")
   market_json=$(jq -cn \
     --arg market "$market" \
     --arg unit "${unit[$market]}" \

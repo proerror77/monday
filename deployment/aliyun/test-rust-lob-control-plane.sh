@@ -36,6 +36,11 @@ grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
 grep -Fq -- '--property=KillMode=control-group' "$GATE"
 grep -Fq 'MemoryHigh=2500M' "$GATE"
 grep -Fq 'MemoryMax=3200M' "$GATE"
+grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
+if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
+  printf 'shadow gate still runs OSS verification in a command-substitution subshell\n' >&2
+  exit 1
+fi
 grep -Fq 'pub fn verify_binance_market_tape_for_strict_gate' "$ARTIFACT_VERIFIER"
 grep -Fq 'verify_binance_market_tape_for_strict_gate(sealed)?' "$COLLECTOR"
 if grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"; then

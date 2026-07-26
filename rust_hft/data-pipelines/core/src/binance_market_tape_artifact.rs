@@ -226,6 +226,9 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
     require_lob_continuity: bool,
     collect_surfaces: bool,
 ) -> Result<VerifiedBinanceMarketTape> {
+    if !collect_surfaces && !require_lob_continuity {
+        bail!("surface-free market-tape verification requires LOB continuity mode");
+    }
     if sealed.is_empty() {
         bail!("market-tape segment set is empty");
     }
@@ -1713,5 +1716,20 @@ mod tests {
         let sealed = seal_binance_market_tape_triplet(&triplet, &lob_anchor).unwrap();
 
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+    }
+
+    #[test]
+    fn surface_free_verifier_requires_lob_continuity_mode() {
+        let error = verify_binance_market_tape_with_requirements_and_surfaces(
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("surface-free market-tape verification requires LOB continuity mode"));
     }
 }
