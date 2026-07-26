@@ -57,7 +57,7 @@ resolve_health_settle_seconds() {
 }
 
 for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
-  mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc zstd; do
+  mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl systemd-run tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -266,8 +266,17 @@ tmp_dir=$(mktemp -d)
 chown "$SERVICE_USER:$SERVICE_USER" "$tmp_dir"
 chmod 0750 "$tmp_dir"
 gate_finished=false
+strict_verifier_unit=
+strict_verifier_counter=0
+stop_strict_verifier() {
+  if [[ -n $strict_verifier_unit ]]; then
+    systemctl stop "$strict_verifier_unit" >/dev/null 2>&1 || true
+    strict_verifier_unit=
+  fi
+}
 cleanup() {
   local status=$?
+  stop_strict_verifier
   rm -rf "$tmp_dir"
   rm -f "$gate_tmp" "$marker_tmp"
   if [[ $gate_finished != true ]]; then
@@ -275,6 +284,7 @@ cleanup() {
   fi
   exit "$status"
 }
+trap 'exit 143' HUP INT TERM
 trap cleanup EXIT
 
 assert_candidate() {
@@ -311,6 +321,81 @@ run_candidate_drain() {
     OSS_COPY_TIMEOUT_SECONDS="${oss_copy_timeout[$market]}" \
     "$candidate_binary" --upload-only
   assert_spool_drained "$market"
+}
+
+run_strict_verifier() {
+  local verifier_status=0
+  strict_verifier_counter=$((strict_verifier_counter + 1))
+  strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
+  if systemd-run --quiet --wait --collect \
+    --unit="$strict_verifier_unit" \
+    --property=KillMode=control-group \
+    --property=MemoryHigh=5000M \
+    --property=MemoryMax=6400M \
+    -- "$candidate_binary" "$@" >/dev/null; then
+    verifier_status=0
+  else
+    verifier_status=$?
+    stop_strict_verifier
+  fi
+  strict_verifier_unit=
+  return "$verifier_status"
+}
+
+run_strict_verifier_pair() {
+  run_strict_verifier --require-lob-continuity "$@"
+}
+
+verify_adjacent_segments() {
+  local previous_path=
+  local previous_content_sha256=
+  local previous_manifest_sha256=
+  local path content_sha256 manifest_sha256 pairs=0
+  (( $# > 0 && $# % 3 == 0 )) \
+    || die 'strict verifier requires one or more complete segment trust anchors'
+  while (($#)); do
+    path=$1
+    content_sha256=$2
+    manifest_sha256=$3
+    shift 3
+    if [[ -n $previous_path ]]; then
+      # Adjacent pairs retain every per-segment check and every stateful
+      # cross-segment transition without retaining the full observation in RAM.
+      run_strict_verifier_pair \
+        --verify-segment "$previous_path" \
+        --segment-content-sha256 "$previous_content_sha256" \
+        --segment-manifest-sha256 "$previous_manifest_sha256" \
+        --verify-segment "$path" \
+        --segment-content-sha256 "$content_sha256" \
+        --segment-manifest-sha256 "$manifest_sha256" \
+        || die 'strict aggregate-trade and LOB continuity readback failed'
+      pairs=$((pairs + 1))
+    fi
+    previous_path=$path
+    previous_content_sha256=$content_sha256
+    previous_manifest_sha256=$manifest_sha256
+  done
+  ((pairs > 0)) || die 'strict verifier requires at least two complete segments'
+}
+
+verify_aggregate_trade_continuity() {
+  local -a verifier_args=(--verify-aggregate-trade-continuity)
+  local path content_sha256 manifest_sha256
+  (( $# > 0 && $# % 3 == 0 )) \
+    || die 'aggregate-trade verifier requires one or more complete segment trust anchors'
+  while (($#)); do
+    path=$1
+    content_sha256=$2
+    manifest_sha256=$3
+    shift 3
+    verifier_args+=(
+      --verify-segment "$path"
+      --segment-content-sha256 "$content_sha256"
+      --segment-manifest-sha256 "$manifest_sha256"
+    )
+  done
+  run_strict_verifier "${verifier_args[@]}" \
+    || die 'strict aggregate-trade continuity readback failed'
 }
 
 systemctl stop "${unit[spot]}" "${unit[usdm]}"
@@ -643,7 +728,7 @@ verify_oss_round_trips() {
   local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
   local previous_end_ns=0
   local round_trips='[]'
-  local -a strict_verifier_args=(--require-lob-continuity)
+  local -a strict_verifier_segments=()
 
   manifest_uris "$market" "$listing" >"$uris"
   : >"$candidates"
@@ -811,11 +896,7 @@ verify_oss_round_trips() {
       || die "$market segment has no valid aggregate trades: $zst_uri"
     [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
       || die "$market manifest aggregate-trade count does not match segment: $uri"
-    strict_verifier_args+=(
-      --verify-segment "$zst_path"
-      --segment-content-sha256 "$digest"
-      --segment-manifest-sha256 "$manifest_digest"
-    )
+    strict_verifier_segments+=("$zst_path" "$digest" "$manifest_digest")
     bytes=$(stat -c '%s' "$zst_path")
     install -m 0640 "$manifest" "$evidence_dir/${market}-manifest-${index}.json"
     round_trip=$(jq -cn \
@@ -851,8 +932,8 @@ verify_oss_round_trips() {
       '$values + [$value]')
   done < <(sort -n -k1,1 "$candidates")
 
-  "$candidate_binary" "${strict_verifier_args[@]}" >/dev/null \
-    || die "$market strict aggregate-trade and LOB continuity readback failed"
+  verify_adjacent_segments "${strict_verifier_segments[@]}"
+  verify_aggregate_trade_continuity "${strict_verifier_segments[@]}"
 
   jq -e --arg session_id "${observed_session[$market]}" '
     all(.[].lob_reconnect_boundary; . == false)
@@ -870,7 +951,9 @@ fi
 
 markets_json='{}'
 for market in "${markets[@]}"; do
-  round_trips=$(verify_oss_round_trips "$market")
+  round_trips_path="$tmp_dir/${market}-round-trips.json"
+  verify_oss_round_trips "$market" >"$round_trips_path"
+  round_trips=$(<"$round_trips_path")
   market_json=$(jq -cn \
     --arg market "$market" \
     --arg unit "${unit[$market]}" \

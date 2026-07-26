@@ -78,6 +78,94 @@ pub struct SealedBinanceMarketTapeTriplet {
     rows: Vec<Range<usize>>,
 }
 
+#[derive(Debug, Default)]
+pub struct BinanceAggregateTradeContinuityVerifier {
+    symbols: Option<BTreeSet<String>>,
+    market: Option<String>,
+    dataset: Option<String>,
+    shard_id: Option<String>,
+    session_id: Option<String>,
+    trade_receive_clocks: BTreeMap<String, Option<u64>>,
+    aggregate_sequence: AggregateTradeSequenceValidator,
+    previous_segment_end_received_at_ns: Option<u64>,
+}
+
+impl BinanceAggregateTradeContinuityVerifier {
+    pub fn observe_segment(&mut self, segment: SealedBinanceMarketTapeTriplet) -> Result<()> {
+        let symbols = segment
+            .manifest
+            .symbols
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if symbols.is_empty() {
+            bail!("aggregate-trade continuity segment has no declared symbols");
+        }
+        if self
+            .previous_segment_end_received_at_ns
+            .is_some_and(|last| segment.manifest.start_received_at_ns < last)
+        {
+            bail!("aggregate-trade receive time moved backwards across segments");
+        }
+        if self.symbols.is_none() {
+            self.trade_receive_clocks = symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), None))
+                .collect();
+            self.symbols = Some(symbols.clone());
+            self.market = Some(segment.manifest.market.clone());
+            self.dataset = Some(segment.manifest.dataset.clone());
+            self.shard_id = Some(segment.manifest.shard_id.clone());
+        } else if self.symbols.as_ref() != Some(&symbols)
+            || self.market.as_deref() != Some(segment.manifest.market.as_str())
+            || self.dataset.as_deref() != Some(segment.manifest.dataset.as_str())
+            || self.shard_id.as_deref() != Some(segment.manifest.shard_id.as_str())
+        {
+            bail!("aggregate-trade continuity segments do not share one scope");
+        }
+
+        let mut aggregate_trade_count = 0_u64;
+        for (index, range) in segment.rows.iter().enumerate() {
+            let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
+                .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
+            let raw = raw
+                .as_object()
+                .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
+            let (event_type, row_session_id, received_at_ns) =
+                validate_row(raw, &segment.manifest)?;
+            if self
+                .session_id
+                .get_or_insert_with(|| row_session_id.to_owned())
+                != row_session_id
+            {
+                bail!("aggregate-trade rows do not share one session_id");
+            }
+            if event_type != "agg_trade" {
+                continue;
+            }
+            let trade = AggregateTrade::from_archived_event(raw, received_at_ns)?;
+            require_symbol(
+                self.symbols.as_ref().expect("initialized above"),
+                &trade.symbol,
+            )?;
+            observe_receive_clock(
+                &mut self.trade_receive_clocks,
+                &trade.symbol,
+                received_at_ns,
+            )?;
+            self.aggregate_sequence.observe(&trade)?;
+            aggregate_trade_count = aggregate_trade_count
+                .checked_add(1)
+                .context("aggregate-trade count overflow")?;
+        }
+        if aggregate_trade_count == 0 {
+            bail!("market-tape segment is missing aggregate trades");
+        }
+        self.previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinanceMarketTapeSegmentIdentity {
     pub market: Market,
@@ -201,11 +289,34 @@ pub fn verify_binance_market_tape_with_required_trade_and_lob_summaries(
     verify_binance_market_tape_with_requirements(sealed, true, true)
 }
 
+pub fn verify_binance_market_tape_for_strict_gate(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<()> {
+    verify_binance_market_tape_with_requirements_and_surfaces(sealed, true, true, false).map(|_| ())
+}
+
 fn verify_binance_market_tape_with_requirements(
-    mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
     require_trade_summaries: bool,
     require_lob_continuity: bool,
 ) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_requirements_and_surfaces(
+        sealed,
+        require_trade_summaries,
+        require_lob_continuity,
+        true,
+    )
+}
+
+fn verify_binance_market_tape_with_requirements_and_surfaces(
+    mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
+    require_trade_summaries: bool,
+    require_lob_continuity: bool,
+    collect_surfaces: bool,
+) -> Result<VerifiedBinanceMarketTape> {
+    if !collect_surfaces && !require_lob_continuity {
+        bail!("surface-free market-tape verification requires LOB continuity mode");
+    }
     if sealed.is_empty() {
         bail!("market-tape segment set is empty");
     }
@@ -238,10 +349,14 @@ fn verify_binance_market_tape_with_requirements(
     let mut identities = Vec::with_capacity(sealed.len());
     let mut aggregate_trades = Vec::new();
     let mut lob_observations = Vec::new();
-    let mut replayed_events = symbols
-        .iter()
-        .map(|symbol| (symbol.clone(), Vec::new()))
-        .collect::<BTreeMap<_, _>>();
+    let mut replayed_events: BTreeMap<String, Vec<ReplayedBinanceBookEvent>> = if collect_surfaces {
+        symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), Vec::new()))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut session_id = None;
     let mut depth_receive_clocks = symbols
         .iter()
@@ -325,12 +440,14 @@ fn verify_binance_market_tape_with_requirements(
                         raw,
                         received_at_ns,
                     )?;
-                    record_replay_events(&mut replayed_events, &clock.symbol, events)?;
-                    lob_observations.push(VerifiedBinanceLobObservation {
-                        symbol: clock.symbol,
-                        source_time_ms: clock.event_time_ms,
-                        received_at_ns: clock.received_at_ns,
-                    });
+                    if collect_surfaces {
+                        record_replay_events(&mut replayed_events, &clock.symbol, events)?;
+                        lob_observations.push(VerifiedBinanceLobObservation {
+                            symbol: clock.symbol,
+                            source_time_ms: clock.event_time_ms,
+                            received_at_ns: clock.received_at_ns,
+                        });
+                    }
                 }
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
@@ -372,12 +489,14 @@ fn verify_binance_market_tape_with_requirements(
                     } else {
                         observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?
                     };
-                    record_replay_events(&mut replayed_events, &symbol, events)?;
-                    if event_type == "checkpoint" {
-                        replayed_events
-                            .get_mut(&symbol)
-                            .context("market-tape replay event symbol is undeclared")?
-                            .push(ReplayedBinanceBookEvent::Checkpoint { received_at_ns });
+                    if collect_surfaces {
+                        record_replay_events(&mut replayed_events, &symbol, events)?;
+                        if event_type == "checkpoint" {
+                            replayed_events
+                                .get_mut(&symbol)
+                                .context("market-tape replay event symbol is undeclared")?
+                                .push(ReplayedBinanceBookEvent::Checkpoint { received_at_ns });
+                        }
                     }
                 }
                 "agg_trade" => {
@@ -390,7 +509,9 @@ fn verify_binance_market_tape_with_requirements(
                     )?;
                     aggregate_sequence.observe(&trade)?;
                     trade_summaries.observe(&trade)?;
-                    aggregate_trades.push(trade);
+                    if collect_surfaces {
+                        aggregate_trades.push(trade);
+                    }
                 }
                 "session_start" => {
                     if required_string(raw, "market")? != market.as_str() {
@@ -476,7 +597,7 @@ fn verify_binance_market_tape_with_requirements(
             bail!("verified market-tape is missing aggregate trades for a declared symbol");
         }
     }
-    let mut replayed_books = Vec::with_capacity(replay.len());
+    let mut replayed_books = Vec::with_capacity(if collect_surfaces { replay.len() } else { 0 });
     for (symbol, validator) in replay {
         validator.finish()?;
         let book = validator.book_snapshot()?;
@@ -490,14 +611,16 @@ fn verify_binance_market_tape_with_requirements(
                 bail!("verified market-tape contains a non-positive replayed book level");
             }
         }
-        let events = replayed_events
-            .remove(&symbol)
-            .context("verified market-tape is missing replay events for a declared symbol")?;
-        replayed_books.push(ReplayedBinanceBook {
-            symbol,
-            book,
-            events,
-        });
+        if collect_surfaces {
+            let events = replayed_events
+                .remove(&symbol)
+                .context("verified market-tape is missing replay events for a declared symbol")?;
+            replayed_books.push(ReplayedBinanceBook {
+                symbol,
+                book,
+                events,
+            });
+        }
     }
     Ok(VerifiedBinanceMarketTape {
         segments: identities,
@@ -1669,5 +1792,68 @@ mod tests {
                 ReplayedBinanceBookEvent::Checkpoint { .. },
             ]
         ));
+    }
+
+    #[test]
+    fn strict_gate_verifier_accepts_complete_v1_without_collecting_surfaces() {
+        let root = tempdir();
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let _ = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let lob_anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &lob_anchor).unwrap();
+
+        verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+    }
+
+    #[test]
+    fn aggregate_trade_continuity_survives_segments_without_a_symbol_trade() {
+        fn rows(start: u64, symbol: &str, aggregate_trade_id: u64) -> Vec<Value> {
+            let mut trade = trade_row(start + 100_000_000, aggregate_trade_id);
+            trade["frame"]["stream"] = json!(format!("{}@aggTrade", symbol.to_ascii_lowercase()));
+            trade["frame"]["data"]["s"] = json!(symbol);
+            vec![
+                json!({"schema":"binance.market_tape.v1","received_at_ns":start,"type":"session_start","session_id":"session-1","market":"usdm","symbols":2,"websocket_shards":2,"websocket_streams":4}),
+                trade,
+            ]
+        }
+
+        let root = tempdir();
+        let first_rows = rows(START_NS, "BTCUSDT", 10);
+        let middle_rows = rows(START_NS + 500_000_000, "SOLUSDT", 20);
+        let last_rows = rows(START_NS + 1_000_000_000, "BTCUSDT", 12);
+        let (first, first_anchor) =
+            write_triplet_for_symbols(root.path(), &first_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (middle, middle_anchor) =
+            write_triplet_for_symbols(root.path(), &middle_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (last, last_anchor) =
+            write_triplet_for_symbols(root.path(), &last_rows, &["BTCUSDT", "SOLUSDT"]);
+
+        let mut verifier = BinanceAggregateTradeContinuityVerifier::default();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&first, &first_anchor).unwrap())
+            .unwrap();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&middle, &middle_anchor).unwrap())
+            .unwrap();
+        let error = verifier
+            .observe_segment(seal_binance_market_tape_triplet(&last, &last_anchor).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("BTCUSDT aggregate trade gap"));
+    }
+
+    #[test]
+    fn surface_free_verifier_requires_lob_continuity_mode() {
+        let error = verify_binance_market_tape_with_requirements_and_surfaces(
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("surface-free market-tape verification requires LOB continuity mode"));
     }
 }

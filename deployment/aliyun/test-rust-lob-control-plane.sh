@@ -9,6 +9,8 @@ GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
+ARTIFACT_VERIFIER="$SCRIPT_DIR/../../rust_hft/data-pipelines/core/src/binance_market_tape_artifact.rs"
+COLLECTOR="$SCRIPT_DIR/../../rust_hft/tools/collector/src/bin/binance-lob-archiver.rs"
 ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
@@ -24,12 +26,30 @@ for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort 
 done
 
 grep -Fq '.trade_summary_contract == "binance.aggregate_trade_summary.v1"' "$GATE"
-grep -Fq 'strict_verifier_args+=' "$GATE"
+grep -Fq 'verify_adjacent_segments' "$GATE"
+grep -Fq 'run_strict_verifier_pair' "$GATE"
+grep -Fq 'run_strict_verifier' "$GATE"
+grep -Fq 'verify_aggregate_trade_continuity' "$GATE"
 grep -Fq -- '--verify-segment' "$GATE"
 grep -Fq -- '--segment-content-sha256' "$GATE"
 grep -Fq -- '--segment-manifest-sha256' "$GATE"
 grep -Fq -- '--require-lob-continuity' "$GATE"
-grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"
+grep -Fq -- '--verify-aggregate-trade-continuity' "$GATE"
+grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
+grep -Fq -- '--property=KillMode=control-group' "$GATE"
+grep -Fq 'MemoryHigh=5000M' "$GATE"
+grep -Fq 'MemoryMax=6400M' "$GATE"
+grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
+if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
+  printf 'shadow gate still runs OSS verification in a command-substitution subshell\n' >&2
+  exit 1
+fi
+grep -Fq 'pub fn verify_binance_market_tape_for_strict_gate' "$ARTIFACT_VERIFIER"
+grep -Fq 'verify_binance_market_tape_for_strict_gate(sealed)?' "$COLLECTOR"
+if grep -Fq '"$candidate_binary" "${strict_verifier_args[@]}"' "$GATE"; then
+  printf 'shadow gate still gives every segment to one unbounded strict verifier\n' >&2
+  exit 1
+fi
 grep -Fq '.lob_continuity.contract == "binance.lob_continuity.v1"' "$GATE"
 grep -Fq 'jq -e --arg session_id "${observed_session[$market]}"' "$GATE"
 grep -Fq -- '--slurpfile manifest "$manifest_path"' "$GATE"
@@ -115,6 +135,105 @@ done
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+strict_verifier_body="$tmp_dir/strict-verifier.sh"
+sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p' \
+  "$GATE" >"$strict_verifier_body"
+run_strict_verifier_fixture() (
+  local -a verifier_units=()
+  local -a verifier_invocations=()
+  strict_verifier_unit=
+  strict_verifier_counter=0
+  candidate_binary=candidate_binary
+  die() { printf '%s\n' "$*" >&2; exit 1; }
+  systemd-run() {
+    verifier_units+=("$*")
+    while (($#)); do
+      if [[ $1 == -- ]]; then
+        shift
+        break
+      fi
+      shift
+    done
+    "$@"
+  }
+  candidate_binary() {
+    verifier_invocations+=("$*")
+  }
+  # shellcheck disable=SC1090
+  . "$strict_verifier_body"
+  verify_adjacent_segments \
+    first.zst first-content first-manifest \
+    second.zst second-content second-manifest \
+    third.zst third-content third-manifest
+  verify_aggregate_trade_continuity \
+    first.zst first-content first-manifest \
+    second.zst second-content second-manifest \
+    third.zst third-content third-manifest
+  [[ ${#verifier_invocations[@]} -eq 3 ]] || {
+    printf 'strict verifier did not run adjacent pairs plus one aggregate continuity pass\n' >&2
+    exit 1
+  }
+  [[ ${verifier_invocations[0]} == \
+    '--require-lob-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest' ]]
+  [[ ${verifier_invocations[1]} == \
+    '--require-lob-continuity --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
+  [[ ${verifier_invocations[2]} == \
+    '--verify-aggregate-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]] || {
+    printf 'aggregate continuity verifier lost segment trust-anchor flags\n' >&2
+    exit 1
+  }
+  [[ ${#verifier_units[@]} -eq 3 ]] || {
+    printf 'strict verifier did not isolate every verification pass\n' >&2
+    exit 1
+  }
+  for verifier_unit in "${verifier_units[@]}"; do
+    [[ $verifier_unit == *'--property=MemoryHigh=5000M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryMax=6400M'* ]] || exit 1
+  done
+)
+run_strict_verifier_fixture
+
+run_strict_verifier_failure_fixture() (
+  local -a stopped_units=()
+  strict_verifier_unit=
+  strict_verifier_counter=0
+  candidate_binary=candidate_binary
+  systemd-run() {
+    while (($#)); do
+      if [[ $1 == -- ]]; then
+        shift
+        break
+      fi
+      shift
+    done
+    "$@"
+    return 17
+  }
+  systemctl() {
+    [[ $1 == stop ]] || exit 1
+    stopped_units+=("$2")
+  }
+  candidate_binary() { :; }
+  # shellcheck disable=SC1090
+  . "$strict_verifier_body"
+  if run_strict_verifier_pair \
+    --verify-segment first.zst \
+    --segment-content-sha256 first-content \
+    --segment-manifest-sha256 first-manifest; then
+    printf 'failed strict verifier fixture unexpectedly passed\n' >&2
+    exit 1
+  fi
+  [[ ${#stopped_units[@]} -eq 1 ]] || {
+    printf 'failed strict verifier did not stop its transient unit\n' >&2
+    exit 1
+  }
+  [[ ${stopped_units[0]} == monday-rust-strict-verifier-*.service ]] || {
+    printf 'failed strict verifier stopped the wrong unit: %s\n' "${stopped_units[0]}" >&2
+    exit 1
+  }
+)
+run_strict_verifier_failure_fixture
 
 health_settle_body="$tmp_dir/resolve-health-settle.sh"
 sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
