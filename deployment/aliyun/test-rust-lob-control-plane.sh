@@ -28,14 +28,17 @@ done
 grep -Fq '.trade_summary_contract == "binance.aggregate_trade_summary.v1"' "$GATE"
 grep -Fq 'verify_adjacent_segments' "$GATE"
 grep -Fq 'run_strict_verifier_pair' "$GATE"
+grep -Fq 'run_strict_verifier' "$GATE"
+grep -Fq 'verify_aggregate_trade_continuity' "$GATE"
 grep -Fq -- '--verify-segment' "$GATE"
 grep -Fq -- '--segment-content-sha256' "$GATE"
 grep -Fq -- '--segment-manifest-sha256' "$GATE"
 grep -Fq -- '--require-lob-continuity' "$GATE"
+grep -Fq -- '--verify-aggregate-trade-continuity' "$GATE"
 grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
 grep -Fq -- '--property=KillMode=control-group' "$GATE"
-grep -Fq 'MemoryHigh=2500M' "$GATE"
-grep -Fq 'MemoryMax=3200M' "$GATE"
+grep -Fq 'MemoryHigh=5000M' "$GATE"
+grep -Fq 'MemoryMax=6400M' "$GATE"
 grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
 if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
   printf 'shadow gate still runs OSS verification in a command-substitution subshell\n' >&2
@@ -134,7 +137,7 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
 strict_verifier_body="$tmp_dir/strict-verifier.sh"
-sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p' \
+sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p' \
   "$GATE" >"$strict_verifier_body"
 run_strict_verifier_fixture() (
   local -a verifier_units=()
@@ -163,17 +166,23 @@ run_strict_verifier_fixture() (
     first.zst first-content first-manifest \
     second.zst second-content second-manifest \
     third.zst third-content third-manifest
-  [[ ${#verifier_invocations[@]} -eq 2 ]] || {
-    printf 'strict verifier did not run exactly one adjacent pair at a time\n' >&2
+  verify_aggregate_trade_continuity \
+    first.zst first-content first-manifest \
+    second.zst second-content second-manifest \
+    third.zst third-content third-manifest
+  [[ ${#verifier_invocations[@]} -eq 3 ]] || {
+    printf 'strict verifier did not run adjacent pairs plus one aggregate continuity pass\n' >&2
     exit 1
   }
   [[ ${verifier_invocations[0]} == \
     '--require-lob-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest' ]]
   [[ ${verifier_invocations[1]} == \
     '--require-lob-continuity --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
+  [[ ${verifier_invocations[2]} == \
+    '--verify-aggregate-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
   for verifier_unit in "${verifier_units[@]}"; do
-    [[ $verifier_unit == *'--property=MemoryHigh=2500M'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryMax=3200M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryHigh=5000M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryMax=6400M'* ]] || exit 1
   done
 )
 run_strict_verifier_fixture

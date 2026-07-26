@@ -323,16 +323,16 @@ run_candidate_drain() {
   assert_spool_drained "$market"
 }
 
-run_strict_verifier_pair() {
+run_strict_verifier() {
   local verifier_status=0
   strict_verifier_counter=$((strict_verifier_counter + 1))
   strict_verifier_unit="monday-rust-strict-verifier-$$-${strict_verifier_counter}.service"
   if systemd-run --quiet --wait --collect \
     --unit="$strict_verifier_unit" \
     --property=KillMode=control-group \
-    --property=MemoryHigh=2500M \
-    --property=MemoryMax=3200M \
-    -- "$candidate_binary" --require-lob-continuity "$@" >/dev/null; then
+    --property=MemoryHigh=5000M \
+    --property=MemoryMax=6400M \
+    -- "$candidate_binary" "$@" >/dev/null; then
     verifier_status=0
   else
     verifier_status=$?
@@ -340,6 +340,10 @@ run_strict_verifier_pair() {
   fi
   strict_verifier_unit=
   return "$verifier_status"
+}
+
+run_strict_verifier_pair() {
+  run_strict_verifier --require-lob-continuity "$@"
 }
 
 verify_adjacent_segments() {
@@ -372,6 +376,13 @@ verify_adjacent_segments() {
     previous_manifest_sha256=$manifest_sha256
   done
   ((pairs > 0)) || die 'strict verifier requires at least two complete segments'
+}
+
+verify_aggregate_trade_continuity() {
+  (( $# > 0 && $# % 3 == 0 )) \
+    || die 'aggregate-trade verifier requires one or more complete segment trust anchors'
+  run_strict_verifier --verify-aggregate-trade-continuity "$@" \
+    || die 'strict aggregate-trade continuity readback failed'
 }
 
 systemctl stop "${unit[spot]}" "${unit[usdm]}"
@@ -909,6 +920,7 @@ verify_oss_round_trips() {
   done < <(sort -n -k1,1 "$candidates")
 
   verify_adjacent_segments "${strict_verifier_segments[@]}"
+  verify_aggregate_trade_continuity "${strict_verifier_segments[@]}"
 
   jq -e --arg session_id "${observed_session[$market]}" '
     all(.[].lob_reconnect_boundary; . == false)

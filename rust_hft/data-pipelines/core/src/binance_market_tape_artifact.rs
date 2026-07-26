@@ -78,6 +78,94 @@ pub struct SealedBinanceMarketTapeTriplet {
     rows: Vec<Range<usize>>,
 }
 
+#[derive(Debug, Default)]
+pub struct BinanceAggregateTradeContinuityVerifier {
+    symbols: Option<BTreeSet<String>>,
+    market: Option<String>,
+    dataset: Option<String>,
+    shard_id: Option<String>,
+    session_id: Option<String>,
+    trade_receive_clocks: BTreeMap<String, Option<u64>>,
+    aggregate_sequence: AggregateTradeSequenceValidator,
+    previous_segment_end_received_at_ns: Option<u64>,
+}
+
+impl BinanceAggregateTradeContinuityVerifier {
+    pub fn observe_segment(&mut self, segment: SealedBinanceMarketTapeTriplet) -> Result<()> {
+        let symbols = segment
+            .manifest
+            .symbols
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if symbols.is_empty() {
+            bail!("aggregate-trade continuity segment has no declared symbols");
+        }
+        if self
+            .previous_segment_end_received_at_ns
+            .is_some_and(|last| segment.manifest.start_received_at_ns < last)
+        {
+            bail!("aggregate-trade receive time moved backwards across segments");
+        }
+        if self.symbols.is_none() {
+            self.trade_receive_clocks = symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), None))
+                .collect();
+            self.symbols = Some(symbols.clone());
+            self.market = Some(segment.manifest.market.clone());
+            self.dataset = Some(segment.manifest.dataset.clone());
+            self.shard_id = Some(segment.manifest.shard_id.clone());
+        } else if self.symbols.as_ref() != Some(&symbols)
+            || self.market.as_deref() != Some(segment.manifest.market.as_str())
+            || self.dataset.as_deref() != Some(segment.manifest.dataset.as_str())
+            || self.shard_id.as_deref() != Some(segment.manifest.shard_id.as_str())
+        {
+            bail!("aggregate-trade continuity segments do not share one scope");
+        }
+
+        let mut aggregate_trade_count = 0_u64;
+        for (index, range) in segment.rows.iter().enumerate() {
+            let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
+                .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
+            let raw = raw
+                .as_object()
+                .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
+            let (event_type, row_session_id, received_at_ns) =
+                validate_row(raw, &segment.manifest)?;
+            if self
+                .session_id
+                .get_or_insert_with(|| row_session_id.to_owned())
+                != row_session_id
+            {
+                bail!("aggregate-trade rows do not share one session_id");
+            }
+            if event_type != "agg_trade" {
+                continue;
+            }
+            let trade = AggregateTrade::from_archived_event(raw, received_at_ns)?;
+            require_symbol(
+                self.symbols.as_ref().expect("initialized above"),
+                &trade.symbol,
+            )?;
+            observe_receive_clock(
+                &mut self.trade_receive_clocks,
+                &trade.symbol,
+                received_at_ns,
+            )?;
+            self.aggregate_sequence.observe(&trade)?;
+            aggregate_trade_count = aggregate_trade_count
+                .checked_add(1)
+                .context("aggregate-trade count overflow")?;
+        }
+        if aggregate_trade_count == 0 {
+            bail!("market-tape segment is missing aggregate trades");
+        }
+        self.previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinanceMarketTapeSegmentIdentity {
     pub market: Market,
@@ -1716,6 +1804,42 @@ mod tests {
         let sealed = seal_binance_market_tape_triplet(&triplet, &lob_anchor).unwrap();
 
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+    }
+
+    #[test]
+    fn aggregate_trade_continuity_survives_segments_without_a_symbol_trade() {
+        fn rows(start: u64, symbol: &str, aggregate_trade_id: u64) -> Vec<Value> {
+            let mut trade = trade_row(start + 100_000_000, aggregate_trade_id);
+            trade["frame"]["stream"] = json!(format!("{}@aggTrade", symbol.to_ascii_lowercase()));
+            trade["frame"]["data"]["s"] = json!(symbol);
+            vec![
+                json!({"schema":"binance.market_tape.v1","received_at_ns":start,"type":"session_start","session_id":"session-1","market":"usdm","symbols":2,"websocket_shards":2,"websocket_streams":4}),
+                trade,
+            ]
+        }
+
+        let root = tempdir();
+        let first_rows = rows(START_NS, "BTCUSDT", 10);
+        let middle_rows = rows(START_NS + 500_000_000, "SOLUSDT", 20);
+        let last_rows = rows(START_NS + 1_000_000_000, "BTCUSDT", 12);
+        let (first, first_anchor) =
+            write_triplet_for_symbols(root.path(), &first_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (middle, middle_anchor) =
+            write_triplet_for_symbols(root.path(), &middle_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (last, last_anchor) =
+            write_triplet_for_symbols(root.path(), &last_rows, &["BTCUSDT", "SOLUSDT"]);
+
+        let mut verifier = BinanceAggregateTradeContinuityVerifier::default();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&first, &first_anchor).unwrap())
+            .unwrap();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&middle, &middle_anchor).unwrap())
+            .unwrap();
+        let error = verifier
+            .observe_segment(seal_binance_market_tape_triplet(&last, &last_anchor).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("BTCUSDT aggregate trade gap"));
     }
 
     #[test]

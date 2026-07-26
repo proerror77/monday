@@ -5,9 +5,9 @@ use data::binance_market_tape::{
     DepthSourceClockSequenceValidator,
 };
 use data::binance_market_tape_artifact::{
-    seal_binance_market_tape_triplet,
-    verify_binance_market_tape_for_strict_gate,
-    verify_binance_market_tape_with_required_trade_summaries, BinanceMarketTapeTriplet,
+    seal_binance_market_tape_triplet, verify_binance_market_tape_for_strict_gate,
+    verify_binance_market_tape_with_required_trade_summaries,
+    BinanceAggregateTradeContinuityVerifier, BinanceMarketTapeTriplet,
     BinanceMarketTapeTrustAnchor,
 };
 use futures::{SinkExt, StreamExt};
@@ -62,6 +62,13 @@ struct Args {
 
     #[arg(long, requires = "verify_segment")]
     require_lob_continuity: bool,
+
+    #[arg(
+        long,
+        requires = "verify_segment",
+        conflicts_with = "require_lob_continuity"
+    )]
+    verify_aggregate_trade_continuity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -741,7 +748,7 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
     }
 
     let mut content_hashes = BTreeSet::new();
-    let mut sealed = Vec::with_capacity(count);
+    let mut trusted_segments = Vec::with_capacity(count);
     for ((path, content_sha256), manifest_sha256) in args
         .verify_segment
         .iter()
@@ -751,6 +758,33 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
         if !content_hashes.insert(content_sha256) {
             bail!("duplicate market-tape segment supplied");
         }
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
+        trusted_segments.push((path, trust));
+    }
+
+    if args.verify_aggregate_trade_continuity {
+        let mut verifier = BinanceAggregateTradeContinuityVerifier::default();
+        for (path, trust) in trusted_segments {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("market-tape segment path has no UTF-8 file name")?;
+            let triplet = BinanceMarketTapeTriplet {
+                data: path.clone(),
+                manifest: path.with_file_name(format!("{file_name}.manifest.json")),
+                success: path.with_file_name(format!("{file_name}._SUCCESS")),
+            };
+            verifier.observe_segment(seal_binance_market_tape_triplet(&triplet, &trust)?)?;
+        }
+        println!(
+            "aggregate-trade continuity verification: ok ({} segments)",
+            count
+        );
+        return Ok(());
+    }
+
+    let mut sealed = Vec::with_capacity(count);
+    for (path, trust) in trusted_segments {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -760,10 +794,8 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
             manifest: path.with_file_name(format!("{file_name}.manifest.json")),
             success: path.with_file_name(format!("{file_name}._SUCCESS")),
         };
-        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    let verified_segment_count = sealed.len();
     if args.require_lob_continuity {
         verify_binance_market_tape_for_strict_gate(sealed)?;
     } else {
@@ -771,7 +803,7 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
     }
     println!(
         "strict market-tape verification: ok ({} segments)",
-        verified_segment_count
+        count
     );
     Ok(())
 }
@@ -3263,6 +3295,31 @@ mod tests {
         assert!(
             Args::try_parse_from(["binance-lob-archiver", "--require-lob-continuity",]).is_err()
         );
+
+        let aggregate = Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-aggregate-trade-continuity",
+        ])
+        .unwrap();
+        assert!(aggregate.verify_aggregate_trade_continuity);
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-aggregate-trade-continuity",
+            "--require-lob-continuity",
+        ])
+        .is_err());
     }
 
     #[tokio::test]
