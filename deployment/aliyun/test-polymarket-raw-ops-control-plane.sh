@@ -1392,6 +1392,25 @@ for mutation in \
     exit 1
   fi
 done
+legacy_health_classifier="$tmp_dir/legacy-health-classifier.sh"
+sed -n '/^legacy_health_sample_state()/,/^}/p' "$GATE" \
+  >"$legacy_health_classifier"
+# shellcheck source=/dev/null
+source "$legacy_health_classifier"
+[[ $(legacy_health_sample_state \
+  "$tmp_dir/legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == clean ]]
+jq '.api_errors = ["trades condition-1: The read operation timed out"]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/transient-legacy-health.json"
+[[ $(legacy_health_sample_state \
+  "$tmp_dir/transient-legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) \
+  == transient_api_error ]]
+[[ $(legacy_health_sample_state \
+  "$tmp_dir/transient-legacy-health.json" "$LEGACY_HEALTH_POLICY" rust_release) \
+  == fatal ]]
+jq '.malformed_trade_rows = 1' "$tmp_dir/transient-legacy-health.json" \
+  >"$tmp_dir/fatal-legacy-health.json"
+[[ $(legacy_health_sample_state \
+  "$tmp_dir/fatal-legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == fatal ]]
 
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
@@ -1498,6 +1517,15 @@ cutover_health_silence_seconds=$(
     "$cutover_health_silence_seconds" >&2
   exit 1
 }
+grep -Fq 'legacy_health_state=$(legacy_health_sample_state' "$GATE"
+grep -Fq '"$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}"' \
+  "$GATE"
+grep -Fq '      "$baseline_mode")' "$GATE"
+grep -Fq 'legacy_api_error_started_at=$now_uptime' "$GATE"
+grep -Fq 'now_uptime - legacy_api_error_started_at <= MAX_HEALTH_SILENCE_SECONDS' \
+  "$GATE"
+grep -Fq 'if [[ $legacy_health_state == clean ]]; then' "$GATE"
+grep -Fq '&& [[ $legacy_health_state == clean ]]; then' "$GATE"
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2
