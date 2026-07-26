@@ -1,6 +1,6 @@
 //! Durable official runner for prediction-market MCTS research.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -18,11 +18,11 @@ use crate::prediction_loop_fs::{
 use crate::prediction_mcts::{
     PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsCheckpointArtifact,
     PredictionMctsEngine, PredictionMctsEvaluation, PredictionMctsIdentity,
-    SettlementTrainingEvidence,
+    PredictionMctsTrainingEvidence,
 };
 
-const RUN_STATE_VERSION: u32 = 2;
-const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v1";
+const RUN_STATE_VERSION: u32 = 3;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v2";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -67,6 +67,8 @@ struct TrainingRecord {
 struct PredictionMctsRunState {
     version: u32,
     mission: PredictionResearchMission,
+    #[serde(default)]
+    identity: Option<PredictionMctsIdentity>,
     deadline_unix_millis: u64,
     baseline_complete: bool,
     advisor_call_consumed: bool,
@@ -105,12 +107,26 @@ struct PredictionMctsRunArtifact {
 #[derive(Serialize)]
 struct PredictionMctsTrainingArtifact {
     candidate: PredictionMctsCandidate,
-    training_settlement: SettlementTrainingEvidence,
+    training: PredictionMctsTrainingEvidence,
 }
 
 impl PredictionMctsRunState {
+    fn identity(&self) -> Result<PredictionMctsIdentity, String> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| "prediction MCTS state is missing its typed identity".to_string())?;
+        identity.validate()?;
+        if identity.mission_id != self.mission.mission_id
+            || identity.data_snapshot_id != self.mission.data_snapshot_id
+        {
+            return Err("prediction MCTS state identity does not match its mission".to_string());
+        }
+        Ok(identity)
+    }
+
     fn read_only_artifact(&self) -> Result<PredictionMctsRunArtifact, String> {
-        let identity = PredictionMctsIdentity::from_mission(&self.mission)?;
+        let identity = self.identity()?;
         let checkpoint_state = self.checkpoint.as_ref();
         let checkpoint = checkpoint_state
             .map(PredictionMctsCheckpoint::read_only_artifact)
@@ -128,20 +144,16 @@ impl PredictionMctsRunState {
             .iter()
             .map(|record| {
                 if record.candidate.identity != identity
-                    || record.evaluation.training_settlement.identity != identity
-                    || record.evaluation.training_settlement.candidate_id
-                        != record.candidate.candidate_id
-                    || record
-                        .evaluation
-                        .training_settlement
-                        .probability_blend_sha256
+                    || record.evaluation.training.identity() != &identity
+                    || record.evaluation.training.candidate_id() != record.candidate.candidate_id
+                    || record.evaluation.training.probability_blend_sha256()
                         != record.candidate.probability_blend_sha256
                 {
                     return Err("invalid prediction MCTS training artifact state".to_string());
                 }
                 Ok(PredictionMctsTrainingArtifact {
                     candidate: record.candidate.clone(),
-                    training_settlement: record.evaluation.training_settlement.clone(),
+                    training: record.evaluation.training.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -236,16 +248,51 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
 ) -> Result<LoopRunSummary, String> {
+    let identity = PredictionMctsIdentity::from_mission(&mission)?;
+    run_or_resume_prediction_mcts_with_identity_and_component_profile(
+        mission,
+        identity,
+        snapshot_dir,
+        output_dir,
+        client,
+        evaluator,
+        component_profile,
+    )
+}
+
+pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
+    C: ProposalClient,
+    E: PredictionMctsRunEvaluator,
+>(
+    mission: PredictionResearchMission,
+    identity: PredictionMctsIdentity,
+    snapshot_dir: &Path,
+    output_dir: &Path,
+    client: &mut C,
+    evaluator: &mut E,
+    component_profile: SettlementProbabilityComponentProfile,
+) -> Result<LoopRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
-    let _lock = OutputLock::acquire(output_dir)?;
+    identity.validate()?;
+    if identity.mission_id != mission.mission_id
+        || identity.data_snapshot_id != mission.data_snapshot_id
+    {
+        return Err("prediction MCTS identity does not match its legacy bridge mission".into());
+    }
+    let output_dir = task_output_dir(output_dir, &identity)?;
+    let _lock = OutputLock::acquire(&output_dir)?;
     let state_path = output_dir.join("prediction-mcts-state.json");
     let mut state = if state_path.exists() {
-        let state: PredictionMctsRunState = read_json(&state_path)?;
-        if state.version != RUN_STATE_VERSION || state.mission != mission {
+        let mut state: PredictionMctsRunState = read_json(&state_path)?;
+        if state.version != RUN_STATE_VERSION
+            || state.mission != mission
+            || state.identity()? != identity
+        {
             return Err(
                 "prediction MCTS output uses an incompatible state version or mission".to_string(),
             );
         }
+        state.identity = Some(identity.clone());
         state
     } else {
         let deadline_unix_millis = now_unix_millis()
@@ -260,6 +307,7 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<
         PredictionMctsRunState {
             version: RUN_STATE_VERSION,
             mission: mission.clone(),
+            identity: Some(identity.clone()),
             deadline_unix_millis,
             baseline_complete: false,
             advisor_call_consumed: false,
@@ -359,8 +407,9 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<
         checkpoint(&state_path, &mut state)?;
     }
 
-    let mut engine = PredictionMctsEngine::new_with_component_profile(
+    let mut engine = PredictionMctsEngine::new_with_identity_and_component_profile(
         &mission,
+        identity,
         baseline_blend(component_profile),
         state.advisor.clone().unwrap_or_default(),
         MCTS_SEED,
@@ -457,6 +506,38 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<
     ))
 }
 
+fn task_output_dir(
+    output_dir: &Path,
+    identity: &PredictionMctsIdentity,
+) -> Result<PathBuf, String> {
+    let Some(mission_sha256) = identity.sealed_mission_sha256() else {
+        return Ok(output_dir.to_path_buf());
+    };
+    let mission_sha256 = mission_sha256
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "sealed prediction MCTS mission identity is invalid".to_string())?;
+    let task = match identity.task {
+        crate::prediction_mcts::PredictionMctsTask::SettlementProbability => "settlement",
+        crate::prediction_mcts::PredictionMctsTask::UpExecution {
+            prediction_horizon_secs,
+        } => {
+            return Ok(output_dir
+                .join("mcts-v4")
+                .join(mission_sha256)
+                .join(format!("up-execution-{prediction_horizon_secs}s")))
+        }
+        crate::prediction_mcts::PredictionMctsTask::DownExecution {
+            prediction_horizon_secs,
+        } => {
+            return Ok(output_dir
+                .join("mcts-v4")
+                .join(mission_sha256)
+                .join(format!("down-execution-{prediction_horizon_secs}s")))
+        }
+    };
+    Ok(output_dir.join("mcts-v4").join(mission_sha256).join(task))
+}
+
 fn baseline_blend(
     component_profile: SettlementProbabilityComponentProfile,
 ) -> ProposedProbabilityBlend {
@@ -495,7 +576,10 @@ fn proposed_blend(blend: crate::LlmProbabilityBlendSpec) -> ProposedProbabilityB
 }
 
 fn training_loss(evaluation: &PredictionMctsEvaluation) -> f64 {
-    evaluation.training_settlement.mean_brier_score + evaluation.training_settlement.mean_log_loss
+    -evaluation
+        .training
+        .reward()
+        .expect("observed prediction MCTS training evidence is valid")
 }
 
 fn pause(
@@ -571,9 +655,10 @@ mod tests {
         PREDICTION_MISSION_SCHEMA_VERSION,
     };
     use crate::prediction_loop_fs::sha256_hex;
-    use crate::prediction_mcts::{
-        HeldOutSettlementEvidence, PredictionExecutionEvidence, PredictionMctsIdentity,
-        SettlementTrainingEvidence, TokenExecutionEvidence,
+    use crate::prediction_mcts::PredictionMctsIdentity;
+    use crate::prediction_mission_v3::{
+        AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionAuthorityProfile,
+        PredictionProductIdentity, PredictionProductSymbol, PredictionRunMode,
     };
 
     fn mission(max_candidates: usize, max_llm_calls: usize) -> PredictionResearchMission {
@@ -637,7 +722,6 @@ mod tests {
         calls: Vec<String>,
         fail_training: VecDeque<bool>,
         candidate_ids: Vec<String>,
-        include_auxiliary_evidence: bool,
     }
 
     impl PredictionMctsRunEvaluator for FakeEvaluator {
@@ -666,34 +750,17 @@ mod tests {
                 return Err("retryable training failure".to_string());
             }
             Ok(PredictionMctsEvaluation {
-                training_settlement: SettlementTrainingEvidence {
-                    candidate_id: candidate.candidate_id.clone(),
-                    identity: candidate.identity.clone(),
-                    probability_blend_sha256: candidate.probability_blend_sha256.clone(),
-                    training_cohort_id: "train-before-boundary".to_string(),
-                    event_count: 12,
-                    mean_brier_score: 0.2,
-                    mean_log_loss: 0.3,
-                },
-                held_out_settlement: self.include_auxiliary_evidence.then_some(
-                    HeldOutSettlementEvidence {
-                        event_count: 4,
-                        mean_brier_score: 0.3,
-                        mean_log_loss: 0.4,
+                training: PredictionMctsTrainingEvidence::SettlementProbability(
+                    crate::prediction_mcts::SettlementTrainingEvidence {
+                        candidate_id: candidate.candidate_id.clone(),
+                        identity: candidate.identity.clone(),
+                        probability_blend_sha256: candidate.probability_blend_sha256.clone(),
+                        training_cohort_id: "train-before-boundary".to_string(),
+                        event_count: 12,
+                        mean_brier_score: 0.2,
+                        mean_log_loss: 0.3,
                     },
                 ),
-                execution: self
-                    .include_auxiliary_evidence
-                    .then_some(PredictionExecutionEvidence {
-                        up: TokenExecutionEvidence {
-                            fill_rate: 0.9,
-                            mean_slippage_bps: 1.0,
-                        },
-                        down: TokenExecutionEvidence {
-                            fill_rate: 0.8,
-                            mean_slippage_bps: 2.0,
-                        },
-                    }),
             })
         }
 
@@ -867,7 +934,6 @@ mod tests {
         let output = temp_dir("auxiliary-evidence");
         let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator {
-            include_auxiliary_evidence: true,
             ..Default::default()
         };
 
@@ -993,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_rejects_v1_state_without_component_profile() {
+    fn runner_rejects_v2_state_after_typed_training_evidence_upgrade() {
         let output = temp_dir("legacy-component-profile");
         let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
@@ -1012,11 +1078,7 @@ mod tests {
         let state_path = output.join("prediction-mcts-state.json");
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        legacy["version"] = serde_json::json!(1);
-        legacy["checkpoint"]["config"]
-            .as_object_mut()
-            .unwrap()
-            .remove("component_profile");
+        legacy["version"] = serde_json::json!(2);
         std::fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
         let error = run_or_resume_prediction_mcts(
@@ -1026,8 +1088,42 @@ mod tests {
             &mut client,
             &mut FakeEvaluator::default(),
         )
-        .expect_err("v1 state must be rejected after explicit deserialization");
+        .expect_err("v2 state must not resume under typed training evidence");
         assert!(error.contains("incompatible state version"));
+    }
+
+    #[test]
+    fn runner_rejects_a_v3_state_missing_its_typed_identity() {
+        let output = temp_dir("missing-typed-identity");
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+        )
+        .expect("pause with a durable v3 state");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged.as_object_mut().unwrap().remove("identity");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut FakeEvaluator::default(),
+        )
+        .expect_err("typed state identity is mandatory once version 3 is written");
+        assert!(error.contains("missing its typed identity"));
     }
 
     #[test]
@@ -1098,5 +1194,54 @@ mod tests {
             std::fs::read(&artifact_path).unwrap(),
             artifact_before_forgery
         );
+    }
+
+    #[test]
+    fn sealed_v4_task_uses_an_isolated_checkpoint_namespace() {
+        let output = temp_dir("sealed-v4-namespace");
+        let mut bridge = mission(1, 1);
+        bridge.mission_id = "btc-5m-up".to_string();
+        bridge.data_snapshot_id = format!("sha256:{}", "5".repeat(64));
+        bridge.prompt_snapshot_id = research_brief_snapshot_id(&bridge);
+        let admitted = AdmittedPredictionMissionV3 {
+            mission_id: bridge.mission_id.clone(),
+            mission_sha256: format!("sha256:{}", "1".repeat(64)),
+            product: PredictionProductIdentity {
+                symbol: PredictionProductSymbol::Btc,
+                event_horizon_secs: 300,
+            },
+            task: AdmittedPredictionTask::UpExecution {
+                prediction_horizon_secs: 15,
+            },
+            run_mode: PredictionRunMode::ResearchTrial,
+            authority_profile: PredictionAuthorityProfile::PolymarketChainlinkBaseline,
+            cohort_manifest_id: format!("sha256:{}", "2".repeat(64)),
+            partition_digest: format!("sha256:{}", "3".repeat(64)),
+            causal_projection_policy_id: current_prediction_policy_snapshot_id(),
+            snapshot_contract_id: bridge.data_snapshot_id.clone(),
+            snapshot_hash: "6".repeat(16),
+            search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
+        };
+        let identity = PredictionMctsIdentity::from_admitted_mission(&admitted).unwrap();
+        let mut client = FakeClient { calls: 0 };
+        let error = run_or_resume_prediction_mcts_with_identity_and_component_profile(
+            bridge,
+            identity,
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut FakeEvaluator::default(),
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        )
+        .expect_err("settlement-only evaluator cannot satisfy an Up execution task");
+        assert!(error.contains("training evidence identity"));
+
+        let state_path = output
+            .join("mcts-v4")
+            .join("1111111111111111111111111111111111111111111111111111111111111111")
+            .join("up-execution-15s")
+            .join("prediction-mcts-state.json");
+        assert!(state_path.exists());
+        assert!(!output.join("prediction-mcts-state.json").exists());
     }
 }
