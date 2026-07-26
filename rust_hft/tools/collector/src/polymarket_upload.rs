@@ -1647,6 +1647,7 @@ fn oss_upload_command(source: &str, destination: &str, config: &UploadConfig) ->
 }
 
 fn run_checked(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
+    command.stdout(Stdio::null());
     let status = command_status_with_timeout(command, timeout)?;
     if !status.success() {
         bail!("child process exited with {status}");
@@ -2095,6 +2096,21 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    #[test]
+    fn oss_runner_keeps_machine_readable_stdout_clean() {
+        let root = TestDir::new();
+        let captured = root.path().join("child.stdout");
+        let output = File::create(&captured).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf 'ossutil progress'"])
+            .stdout(Stdio::from(output));
+
+        run_checked(&mut command, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(fs::read(captured).unwrap(), b"");
     }
 
     fn valid_v2_trade_update() -> Value {
