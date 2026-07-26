@@ -14,6 +14,7 @@ These pages describe the deterministic Rust runtime and its bounded Loop Enginee
 - [Quotes-only operation](QUOTES_ONLY.md)
 - [SLO runbook](slo_runbook.md)
 - [OMS accounting](oms-accounting.md)
+- [CEX HFT latency measurement guideline](architecture/CEX_HFT_LATENCY_MEASUREMENT_GUIDELINE.md)
 
 ## Execution and Data
 
