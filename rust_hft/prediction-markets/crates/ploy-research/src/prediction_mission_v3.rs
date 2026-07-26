@@ -3,14 +3,20 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::prediction_loop::{
-    validate_prediction_search_budget, validate_sha256_id, PredictionResearchMission,
-    PredictionSearchBudget,
+    current_prediction_policy_snapshot_id, validate_prediction_search_budget, validate_sha256_id,
+    PredictionResearchMission, PredictionSearchBudget,
 };
 use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
+use crate::research_snapshot::{
+    AuthenticatedResearchSnapshot, POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND,
+};
 
-pub const PREDICTION_MISSION_V3_SCHEMA_VERSION: &str = "prediction_research_mission.v3";
+// The sealed identity fields are wire-incompatible with the former v3 Mission
+// document. Keep the adapter name stable for its #324 consumer, but require a
+// distinct wire version instead of silently reinterpreting legacy Missions.
+pub const PREDICTION_MISSION_V3_SCHEMA_VERSION: &str = "prediction_research_mission.v4";
 pub const PREDICTION_MISSION_V3_CHECKPOINT_SCHEMA_VERSION: &str =
-    "prediction_research_checkpoint.v3";
+    "prediction_research_checkpoint.v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PredictionProductSymbol {
@@ -82,7 +88,10 @@ pub struct PredictionResearchMissionV3 {
     pub authority_profile: PredictionAuthorityProfile,
     pub required_capabilities: BTreeSet<PredictionMissionCapability>,
     pub cohort_manifest_id: String,
+    pub partition_digest: String,
+    pub causal_projection_policy_id: String,
     pub snapshot_contract_id: String,
+    pub snapshot_hash: String,
     pub search_policy_snapshot_id: String,
     pub search_budget: PredictionSearchBudget,
 }
@@ -112,8 +121,12 @@ pub struct AuthenticatedPredictionMissionV3Inputs {
     authority_profile: PredictionAuthorityProfile,
     capabilities: BTreeSet<PredictionMissionCapability>,
     cohort_manifest_id: AuthenticatedDigest,
+    partition_digest: AuthenticatedDigest,
+    causal_projection_policy_id: AuthenticatedDigest,
     snapshot_contract_id: AuthenticatedDigest,
+    snapshot_hash: AuthenticatedDigest,
     search_policy_snapshot_id: AuthenticatedDigest,
+    source_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +134,11 @@ pub struct AuthenticatedPredictionMissionV3Inputs {
 pub struct PredictionMissionV3CheckpointIdentity {
     pub schema_version: String,
     pub mission_sha256: String,
+    pub cohort_manifest_id: String,
+    pub partition_digest: String,
+    pub causal_projection_policy_id: String,
     pub snapshot_contract_id: String,
+    pub snapshot_hash: String,
     pub search_policy_snapshot_id: String,
 }
 
@@ -134,7 +151,10 @@ pub struct AdmittedPredictionMissionV3 {
     pub run_mode: PredictionRunMode,
     pub authority_profile: PredictionAuthorityProfile,
     pub cohort_manifest_id: String,
+    pub partition_digest: String,
+    pub causal_projection_policy_id: String,
     pub snapshot_contract_id: String,
+    pub snapshot_hash: String,
     pub search_policy_snapshot_id: String,
 }
 
@@ -143,7 +163,11 @@ impl AdmittedPredictionMissionV3 {
         PredictionMissionV3CheckpointIdentity {
             schema_version: PREDICTION_MISSION_V3_CHECKPOINT_SCHEMA_VERSION.to_string(),
             mission_sha256: self.mission_sha256.clone(),
+            cohort_manifest_id: self.cohort_manifest_id.clone(),
+            partition_digest: self.partition_digest.clone(),
+            causal_projection_policy_id: self.causal_projection_policy_id.clone(),
             snapshot_contract_id: self.snapshot_contract_id.clone(),
+            snapshot_hash: self.snapshot_hash.clone(),
             search_policy_snapshot_id: self.search_policy_snapshot_id.clone(),
         }
     }
@@ -162,7 +186,7 @@ pub fn parse_prediction_mission_json(bytes: &[u8]) -> Result<ParsedPredictionMis
             .map_err(|error| format!("parse prediction Mission v2: {error}")),
         PREDICTION_MISSION_V3_SCHEMA_VERSION => serde_json::from_value(value)
             .map(ParsedPredictionMission::V3)
-            .map_err(|error| format!("parse prediction Mission v3: {error}")),
+            .map_err(|error| format!("parse prediction Mission v4: {error}")),
         other => Err(format!(
             "unsupported prediction mission schema_version {other}"
         )),
@@ -190,14 +214,20 @@ pub fn validate_prediction_mission_v3(mission: &PredictionResearchMissionV3) -> 
     if mission.product.symbol != PredictionProductSymbol::Btc
         || mission.product.event_horizon_secs != 300
     {
-        return Err("Mission v3 currently supports only BTC x 300 seconds".to_string());
+        return Err("Mission v4 currently supports only BTC x 300 seconds".to_string());
     }
     validate_task(&mission.task)?;
     validate_sha256_id(&mission.cohort_manifest_id, "mission.cohort_manifest_id")?;
+    validate_sha256_id(&mission.partition_digest, "mission.partition_digest")?;
+    validate_sha256_id(
+        &mission.causal_projection_policy_id,
+        "mission.causal_projection_policy_id",
+    )?;
     validate_sha256_id(
         &mission.snapshot_contract_id,
         "mission.snapshot_contract_id",
     )?;
+    validate_snapshot_hash(&mission.snapshot_hash)?;
     validate_sha256_id(
         &mission.search_policy_snapshot_id,
         "mission.search_policy_snapshot_id",
@@ -223,6 +253,80 @@ pub fn validate_prediction_mission_v3(mission: &PredictionResearchMissionV3) -> 
     Ok(())
 }
 
+/// Seal a Mission v4 admission request to the identities independently read
+/// from a verified snapshot cache entry. Callers can provide a Mission, but
+/// cannot manufacture the resulting admission evidence from raw strings.
+pub fn authenticate_prediction_mission_v3_inputs(
+    snapshot: &AuthenticatedResearchSnapshot,
+    mission: &PredictionResearchMissionV3,
+) -> Result<AuthenticatedPredictionMissionV3Inputs, String> {
+    validate_prediction_mission_v3(mission)?;
+    if mission.authority_profile != PredictionAuthorityProfile::PolymarketChainlinkBaseline
+        || snapshot.source_kind() != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+    {
+        return Err(
+            "authenticated snapshot source does not match Mission v4 authority profile".to_string(),
+        );
+    }
+    let current_policy = current_prediction_policy_snapshot_id();
+    if snapshot.causal_projection_policy_id() != current_policy {
+        return Err(
+            "authenticated snapshot has a stale causal projection policy identity".to_string(),
+        );
+    }
+    for (identity, field) in [
+        (
+            snapshot.cohort_manifest_id(),
+            "authenticated cohort manifest",
+        ),
+        (
+            snapshot.partition_digest(),
+            "authenticated partition digest",
+        ),
+        (
+            snapshot.causal_projection_policy_id(),
+            "authenticated causal projection policy",
+        ),
+        (
+            snapshot.snapshot_contract_id(),
+            "authenticated snapshot contract",
+        ),
+    ] {
+        validate_sha256_id(identity, field)?;
+    }
+    validate_snapshot_hash(snapshot.snapshot_hash())?;
+    Ok(AuthenticatedPredictionMissionV3Inputs {
+        task: mission.task.clone(),
+        authority_profile: mission.authority_profile,
+        capabilities: mission.required_capabilities.clone(),
+        cohort_manifest_id: AuthenticatedDigest(snapshot.cohort_manifest_id().to_string()),
+        partition_digest: AuthenticatedDigest(snapshot.partition_digest().to_string()),
+        causal_projection_policy_id: AuthenticatedDigest(
+            snapshot.causal_projection_policy_id().to_string(),
+        ),
+        snapshot_contract_id: AuthenticatedDigest(snapshot.snapshot_contract_id().to_string()),
+        snapshot_hash: AuthenticatedDigest(snapshot.snapshot_hash().to_string()),
+        search_policy_snapshot_id: AuthenticatedDigest(
+            snapshot.causal_projection_policy_id().to_string(),
+        ),
+        source_kind: snapshot.source_kind().to_string(),
+    })
+}
+
+fn validate_snapshot_hash(value: &str) -> Result<(), String> {
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "mission.snapshot_hash must use a 16-character lowercase hexadecimal content hash"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn admit_prediction_mission_v3(
     mission: &PredictionResearchMissionV3,
     authenticated: &AuthenticatedPredictionMissionV3Inputs,
@@ -230,13 +334,20 @@ pub fn admit_prediction_mission_v3(
 ) -> Result<AdmittedPredictionMissionV3, String> {
     validate_prediction_mission_v3(mission)?;
     if authenticated.task != mission.task {
-        return Err("authenticated task does not match Mission v3".to_string());
+        return Err("authenticated task does not match Mission v4".to_string());
     }
     if authenticated.authority_profile != mission.authority_profile {
-        return Err("authenticated authority profile does not match Mission v3".to_string());
+        return Err("authenticated authority profile does not match Mission v4".to_string());
     }
     if authenticated.capabilities != mission.required_capabilities {
-        return Err("authenticated capabilities do not match Mission v3".to_string());
+        return Err("authenticated capabilities do not match Mission v4".to_string());
+    }
+    if mission.authority_profile != PredictionAuthorityProfile::PolymarketChainlinkBaseline
+        || authenticated.source_kind != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+    {
+        return Err(
+            "authenticated snapshot source does not match Mission v4 authority profile".to_string(),
+        );
     }
     for (actual, expected, field) in [
         (
@@ -245,9 +356,24 @@ pub fn admit_prediction_mission_v3(
             "cohort manifest",
         ),
         (
+            &authenticated.partition_digest.0,
+            &mission.partition_digest,
+            "partition",
+        ),
+        (
+            &authenticated.causal_projection_policy_id.0,
+            &mission.causal_projection_policy_id,
+            "causal projection policy",
+        ),
+        (
             &authenticated.snapshot_contract_id.0,
             &mission.snapshot_contract_id,
             "snapshot contract",
+        ),
+        (
+            &authenticated.snapshot_hash.0,
+            &mission.snapshot_hash,
+            "snapshot hash",
         ),
         (
             &authenticated.search_policy_snapshot_id.0,
@@ -257,7 +383,7 @@ pub fn admit_prediction_mission_v3(
     ] {
         if actual != expected {
             return Err(format!(
-                "authenticated {field} identity does not match Mission v3"
+                "authenticated {field} identity does not match Mission v4"
             ));
         }
     }
@@ -265,10 +391,14 @@ pub fn admit_prediction_mission_v3(
     if let Some(checkpoint) = checkpoint {
         if checkpoint.schema_version != PREDICTION_MISSION_V3_CHECKPOINT_SCHEMA_VERSION
             || checkpoint.mission_sha256 != mission_sha256
+            || checkpoint.cohort_manifest_id != mission.cohort_manifest_id
+            || checkpoint.partition_digest != mission.partition_digest
+            || checkpoint.causal_projection_policy_id != mission.causal_projection_policy_id
             || checkpoint.snapshot_contract_id != mission.snapshot_contract_id
+            || checkpoint.snapshot_hash != mission.snapshot_hash
             || checkpoint.search_policy_snapshot_id != mission.search_policy_snapshot_id
         {
-            return Err("checkpoint identity does not match Mission v3".to_string());
+            return Err("checkpoint identity does not match Mission v4".to_string());
         }
     }
     Ok(AdmittedPredictionMissionV3 {
@@ -279,7 +409,10 @@ pub fn admit_prediction_mission_v3(
         run_mode: mission.run_mode,
         authority_profile: mission.authority_profile,
         cohort_manifest_id: mission.cohort_manifest_id.clone(),
+        partition_digest: mission.partition_digest.clone(),
+        causal_projection_policy_id: mission.causal_projection_policy_id.clone(),
         snapshot_contract_id: mission.snapshot_contract_id.clone(),
+        snapshot_hash: mission.snapshot_hash.clone(),
         search_policy_snapshot_id: mission.search_policy_snapshot_id.clone(),
     })
 }
@@ -325,16 +458,19 @@ mod tests {
 
     fn settlement_mission() -> serde_json::Value {
         serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-settlement",
             "product": { "symbol": "BTC", "event_horizon_secs": 300 },
             "task": { "kind": "settlement_probability" },
             "run_mode": "research_trial",
-            "authority_profile": "polymarket_chainlink_binance",
-            "required_capabilities": ["polymarket_chainlink", "binance_context"],
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
             "cohort_manifest_id": sha('1'),
-            "snapshot_contract_id": sha('2'),
-            "search_policy_snapshot_id": sha('3'),
+            "partition_digest": sha('2'),
+            "causal_projection_policy_id": sha('3'),
+            "snapshot_contract_id": sha('4'),
+            "snapshot_hash": "5".repeat(16),
+            "search_policy_snapshot_id": sha('6'),
             "search_budget": {
                 "max_candidates": 8,
                 "max_llm_calls": 1,
@@ -358,10 +494,16 @@ mod tests {
             authority_profile: mission.authority_profile,
             capabilities: mission.required_capabilities.clone(),
             cohort_manifest_id: AuthenticatedDigest(mission.cohort_manifest_id.clone()),
+            partition_digest: AuthenticatedDigest(mission.partition_digest.clone()),
+            causal_projection_policy_id: AuthenticatedDigest(
+                mission.causal_projection_policy_id.clone(),
+            ),
             snapshot_contract_id: AuthenticatedDigest(mission.snapshot_contract_id.clone()),
+            snapshot_hash: AuthenticatedDigest(mission.snapshot_hash.clone()),
             search_policy_snapshot_id: AuthenticatedDigest(
                 mission.search_policy_snapshot_id.clone(),
             ),
+            source_kind: POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND.to_string(),
         }
     }
 
@@ -462,7 +604,9 @@ mod tests {
     #[test]
     fn v3_rejects_baseline_authority_requesting_binance_context() {
         let mut mission = parse_v3(settlement_mission());
-        mission.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBaseline;
+        mission
+            .required_capabilities
+            .insert(PredictionMissionCapability::BinanceContext);
 
         assert_eq!(
             validate_prediction_mission_v3(&mission).unwrap_err(),
@@ -484,23 +628,33 @@ mod tests {
         let mut mismatched = authenticated(&mission);
         mismatched
             .capabilities
-            .remove(&PredictionMissionCapability::BinanceContext);
+            .remove(&PredictionMissionCapability::PolymarketChainlink);
         assert!(admit_prediction_mission_v3(&mission, &mismatched, None)
             .unwrap_err()
             .contains("capabilities"));
 
         let mut mismatched = authenticated(&mission);
-        mismatched.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBaseline;
+        mismatched.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBinance;
         assert!(admit_prediction_mission_v3(&mission, &mismatched, None)
             .unwrap_err()
             .contains("authority"));
 
-        for (field, change) in [("cohort", 0_u8), ("snapshot", 1_u8), ("policy", 2_u8)] {
+        for (field, change) in [
+            ("cohort", 0_u8),
+            ("partition", 1_u8),
+            ("causal projection", 2_u8),
+            ("snapshot contract", 3_u8),
+            ("snapshot hash", 4_u8),
+            ("search policy", 5_u8),
+        ] {
             let mut mismatched = authenticated(&mission);
             match change {
                 0 => mismatched.cohort_manifest_id = AuthenticatedDigest(sha('4')),
-                1 => mismatched.snapshot_contract_id = AuthenticatedDigest(sha('4')),
-                _ => mismatched.search_policy_snapshot_id = AuthenticatedDigest(sha('4')),
+                1 => mismatched.partition_digest = AuthenticatedDigest(sha('7')),
+                2 => mismatched.causal_projection_policy_id = AuthenticatedDigest(sha('7')),
+                3 => mismatched.snapshot_contract_id = AuthenticatedDigest(sha('7')),
+                4 => mismatched.snapshot_hash = AuthenticatedDigest("7".repeat(16)),
+                _ => mismatched.search_policy_snapshot_id = AuthenticatedDigest(sha('7')),
             }
             assert!(admit_prediction_mission_v3(&mission, &mismatched, None)
                 .unwrap_err()
@@ -538,15 +692,26 @@ mod tests {
         changed.search_budget.max_llm_calls = 0;
         variants.push(changed);
         let mut changed = base.clone();
-        changed.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBaseline;
-        changed.required_capabilities =
-            BTreeSet::from([PredictionMissionCapability::PolymarketChainlink]);
+        changed.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBinance;
+        changed.required_capabilities = BTreeSet::from([
+            PredictionMissionCapability::PolymarketChainlink,
+            PredictionMissionCapability::BinanceContext,
+        ]);
         variants.push(changed);
         let mut changed = base.clone();
         changed.cohort_manifest_id = sha('4');
         variants.push(changed);
         let mut changed = base.clone();
-        changed.snapshot_contract_id = sha('4');
+        changed.partition_digest = sha('7');
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.causal_projection_policy_id = sha('7');
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.snapshot_contract_id = sha('7');
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.snapshot_hash = "7".repeat(16);
         variants.push(changed);
         let mut changed = base.clone();
         changed.search_policy_snapshot_id = sha('4');
@@ -560,7 +725,7 @@ mod tests {
             .map(|mission| prediction_mission_v3_sha256(&mission).unwrap())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(hashes.len(), 10);
+        assert_eq!(hashes.len(), 13);
     }
 
     #[test]
@@ -574,12 +739,12 @@ mod tests {
     }
 
     #[test]
-    fn v3_resume_rejects_checkpoint_version_or_identity_drift() {
+    fn v3_resume_rejects_legacy_v3_checkpoint_or_identity_drift() {
         let mission = parse_v3(settlement_mission());
         let admitted =
             admit_prediction_mission_v3(&mission, &authenticated(&mission), None).unwrap();
         let mut checkpoint = admitted.checkpoint_identity();
-        checkpoint.schema_version = "prediction_research_checkpoint.v2".to_string();
+        checkpoint.schema_version = "prediction_research_checkpoint.v3".to_string();
         assert!(
             admit_prediction_mission_v3(&mission, &authenticated(&mission), Some(&checkpoint))
                 .unwrap_err()

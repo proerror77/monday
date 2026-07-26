@@ -61,10 +61,41 @@ struct PipelineSmokeSummary {
     evaluator_report_sha256: String,
 }
 
+struct PipelineSmokeAdmission {
+    cohort_manifest_id: String,
+    partition_digest: String,
+    policy_identity: String,
+    snapshot_contract_id: String,
+    snapshot_hash: String,
+}
+
+fn parse_pipeline_smoke_admission(args: &[String]) -> Result<PipelineSmokeAdmission, String> {
+    let [cohort_flag, cohort_manifest_id, partition_flag, partition_digest, policy_flag, policy_identity, contract_flag, snapshot_contract_id, hash_flag, snapshot_hash] =
+        args
+    else {
+        return Err("pipeline smoke requires the complete admitted snapshot identity".into());
+    };
+    if cohort_flag != "--admitted-cohort-manifest-id"
+        || partition_flag != "--admitted-partition-digest"
+        || policy_flag != "--admitted-policy-identity"
+        || contract_flag != "--admitted-snapshot-contract-id"
+        || hash_flag != "--admitted-snapshot-digest"
+    {
+        return Err("pipeline smoke admitted identity arguments are invalid".into());
+    }
+    Ok(PipelineSmokeAdmission {
+        cohort_manifest_id: cohort_manifest_id.clone(),
+        partition_digest: partition_digest.clone(),
+        policy_identity: policy_identity.clone(),
+        snapshot_contract_id: snapshot_contract_id.clone(),
+        snapshot_hash: snapshot_hash.clone(),
+    })
+}
+
 fn pipeline_smoke_task(mission: &PredictionResearchMissionV3) -> Result<String, String> {
     match (mission.task.kind, mission.task.prediction_horizon_secs) {
         (PredictionTaskKind::SettlementProbability, None) => Ok("settlement_probability".into()),
-        _ => Err("pipeline smoke Mission v3 task is not admitted".into()),
+        _ => Err("pipeline smoke Mission v4 task is not admitted".into()),
     }
 }
 
@@ -302,23 +333,33 @@ fn run_pipeline_smoke(
     mission_path: &Path,
     snapshot_dir: &Path,
     output_dir: &Path,
+    admitted: &PipelineSmokeAdmission,
 ) -> Result<PipelineSmokeSummary, String> {
     let bytes = fs::read(mission_path).map_err(|error| {
         format!(
-            "read pipeline smoke Mission v3 {}: {error}",
+            "read pipeline smoke Mission v4 {}: {error}",
             mission_path.display()
         )
     })?;
     let mission = match parse_prediction_mission_json(&bytes)? {
         ParsedPredictionMission::V3(mission) => mission,
-        ParsedPredictionMission::V2(_) => return Err("pipeline smoke requires Mission v3".into()),
+        ParsedPredictionMission::V2(_) => return Err("pipeline smoke requires Mission v4".into()),
     };
     validate_prediction_mission_v3(&mission)?;
     if mission.run_mode != PredictionRunMode::PipelineSmoke {
         return Err("pipeline smoke requires run_mode pipeline_smoke".into());
     }
     if mission.search_policy_snapshot_id != current_prediction_policy_snapshot_id() {
-        return Err("pipeline smoke Mission v3 has a stale evaluator policy identity".into());
+        return Err("pipeline smoke Mission v4 has a stale evaluator policy identity".into());
+    }
+    if mission.cohort_manifest_id != admitted.cohort_manifest_id
+        || mission.partition_digest != admitted.partition_digest
+        || mission.causal_projection_policy_id != admitted.policy_identity
+        || mission.snapshot_contract_id != admitted.snapshot_contract_id
+        || mission.snapshot_hash != admitted.snapshot_hash
+        || mission.search_policy_snapshot_id != admitted.policy_identity
+    {
+        return Err("pipeline smoke Mission does not match its admitted sealed identity".into());
     }
     let task = pipeline_smoke_task(&mission)?;
     let snapshot = load_research_snapshot(snapshot_dir)
@@ -329,8 +370,13 @@ fn run_pipeline_smoke(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "pipeline smoke snapshot is missing snapshot_hash".to_string())?;
-    if snapshot.manifest.snapshot_contract_hash.as_deref() != Some(&mission.snapshot_contract_id) {
-        return Err("pipeline smoke snapshot contract does not match Mission v3".into());
+    if snapshot.manifest.source_kind
+        != ploy_research::research_snapshot::POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        || snapshot.manifest.snapshot_contract_hash.as_deref()
+            != Some(&mission.snapshot_contract_id)
+        || snapshot_hash != admitted.snapshot_hash
+    {
+        return Err("pipeline smoke snapshot does not match Mission v4".into());
     }
     fs::create_dir_all(output_dir)
         .map_err(|error| format!("create pipeline smoke output directory: {error}"))?;
@@ -942,12 +988,17 @@ fn main() {
         println!("{}", research_brief_snapshot_id(&mission));
         return;
     }
-    if let [flag, mission_path, snapshot_dir, output_dir] = args.as_slice() {
+    if let [flag, mission_path, snapshot_dir, output_dir, admitted @ ..] = args.as_slice() {
         if flag == "--pipeline-smoke" {
+            let admitted = parse_pipeline_smoke_admission(admitted).unwrap_or_else(|reason| {
+                eprintln!("ERROR: {reason}");
+                std::process::exit(2);
+            });
             let summary = run_pipeline_smoke(
                 Path::new(mission_path),
                 Path::new(snapshot_dir),
                 Path::new(output_dir),
+                &admitted,
             )
             .unwrap_or_else(|reason| {
                 eprintln!("ERROR: {reason}");
@@ -1193,14 +1244,17 @@ mod tests {
     #[test]
     fn pipeline_smoke_task_rejects_unadmitted_execution_variants() {
         let base = serde_json::json!({
-            "schema_version": "prediction_research_mission.v3",
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "btc-5m-smoke",
             "product": {"symbol": "BTC", "event_horizon_secs": 300},
             "run_mode": "pipeline_smoke",
             "authority_profile": "polymarket_chainlink_baseline",
             "required_capabilities": ["polymarket_chainlink"],
             "cohort_manifest_id": format!("sha256:{}", "1".repeat(64)),
+            "partition_digest": format!("sha256:{}", "2".repeat(64)),
+            "causal_projection_policy_id": format!("sha256:{}", "3".repeat(64)),
             "snapshot_contract_id": format!("sha256:{}", "2".repeat(64)),
+            "snapshot_hash": "4".repeat(16),
             "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
             "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
         });
@@ -1216,5 +1270,31 @@ mod tests {
         up["task"] = serde_json::json!({"kind": "up_execution", "side": "up", "prediction_horizon_secs": 10});
         let up = serde_json::from_value::<PredictionResearchMissionV3>(up).unwrap();
         assert!(pipeline_smoke_task(&up).is_err());
+    }
+
+    #[test]
+    fn pipeline_smoke_requires_the_complete_admitted_identity() {
+        let args = [
+            "--admitted-cohort-manifest-id",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--admitted-partition-digest",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--admitted-policy-identity",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--admitted-snapshot-contract-id",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--admitted-snapshot-digest",
+            "0123456789abcdef",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            parse_pipeline_smoke_admission(&args)
+                .expect("complete identity")
+                .partition_digest,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(parse_pipeline_smoke_admission(&args[..8]).is_err());
     }
 }
