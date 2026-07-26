@@ -20,6 +20,10 @@ use ploy_market_data::polymarket_evidence::{
     verify_polymarket_evidence, PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor,
     VerifiedPolymarketEvidence, VerifiedPolymarketEvidenceSet,
 };
+use ploy_research::prediction_mission_v3::{
+    parse_prediction_mission_json, validate_prediction_mission_v3, ParsedPredictionMission,
+};
+use ploy_research::prediction_mission_v3::{PredictionMissionTask, PredictionTaskKind};
 use ploy_research::research_snapshot::{
     admit_cached_authenticated_research_snapshot, authenticate_ready_event_cohort,
     AuthenticatedSnapshotMaterializationRequest, ResearchSnapshotInputArtifact,
@@ -52,11 +56,11 @@ const VERIFIED_MODE_FORBIDDEN_FLAGS: [&str; 7] = [
     "--pm-book-archive-dir",
     "--skip-deribit",
 ];
-const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v1";
-const SNAPSHOT_ADMISSION_REQUEST_MAX_BYTES: u64 = 16 * 1024;
+const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v2";
+const SNAPSHOT_ADMISSION_REQUEST_MAX_BYTES: u64 = 32 * 1024;
 const BTC_5M_BACKTEST_CAPABILITY: &str = "btc_5m_backtest";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotAdmissionRequest {
     schema_version: String,
@@ -65,6 +69,11 @@ struct SnapshotAdmissionRequest {
     compiler_image_identity: String,
     build_input_identity: String,
     task_capability: String,
+    task: PredictionMissionTask,
+    cohort_partition_id: String,
+    mission_id: String,
+    snapshot_contract_id: String,
+    mission_json: String,
 }
 
 struct SnapshotAdmissionRoots {
@@ -102,6 +111,9 @@ fn snapshot_admission_protocol_response(
     if request.task_capability != BTC_5M_BACKTEST_CAPABILITY {
         return snapshot_admission_rejection("unsupported_task");
     }
+    if !is_supported_btc_5m_task(&request.task) {
+        return snapshot_admission_rejection("unsupported_task");
+    }
     for identity in [
         &request.compiler_source_identity,
         &request.compiler_image_identity,
@@ -111,6 +123,9 @@ fn snapshot_admission_protocol_response(
             return snapshot_admission_rejection("invalid_identity");
         }
     }
+    if !is_immutable_sha256_identity(&request.cohort_partition_id) {
+        return snapshot_admission_rejection("invalid_identity");
+    }
     let artifact = match read_catalog_partition_artifact(
         &roots.catalog_root,
         &request.catalog_partition_artifact,
@@ -119,6 +134,9 @@ fn snapshot_admission_protocol_response(
         Err(_) => return snapshot_admission_rejection("catalog_partition_unavailable"),
     };
     let partition_digest = artifact.partition().digest().to_string();
+    if request.cohort_partition_id != partition_digest {
+        return snapshot_admission_rejection("partition_mismatch");
+    }
     let policy_identity = artifact
         .partition()
         .causal_projection_policy_id()
@@ -127,6 +145,11 @@ fn snapshot_admission_protocol_response(
         Ok(cohort) => cohort,
         Err(rejection) => return snapshot_admission_rejection(rejection.code()),
     };
+    if let Err(rejection) =
+        validate_mission_admission_identity(&request, &policy_identity, cohort.manifest_id())
+    {
+        return snapshot_admission_rejection(rejection);
+    }
     let admission = admit_cached_authenticated_research_snapshot(
         &cohort,
         &AuthenticatedSnapshotMaterializationRequest {
@@ -145,10 +168,42 @@ fn snapshot_admission_protocol_response(
             "partition_digest": partition_digest,
             "policy_identity": policy_identity,
             "task_capability": BTC_5M_BACKTEST_CAPABILITY,
+            "task": request.task,
+            "cohort_partition_id": request.cohort_partition_id,
+            "cohort_manifest_id": cohort.manifest_id(),
             "immutable_image_identity": request.compiler_image_identity,
         }),
         Err(rejection) => snapshot_admission_rejection(rejection.code()),
     }
+}
+
+fn is_supported_btc_5m_task(task: &PredictionMissionTask) -> bool {
+    matches!(task.kind, PredictionTaskKind::SettlementProbability)
+        && task.side.is_none()
+        && task.prediction_horizon_secs.is_none()
+}
+
+fn validate_mission_admission_identity(
+    request: &SnapshotAdmissionRequest,
+    policy_identity: &str,
+    cohort_manifest_id: &str,
+) -> Result<(), &'static str> {
+    let ParsedPredictionMission::V3(mission) =
+        parse_prediction_mission_json(request.mission_json.as_bytes())
+            .map_err(|_| "invalid_mission")?
+    else {
+        return Err("invalid_mission");
+    };
+    validate_prediction_mission_v3(&mission).map_err(|_| "invalid_mission")?;
+    if mission.mission_id != request.mission_id
+        || mission.task != request.task
+        || mission.cohort_manifest_id != cohort_manifest_id
+        || mission.snapshot_contract_id != request.snapshot_contract_id
+        || mission.search_policy_snapshot_id != policy_identity
+    {
+        return Err("mission_mismatch");
+    }
+    Ok(())
 }
 
 fn snapshot_admission_protocol_from_reader(
@@ -756,10 +811,12 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::{parse_polymarket_verify_args, parse_verified_artifact_args, validated_data_audit};
     use chrono::{TimeZone, Utc};
+    use ploy_market_data::polymarket_evidence::PolymarketReadyEventCatalog;
+    use ploy_research::{write_catalog_partition_artifact, EventCohortPartition};
 
     fn admission_request() -> serde_json::Value {
         serde_json::json!({
-            "schema_version": "monday.prediction.snapshot_admission.v1",
+            "schema_version": "monday.prediction.snapshot_admission.v2",
             "catalog_partition_artifact": {
                 "path": "catalog/catalog-partition-deadbeef.json",
                 "artifact_sha256": format!("sha256:{}", "1".repeat(64)),
@@ -769,6 +826,11 @@ mod tests {
             "compiler_image_identity": format!("sha256:{}", "4".repeat(64)),
             "build_input_identity": format!("sha256:{}", "5".repeat(64)),
             "task_capability": "btc_5m_backtest",
+            "task": {"kind": "settlement_probability"},
+            "cohort_partition_id": format!("sha256:{}", "6".repeat(64)),
+            "mission_id": "btc-5m-mission-001",
+            "snapshot_contract_id": format!("sha256:{}", "7".repeat(64)),
+            "mission_json": "{}",
         })
     }
 
@@ -819,6 +881,35 @@ mod tests {
         assert_eq!(unsupported["status"], "rejected");
         assert_eq!(unsupported["rejection"], "unsupported_task");
 
+        let mut unsupported_kind = admission_request();
+        unsupported_kind["task"] = serde_json::json!({
+            "kind": "up_execution",
+            "side": "up",
+            "prediction_horizon_secs": 60,
+        });
+        let unsupported_kind = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&unsupported_kind)
+                .expect("serialize unsupported typed task")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(unsupported_kind["status"], "rejected");
+        assert_eq!(unsupported_kind["rejection"], "unsupported_task");
+
+        let mut invalid_task_shape = admission_request();
+        invalid_task_shape["task"] = serde_json::json!({
+            "kind": "settlement_probability",
+            "side": "up",
+        });
+        let invalid_task_shape = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&invalid_task_shape)
+                .expect("serialize invalid settlement task")
+                .as_slice(),
+            &roots,
+        );
+        assert_eq!(invalid_task_shape["status"], "rejected");
+        assert_eq!(invalid_task_shape["rejection"], "unsupported_task");
+
         let missing_partition = super::snapshot_admission_protocol_response(
             serde_json::to_vec(&admission_request())
                 .expect("serialize missing-partition request")
@@ -829,6 +920,99 @@ mod tests {
         assert_eq!(
             missing_partition["rejection"],
             "catalog_partition_unavailable"
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_protocol_rejects_a_verified_artifact_with_the_wrong_partition() {
+        let root = tempfile::tempdir().expect("create catalog root");
+        let catalog = PolymarketReadyEventCatalog::default();
+        let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000)
+            .expect("derive empty verified partition");
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("catalog"),
+            &catalog,
+            &partition,
+        )
+        .expect("write verified catalog partition artifact");
+        let mut request = admission_request();
+        request["catalog_partition_artifact"] =
+            serde_json::to_value(artifact).expect("serialize artifact reference");
+        request["cohort_partition_id"] = serde_json::json!(format!("sha256:{}", "9".repeat(64)));
+        let response = super::snapshot_admission_protocol_response(
+            serde_json::to_vec(&request)
+                .expect("serialize mismatched partition request")
+                .as_slice(),
+            &super::SnapshotAdmissionRoots {
+                catalog_root: root.path().to_path_buf(),
+                cache_root: root.path().join("cache"),
+            },
+        );
+        assert_eq!(response["status"], "rejected");
+        assert_eq!(response["rejection"], "partition_mismatch");
+    }
+
+    #[test]
+    fn mission_admission_identity_binds_distinct_partition_and_cohort_manifest_ids() {
+        let mut request = admission_request();
+        request["mission_json"] = serde_json::Value::String(
+            serde_json::json!({
+            "schema_version": "prediction_research_mission.v3",
+            "mission_id": "btc-5m-mission-001",
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "task": {"kind": "settlement_probability"},
+            "run_mode": "pipeline_smoke",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": format!("sha256:{}", "9".repeat(64)),
+            "snapshot_contract_id": format!("sha256:{}", "7".repeat(64)),
+            "search_policy_snapshot_id": format!("sha256:{}", "8".repeat(64)),
+            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 60},
+            })
+            .to_string(),
+        );
+        let request: super::SnapshotAdmissionRequest =
+            serde_json::from_value(request).expect("parse admission request");
+        let policy_identity = format!("sha256:{}", "8".repeat(64));
+        let cohort_manifest_id = format!("sha256:{}", "9".repeat(64));
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &request,
+                &policy_identity,
+                &cohort_manifest_id,
+            ),
+            Ok(())
+        );
+        let mut mismatched = serde_json::from_str::<serde_json::Value>(&request.mission_json)
+            .expect("parse mission");
+        mismatched["cohort_manifest_id"] = serde_json::json!(request.cohort_partition_id.clone());
+        let mut mismatched_request = request.clone();
+        mismatched_request.mission_json = mismatched.to_string();
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &mismatched_request,
+                &policy_identity,
+                &cohort_manifest_id,
+            ),
+            Err("mission_mismatch")
+        );
+        let mut task_mismatched = serde_json::from_str::<serde_json::Value>(&request.mission_json)
+            .expect("parse mission");
+        task_mismatched["task"] = serde_json::json!({
+            "kind": "up_execution",
+            "side": "up",
+            "prediction_horizon_secs": 10,
+        });
+        let mut task_mismatched_request = request;
+        task_mismatched_request.mission_json = task_mismatched.to_string();
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &task_mismatched_request,
+                &policy_identity,
+                &cohort_manifest_id,
+            ),
+            Err("mission_mismatch")
         );
     }
 
@@ -874,6 +1058,9 @@ mod tests {
             "partition_digest": format!("sha256:{}", "c".repeat(64)),
             "policy_identity": format!("sha256:{}", "d".repeat(64)),
             "task_capability": "btc_5m_backtest",
+            "task": {"kind": "settlement_probability"},
+            "cohort_partition_id": format!("sha256:{}", "c".repeat(64)),
+            "cohort_manifest_id": format!("sha256:{}", "b".repeat(64)),
             "immutable_image_identity": format!("sha256:{}", "e".repeat(64)),
         });
         let mut output = Vec::new();

@@ -3,9 +3,10 @@ use crate::{
         print_json, PredictionDispatchRenderArgs, PredictionDispatchStatusArgs,
         PredictionDispatchSubmitArgs,
     },
-    mission_runner::{configured_sibling_binary, normalized_sha256},
+    mission_runner::{configured_sibling_binary, fetch_to_file, normalized_sha256},
 };
 use anyhow::{bail, Context};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,10 +23,37 @@ use std::{
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
 const MAX_ADMISSION_RESPONSE_BYTES: u64 = 16 * 1024;
+const MAX_ADMISSION_REQUEST_BYTES: usize = 32 * 1024;
+const MAX_ADMISSION_MISSION_BYTES: u64 = 8 * 1024;
 const SNAPSHOT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_PROFILE: &str = "standard-v1";
 const ACTIVE_DEADLINE_SECONDS: u64 = 1800;
-const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v1";
+const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v2";
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MissionTaskKind {
+    SettlementProbability,
+    UpExecution,
+    DownExecution,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MissionTokenSide {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MissionTaskIdentity {
+    kind: MissionTaskKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    side: Option<MissionTokenSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prediction_horizon_secs: Option<u32>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +78,8 @@ struct PredictionSubmission {
     compiler_source_identity: String,
     build_input_identity: String,
     task_capability: String,
+    task: MissionTaskIdentity,
+    cohort_partition_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -68,6 +98,11 @@ struct SnapshotAdmissionRequest<'a> {
     compiler_image_identity: String,
     build_input_identity: &'a str,
     task_capability: &'a str,
+    task: &'a MissionTaskIdentity,
+    cohort_partition_id: &'a str,
+    mission_id: &'a str,
+    snapshot_contract_id: &'a str,
+    mission_json: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +115,9 @@ enum SnapshotAdmissionResponse {
         partition_digest: String,
         policy_identity: String,
         task_capability: String,
+        task: MissionTaskIdentity,
+        cohort_partition_id: String,
+        cohort_manifest_id: String,
         immutable_image_identity: String,
     },
     Rejected {
@@ -94,6 +132,9 @@ struct SnapshotAdmission {
     partition_digest: String,
     policy_identity: String,
     task_capability: String,
+    task: MissionTaskIdentity,
+    cohort_partition_id: String,
+    cohort_manifest_id: String,
     immutable_image_identity: String,
 }
 
@@ -505,6 +546,8 @@ fn validate_submission(submission: PredictionSubmission) -> anyhow::Result<Valid
     validate_identifier("mission id", &submission.mission_id)?;
     validate_identifier("evaluator version", &submission.evaluator_version)?;
     validate_task_capability(&submission.task_capability)?;
+    validate_admitted_task(&submission.task)?;
+    immutable_sha256_identity("cohort partition", &submission.cohort_partition_id)?;
     validate_dns_label("LLM secret name", &submission.llm_secret_name)?;
     if submission.resource_profile != RESOURCE_PROFILE {
         bail!("prediction resource profile must be {RESOURCE_PROFILE}");
@@ -568,6 +611,30 @@ fn admit_submission_with_timeout(
     sibling: &Path,
     timeout: Duration,
 ) -> anyhow::Result<AdmissionDecision> {
+    let deadline = Instant::now() + timeout;
+    let mission_json = read_verified_mission_for_admission(
+        &validated,
+        remaining_admission_time(deadline, "immutable Mission v3 fetch")?,
+    )?;
+    admit_submission_before_deadline(validated, sibling, deadline, &mission_json)
+}
+
+#[cfg(test)]
+fn admit_submission_with_timeout_and_mission(
+    validated: ValidatedSubmission,
+    sibling: &Path,
+    timeout: Duration,
+    mission_json: &str,
+) -> anyhow::Result<AdmissionDecision> {
+    admit_submission_before_deadline(validated, sibling, Instant::now() + timeout, mission_json)
+}
+
+fn admit_submission_before_deadline(
+    validated: ValidatedSubmission,
+    sibling: &Path,
+    deadline: Instant,
+    mission_json: &str,
+) -> anyhow::Result<AdmissionDecision> {
     let compiler_source_identity = immutable_sha256_identity(
         "compiler source identity",
         &validated.submission.compiler_source_identity,
@@ -604,8 +671,16 @@ fn admit_submission_with_timeout(
         compiler_image_identity: format!("sha256:{}", validated.image_digest),
         build_input_identity: &build_input_identity,
         task_capability: &validated.submission.task_capability,
+        task: &validated.submission.task,
+        cohort_partition_id: &validated.submission.cohort_partition_id,
+        mission_id: &validated.submission.mission_id,
+        snapshot_contract_id: &validated.submission.snapshot_contract_id,
+        mission_json,
     };
     let request = serde_json::to_vec(&request).context("serialize snapshot admission request")?;
+    if request.len() > MAX_ADMISSION_REQUEST_BYTES {
+        bail!("snapshot admission request exceeds {MAX_ADMISSION_REQUEST_BYTES} bytes");
+    }
     let mut child = Command::new(sibling)
         .arg("--admit-authenticated-snapshot")
         .stdin(Stdio::piped())
@@ -617,12 +692,35 @@ fn admit_submission_with_timeout(
         .stdin
         .take()
         .context("snapshot admission sibling stdin is unavailable")?;
-    if let Err(error) = stdin.write_all(&request) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).context("write snapshot admission request");
+    let (write_sender, write_receiver) = mpsc::sync_channel(1);
+    let writer = thread::spawn(move || {
+        let _ = write_sender.send(
+            stdin
+                .write_all(&request)
+                .context("write snapshot admission request"),
+        );
+    });
+    let write_result = match write_receiver.recv_timeout(remaining_admission_time(
+        deadline,
+        "snapshot admission sibling request",
+    )?) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            terminate_admission_child(&mut child);
+            bail!("snapshot admission sibling timed out before the admission deadline");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            terminate_admission_child(&mut child);
+            bail!("snapshot admission sibling request writer failed");
+        }
+    };
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("snapshot admission sibling request writer panicked"))?;
+    if let Err(error) = write_result {
+        terminate_admission_child(&mut child);
+        return Err(error);
     }
-    drop(stdin);
     let stdout = child
         .stdout
         .take()
@@ -631,14 +729,14 @@ fn admit_submission_with_timeout(
     let reader = thread::spawn(move || {
         let _ = sender.send(read_bounded_admission_response(stdout));
     });
-    let output = match receiver.recv_timeout(timeout) {
+    let output = match receiver.recv_timeout(remaining_admission_time(
+        deadline,
+        "snapshot admission sibling response",
+    )?) {
         Ok(output) => output,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             terminate_admission_child(&mut child);
-            bail!(
-                "snapshot admission sibling timed out after {} seconds",
-                timeout.as_secs()
-            );
+            bail!("snapshot admission sibling timed out before the admission deadline");
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             terminate_admission_child(&mut child);
@@ -648,7 +746,7 @@ fn admit_submission_with_timeout(
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("snapshot admission sibling response reader panicked"))?;
-    let status = wait_for_admission_child_exit(&mut child, timeout)?;
+    let status = wait_for_admission_child_exit_until(&mut child, deadline)?;
     let output = output?;
     if !status.success() {
         bail!("snapshot admission sibling exited unsuccessfully");
@@ -666,26 +764,54 @@ fn admit_submission_with_timeout(
     }
 }
 
+fn read_verified_mission_for_admission(
+    validated: &ValidatedSubmission,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let root = tempfile::tempdir().context("create bounded mission admission directory")?;
+    let mission_path = root.path().join("mission.json");
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("build mission admission client")?;
+    let (_, mission_sha256) = fetch_to_file(
+        &client,
+        &validated.submission.mission_url,
+        &mission_path,
+        MAX_ADMISSION_MISSION_BYTES,
+    )
+    .context("fetch bounded immutable Mission v3 for admission")?;
+    if mission_sha256 != validated.mission_sha256 {
+        bail!("prediction Mission v3 SHA256 mismatch before snapshot admission");
+    }
+    std::fs::read_to_string(&mission_path)
+        .context("Mission v3 must be valid UTF-8 JSON for snapshot admission")
+}
+
 fn terminate_admission_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
+#[cfg(test)]
 fn wait_for_admission_child_exit(
     child: &mut Child,
     timeout: Duration,
 ) -> anyhow::Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + timeout;
+    wait_for_admission_child_exit_until(child, Instant::now() + timeout)
+}
+
+fn wait_for_admission_child_exit_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> anyhow::Result<std::process::ExitStatus> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
                 terminate_admission_child(child);
-                bail!(
-                    "snapshot admission sibling did not exit within {} seconds after responding",
-                    timeout.as_secs()
-                );
+                bail!("snapshot admission sibling did not exit before the admission deadline");
             }
             Err(error) => {
                 terminate_admission_child(child);
@@ -693,6 +819,13 @@ fn wait_for_admission_child_exit(
             }
         }
     }
+}
+
+fn remaining_admission_time(deadline: Instant, phase: &str) -> anyhow::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("{phase} exhausted snapshot admission timeout"))
 }
 
 fn read_bounded_admission_response(mut reader: impl Read) -> anyhow::Result<Vec<u8>> {
@@ -743,10 +876,15 @@ fn parse_snapshot_admission_response(
             partition_digest,
             policy_identity,
             task_capability,
+            task,
+            cohort_partition_id,
+            cohort_manifest_id,
             immutable_image_identity,
         } => {
             if schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION
                 || task_capability != validated.submission.task_capability
+                || task != validated.submission.task
+                || cohort_partition_id != validated.submission.cohort_partition_id
                 || snapshot_contract_id != validated.submission.snapshot_contract_id
                 || immutable_image_identity != format!("sha256:{}", validated.image_digest)
                 || validate_snapshot_digest(&snapshot_digest).is_err()
@@ -765,6 +903,15 @@ fn parse_snapshot_admission_response(
                 )?,
                 policy_identity: immutable_sha256_identity("admitted policy", &policy_identity)?,
                 task_capability,
+                task,
+                cohort_partition_id: immutable_sha256_identity(
+                    "admitted cohort partition",
+                    &cohort_partition_id,
+                )?,
+                cohort_manifest_id: immutable_sha256_identity(
+                    "admitted cohort manifest",
+                    &cohort_manifest_id,
+                )?,
                 immutable_image_identity,
             }))
         }
@@ -832,8 +979,11 @@ fn render_validated_submission(
         "research.monday/snapshot-contract-id": admission.snapshot_contract_id,
         "research.monday/admitted-snapshot-digest": admission.snapshot_digest,
         "research.monday/partition-digest": admission.partition_digest,
+        "research.monday/cohort-partition-id": admission.cohort_partition_id,
+        "research.monday/cohort-manifest-id": admission.cohort_manifest_id,
         "research.monday/policy-identity": admission.policy_identity,
         "research.monday/task-capability": admission.task_capability,
+        "research.monday/task-kind": admitted_task_kind(&admission.task),
         "research.monday/admitted-image-identity": admission.immutable_image_identity,
         "research.monday/result-object": validated.result_object,
         "research.monday/result-identity-sha256": validated.result_identity_sha256,
@@ -1031,6 +1181,26 @@ fn validate_task_capability(value: &str) -> anyhow::Result<()> {
         bail!("task capability must be a lowercase safe identifier");
     }
     Ok(())
+}
+
+fn validate_admitted_task(task: &MissionTaskIdentity) -> anyhow::Result<()> {
+    if matches!(task.kind, MissionTaskKind::SettlementProbability)
+        && task.side.is_none()
+        && task.prediction_horizon_secs.is_none()
+    {
+        return Ok(());
+    }
+    bail!(
+        "btc_5m_backtest only admits settlement_probability without token side or prediction horizon"
+    )
+}
+
+fn admitted_task_kind(task: &MissionTaskIdentity) -> &'static str {
+    match task.kind {
+        MissionTaskKind::SettlementProbability => "settlement_probability",
+        MissionTaskKind::UpExecution => "up_execution",
+        MissionTaskKind::DownExecution => "down_execution",
+    }
 }
 
 fn validate_catalog_partition_artifact_path(value: &str) -> anyhow::Result<()> {
@@ -1366,7 +1536,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejected_sibling_admission_never_reaches_kubectl() {
+    fn invalid_submission_never_reaches_kubectl() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().expect("create dispatch test root");
@@ -1379,7 +1549,7 @@ mod tests {
                 "image": format!("registry/research-runner@sha256:{}", "a".repeat(64)),
                 "evaluator_version": format!("sha256:{}", "b".repeat(64)),
                 "resource_profile": RESOURCE_PROFILE,
-                "mission_url": "https://oss-internal/missions/mission.json?signature=x",
+                "mission_url": "not-an-https-url",
                 "mission_sha256": "c".repeat(64),
                 "snapshot_url": "https://oss-internal/snapshots/snapshot.zip?signature=x",
                 "snapshot_sha256": "d".repeat(64),
@@ -1394,6 +1564,8 @@ mod tests {
                 "compiler_source_identity": format!("sha256:{}", "1".repeat(64)),
                 "build_input_identity": format!("sha256:{}", "2".repeat(64)),
                 "task_capability": "btc_5m_backtest",
+                "task": {"kind": "settlement_probability"},
+                "cohort_partition_id": format!("sha256:{}", "e".repeat(64)),
             }))
             .expect("serialize submission"),
         )
@@ -1401,7 +1573,7 @@ mod tests {
         let sibling = root.path().join("monday-prediction-snapshot");
         std::fs::write(
             &sibling,
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"schema_version\":\"monday.prediction.snapshot_admission.v1\",\"status\":\"rejected\",\"rejection\":\"unsupported_task\"}'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"schema_version\":\"monday.prediction.snapshot_admission.v2\",\"status\":\"rejected\",\"rejection\":\"unsupported_task\"}'\n",
         )
         .expect("write sibling");
         std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
@@ -1416,7 +1588,7 @@ mod tests {
         std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700))
             .expect("make kubectl sentinel executable");
 
-        let error = submit_with_binaries(
+        let _error = submit_with_binaries(
             PredictionDispatchSubmitArgs {
                 submission,
                 context: "ack".to_owned(),
@@ -1427,10 +1599,9 @@ mod tests {
         )
         .expect_err("rejected admission must fail dispatch after reporting a typed result");
 
-        assert!(error.to_string().contains("unsupported_task"));
         assert!(
             !kubectl_log.exists(),
-            "rejection must occur before any Kubernetes read or write"
+            "invalid submission must fail before any Kubernetes read or write"
         );
     }
 
@@ -1445,6 +1616,9 @@ mod tests {
             "partition_digest": format!("sha256:{}", "e".repeat(64)),
             "policy_identity": format!("sha256:{}", "f".repeat(64)),
             "task_capability": "btc_5m_backtest",
+            "task": {"kind": "settlement_probability"},
+            "cohort_partition_id": format!("sha256:{}", "e".repeat(64)),
+            "cohort_manifest_id": format!("sha256:{}", "d".repeat(64)),
             "immutable_image_identity": format!("sha256:{}", "a".repeat(64)),
         }))
         .expect("serialize admitted response");
@@ -1483,7 +1657,27 @@ mod tests {
         let mut contract_mismatch =
             serde_json::to_vec(&contract_mismatch).expect("serialize contract mismatch");
         contract_mismatch.push(b'\n');
-        for output in [admitted, extra_output, invalid_digest, contract_mismatch] {
+        let mut task_mismatch =
+            serde_json::from_slice::<Value>(&admitted).expect("parse admitted response");
+        task_mismatch["task"] =
+            json!({"kind": "up_execution", "side": "up", "prediction_horizon_secs": 60});
+        let mut task_mismatch =
+            serde_json::to_vec(&task_mismatch).expect("serialize task mismatch");
+        task_mismatch.push(b'\n');
+        let mut partition_mismatch =
+            serde_json::from_slice::<Value>(&admitted).expect("parse admitted response");
+        partition_mismatch["cohort_partition_id"] = json!(format!("sha256:{}", "9".repeat(64)));
+        let mut partition_mismatch =
+            serde_json::to_vec(&partition_mismatch).expect("serialize partition mismatch");
+        partition_mismatch.push(b'\n');
+        for output in [
+            admitted,
+            extra_output,
+            invalid_digest,
+            contract_mismatch,
+            task_mismatch,
+            partition_mismatch,
+        ] {
             assert!(parse_snapshot_admission_response(&output, &validated).is_err());
         }
     }
@@ -1500,15 +1694,41 @@ mod tests {
         std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
             .expect("make stalled sibling executable");
 
-        let error = admit_submission_with_timeout(
+        let error = admit_submission_with_timeout_and_mission(
             validate_submission(valid_submission()).expect("valid submission"),
             &sibling,
             Duration::from_millis(100),
+            "{}",
         )
         .err()
         .expect("stalled sibling must time out");
 
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_request_write_timeout_kills_a_nonreading_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("create nonreading sibling root");
+        let sibling = root.path().join("monday-prediction-snapshot");
+        std::fs::write(&sibling, "#!/bin/sh\nsleep 1\n").expect("write nonreading sibling");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700))
+            .expect("make nonreading sibling executable");
+
+        let started = Instant::now();
+        let error = admit_submission_with_timeout_and_mission(
+            validate_submission(valid_submission()).expect("valid submission"),
+            &sibling,
+            Duration::from_millis(100),
+            &format!("\"{}\"", "x".repeat(24 * 1024)),
+        )
+        .err()
+        .expect("nonreading sibling must time out during request write");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[cfg(unix)]
@@ -1524,16 +1744,34 @@ mod tests {
             .expect("make descendant-stalling sibling executable");
 
         let started = Instant::now();
-        let error = admit_submission_with_timeout(
+        let error = admit_submission_with_timeout_and_mission(
             validate_submission(valid_submission()).expect("valid submission"),
             &sibling,
             Duration::from_millis(10),
+            "{}",
         )
         .err()
         .expect("inherited stdout must time out without joining its reader");
 
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn oversized_admission_request_is_rejected_before_spawning_a_sibling() {
+        let root = tempfile::tempdir().expect("create admission request root");
+        let result = admit_submission_with_timeout_and_mission(
+            validate_submission(valid_submission()).expect("valid submission"),
+            &root.path().join("missing-sibling"),
+            Duration::from_secs(1),
+            &"x".repeat(MAX_ADMISSION_REQUEST_BYTES),
+        );
+        let error = match result {
+            Ok(_) => panic!("oversized request must fail before spawning the sibling"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("request exceeds"));
     }
 
     #[cfg(unix)]
@@ -1676,6 +1914,12 @@ mod tests {
             compiler_source_identity: format!("sha256:{}", "1".repeat(64)),
             build_input_identity: format!("sha256:{}", "2".repeat(64)),
             task_capability: "btc_5m_backtest".to_owned(),
+            task: MissionTaskIdentity {
+                kind: MissionTaskKind::SettlementProbability,
+                side: None,
+                prediction_horizon_secs: None,
+            },
+            cohort_partition_id: format!("sha256:{}", "e".repeat(64)),
         }
     }
 
@@ -1688,6 +1932,13 @@ mod tests {
                 partition_digest: format!("sha256:{}", "e".repeat(64)),
                 policy_identity: format!("sha256:{}", "f".repeat(64)),
                 task_capability: "btc_5m_backtest".to_owned(),
+                task: MissionTaskIdentity {
+                    kind: MissionTaskKind::SettlementProbability,
+                    side: None,
+                    prediction_horizon_secs: None,
+                },
+                cohort_partition_id: format!("sha256:{}", "e".repeat(64)),
+                cohort_manifest_id: format!("sha256:{}", "d".repeat(64)),
                 immutable_image_identity: format!("sha256:{}", "a".repeat(64)),
             },
         }
