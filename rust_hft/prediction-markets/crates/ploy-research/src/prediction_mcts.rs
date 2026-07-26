@@ -79,7 +79,9 @@ impl PredictionMctsIdentity {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_admitted_mission(mission: &AdmittedPredictionMissionV3) -> Result<Self, String> {
+    pub(crate) fn from_admitted_mission(
+        mission: &AdmittedPredictionMissionV3,
+    ) -> Result<Self, String> {
         let task = match mission.task {
             AdmittedPredictionTask::SettlementProbability => {
                 PredictionMctsTask::SettlementProbability
