@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
@@ -318,6 +318,44 @@ pub(crate) fn verify_artifact(
         ));
     }
     Ok(path)
+}
+
+/// Read a verified content-addressed artifact without allowing an unbounded
+/// allocation from a caller-controlled file.
+pub(crate) fn read_verified_artifact_bounded(
+    output_root: &Path,
+    artifact: &ArtifactRef,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let path = artifact_path(output_root, artifact)?;
+    reject_symlink_components(output_root, &path)?;
+    let file = File::open(&path)
+        .map_err(|error| format!("open referenced evidence {}: {error}", path.display()))?;
+    let mut body = Vec::with_capacity(max_bytes.saturating_add(1).min(64 * 1024));
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(|error| format!("read referenced evidence {}: {error}", path.display()))?;
+    if body.len() > max_bytes {
+        return Err(format!(
+            "referenced evidence exceeds {max_bytes} bytes: {}",
+            path.display()
+        ));
+    }
+    let digest = sha256_hex(&body);
+    if digest != artifact.sha256 {
+        return Err(format!("evidence hash mismatch for {}", path.display()));
+    }
+    let file_name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !file_name.ends_with(&artifact.sha256) {
+        return Err(format!(
+            "evidence filename is not content-addressed: {}",
+            path.display()
+        ));
+    }
+    Ok(body)
 }
 
 fn reject_symlink_components(output_root: &Path, path: &Path) -> Result<(), String> {
