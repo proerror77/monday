@@ -942,7 +942,7 @@ jobs:
           npm run contracts:check --prefix ploy-frontend
           npm run lint --prefix ploy-frontend
           npm run build --prefix ploy-frontend
-          if rg -n -i 'rsc' ploy-frontend/src; then
+          if rg -n -i 'unstable_(RSC(HydratedRouter|StaticRouter|Payload)?|getRSCStream|createCallServer|routeRSCServerRequest|matchRSCServerRequest|reactRouterRSC)|@vitejs/plugin-rsc|react-server-dom' ploy-frontend; then
             echo "frontend must not use RSC APIs while GHSA-qwww-vcr4-c8h2 is excepted" >&2
             exit 1
           fi
