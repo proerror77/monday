@@ -7,6 +7,7 @@ use super::{
 use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +17,8 @@ const BTC_5M_SECS: i64 = 300;
 
 /// Immutable identity of the verifier that classified an evidence receipt.
 /// Paths and mutable version strings are deliberately not accepted as identities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolymarketCatalogVerifier {
     source_sha256: String,
     binary_sha256: String,
@@ -50,13 +52,13 @@ impl PolymarketCatalogVerifier {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketResearchTask {
     Btc5mBacktest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketCatalogReceiptState {
     Ready,
@@ -64,7 +66,7 @@ pub enum PolymarketCatalogReceiptState {
     Rejected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketCatalogReason {
     EvidenceVerificationFailed,
@@ -75,7 +77,8 @@ pub enum PolymarketCatalogReason {
     UnsupportedProduct,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolymarketEvidenceAvailability {
     pub contract: Option<DateTime<Utc>>,
     pub books: Option<DateTime<Utc>>,
@@ -214,6 +217,262 @@ impl PolymarketReadyEventCatalog {
 
     pub fn receipts(&self) -> impl Iterator<Item = &PolymarketCatalogReceipt> {
         self.receipts.values()
+    }
+
+    /// Restore only #319's authenticated Ready receipts. The caller supplies
+    /// JSON values so this module can retain control of the receipt identity
+    /// reconstruction and re-hash every persisted record before admission.
+    pub fn from_persisted_ready_receipts(receipts: Vec<Value>) -> Result<Self> {
+        let mut catalog = Self::default();
+        for value in receipts {
+            let persisted: PersistedReadyCatalogReceipt =
+                serde_json::from_value(value).map_err(|error| {
+                    anyhow::anyhow!("parse persisted ready catalog receipt: {error}")
+                })?;
+            let receipt = persisted.into_receipt()?;
+            let digest = receipt.receipt_sha256.clone();
+            ensure!(
+                !catalog.receipts.contains_key(&digest),
+                "persisted ready catalog contains duplicate receipt_sha256 {digest}"
+            );
+            ensure!(
+                !catalog
+                    .receipts
+                    .values()
+                    .any(|existing| existing.market_id == receipt.market_id),
+                "persisted ready catalog contains duplicate market_id {}",
+                receipt.market_id
+            );
+            catalog.receipts.insert(digest, receipt);
+        }
+        Ok(catalog)
+    }
+
+    /// Bound variable-length Ready receipt fields before a caller serializes an
+    /// artifact. This preserves the caller's fixed byte budget without first
+    /// allocating a canonical representation of unbounded producer text.
+    pub fn validate_ready_artifact_bounds(
+        &self,
+        max_entries: usize,
+        max_text_bytes: usize,
+    ) -> Result<()> {
+        let mut ready_count = 0_usize;
+        for receipt in self.receipts.values() {
+            if receipt.state != PolymarketCatalogReceiptState::Ready {
+                continue;
+            }
+            ready_count = ready_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Ready catalog count overflow"))?;
+            ensure!(
+                ready_count <= max_entries,
+                "ready-event catalog exceeds the bounded entry count"
+            );
+            for (field, value) in [
+                ("market_id", receipt.market_id.as_str()),
+                (
+                    "up_token_id",
+                    receipt.up_token_id.as_deref().unwrap_or_default(),
+                ),
+                (
+                    "down_token_id",
+                    receipt.down_token_id.as_deref().unwrap_or_default(),
+                ),
+            ] {
+                ensure!(
+                    value.len() <= max_text_bytes,
+                    "ready catalog {field} exceeds {max_text_bytes} bytes"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedReadyCatalogReceipt {
+    receipt_sha256: String,
+    market_id: String,
+    content_sha256: String,
+    manifest_sha256: String,
+    qualification_sha256: String,
+    success_sha256: Option<String>,
+    verifier: PolymarketCatalogVerifier,
+    event_start: Option<DateTime<Utc>>,
+    event_end: Option<DateTime<Utc>>,
+    up_token_id: Option<String>,
+    down_token_id: Option<String>,
+    sequence: Option<PersistedEvidenceSequence>,
+    coverage: Option<PersistedSurfaceCoverage>,
+    trade_completion: Option<PersistedTradeCompletion>,
+    availability: Option<PolymarketEvidenceAvailability>,
+    state: PolymarketCatalogReceiptState,
+    reasons: Vec<PolymarketCatalogReason>,
+    supported_tasks: Vec<PolymarketResearchTask>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedEvidenceSequence {
+    start: u64,
+    end: u64,
+    gaps: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedSurfaceCoverage {
+    up_book: u64,
+    down_book: u64,
+    trades: u64,
+    reference: u64,
+    settlement: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTradeCompletion {
+    trade_count: u64,
+    trade_record_ids_sha256: String,
+}
+
+impl PersistedReadyCatalogReceipt {
+    fn into_receipt(self) -> Result<PolymarketCatalogReceipt> {
+        ensure!(
+            self.state == PolymarketCatalogReceiptState::Ready,
+            "persisted catalog receipt {} is not Ready",
+            self.receipt_sha256
+        );
+        ensure!(
+            self.reasons.is_empty(),
+            "persisted Ready catalog receipt {} has rejection reasons",
+            self.receipt_sha256
+        );
+        ensure!(
+            self.supported_tasks == [PolymarketResearchTask::Btc5mBacktest],
+            "persisted Ready catalog receipt {} has unsupported tasks",
+            self.receipt_sha256
+        );
+        ensure!(!self.market_id.trim().is_empty() && self.market_id.trim() == self.market_id);
+        for (label, digest) in [
+            ("receipt", &self.receipt_sha256),
+            ("content", &self.content_sha256),
+            ("manifest", &self.manifest_sha256),
+            ("qualification", &self.qualification_sha256),
+        ] {
+            ensure!(is_sha256(digest), "persisted {label} digest is invalid");
+        }
+        let success_sha256 = self
+            .success_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing success_sha256"))?;
+        ensure!(
+            is_sha256(success_sha256),
+            "persisted success digest is invalid"
+        );
+        let verifier = PolymarketCatalogVerifier::new(
+            self.verifier.source_sha256,
+            self.verifier.binary_sha256,
+            self.verifier.configuration_sha256,
+            self.verifier.policy_sha256,
+        )?;
+        let event_start = self
+            .event_start
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing event_start"))?;
+        let event_end = self
+            .event_end
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing event_end"))?;
+        ensure!(
+            event_start < event_end,
+            "persisted Ready receipt has an invalid event window"
+        );
+        let up_token_id = self
+            .up_token_id
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing Up token"))?;
+        let down_token_id = self
+            .down_token_id
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing Down token"))?;
+        ensure!(
+            up_token_id != down_token_id,
+            "persisted Ready receipt has identical tokens"
+        );
+        let sequence = self
+            .sequence
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing sequence"))?;
+        ensure!(
+            sequence.start <= sequence.end && sequence.gaps == 0,
+            "persisted Ready receipt has invalid sequence"
+        );
+        let coverage = self
+            .coverage
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing coverage"))?;
+        ensure!(
+            coverage.up_book > 0
+                && coverage.down_book > 0
+                && coverage.trades > 0
+                && coverage.reference > 0
+                && coverage.settlement > 0,
+            "persisted Ready receipt has incomplete coverage"
+        );
+        let trade_completion = self.trade_completion.ok_or_else(|| {
+            anyhow::anyhow!("persisted Ready receipt is missing trade completion")
+        })?;
+        ensure!(
+            trade_completion.trade_count > 0
+                && is_sha256(&trade_completion.trade_record_ids_sha256),
+            "persisted Ready receipt has invalid trade completion"
+        );
+        let availability = self
+            .availability
+            .ok_or_else(|| anyhow::anyhow!("persisted Ready receipt is missing availability"))?;
+        let settlement = availability.settlement.ok_or_else(|| {
+            anyhow::anyhow!("persisted Ready receipt is missing settlement availability")
+        })?;
+        ensure!(
+            settlement >= event_end,
+            "persisted Ready receipt settlement predates event end"
+        );
+        let receipt = PolymarketCatalogReceipt {
+            receipt_sha256: self.receipt_sha256,
+            market_id: self.market_id,
+            content_sha256: self.content_sha256,
+            manifest_sha256: self.manifest_sha256,
+            qualification_sha256: self.qualification_sha256,
+            success_sha256: self.success_sha256,
+            verifier,
+            event_start: Some(event_start),
+            event_end: Some(event_end),
+            up_token_id: Some(up_token_id),
+            down_token_id: Some(down_token_id),
+            sequence: Some(PolymarketEvidenceSequence {
+                start: sequence.start,
+                end: sequence.end,
+                gaps: sequence.gaps,
+            }),
+            coverage: Some(PolymarketCandidateSurfaceCoverage {
+                up_book: coverage.up_book,
+                down_book: coverage.down_book,
+                trades: coverage.trades,
+                reference: coverage.reference,
+                settlement: coverage.settlement,
+            }),
+            trade_completion: Some(PolymarketEvidenceTradeCompletion {
+                trade_count: trade_completion.trade_count,
+                trade_record_ids_sha256: trade_completion.trade_record_ids_sha256,
+            }),
+            availability: Some(availability),
+            state: self.state,
+            reasons: self.reasons,
+            supported_tasks: self.supported_tasks,
+        };
+        ensure!(
+            receipt_digest(&receipt)? == receipt.receipt_sha256,
+            "persisted Ready receipt digest does not match its canonical content"
+        );
+        Ok(receipt)
     }
 }
 
@@ -878,5 +1137,80 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn persisted_ready_catalog_rejects_non_ready_extra_and_rehashed_receipts() {
+        let rows = verified_tests::valid_rows();
+        let (_temp, triplet) = verified_tests::candidate_triplet(&rows);
+        let ready_path = triplet
+            .data
+            .parent()
+            .unwrap()
+            .join("qualification-ready.json");
+        let ready_anchor = qualification(&ready_path, &triplet, "BTCUSDT", "up-token");
+        let mut catalog = PolymarketReadyEventCatalog::default();
+        catalog
+            .verify_and_append(
+                "market-1",
+                &triplet,
+                &tests::trust(&triplet),
+                &ready_path,
+                &ready_anchor,
+                PolymarketCatalogVerifier::new(
+                    "d".repeat(64),
+                    "e".repeat(64),
+                    "f".repeat(64),
+                    "a".repeat(64),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let receipt = serde_json::to_value(catalog.receipts().next().unwrap()).unwrap();
+        assert_eq!(
+            PolymarketReadyEventCatalog::from_persisted_ready_receipts(vec![receipt.clone()])
+                .unwrap()
+                .receipts()
+                .count(),
+            1
+        );
+
+        let mut non_ready = receipt.clone();
+        non_ready["state"] = json!("partial");
+        assert!(
+            PolymarketReadyEventCatalog::from_persisted_ready_receipts(vec![non_ready])
+                .expect_err("non-Ready receipts cannot enter persisted ready catalog")
+                .to_string()
+                .contains("not Ready")
+        );
+
+        let mut extra = receipt.clone();
+        extra["unexpected"] = json!(true);
+        assert!(
+            PolymarketReadyEventCatalog::from_persisted_ready_receipts(vec![extra])
+                .expect_err("extra receipt fields must fail closed")
+                .to_string()
+                .contains("unknown field")
+        );
+
+        let mut rehashed = receipt;
+        rehashed["market_id"] = json!("market-rewritten");
+        assert!(
+            PolymarketReadyEventCatalog::from_persisted_ready_receipts(vec![rehashed])
+                .expect_err("receipt content cannot move behind a fixed receipt identity")
+                .to_string()
+                .contains("digest does not match")
+        );
+
+        let mut oversized_receipt = catalog.receipts().next().unwrap().clone();
+        oversized_receipt.market_id = "x".repeat(33);
+        oversized_receipt.receipt_sha256 = receipt_digest(&oversized_receipt).unwrap();
+        let mut oversized_catalog = PolymarketReadyEventCatalog::default();
+        oversized_catalog.append(oversized_receipt).unwrap();
+        assert!(oversized_catalog
+            .validate_ready_artifact_bounds(1, 32)
+            .expect_err("artifact serialization must reject oversized producer text")
+            .to_string()
+            .contains("market_id exceeds"));
     }
 }

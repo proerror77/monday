@@ -54,7 +54,9 @@ pub use deribit::{
     DeribitFeatureLoadResult,
 };
 pub use event_cohort_partition::{
-    EventCohortPartition, EventCohortReadyEntry, EVENT_COHORT_PARTITION_VERSION,
+    read_catalog_partition_artifact, write_catalog_partition_artifact, CatalogPartitionArtifactRef,
+    EventCohortPartition, EventCohortReadyEntry, ValidatedCatalogPartitionArtifact,
+    CATALOG_PARTITION_ARTIFACT_VERSION, EVENT_COHORT_PARTITION_VERSION,
 };
 pub use event_ml::{
     build_event_ml_strategy_handoff, build_walk_forward_report, canonical_event_ml_architecture,

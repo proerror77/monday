@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
@@ -193,6 +193,7 @@ fn write_content_addressed(
     extension: &str,
     body: &[u8],
 ) -> Result<ArtifactRef, String> {
+    validate_artifact_write_directory(output_root, directory)?;
     create_dir_all_durable(directory, "evidence")?;
     reject_symlink_components(output_root, directory)?;
     let digest = sha256_hex(body);
@@ -244,6 +245,52 @@ fn write_content_addressed(
         path: relative_path(output_root, &path)?,
         sha256: digest,
     })
+}
+
+fn validate_artifact_write_directory(output_root: &Path, directory: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(output_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "evidence root must not be a symlink: {}",
+                output_root.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect evidence root {}: {error}",
+                output_root.display()
+            ));
+        }
+    }
+    let relative = directory
+        .strip_prefix(output_root)
+        .map_err(|_| format!("artifact path {} escapes output root", directory.display()))?;
+    let mut current = output_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(format!("unsafe artifact path {}", directory.display()));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "evidence path contains symlink component {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect evidence path {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -320,6 +367,44 @@ pub(crate) fn verify_artifact(
     Ok(path)
 }
 
+/// Read a verified content-addressed artifact without allowing an unbounded
+/// allocation from a caller-controlled file.
+pub(crate) fn read_verified_artifact_bounded(
+    output_root: &Path,
+    artifact: &ArtifactRef,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let path = artifact_path(output_root, artifact)?;
+    reject_symlink_components(output_root, &path)?;
+    let file = File::open(&path)
+        .map_err(|error| format!("open referenced evidence {}: {error}", path.display()))?;
+    let mut body = Vec::with_capacity(max_bytes.saturating_add(1).min(64 * 1024));
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(|error| format!("read referenced evidence {}: {error}", path.display()))?;
+    if body.len() > max_bytes {
+        return Err(format!(
+            "referenced evidence exceeds {max_bytes} bytes: {}",
+            path.display()
+        ));
+    }
+    let digest = sha256_hex(&body);
+    if digest != artifact.sha256 {
+        return Err(format!("evidence hash mismatch for {}", path.display()));
+    }
+    let file_name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !file_name.ends_with(&artifact.sha256) {
+        return Err(format!(
+            "evidence filename is not content-addressed: {}",
+            path.display()
+        ));
+    }
+    Ok(body)
+}
+
 fn reject_symlink_components(output_root: &Path, path: &Path) -> Result<(), String> {
     let root_metadata = fs::symlink_metadata(output_root)
         .map_err(|error| format!("inspect evidence root {}: {error}", output_root.display()))?;
@@ -389,6 +474,23 @@ pub(crate) fn next_attempt_dir(parent: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_addressed_writer_rejects_parent_directory_escape_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let output_root = root.path().join("output");
+        let escaped_directory = output_root.join("inside/../../escaped");
+
+        assert!(write_content_addressed_json(
+            &output_root,
+            &escaped_directory,
+            "record",
+            &serde_json::json!({"a": 1}),
+        )
+        .expect_err("a writer directory must not escape its output root")
+        .contains("unsafe artifact path"));
+        assert!(!escaped_directory.exists());
+    }
 
     #[test]
     fn content_addressed_artifact_rejects_tampering_and_escape() {
