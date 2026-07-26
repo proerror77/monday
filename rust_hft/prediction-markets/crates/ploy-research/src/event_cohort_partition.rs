@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 
 use ploy_market_data::polymarket_evidence::{
     PolymarketCatalogReceipt, PolymarketCatalogReceiptState, PolymarketReadyEventCatalog,
-    PolymarketResearchTask,
 };
 use serde::Serialize;
 
@@ -47,7 +46,9 @@ impl EventCohortPartition {
         common_time_boundary_ms: i64,
     ) -> Result<Self, String> {
         Self::from_ready_entries(
-            catalog.ready_for(PolymarketResearchTask::Btc5mBacktest),
+            catalog
+                .receipts()
+                .filter(|receipt| receipt.state == PolymarketCatalogReceiptState::Ready),
             common_time_boundary_ms,
         )
     }
@@ -283,10 +284,12 @@ mod tests {
         let changed_window = ready_receipt('a', "first", 100, 998);
         let changed_path =
             EventCohortPartition::from_ready_entries([&changed_window, &second], 1_000).unwrap();
+        let missing_member = EventCohortPartition::from_ready_entries([&first], 1_000).unwrap();
 
         assert_ne!(partition.digest(), reordered.digest());
         assert_ne!(partition.digest(), changed_identity.digest());
         assert_ne!(partition.digest(), changed_path.digest());
+        assert_ne!(partition.digest(), missing_member.digest());
     }
 
     #[test]
@@ -327,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn public_catalog_seam_uses_the_complete_authenticated_ready_projection() {
+    fn public_catalog_seam_is_task_agnostic_and_uses_the_complete_ready_projection() {
         let catalog = PolymarketReadyEventCatalog::default();
 
         let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000).unwrap();
