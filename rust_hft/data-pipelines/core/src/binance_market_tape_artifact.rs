@@ -201,10 +201,30 @@ pub fn verify_binance_market_tape_with_required_trade_and_lob_summaries(
     verify_binance_market_tape_with_requirements(sealed, true, true)
 }
 
+pub fn verify_binance_market_tape_for_strict_gate(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+) -> Result<()> {
+    verify_binance_market_tape_with_requirements_and_surfaces(sealed, true, true, false).map(|_| ())
+}
+
 fn verify_binance_market_tape_with_requirements(
+    sealed: Vec<SealedBinanceMarketTapeTriplet>,
+    require_trade_summaries: bool,
+    require_lob_continuity: bool,
+) -> Result<VerifiedBinanceMarketTape> {
+    verify_binance_market_tape_with_requirements_and_surfaces(
+        sealed,
+        require_trade_summaries,
+        require_lob_continuity,
+        true,
+    )
+}
+
+fn verify_binance_market_tape_with_requirements_and_surfaces(
     mut sealed: Vec<SealedBinanceMarketTapeTriplet>,
     require_trade_summaries: bool,
     require_lob_continuity: bool,
+    collect_surfaces: bool,
 ) -> Result<VerifiedBinanceMarketTape> {
     if sealed.is_empty() {
         bail!("market-tape segment set is empty");
@@ -238,10 +258,14 @@ fn verify_binance_market_tape_with_requirements(
     let mut identities = Vec::with_capacity(sealed.len());
     let mut aggregate_trades = Vec::new();
     let mut lob_observations = Vec::new();
-    let mut replayed_events = symbols
-        .iter()
-        .map(|symbol| (symbol.clone(), Vec::new()))
-        .collect::<BTreeMap<_, _>>();
+    let mut replayed_events: BTreeMap<String, Vec<ReplayedBinanceBookEvent>> = if collect_surfaces {
+        symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), Vec::new()))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut session_id = None;
     let mut depth_receive_clocks = symbols
         .iter()
@@ -325,12 +349,14 @@ fn verify_binance_market_tape_with_requirements(
                         raw,
                         received_at_ns,
                     )?;
-                    record_replay_events(&mut replayed_events, &clock.symbol, events)?;
-                    lob_observations.push(VerifiedBinanceLobObservation {
-                        symbol: clock.symbol,
-                        source_time_ms: clock.event_time_ms,
-                        received_at_ns: clock.received_at_ns,
-                    });
+                    if collect_surfaces {
+                        record_replay_events(&mut replayed_events, &clock.symbol, events)?;
+                        lob_observations.push(VerifiedBinanceLobObservation {
+                            symbol: clock.symbol,
+                            source_time_ms: clock.event_time_ms,
+                            received_at_ns: clock.received_at_ns,
+                        });
+                    }
                 }
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
@@ -372,12 +398,14 @@ fn verify_binance_market_tape_with_requirements(
                     } else {
                         observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?
                     };
-                    record_replay_events(&mut replayed_events, &symbol, events)?;
-                    if event_type == "checkpoint" {
-                        replayed_events
-                            .get_mut(&symbol)
-                            .context("market-tape replay event symbol is undeclared")?
-                            .push(ReplayedBinanceBookEvent::Checkpoint { received_at_ns });
+                    if collect_surfaces {
+                        record_replay_events(&mut replayed_events, &symbol, events)?;
+                        if event_type == "checkpoint" {
+                            replayed_events
+                                .get_mut(&symbol)
+                                .context("market-tape replay event symbol is undeclared")?
+                                .push(ReplayedBinanceBookEvent::Checkpoint { received_at_ns });
+                        }
                     }
                 }
                 "agg_trade" => {
@@ -390,7 +418,9 @@ fn verify_binance_market_tape_with_requirements(
                     )?;
                     aggregate_sequence.observe(&trade)?;
                     trade_summaries.observe(&trade)?;
-                    aggregate_trades.push(trade);
+                    if collect_surfaces {
+                        aggregate_trades.push(trade);
+                    }
                 }
                 "session_start" => {
                     if required_string(raw, "market")? != market.as_str() {
@@ -476,7 +506,7 @@ fn verify_binance_market_tape_with_requirements(
             bail!("verified market-tape is missing aggregate trades for a declared symbol");
         }
     }
-    let mut replayed_books = Vec::with_capacity(replay.len());
+    let mut replayed_books = Vec::with_capacity(if collect_surfaces { replay.len() } else { 0 });
     for (symbol, validator) in replay {
         validator.finish()?;
         let book = validator.book_snapshot()?;
@@ -490,14 +520,16 @@ fn verify_binance_market_tape_with_requirements(
                 bail!("verified market-tape contains a non-positive replayed book level");
             }
         }
-        let events = replayed_events
-            .remove(&symbol)
-            .context("verified market-tape is missing replay events for a declared symbol")?;
-        replayed_books.push(ReplayedBinanceBook {
-            symbol,
-            book,
-            events,
-        });
+        if collect_surfaces {
+            let events = replayed_events
+                .remove(&symbol)
+                .context("verified market-tape is missing replay events for a declared symbol")?;
+            replayed_books.push(ReplayedBinanceBook {
+                symbol,
+                book,
+                events,
+            });
+        }
     }
     Ok(VerifiedBinanceMarketTape {
         segments: identities,
@@ -1669,5 +1701,17 @@ mod tests {
                 ReplayedBinanceBookEvent::Checkpoint { .. },
             ]
         ));
+    }
+
+    #[test]
+    fn strict_gate_verifier_accepts_complete_v1_without_collecting_surfaces() {
+        let root = tempdir();
+        let rows = with_stream_coverage(valid_rows(), &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let _ = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let lob_anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &lob_anchor).unwrap();
+
+        verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
     }
 }

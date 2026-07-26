@@ -6,7 +6,7 @@ use data::binance_market_tape::{
 };
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet,
-    verify_binance_market_tape_with_required_trade_and_lob_summaries,
+    verify_binance_market_tape_for_strict_gate,
     verify_binance_market_tape_with_required_trade_summaries, BinanceMarketTapeTriplet,
     BinanceMarketTapeTrustAnchor,
 };
@@ -763,14 +763,15 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    let verified = if args.require_lob_continuity {
-        verify_binance_market_tape_with_required_trade_and_lob_summaries(sealed)?
+    let verified_segment_count = sealed.len();
+    if args.require_lob_continuity {
+        verify_binance_market_tape_for_strict_gate(sealed)?;
     } else {
-        verify_binance_market_tape_with_required_trade_summaries(sealed)?
-    };
+        verify_binance_market_tape_with_required_trade_summaries(sealed)?;
+    }
     println!(
         "strict market-tape verification: ok ({} segments)",
-        verified.segments().len()
+        verified_segment_count
     );
     Ok(())
 }
