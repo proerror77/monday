@@ -150,22 +150,25 @@ fn snapshot_admission_protocol_response(
         Ok(cohort) => cohort,
         Err(rejection) => return snapshot_admission_rejection(rejection.code()),
     };
-    if let Err(rejection) =
-        validate_mission_admission_identity(&request, &policy_identity, cohort.manifest_id())
-    {
-        return snapshot_admission_rejection(rejection);
-    }
     let admission = admit_cached_authenticated_research_snapshot(
         &cohort,
         &AuthenticatedSnapshotMaterializationRequest {
             cache_root: roots.cache_root.clone(),
-            compiler_source_identity: request.compiler_source_identity,
+            compiler_source_identity: request.compiler_source_identity.clone(),
             compiler_image_identity: request.compiler_image_identity.clone(),
-            build_input_identity: request.build_input_identity,
+            build_input_identity: request.build_input_identity.clone(),
         },
     );
     match admission {
         Ok(snapshot) if is_supported_snapshot_authority(snapshot.source_kind()) => {
+            if let Err(rejection) = validate_mission_admission_identity(
+                &request,
+                &policy_identity,
+                cohort.manifest_id(),
+                snapshot.snapshot_hash(),
+            ) {
+                return snapshot_admission_rejection(rejection);
+            }
             serde_json::json!({
                 "schema_version": SNAPSHOT_ADMISSION_SCHEMA_VERSION,
                 "status": "admitted",
@@ -199,6 +202,7 @@ fn validate_mission_admission_identity(
     request: &SnapshotAdmissionRequest,
     policy_identity: &str,
     cohort_manifest_id: &str,
+    snapshot_hash: &str,
 ) -> Result<(), &'static str> {
     let ParsedPredictionMission::V3(mission) =
         parse_prediction_mission_json(request.mission_json.as_bytes())
@@ -219,7 +223,10 @@ fn validate_mission_admission_identity(
     if mission.mission_id != request.mission_id
         || mission.task != request.task
         || mission.cohort_manifest_id != cohort_manifest_id
+        || mission.partition_digest != request.cohort_partition_id
+        || mission.causal_projection_policy_id != policy_identity
         || mission.snapshot_contract_id != request.snapshot_contract_id
+        || mission.snapshot_hash != snapshot_hash
         || mission.search_policy_snapshot_id != policy_identity
     {
         return Err("mission_mismatch");
@@ -997,7 +1004,10 @@ mod tests {
             "authority_profile": "polymarket_chainlink_baseline",
             "required_capabilities": ["polymarket_chainlink"],
             "cohort_manifest_id": format!("sha256:{}", "9".repeat(64)),
+            "partition_digest": request["cohort_partition_id"].clone(),
+            "causal_projection_policy_id": format!("sha256:{}", "8".repeat(64)),
             "snapshot_contract_id": format!("sha256:{}", "7".repeat(64)),
+            "snapshot_hash": "0".repeat(16),
             "search_policy_snapshot_id": format!("sha256:{}", "8".repeat(64)),
             "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 60},
             })
@@ -1007,11 +1017,13 @@ mod tests {
             serde_json::from_value(request).expect("parse admission request");
         let policy_identity = format!("sha256:{}", "8".repeat(64));
         let cohort_manifest_id = format!("sha256:{}", "9".repeat(64));
+        let snapshot_hash = "0".repeat(16);
         assert_eq!(
             super::validate_mission_admission_identity(
                 &request,
                 &policy_identity,
                 &cohort_manifest_id,
+                &snapshot_hash,
             ),
             Ok(())
         );
@@ -1025,6 +1037,22 @@ mod tests {
                 &mismatched_request,
                 &policy_identity,
                 &cohort_manifest_id,
+                &snapshot_hash,
+            ),
+            Err("mission_mismatch")
+        );
+        let mut snapshot_mismatched =
+            serde_json::from_str::<serde_json::Value>(&request.mission_json)
+                .expect("parse mission");
+        snapshot_mismatched["snapshot_hash"] = serde_json::json!("1".repeat(16));
+        let mut snapshot_mismatched_request = request.clone();
+        snapshot_mismatched_request.mission_json = snapshot_mismatched.to_string();
+        assert_eq!(
+            super::validate_mission_admission_identity(
+                &snapshot_mismatched_request,
+                &policy_identity,
+                &cohort_manifest_id,
+                &snapshot_hash,
             ),
             Err("mission_mismatch")
         );
@@ -1042,6 +1070,7 @@ mod tests {
                 &task_mismatched_request,
                 &policy_identity,
                 &cohort_manifest_id,
+                &snapshot_hash,
             ),
             Err("mission_mismatch")
         );
@@ -1056,6 +1085,7 @@ mod tests {
                 &research_trial_request,
                 &policy_identity,
                 &cohort_manifest_id,
+                &snapshot_hash,
             ),
             Err("unsupported_run_mode")
         );
@@ -1072,6 +1102,7 @@ mod tests {
                 &binance_request,
                 &policy_identity,
                 &cohort_manifest_id,
+                &snapshot_hash,
             ),
             Err("authority_mismatch")
         );

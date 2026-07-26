@@ -240,6 +240,8 @@ pub struct AuthenticatedSnapshotMaterializationRequest {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedResearchSnapshot {
     cohort_manifest_id: String,
+    partition_digest: String,
+    causal_projection_policy_id: String,
     snapshot_contract_id: String,
     snapshot_hash: String,
     source_kind: String,
@@ -249,6 +251,14 @@ pub struct AuthenticatedResearchSnapshot {
 impl AuthenticatedResearchSnapshot {
     pub fn cohort_manifest_id(&self) -> &str {
         &self.cohort_manifest_id
+    }
+
+    pub fn partition_digest(&self) -> &str {
+        &self.partition_digest
+    }
+
+    pub fn causal_projection_policy_id(&self) -> &str {
+        &self.causal_projection_policy_id
     }
 
     pub fn snapshot_contract_id(&self) -> &str {
@@ -1089,6 +1099,8 @@ fn admitted_snapshot(
     })?;
     Ok(AuthenticatedResearchSnapshot {
         cohort_manifest_id: cohort.manifest_id.clone(),
+        partition_digest: cohort.partition_digest.clone(),
+        causal_projection_policy_id: cohort.causal_projection_policy_id.clone(),
         snapshot_contract_id,
         snapshot_hash,
         source_kind: snapshot.manifest.source_kind.clone(),
@@ -3699,6 +3711,8 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::ResearchPmBookLevel;
 
@@ -5106,5 +5120,80 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains(".staging-")));
+    }
+
+    #[test]
+    fn sealed_snapshot_v3_handoff_rejects_partition_and_authority_drift() {
+        use crate::prediction_loop::PredictionSearchBudget;
+        use crate::prediction_mission_v3::{
+            admit_prediction_mission_v3, authenticate_prediction_mission_v3_inputs,
+            PredictionAuthorityProfile, PredictionMissionCapability, PredictionMissionTask,
+            PredictionProductIdentity, PredictionProductSymbol, PredictionResearchMissionV3,
+            PredictionRunMode, PredictionTaskKind,
+        };
+
+        let cache = tempfile::tempdir().expect("cache root");
+        let mut cohort = authenticated_test_cohort();
+        cohort.causal_projection_policy_id =
+            crate::prediction_loop::current_prediction_policy_snapshot_id();
+        let request = authenticated_test_request(cache.path().to_path_buf());
+        let snapshot = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("sealed snapshot handle");
+        let mission = PredictionResearchMissionV3 {
+            schema_version: "prediction_research_mission.v3".to_string(),
+            mission_id: "sealed-snapshot-handoff".to_string(),
+            product: PredictionProductIdentity {
+                symbol: PredictionProductSymbol::Btc,
+                event_horizon_secs: 300,
+            },
+            task: PredictionMissionTask {
+                kind: PredictionTaskKind::SettlementProbability,
+                side: None,
+                prediction_horizon_secs: None,
+            },
+            run_mode: PredictionRunMode::ResearchTrial,
+            authority_profile: PredictionAuthorityProfile::PolymarketChainlinkBaseline,
+            required_capabilities: BTreeSet::from([
+                PredictionMissionCapability::PolymarketChainlink,
+            ]),
+            cohort_manifest_id: snapshot.cohort_manifest_id().to_string(),
+            partition_digest: cohort.partition_digest.clone(),
+            causal_projection_policy_id: cohort.causal_projection_policy_id.clone(),
+            snapshot_contract_id: snapshot.snapshot_contract_id().to_string(),
+            snapshot_hash: snapshot.snapshot_hash().to_string(),
+            search_policy_snapshot_id: cohort.causal_projection_policy_id.clone(),
+            search_budget: PredictionSearchBudget {
+                max_candidates: 0,
+                max_llm_calls: 0,
+                max_seconds: 1,
+            },
+        };
+        let authenticated = authenticate_prediction_mission_v3_inputs(&snapshot, &mission)
+            .expect("sealed snapshot binds Mission v3 identities");
+        admit_prediction_mission_v3(&mission, &authenticated, None)
+            .expect("matching Mission v3 is admitted");
+
+        let mut forged_partition = mission.clone();
+        forged_partition.partition_digest = format!("sha256:{}", "9".repeat(64));
+        assert!(
+            admit_prediction_mission_v3(&forged_partition, &authenticated, None)
+                .expect_err("forged partition must not reach an evaluator")
+                .contains("partition")
+        );
+
+        let mut incompatible_authority = mission;
+        incompatible_authority.authority_profile =
+            PredictionAuthorityProfile::PolymarketChainlinkBinance;
+        incompatible_authority.required_capabilities = BTreeSet::from([
+            PredictionMissionCapability::PolymarketChainlink,
+            PredictionMissionCapability::BinanceContext,
+        ]);
+        assert!(
+            authenticate_prediction_mission_v3_inputs(&snapshot, &incompatible_authority)
+                .expect_err("baseline source must not authorize Binance context")
+                .contains("source")
+        );
     }
 }
