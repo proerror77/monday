@@ -1375,20 +1375,35 @@ done
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
-  target_markets:120,state_recovery_markets:106,
+  target_markets:120,
   missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
   trade_poll_budget:112,trade_poll_concurrency:4,trade_request_spacing_ms:100,
-  market_detail_budget:4,market_detail_eligible:3,market_detail_priority:2,
-  market_detail_selected:3,market_detail_deferred:0,market_detail_priority_deferred:0,
-  trade_poll_budget_after_market_details:109,
-  eligible_trade_markets:112,priority_trade_markets:8,
-  selected_trade_markets:109,deferred_trade_markets:3,priority_trade_backlog:0,
-  trade_polls:109,successful_trade_polls:109,
+  priority_trade_markets_before_market_details:108,
+  market_detail_budget:2,market_detail_eligible:3,market_detail_priority:2,
+  market_detail_selected:2,market_detail_deferred:1,market_detail_priority_deferred:0,
+  trade_poll_budget_after_market_details:110,
+  eligible_trade_markets:112,priority_trade_markets:110,
+  selected_trade_markets:110,deferred_trade_markets:2,priority_trade_backlog:0,
+  trade_polls:110,successful_trade_polls:110,
   truncated_trade_markets:[],non_object_trade_markets:[],invalid_settlement_markets:[],
   invalid_end_time_markets:[],stale_trade_markets:[],stale_settlement_markets:[],
   overdue_unresolved_markets:[]
 }' >"$tmp_dir/rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/rust-health.json" >/dev/null
+jq '
+  .priority_trade_markets_before_market_details = 112
+  | .market_detail_budget = 0
+  | .market_detail_selected = 0
+  | .market_detail_deferred = 3
+  | .market_detail_priority_deferred = 2
+  | .trade_poll_budget_after_market_details = 112
+  | .priority_trade_markets = 112
+  | .selected_trade_markets = 112
+  | .deferred_trade_markets = 0
+  | .trade_polls = 112
+  | .successful_trade_polls = 112
+' "$tmp_dir/rust-health.json" >"$tmp_dir/saturated-rust-health.json"
+jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/saturated-rust-health.json" >/dev/null
 for mutation in \
   'del(.last_success_at)' \
   'del(.cycle_started_at)' \
@@ -1399,22 +1414,23 @@ for mutation in \
   '.trade_poll_concurrency = 0' \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \
-  'del(.state_recovery_markets)' \
-  '.state_recovery_markets = 121' \
-  '.market_detail_budget = 5' \
+  'del(.priority_trade_markets_before_market_details)' \
+  '.priority_trade_markets_before_market_details = 113' \
+  '.market_detail_budget = 3' \
   '.market_detail_priority = 4' \
-  '.market_detail_selected = 2' \
-  '.market_detail_deferred = 1' \
+  '.market_detail_selected = 1' \
+  '.market_detail_deferred = 2' \
   '.market_detail_priority_deferred = 1' \
-  '.trade_poll_budget_after_market_details = 112' \
+  '.trade_poll_budget_after_market_details = 109' \
   'del(.trade_request_spacing_ms)' \
   '.trade_request_spacing_ms = 99' \
+  '.priority_trade_markets = 107' \
   '.priority_trade_backlog = 1' \
-  '.selected_trade_markets = 108' \
+  '.selected_trade_markets = 109' \
   '.deferred_trade_markets = 1' \
   '.eligible_trade_markets = 111' \
   '.successful_trade_polls = 0' \
-  '.successful_trade_polls = 110' \
+  '.successful_trade_polls = 111' \
   '.missing_target_symbols = ["BTCUSDT"]' \
   '.api_errors = ["Gamma unavailable"]' \
   '.non_object_trade_markets = ["condition-1"]' \
