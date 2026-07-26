@@ -7,6 +7,7 @@ pub mod backtesting;
 pub mod dataset;
 #[cfg(feature = "db")]
 pub mod deribit;
+mod event_cohort_partition;
 pub mod event_ml;
 pub mod factors;
 pub mod factors_new;
@@ -51,6 +52,9 @@ pub use dataset::{
 pub use deribit::{
     load_deribit_feature_snapshots, load_deribit_feature_snapshots_with_timings,
     DeribitFeatureLoadResult,
+};
+pub use event_cohort_partition::{
+    EventCohortPartition, EventCohortReadyEntry, EVENT_COHORT_PARTITION_VERSION,
 };
 pub use event_ml::{
     build_event_ml_strategy_handoff, build_walk_forward_report, canonical_event_ml_architecture,
