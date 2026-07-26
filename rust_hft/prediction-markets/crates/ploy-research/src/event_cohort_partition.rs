@@ -840,32 +840,27 @@ mod tests {
 
     #[test]
     fn persisted_catalog_partition_artifact_round_trips_only_after_content_addressed_readback() {
-        let root = std::env::temp_dir().join(format!(
-            "ploy-catalog-partition-artifact-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let root = tempfile::tempdir().unwrap();
         let catalog = PolymarketReadyEventCatalog::default();
         let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000).unwrap();
 
-        let artifact =
-            write_catalog_partition_artifact(&root, &root.join("evidence"), &catalog, &partition)
-                .expect("persist canonical catalog and partition");
-        let restored = read_catalog_partition_artifact(&root, &artifact)
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("evidence"),
+            &catalog,
+            &partition,
+        )
+        .expect("persist canonical catalog and partition");
+        let restored = read_catalog_partition_artifact(root.path(), &artifact)
             .expect("fresh readback must validate the persisted artifact");
 
         assert_eq!(restored.partition().digest(), partition.digest());
         assert_eq!(restored.catalog().receipts().count(), 0);
-        std::fs::remove_dir_all(root).expect("remove artifact fixture");
     }
 
     #[test]
     fn persisted_catalog_partition_artifact_round_trips_a_verified_ready_receipt() {
-        let root = std::env::temp_dir().join(format!(
-            "ploy-catalog-partition-artifact-ready-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let root = tempfile::tempdir().unwrap();
         let catalog = persisted_ready_catalog_fixture();
         let end = catalog
             .receipts()
@@ -875,11 +870,15 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let partition = EventCohortPartition::from_ready_catalog(&catalog, end + 3_000).unwrap();
-        let artifact =
-            write_catalog_partition_artifact(&root, &root.join("evidence"), &catalog, &partition)
-                .unwrap();
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("evidence"),
+            &catalog,
+            &partition,
+        )
+        .unwrap();
 
-        let restored = read_catalog_partition_artifact(&root, &artifact).unwrap();
+        let restored = read_catalog_partition_artifact(root.path(), &artifact).unwrap();
         let receipt = restored.catalog().receipts().next().unwrap();
         assert_eq!(
             receipt.receipt_sha256,
@@ -891,36 +890,36 @@ mod tests {
             receipt.receipt_sha256
         );
         assert_eq!(restored.partition().digest(), partition.digest());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn persisted_catalog_partition_artifact_rejects_corruption_mutable_paths_and_missing_partition()
     {
-        let root = std::env::temp_dir().join(format!(
-            "ploy-catalog-partition-artifact-rejection-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let root = tempfile::tempdir().unwrap();
         let catalog = PolymarketReadyEventCatalog::default();
         let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000).unwrap();
-        let artifact =
-            write_catalog_partition_artifact(&root, &root.join("evidence"), &catalog, &partition)
-                .unwrap();
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("evidence"),
+            &catalog,
+            &partition,
+        )
+        .unwrap();
 
         let mut mutable_path = artifact.clone();
         mutable_path.path = "mutable.json".to_string();
-        assert!(read_catalog_partition_artifact(&root, &mutable_path).is_err());
+        assert!(read_catalog_partition_artifact(root.path(), &mutable_path).is_err());
 
         let mut missing_partition: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join(artifact.path())).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(root.path().join(artifact.path())).unwrap())
+                .unwrap();
         missing_partition["payload"]
             .as_object_mut()
             .unwrap()
             .remove("partition");
         let missing = write_content_addressed_json(
-            &root,
-            &root.join("evidence"),
+            root.path(),
+            &root.path().join("evidence"),
             "catalog-partition",
             &missing_partition,
         )
@@ -930,31 +929,31 @@ mod tests {
             artifact_sha256: format!("sha256:{}", missing.sha256),
             payload_sha256: artifact.payload_sha256.clone(),
         };
-        assert!(read_catalog_partition_artifact(&root, &missing_ref)
+        assert!(read_catalog_partition_artifact(root.path(), &missing_ref)
             .expect_err("missing partition must fail closed")
             .contains("missing field `partition`"));
 
-        std::fs::write(root.join(artifact.path()), b"corrupt").unwrap();
-        assert!(read_catalog_partition_artifact(&root, &artifact)
+        std::fs::write(root.path().join(artifact.path()), b"corrupt").unwrap();
+        assert!(read_catalog_partition_artifact(root.path(), &artifact)
             .expect_err("tampered bytes must fail before parse")
             .contains("hash mismatch"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn persisted_catalog_partition_artifact_rejects_catalog_partition_membership_mismatch() {
-        let root = std::env::temp_dir().join(format!(
-            "ploy-catalog-partition-artifact-membership-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let root = tempfile::tempdir().unwrap();
         let catalog = PolymarketReadyEventCatalog::default();
         let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000).unwrap();
-        let artifact =
-            write_catalog_partition_artifact(&root, &root.join("evidence"), &catalog, &partition)
-                .unwrap();
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("evidence"),
+            &catalog,
+            &partition,
+        )
+        .unwrap();
         let mut envelope: CatalogPartitionArtifactEnvelope =
-            serde_json::from_slice(&std::fs::read(root.join(artifact.path())).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(root.path().join(artifact.path())).unwrap())
+                .unwrap();
         let persisted = &mut envelope.payload.partition;
         persisted.ready_entries.push(EventCohortReadyEntry {
             receipt_sha256: "a".repeat(64),
@@ -984,8 +983,8 @@ mod tests {
             sha256_hex(&canonical_json_bytes(&envelope.payload).unwrap())
         );
         let mismatched = write_content_addressed_json(
-            &root,
-            &root.join("evidence"),
+            root.path(),
+            &root.path().join("evidence"),
             "catalog-partition",
             &envelope,
         )
@@ -995,10 +994,11 @@ mod tests {
             artifact_sha256: format!("sha256:{}", mismatched.sha256),
             payload_sha256: envelope.payload_sha256,
         };
-        assert!(read_catalog_partition_artifact(&root, &mismatched_ref)
-            .expect_err("partition cannot add a receipt absent from the catalog")
-            .contains("does not contain every Ready catalog receipt"));
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            read_catalog_partition_artifact(root.path(), &mismatched_ref)
+                .expect_err("partition cannot add a receipt absent from the catalog")
+                .contains("does not contain every Ready catalog receipt")
+        );
     }
 
     #[test]
