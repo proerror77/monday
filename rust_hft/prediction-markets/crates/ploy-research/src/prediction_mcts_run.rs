@@ -22,8 +22,8 @@ use crate::prediction_mcts::{
 };
 use crate::prediction_mission_v3::{AdmittedPredictionMissionV3, PredictionResearchMissionV3};
 
-const RUN_STATE_VERSION: u32 = 3;
-const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v2";
+const RUN_STATE_VERSION: u32 = 4;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v3";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -70,6 +70,8 @@ struct PredictionMctsRunState {
     mission: PredictionResearchMission,
     #[serde(default)]
     identity: Option<PredictionMctsIdentity>,
+    #[serde(default)]
+    immutable_image_identity: Option<String>,
     deadline_unix_millis: u64,
     baseline_complete: bool,
     advisor_call_consumed: bool,
@@ -90,6 +92,8 @@ struct PredictionMctsRunState {
 struct PredictionMctsRunArtifact {
     version: &'static str,
     identity: PredictionMctsIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    immutable_image_identity: Option<String>,
     prompt_snapshot_id: String,
     search_policy_snapshot_id: String,
     phase: &'static str,
@@ -190,6 +194,7 @@ impl PredictionMctsRunState {
         Ok(PredictionMctsRunArtifact {
             version: RUN_ARTIFACT_VERSION,
             identity,
+            immutable_image_identity: self.immutable_image_identity.clone(),
             prompt_snapshot_id: self.mission.prompt_snapshot_id.clone(),
             search_policy_snapshot_id: self.mission.search_policy_snapshot_id.clone(),
             phase: if self.pause_reason.is_some() {
@@ -285,9 +290,11 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
         client,
         evaluator,
         component_profile,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_or_resume_authenticated_prediction_mcts<
     C: ProposalClient,
     E: PredictionMctsRunEvaluator,
@@ -299,6 +306,7 @@ pub(crate) fn run_or_resume_authenticated_prediction_mcts<
     client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
+    immutable_image_identity: &str,
 ) -> Result<LoopRunSummary, String> {
     run_or_resume_prediction_mcts_core(
         mission,
@@ -309,6 +317,7 @@ pub(crate) fn run_or_resume_authenticated_prediction_mcts<
         client,
         evaluator,
         component_profile,
+        Some(immutable_image_identity),
     )
 }
 
@@ -322,6 +331,7 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
     client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
+    immutable_image_identity: Option<&str>,
 ) -> Result<LoopRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
     identity.validate()?;
@@ -338,6 +348,7 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         if state.version != RUN_STATE_VERSION
             || state.mission != mission
             || state.identity()? != identity
+            || state.immutable_image_identity.as_deref() != immutable_image_identity
         {
             return Err(
                 "prediction MCTS output uses an incompatible state version or mission".to_string(),
@@ -359,6 +370,7 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             version: RUN_STATE_VERSION,
             mission: mission.clone(),
             identity: Some(identity.clone()),
+            immutable_image_identity: immutable_image_identity.map(str::to_string),
             deadline_unix_millis,
             baseline_complete: false,
             advisor_call_consumed: false,
@@ -503,6 +515,9 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         let candidate = if let Some(pending) = state.pending.clone() {
             pending
         } else {
+            if !engine.has_expandable_candidate()? {
+                break;
+            }
             let candidate = engine.propose()?;
             state.pending = Some(candidate.clone());
             state.checkpoint = Some(engine.checkpoint()?);
@@ -605,9 +620,8 @@ pub(crate) fn task_output_dir(
 
 #[derive(Debug)]
 pub(crate) struct PredictionMctsSelectionEvidence {
-    pub checkpoint_sha256: String,
-    pub selected_candidate_sha256: String,
     pub held_out_complete: bool,
+    pub immutable_image_identity: Option<String>,
 }
 
 pub(crate) fn authenticated_selection_evidence(
@@ -619,19 +633,20 @@ pub(crate) fn authenticated_selection_evidence(
     if state.identity()? != *identity {
         return Err("prediction MCTS selection identity mismatch".to_string());
     }
-    state.read_only_artifact()?;
-    let selected = state
-        .selected
-        .as_ref()
-        .ok_or_else(|| "held-out view is unavailable before candidate selection".to_string())?;
+    let current_artifact = state.read_only_artifact()?;
+    if state.selected.is_none() {
+        return Err("held-out view is unavailable before candidate selection".to_string());
+    }
     let checkpoint = state.checkpoint_artifact.as_ref().ok_or_else(|| {
         "held-out view is unavailable before the selection checkpoint is durable".to_string()
     })?;
     verify_artifact(&output_dir, checkpoint)?;
+    if checkpoint.sha256 != sha256_hex(&canonical_json_bytes(&current_artifact)?) {
+        return Err("selection checkpoint does not match the current durable state".to_string());
+    }
     Ok(PredictionMctsSelectionEvidence {
-        checkpoint_sha256: checkpoint.sha256.clone(),
-        selected_candidate_sha256: sha256_hex(&canonical_json_bytes(selected)?),
         held_out_complete: state.held_out_complete,
+        immutable_image_identity: state.immutable_image_identity,
     })
 }
 
@@ -1359,6 +1374,93 @@ mod tests {
             std::fs::read(&artifact_path).unwrap(),
             artifact_before_forgery
         );
+    }
+
+    #[test]
+    fn reduced_profile_selects_when_the_tree_exhausts_before_the_budget() {
+        let output = temp_dir("reduced-profile-tree-exhaustion");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+
+        run_or_resume_prediction_mcts_with_component_profile(
+            mission(8, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+        )
+        .expect("tree exhaustion selects the best evaluated candidate");
+
+        assert_eq!(evaluator.calls.last().map(String::as_str), Some("held_out"));
+        assert_eq!(evaluator.candidate_ids.len(), 4);
+    }
+
+    #[test]
+    fn selection_evidence_rejects_a_state_newer_than_its_checkpoint_artifact() {
+        let output = temp_dir("selection-checkpoint-mismatch");
+        let configured = mission(2, 1);
+        let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            configured,
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("completed run");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged["selected"] = forged["training"][1]["candidate"].clone();
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+
+        let error = authenticated_selection_evidence(&output, &identity)
+            .expect_err("selection must match the durable checkpoint artifact");
+        assert!(error.contains("selection checkpoint"));
+    }
+
+    #[test]
+    fn resume_rejects_a_different_immutable_evaluator_image() {
+        let output = temp_dir("immutable-image-resume");
+        let configured = mission(1, 1);
+        let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
+        let image_a = format!("sha256:{}", "a".repeat(64));
+        let image_b = format!("sha256:{}", "b".repeat(64));
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts_core(
+            configured.clone(),
+            identity.clone(),
+            None,
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+            SettlementProbabilityComponentProfile::FullSurface,
+            Some(&image_a),
+        )
+        .expect("pause with image-bound state");
+
+        let error = run_or_resume_prediction_mcts_core(
+            configured,
+            identity,
+            None,
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut FakeEvaluator::default(),
+            SettlementProbabilityComponentProfile::FullSurface,
+            Some(&image_b),
+        )
+        .expect_err("resume under a different image must fail closed");
+        assert!(error.contains("incompatible state version or mission"));
     }
 
     #[test]

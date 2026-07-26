@@ -877,6 +877,19 @@ impl PredictionMctsEngine {
         Err("prediction MCTS could not produce a novel candidate".to_string())
     }
 
+    pub(crate) fn has_expandable_candidate(&self) -> Result<bool, String> {
+        if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
+            return Ok(false);
+        }
+        Ok(select_expandable(
+            &self.checkpoint.nodes,
+            0,
+            self.checkpoint.config.exploration,
+        )
+        .map_err(|error| error.to_string())?
+        .is_some())
+    }
+
     pub fn evaluate_and_observe<E: PredictionTrainingEvaluator>(
         &mut self,
         evaluator: &E,

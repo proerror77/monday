@@ -11,24 +11,20 @@ use crate::prediction_loop::{
     PredictionResearchMission, ProposalClient, PREDICTION_LOOP_TARGET,
     PREDICTION_MISSION_SCHEMA_VERSION,
 };
-use crate::prediction_loop_fs::{
-    atomic_write_json, read_json, verify_artifact, write_content_addressed_json, ArtifactRef,
-};
+use crate::prediction_loop_fs::{atomic_write_json, read_json};
 use crate::prediction_mcts::{
     PredictionMctsCandidate, PredictionMctsEvaluation, PredictionMctsIdentity,
 };
 use crate::prediction_mcts_run::{
     authenticated_selection_evidence, run_or_resume_authenticated_prediction_mcts, task_output_dir,
-    PredictionMctsRunEvaluator, PredictionMctsSelectionEvidence,
+    PredictionMctsRunEvaluator,
 };
 use crate::prediction_mission_v3::{
     admit_prediction_mission_v3, authenticate_prediction_mission_v3_inputs,
-    validate_prediction_mission_v3, AdmittedPredictionMissionV3, AdmittedPredictionTask,
-    PredictionResearchMissionV3, PredictionRunMode,
+    validate_prediction_mission_v3, AdmittedPredictionMissionV3, PredictionResearchMissionV3,
+    PredictionRunMode,
 };
 use crate::research_snapshot::{AuthenticatedResearchSnapshot, ResearchSnapshot};
-
-const RECEIPT_VERSION: &str = "authenticated_prediction_mcts_trial_receipt.v1";
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedTrainingSnapshot {
@@ -106,56 +102,8 @@ pub trait AuthenticatedPredictionMctsEvaluator: sealed::Evaluator {
     ) -> Result<AuthenticatedEvaluationArtifact, String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthenticatedPredictionMctsReceiptEvidence {
-    pub schema_version: String,
-    pub mission_sha256: String,
-    pub cohort_manifest_id: String,
-    pub partition_digest: String,
-    pub causal_projection_policy_id: String,
-    pub search_policy_snapshot_id: String,
-    pub snapshot_contract_id: String,
-    pub snapshot_hash: String,
-    pub immutable_image_identity: String,
-    pub common_time_boundary_ms: i64,
-    pub train_market_ids: Vec<String>,
-    pub crossing_excluded_market_ids: Vec<String>,
-    pub held_out_market_ids: Vec<String>,
-    pub checkpoint_sha256: String,
-    pub selected_candidate_sha256: String,
-    pub evaluator_artifact_sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "task", rename_all = "snake_case")]
-pub enum AuthenticatedPredictionMctsReceipt {
-    SettlementProbability {
-        #[serde(flatten)]
-        evidence: AuthenticatedPredictionMctsReceiptEvidence,
-    },
-    UpExecution {
-        prediction_horizon_secs: u32,
-        #[serde(flatten)]
-        evidence: AuthenticatedPredictionMctsReceiptEvidence,
-    },
-    DownExecution {
-        prediction_horizon_secs: u32,
-        #[serde(flatten)]
-        evidence: AuthenticatedPredictionMctsReceiptEvidence,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthenticatedPredictionMctsReceiptArtifact {
-    pub path: String,
-    pub sha256: String,
-}
-
 pub struct AuthenticatedPredictionMctsTrialRun {
     pub summary: LoopRunSummary,
-    pub receipt: Option<AuthenticatedPredictionMctsReceiptArtifact>,
 }
 
 struct EvaluatorAdapter<'a, E> {
@@ -163,11 +111,7 @@ struct EvaluatorAdapter<'a, E> {
     views: &'a AuthenticatedSnapshotViews,
     output_dir: &'a Path,
     identity: &'a PredictionMctsIdentity,
-    admitted: &'a AdmittedPredictionMissionV3,
-    snapshot: &'a AuthenticatedResearchSnapshot,
-    immutable_image_identity: &'a str,
     evaluator: &'a mut E,
-    receipt: Option<AuthenticatedPredictionMctsReceiptArtifact>,
 }
 
 impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
@@ -209,7 +153,6 @@ impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
         candidate: &PredictionMctsCandidate,
         timeout: Duration,
     ) -> Result<(), String> {
-        let selection = authenticated_selection_evidence(self.output_dir, self.identity)?;
         let artifact = self.evaluator.evaluate_selected(
             self.mission,
             self.views.held_out(),
@@ -221,15 +164,11 @@ impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
             &artifact.sha256,
             "held-out evaluator artifact",
         )?;
-        self.receipt = Some(publish_receipt(
-            self.admitted,
-            self.snapshot,
-            self.immutable_image_identity,
-            self.output_dir,
-            self.identity,
-            selection,
-            artifact,
-        )?);
+        let task_dir = task_output_dir(self.output_dir, self.identity)?;
+        atomic_write_json(
+            &task_dir.join("authenticated-held-out-evaluation.json"),
+            &artifact,
+        )?;
         Ok(())
     }
 }
@@ -262,48 +201,37 @@ pub fn run_or_resume_authenticated_prediction_mcts_trial<
     let views = authenticated_snapshot_views(snapshot)?;
     let bridge = legacy_bridge(mission, snapshot.partition_view().common_time_boundary_ms());
     let identity = PredictionMctsIdentity::from_admitted_mission(admitted)?;
-    let mut adapter = EvaluatorAdapter {
-        mission,
-        views: &views,
-        output_dir,
-        identity: &identity,
-        admitted,
-        snapshot,
-        immutable_image_identity,
-        evaluator,
-        receipt: None,
-    };
-    let summary = run_or_resume_authenticated_prediction_mcts(
-        bridge,
-        identity.clone(),
-        (mission, admitted),
-        output_dir,
-        client,
-        &mut adapter,
-        SettlementProbabilityComponentProfile::MarketMidpointOnly,
-    )?;
-    let task_dir = task_output_dir(output_dir, &identity)?;
-    let receipt_path = task_dir.join("authenticated-receipt-ref.json");
-    let receipt = if let Some(receipt) = adapter.receipt {
-        Some(receipt)
-    } else if receipt_path.exists() {
-        Some(read_json(&receipt_path)?)
-    } else {
-        None
-    };
-    if let Some(receipt) = &receipt {
-        if !authenticated_selection_evidence(output_dir, &identity)?.held_out_complete {
-            return Err("authenticated receipt exists before held-out completion".to_string());
-        }
-        let artifact = ArtifactRef {
-            path: receipt.path.clone(),
-            sha256: receipt.sha256.clone(),
+    let summary = {
+        let mut adapter = EvaluatorAdapter {
+            mission,
+            views: &views,
+            output_dir,
+            identity: &identity,
+            evaluator,
         };
-        if !verify_artifact(output_dir, &artifact)?.starts_with(task_dir.join("receipts")) {
-            return Err("authenticated receipt escaped its task namespace".to_string());
-        }
+        run_or_resume_authenticated_prediction_mcts(
+            bridge,
+            identity.clone(),
+            (mission, admitted),
+            output_dir,
+            client,
+            &mut adapter,
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+            immutable_image_identity,
+        )?
+    };
+    let task_dir = task_output_dir(output_dir, &identity)?;
+    let selection = authenticated_selection_evidence(output_dir, &identity)?;
+    if !selection.held_out_complete {
+        return Err("held-out evaluation is not durably complete".to_string());
     }
-    Ok(AuthenticatedPredictionMctsTrialRun { summary, receipt })
+    if selection.immutable_image_identity.as_deref() != Some(immutable_image_identity) {
+        return Err("immutable evaluator image does not match the durable run".to_string());
+    }
+    let artifact: AuthenticatedEvaluationArtifact =
+        read_json(&task_dir.join("authenticated-held-out-evaluation.json"))?;
+    crate::prediction_loop::validate_sha256_id(&artifact.sha256, "held-out evaluator artifact")?;
+    Ok(AuthenticatedPredictionMctsTrialRun { summary })
 }
 
 fn legacy_bridge(
@@ -328,64 +256,6 @@ fn legacy_bridge(
     };
     bridge.prompt_snapshot_id = research_brief_snapshot_id(&bridge);
     bridge
-}
-
-#[allow(clippy::too_many_arguments)]
-fn publish_receipt(
-    admitted: &AdmittedPredictionMissionV3,
-    snapshot: &AuthenticatedResearchSnapshot,
-    immutable_image_identity: &str,
-    output_dir: &Path,
-    identity: &PredictionMctsIdentity,
-    selection: PredictionMctsSelectionEvidence,
-    artifact: AuthenticatedEvaluationArtifact,
-) -> Result<AuthenticatedPredictionMctsReceiptArtifact, String> {
-    let view = snapshot.partition_view();
-    let evidence = AuthenticatedPredictionMctsReceiptEvidence {
-        schema_version: RECEIPT_VERSION.to_string(),
-        mission_sha256: admitted.mission_sha256.clone(),
-        cohort_manifest_id: admitted.cohort_manifest_id.clone(),
-        partition_digest: admitted.partition_digest.clone(),
-        causal_projection_policy_id: admitted.causal_projection_policy_id.clone(),
-        search_policy_snapshot_id: admitted.search_policy_snapshot_id.clone(),
-        snapshot_contract_id: admitted.snapshot_contract_id.clone(),
-        snapshot_hash: admitted.snapshot_hash.clone(),
-        immutable_image_identity: immutable_image_identity.to_string(),
-        common_time_boundary_ms: view.common_time_boundary_ms(),
-        train_market_ids: view.train_market_ids().to_vec(),
-        crossing_excluded_market_ids: view.crossing_excluded_market_ids().to_vec(),
-        held_out_market_ids: view.held_out_market_ids().to_vec(),
-        checkpoint_sha256: format!("sha256:{}", selection.checkpoint_sha256),
-        selected_candidate_sha256: format!("sha256:{}", selection.selected_candidate_sha256),
-        evaluator_artifact_sha256: artifact.sha256,
-    };
-    let receipt = match admitted.task {
-        AdmittedPredictionTask::SettlementProbability => {
-            AuthenticatedPredictionMctsReceipt::SettlementProbability { evidence }
-        }
-        AdmittedPredictionTask::UpExecution {
-            prediction_horizon_secs,
-        } => AuthenticatedPredictionMctsReceipt::UpExecution {
-            prediction_horizon_secs,
-            evidence,
-        },
-        AdmittedPredictionTask::DownExecution {
-            prediction_horizon_secs,
-        } => AuthenticatedPredictionMctsReceipt::DownExecution {
-            prediction_horizon_secs,
-            evidence,
-        },
-    };
-    let task_dir = task_output_dir(output_dir, identity)?;
-    let ArtifactRef { path, sha256 } = write_content_addressed_json(
-        output_dir,
-        &task_dir.join("receipts"),
-        "authenticated-prediction-mcts-receipt",
-        &receipt,
-    )?;
-    let receipt = AuthenticatedPredictionMctsReceiptArtifact { path, sha256 };
-    atomic_write_json(&task_dir.join("authenticated-receipt-ref.json"), &receipt)?;
-    Ok(receipt)
 }
 
 pub(crate) struct AuthenticatedSnapshotViews {
