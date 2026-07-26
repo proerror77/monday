@@ -10424,6 +10424,9 @@ fn enrich_rolling_features(
                     ts + chrono::Duration::seconds(horizon_secs),
                 ) {
                     let future = rows[future_idx].clone();
+                    if future.pm_token_id != rows[idx].pm_token_id {
+                        continue;
+                    }
                     let future_book = pm_book_index.and_then(|index| {
                         latest_pm_book(
                             index,
@@ -13801,6 +13804,59 @@ mod tests {
 
         assert!(up.label_future_exit_pnl_15s.unwrap() > 0.0);
         assert_eq!(up.label_future_exit_full_depth_fillable_15s, Some(0.0));
+        assert!(up.label_future_exit_full_depth_pnl_15s.is_none());
+    }
+
+    #[test]
+    fn fifteen_second_labels_reject_a_future_token_change() {
+        let mut current = base_obs();
+        current.pm_up_ask_size = 100.0;
+        current.pm_up_bid_size = 100.0;
+        let mut future = current.clone();
+        future.tick_ts = current.tick_ts + chrono::Duration::seconds(15);
+        future.up_token_id = "replacement-up-token".into();
+        future.pm_up_bid = 0.70;
+        let books = vec![
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.up_token_id.clone(),
+                side: "UP".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.49,
+                    size: 100.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.50,
+                    size: 100.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: future.event_id.clone(),
+                token_id: future.up_token_id.clone(),
+                side: "UP".into(),
+                ts: future.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.70,
+                    size: 100.0,
+                }],
+                asks: Vec::new(),
+            },
+        ];
+
+        let rows = build_factor_observations_v2_with_deribit_and_pm_books(
+            &[current.clone(), future],
+            &[],
+            &books,
+            &FactorReviewOptions::default(),
+        );
+        let up = rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up && row.tick_ts == current.tick_ts)
+            .unwrap();
+
+        assert!(up.label_future_exit_bid_change_15s.is_none());
+        assert!(up.label_future_exit_pnl_15s.is_none());
         assert!(up.label_future_exit_full_depth_pnl_15s.is_none());
     }
 
