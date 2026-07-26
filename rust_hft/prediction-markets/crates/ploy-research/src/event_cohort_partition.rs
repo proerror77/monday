@@ -113,11 +113,10 @@ impl EventCohortPartition {
             .filter(|entry| entry.reference_path_start_ms >= common_time_boundary_ms)
             .map(|entry| entry.reference_path_start_ms)
             .min()
-            .map(|decision| decision.min(common_time_boundary_ms))
             .unwrap_or(common_time_boundary_ms);
         for entry in &ready_entries {
             if entry.reference_path_end_ms < common_time_boundary_ms
-                && entry.settlement_available_at_ms > label_availability_cutoff_ms
+                && entry.settlement_available_at_ms >= label_availability_cutoff_ms
             {
                 return Err(format!(
                     "ready market {} settlement label unavailable by cutoff {}",
@@ -317,7 +316,7 @@ mod tests {
                 books: None,
                 references: None,
                 trades: None,
-                settlement: Utc.timestamp_millis_opt(reference_path_end_ms + 1).single(),
+                settlement: Utc.timestamp_millis_opt(reference_path_end_ms).single(),
             }),
             state: PolymarketCatalogReceiptState::Ready,
             reasons: Vec::new(),
@@ -359,7 +358,7 @@ mod tests {
             .availability
             .as_mut()
             .unwrap()
-            .settlement = Utc.timestamp_millis_opt(999).single();
+            .settlement = Utc.timestamp_millis_opt(1_000).single();
         let changed_label_availability =
             EventCohortPartition::from_ready_entries([&changed_availability, &second], 1_000)
                 .unwrap();
@@ -449,5 +448,21 @@ mod tests {
             partition.causal_projection_policy_id(),
             crate::prediction_loop::current_prediction_policy_snapshot_id()
         );
+    }
+
+    #[test]
+    fn first_held_out_decision_is_the_label_availability_cutoff() {
+        let mut train = ready_receipt('a', "train", 100, 900);
+        train.availability.as_mut().unwrap().settlement = Utc.timestamp_millis_opt(1_500).single();
+        let held_out = ready_receipt('b', "held-out", 2_000, 2_500);
+
+        let partition = EventCohortPartition::from_ready_entries([&train, &held_out], 1_000)
+            .expect("settlement before the first held-out decision remains admissible");
+        assert_eq!(partition.label_availability_cutoff_ms(), 2_000);
+
+        train.availability.as_mut().unwrap().settlement = Utc.timestamp_millis_opt(2_000).single();
+        let error = EventCohortPartition::from_ready_entries([&train, &held_out], 1_000)
+            .expect_err("settlement at the first held-out decision must fail closed");
+        assert!(error.contains("settlement label unavailable by cutoff"));
     }
 }

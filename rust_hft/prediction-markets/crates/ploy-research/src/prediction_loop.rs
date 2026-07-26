@@ -234,7 +234,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 39] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 40] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -253,6 +253,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 39] {
             include_bytes!("factors_v2.rs"),
         ),
         ("crates/ploy-research/src/lib.rs", include_bytes!("lib.rs")),
+        (
+            "crates/ploy-research/src/event_cohort_partition.rs",
+            include_bytes!("event_cohort_partition.rs"),
+        ),
         (
             "crates/ploy-research/src/polymarket_evidence_projection.rs",
             include_bytes!("polymarket_evidence_projection.rs"),
@@ -4151,6 +4155,7 @@ mod tests {
             .iter()
             .any(|path| path.contains("monday-prediction-research")));
         assert!(paths.contains(&"crates/ploy-research/src/polymarket_evidence_projection.rs"));
+        assert!(paths.contains(&"crates/ploy-research/src/event_cohort_partition.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/verified_artifact_audit.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/verified_binance_projection.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/prediction_mcts.rs"));
