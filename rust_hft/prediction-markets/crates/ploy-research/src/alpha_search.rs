@@ -920,7 +920,7 @@ fn validate_side_bound_inputs(
 fn is_side_bound_repricing_target(target: &str) -> bool {
     matches!(
         target,
-        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_15s" | "full_depth_reprice_pnl_30s"
     )
 }
 
@@ -2584,6 +2584,12 @@ mod tests {
             reason: "passed".to_string(),
             parent_name: None,
         }
+    }
+
+    #[test]
+    fn fifteen_second_full_depth_repricing_target_requires_side_bound_artifacts() {
+        assert!(is_side_bound_repricing_target("full_depth_reprice_pnl_15s"));
+        assert!(!is_side_bound_repricing_target("reprice_pnl_15s"));
     }
 
     fn checkpoint(

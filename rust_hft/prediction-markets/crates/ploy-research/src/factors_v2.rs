@@ -255,26 +255,32 @@ pub struct FactorObservationV2 {
     pub label_conservative_entry_fillable: bool,
     pub label_future_exit_bid_change_5s: Option<f64>,
     pub label_future_exit_bid_change_10s: Option<f64>,
+    pub label_future_exit_bid_change_15s: Option<f64>,
     pub label_future_exit_bid_change_30s: Option<f64>,
     pub label_future_exit_bid_change_60s: Option<f64>,
     pub label_future_exit_pnl_5s: Option<f64>,
     pub label_future_exit_pnl_10s: Option<f64>,
+    pub label_future_exit_pnl_15s: Option<f64>,
     pub label_future_exit_pnl_30s: Option<f64>,
     pub label_future_exit_pnl_60s: Option<f64>,
     pub label_future_exit_full_depth_pnl_5s: Option<f64>,
     pub label_future_exit_full_depth_pnl_10s: Option<f64>,
+    pub label_future_exit_full_depth_pnl_15s: Option<f64>,
     pub label_future_exit_full_depth_pnl_30s: Option<f64>,
     pub label_future_exit_full_depth_pnl_60s: Option<f64>,
     pub label_future_exit_full_depth_value_5s: Option<f64>,
     pub label_future_exit_full_depth_value_10s: Option<f64>,
+    pub label_future_exit_full_depth_value_15s: Option<f64>,
     pub label_future_exit_full_depth_value_30s: Option<f64>,
     pub label_future_exit_full_depth_value_60s: Option<f64>,
     pub label_future_exit_fillable_5s: Option<f64>,
     pub label_future_exit_fillable_10s: Option<f64>,
+    pub label_future_exit_fillable_15s: Option<f64>,
     pub label_future_exit_fillable_30s: Option<f64>,
     pub label_future_exit_fillable_60s: Option<f64>,
     pub label_future_exit_full_depth_fillable_5s: Option<f64>,
     pub label_future_exit_full_depth_fillable_10s: Option<f64>,
+    pub label_future_exit_full_depth_fillable_15s: Option<f64>,
     pub label_future_exit_full_depth_fillable_30s: Option<f64>,
     pub label_future_exit_full_depth_fillable_60s: Option<f64>,
 }
@@ -372,15 +378,19 @@ pub struct FullDepthExecutionMatrixRow {
     pub entry_avg_levels_used: f64,
     pub exit_5s_fill_rate: f64,
     pub exit_10s_fill_rate: f64,
+    pub exit_15s_fill_rate: f64,
     pub exit_30s_fill_rate: f64,
     pub exit_10s_avg_slippage_bps: f64,
+    pub exit_15s_avg_slippage_bps: f64,
     pub exit_30s_avg_slippage_bps: f64,
     pub roundtrip_fill_rate_5s: f64,
     pub roundtrip_fill_rate_10s: f64,
+    pub roundtrip_fill_rate_15s: f64,
     pub roundtrip_fill_rate_30s: f64,
     pub avg_settlement_pnl: f64,
     pub avg_reprice_pnl_5s: f64,
     pub avg_reprice_pnl_10s: f64,
+    pub avg_reprice_pnl_15s: f64,
     pub avg_reprice_pnl_30s: f64,
 }
 
@@ -413,6 +423,10 @@ pub struct FullDepthExecutionEventRow {
     pub exit_10s_avg_price: Option<f64>,
     pub exit_10s_slippage_bps: Option<f64>,
     pub exit_10s_reprice_pnl: Option<f64>,
+    pub exit_15s_fillable: bool,
+    pub exit_15s_avg_price: Option<f64>,
+    pub exit_15s_slippage_bps: Option<f64>,
+    pub exit_15s_reprice_pnl: Option<f64>,
     pub exit_30s_fillable: bool,
     pub exit_30s_avg_price: Option<f64>,
     pub exit_30s_slippage_bps: Option<f64>,
@@ -2042,6 +2056,12 @@ pub fn factor_v2_descriptors() -> Vec<FactorV2Descriptor> {
             |r| r.label_future_exit_bid_change_10s.unwrap_or(f64::NAN),
         ),
         descriptor(
+            "future_exit_bid_change_15s",
+            FactorFamily::Exit,
+            ThreeLayerArchive::PmExecutableLiquidityRiskGate,
+            |r| r.label_future_exit_bid_change_15s.unwrap_or(f64::NAN),
+        ),
+        descriptor(
             "future_exit_bid_change_30s",
             FactorFamily::Exit,
             ThreeLayerArchive::PmExecutableLiquidityRiskGate,
@@ -2066,6 +2086,12 @@ pub fn factor_v2_descriptors() -> Vec<FactorV2Descriptor> {
             |r| r.label_future_exit_pnl_10s.unwrap_or(f64::NAN),
         ),
         descriptor(
+            "future_exit_pnl_15s",
+            FactorFamily::Exit,
+            ThreeLayerArchive::PmExecutableLiquidityRiskGate,
+            |r| r.label_future_exit_pnl_15s.unwrap_or(f64::NAN),
+        ),
+        descriptor(
             "future_exit_pnl_30s",
             FactorFamily::Exit,
             ThreeLayerArchive::PmExecutableLiquidityRiskGate,
@@ -2088,6 +2114,12 @@ pub fn factor_v2_descriptors() -> Vec<FactorV2Descriptor> {
             FactorFamily::Exit,
             ThreeLayerArchive::PmExecutableLiquidityRiskGate,
             |r| r.label_future_exit_fillable_10s.unwrap_or(f64::NAN),
+        ),
+        descriptor(
+            "future_exit_fillable_15s",
+            FactorFamily::Exit,
+            ThreeLayerArchive::PmExecutableLiquidityRiskGate,
+            |r| r.label_future_exit_fillable_15s.unwrap_or(f64::NAN),
         ),
         descriptor(
             "future_exit_fillable_30s",
@@ -2797,10 +2829,10 @@ pub fn format_full_depth_execution_matrix_report(
         report.rows.len(),
     ));
     out.push_str("Full-depth matrix is the execution gate: entry sweeps asks by stake, repricing exits sweep future bids by entry shares, settlement uses entry sweep only.\n");
-    out.push_str("stake,symbol,side,time_bucket,distance_bucket,entry_price_bucket,spread_bucket,quote_age_bucket,count,entry_fill,entry_avg_price,entry_avg_slip_bps,entry_p50_slip_bps,entry_p90_slip_bps,entry_avg_levels,exit_5s_fill,exit_10s_fill,exit_30s_fill,exit_10s_slip_bps,exit_30s_slip_bps,roundtrip_5s,roundtrip_10s,roundtrip_30s,avg_settlement_pnl,avg_reprice_pnl_5s,avg_reprice_pnl_10s,avg_reprice_pnl_30s\n");
+    out.push_str("stake,symbol,side,time_bucket,distance_bucket,entry_price_bucket,spread_bucket,quote_age_bucket,count,entry_fill,entry_avg_price,entry_avg_slip_bps,entry_p50_slip_bps,entry_p90_slip_bps,entry_avg_levels,exit_5s_fill,exit_10s_fill,exit_15s_fill,exit_30s_fill,exit_10s_slip_bps,exit_15s_slip_bps,exit_30s_slip_bps,roundtrip_5s,roundtrip_10s,roundtrip_15s,roundtrip_30s,avg_settlement_pnl,avg_reprice_pnl_5s,avg_reprice_pnl_10s,avg_reprice_pnl_15s,avg_reprice_pnl_30s\n");
     for row in report.rows.iter().take(top_n.max(1)) {
         out.push_str(&format!(
-            "{:.2},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
+            "{:.2},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
             row.stake_usd,
             row.symbol,
             row.side.as_str(),
@@ -2818,15 +2850,19 @@ pub fn format_full_depth_execution_matrix_report(
             row.entry_avg_levels_used,
             row.exit_5s_fill_rate,
             row.exit_10s_fill_rate,
+            row.exit_15s_fill_rate,
             row.exit_30s_fill_rate,
             row.exit_10s_avg_slippage_bps,
+            row.exit_15s_avg_slippage_bps,
             row.exit_30s_avg_slippage_bps,
             row.roundtrip_fill_rate_5s,
             row.roundtrip_fill_rate_10s,
+            row.roundtrip_fill_rate_15s,
             row.roundtrip_fill_rate_30s,
             row.avg_settlement_pnl,
             row.avg_reprice_pnl_5s,
             row.avg_reprice_pnl_10s,
+            row.avg_reprice_pnl_15s,
             row.avg_reprice_pnl_30s,
         ));
     }
@@ -8304,12 +8340,16 @@ struct FullDepthExecutionSample {
     exit_5s_slippage_bps: f64,
     exit_10s_fillable: bool,
     exit_10s_avg_price: f64,
+    exit_15s_fillable: bool,
+    exit_15s_avg_price: f64,
     exit_30s_fillable: bool,
     exit_30s_avg_price: f64,
     exit_10s_slippage_bps: f64,
+    exit_15s_slippage_bps: f64,
     exit_30s_slippage_bps: f64,
     reprice_pnl_5s: Option<f64>,
     reprice_pnl_10s: Option<f64>,
+    reprice_pnl_15s: Option<f64>,
     reprice_pnl_30s: Option<f64>,
     settlement_outcome: Option<f64>,
     settlement_pnl: Option<f64>,
@@ -8543,7 +8583,7 @@ fn build_full_depth_execution_sample(
         return sample;
     }
 
-    for horizon_secs in [5, 10, 30] {
+    for horizon_secs in [5, 10, 15, 30] {
         let future = event_rows.and_then(|rows| {
             let target = source.tick_ts + chrono::Duration::seconds(horizon_secs);
             rows.iter().copied().find(|row| row.tick_ts >= target)
@@ -8585,6 +8625,12 @@ fn build_full_depth_execution_sample(
                 sample.exit_10s_avg_price = exit_sweep.avg_price;
                 sample.exit_10s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_10s = reprice_pnl;
+            }
+            15 => {
+                sample.exit_15s_fillable = exit_sweep.fillable;
+                sample.exit_15s_avg_price = exit_sweep.avg_price;
+                sample.exit_15s_slippage_bps = exit_sweep.slippage_bps;
+                sample.reprice_pnl_15s = reprice_pnl;
             }
             30 => {
                 sample.exit_30s_fillable = exit_sweep.fillable;
@@ -8635,6 +8681,14 @@ fn build_full_depth_execution_event_row(
             .exit_10s_fillable
             .then_some(sample.exit_10s_slippage_bps),
         exit_10s_reprice_pnl: sample.reprice_pnl_10s,
+        exit_15s_fillable: sample.exit_15s_fillable,
+        exit_15s_avg_price: sample
+            .exit_15s_fillable
+            .then_some(sample.exit_15s_avg_price),
+        exit_15s_slippage_bps: sample
+            .exit_15s_fillable
+            .then_some(sample.exit_15s_slippage_bps),
+        exit_15s_reprice_pnl: sample.reprice_pnl_15s,
         exit_30s_fillable: sample.exit_30s_fillable,
         exit_30s_avg_price: sample
             .exit_30s_fillable
@@ -8711,6 +8765,13 @@ fn summarize_full_depth_execution_group(
                 .count(),
             samples.len(),
         ),
+        exit_15s_fill_rate: ratio(
+            samples
+                .iter()
+                .filter(|sample| sample.exit_15s_fillable)
+                .count(),
+            samples.len(),
+        ),
         exit_30s_fill_rate: ratio(
             samples
                 .iter()
@@ -8723,6 +8784,12 @@ fn summarize_full_depth_execution_group(
                 .iter()
                 .filter(|sample| sample.exit_10s_fillable)
                 .map(|sample| sample.exit_10s_slippage_bps),
+        ),
+        exit_15s_avg_slippage_bps: mean(
+            samples
+                .iter()
+                .filter(|sample| sample.exit_15s_fillable)
+                .map(|sample| sample.exit_15s_slippage_bps),
         ),
         exit_30s_avg_slippage_bps: mean(
             samples
@@ -8744,6 +8811,13 @@ fn summarize_full_depth_execution_group(
                 .count(),
             samples.len(),
         ),
+        roundtrip_fill_rate_15s: ratio(
+            samples
+                .iter()
+                .filter(|sample| sample.entry_fillable && sample.exit_15s_fillable)
+                .count(),
+            samples.len(),
+        ),
         roundtrip_fill_rate_30s: ratio(
             samples
                 .iter()
@@ -8754,6 +8828,7 @@ fn summarize_full_depth_execution_group(
         avg_settlement_pnl: mean(samples.iter().filter_map(|sample| sample.settlement_pnl)),
         avg_reprice_pnl_5s: mean(samples.iter().filter_map(|sample| sample.reprice_pnl_5s)),
         avg_reprice_pnl_10s: mean(samples.iter().filter_map(|sample| sample.reprice_pnl_10s)),
+        avg_reprice_pnl_15s: mean(samples.iter().filter_map(|sample| sample.reprice_pnl_15s)),
         avg_reprice_pnl_30s: mean(samples.iter().filter_map(|sample| sample.reprice_pnl_30s)),
     }
 }
@@ -10221,26 +10296,32 @@ fn side_row(
         label_conservative_entry_fillable: conservative_entry_sweep.fillable,
         label_future_exit_bid_change_5s: None,
         label_future_exit_bid_change_10s: None,
+        label_future_exit_bid_change_15s: None,
         label_future_exit_bid_change_30s: None,
         label_future_exit_bid_change_60s: None,
         label_future_exit_pnl_5s: None,
         label_future_exit_pnl_10s: None,
+        label_future_exit_pnl_15s: None,
         label_future_exit_pnl_30s: None,
         label_future_exit_pnl_60s: None,
         label_future_exit_full_depth_pnl_5s: None,
         label_future_exit_full_depth_pnl_10s: None,
+        label_future_exit_full_depth_pnl_15s: None,
         label_future_exit_full_depth_pnl_30s: None,
         label_future_exit_full_depth_pnl_60s: None,
         label_future_exit_full_depth_value_5s: None,
         label_future_exit_full_depth_value_10s: None,
+        label_future_exit_full_depth_value_15s: None,
         label_future_exit_full_depth_value_30s: None,
         label_future_exit_full_depth_value_60s: None,
         label_future_exit_fillable_5s: None,
         label_future_exit_fillable_10s: None,
+        label_future_exit_fillable_15s: None,
         label_future_exit_fillable_30s: None,
         label_future_exit_fillable_60s: None,
         label_future_exit_full_depth_fillable_5s: None,
         label_future_exit_full_depth_fillable_10s: None,
+        label_future_exit_full_depth_fillable_15s: None,
         label_future_exit_full_depth_fillable_30s: None,
         label_future_exit_full_depth_fillable_60s: None,
     }
@@ -10335,7 +10416,7 @@ fn enrich_rolling_features(
                     prev.cum_trade_imbalance_5m,
                 ) * rows[idx].side.multiplier();
             }
-            for horizon_secs in [5, 10, 30, 60] {
+            for horizon_secs in [5, 10, 15, 30, 60] {
                 if let Some(future_idx) = future_idx_at_or_after(
                     rows,
                     indexes,
@@ -10456,6 +10537,14 @@ fn set_future_exit_labels(
             rows[idx].label_future_exit_full_depth_fillable_10s = full_depth_fillable;
             rows[idx].label_future_exit_full_depth_value_10s = full_depth_value;
             rows[idx].label_future_exit_full_depth_pnl_10s = full_depth_pnl;
+        }
+        15 => {
+            rows[idx].label_future_exit_bid_change_15s = bid_change;
+            rows[idx].label_future_exit_fillable_15s = fillable;
+            rows[idx].label_future_exit_pnl_15s = pnl;
+            rows[idx].label_future_exit_full_depth_fillable_15s = full_depth_fillable;
+            rows[idx].label_future_exit_full_depth_value_15s = full_depth_value;
+            rows[idx].label_future_exit_full_depth_pnl_15s = full_depth_pnl;
         }
         30 => {
             rows[idx].label_future_exit_bid_change_30s = bid_change;
@@ -10735,6 +10824,9 @@ fn repricing_ic_targets() -> Vec<RepricingIcTargetDescriptor> {
         repricing_target("reprice_pnl_10s", "reprice_pnl", |row| {
             row.label_future_exit_pnl_10s
         }),
+        repricing_target("reprice_pnl_15s", "reprice_pnl", |row| {
+            row.label_future_exit_pnl_15s
+        }),
         repricing_target("reprice_pnl_30s", "reprice_pnl", |row| {
             row.label_future_exit_pnl_30s
         }),
@@ -10752,6 +10844,11 @@ fn repricing_ic_targets() -> Vec<RepricingIcTargetDescriptor> {
             |row| row.label_future_exit_full_depth_pnl_10s,
         ),
         repricing_target(
+            "full_depth_reprice_pnl_15s",
+            "full_depth_reprice_pnl",
+            |row| row.label_future_exit_full_depth_pnl_15s,
+        ),
+        repricing_target(
             "full_depth_reprice_pnl_30s",
             "full_depth_reprice_pnl",
             |row| row.label_future_exit_full_depth_pnl_30s,
@@ -10767,6 +10864,9 @@ fn repricing_ic_targets() -> Vec<RepricingIcTargetDescriptor> {
         repricing_target("reprice_bid_change_10s", "reprice_bid_change", |row| {
             row.label_future_exit_bid_change_10s
         }),
+        repricing_target("reprice_bid_change_15s", "reprice_bid_change", |row| {
+            row.label_future_exit_bid_change_15s
+        }),
         repricing_target("reprice_bid_change_30s", "reprice_bid_change", |row| {
             row.label_future_exit_bid_change_30s
         }),
@@ -10778,6 +10878,9 @@ fn repricing_ic_targets() -> Vec<RepricingIcTargetDescriptor> {
         }),
         repricing_target("abs_reprice_bid_change_10s", "volatility", |row| {
             row.label_future_exit_bid_change_10s.map(f64::abs)
+        }),
+        repricing_target("abs_reprice_bid_change_15s", "volatility", |row| {
+            row.label_future_exit_bid_change_15s.map(f64::abs)
         }),
         repricing_target("abs_reprice_bid_change_30s", "volatility", |row| {
             row.label_future_exit_bid_change_30s.map(f64::abs)
@@ -10798,10 +10901,18 @@ fn repricing_ic_targets() -> Vec<RepricingIcTargetDescriptor> {
         repricing_target("execution_future_exit_fillable_30s", "execution", |row| {
             row.label_future_exit_fillable_30s
         }),
+        repricing_target("execution_future_exit_fillable_15s", "execution", |row| {
+            row.label_future_exit_fillable_15s
+        }),
         repricing_target(
             "execution_full_depth_future_exit_fillable_30s",
             "execution",
             |row| row.label_future_exit_full_depth_fillable_30s,
+        ),
+        repricing_target(
+            "execution_full_depth_future_exit_fillable_15s",
+            "execution",
+            |row| row.label_future_exit_full_depth_fillable_15s,
         ),
         repricing_target("execution_pm_spread_bps", "execution", |row| {
             row.pm_spread_bps.is_finite().then_some(row.pm_spread_bps)
@@ -13180,15 +13291,19 @@ mod tests {
                 entry_avg_levels_used: 1.0,
                 exit_5s_fill_rate: 0.5,
                 exit_10s_fill_rate: 0.5,
+                exit_15s_fill_rate: 0.5,
                 exit_30s_fill_rate: 0.5,
                 exit_10s_avg_slippage_bps: 10.0,
+                exit_15s_avg_slippage_bps: 10.0,
                 exit_30s_avg_slippage_bps: 10.0,
                 roundtrip_fill_rate_5s: 0.5,
                 roundtrip_fill_rate_10s: 0.5,
+                roundtrip_fill_rate_15s: 0.5,
                 roundtrip_fill_rate_30s: 0.5,
                 avg_settlement_pnl: 1.0,
                 avg_reprice_pnl_5s: 0.1,
                 avg_reprice_pnl_10s: 0.1,
+                avg_reprice_pnl_15s: 0.1,
                 avg_reprice_pnl_30s: 0.1,
             }],
         };
@@ -13502,6 +13617,8 @@ mod tests {
         future.tick_ts = current.tick_ts + chrono::Duration::seconds(10);
         future.pm_up_bid = 0.70;
         future.pm_up_bid_size = 100.0;
+        let mut future_15s = future.clone();
+        future_15s.tick_ts = current.tick_ts + chrono::Duration::seconds(15);
         let books = vec![
             ResearchPmBookSnapshot {
                 event_id: "evt".into(),
@@ -13531,10 +13648,24 @@ mod tests {
                     size: 40.0,
                 }],
             },
+            ResearchPmBookSnapshot {
+                event_id: "evt".into(),
+                token_id: "up-token".into(),
+                side: "UP".into(),
+                ts: future_15s.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.70,
+                    size: 5.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.72,
+                    size: 40.0,
+                }],
+            },
         ];
 
         let rows = build_factor_observations_v2_with_deribit_and_pm_books(
-            &[current.clone(), future],
+            &[current.clone(), future, future_15s],
             &[],
             &books,
             &FactorReviewOptions::default(),
@@ -13548,7 +13679,129 @@ mod tests {
         assert!(up.label_future_exit_pnl_10s.unwrap() > 0.0);
         assert_eq!(up.label_future_exit_full_depth_fillable_10s, Some(0.0));
         assert!(up.label_future_exit_full_depth_pnl_10s.is_none());
+        assert_eq!(up.label_future_exit_full_depth_fillable_15s, Some(0.0));
+        assert!(up.label_future_exit_full_depth_pnl_15s.is_none());
         assert!(up.label_full_depth_executable_pnl_15u.is_some());
+    }
+
+    #[test]
+    fn fifteen_second_full_depth_label_is_causal_and_side_bound() {
+        let mut current = base_obs();
+        current.pm_up_ask_size = 100.0;
+        current.pm_up_bid_size = 100.0;
+        let mut before_boundary = current.clone();
+        before_boundary.tick_ts = current.tick_ts + chrono::Duration::seconds(14);
+        before_boundary.pm_up_bid = 0.99;
+        let mut at_boundary = current.clone();
+        at_boundary.tick_ts = current.tick_ts + chrono::Duration::seconds(15);
+        at_boundary.pm_up_bid = 0.70;
+        let books = vec![
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.up_token_id.clone(),
+                side: "UP".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.49,
+                    size: 100.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.50,
+                    size: 100.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: "wrong-token".into(),
+                side: "UP".into(),
+                ts: at_boundary.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.99,
+                    size: 100.0,
+                }],
+                asks: Vec::new(),
+            },
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.up_token_id.clone(),
+                side: "UP".into(),
+                ts: at_boundary.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.70,
+                    size: 100.0,
+                }],
+                asks: Vec::new(),
+            },
+        ];
+
+        let rows = build_factor_observations_v2_with_deribit_and_pm_books(
+            &[current.clone(), before_boundary, at_boundary],
+            &[],
+            &books,
+            &FactorReviewOptions::default(),
+        );
+        let up = rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up && row.tick_ts == current.tick_ts)
+            .unwrap();
+
+        assert_eq!(up.label_future_exit_full_depth_fillable_15s, Some(1.0));
+        assert!(up.label_future_exit_full_depth_pnl_15s.unwrap() > 0.0);
+        assert!((up.label_future_exit_bid_change_15s.unwrap() - 0.22).abs() < EPS);
+        assert!((up.label_future_exit_full_depth_value_15s.unwrap() - 21.0).abs() < EPS);
+    }
+
+    #[test]
+    fn fifteen_second_full_depth_label_rejects_a_stale_future_book() {
+        let mut current = base_obs();
+        current.pm_up_ask_size = 100.0;
+        let mut future = current.clone();
+        future.tick_ts = current.tick_ts + chrono::Duration::seconds(15);
+        future.pm_up_bid = 0.70;
+        let books = vec![
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.up_token_id.clone(),
+                side: "UP".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.48,
+                    size: 100.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.50,
+                    size: 100.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: future.event_id.clone(),
+                token_id: future.up_token_id.clone(),
+                side: "UP".into(),
+                ts: future.tick_ts - chrono::Duration::seconds(6),
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.70,
+                    size: 100.0,
+                }],
+                asks: Vec::new(),
+            },
+        ];
+        let rows = build_factor_observations_v2_with_deribit_and_pm_books(
+            &[current.clone(), future],
+            &[],
+            &books,
+            &FactorReviewOptions {
+                max_quote_age_secs: 5,
+                ..Default::default()
+            },
+        );
+        let up = rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up && row.tick_ts == current.tick_ts)
+            .unwrap();
+
+        assert!(up.label_future_exit_pnl_15s.unwrap() > 0.0);
+        assert_eq!(up.label_future_exit_full_depth_fillable_15s, Some(0.0));
+        assert!(up.label_future_exit_full_depth_pnl_15s.is_none());
     }
 
     #[test]
@@ -13622,6 +13875,7 @@ mod tests {
         assert!(up_1u.roundtrip_fill_rate_10s > up_15u.roundtrip_fill_rate_10s);
         assert!(format_full_depth_execution_matrix_report(&report, 5)
             .contains("Full-depth matrix is the execution gate"));
+        assert!(format_full_depth_execution_matrix_report(&report, 5).contains("exit_15s_fill"));
     }
 
     #[test]
@@ -13641,6 +13895,10 @@ mod tests {
         future.tick_ts = tick_ts + chrono::Duration::seconds(10);
         future.pm_up_bid = 0.70;
         future.pm_down_bid = 0.22;
+        let mut future_15s = future.clone();
+        future_15s.tick_ts = tick_ts + chrono::Duration::seconds(15);
+        future_15s.pm_up_bid = 0.75;
+        future_15s.pm_down_bid = 0.18;
         let books = vec![
             ResearchPmBookSnapshot {
                 event_id: current.event_id.clone(),
@@ -13698,9 +13956,37 @@ mod tests {
                     size: 20.0,
                 }],
             },
+            ResearchPmBookSnapshot {
+                event_id: future_15s.event_id.clone(),
+                token_id: future_15s.up_token_id.clone(),
+                side: "UP".into(),
+                ts: future_15s.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.75,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.77,
+                    size: 20.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: future_15s.event_id.clone(),
+                token_id: future_15s.down_token_id.clone(),
+                side: "DOWN".into(),
+                ts: future_15s.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.18,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.20,
+                    size: 20.0,
+                }],
+            },
         ];
 
-        let observations = vec![current, future];
+        let observations = vec![current, future, future_15s];
         let matrix_options = FullDepthExecutionMatrixOptions {
             stakes_usd: vec![5.0],
             min_bucket_observations: 1,
@@ -13743,6 +14029,10 @@ mod tests {
         assert!((down.exit_10s_avg_price.unwrap() - 0.22).abs() < EPS);
         assert!(up.exit_10s_reprice_pnl.unwrap() > 0.0);
         assert!(down.exit_10s_reprice_pnl.unwrap() < 0.0);
+        assert!((up.exit_15s_avg_price.unwrap() - 0.75).abs() < EPS);
+        assert!((down.exit_15s_avg_price.unwrap() - 0.18).abs() < EPS);
+        assert!(up.exit_15s_reprice_pnl.unwrap() > 0.0);
+        assert!(down.exit_15s_reprice_pnl.unwrap() < 0.0);
     }
 
     #[test]
