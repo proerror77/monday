@@ -308,6 +308,44 @@ verify_fresh_baseline_health() {
   done
 }
 
+legacy_health_sample_state() {
+  local health=$1 policy=$2 baseline_mode=$3
+  if jq -e -f "$policy" "$health" >/dev/null; then
+    printf '%s\n' clean
+  elif [[ $baseline_mode == legacy_python ]] \
+    && jq -e '.api_errors | type == "array" and length > 0' "$health" >/dev/null \
+    && jq '.api_errors = []' "$health" | jq -e -f "$policy" >/dev/null; then
+    printf '%s\n' transient_api_error
+  else
+    printf '%s\n' fatal
+  fi
+}
+
+legacy_health_transition() {
+  local sample_state=$1 error_started_at=$2 now_uptime=$3 budget_seconds=$4
+  local decision=fatal
+  case "$sample_state" in
+    clean)
+      if [[ -n $error_started_at ]] \
+        && ((now_uptime - error_started_at > budget_seconds)); then
+        decision=expired
+      else
+        error_started_at=
+        decision=advance
+      fi
+      ;;
+    transient_api_error)
+      [[ -n $error_started_at ]] || error_started_at=$now_uptime
+      if ((now_uptime - error_started_at <= budget_seconds)); then
+        decision='wait'
+      else
+        decision=expired
+      fi
+      ;;
+  esac
+  printf '%s:%s\n' "$decision" "$error_started_at"
+}
+
 env_value() {
   local key=$1 file=${2:-$UPLOAD_ENV} count value
   count=$(grep -c "^${key}=" "$file" || true)
@@ -719,6 +757,9 @@ last_health=
 last_health_change=$start_uptime
 last_legacy_health=
 last_legacy_health_change=$start_uptime
+legacy_api_error_started_at=
+legacy_health_state=fatal
+legacy_health_decision=fatal
 common_cutoff=
 parity_window_started_at=
 while :; do
@@ -726,6 +767,34 @@ while :; do
   elapsed=$((now_uptime - start_uptime))
   verify_baseline_identity \
     || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
+  legacy_health="$LEGACY_SPOOL/health.json"
+  [[ -f $legacy_health && ! -L $legacy_health ]] \
+    || die "$baseline_label health is missing"
+  legacy_health_state=$(legacy_health_sample_state \
+    "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
+    "$baseline_mode")
+  legacy_health_result=$(legacy_health_transition \
+    "$legacy_health_state" "$legacy_api_error_started_at" \
+    "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+  legacy_health_decision=${legacy_health_result%%:*}
+  legacy_api_error_started_at=${legacy_health_result#*:}
+  case "$legacy_health_decision" in
+    advance|wait)
+      ;;
+    expired)
+      die "$baseline_label API errors did not recover within the health budget"
+      ;;
+    *)
+      die "$baseline_label health is not fail-closed clean during shadow"
+      ;;
+  esac
+  current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
+  if [[ $current_legacy_health != "$last_legacy_health" ]]; then
+    last_legacy_health=$current_legacy_health
+    last_legacy_health_change=$now_uptime
+  fi
+  ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
+    || die "$baseline_label health stopped advancing during shadow"
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
   [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
@@ -750,19 +819,6 @@ while :; do
     ((now_uptime - last_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die 'Rust shadow health stopped advancing'
 
-    legacy_health="$LEGACY_SPOOL/health.json"
-    [[ -f $legacy_health && ! -L $legacy_health ]] \
-      || die "$baseline_label health is missing"
-    jq -e -f "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" "$legacy_health" >/dev/null \
-      || die "$baseline_label health is not fail-closed clean during shadow"
-    current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
-    if [[ $current_legacy_health != "$last_legacy_health" ]]; then
-      last_legacy_health=$current_legacy_health
-      last_legacy_health_change=$now_uptime
-    fi
-    ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
-      || die "$baseline_label health stopped advancing during shadow"
-
     rust_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
       "$health") || die 'Rust health has no last_success_at'
     legacy_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
@@ -776,18 +832,21 @@ while :; do
       || die 'Rust last_success_at is stale or from the future'
     ((legacy_success_epoch <= now_epoch && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die "$baseline_label last_success_at is stale or from the future"
-    common_cutoff=$rust_success_epoch
-    ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
-    if [[ $test_only == false ]]; then
-      common_cutoff=$((common_cutoff - PARITY_CUTOFF_LAG_SECONDS))
+    if [[ $legacy_health_decision == advance ]]; then
+      common_cutoff=$rust_success_epoch
+      ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
+      if [[ $test_only == false ]]; then
+        common_cutoff=$((common_cutoff - PARITY_CUTOFF_LAG_SECONDS))
+      fi
+      parity_window_started_at=$(bounded_parity_window_start \
+        "$started_at_unix" "$common_cutoff" "$test_only" \
+        "$SETTLEMENT_EVENT_LOOKBACK_SECONDS") \
+        || die 'could not derive a bounded parity window start'
     fi
-    parity_window_started_at=$(bounded_parity_window_start \
-      "$started_at_unix" "$common_cutoff" "$test_only" \
-      "$SETTLEMENT_EVENT_LOOKBACK_SECONDS") \
-      || die 'could not derive a bounded parity window start'
   fi
 
-  if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]]; then
+  if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]] \
+    && [[ $legacy_health_decision == advance ]]; then
     if valid_parity_window "$parity_window_started_at" "$common_cutoff"; then
       if [[ $test_only == true ]] \
         || ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)); then
