@@ -25,11 +25,54 @@ const MAX_SNAPSHOT_EXTRACTED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
-struct PredictionMissionIdentity {
+struct PredictionMissionV2Identity {
     mission_id: String,
     lane: String,
     data_snapshot_id: String,
     search_policy_snapshot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PredictionMissionV3Identity {
+    schema_version: String,
+    mission_id: String,
+    run_mode: String,
+    cohort_manifest_id: String,
+    snapshot_contract_id: String,
+    search_policy_snapshot_id: String,
+}
+
+#[derive(Debug)]
+enum PredictionMissionIdentity {
+    V2(PredictionMissionV2Identity),
+    PipelineSmoke(PredictionMissionV3Identity),
+}
+
+impl PredictionMissionIdentity {
+    fn mission_id(&self) -> &str {
+        match self {
+            Self::V2(mission) => &mission.mission_id,
+            Self::PipelineSmoke(mission) => &mission.mission_id,
+        }
+    }
+
+    fn snapshot_contract_id(&self) -> &str {
+        match self {
+            Self::V2(mission) => &mission.data_snapshot_id,
+            Self::PipelineSmoke(mission) => &mission.snapshot_contract_id,
+        }
+    }
+
+    fn policy_identity(&self) -> &str {
+        match self {
+            Self::V2(mission) => &mission.search_policy_snapshot_id,
+            Self::PipelineSmoke(mission) => &mission.search_policy_snapshot_id,
+        }
+    }
+
+    fn is_pipeline_smoke(&self) -> bool {
+        matches!(self, Self::PipelineSmoke(_))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +91,11 @@ struct PredictionExecutionEvidence<'a> {
     mission_sha256: &'a str,
     snapshot_archive_sha256: &'a str,
     snapshot_archive_source: &'static str,
+    partition_digest: &'a str,
+    policy_identity: &'a str,
+    task_capability: &'a str,
+    image_identity: &'a str,
+    run_mode: &'static str,
     resume_bundle_sha256: Option<&'a str>,
     runner_exit_code: Option<i32>,
 }
@@ -58,6 +106,21 @@ struct PredictionExecutionReport<'a> {
     evidence: PredictionExecutionEvidence<'a>,
     bundle_bytes: u64,
     bundle_sha256: String,
+    readback_bundle_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline_smoke: Option<PipelineSmokeCompletion>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PipelineSmokeCompletion {
+    schema_version: String,
+    status: String,
+    mission_id: String,
+    task: String,
+    snapshot_contract_id: String,
+    snapshot_digest: String,
+    search_policy_snapshot_id: String,
+    evaluator_report_sha256: String,
 }
 
 pub fn execute(args: PredictionExecuteArgs) -> anyhow::Result<()> {
@@ -92,8 +155,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     if mission_sha256 != normalized_sha256("mission", &args.mission_sha256)? {
         bail!("prediction mission SHA256 mismatch");
     }
-    let mission: PredictionMissionIdentity = serde_json::from_slice(&std::fs::read(&mission_path)?)
-        .context("prediction mission identity is invalid JSON")?;
+    let mission = parse_prediction_mission_identity(&mission_path)?;
     validate_mission_identity(&mission)?;
 
     let (snapshot_sha256, snapshot_archive_source) =
@@ -132,7 +194,11 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
 
     let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
     let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
-    let status = Command::new(runner)
+    let mut command = Command::new(runner);
+    if mission.is_pipeline_smoke() {
+        command.arg("--pipeline-smoke");
+    }
+    let status = command
         .arg(&mission_path)
         .arg(snapshot_dir.path())
         .arg(&results_dir)
@@ -145,14 +211,35 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     stderr.as_file().sync_all()?;
     data_mission::persist_output_file(stdout, &stdout_path, "prediction runner stdout")?;
     data_mission::persist_output_file(stderr, &stderr_path, "prediction runner stderr")?;
+    let pipeline_smoke = if mission.is_pipeline_smoke() && status.success() {
+        Some(read_pipeline_smoke_completion(
+            &stdout_path,
+            &mission,
+            &args,
+        )?)
+    } else {
+        None
+    };
+    if let Some(completion) = pipeline_smoke.as_ref() {
+        verify_pipeline_smoke_report_digest(&results_dir, completion)?;
+    }
     let evidence = PredictionExecutionEvidence {
         lane: "prediction_market",
-        mission_id: &mission.mission_id,
-        data_snapshot_id: &mission.data_snapshot_id,
-        evaluator_version: &mission.search_policy_snapshot_id,
+        mission_id: mission.mission_id(),
+        data_snapshot_id: mission.snapshot_contract_id(),
+        evaluator_version: mission.policy_identity(),
         mission_sha256: &mission_sha256,
         snapshot_archive_sha256: &snapshot_sha256,
         snapshot_archive_source,
+        partition_digest: &args.partition_digest,
+        policy_identity: &args.policy_identity,
+        task_capability: &args.task_capability,
+        image_identity: &args.image_identity,
+        run_mode: if mission.is_pipeline_smoke() {
+            "pipeline_smoke"
+        } else {
+            "research_trial_or_legacy"
+        },
         resume_bundle_sha256: resume_bundle_sha256.as_deref(),
         runner_exit_code: status.code(),
     };
@@ -163,16 +250,99 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
-    print_json(&PredictionExecutionReport {
+    let readback_bundle = input_dir.join("published-result-readback.zip");
+    let (_, readback_sha256) = fetch_to_file(
+        &client,
+        &args.result_readback_url,
+        &readback_bundle,
+        MAX_RESUME_ARCHIVE_BYTES,
+    )?;
+    if readback_sha256 != bundle_sha256 {
+        bail!("published prediction result readback SHA256 mismatch");
+    }
+    let report = PredictionExecutionReport {
         evidence,
         bundle_bytes,
         bundle_sha256,
-    })?;
+        readback_bundle_sha256: readback_sha256,
+        pipeline_smoke,
+    };
+    // The readback hash proves the published bundle is the exact bundle whose smoke
+    // report was verified before publication. Keep local status evidence outside that
+    // hash cycle after readback is verified.
+    data_mission::write_json_atomic(&artifact_dir.join("execution-evidence.json"), &report)?;
+    print_json(&report)?;
     if !status.success() {
         bail!(
             "prediction research runner exited unsuccessfully with {:?}; immutable evidence was published",
             status.code()
         );
+    }
+    Ok(())
+}
+
+fn read_pipeline_smoke_completion(
+    stdout_path: &Path,
+    mission: &PredictionMissionIdentity,
+    args: &PredictionExecuteArgs,
+) -> anyhow::Result<PipelineSmokeCompletion> {
+    let bytes = std::fs::read(stdout_path)
+        .with_context(|| format!("read pipeline smoke completion {}", stdout_path.display()))?;
+    if bytes.len() as u64 > MAX_MISSION_BYTES {
+        bail!("pipeline smoke completion exceeds {MAX_MISSION_BYTES} bytes");
+    }
+    let completion: PipelineSmokeCompletion = serde_json::from_slice(&bytes)
+        .context("pipeline smoke completion must be a typed JSON object")?;
+    if completion.schema_version != "monday.prediction.pipeline_smoke.result.v1"
+        || completion.status != "completed"
+        || completion.mission_id != mission.mission_id()
+        || completion.task != "settlement_probability"
+        || completion.snapshot_contract_id != args.snapshot_contract_id
+        || completion.snapshot_digest != args.snapshot_digest
+        || completion.search_policy_snapshot_id != args.policy_identity
+    {
+        bail!("pipeline smoke completion does not bind the admitted identity");
+    }
+    normalized_sha256(
+        "pipeline smoke evaluator report",
+        &completion.evaluator_report_sha256,
+    )?;
+    Ok(completion)
+}
+
+fn verify_pipeline_smoke_report_digest(
+    results_dir: &Path,
+    completion: &PipelineSmokeCompletion,
+) -> anyhow::Result<()> {
+    let report_dir = results_dir.join("reports");
+    let reports = std::fs::read_dir(&report_dir)
+        .with_context(|| {
+            format!(
+                "read pipeline smoke report directory {}",
+                report_dir.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pipeline-smoke-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    let [report] = reports.as_slice() else {
+        bail!(
+            "expected exactly one pipeline smoke evaluator report, found {}",
+            reports.len()
+        );
+    };
+    if sha256_file(report)?
+        != normalized_sha256(
+            "pipeline smoke evaluator report",
+            &completion.evaluator_report_sha256,
+        )?
+    {
+        bail!("pipeline smoke evaluator report SHA256 does not match its completion");
     }
     Ok(())
 }
@@ -186,7 +356,12 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
             args.snapshot_sha256.as_str(),
             args.snapshot_contract_id.as_str(),
             args.snapshot_digest.as_str(),
+            args.partition_digest.as_str(),
+            args.policy_identity.as_str(),
+            args.task_capability.as_str(),
+            args.image_identity.as_str(),
             args.result_put_url.as_str(),
+            args.result_readback_url.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -194,7 +369,13 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
         bail!("prediction execution paths, URLs, and hashes are required");
     }
     immutable_sha256_identity("prediction snapshot contract", &args.snapshot_contract_id)?;
+    immutable_sha256_identity("prediction partition", &args.partition_digest)?;
+    immutable_sha256_identity("prediction policy", &args.policy_identity)?;
+    immutable_sha256_identity("prediction image", &args.image_identity)?;
     validate_snapshot_digest(&args.snapshot_digest)?;
+    if args.task_capability != "btc_5m_backtest" {
+        bail!("prediction task capability is not admitted for the current snapshot contract");
+    }
     resume_source(args)?;
     Ok(())
 }
@@ -255,15 +436,50 @@ fn resume_source(args: &PredictionExecuteArgs) -> anyhow::Result<Option<(&str, &
     }
 }
 
-fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Result<()> {
-    if mission.lane != "prediction_market"
-        || mission.mission_id.trim().is_empty()
-        || mission.data_snapshot_id.trim().is_empty()
-        || mission.search_policy_snapshot_id.trim().is_empty()
-    {
-        bail!("prediction mission identity or lane is invalid");
+fn parse_prediction_mission_identity(path: &Path) -> anyhow::Result<PredictionMissionIdentity> {
+    let bytes = std::fs::read(path)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("prediction mission identity is invalid JSON")?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if schema_version == "prediction_research_mission.v3" {
+        let mission = serde_json::from_value::<PredictionMissionV3Identity>(value)
+            .context("prediction Mission v3 identity is invalid")?;
+        let identity = PredictionMissionIdentity::PipelineSmoke(mission);
+        validate_mission_identity(&identity)?;
+        return Ok(identity);
     }
-    Ok(())
+    let mission = serde_json::from_value::<PredictionMissionV2Identity>(value)
+        .context("prediction mission identity is invalid")?;
+    let identity = PredictionMissionIdentity::V2(mission);
+    validate_mission_identity(&identity)?;
+    Ok(identity)
+}
+
+fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Result<()> {
+    match mission {
+        PredictionMissionIdentity::V2(mission)
+            if mission.lane == "prediction_market"
+                && !mission.mission_id.trim().is_empty()
+                && !mission.data_snapshot_id.trim().is_empty()
+                && !mission.search_policy_snapshot_id.trim().is_empty() =>
+        {
+            Ok(())
+        }
+        PredictionMissionIdentity::PipelineSmoke(mission)
+            if mission.schema_version == "prediction_research_mission.v3"
+                && mission.run_mode == "pipeline_smoke"
+                && !mission.mission_id.trim().is_empty()
+                && !mission.cohort_manifest_id.trim().is_empty()
+                && !mission.snapshot_contract_id.trim().is_empty()
+                && !mission.search_policy_snapshot_id.trim().is_empty() =>
+        {
+            Ok(())
+        }
+        _ => bail!("prediction mission identity or lane is invalid"),
+    }
 }
 
 fn verify_admitted_snapshot_identity(
@@ -277,9 +493,10 @@ fn verify_admitted_snapshot_identity(
     )
     .context("prediction snapshot manifest identity is invalid JSON")?;
     if snapshot.schema_version != "research_snapshot_v2"
-        || mission.data_snapshot_id != args.snapshot_contract_id
+        || mission.snapshot_contract_id() != args.snapshot_contract_id
         || snapshot.snapshot_contract_hash != args.snapshot_contract_id
         || snapshot.snapshot_hash != args.snapshot_digest
+        || (mission.is_pipeline_smoke() && mission.policy_identity() != args.policy_identity)
     {
         bail!("prediction mission, admitted snapshot contract, and snapshot manifest do not match");
     }
@@ -441,6 +658,21 @@ mod tests {
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
+    #[test]
+    fn execute_rejects_an_unadmitted_task_capability_before_fetching_inputs() {
+        let fixture = execute_fixture("wrong-task-capability");
+        let mut args = fixture.args;
+        args.task_capability = "unsupported_task".to_owned();
+
+        let error = execute_with_runner(args, Path::new("/runner-must-not-start"))
+            .expect_err("an unadmitted task capability must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("task capability is not admitted"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_reuses_verified_snapshot_cache_across_isolated_attempts() {
@@ -483,6 +715,7 @@ mod tests {
         let mut second = fixture.args.clone();
         second.work_dir = fixture.root.join("second-work");
         second.result_put_url = second_result.to_string_lossy().into_owned();
+        second.result_readback_url = second_result.to_string_lossy().into_owned();
         second.snapshot_cache_dir = Some(cache_dir);
         second.snapshot_url = missing_remote.to_string_lossy().into_owned();
 
@@ -583,6 +816,160 @@ mod tests {
         let names = archive.file_names().collect::<Vec<_>>();
         assert!(names.contains(&"results/summary.json"));
         assert!(names.contains(&"artifacts/execution-evidence.json"));
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.root.join("work/artifacts/execution-evidence.json")).unwrap(),
+        )
+        .unwrap();
+        let published_digest = sha256_file(&fixture.result_path).unwrap();
+        assert_eq!(evidence["bundle_sha256"], published_digest);
+        assert_eq!(
+            evidence["readback_bundle_sha256"],
+            evidence["bundle_sha256"]
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_routes_a_v3_pipeline_smoke_mission_without_the_v2_runner_shape() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = execute_fixture("pipeline-smoke");
+        let mission = serde_json::json!({
+            "schema_version": "prediction_research_mission.v3",
+            "mission_id": "btc-5m-smoke",
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "task": {"kind": "settlement_probability"},
+            "run_mode": "pipeline_smoke",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": format!("sha256:{}", "2".repeat(64)),
+            "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
+            "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
+            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+        });
+        let mission_bytes = serde_json::to_vec(&mission).unwrap();
+        let mission_path = fixture.root.join("pipeline-smoke-mission.json");
+        std::fs::write(&mission_path, &mission_bytes).unwrap();
+        fixture.args.mission_url = mission_path.to_string_lossy().into_owned();
+        fixture.args.mission_sha256 = format!("{:x}", Sha256::digest(&mission_bytes));
+        let evaluator_report = serde_json::json!({
+            "schema_version": "monday.prediction.pipeline_smoke.v1",
+            "status": "completed",
+            "scope": "pipeline_compatibility_only",
+        });
+        let evaluator_report_bytes = serde_json::to_vec(&evaluator_report).unwrap();
+        let evaluator_report_sha256 = format!("{:x}", Sha256::digest(&evaluator_report_bytes));
+        let evaluator_report_path = fixture.root.join("pipeline-smoke-report.json");
+        std::fs::write(&evaluator_report_path, evaluator_report_bytes).unwrap();
+        let runner = fixture.root.join("monday-prediction-research");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\ntest \"$1\" = '--pipeline-smoke' || exit 2\nmkdir -p \"$4/reports\"\ncp '{}' \"$4/reports/pipeline-smoke-{}.json\"\nprintf '%s\\n' '{}'\n",
+                evaluator_report_path.display(),
+                evaluator_report_sha256,
+                serde_json::json!({
+                    "schema_version": "monday.prediction.pipeline_smoke.result.v1",
+                    "status": "completed",
+                    "mission_id": "btc-5m-smoke",
+                    "task": "settlement_probability",
+                    "snapshot_contract_id": fixture.args.snapshot_contract_id,
+                    "snapshot_digest": fixture.args.snapshot_digest,
+                    "search_policy_snapshot_id": fixture.args.policy_identity,
+                    "evaluator_report_sha256": evaluator_report_sha256,
+                })
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        execute_with_runner(fixture.args, &runner).unwrap();
+
+        assert!(fixture.result_path.is_file());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_pipeline_smoke_completion_with_wrong_report_digest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = execute_fixture("pipeline-smoke-report-digest");
+        let mission = serde_json::json!({
+            "schema_version": "prediction_research_mission.v3",
+            "mission_id": "btc-5m-smoke",
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "task": {"kind": "settlement_probability"},
+            "run_mode": "pipeline_smoke",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": format!("sha256:{}", "2".repeat(64)),
+            "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
+            "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
+            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+        });
+        let mission_bytes = serde_json::to_vec(&mission).unwrap();
+        let mission_path = fixture.root.join("pipeline-smoke-mission.json");
+        std::fs::write(&mission_path, &mission_bytes).unwrap();
+        fixture.args.mission_url = mission_path.to_string_lossy().into_owned();
+        fixture.args.mission_sha256 = format!("{:x}", Sha256::digest(&mission_bytes));
+        let runner = fixture.root.join("monday-prediction-research");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nmkdir -p \"$4/reports\"\nprintf '{{}}' > \"$4/reports/pipeline-smoke-report.json\"\nprintf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "schema_version": "monday.prediction.pipeline_smoke.result.v1",
+                    "status": "completed",
+                    "mission_id": "btc-5m-smoke",
+                    "task": "settlement_probability",
+                    "snapshot_contract_id": fixture.args.snapshot_contract_id,
+                    "snapshot_digest": fixture.args.snapshot_digest,
+                    "search_policy_snapshot_id": fixture.args.policy_identity,
+                    "evaluator_report_sha256": "4".repeat(64),
+                })
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = execute_with_runner(fixture.args, &runner)
+            .expect_err("a mismatched evaluator report digest must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("evaluator report SHA256 does not match"));
+        assert!(
+            !fixture.result_path.exists(),
+            "a rejected smoke report must not occupy the immutable result object"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_a_published_result_readback_with_different_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = execute_fixture("result-readback-mismatch");
+        let runner = fixture.root.join("monday-prediction-research");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"completed\"}\\n' > \"$3/summary.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let readback = fixture.root.join("tampered-readback.zip");
+        std::fs::write(&readback, "different immutable object").unwrap();
+        fixture.args.result_readback_url = readback.to_string_lossy().into_owned();
+
+        let error = execute_with_runner(fixture.args, &runner)
+            .expect_err("a different published readback must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("published prediction result readback SHA256 mismatch"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -639,11 +1026,9 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&resumed_runner, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut retry_args = fixture.args.clone();
-        retry_args.result_put_url = fixture
-            .root
-            .join("resumed-results.zip")
-            .to_string_lossy()
-            .into_owned();
+        let resumed_result = fixture.root.join("resumed-results.zip");
+        retry_args.result_put_url = resumed_result.to_string_lossy().into_owned();
+        retry_args.result_readback_url = resumed_result.to_string_lossy().into_owned();
 
         execute_with_runner(retry_args, &resumed_runner)
             .expect("retry with no local results must ignore stale extraction");
@@ -803,10 +1188,15 @@ mod tests {
             snapshot_sha256: sha256_file(&snapshot_path).unwrap(),
             snapshot_contract_id,
             snapshot_digest: snapshot_digest.to_owned(),
+            partition_digest: format!("sha256:{}", "2".repeat(64)),
+            policy_identity: format!("sha256:{}", "3".repeat(64)),
+            task_capability: "btc_5m_backtest".to_owned(),
+            image_identity: format!("sha256:{}", "4".repeat(64)),
             snapshot_cache_dir: None,
             resume_url: None,
             resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
+            result_readback_url: result_path.to_string_lossy().into_owned(),
         };
         ExecuteFixture {
             root,

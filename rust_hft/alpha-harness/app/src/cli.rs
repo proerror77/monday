@@ -91,7 +91,7 @@ enum DataCommand {
 
 #[derive(Debug, Subcommand)]
 enum PredictionCommand {
-    Execute(PredictionExecuteArgs),
+    Execute(Box<PredictionExecuteArgs>),
     Snapshot(PredictionSnapshotArgs),
     Dispatch {
         #[command(subcommand)]
@@ -152,6 +152,14 @@ pub struct PredictionExecuteArgs {
     pub snapshot_contract_id: String,
     #[arg(long)]
     pub snapshot_digest: String,
+    #[arg(long)]
+    pub partition_digest: String,
+    #[arg(long)]
+    pub policy_identity: String,
+    #[arg(long)]
+    pub task_capability: String,
+    #[arg(long)]
+    pub image_identity: String,
     /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
     #[arg(long)]
     pub snapshot_cache_dir: Option<PathBuf>,
@@ -162,6 +170,9 @@ pub struct PredictionExecuteArgs {
     pub resume_sha256: Option<String>,
     #[arg(long)]
     pub result_put_url: String,
+    /// Independently authorized read URL for the immutable published result bundle.
+    #[arg(long)]
+    pub result_readback_url: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -655,7 +666,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Prediction { command } => match command {
             PredictionCommand::Execute(args) => {
-                tokio::task::spawn_blocking(move || prediction_runner::execute(args))
+                tokio::task::spawn_blocking(move || prediction_runner::execute(*args))
                     .await
                     .context("prediction execution worker failed")?
             }
@@ -809,7 +820,17 @@ mod tests {
             OsString::from(format!("sha256:{}", "c".repeat(64))),
             OsString::from("--snapshot-digest"),
             OsString::from("0123456789abcdef"),
+            OsString::from("--partition-digest"),
+            OsString::from(format!("sha256:{}", "d".repeat(64))),
+            OsString::from("--policy-identity"),
+            OsString::from(format!("sha256:{}", "e".repeat(64))),
+            OsString::from("--task-capability"),
+            OsString::from("btc_5m_backtest"),
+            OsString::from("--image-identity"),
+            OsString::from(format!("sha256:{}", "f".repeat(64))),
             OsString::from("--result-put-url"),
+            root.path().join("results.zip").into_os_string(),
+            OsString::from("--result-readback-url"),
             root.path().join("results.zip").into_os_string(),
         ])
         .unwrap();
@@ -993,11 +1014,21 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "--snapshot-digest",
             "0123456789abcdef",
+            "--partition-digest",
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "--policy-identity",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "--task-capability",
+            "btc_5m_backtest",
+            "--image-identity",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "--resume-url",
             "previous-results.zip",
             "--resume-sha256",
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "--result-put-url",
+            "results.zip",
+            "--result-readback-url",
             "results.zip",
         ])
         .is_ok());
