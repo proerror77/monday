@@ -319,6 +319,20 @@ impl AuthenticatedResearchSnapshot {
     pub fn snapshot_dir(&self) -> &Path {
         &self.snapshot_dir
     }
+
+    pub(crate) fn verified_readback(&self) -> Result<ResearchSnapshot, String> {
+        let snapshot = load_research_snapshot(&self.snapshot_dir)
+            .map_err(|error| format!("read authenticated research snapshot: {error:#}"))?;
+        verify_sealed_snapshot_cache(&self.snapshot_dir, &snapshot)
+            .map_err(|error| format!("verify authenticated research snapshot seal: {error:#}"))?;
+        if snapshot.manifest.snapshot_contract_hash.as_deref() != Some(&self.snapshot_contract_id)
+            || snapshot.manifest.snapshot_hash.as_deref() != Some(&self.snapshot_hash)
+            || snapshot.manifest.source_kind != self.source_kind
+        {
+            return Err("authenticated research snapshot readback identity mismatch".to_string());
+        }
+        Ok(snapshot)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -12,14 +12,15 @@ use crate::prediction_loop::{
     PredictionResearchMission, ProposalClient, ProposedProbabilityBlend,
 };
 use crate::prediction_loop_fs::{
-    atomic_write_json, next_attempt_dir, read_json, write_content_addressed_json, ArtifactRef,
-    OutputLock,
+    atomic_write_json, canonical_json_bytes, next_attempt_dir, read_json, sha256_hex,
+    verify_artifact, write_content_addressed_json, ArtifactRef, OutputLock,
 };
 use crate::prediction_mcts::{
     PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsCheckpointArtifact,
     PredictionMctsEngine, PredictionMctsEvaluation, PredictionMctsIdentity,
     PredictionMctsTrainingEvidence,
 };
+use crate::prediction_mission_v3::{AdmittedPredictionMissionV3, PredictionResearchMissionV3};
 
 const RUN_STATE_VERSION: u32 = 3;
 const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v2";
@@ -274,9 +275,56 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
 ) -> Result<LoopRunSummary, String> {
+    identity.reject_unadmitted_legacy_bridge()?;
+    run_or_resume_prediction_mcts_core(
+        mission,
+        identity,
+        None,
+        snapshot_dir,
+        output_dir,
+        client,
+        evaluator,
+        component_profile,
+    )
+}
+
+pub(crate) fn run_or_resume_authenticated_prediction_mcts<
+    C: ProposalClient,
+    E: PredictionMctsRunEvaluator,
+>(
+    mission: PredictionResearchMission,
+    identity: PredictionMctsIdentity,
+    admitted: (&PredictionResearchMissionV3, &AdmittedPredictionMissionV3),
+    output_dir: &Path,
+    client: &mut C,
+    evaluator: &mut E,
+    component_profile: SettlementProbabilityComponentProfile,
+) -> Result<LoopRunSummary, String> {
+    run_or_resume_prediction_mcts_core(
+        mission,
+        identity,
+        Some(admitted),
+        Path::new("authenticated-snapshot-view"),
+        output_dir,
+        client,
+        evaluator,
+        component_profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEvaluator>(
+    mission: PredictionResearchMission,
+    identity: PredictionMctsIdentity,
+    admitted: Option<(&PredictionResearchMissionV3, &AdmittedPredictionMissionV3)>,
+    snapshot_dir: &Path,
+    output_dir: &Path,
+    client: &mut C,
+    evaluator: &mut E,
+    component_profile: SettlementProbabilityComponentProfile,
+) -> Result<LoopRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
     identity.validate()?;
-    identity.reject_unadmitted_legacy_bridge()?;
     if identity.mission_id != mission.mission_id
         || identity.data_snapshot_id != mission.data_snapshot_id
     {
@@ -410,16 +458,30 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
         checkpoint(&state_path, &mut state)?;
     }
 
-    let mut engine = PredictionMctsEngine::new_with_identity_and_component_profile(
-        &mission,
-        identity,
-        baseline_blend(component_profile),
-        state.advisor.clone().unwrap_or_default(),
-        MCTS_SEED,
-        MCTS_EXPLORATION,
-        MCTS_MAX_DEPTH,
-        component_profile,
-    )?;
+    let mut engine = if let Some((sealed_mission, admitted)) = admitted {
+        PredictionMctsEngine::new_with_admitted_mission(
+            sealed_mission,
+            admitted,
+            &mission,
+            baseline_blend(component_profile),
+            state.advisor.clone().unwrap_or_default(),
+            MCTS_SEED,
+            MCTS_EXPLORATION,
+            MCTS_MAX_DEPTH,
+            component_profile,
+        )?
+    } else {
+        PredictionMctsEngine::new_with_identity_and_component_profile(
+            &mission,
+            identity,
+            baseline_blend(component_profile),
+            state.advisor.clone().unwrap_or_default(),
+            MCTS_SEED,
+            MCTS_EXPLORATION,
+            MCTS_MAX_DEPTH,
+            component_profile,
+        )?
+    };
     if let Some(saved) = state.checkpoint.clone() {
         engine.restore_checkpoint(saved)?;
     } else {
@@ -509,7 +571,7 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
     ))
 }
 
-fn task_output_dir(
+pub(crate) fn task_output_dir(
     output_dir: &Path,
     identity: &PredictionMctsIdentity,
 ) -> Result<PathBuf, String> {
@@ -539,6 +601,38 @@ fn task_output_dir(
         }
     };
     Ok(output_dir.join("mcts-v4").join(mission_sha256).join(task))
+}
+
+#[derive(Debug)]
+pub(crate) struct PredictionMctsSelectionEvidence {
+    pub checkpoint_sha256: String,
+    pub selected_candidate_sha256: String,
+    pub held_out_complete: bool,
+}
+
+pub(crate) fn authenticated_selection_evidence(
+    output_dir: &Path,
+    identity: &PredictionMctsIdentity,
+) -> Result<PredictionMctsSelectionEvidence, String> {
+    let output_dir = task_output_dir(output_dir, identity)?;
+    let state: PredictionMctsRunState = read_json(&output_dir.join("prediction-mcts-state.json"))?;
+    if state.identity()? != *identity {
+        return Err("prediction MCTS selection identity mismatch".to_string());
+    }
+    state.read_only_artifact()?;
+    let selected = state
+        .selected
+        .as_ref()
+        .ok_or_else(|| "held-out view is unavailable before candidate selection".to_string())?;
+    let checkpoint = state.checkpoint_artifact.as_ref().ok_or_else(|| {
+        "held-out view is unavailable before the selection checkpoint is durable".to_string()
+    })?;
+    verify_artifact(&output_dir, checkpoint)?;
+    Ok(PredictionMctsSelectionEvidence {
+        checkpoint_sha256: checkpoint.sha256.clone(),
+        selected_candidate_sha256: sha256_hex(&canonical_json_bytes(selected)?),
+        held_out_complete: state.held_out_complete,
+    })
 }
 
 fn baseline_blend(
@@ -838,6 +932,12 @@ mod tests {
         )
         .expect("retryable pause");
         assert_eq!(first_summary.status, LoopRunStatus::Paused);
+        let selection_error = authenticated_selection_evidence(
+            &output,
+            &PredictionMctsIdentity::from_mission(&mission(2, 1)).unwrap(),
+        )
+        .expect_err("held-out evidence must remain unavailable before selection");
+        assert!(selection_error.contains("before candidate selection"));
         let pending = first.candidate_ids[0].clone();
 
         let mut resumed = FakeEvaluator::default();

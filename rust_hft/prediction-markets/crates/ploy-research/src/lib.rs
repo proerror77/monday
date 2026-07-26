@@ -20,6 +20,7 @@ pub mod prediction_llm;
 pub mod prediction_loop;
 mod prediction_loop_fs;
 pub mod prediction_mcts;
+pub mod prediction_mcts_authenticated;
 pub mod prediction_mcts_run;
 pub mod prediction_mission_v3;
 mod prediction_policy_identity;
