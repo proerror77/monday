@@ -45,6 +45,8 @@ const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
+const OSS_READBACK_ATTEMPTS: usize = 3;
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1737,8 +1739,21 @@ fn verify_remote_artifacts_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let (_verify_dir, downloaded) = download_remote_artifacts_with(artifacts, config, runner)?;
-    verify_downloaded_artifacts(artifacts, &downloaded)
+    let mut last_error = None;
+    for attempt in 0..OSS_READBACK_ATTEMPTS {
+        match download_remote_artifacts_with(artifacts, config, runner) {
+            Ok((_verify_dir, downloaded)) => {
+                return verify_downloaded_artifacts(artifacts, &downloaded);
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < OSS_READBACK_ATTEMPTS {
+            std::thread::sleep(OSS_READBACK_RETRY_DELAY);
+        }
+    }
+    Err(last_error
+        .expect("readback retry loop must record an error")
+        .context("remote artifacts remained unreadable after bounded retries"))
 }
 
 fn remote_artifacts_exist_and_match_with<F>(
@@ -3181,6 +3196,82 @@ mod tests {
 
         assert_eq!((uploads, downloads), (3, 4));
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn newly_uploaded_triplet_retries_transient_readback_miss() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut remote = BTreeMap::<String, Vec<u8>>::new();
+        let mut uploads = 0;
+        let mut post_upload_downloads = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                if uploads == 0 || post_upload_downloads == 0 {
+                    post_upload_downloads += usize::from(uploads > 0);
+                    bail!("NoSuchKey");
+                }
+                post_upload_downloads += 1;
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                fs::write(&args[3], &remote[name])?;
+            } else {
+                let name = Path::new(&args[3])
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                remote.insert(name, fs::read(&args[2])?);
+                uploads += 1;
+            }
+            Ok(success_status())
+        };
+
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        assert_eq!(uploads, 3);
+        assert_eq!(post_upload_downloads, 4);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn remote_readback_retries_are_bounded() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut attempts = 0;
+        let error = verify_remote_artifacts_with(&artifacts, &config, &mut |_, _| {
+            attempts += 1;
+            bail!("NoSuchKey")
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, OSS_READBACK_ATTEMPTS);
+        assert!(error
+            .to_string()
+            .contains("remote artifacts remained unreadable after bounded retries"));
+        assert!(source.exists());
     }
 
     #[test]
