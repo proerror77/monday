@@ -234,7 +234,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 40] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 41] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -292,6 +292,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 40] {
         (
             "crates/ploy-market-data/src/polymarket_evidence/set.rs",
             include_bytes!("../../ploy-market-data/src/polymarket_evidence/set.rs"),
+        ),
+        (
+            "crates/ploy-market-data/src/polymarket_evidence/catalog.rs",
+            include_bytes!("../../ploy-market-data/src/polymarket_evidence/catalog.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_loop.rs",
@@ -4167,6 +4171,7 @@ mod tests {
             "crates/ploy-market-data/src/polymarket_evidence/wire.rs",
             "crates/ploy-market-data/src/polymarket_evidence/verified.rs",
             "crates/ploy-market-data/src/polymarket_evidence/set.rs",
+            "crates/ploy-market-data/src/polymarket_evidence/catalog.rs",
         ] {
             assert!(paths.contains(&path));
         }

@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     prediction_loop::{current_prediction_policy_snapshot_id, validate_sha256_id},
     prediction_loop_fs::{
-        canonical_json_bytes, read_verified_artifact_bounded, sha256_hex,
+        canonical_json_bytes, read_verified_artifact_bounded, relative_path, sha256_hex,
         write_content_addressed_json, ArtifactRef,
     },
 };
@@ -305,8 +305,14 @@ pub fn write_catalog_partition_artifact(
             "catalog partition artifact exceeds {MAX_CATALOG_PARTITION_ARTIFACT_BYTES} bytes"
         ));
     }
+    let expected_path = relative_path(
+        output_root,
+        &directory.join(format!("catalog-partition-{}.json", sha256_hex(&bytes))),
+    )?;
+    validate_catalog_partition_artifact_path(&expected_path)?;
     let artifact =
         write_content_addressed_json(output_root, directory, "catalog-partition", &envelope)?;
+    debug_assert_eq!(artifact.path, expected_path);
     Ok(CatalogPartitionArtifactRef {
         path: artifact.path,
         artifact_sha256: format!("sha256:{}", artifact.sha256),
@@ -319,9 +325,7 @@ pub fn read_catalog_partition_artifact(
     output_root: &Path,
     artifact: &CatalogPartitionArtifactRef,
 ) -> Result<ValidatedCatalogPartitionArtifact, String> {
-    if artifact.path.len() > MAX_CATALOG_PARTITION_ARTIFACT_PATH_BYTES {
-        return Err("catalog partition artifact path exceeds the bounded length".into());
-    }
+    validate_catalog_partition_artifact_path(&artifact.path)?;
     validate_sha256_id(
         &artifact.artifact_sha256,
         "catalog partition artifact identity",
@@ -370,9 +374,16 @@ pub fn read_catalog_partition_artifact(
         catalog_receipts,
         partition,
     } = envelope.payload;
+    if catalog_receipts.len() > MAX_READY_CATALOG_ENTRIES {
+        return Err("persisted ready catalog exceeds the bounded entry count".into());
+    }
+    if partition.ready_entries.len() > MAX_READY_CATALOG_ENTRIES {
+        return Err("event cohort partition exceeds the bounded Ready entry count".into());
+    }
     let catalog = PolymarketReadyEventCatalog::from_persisted_ready_receipts(catalog_receipts)
         .map_err(|error| format!("validate persisted ready catalog: {error}"))?;
     let partition = partition.into_partition()?;
+    validate_catalog_partition_write_bounds(&catalog, &partition)?;
     if policy_snapshot_id != partition.causal_projection_policy_id() {
         return Err("artifact policy identity does not match partition".into());
     }
@@ -381,6 +392,13 @@ pub fn read_catalog_partition_artifact(
     }
     validate_catalog_partition_membership(&catalog, &partition)?;
     Ok(ValidatedCatalogPartitionArtifact { catalog, partition })
+}
+
+fn validate_catalog_partition_artifact_path(path: &str) -> Result<(), String> {
+    if path.len() > MAX_CATALOG_PARTITION_ARTIFACT_PATH_BYTES {
+        return Err("catalog partition artifact path exceeds the bounded length".into());
+    }
+    Ok(())
 }
 
 fn validate_catalog_partition_membership(
@@ -682,6 +700,7 @@ mod tests {
         read_catalog_partition_artifact, write_catalog_partition_artifact,
         CatalogPartitionArtifactEnvelope, CatalogPartitionArtifactRef, EventCohortPartition,
         EventCohortPartitionPayload, EventCohortReadyEntry, EVENT_COHORT_PARTITION_VERSION,
+        MAX_READY_CATALOG_ENTRIES,
     };
 
     fn ready_receipt(
@@ -999,6 +1018,113 @@ mod tests {
                 .expect_err("partition cannot add a receipt absent from the catalog")
                 .contains("does not contain every Ready catalog receipt")
         );
+    }
+
+    #[test]
+    fn persisted_catalog_partition_artifact_rejects_correctly_hashed_oversized_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = persisted_ready_catalog_fixture();
+        let end = catalog
+            .receipts()
+            .next()
+            .unwrap()
+            .event_end
+            .unwrap()
+            .timestamp_millis();
+        let partition = EventCohortPartition::from_ready_catalog(&catalog, end + 3_000).unwrap();
+        let artifact = write_catalog_partition_artifact(
+            root.path(),
+            &root.path().join("evidence"),
+            &catalog,
+            &partition,
+        )
+        .unwrap();
+        let envelope_bytes = std::fs::read(root.path().join(artifact.path())).unwrap();
+
+        let mut oversized_catalog: CatalogPartitionArtifactEnvelope =
+            serde_json::from_slice(&envelope_bytes).unwrap();
+        let receipt = oversized_catalog.payload.catalog_receipts[0].clone();
+        oversized_catalog.payload.catalog_receipts = vec![receipt; MAX_READY_CATALOG_ENTRIES + 1];
+        oversized_catalog.payload_sha256 = format!(
+            "sha256:{}",
+            sha256_hex(&canonical_json_bytes(&oversized_catalog.payload).unwrap())
+        );
+        let oversized_catalog_ref = write_content_addressed_json(
+            root.path(),
+            &root.path().join("evidence"),
+            "catalog-partition",
+            &oversized_catalog,
+        )
+        .unwrap();
+        let oversized_catalog_ref = CatalogPartitionArtifactRef {
+            path: oversized_catalog_ref.path,
+            artifact_sha256: format!("sha256:{}", oversized_catalog_ref.sha256),
+            payload_sha256: oversized_catalog.payload_sha256,
+        };
+        assert!(
+            read_catalog_partition_artifact(root.path(), &oversized_catalog_ref)
+                .expect_err("an oversized canonical catalog must fail before receipt admission")
+                .contains("persisted ready catalog exceeds the bounded entry count")
+        );
+
+        let mut oversized_partition: CatalogPartitionArtifactEnvelope =
+            serde_json::from_slice(&envelope_bytes).unwrap();
+        let entry = oversized_partition.payload.partition.ready_entries[0].clone();
+        oversized_partition.payload.partition.ready_entries =
+            vec![entry; MAX_READY_CATALOG_ENTRIES + 1];
+        let persisted = &mut oversized_partition.payload.partition;
+        let partition_payload = EventCohortPartitionPayload {
+            schema_version: EVENT_COHORT_PARTITION_VERSION,
+            ready_entries: &persisted.ready_entries,
+            common_time_boundary_ms: persisted.common_time_boundary_ms,
+            label_availability_cutoff_ms: persisted.label_availability_cutoff_ms,
+            causal_projection_policy_id: &persisted.causal_projection_policy_id,
+            train_market_ids: &persisted.train_market_ids,
+            crossing_excluded_market_ids: &persisted.crossing_excluded_market_ids,
+            held_out_market_ids: &persisted.held_out_market_ids,
+        };
+        persisted.digest = format!(
+            "sha256:{}",
+            sha256_hex(&canonical_json_bytes(&partition_payload).unwrap())
+        );
+        oversized_partition.payload_sha256 = format!(
+            "sha256:{}",
+            sha256_hex(&canonical_json_bytes(&oversized_partition.payload).unwrap())
+        );
+        let oversized_partition_ref = write_content_addressed_json(
+            root.path(),
+            &root.path().join("evidence"),
+            "catalog-partition",
+            &oversized_partition,
+        )
+        .unwrap();
+        let oversized_partition_ref = CatalogPartitionArtifactRef {
+            path: oversized_partition_ref.path,
+            artifact_sha256: format!("sha256:{}", oversized_partition_ref.sha256),
+            payload_sha256: oversized_partition.payload_sha256,
+        };
+        assert!(
+            read_catalog_partition_artifact(root.path(), &oversized_partition_ref)
+                .expect_err(
+                    "an oversized canonical partition must fail before membership admission"
+                )
+                .contains("event cohort partition exceeds the bounded Ready entry count")
+        );
+    }
+
+    #[test]
+    fn catalog_partition_writer_rejects_an_oversized_relative_artifact_path() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = PolymarketReadyEventCatalog::default();
+        let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000).unwrap();
+        let directory = root.path().join(vec!["nested"; 200].join("/"));
+
+        assert!(
+            write_catalog_partition_artifact(root.path(), &directory, &catalog, &partition)
+                .expect_err("the writer must reject an artifact reference it cannot safely return")
+                .contains("catalog partition artifact path exceeds the bounded length")
+        );
+        assert!(!directory.exists());
     }
 
     #[test]
