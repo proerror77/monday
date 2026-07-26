@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ use crate::{
     project_verified_binance_market_tape, project_verified_polymarket_evidence,
     DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot, ResearchPolymarketContract,
     ResearchPolymarketSettlement, VerifiedArtifactAuditRequest,
+};
+use crate::{
+    prediction_loop_fs::{canonical_json_bytes, sha256_hex},
+    EventCohortPartition,
 };
 
 pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v2";
@@ -173,6 +177,623 @@ pub struct ResearchSnapshotRequest<'a> {
     pub max_quote_age_secs: i64,
     pub stake_usd: f64,
     pub require_official_settlement: bool,
+}
+
+const AUTHENTICATED_SNAPSHOT_CACHE_VERSION: &str = "authenticated_research_snapshot_cache.v1";
+const AUTHENTICATED_SNAPSHOT_SYMBOL: &str = "BTCUSDT";
+const AUTHENTICATED_SNAPSHOT_WINDOW_SECS: i64 = 300;
+const AUTHENTICATED_COHORT_ARTIFACT: &str = "authenticated_ready_event_cohort";
+const AUTHENTICATED_PARTITION_ARTIFACT: &str = "event_cohort_partition";
+const AUTHENTICATED_COMPILER_SOURCE_ARTIFACT: &str = "research_snapshot_compiler_source";
+const AUTHENTICATED_COMPILER_IMAGE_ARTIFACT: &str = "research_snapshot_compiler_image";
+
+/// A catalog-and-partition identity whose fields can only be assembled from an
+/// authenticated ready-event catalog.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedReadyEventCohort {
+    manifest_id: String,
+    partition_digest: String,
+    causal_projection_policy_id: String,
+    members: Vec<AuthenticatedReadyEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedReadyEvent {
+    receipt_sha256: String,
+    market_id: String,
+    content_sha256: String,
+    manifest_sha256: String,
+    qualification_sha256: String,
+    success_sha256: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    up_token_id: String,
+    down_token_id: String,
+}
+
+impl AuthenticatedReadyEventCohort {
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+}
+
+/// Stable caller input for the filesystem cache. Compiler identities are
+/// treated as opaque immutable strings and are bound into the snapshot
+/// evaluator contract before admission.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedSnapshotMaterializationRequest {
+    pub cache_root: PathBuf,
+    pub compiler_source_identity: String,
+    pub compiler_image_identity: String,
+}
+
+/// The only successful result of snapshot admission. Its fields are private so
+/// callers cannot manufacture evidence without catalog authentication and a
+/// fresh snapshot readback.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedResearchSnapshot {
+    cohort_manifest_id: String,
+    snapshot_contract_id: String,
+    snapshot_hash: String,
+    snapshot_dir: PathBuf,
+}
+
+impl AuthenticatedResearchSnapshot {
+    pub fn cohort_manifest_id(&self) -> &str {
+        &self.cohort_manifest_id
+    }
+
+    pub fn snapshot_contract_id(&self) -> &str {
+        &self.snapshot_contract_id
+    }
+
+    pub fn snapshot_hash(&self) -> &str {
+        &self.snapshot_hash
+    }
+
+    pub fn snapshot_dir(&self) -> &Path {
+        &self.snapshot_dir
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticatedResearchSnapshotRejection {
+    CatalogPartitionMismatch { reason: String },
+    InsufficientCohort { reason: String },
+    UnsupportedTask { reason: String },
+    PartialOrRejectedEvent { reason: String },
+    FutureReferenceExposure { reason: String },
+    TokenMismatch { reason: String },
+    CorruptCachedSnapshot { reason: String },
+    MaterializationFailed { reason: String },
+    SnapshotRejected { reason: String },
+}
+
+#[derive(Serialize)]
+struct AuthenticatedCohortPayload<'a> {
+    schema_version: &'static str,
+    partition_digest: &'a str,
+    causal_projection_policy_id: &'a str,
+    members: &'a [AuthenticatedReadyEvent],
+}
+
+impl Serialize for AuthenticatedReadyEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        (
+            &self.receipt_sha256,
+            &self.market_id,
+            &self.content_sha256,
+            &self.manifest_sha256,
+            &self.qualification_sha256,
+            &self.success_sha256,
+            self.start,
+            self.end,
+            &self.up_token_id,
+            &self.down_token_id,
+        )
+            .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct AuthenticatedSnapshotCacheKey<'a> {
+    schema_version: &'static str,
+    cohort_manifest_id: &'a str,
+    partition_digest: &'a str,
+    causal_projection_policy_id: &'a str,
+    compiler_source_identity: &'a str,
+    compiler_image_identity: &'a str,
+    research_snapshot_schema_version: &'static str,
+}
+
+/// Authenticate #319's ready catalog against #322's already-derived
+/// partition. This validates membership only; it never derives or resplits a
+/// partition from snapshot rows.
+pub fn authenticate_ready_event_cohort(
+    catalog: &ploy_market_data::polymarket_evidence::PolymarketReadyEventCatalog,
+    partition: &EventCohortPartition,
+) -> std::result::Result<AuthenticatedReadyEventCohort, AuthenticatedResearchSnapshotRejection> {
+    use ploy_market_data::polymarket_evidence::{
+        PolymarketCatalogReceiptState, PolymarketResearchTask,
+    };
+
+    let ready = catalog
+        .receipts()
+        .filter(|receipt| receipt.state == PolymarketCatalogReceiptState::Ready)
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Err(AuthenticatedResearchSnapshotRejection::InsufficientCohort {
+            reason: "ready-event catalog has no Ready entries".to_string(),
+        });
+    }
+    if ready.len() != partition.ready_entries().len() {
+        return Err(
+            AuthenticatedResearchSnapshotRejection::CatalogPartitionMismatch {
+                reason: "partition does not contain every Ready catalog entry".to_string(),
+            },
+        );
+    }
+
+    let validate_digest = |value: &str, field: &str| {
+        crate::prediction_loop::validate_sha256_id(&format!("sha256:{value}"), field).map_err(
+            |reason| AuthenticatedResearchSnapshotRejection::CatalogPartitionMismatch { reason },
+        )
+    };
+    let mut members = Vec::with_capacity(ready.len());
+    for (receipt, entry) in ready.into_iter().zip(partition.ready_entries()) {
+        let reject = |reason: String| {
+            AuthenticatedResearchSnapshotRejection::CatalogPartitionMismatch { reason }
+        };
+        validate_digest(&receipt.receipt_sha256, "catalog receipt_sha256")?;
+        validate_digest(&receipt.content_sha256, "catalog content_sha256")?;
+        validate_digest(&receipt.manifest_sha256, "catalog manifest_sha256")?;
+        validate_digest(
+            &receipt.qualification_sha256,
+            "catalog qualification_sha256",
+        )?;
+        let success_sha256 = receipt.success_sha256.as_deref().ok_or_else(|| {
+            reject(format!(
+                "ready market {} is missing success_sha256",
+                receipt.market_id
+            ))
+        })?;
+        validate_digest(success_sha256, "catalog success_sha256")?;
+        let start = receipt.event_start.ok_or_else(|| {
+            reject(format!(
+                "ready market {} is missing event_start",
+                receipt.market_id
+            ))
+        })?;
+        let end = receipt.event_end.ok_or_else(|| {
+            reject(format!(
+                "ready market {} is missing event_end",
+                receipt.market_id
+            ))
+        })?;
+        if receipt.receipt_sha256 != entry.receipt_sha256()
+            || receipt.market_id != entry.market_id()
+            || start.timestamp_millis() != entry.reference_path_start_ms()
+            || end.timestamp_millis() != entry.reference_path_end_ms()
+        {
+            return Err(reject(format!(
+                "partition entry does not match authenticated catalog market {}",
+                receipt.market_id
+            )));
+        }
+        if !receipt
+            .supported_tasks
+            .contains(&PolymarketResearchTask::Btc5mBacktest)
+        {
+            continue;
+        }
+        if end - start != Duration::seconds(AUTHENTICATED_SNAPSHOT_WINDOW_SECS) {
+            return Err(AuthenticatedResearchSnapshotRejection::UnsupportedTask {
+                reason: format!(
+                    "ready market {} is not a 300-second event",
+                    receipt.market_id
+                ),
+            });
+        }
+        let up_token_id = receipt.up_token_id.as_deref().ok_or_else(|| {
+            reject(format!(
+                "ready market {} is missing its Up token",
+                receipt.market_id
+            ))
+        })?;
+        let down_token_id = receipt.down_token_id.as_deref().ok_or_else(|| {
+            reject(format!(
+                "ready market {} is missing its Down token",
+                receipt.market_id
+            ))
+        })?;
+        if up_token_id.is_empty() || down_token_id.is_empty() || up_token_id == down_token_id {
+            return Err(AuthenticatedResearchSnapshotRejection::TokenMismatch {
+                reason: format!(
+                    "ready market {} has invalid Up/Down token identity",
+                    receipt.market_id
+                ),
+            });
+        }
+        members.push(AuthenticatedReadyEvent {
+            receipt_sha256: receipt.receipt_sha256.clone(),
+            market_id: receipt.market_id.clone(),
+            content_sha256: receipt.content_sha256.clone(),
+            manifest_sha256: receipt.manifest_sha256.clone(),
+            qualification_sha256: receipt.qualification_sha256.clone(),
+            success_sha256: success_sha256.to_string(),
+            start,
+            end,
+            up_token_id: up_token_id.to_string(),
+            down_token_id: down_token_id.to_string(),
+        });
+    }
+    if members.is_empty() {
+        return Err(AuthenticatedResearchSnapshotRejection::InsufficientCohort {
+            reason: "ready-event catalog has no BTC x 300-second entries".to_string(),
+        });
+    }
+    let payload = AuthenticatedCohortPayload {
+        schema_version: AUTHENTICATED_SNAPSHOT_CACHE_VERSION,
+        partition_digest: partition.digest(),
+        causal_projection_policy_id: partition.causal_projection_policy_id(),
+        members: &members,
+    };
+    let manifest_id = format!(
+        "sha256:{}",
+        sha256_hex(&canonical_json_bytes(&payload).map_err(|error| {
+            AuthenticatedResearchSnapshotRejection::CatalogPartitionMismatch { reason: error }
+        })?,)
+    );
+    Ok(AuthenticatedReadyEventCohort {
+        manifest_id,
+        partition_digest: partition.digest().to_string(),
+        causal_projection_policy_id: partition.causal_projection_policy_id().to_string(),
+        members,
+    })
+}
+
+/// Write once or reuse a verified content-addressed cache entry. A cache hit is
+/// always read and rehashed before its opaque handle is returned.
+pub fn materialize_authenticated_research_snapshot<F>(
+    cohort: &AuthenticatedReadyEventCohort,
+    request: &AuthenticatedSnapshotMaterializationRequest,
+    build: F,
+) -> std::result::Result<AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection>
+where
+    F: FnOnce() -> Result<ResearchSnapshot>,
+{
+    if request.compiler_source_identity.trim().is_empty()
+        || request.compiler_source_identity.trim() != request.compiler_source_identity
+        || request.compiler_image_identity.trim().is_empty()
+        || request.compiler_image_identity.trim() != request.compiler_image_identity
+    {
+        return Err(
+            AuthenticatedResearchSnapshotRejection::MaterializationFailed {
+                reason: "compiler identities must be trimmed non-empty strings".to_string(),
+            },
+        );
+    }
+    let key = AuthenticatedSnapshotCacheKey {
+        schema_version: AUTHENTICATED_SNAPSHOT_CACHE_VERSION,
+        cohort_manifest_id: &cohort.manifest_id,
+        partition_digest: &cohort.partition_digest,
+        causal_projection_policy_id: &cohort.causal_projection_policy_id,
+        compiler_source_identity: &request.compiler_source_identity,
+        compiler_image_identity: &request.compiler_image_identity,
+        research_snapshot_schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+    };
+    let cache_key = sha256_hex(&canonical_json_bytes(&key).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::MaterializationFailed { reason: error }
+    })?);
+    let snapshot_dir = request.cache_root.join(format!("sha256={cache_key}"));
+    if snapshot_dir.exists() {
+        let snapshot = load_research_snapshot(&snapshot_dir).map_err(|error| {
+            AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+                reason: error.to_string(),
+            }
+        })?;
+        validate_authenticated_snapshot(&snapshot, cohort, request, true)?;
+        return admitted_snapshot(cohort, &snapshot, snapshot_dir);
+    }
+
+    let mut snapshot =
+        build().map_err(
+            |error| AuthenticatedResearchSnapshotRejection::MaterializationFailed {
+                reason: error.to_string(),
+            },
+        )?;
+    bind_authenticated_snapshot_identity(&mut snapshot, cohort, request)?;
+    validate_authenticated_snapshot(&snapshot, cohort, request, true)?;
+    write_research_snapshot(&snapshot_dir, snapshot).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::MaterializationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let snapshot = load_research_snapshot(&snapshot_dir).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+            reason: error.to_string(),
+        }
+    })?;
+    validate_authenticated_snapshot(&snapshot, cohort, request, true)?;
+    mark_snapshot_cache_read_only(&snapshot_dir, &snapshot).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::MaterializationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    admitted_snapshot(cohort, &snapshot, snapshot_dir)
+}
+
+fn bind_authenticated_snapshot_identity(
+    snapshot: &mut ResearchSnapshot,
+    cohort: &AuthenticatedReadyEventCohort,
+    request: &AuthenticatedSnapshotMaterializationRequest,
+) -> std::result::Result<(), AuthenticatedResearchSnapshotRejection> {
+    let reserved = [
+        AUTHENTICATED_COHORT_ARTIFACT,
+        AUTHENTICATED_PARTITION_ARTIFACT,
+        AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,
+        AUTHENTICATED_COMPILER_IMAGE_ARTIFACT,
+    ];
+    if snapshot
+        .manifest
+        .input_artifacts
+        .iter()
+        .any(|artifact| reserved.contains(&artifact.name.as_str()))
+    {
+        return Err(AuthenticatedResearchSnapshotRejection::SnapshotRejected {
+            reason: "snapshot already declares an authenticated materialization identity"
+                .to_string(),
+        });
+    }
+    snapshot.manifest.input_artifacts.extend([
+        ResearchSnapshotInputArtifact {
+            name: AUTHENTICATED_COHORT_ARTIFACT.to_string(),
+            path: "authenticated://ready-event-cohort".to_string(),
+            content_hash: Some(cohort.manifest_id.clone()),
+            row_count: Some(cohort.members.len()),
+        },
+        ResearchSnapshotInputArtifact {
+            name: AUTHENTICATED_PARTITION_ARTIFACT.to_string(),
+            path: "authenticated://event-cohort-partition".to_string(),
+            content_hash: Some(cohort.partition_digest.clone()),
+            row_count: Some(cohort.members.len()),
+        },
+        ResearchSnapshotInputArtifact {
+            name: AUTHENTICATED_COMPILER_SOURCE_ARTIFACT.to_string(),
+            path: request.compiler_source_identity.clone(),
+            content_hash: None,
+            row_count: None,
+        },
+        ResearchSnapshotInputArtifact {
+            name: AUTHENTICATED_COMPILER_IMAGE_ARTIFACT.to_string(),
+            path: request.compiler_image_identity.clone(),
+            content_hash: None,
+            row_count: None,
+        },
+    ]);
+    Ok(())
+}
+
+fn validate_authenticated_snapshot(
+    snapshot: &ResearchSnapshot,
+    cohort: &AuthenticatedReadyEventCohort,
+    request: &AuthenticatedSnapshotMaterializationRequest,
+    require_identity: bool,
+) -> std::result::Result<(), AuthenticatedResearchSnapshotRejection> {
+    if snapshot.manifest.schema_version != RESEARCH_SNAPSHOT_SCHEMA_VERSION
+        || snapshot.manifest.symbols.as_slice() != [AUTHENTICATED_SNAPSHOT_SYMBOL]
+    {
+        return Err(AuthenticatedResearchSnapshotRejection::UnsupportedTask {
+            reason: "authenticated materialization supports only BTC x 300-second snapshots"
+                .to_string(),
+        });
+    }
+    if require_identity {
+        let artifacts = snapshot
+            .manifest
+            .input_artifacts
+            .iter()
+            .map(|artifact| (artifact.name.as_str(), artifact))
+            .collect::<BTreeMap<_, _>>();
+        let expected = [
+            (
+                AUTHENTICATED_COHORT_ARTIFACT,
+                "authenticated://ready-event-cohort",
+                Some(cohort.manifest_id.as_str()),
+            ),
+            (
+                AUTHENTICATED_PARTITION_ARTIFACT,
+                "authenticated://event-cohort-partition",
+                Some(cohort.partition_digest.as_str()),
+            ),
+            (
+                AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,
+                request.compiler_source_identity.as_str(),
+                None,
+            ),
+            (
+                AUTHENTICATED_COMPILER_IMAGE_ARTIFACT,
+                request.compiler_image_identity.as_str(),
+                None,
+            ),
+        ];
+        for (name, path, content_hash) in expected {
+            let artifact = artifacts.get(name).ok_or_else(|| {
+                AuthenticatedResearchSnapshotRejection::SnapshotRejected {
+                    reason: format!("snapshot is missing {name} identity"),
+                }
+            })?;
+            if artifact.path != path || artifact.content_hash.as_deref() != content_hash {
+                return Err(AuthenticatedResearchSnapshotRejection::SnapshotRejected {
+                    reason: format!("snapshot {name} identity does not match this request"),
+                });
+            }
+        }
+    }
+    let events = cohort
+        .members
+        .iter()
+        .map(|member| (member.market_id.as_str(), member))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed = BTreeMap::<&str, ()>::new();
+    for row in &snapshot.observations {
+        let member = events.get(row.event_id.as_str()).ok_or_else(|| {
+            AuthenticatedResearchSnapshotRejection::PartialOrRejectedEvent {
+                reason: format!(
+                    "snapshot observation references unauthenticated event {}",
+                    row.event_id
+                ),
+            }
+        })?;
+        if row.symbol != AUTHENTICATED_SNAPSHOT_SYMBOL
+            || row.event_window_secs != AUTHENTICATED_SNAPSHOT_WINDOW_SECS
+        {
+            return Err(AuthenticatedResearchSnapshotRejection::UnsupportedTask {
+                reason: format!(
+                    "snapshot observation for {} is not BTC x 300 seconds",
+                    row.event_id
+                ),
+            });
+        }
+        if row.up_token_id != member.up_token_id || row.down_token_id != member.down_token_id {
+            return Err(AuthenticatedResearchSnapshotRejection::TokenMismatch {
+                reason: format!(
+                    "snapshot observation token identity mismatches {}",
+                    row.event_id
+                ),
+            });
+        }
+        if row.event_end_ts != Some(member.end)
+            || row.tick_ts < member.start
+            || row.tick_ts >= member.end
+        {
+            return Err(
+                AuthenticatedResearchSnapshotRejection::FutureReferenceExposure {
+                    reason: format!(
+                        "snapshot observation for {} crosses its event reference window",
+                        row.event_id
+                    ),
+                },
+            );
+        }
+        observed.insert(member.market_id.as_str(), ());
+    }
+    let mut books = BTreeMap::<&str, (bool, bool)>::new();
+    for book in &snapshot.pm_book_snapshots {
+        let member = events.get(book.event_id.as_str()).ok_or_else(|| {
+            AuthenticatedResearchSnapshotRejection::PartialOrRejectedEvent {
+                reason: format!(
+                    "snapshot book references unauthenticated event {}",
+                    book.event_id
+                ),
+            }
+        })?;
+        if book.ts < member.start || book.ts >= member.end {
+            return Err(
+                AuthenticatedResearchSnapshotRejection::FutureReferenceExposure {
+                    reason: format!(
+                        "snapshot book for {} crosses its event reference window",
+                        book.event_id
+                    ),
+                },
+            );
+        }
+        if book.bids.is_empty() || book.asks.is_empty() {
+            return Err(
+                AuthenticatedResearchSnapshotRejection::PartialOrRejectedEvent {
+                    reason: format!(
+                        "snapshot book for {} lacks full bid/ask depth",
+                        book.event_id
+                    ),
+                },
+            );
+        }
+        let sides = books.entry(member.market_id.as_str()).or_default();
+        match (book.token_id.as_str(), book.side.as_str()) {
+            (token, "UP") if token == member.up_token_id => sides.0 = true,
+            (token, "DOWN") if token == member.down_token_id => sides.1 = true,
+            _ => {
+                return Err(AuthenticatedResearchSnapshotRejection::TokenMismatch {
+                    reason: format!("snapshot book token identity mismatches {}", book.event_id),
+                })
+            }
+        }
+    }
+    for member in &cohort.members {
+        if !observed.contains_key(member.market_id.as_str()) {
+            return Err(AuthenticatedResearchSnapshotRejection::InsufficientCohort {
+                reason: format!("snapshot has no observation for {}", member.market_id),
+            });
+        }
+        if books.get(member.market_id.as_str()) != Some(&(true, true)) {
+            return Err(
+                AuthenticatedResearchSnapshotRejection::PartialOrRejectedEvent {
+                    reason: format!(
+                        "snapshot lacks paired Up/Down books for {}",
+                        member.market_id
+                    ),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn admitted_snapshot(
+    cohort: &AuthenticatedReadyEventCohort,
+    snapshot: &ResearchSnapshot,
+    snapshot_dir: PathBuf,
+) -> std::result::Result<AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection> {
+    let snapshot_contract_id = snapshot
+        .manifest
+        .snapshot_contract_hash
+        .clone()
+        .ok_or_else(
+            || AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+                reason: "verified snapshot is missing snapshot_contract_hash".to_string(),
+            },
+        )?;
+    let snapshot_hash = snapshot.manifest.snapshot_hash.clone().ok_or_else(|| {
+        AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+            reason: "verified snapshot is missing snapshot_hash".to_string(),
+        }
+    })?;
+    Ok(AuthenticatedResearchSnapshot {
+        cohort_manifest_id: cohort.manifest_id.clone(),
+        snapshot_contract_id,
+        snapshot_hash,
+        snapshot_dir,
+    })
+}
+
+fn mark_snapshot_cache_read_only(snapshot_dir: &Path, snapshot: &ResearchSnapshot) -> Result<()> {
+    let mut paths = vec![
+        snapshot_dir.join("manifest.json"),
+        snapshot_dir.join(&snapshot.manifest.artifacts.observations_json),
+        snapshot_dir.join(&snapshot.manifest.artifacts.deribit_snapshots_json),
+        snapshot_dir.join(&snapshot.manifest.artifacts.pm_book_snapshots_json),
+        snapshot_dir.join(&snapshot.manifest.artifacts.query_timings_json),
+        snapshot_dir.join(&snapshot.manifest.artifacts.quality_markdown),
+    ];
+    if let Some(parquet) = &snapshot.manifest.artifacts.observations_parquet {
+        paths.push(snapshot_dir.join(parquet));
+    }
+    for path in paths {
+        let mut permissions = fs::metadata(&path)
+            .with_context(|| format!("inspect authenticated snapshot cache {}", path.display()))?
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).with_context(|| {
+            format!(
+                "make authenticated snapshot cache read-only {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub struct VerifiedArtifactSnapshotBuildOptions {
@@ -2749,6 +3370,97 @@ mod tests {
         row
     }
 
+    fn authenticated_test_cohort() -> AuthenticatedReadyEventCohort {
+        AuthenticatedReadyEventCohort {
+            manifest_id: format!("sha256:{}", "a".repeat(64)),
+            partition_digest: format!("sha256:{}", "b".repeat(64)),
+            causal_projection_policy_id: format!("sha256:{}", "c".repeat(64)),
+            members: vec![AuthenticatedReadyEvent {
+                receipt_sha256: "d".repeat(64),
+                market_id: "event-1".to_string(),
+                content_sha256: "e".repeat(64),
+                manifest_sha256: "f".repeat(64),
+                qualification_sha256: "1".repeat(64),
+                success_sha256: "2".repeat(64),
+                start: "2026-07-17T05:30:00Z".parse().unwrap(),
+                end: "2026-07-17T05:35:00Z".parse().unwrap(),
+                up_token_id: "up".to_string(),
+                down_token_id: "down".to_string(),
+            }],
+        }
+    }
+
+    fn authenticated_test_snapshot() -> ResearchSnapshot {
+        let cohort = authenticated_test_cohort();
+        let member = &cohort.members[0];
+        let contract = verified_contract("2026-07-17T05:31:00Z");
+        let mut observation = bind_and_filter_polymarket_chainlink_baseline_observations(
+            vec![verified_observation("2026-07-17T05:31:00Z")],
+            std::slice::from_ref(&contract),
+            &verified_outcomes(true),
+            "BTCUSDT",
+            member.start,
+            member.end,
+        )
+        .expect("authenticated observation fixture")
+        .remove(0);
+        observation.event_window_secs = 300;
+        let tick_ts = observation.tick_ts;
+        let book = |token_id: &str, side: &str| ResearchPmBookSnapshot {
+            event_id: member.market_id.clone(),
+            token_id: token_id.to_string(),
+            side: side.to_string(),
+            ts: tick_ts,
+            bids: vec![ResearchPmBookLevel {
+                price: 0.4,
+                size: 10.0,
+            }],
+            asks: vec![ResearchPmBookLevel {
+                price: 0.6,
+                size: 10.0,
+            }],
+        };
+        ResearchSnapshot {
+            manifest: ResearchSnapshotManifest {
+                schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
+                snapshot_hash: None,
+                snapshot_contract_hash: None,
+                generated_at: Utc::now(),
+                git_sha: Some("test-sha".to_string()),
+                symbols: vec!["BTCUSDT".to_string()],
+                start: member.start,
+                end: member.end,
+                history_start: member.start,
+                lob_sample_secs: 30,
+                pm_book_sample_secs: Some(30),
+                observation_sample_secs: 30,
+                max_quote_age_secs: 30,
+                stake_usd: 15.0,
+                require_official_settlement: true,
+                immutable_input: true,
+                source_kind: "authenticated-test".to_string(),
+                optimizer_data_dir: Some("/tmp/authenticated-test".to_string()),
+                source_surfaces: vec![],
+                input_artifacts: vec![],
+                data_requirements: vec![],
+                data_audit_status: Some("ok".to_string()),
+                data_audit_report: None,
+                include_deribit: false,
+                artifacts: ResearchSnapshotArtifacts::default(),
+                row_counts: ResearchSnapshotRowCounts::default(),
+                phase_timings: vec![],
+                quality_flags: vec![],
+                pm_book_source: ResearchSnapshotPmBookSource::default(),
+            },
+            observations: vec![observation],
+            deribit_snapshots: vec![],
+            pm_book_snapshots: vec![
+                book(&member.up_token_id, "UP"),
+                book(&member.down_token_id, "DOWN"),
+            ],
+        }
+    }
+
     fn verified_outcomes(
         settlement_up: bool,
     ) -> HashMap<OfficialOutcomeKey, OfficialBinaryOutcome> {
@@ -3782,5 +4494,73 @@ mod tests {
         assert!(sql.contains("'btc-up''s-test'"));
         assert!(sql.contains("TIMESTAMPTZ '2026-05-18T00:00:00+00:00'"));
         assert!(sql.contains("TIMESTAMPTZ '2026-05-18T00:05:00+00:00'"));
+    }
+
+    #[test]
+    fn authenticated_snapshot_cache_reuses_a_verified_readback_without_a_hash_cycle() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = AuthenticatedSnapshotMaterializationRequest {
+            cache_root: cache.path().to_path_buf(),
+            compiler_source_identity: "test-source".to_string(),
+            compiler_image_identity: "sha256:test-image".to_string(),
+        };
+        let mut builds = 0;
+
+        let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            builds += 1;
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("first materialization admits the verified snapshot");
+        let first_contract = admitted.snapshot_contract_id().to_string();
+
+        let reused = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            panic!("cache hit must not rebuild, collect, or upload")
+        })
+        .expect("verified cache readback is admitted");
+
+        assert_eq!(builds, 1);
+        assert_eq!(reused.snapshot_contract_id(), first_contract);
+        assert_eq!(reused.cohort_manifest_id(), cohort.manifest_id());
+        assert!(!cohort.manifest_id().contains(&first_contract));
+    }
+
+    #[test]
+    fn empty_ready_catalog_is_a_typed_insufficient_cohort_rejection() {
+        let catalog = ploy_market_data::polymarket_evidence::PolymarketReadyEventCatalog::default();
+        let partition = EventCohortPartition::from_ready_catalog(&catalog, 1_000)
+            .expect("empty catalog still has a partition artifact");
+
+        assert!(matches!(
+            authenticate_ready_event_cohort(&catalog, &partition),
+            Err(AuthenticatedResearchSnapshotRejection::InsufficientCohort { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupt_cached_snapshot_is_rejected_without_rebuilding() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = AuthenticatedSnapshotMaterializationRequest {
+            cache_root: cache.path().to_path_buf(),
+            compiler_source_identity: "test-source".to_string(),
+            compiler_image_identity: "sha256:test-image".to_string(),
+        };
+        let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("materialize cache fixture");
+        let observations = admitted.snapshot_dir().join("observations.json");
+        let mut permissions = std::fs::metadata(&observations).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&observations, permissions).unwrap();
+        std::fs::write(&observations, "[]\n").unwrap();
+
+        assert!(matches!(
+            materialize_authenticated_research_snapshot(&cohort, &request, || {
+                panic!("corrupt cache must reject before rebuilding")
+            }),
+            Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
+        ));
     }
 }
