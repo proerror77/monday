@@ -321,6 +321,31 @@ legacy_health_sample_state() {
   fi
 }
 
+legacy_health_transition() {
+  local sample_state=$1 error_started_at=$2 now_uptime=$3 budget_seconds=$4
+  local decision=fatal
+  case "$sample_state" in
+    clean)
+      if [[ -n $error_started_at ]] \
+        && ((now_uptime - error_started_at > budget_seconds)); then
+        decision=expired
+      else
+        error_started_at=
+        decision=advance
+      fi
+      ;;
+    transient_api_error)
+      [[ -n $error_started_at ]] || error_started_at=$now_uptime
+      if ((now_uptime - error_started_at <= budget_seconds)); then
+        decision='wait'
+      else
+        decision=expired
+      fi
+      ;;
+  esac
+  printf '%s:%s\n' "$decision" "$error_started_at"
+}
+
 env_value() {
   local key=$1 file=${2:-$UPLOAD_ENV} count value
   count=$(grep -c "^${key}=" "$file" || true)
@@ -734,6 +759,7 @@ last_legacy_health=
 last_legacy_health_change=$start_uptime
 legacy_api_error_started_at=
 legacy_health_state=fatal
+legacy_health_decision=fatal
 common_cutoff=
 parity_window_started_at=
 while :; do
@@ -771,15 +797,16 @@ while :; do
     legacy_health_state=$(legacy_health_sample_state \
       "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
       "$baseline_mode")
-    case "$legacy_health_state" in
-      clean)
-        legacy_api_error_started_at=
+    legacy_health_result=$(legacy_health_transition \
+      "$legacy_health_state" "$legacy_api_error_started_at" \
+      "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+    legacy_health_decision=${legacy_health_result%%:*}
+    legacy_api_error_started_at=${legacy_health_result#*:}
+    case "$legacy_health_decision" in
+      advance|wait)
         ;;
-      transient_api_error)
-        [[ -n $legacy_api_error_started_at ]] \
-          || legacy_api_error_started_at=$now_uptime
-        ((now_uptime - legacy_api_error_started_at <= MAX_HEALTH_SILENCE_SECONDS)) \
-          || die "$baseline_label API errors did not recover within the health budget"
+      expired)
+        die "$baseline_label API errors did not recover within the health budget"
         ;;
       *)
         die "$baseline_label health is not fail-closed clean during shadow"
@@ -806,7 +833,7 @@ while :; do
       || die 'Rust last_success_at is stale or from the future'
     ((legacy_success_epoch <= now_epoch && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die "$baseline_label last_success_at is stale or from the future"
-    if [[ $legacy_health_state == clean ]]; then
+    if [[ $legacy_health_decision == advance ]]; then
       common_cutoff=$rust_success_epoch
       ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
       if [[ $test_only == false ]]; then
@@ -820,7 +847,7 @@ while :; do
   fi
 
   if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]] \
-    && [[ $legacy_health_state == clean ]]; then
+    && [[ $legacy_health_decision == advance ]]; then
     if valid_parity_window "$parity_window_started_at" "$common_cutoff"; then
       if [[ $test_only == true ]] \
         || ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)); then
