@@ -879,9 +879,10 @@ rust_closed="$rust/market-updates.19700101T000400000000.ndjson"
 
 sequence=0
 append_row() {
-  local update=$1 row
+  local update=$1 recorded_at=${2:-1970-01-01T00:03:20Z} row
   row=$(jq -cn --argjson sequence "$sequence" --argjson update "$update" \
-    '{sequence:$sequence,recorded_at:"1970-01-01T00:03:20Z",update:$update}')
+    --arg recorded_at "$recorded_at" \
+    '{sequence:$sequence,recorded_at:$recorded_at,update:$update}')
   printf '%s\n' "$row" >>"$legacy_tape"
   printf '%s\n' "$row" >>"$rust_closed"
   sequence=$((sequence + 1))
@@ -924,6 +925,21 @@ trade=$(jq -cn --arg record_id "$trade_id" \
       outcomeIndex:0,outcome:"Up"}}')
 append_row "$trade"
 
+late_settlement_trade_id=$(printf '%s' \
+  '0xlate|condition-BTCUSDT|up-BTCUSDT|BUY|319|0x2|1|0.5|0' \
+  | sha256sum | awk '{print $1}')
+late_settlement_trade=$(jq -cn --arg record_id "$late_settlement_trade_id" \
+  '{kind:"polymarket_trade",record_id:$record_id,record_id_version:"v2",
+    market_id:"market-BTCUSDT",condition_id:"condition-BTCUSDT",token_id:"up-BTCUSDT",
+    symbol:"BTCUSDT",market_window_secs:300,side:"BUY",size:"1",price:"0.5",
+    trade_ts:"1970-01-01T00:05:19Z",trade_ts_unix:319,
+    transaction_hash:"0xlate",proxy_wallet:"0x2",outcome:"Up",outcome_index:0,
+    source:"polymarket_data_api",received_at:"1970-01-01T00:05:21Z",
+    trade:{transactionHash:"0xlate",conditionId:"condition-BTCUSDT",asset:"up-BTCUSDT",
+      side:"BUY",timestamp:319,proxyWallet:"0x2",size:"1",price:"0.5",
+      outcomeIndex:0,outcome:"Up"}}')
+append_row "$late_settlement_trade" "1970-01-01T00:05:21Z"
+
 append_row "$(jq -cn \
   '{kind:"market_settlement",market_id:"market-BTCUSDT",
     condition_id:"condition-BTCUSDT",symbol:"BTCUSDT",market_window_secs:300,
@@ -955,10 +971,18 @@ parity="$tmp_dir/parity.json"
   --output "$parity"
 jq -e '.passed == true and .checks.metadata_parity == true
   and ([.checks[]] | all)
+  and .metrics.legacy_trade_count == 2
+  and .metrics.rust_trade_count == 2
+  and .metrics.trade_shared_value_mismatch_ids == []
   and (.metrics.normalized_trade_sha256 | test("^[a-f0-9]{64}$"))
   and (.metrics.normalized_metadata_sha256 | test("^[a-f0-9]{64}$"))
   and (.metrics.normalized_settlement_sha256 | test("^[a-f0-9]{64}$"))' \
   "$parity" >/dev/null
+jq -e 'select(.update.transaction_hash == "0xlate")
+  | .update.trade_ts_unix == 319
+    and .update.trade.timestamp == 319
+    and .update.received_at == "1970-01-01T00:05:21Z"' \
+  "$legacy_tape" "$rust_closed" >/dev/null
 
 rust_bad="$tmp_dir/rust-bad"
 cp -R "$rust" "$rust_bad"

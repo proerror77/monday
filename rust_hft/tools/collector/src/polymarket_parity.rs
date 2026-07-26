@@ -865,17 +865,7 @@ fn trade_metadata_context_mismatch_ids(
         let metadata_market = context["market"]
             .as_object()
             .expect("metadata contract requires a market object");
-        let start_epoch = parse_timestamp(metadata_market.get("startDate"))
-            .or_else(|| parse_timestamp(metadata_market.get("startDateIso")))
-            .context("metadata has no valid market start time")?;
-        let end_epoch = market_end_epoch(context, &format!("metadata {market_id}"))?;
-        let Some(trade_epoch) = trade.get("trade_ts_unix").and_then(Value::as_i64) else {
-            mismatches.insert(market_id.to_owned());
-            continue;
-        };
-        if !(start_epoch..=end_epoch).contains(&trade_epoch) {
-            context_matches = false;
-        }
+        // Data API timestamps can reflect settlement; event-time admission is a research contract.
         let tokens = normalized_array(metadata_market.get("clobTokenIds"), "clobTokenIds")?;
         let outcomes = normalized_array(metadata_market.get("outcomes"), "outcomes")?;
         let Some(outcome_index) = trade.get("outcome_index").and_then(Value::as_u64) else {
@@ -1579,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_only_trade_outside_its_market_window_fails_parity() {
+    fn rust_only_trade_with_post_end_settlement_timestamp_follows_superset_policy() {
         let (_root, config) = fixture();
         append_tape(
             &config.rust_spool.join(ACTIVE_TAPE),
@@ -1588,11 +1578,11 @@ mod tests {
         );
 
         let evidence = compare(&config).unwrap();
-        assert_eq!(evidence["passed"], false);
-        assert_eq!(evidence["checks"]["trade_contract_parity"], false);
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["checks"]["trade_contract_parity"], true);
         assert_eq!(
             evidence["metrics"]["rust_trade_metadata_context_mismatch_market_ids"],
-            json!(["market-BTCUSDT"])
+            json!([])
         );
     }
 
@@ -1760,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn trade_context_rejects_metadata_outside_the_trade_time_window() {
+    fn trade_context_uses_market_association_not_settlement_time() {
         let (_root, config) = fixture();
         let mut future_metadata = extra_metadata();
         future_metadata["market"]["startDate"] = json!("1970-01-01T00:28:20Z");
@@ -1786,14 +1776,14 @@ mod tests {
         }
 
         let evidence = compare(&config).unwrap();
-        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["passed"], true);
         assert_eq!(
             evidence["metrics"]["legacy_trade_metadata_context_match"],
-            false
+            true
         );
         assert_eq!(
             evidence["metrics"]["rust_trade_metadata_context_match"],
-            false
+            true
         );
 
         let (_root, config) = fixture();
@@ -1813,7 +1803,7 @@ mod tests {
         assert_eq!(evidence["passed"], false);
         assert_eq!(
             evidence["metrics"]["legacy_trade_metadata_context_match"],
-            false
+            true
         );
         assert_eq!(
             evidence["metrics"]["rust_trade_metadata_context_match"],
