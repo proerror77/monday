@@ -179,7 +179,14 @@ run_strict_verifier_fixture() (
   [[ ${verifier_invocations[1]} == \
     '--require-lob-continuity --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
   [[ ${verifier_invocations[2]} == \
-    '--verify-aggregate-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]]
+    '--verify-aggregate-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]] || {
+    printf 'aggregate continuity verifier lost segment trust-anchor flags\n' >&2
+    exit 1
+  }
+  [[ ${#verifier_units[@]} -eq 3 ]] || {
+    printf 'strict verifier did not isolate every verification pass\n' >&2
+    exit 1
+  }
   for verifier_unit in "${verifier_units[@]}"; do
     [[ $verifier_unit == *'--property=MemoryHigh=5000M'* ]] || exit 1
     [[ $verifier_unit == *'--property=MemoryMax=6400M'* ]] || exit 1

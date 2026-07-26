@@ -379,9 +379,22 @@ verify_adjacent_segments() {
 }
 
 verify_aggregate_trade_continuity() {
+  local -a verifier_args=(--verify-aggregate-trade-continuity)
+  local path content_sha256 manifest_sha256
   (( $# > 0 && $# % 3 == 0 )) \
     || die 'aggregate-trade verifier requires one or more complete segment trust anchors'
-  run_strict_verifier --verify-aggregate-trade-continuity "$@" \
+  while (($#)); do
+    path=$1
+    content_sha256=$2
+    manifest_sha256=$3
+    shift 3
+    verifier_args+=(
+      --verify-segment "$path"
+      --segment-content-sha256 "$content_sha256"
+      --segment-manifest-sha256 "$manifest_sha256"
+    )
+  done
+  run_strict_verifier "${verifier_args[@]}" \
     || die 'strict aggregate-trade continuity readback failed'
 }
 
