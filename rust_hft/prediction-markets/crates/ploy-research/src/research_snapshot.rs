@@ -1988,14 +1988,7 @@ pub fn build_research_snapshot_from_polymarket_chainlink_baseline(
             optimizer_data_dir: Some(options.optimizer_data_dir),
             source_surfaces,
             input_artifacts,
-            data_requirements: [
-                POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
-                "chainlink_reference",
-                "polymarket_orderbook",
-                "polymarket_official_settlement",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            data_requirements: vec![POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT.to_string()],
             data_audit_status: Some("ok".to_string()),
             data_audit_report: Some(format!(
                 "verified+polymarket-chainlink-baseline-audit://sha256/{audit_sha256}"
