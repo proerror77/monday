@@ -145,9 +145,11 @@ impl PredictionMctsRunState {
             .map(|record| {
                 if record.candidate.identity != identity
                     || record.evaluation.training.identity() != &identity
+                    || !record.evaluation.training.matches_task(identity.task)
                     || record.evaluation.training.candidate_id() != record.candidate.candidate_id
                     || record.evaluation.training.probability_blend_sha256()
                         != record.candidate.probability_blend_sha256
+                    || record.evaluation.training.reward().is_err()
                 {
                     return Err("invalid prediction MCTS training artifact state".to_string());
                 }
@@ -274,6 +276,7 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
 ) -> Result<LoopRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
     identity.validate()?;
+    identity.reject_unadmitted_legacy_bridge()?;
     if identity.mission_id != mission.mission_id
         || identity.data_snapshot_id != mission.data_snapshot_id
     {
@@ -1158,6 +1161,68 @@ mod tests {
     }
 
     #[test]
+    fn runner_rejects_task_mismatched_persisted_training_evidence() {
+        let output = temp_dir("task-mismatched-training");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("completed run");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let original = std::fs::read(&state_path).unwrap();
+        let mut forged: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let settlement =
+            forged["training"][0]["evaluation"]["training"]["settlement_probability"].take();
+        forged["training"][0]["evaluation"]["training"] = serde_json::json!({
+            "up_execution": {
+                "candidate_id": settlement["candidate_id"],
+                "identity": settlement["identity"],
+                "probability_blend_sha256": settlement["probability_blend_sha256"],
+                "training_cohort_id": "train-before-boundary",
+                "event_count": 12,
+                "prediction_horizon_secs": 15,
+                "mean_fill_rate": 0.5,
+                "mean_fee_usd": 0.01,
+                "mean_entry_slippage_bps": 1.0,
+                "mean_exit_slippage_bps": 1.0,
+                "mean_capacity_usd": 100.0,
+                "mean_reprice_pnl": 0.25
+            }
+        });
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect_err("task-mismatched persisted evidence must fail closed");
+        assert!(error.contains("invalid prediction MCTS training artifact state"));
+
+        let mut forged: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        forged["training"][0]["evaluation"]["training"]["settlement_probability"]
+            ["mean_brier_score"] = serde_json::json!(1.5);
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect_err("invalid persisted reward must fail closed");
+        assert!(error.contains("invalid prediction MCTS training artifact state"));
+    }
+
+    #[test]
     fn runner_rejects_a_checkpoint_with_a_mismatched_identity_before_rewriting_it() {
         let output = temp_dir("forged-checkpoint-artifact");
         let mut client = FakeClient { calls: 0 };
@@ -1197,10 +1262,11 @@ mod tests {
     }
 
     #[test]
-    fn sealed_v4_task_uses_an_isolated_checkpoint_namespace() {
+    fn sealed_v4_run_rejects_an_unadmitted_legacy_bridge_before_writing_state() {
         let output = temp_dir("sealed-v4-namespace");
-        let mut bridge = mission(1, 1);
+        let mut bridge = mission(0, 0);
         bridge.mission_id = "btc-5m-up".to_string();
+        bridge.objective = "Unadmitted objective drift".to_string();
         bridge.data_snapshot_id = format!("sha256:{}", "5".repeat(64));
         bridge.prompt_snapshot_id = research_brief_snapshot_id(&bridge);
         let admitted = AdmittedPredictionMissionV3 {
@@ -1223,25 +1289,22 @@ mod tests {
             search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
         };
         let identity = PredictionMctsIdentity::from_admitted_mission(&admitted).unwrap();
+        let isolated_output = task_output_dir(&output, &identity).unwrap();
         let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
         let error = run_or_resume_prediction_mcts_with_identity_and_component_profile(
             bridge,
             identity,
             Path::new("unused-snapshot"),
             &output,
             &mut client,
-            &mut FakeEvaluator::default(),
+            &mut evaluator,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
         )
-        .expect_err("settlement-only evaluator cannot satisfy an Up execution task");
-        assert!(error.contains("training evidence identity"));
-
-        let state_path = output
-            .join("mcts-v4")
-            .join("1111111111111111111111111111111111111111111111111111111111111111")
-            .join("up-execution-15s")
-            .join("prediction-mcts-state.json");
-        assert!(state_path.exists());
+        .expect_err("sealed Mission v4 cannot consume an unadmitted legacy bridge");
+        assert!(error.contains("authenticated Mission v4 runner"));
+        assert!(evaluator.calls.is_empty());
+        assert!(!isolated_output.join("prediction-mcts-state.json").exists());
         assert!(!output.join("prediction-mcts-state.json").exists());
     }
 }

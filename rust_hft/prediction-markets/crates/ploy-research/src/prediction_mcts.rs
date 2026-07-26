@@ -182,6 +182,16 @@ impl PredictionMctsIdentity {
             .as_ref()
             .map(|sealed| sealed.mission_sha256.as_str())
     }
+
+    pub(crate) fn reject_unadmitted_legacy_bridge(&self) -> Result<(), String> {
+        if self.sealed_mission.is_some() {
+            return Err(
+                "sealed prediction MCTS identity requires an authenticated Mission v4 runner"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -308,7 +318,7 @@ impl PredictionMctsTrainingEvidence {
         }
     }
 
-    fn matches_task(&self, task: PredictionMctsTask) -> bool {
+    pub(crate) fn matches_task(&self, task: PredictionMctsTask) -> bool {
         match (task, self) {
             (PredictionMctsTask::SettlementProbability, Self::SettlementProbability(_)) => true,
             (
@@ -679,6 +689,7 @@ impl PredictionMctsEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_identity_and_component_profile(
         mission: &PredictionResearchMission,
         identity: PredictionMctsIdentity,
@@ -691,6 +702,7 @@ impl PredictionMctsEngine {
     ) -> Result<Self, String> {
         validate_prediction_mission(mission, &current_prediction_policy_snapshot_id())?;
         identity.validate()?;
+        identity.reject_unadmitted_legacy_bridge()?;
         if identity.mission_id != mission.mission_id
             || identity.data_snapshot_id != mission.data_snapshot_id
         {
@@ -1216,7 +1228,7 @@ mod tests {
         legacy_bridge.mission_id = admitted.mission_id.clone();
         legacy_bridge.data_snapshot_id = admitted.snapshot_contract_id.clone();
         legacy_bridge.prompt_snapshot_id = research_brief_snapshot_id(&legacy_bridge);
-        let engine = PredictionMctsEngine::new_with_identity_and_component_profile(
+        let error = PredictionMctsEngine::new_with_identity_and_component_profile(
             &legacy_bridge,
             identity.clone(),
             market_midpoint_blend("baseline"),
@@ -1226,8 +1238,9 @@ mod tests {
             3,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
         )
-        .expect("sealed identity configures the existing shared kernel");
-        assert_eq!(engine.checkpoint().unwrap().config.identity, identity);
+        .err()
+        .expect("sealed identity cannot consume an unadmitted legacy bridge");
+        assert!(error.contains("authenticated Mission v4 runner"));
     }
 
     #[test]
