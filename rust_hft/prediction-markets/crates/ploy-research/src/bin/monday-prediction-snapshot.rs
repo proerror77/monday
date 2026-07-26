@@ -870,7 +870,7 @@ mod tests {
             "schema_version": super::SNAPSHOT_ADMISSION_SCHEMA_VERSION,
             "status": "admitted",
             "snapshot_contract_id": format!("sha256:{}", "a".repeat(64)),
-            "snapshot_digest": format!("sha256:{}", "b".repeat(64)),
+            "snapshot_digest": "0123456789abcdef",
             "partition_digest": format!("sha256:{}", "c".repeat(64)),
             "policy_identity": format!("sha256:{}", "d".repeat(64)),
             "task_capability": "btc_5m_backtest",
@@ -890,7 +890,6 @@ mod tests {
         assert_eq!(response["task_capability"], "btc_5m_backtest");
         for field in [
             "snapshot_contract_id",
-            "snapshot_digest",
             "partition_digest",
             "policy_identity",
             "immutable_image_identity",
@@ -899,6 +898,12 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("sha256:")));
         }
+        assert!(response["snapshot_digest"].as_str().is_some_and(|value| {
+            value.len() == 16
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }));
         assert!(response.get("snapshot_dir").is_none());
         assert!(response.get("handle").is_none());
     }
