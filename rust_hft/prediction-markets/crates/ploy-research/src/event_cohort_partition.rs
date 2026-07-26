@@ -5,9 +5,12 @@ use ploy_market_data::polymarket_evidence::{
 };
 use serde::Serialize;
 
-use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
+use crate::{
+    prediction_loop::{current_prediction_policy_snapshot_id, validate_sha256_id},
+    prediction_loop_fs::{canonical_json_bytes, sha256_hex},
+};
 
-pub const EVENT_COHORT_PARTITION_VERSION: &str = "event_cohort_partition.v2";
+pub const EVENT_COHORT_PARTITION_VERSION: &str = "event_cohort_partition.v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventCohortReadyEntry {
@@ -15,6 +18,7 @@ pub struct EventCohortReadyEntry {
     market_id: String,
     reference_path_start_ms: i64,
     reference_path_end_ms: i64,
+    settlement_available_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -22,6 +26,8 @@ pub struct EventCohortPartition {
     schema_version: &'static str,
     ready_entries: Vec<EventCohortReadyEntry>,
     common_time_boundary_ms: i64,
+    label_availability_cutoff_ms: i64,
+    causal_projection_policy_id: String,
     train_market_ids: Vec<String>,
     crossing_excluded_market_ids: Vec<String>,
     held_out_market_ids: Vec<String>,
@@ -33,6 +39,8 @@ struct EventCohortPartitionPayload<'a> {
     schema_version: &'static str,
     ready_entries: &'a [EventCohortReadyEntry],
     common_time_boundary_ms: i64,
+    label_availability_cutoff_ms: i64,
+    causal_projection_policy_id: &'a str,
     train_market_ids: &'a [String],
     crossing_excluded_market_ids: &'a [String],
     held_out_market_ids: &'a [String],
@@ -62,6 +70,11 @@ impl EventCohortPartition {
                 "common time boundary must be a positive Unix millisecond timestamp".into(),
             );
         }
+        let causal_projection_policy_id = current_prediction_policy_snapshot_id();
+        validate_sha256_id(
+            &causal_projection_policy_id,
+            "causal projection policy identity",
+        )?;
 
         let ready_entries = ready_entries
             .into_iter()
@@ -95,11 +108,30 @@ impl EventCohortPartition {
                 crossing_excluded_market_ids.push(entry.market_id.clone());
             }
         }
+        let label_availability_cutoff_ms = ready_entries
+            .iter()
+            .filter(|entry| entry.reference_path_start_ms >= common_time_boundary_ms)
+            .map(|entry| entry.reference_path_start_ms)
+            .min()
+            .map(|decision| decision.min(common_time_boundary_ms))
+            .unwrap_or(common_time_boundary_ms);
+        for entry in &ready_entries {
+            if entry.reference_path_end_ms < common_time_boundary_ms
+                && entry.settlement_available_at_ms > label_availability_cutoff_ms
+            {
+                return Err(format!(
+                    "ready market {} settlement label unavailable by cutoff {}",
+                    entry.market_id, label_availability_cutoff_ms
+                ));
+            }
+        }
 
         let payload = EventCohortPartitionPayload {
             schema_version: EVENT_COHORT_PARTITION_VERSION,
             ready_entries: &ready_entries,
             common_time_boundary_ms,
+            label_availability_cutoff_ms,
+            causal_projection_policy_id: &causal_projection_policy_id,
             train_market_ids: &train_market_ids,
             crossing_excluded_market_ids: &crossing_excluded_market_ids,
             held_out_market_ids: &held_out_market_ids,
@@ -110,6 +142,8 @@ impl EventCohortPartition {
             schema_version: EVENT_COHORT_PARTITION_VERSION,
             ready_entries,
             common_time_boundary_ms,
+            label_availability_cutoff_ms,
+            causal_projection_policy_id,
             train_market_ids,
             crossing_excluded_market_ids,
             held_out_market_ids,
@@ -123,6 +157,14 @@ impl EventCohortPartition {
 
     pub fn ready_entries(&self) -> &[EventCohortReadyEntry] {
         &self.ready_entries
+    }
+
+    pub fn label_availability_cutoff_ms(&self) -> i64 {
+        self.label_availability_cutoff_ms
+    }
+
+    pub fn causal_projection_policy_id(&self) -> &str {
+        &self.causal_projection_policy_id
     }
 
     pub fn train_market_ids(&self) -> &[String] {
@@ -159,6 +201,10 @@ impl EventCohortReadyEntry {
         self.reference_path_end_ms
     }
 
+    pub fn settlement_available_at_ms(&self) -> i64 {
+        self.settlement_available_at_ms
+    }
+
     fn from_receipt(receipt: &PolymarketCatalogReceipt) -> Result<Self, String> {
         if receipt.state != PolymarketCatalogReceiptState::Ready {
             return Err(format!(
@@ -182,11 +228,29 @@ impl EventCohortReadyEntry {
                 receipt.market_id
             ));
         }
+        let settlement_available_at_ms = receipt
+            .availability
+            .as_ref()
+            .and_then(|availability| availability.settlement)
+            .ok_or_else(|| {
+                format!(
+                    "ready market {} is missing settlement label availability",
+                    receipt.market_id
+                )
+            })?
+            .timestamp_millis();
+        if settlement_available_at_ms < reference_path_end_ms {
+            return Err(format!(
+                "ready market {} settlement label predates event end",
+                receipt.market_id
+            ));
+        }
         Ok(Self {
             receipt_sha256: receipt.receipt_sha256.clone(),
             market_id: receipt.market_id.clone(),
             reference_path_start_ms,
             reference_path_end_ms,
+            settlement_available_at_ms,
         })
     }
 }
@@ -216,7 +280,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ploy_market_data::polymarket_evidence::{
         PolymarketCatalogReceipt, PolymarketCatalogReceiptState, PolymarketCatalogVerifier,
-        PolymarketReadyEventCatalog, PolymarketResearchTask,
+        PolymarketEvidenceAvailability, PolymarketReadyEventCatalog, PolymarketResearchTask,
     };
 
     use super::EventCohortPartition;
@@ -248,7 +312,13 @@ mod tests {
             sequence: None,
             coverage: None,
             trade_completion: None,
-            availability: None,
+            availability: Some(PolymarketEvidenceAvailability {
+                contract: None,
+                books: None,
+                references: None,
+                trades: None,
+                settlement: Utc.timestamp_millis_opt(reference_path_end_ms + 1).single(),
+            }),
             state: PolymarketCatalogReceiptState::Ready,
             reasons: Vec::new(),
             supported_tasks: vec![PolymarketResearchTask::Btc5mBacktest],
@@ -284,11 +354,21 @@ mod tests {
         let changed_window = ready_receipt('a', "first", 100, 998);
         let changed_path =
             EventCohortPartition::from_ready_entries([&changed_window, &second], 1_000).unwrap();
+        let mut changed_availability = ready_receipt('a', "first", 100, 999);
+        changed_availability
+            .availability
+            .as_mut()
+            .unwrap()
+            .settlement = Utc.timestamp_millis_opt(999).single();
+        let changed_label_availability =
+            EventCohortPartition::from_ready_entries([&changed_availability, &second], 1_000)
+                .unwrap();
         let missing_member = EventCohortPartition::from_ready_entries([&first], 1_000).unwrap();
 
         assert_ne!(partition.digest(), reordered.digest());
         assert_ne!(partition.digest(), changed_identity.digest());
         assert_ne!(partition.digest(), changed_path.digest());
+        assert_ne!(partition.digest(), changed_label_availability.digest());
         assert_ne!(partition.digest(), missing_member.digest());
     }
 
@@ -323,7 +403,7 @@ mod tests {
             ["ends-at-boundary"]
         );
         assert_eq!(partition.held_out_market_ids(), ["starts-at-boundary"]);
-        assert!(serde_json::to_value(partition)
+        assert!(serde_json::to_value(&partition)
             .unwrap()
             .get("authenticated_snapshot_digest")
             .is_none());
@@ -337,5 +417,37 @@ mod tests {
 
         assert!(partition.ready_entries().is_empty());
         assert_eq!(partition.common_time_boundary_ms(), 1_000);
+    }
+
+    #[test]
+    fn training_label_unavailable_by_the_cutoff_rejects_the_partition() {
+        let mut train = ready_receipt('a', "late-label", 100, 999);
+        train.availability = Some(PolymarketEvidenceAvailability {
+            contract: None,
+            books: None,
+            references: None,
+            trades: None,
+            settlement: Utc.timestamp_millis_opt(1_001).single(),
+        });
+
+        let error = EventCohortPartition::from_ready_entries([&train], 1_000)
+            .expect_err("a training label observed after the cutoff must fail closed");
+
+        assert!(error.contains("settlement label unavailable by cutoff"));
+    }
+
+    #[test]
+    fn artifact_serialization_binds_the_causal_projection_policy_identity() {
+        let train = ready_receipt('a', "train", 100, 999);
+        let partition = EventCohortPartition::from_ready_entries([&train], 1_000).unwrap();
+
+        assert!(serde_json::to_value(&partition)
+            .unwrap()
+            .get("causal_projection_policy_id")
+            .is_some());
+        assert_eq!(
+            partition.causal_projection_policy_id(),
+            crate::prediction_loop::current_prediction_policy_snapshot_id()
+        );
     }
 }
