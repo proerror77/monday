@@ -2008,22 +2008,26 @@ async fn receive_url(
                     }
                 },
                 ProducerWait::PauseRequested => {
-                    if proof_events.is_empty() {
-                        if let Some(exit) = acknowledge_rotation_pause(
-                            producer_id,
-                            &sender,
-                            &mut rotation_pause,
-                            &mut rotation_resume,
-                            &mut last_pause_epoch,
-                            &mut shutdown,
-                        )
-                        .await?
-                        {
-                            return Ok(exit);
-                        }
-                        subscription_proof_deadline =
-                            tokio::time::Instant::now() + subscription_proof_timeout;
+                    let buffered_proof_interrupted = !proof_events.is_empty();
+                    if let Some(exit) = acknowledge_rotation_pause(
+                        producer_id,
+                        &sender,
+                        &mut rotation_pause,
+                        &mut rotation_resume,
+                        &mut last_pause_epoch,
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
                     }
+                    if buffered_proof_interrupted {
+                        proof_failure =
+                            Some("segment rotation interrupted buffered subscription proof".into());
+                        break;
+                    }
+                    subscription_proof_deadline =
+                        tokio::time::Instant::now() + subscription_proof_timeout;
                     continue;
                 }
                 ProducerWait::Stopped => {
@@ -4179,7 +4183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_reconnect_proof_event_drains_before_rotation_barrier() {
+    async fn buffered_reconnect_proof_event_is_abandoned_after_rotation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let event_time_ms = now_ns().unwrap() / 1_000_000;
@@ -4277,29 +4281,23 @@ mod tests {
         market_frame_rx.await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         pause_tx.send(1).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
                 .await
-                .is_err(),
-            "rotation barrier acknowledged before the buffered proof event was verified"
-        );
-        proof_tx.send(()).unwrap();
-        assert!(matches!(
-            receiver.recv().await,
-            Some(Event::StreamReconnected { .. })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(Event::AggregateTrade { .. })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
+                .unwrap(),
             Some(Event::RotationBarrier {
                 producer_id: 0,
                 epoch: 1
             })
         ));
         resume_tx.send(1).unwrap();
+        proof_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
         shutdown_tx.send(true).unwrap();
         assert!(matches!(
             task.await.unwrap().unwrap(),
@@ -4397,26 +4395,22 @@ mod tests {
         market_frame_rx.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         pause_tx.send(1).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
-                .await
-                .is_err(),
-            "rotation barrier acknowledged before the buffered proof event timed out"
-        );
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), receiver.recv())
                 .await
                 .unwrap(),
-            Some(Event::StreamDisconnected { .. })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
             Some(Event::RotationBarrier {
                 producer_id: 0,
                 epoch: 1
             })
         ));
         resume_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::StreamDisconnected { .. })
+        ));
         shutdown_tx.send(true).unwrap();
         assert!(matches!(
             task.await.unwrap().unwrap(),
