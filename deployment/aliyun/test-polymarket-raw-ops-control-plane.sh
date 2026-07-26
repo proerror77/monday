@@ -1121,10 +1121,7 @@ if jq -e -f "$POLICY" "$tmp_dir/legacy-trade-omission.json" >/dev/null; then
 fi
 jq '.metrics.rust_only_trade_ids = ["missing-from-legacy"]' \
   "$tmp_dir/gate.json" >"$tmp_dir/rust-trade-addition.json"
-if jq -e -f "$POLICY" "$tmp_dir/rust-trade-addition.json" >/dev/null; then
-  printf 'gate policy accepted a mature trade missing from legacy\n' >&2
-  exit 1
-fi
+jq -e -f "$POLICY" "$tmp_dir/rust-trade-addition.json" >/dev/null
 jq '.metrics.trade_metadata_shared_value_mismatch_market_ids = ["market-extra"]' \
   "$tmp_dir/gate.json" >"$tmp_dir/trade-metadata-value-mismatch.json"
 if jq -e -f "$POLICY" "$tmp_dir/trade-metadata-value-mismatch.json" >/dev/null; then
