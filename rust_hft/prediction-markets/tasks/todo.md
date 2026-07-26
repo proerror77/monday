@@ -52,6 +52,8 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
   cohort partition artifact without reconstructing the partition (#365).
 - [x] Expose read-only authenticated snapshot-cache admission through the
   versioned sibling-binary protocol without a cross-workspace dependency (#364).
+- [x] Bind the verified partition boundary and train/held-out membership into
+  the read-only authenticated snapshot handle for ResearchTrial (#382).
 - [ ] Wire the verified-artifact ResearchSnapshot adapter into the snapshot CLI and complete its cloud alpha-harness E2E.
 - [ ] Project causally valid in-event Chainlink ticks without allowing them to replace the pre-open five-minute strike (#304).
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled

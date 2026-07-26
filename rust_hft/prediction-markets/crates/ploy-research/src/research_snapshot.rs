@@ -199,7 +199,45 @@ pub struct AuthenticatedReadyEventCohort {
     manifest_id: String,
     partition_digest: String,
     causal_projection_policy_id: String,
+    partition_view: AuthenticatedPartitionView,
     members: Vec<AuthenticatedReadyEvent>,
+}
+
+/// Read-only cohort assignment copied from the validated #322 partition.
+/// Its digest is already bound into the authenticated snapshot contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedPartitionView {
+    common_time_boundary_ms: i64,
+    train_market_ids: Vec<String>,
+    crossing_excluded_market_ids: Vec<String>,
+    held_out_market_ids: Vec<String>,
+}
+
+impl AuthenticatedPartitionView {
+    pub fn common_time_boundary_ms(&self) -> i64 {
+        self.common_time_boundary_ms
+    }
+
+    pub fn train_market_ids(&self) -> &[String] {
+        &self.train_market_ids
+    }
+
+    pub fn crossing_excluded_market_ids(&self) -> &[String] {
+        &self.crossing_excluded_market_ids
+    }
+
+    pub fn held_out_market_ids(&self) -> &[String] {
+        &self.held_out_market_ids
+    }
+
+    fn from_partition(partition: &EventCohortPartition) -> Self {
+        Self {
+            common_time_boundary_ms: partition.common_time_boundary_ms(),
+            train_market_ids: partition.train_market_ids().to_vec(),
+            crossing_excluded_market_ids: partition.crossing_excluded_market_ids().to_vec(),
+            held_out_market_ids: partition.held_out_market_ids().to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +280,7 @@ pub struct AuthenticatedResearchSnapshot {
     cohort_manifest_id: String,
     partition_digest: String,
     causal_projection_policy_id: String,
+    partition_view: AuthenticatedPartitionView,
     snapshot_contract_id: String,
     snapshot_hash: String,
     source_kind: String,
@@ -259,6 +298,10 @@ impl AuthenticatedResearchSnapshot {
 
     pub fn causal_projection_policy_id(&self) -> &str {
         &self.causal_projection_policy_id
+    }
+
+    pub fn partition_view(&self) -> &AuthenticatedPartitionView {
+        &self.partition_view
     }
 
     pub fn snapshot_contract_id(&self) -> &str {
@@ -483,6 +526,7 @@ pub fn authenticate_ready_event_cohort(
         manifest_id,
         partition_digest: partition.digest().to_string(),
         causal_projection_policy_id: partition.causal_projection_policy_id().to_string(),
+        partition_view: AuthenticatedPartitionView::from_partition(partition),
         members,
     })
 }
@@ -1101,6 +1145,7 @@ fn admitted_snapshot(
         cohort_manifest_id: cohort.manifest_id.clone(),
         partition_digest: cohort.partition_digest.clone(),
         causal_projection_policy_id: cohort.causal_projection_policy_id.clone(),
+        partition_view: cohort.partition_view.clone(),
         snapshot_contract_id,
         snapshot_hash,
         source_kind: snapshot.manifest.source_kind.clone(),
@@ -3776,6 +3821,12 @@ mod tests {
             manifest_id: format!("sha256:{}", "a".repeat(64)),
             partition_digest: format!("sha256:{}", "b".repeat(64)),
             causal_projection_policy_id: format!("sha256:{}", "c".repeat(64)),
+            partition_view: AuthenticatedPartitionView {
+                common_time_boundary_ms: 1_784_326_800_000,
+                train_market_ids: vec!["event-1".to_string()],
+                crossing_excluded_market_ids: Vec::new(),
+                held_out_market_ids: Vec::new(),
+            },
             members: vec![AuthenticatedReadyEvent {
                 receipt_sha256: "d".repeat(64),
                 market_id: "event-1".to_string(),
@@ -4944,6 +4995,28 @@ mod tests {
             POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
         );
         assert!(!cohort.manifest_id().contains(&first_contract));
+    }
+
+    #[test]
+    fn authenticated_snapshot_exposes_only_the_validated_partition_view() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = authenticated_test_request(cache.path().to_path_buf());
+
+        let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("materialize authenticated snapshot");
+        let partition = admitted.partition_view();
+
+        assert_eq!(partition.common_time_boundary_ms(), 1_784_326_800_000);
+        assert_eq!(partition.train_market_ids(), ["event-1"]);
+        assert!(partition.crossing_excluded_market_ids().is_empty());
+        assert!(partition.held_out_market_ids().is_empty());
+
+        let cached = admit_cached_authenticated_research_snapshot(&cohort, &request)
+            .expect("cached readback preserves the authenticated partition view");
+        assert_eq!(cached.partition_view(), partition);
     }
 
     #[test]
