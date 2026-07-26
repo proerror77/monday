@@ -284,6 +284,8 @@ jobs:
             --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
             "$IMAGE")
           test "$actual_source_revision" = "$SOURCE_REVISION"
+          docker run --rm --entrypoint /usr/local/bin/polymarket-raw-ops "$IMAGE" \
+            --version | grep -Fqx "polymarket-raw-ops $SOURCE_REVISION"
 
       - name: Verify Polymarket market recorder image
         if: matrix.repository == 'polymarket-market-recorder'

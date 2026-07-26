@@ -434,12 +434,15 @@ jobs:
         run: |
           image=polymarket-evidence-compiler:${{ github.sha }}
           docker build \
+            --build-arg "SOURCE_REVISION=${{ github.sha }}" \
             --file rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler \
             --tag "$image" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             rust_hft
           docker run --rm --entrypoint /usr/local/bin/polymarket-raw-ops "$image" \
             publish-polymarket-evidence --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/polymarket-raw-ops "$image" \
+            --version | grep -Fqx "polymarket-raw-ops ${{ github.sha }}"
           docker run --rm --entrypoint /usr/local/bin/aliyun "$image" version >/dev/null
           docker run --rm --entrypoint /bin/sh "$image" -ec \
             'test ! -e /usr/local/bin/binance-lob-archiver'
