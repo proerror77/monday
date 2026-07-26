@@ -182,6 +182,7 @@ pub struct ResearchSnapshotRequest<'a> {
 const AUTHENTICATED_SNAPSHOT_CACHE_VERSION: &str = "authenticated_research_snapshot_cache.v1";
 const AUTHENTICATED_SNAPSHOT_SYMBOL: &str = "BTCUSDT";
 const AUTHENTICATED_SNAPSHOT_WINDOW_SECS: i64 = 300;
+const SEALED_SNAPSHOT_CACHE_MARKER: &str = ".authenticated-research-snapshot.sealed";
 const AUTHENTICATED_COHORT_ARTIFACT: &str = "authenticated_ready_event_cohort";
 const AUTHENTICATED_PARTITION_ARTIFACT: &str = "event_cohort_partition";
 const AUTHENTICATED_COMPILER_SOURCE_ARTIFACT: &str = "research_snapshot_compiler_source";
@@ -217,9 +218,9 @@ impl AuthenticatedReadyEventCohort {
     }
 }
 
-/// Stable caller input for the filesystem cache. Compiler identities are
-/// treated as opaque immutable strings and are bound into the snapshot
-/// evaluator contract before admission.
+/// Stable caller input for the filesystem cache. Compiler identities must be
+/// immutable SHA-256 IDs and are bound into the snapshot evaluator contract
+/// before admission.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSnapshotMaterializationRequest {
     pub cache_root: PathBuf,
@@ -465,16 +466,16 @@ pub fn materialize_authenticated_research_snapshot<F>(
 where
     F: FnOnce() -> Result<ResearchSnapshot>,
 {
-    if request.compiler_source_identity.trim().is_empty()
-        || request.compiler_source_identity.trim() != request.compiler_source_identity
-        || request.compiler_image_identity.trim().is_empty()
-        || request.compiler_image_identity.trim() != request.compiler_image_identity
-    {
-        return Err(
-            AuthenticatedResearchSnapshotRejection::MaterializationFailed {
-                reason: "compiler identities must be trimmed non-empty strings".to_string(),
-            },
-        );
+    for (identity, field) in [
+        (
+            &request.compiler_source_identity,
+            "compiler_source_identity",
+        ),
+        (&request.compiler_image_identity, "compiler_image_identity"),
+    ] {
+        crate::prediction_loop::validate_sha256_id(identity, field).map_err(|reason| {
+            AuthenticatedResearchSnapshotRejection::MaterializationFailed { reason }
+        })?;
     }
     let key = AuthenticatedSnapshotCacheKey {
         schema_version: AUTHENTICATED_SNAPSHOT_CACHE_VERSION,
@@ -491,6 +492,11 @@ where
     let snapshot_dir = request.cache_root.join(format!("sha256={cache_key}"));
     if snapshot_dir.exists() {
         let snapshot = load_research_snapshot(&snapshot_dir).map_err(|error| {
+            AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+                reason: error.to_string(),
+            }
+        })?;
+        verify_sealed_snapshot_cache(&snapshot_dir, &snapshot).map_err(|error| {
             AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
                 reason: error.to_string(),
             }
@@ -518,7 +524,7 @@ where
         }
     })?;
     validate_authenticated_snapshot(&snapshot, cohort, request, true)?;
-    mark_snapshot_cache_read_only(&snapshot_dir, &snapshot).map_err(|error| {
+    seal_snapshot_cache(&snapshot_dir, &snapshot).map_err(|error| {
         AuthenticatedResearchSnapshotRejection::MaterializationFailed {
             reason: error.to_string(),
         }
@@ -563,14 +569,14 @@ fn bind_authenticated_snapshot_identity(
         },
         ResearchSnapshotInputArtifact {
             name: AUTHENTICATED_COMPILER_SOURCE_ARTIFACT.to_string(),
-            path: request.compiler_source_identity.clone(),
-            content_hash: None,
+            path: "authenticated://compiler-source".to_string(),
+            content_hash: Some(request.compiler_source_identity.clone()),
             row_count: None,
         },
         ResearchSnapshotInputArtifact {
             name: AUTHENTICATED_COMPILER_IMAGE_ARTIFACT.to_string(),
-            path: request.compiler_image_identity.clone(),
-            content_hash: None,
+            path: "authenticated://compiler-image".to_string(),
+            content_hash: Some(request.compiler_image_identity.clone()),
             row_count: None,
         },
     ]);
@@ -611,13 +617,13 @@ fn validate_authenticated_snapshot(
             ),
             (
                 AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,
-                request.compiler_source_identity.as_str(),
-                None,
+                "authenticated://compiler-source",
+                Some(request.compiler_source_identity.as_str()),
             ),
             (
                 AUTHENTICATED_COMPILER_IMAGE_ARTIFACT,
-                request.compiler_image_identity.as_str(),
-                None,
+                "authenticated://compiler-image",
+                Some(request.compiler_image_identity.as_str()),
             ),
         ];
         for (name, path, content_hash) in expected {
@@ -769,7 +775,7 @@ fn admitted_snapshot(
     })
 }
 
-fn mark_snapshot_cache_read_only(snapshot_dir: &Path, snapshot: &ResearchSnapshot) -> Result<()> {
+fn snapshot_cache_paths(snapshot_dir: &Path, snapshot: &ResearchSnapshot) -> Vec<PathBuf> {
     let mut paths = vec![
         snapshot_dir.join("manifest.json"),
         snapshot_dir.join(&snapshot.manifest.artifacts.observations_json),
@@ -781,7 +787,11 @@ fn mark_snapshot_cache_read_only(snapshot_dir: &Path, snapshot: &ResearchSnapsho
     if let Some(parquet) = &snapshot.manifest.artifacts.observations_parquet {
         paths.push(snapshot_dir.join(parquet));
     }
-    for path in paths {
+    paths
+}
+
+fn seal_snapshot_cache(snapshot_dir: &Path, snapshot: &ResearchSnapshot) -> Result<()> {
+    for path in snapshot_cache_paths(snapshot_dir, snapshot) {
         let mut permissions = fs::metadata(&path)
             .with_context(|| format!("inspect authenticated snapshot cache {}", path.display()))?
             .permissions();
@@ -793,6 +803,69 @@ fn mark_snapshot_cache_read_only(snapshot_dir: &Path, snapshot: &ResearchSnapsho
             )
         })?;
     }
+    let marker = snapshot_dir.join(SEALED_SNAPSHOT_CACHE_MARKER);
+    let contract_id = snapshot
+        .manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .context("sealed snapshot cache requires snapshot_contract_hash")?;
+    fs::write(&marker, contract_id).with_context(|| {
+        format!(
+            "write authenticated snapshot cache seal {}",
+            marker.display()
+        )
+    })?;
+    let mut permissions = fs::metadata(&marker)
+        .with_context(|| {
+            format!(
+                "inspect authenticated snapshot cache seal {}",
+                marker.display()
+            )
+        })?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&marker, permissions)
+        .with_context(|| format!("seal authenticated snapshot cache {}", marker.display()))?;
+    Ok(())
+}
+
+fn verify_sealed_snapshot_cache(snapshot_dir: &Path, snapshot: &ResearchSnapshot) -> Result<()> {
+    for path in snapshot_cache_paths(snapshot_dir, snapshot) {
+        ensure!(
+            fs::metadata(&path)
+                .with_context(|| format!(
+                    "inspect authenticated snapshot cache {}",
+                    path.display()
+                ))?
+                .permissions()
+                .readonly(),
+            "authenticated snapshot cache artifact is not read-only: {}",
+            path.display()
+        );
+    }
+    let marker = snapshot_dir.join(SEALED_SNAPSHOT_CACHE_MARKER);
+    let metadata = fs::metadata(&marker).with_context(|| {
+        format!(
+            "read authenticated snapshot cache seal {}",
+            marker.display()
+        )
+    })?;
+    ensure!(
+        metadata.permissions().readonly(),
+        "authenticated snapshot cache seal is not read-only"
+    );
+    let expected = snapshot
+        .manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .context("sealed snapshot cache requires snapshot_contract_hash")?;
+    ensure!(
+        fs::read_to_string(&marker).with_context(|| format!(
+            "read authenticated snapshot cache seal {}",
+            marker.display()
+        ))? == expected,
+        "authenticated snapshot cache seal does not match snapshot_contract_hash"
+    );
     Ok(())
 }
 
@@ -3390,6 +3463,16 @@ mod tests {
         }
     }
 
+    fn authenticated_test_request(
+        cache_root: PathBuf,
+    ) -> AuthenticatedSnapshotMaterializationRequest {
+        AuthenticatedSnapshotMaterializationRequest {
+            cache_root,
+            compiler_source_identity: format!("sha256:{}", "3".repeat(64)),
+            compiler_image_identity: format!("sha256:{}", "4".repeat(64)),
+        }
+    }
+
     fn authenticated_test_snapshot() -> ResearchSnapshot {
         let cohort = authenticated_test_cohort();
         let member = &cohort.members[0];
@@ -4500,11 +4583,7 @@ mod tests {
     fn authenticated_snapshot_cache_reuses_a_verified_readback_without_a_hash_cycle() {
         let cache = tempfile::tempdir().expect("cache root");
         let cohort = authenticated_test_cohort();
-        let request = AuthenticatedSnapshotMaterializationRequest {
-            cache_root: cache.path().to_path_buf(),
-            compiler_source_identity: "test-source".to_string(),
-            compiler_image_identity: "sha256:test-image".to_string(),
-        };
+        let request = authenticated_test_request(cache.path().to_path_buf());
         let mut builds = 0;
 
         let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
@@ -4541,26 +4620,56 @@ mod tests {
     fn corrupt_cached_snapshot_is_rejected_without_rebuilding() {
         let cache = tempfile::tempdir().expect("cache root");
         let cohort = authenticated_test_cohort();
-        let request = AuthenticatedSnapshotMaterializationRequest {
-            cache_root: cache.path().to_path_buf(),
-            compiler_source_identity: "test-source".to_string(),
-            compiler_image_identity: "sha256:test-image".to_string(),
-        };
+        let request = authenticated_test_request(cache.path().to_path_buf());
         let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
             Ok(authenticated_test_snapshot())
         })
         .expect("materialize cache fixture");
         let observations = admitted.snapshot_dir().join("observations.json");
-        let mut permissions = std::fs::metadata(&observations).unwrap().permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(&observations, permissions).unwrap();
-        std::fs::write(&observations, "[]\n").unwrap();
+        std::fs::remove_file(&observations).unwrap();
 
         assert!(matches!(
             materialize_authenticated_research_snapshot(&cohort, &request, || {
                 panic!("corrupt cache must reject before rebuilding")
             }),
             Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn unsealed_cache_is_rejected_without_rebuilding() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = authenticated_test_request(cache.path().to_path_buf());
+        let admitted = materialize_authenticated_research_snapshot(&cohort, &request, || {
+            Ok(authenticated_test_snapshot())
+        })
+        .expect("materialize cache fixture");
+        std::fs::remove_file(admitted.snapshot_dir().join(SEALED_SNAPSHOT_CACHE_MARKER)).unwrap();
+
+        assert!(matches!(
+            materialize_authenticated_research_snapshot(&cohort, &request, || {
+                panic!("unsealed cache must reject before rebuilding")
+            }),
+            Err(AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn compiler_identity_requires_a_sha256_digest() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cohort = authenticated_test_cohort();
+        let request = AuthenticatedSnapshotMaterializationRequest {
+            cache_root: cache.path().to_path_buf(),
+            compiler_source_identity: "compiler-source-label".to_string(),
+            compiler_image_identity: format!("sha256:{}", "4".repeat(64)),
+        };
+
+        assert!(matches!(
+            materialize_authenticated_research_snapshot(&cohort, &request, || {
+                panic!("malformed compiler identity must reject before building")
+            }),
+            Err(AuthenticatedResearchSnapshotRejection::MaterializationFailed { .. })
         ));
     }
 }
