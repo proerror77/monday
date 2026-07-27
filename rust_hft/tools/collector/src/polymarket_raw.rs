@@ -2659,12 +2659,6 @@ impl ReferenceCollector {
             ))
             .into());
         }
-        if !overdue_unresolved_markets.is_empty() {
-            return Err(DataCompletenessError(format!(
-                "overdue unresolved settlements: {overdue_unresolved_markets:?}"
-            ))
-            .into());
-        }
         if !stale_trade_markets.is_empty() {
             return Err(DataCompletenessError(format!(
                 "stale trade markets: {stale_trade_markets:?}"
@@ -3119,6 +3113,70 @@ mod tests {
         assert!(trade_source_at < post_fetch_at);
         assert_eq!(trade["update"]["received_at"], iso_z(post_fetch_at));
         assert_eq!(trade["recorded_at"], iso_z(post_fetch_at));
+    }
+
+    #[tokio::test]
+    async fn collect_once_reports_historical_overdue_settlement_without_failing_cycle() {
+        use std::io::Read as _;
+
+        let now = fixed_time("2026-07-21T03:00:00Z");
+        let discovery = serde_json::to_vec(&json!({
+            "markets": [market(
+                "Bitcoin Up or Down - 5 minutes",
+                "2026-07-20T00:00:00Z",
+                "2026-07-20T00:05:00Z",
+            )],
+            "next_cursor": "",
+        }))
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut connection, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2_048];
+                let _ = connection.read(&mut request).unwrap();
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    discovery.len()
+                )
+                .unwrap();
+                connection.write_all(&discovery).unwrap();
+            }
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        collector.state.markets.insert(
+            "market-1".to_owned(),
+            TrackedMarket {
+                condition_id: Some("condition-1".to_owned()),
+                symbol: Some("BTCUSDT".to_owned()),
+                market_window_secs: 300,
+                end_time: Some("2026-07-20T00:05:00Z".to_owned()),
+                trade_complete: true,
+                ..TrackedMarket::default()
+            },
+        );
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+        collector.clock = Box::new(move || now);
+
+        let health = collector.collect_once().await.unwrap();
+
+        server.join().unwrap();
+        assert_eq!(health["overdue_unresolved_markets"], json!(["market-1"]));
+        assert_eq!(health["api_errors"], json!([]));
     }
 
     #[tokio::test]

@@ -1726,11 +1726,25 @@ for mutation in \
   '.malformed_trade_rows = 1' \
   '.truncated_trade_markets = ["condition-1"]' \
   '.stale_trade_markets = ["condition-1"]' \
-  '.stale_settlement_markets = ["market-1"]' \
-  '.overdue_unresolved_markets = ["market-1"]'; do
+  '.stale_settlement_markets = ["market-1"]'; do
   jq "$mutation" "$tmp_dir/legacy-health.json" >"$tmp_dir/bad-legacy-health.json"
   if jq -e -f "$LEGACY_HEALTH_POLICY" "$tmp_dir/bad-legacy-health.json" >/dev/null; then
     printf 'legacy health policy accepted failure mutation: %s\n' "$mutation" >&2
+    exit 1
+  fi
+done
+jq '.overdue_unresolved_markets = ["historical-market"]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/historical-overdue-legacy-health.json"
+jq -e -f "$LEGACY_HEALTH_POLICY" \
+  "$tmp_dir/historical-overdue-legacy-health.json" >/dev/null
+for mutation in \
+  'del(.overdue_unresolved_markets)' \
+  '.overdue_unresolved_markets = "market-1"' \
+  '.overdue_unresolved_markets = [""]' \
+  '.overdue_unresolved_markets = [1]'; do
+  jq "$mutation" "$tmp_dir/legacy-health.json" >"$tmp_dir/bad-legacy-overdue.json"
+  if jq -e -f "$LEGACY_HEALTH_POLICY" "$tmp_dir/bad-legacy-overdue.json" >/dev/null; then
+    printf 'legacy health policy accepted invalid overdue evidence: %s\n' "$mutation" >&2
     exit 1
   fi
 done
@@ -1784,6 +1798,21 @@ jq -n '{
   overdue_unresolved_markets:[]
 }' >"$tmp_dir/rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/rust-health.json" >/dev/null
+jq '.overdue_unresolved_markets = ["historical-market"]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/historical-overdue-rust-health.json"
+jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/historical-overdue-rust-health.json" >/dev/null
+for mutation in \
+  'del(.overdue_unresolved_markets)' \
+  '.overdue_unresolved_markets = "market-1"' \
+  '.overdue_unresolved_markets = [""]' \
+  '.overdue_unresolved_markets = [1]'; do
+  jq "$mutation" "$tmp_dir/rust-health.json" >"$tmp_dir/bad-rust-overdue.json"
+  if jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/bad-rust-overdue.json" >/dev/null; then
+    printf 'Rust health policy accepted invalid overdue evidence: %s\n' "$mutation" >&2
+    exit 1
+  fi
+done
 jq '
   .priority_trade_markets_before_market_details = 112
   | .market_detail_budget = 0

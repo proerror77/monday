@@ -53,4 +53,4 @@ and .invalid_settlement_markets == []
 and .invalid_end_time_markets == []
 and .stale_trade_markets == []
 and .stale_settlement_markets == []
-and .overdue_unresolved_markets == []
+and (.overdue_unresolved_markets | type == "array" and all(.[]; type == "string" and length > 0))
