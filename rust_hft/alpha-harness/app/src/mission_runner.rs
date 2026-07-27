@@ -12,7 +12,9 @@ use alpha_domain::{
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
-use hft_research_manifest::ManifestId;
+use hft_research_manifest::{
+    CexReplaySnapshotV1, ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+};
 use reqwest::{
     blocking::Client,
     header::{HeaderValue, CONTENT_TYPE},
@@ -28,7 +30,6 @@ use std::{
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
-const MATERIALIZATION_SCHEMA: &str = "binance-lob-pit-v1";
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
@@ -44,11 +45,20 @@ struct Materialization {
     artifact_sha256: String,
     bucket_ms: u64,
     label_horizon_buckets: usize,
+    top_depth: usize,
+    first_event_time: chrono::DateTime<Utc>,
+    last_event_time: chrono::DateTime<Utc>,
+    snapshot: CexReplaySnapshotV1,
+    snapshot_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct SourceSegment {
     sha256: String,
+    collector_manifest_sha256: String,
+    start_received_at_ns: u64,
+    end_received_at_ns: u64,
+    events: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +156,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 
     let db = results_dir.join("alpha.duckdb");
     let feature_manifest_path = results_dir.join("feature-manifest.json");
+    let dataset_manifest_path = results_dir.join("cex-replay-dataset-manifest.json");
     let mut store = AlphaStore::open(&db)?;
     let feature_manifest = data_mission::import_and_register_features(
         &mut store,
@@ -163,12 +174,20 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     {
         bail!("registered feature lineage or label facts do not match the materialization");
     }
+    let dataset_manifest = data_mission::admit_cex_replay_dataset(
+        &mut store,
+        &feature_manifest,
+        &materialization.snapshot,
+    )?;
     data_mission::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
+    data_mission::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
     data_mission::write_json_atomic(
         &results_dir.join("data-import.json"),
         &serde_json::json!({
-            "manifest": &feature_manifest,
-            "manifest_path": &feature_manifest_path,
+            "manifest": &dataset_manifest,
+            "manifest_path": &dataset_manifest_path,
+            "feature_manifest": &feature_manifest,
+            "feature_manifest_path": &feature_manifest_path,
         }),
     )?;
     std::fs::copy(
@@ -186,7 +205,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         objective: args.objective.clone(),
         hypothesis_scope: args.hypothesis_scope.clone(),
         mutable_scope: vec!["factor_ast".to_string()],
-        dataset_manifest_id: ManifestId::new(feature_manifest.manifest_id.clone())?,
+        dataset_manifest_id: ManifestId::new(dataset_manifest.manifest_id.clone())?,
         baseline_artifact_id: None,
         validation_mode: ValidatorMode::MissionValidator,
         validator_spec: serde_json::json!({"multiple_testing_trials": args.max_candidates}),
@@ -210,7 +229,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     drop(store);
 
     let dataset = DatasetArgs {
-        dataset_manifest: feature_manifest_path,
+        dataset_manifest: dataset_manifest_path,
         validation: args.validation.clone(),
     };
     let run_report = mission::execute_mission(
@@ -323,8 +342,17 @@ fn validate_materialization(
     feature_sha256: &str,
     validation: &ValidationArgs,
 ) -> anyhow::Result<()> {
+    materialization
+        .snapshot
+        .validate()
+        .map_err(anyhow::Error::new)?;
+    let snapshot_sha256 =
+        normalized_sha256("CEX replay snapshot", &materialization.snapshot_sha256)?;
+    if snapshot_sha256 != materialization.snapshot.sha256() {
+        bail!("CEX replay snapshot SHA256 mismatch");
+    }
     if materialization.dataset_kind != MATERIALIZATION_KIND
-        || materialization.schema_version != MATERIALIZATION_SCHEMA
+        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2
     {
         bail!("materialization kind or schema is unsupported");
     }
@@ -334,8 +362,33 @@ fn validate_materialization(
         || materialization.source_segments.is_empty()
         || materialization.bucket_ms == 0
         || materialization.label_horizon_buckets == 0
+        || materialization.top_depth == 0
     {
         bail!("materialization lineage is incomplete");
+    }
+    if materialization.snapshot.symbol != materialization.symbol
+        || materialization.snapshot.instrument_type != materialization.market
+        || materialization.snapshot.bucket_ms != materialization.bucket_ms
+        || materialization.snapshot.label_horizon_buckets != materialization.label_horizon_buckets
+        || materialization.snapshot.top_depth != materialization.top_depth
+        || materialization.snapshot.first_event_time != materialization.first_event_time
+        || materialization.snapshot.last_event_time != materialization.last_event_time
+        || materialization.snapshot.feature_artifact_sha256 != materialization.artifact_sha256
+        || materialization.snapshot.source_segments.len() != materialization.source_segments.len()
+        || materialization
+            .snapshot
+            .source_segments
+            .iter()
+            .zip(&materialization.source_segments)
+            .any(|(snapshot, report)| {
+                snapshot.content_sha256 != report.sha256
+                    || snapshot.manifest_sha256 != report.collector_manifest_sha256
+                    || snapshot.start_received_at_ns != report.start_received_at_ns
+                    || snapshot.end_received_at_ns != report.end_received_at_ns
+                    || snapshot.events != report.events
+            })
+    {
+        bail!("CEX replay snapshot does not match the materialization");
     }
     if materialization.bucket_ms != validation.observation_frequency_millis
         || materialization.label_horizon_buckets != validation.label_horizon_buckets
@@ -518,6 +571,7 @@ mod tests {
     use hft_collector::{DataModality, PointInTimeFeatureRow};
     use std::{
         collections::{BTreeMap, BTreeSet},
+        io::BufRead,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -556,6 +610,10 @@ mod tests {
         let fixture = fixture("hash-mismatch");
         let mut materialization = fixture.materialization;
         materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
+        materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!("0".repeat(64));
+        let snapshot: CexReplaySnapshotV1 =
+            serde_json::from_value(materialization["snapshot"].clone()).unwrap();
+        materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         std::fs::write(
             &fixture.materialization_path,
             serde_json::to_vec_pretty(&materialization).unwrap(),
@@ -569,6 +627,101 @@ mod tests {
         assert!(error
             .to_string()
             .contains("PIT feature artifact does not match materialization"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_snapshot_missing_aggregate_trade_modality() {
+        let fixture = fixture("missing-aggregate-trade-modality");
+        let mut materialization = fixture.materialization;
+        materialization["snapshot"] = serde_json::json!({
+            "schema_version": "cex-replay-snapshot-v1",
+            "venue": "binance",
+            "instrument_type": "usdm",
+            "symbol": "BTCUSDT",
+            "replay_clock": "received_at_ns",
+            "required_modalities": ["lob"],
+            "source_segments": [{
+                "content_sha256": "1".repeat(64),
+                "manifest_sha256": "2".repeat(64),
+                "start_received_at_ns": 1,
+                "end_received_at_ns": 2,
+                "events": 1
+            }],
+            "first_event_time": materialization["first_event_time"].clone(),
+            "last_event_time": materialization["last_event_time"].clone(),
+            "feature_artifact_sha256": materialization["artifact_sha256"].clone(),
+            "feature_availability_policy": "feature_available_time_equals_event_time",
+            "bucket_ms": 1_000,
+            "label_horizon_buckets": 5,
+            "top_depth": 5
+        });
+        materialization["snapshot_sha256"] = serde_json::json!("0".repeat(64));
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&materialization).unwrap(),
+        )
+        .unwrap();
+        let mut args = fixture.args;
+        args.materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
+
+        let error = execute(args).unwrap_err();
+
+        assert!(error.to_string().contains("required modalities"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_binds_snapshot_to_mission_dataset_identity() {
+        let fixture = fixture("snapshot-dataset-identity");
+        let expected = format!(
+            "dataset-cex-replay-{}",
+            fixture.materialization["snapshot_sha256"].as_str().unwrap()
+        );
+
+        execute(fixture.args.clone()).unwrap();
+
+        let mission: ResearchMission = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/mission.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mission.dataset_manifest_id.as_str(), expected);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_feature_available_after_decision_clock() {
+        let mut fixture = fixture("feature-after-decision-clock");
+        rewrite_features(&mut fixture, |row| {
+            row.feature_available_time += ChronoDuration::milliseconds(1);
+        });
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("feature availability does not match the CEX replay decision clock"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_snapshot_range_that_disagrees_with_feature_rows() {
+        let mut fixture = fixture("snapshot-feature-range-mismatch");
+        let first_event_time = serde_json::from_value::<chrono::DateTime<Utc>>(
+            fixture.materialization["first_event_time"].clone(),
+        )
+        .unwrap()
+            + ChronoDuration::seconds(1);
+        fixture.materialization["first_event_time"] = serde_json::json!(first_event_time);
+        fixture.materialization["snapshot"]["first_event_time"] =
+            serde_json::json!(first_event_time);
+        resign_materialization(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("feature time bounds do not match the CEX replay snapshot"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -765,6 +918,7 @@ mod tests {
 
     struct Fixture {
         root: PathBuf,
+        feature_path: PathBuf,
         materialization_path: PathBuf,
         result_path: PathBuf,
         materialization: serde_json::Value,
@@ -812,9 +966,45 @@ mod tests {
         }
         std::fs::write(&feature_path, &feature_bytes).unwrap();
         let feature_sha256 = hex::encode(Sha256::digest(&feature_bytes));
+        let first_event_time = ingestion_time - ChronoDuration::seconds(300);
+        let last_event_time = ingestion_time - ChronoDuration::seconds(141);
+        let source_start_ns = u64::try_from(
+            (first_event_time - ChronoDuration::seconds(1))
+                .timestamp_nanos_opt()
+                .unwrap(),
+        )
+        .unwrap();
+        let source_end_ns = u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
+        let snapshot = CexReplaySnapshotV1 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V1.to_string(),
+            venue: "binance".to_string(),
+            instrument_type: "usdm".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
+            required_modalities: BTreeSet::from([
+                hft_research_manifest::CEX_MODALITY_LOB.to_string(),
+                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ]),
+            source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
+                content_sha256: "1".repeat(64),
+                manifest_sha256: "2".repeat(64),
+                start_received_at_ns: source_start_ns,
+                end_received_at_ns: source_end_ns,
+                events: 160,
+            }],
+            first_event_time,
+            last_event_time,
+            feature_artifact_sha256: feature_sha256.clone(),
+            feature_availability_policy: hft_research_manifest::CEX_FEATURE_AVAILABILITY_POLICY
+                .to_string(),
+            bucket_ms: 1_000,
+            label_horizon_buckets: 5,
+            top_depth: 5,
+        };
+        let snapshot_sha256 = snapshot.sha256();
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
-            "schema_version": MATERIALIZATION_SCHEMA,
+            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
             "mission_id": "materialize-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
@@ -825,15 +1015,21 @@ mod tests {
             "source_segments": [{
                 "path": "segment.jsonl.zst",
                 "sha256": "1".repeat(64),
-                "start_received_at_ns": 1,
-                "end_received_at_ns": 2,
-                "events": 1
+                "collector_manifest_path": "segment.jsonl.zst.manifest.json",
+                "collector_manifest_sha256": "2".repeat(64),
+                "success_marker_path": "segment.jsonl.zst._SUCCESS",
+                "success_marker_sha256": "3".repeat(64),
+                "start_received_at_ns": source_start_ns,
+                "end_received_at_ns": source_end_ns,
+                "events": 160
             }],
             "rows": 160,
-            "first_event_time": ingestion_time - ChronoDuration::seconds(300),
-            "last_event_time": ingestion_time - ChronoDuration::seconds(141),
+            "first_event_time": first_event_time,
+            "last_event_time": last_event_time,
             "artifact_path": "features.jsonl",
             "artifact_sha256": feature_sha256,
+            "snapshot": snapshot,
+            "snapshot_sha256": snapshot_sha256,
             "created_at": ingestion_time
         });
         let materialization_path = root.join("materialization.json");
@@ -881,10 +1077,42 @@ mod tests {
         };
         Fixture {
             root,
+            feature_path,
             materialization_path,
             result_path,
             materialization,
             args,
         }
+    }
+
+    fn rewrite_features(fixture: &mut Fixture, mutate: impl Fn(&mut PointInTimeFeatureRow)) {
+        let bytes = std::fs::read(&fixture.feature_path).unwrap();
+        let mut rows = std::io::BufReader::new(bytes.as_slice())
+            .lines()
+            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        rows.iter_mut().for_each(mutate);
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, &row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&fixture.feature_path, &bytes).unwrap();
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        fixture.materialization["artifact_sha256"] = serde_json::json!(&sha256);
+        fixture.materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(&sha256);
+        resign_materialization(fixture);
+    }
+
+    fn resign_materialization(fixture: &mut Fixture) {
+        let snapshot: CexReplaySnapshotV1 =
+            serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
+        fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&fixture.materialization).unwrap(),
+        )
+        .unwrap();
+        fixture.args.materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
     }
 }
