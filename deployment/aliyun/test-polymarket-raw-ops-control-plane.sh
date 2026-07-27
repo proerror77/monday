@@ -385,7 +385,7 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
   if verify_cutover_target_preflight \
     "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
     secure_test_file; then
-    printf 'cutover target preflight accepted a stale Rust target in Python mode\n' >&2
+    printf 'cutover target preflight accepted a stale Rust target in legacy mode\n' >&2
     exit 1
   fi
   baseline_mode=rust_release
