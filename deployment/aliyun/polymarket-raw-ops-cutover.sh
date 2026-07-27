@@ -206,10 +206,12 @@ verify_release_binding() {
 }
 
 verify_control_release() {
-  local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest
+  local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest asset
   manifest="$control_dir/${RELEASE_MANIFEST##*/}"
-  for asset in "${BUNDLE_ASSETS[@]}"; do secure_regular_file "$control_dir/$asset"; done
-  secure_regular_file "$manifest"
+  for asset in "${BUNDLE_ASSETS[@]}"; do
+    secure_regular_file "$control_dir/$asset" || return 1
+  done
+  secure_regular_file "$manifest" || return 1
   verify_release_binding "$manifest" "$(sha256sum "$manifest" | awk '{print $1}')" \
     "$expected_sha" "$(jq -er '.source_revision' "$manifest")" \
     "$(jq -er '.control_manifest.sha256' "$manifest")" \

@@ -182,6 +182,12 @@ if verify_control_release "$release_manifest_dir" "$(printf '0%.0s' {1..64})" \
   printf 'global controls accepted a different Rust baseline release\n' >&2
   exit 1
 fi
+rm "$release_manifest_dir/fixture-control"
+if verify_control_release "$release_manifest_dir" "$candidate_sha" "$candidate_file"; then
+  printf 'global controls accepted a missing bundled control asset\n' >&2
+  exit 1
+fi
+: >"$release_manifest_dir/fixture-control"
 if verify_release_binding "$release_manifest" "$(printf '0%.0s' {1..64})" \
   "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
   "$control_archive_sha" "$candidate_file"; then
