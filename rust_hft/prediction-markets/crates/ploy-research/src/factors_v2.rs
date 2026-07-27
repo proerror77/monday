@@ -8521,8 +8521,6 @@ fn build_full_depth_execution_matrix_internal(
                         side,
                         stake_usd,
                         current_book,
-                        quote_age_secs,
-                        pm_spread_bps,
                         &sample,
                         &joint,
                         &options,
@@ -8720,12 +8718,19 @@ fn build_full_depth_execution_event_row(
     side: ReviewSide,
     stake_usd: f64,
     current_book: Option<&ResearchPmBookSnapshot>,
-    quote_age_secs: f64,
-    spread_bps: f64,
     sample: &FullDepthExecutionSample,
     joint: &JointBinaryBookMetrics,
     options: &FullDepthExecutionMatrixOptions,
 ) -> FullDepthExecutionEventRow {
+    let (entry_ask, exit_bid, _) = side_market_values(source, side);
+    let spread_bps = if valid_price(entry_ask) && valid_price(exit_bid) {
+        ((entry_ask - exit_bid).max(0.0) / entry_ask) * 10_000.0
+    } else {
+        f64::NAN
+    };
+    let quote_age_secs = current_book
+        .map(|book| (source.tick_ts - book.ts).num_milliseconds() as f64 / 1000.0)
+        .unwrap_or(f64::NAN);
     let opposite = match side {
         ReviewSide::Up => ReviewSide::Down,
         ReviewSide::Down => ReviewSide::Up,
