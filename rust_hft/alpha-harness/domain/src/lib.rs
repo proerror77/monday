@@ -552,7 +552,10 @@ impl CandidateEvaluation {
             && self.evaluation_protocol_hash.is_none()
             && matches!(
                 self.evaluator_version.as_str(),
-                WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                WALK_FORWARD_EVALUATOR_VERSION
+                    | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                    | "purged-walk-forward-v3"
+                    | "onnx-purged-walk-forward-v2"
             );
         self.validate_inner(legacy_unbound_walk_forward)
     }

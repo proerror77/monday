@@ -7,14 +7,15 @@ pub mod formula_evaluator;
 pub mod learning;
 pub mod llm;
 
+#[cfg(feature = "kernel")]
+use alpha_domain::{
+    canonical_json_hash, IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration,
+    SearchBudgetLimit,
+};
 use alpha_domain::{CandidateArtifact, EngineKind};
 pub use alpha_domain::{
     CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics, FoldPredictiveMetrics,
     PredictiveMetrics,
-};
-#[cfg(feature = "kernel")]
-use alpha_domain::{
-    IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration, SearchBudgetLimit,
 };
 #[cfg(feature = "kernel")]
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
@@ -621,9 +622,91 @@ fn historical_observations(
 }
 
 #[cfg(feature = "kernel")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvaluationCostsV1 {
+    fee_bps: f64,
+    funding_bps: f64,
+    latency_bps: f64,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    slippage_bps: f64,
+    #[serde(default, skip_serializing_if = "legacy_false")]
+    cross_spread: bool,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    position_notional_usd: f64,
+    #[serde(default, skip_serializing_if = "legacy_zero_usize")]
+    capacity_depth_levels: usize,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    max_book_depth_fraction: f64,
+}
+
+#[cfg(feature = "kernel")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvaluationProtocolV1 {
+    version: String,
+    walk_forward: alpha_domain::EvaluationWalkForwardV1,
+    costs: LegacyEvaluationCostsV1,
+    labels: alpha_domain::EvaluationLabelSpecV1,
+    metrics: alpha_domain::EvaluationMetricDefinitionsV1,
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_zero_f64(value: &f64) -> bool {
+    *value == 0.0
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_false(value: &bool) -> bool {
+    !*value
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_protocol_hash(protocol: &serde_json::Value) -> Result<String, String> {
+    let protocol: LegacyEvaluationProtocolV1 =
+        serde_json::from_value(protocol.clone()).map_err(|error| error.to_string())?;
+    canonical_json_hash(&protocol).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "kernel")]
 fn historical_evaluation(payload: &serde_json::Value) -> Result<CandidateEvaluation, String> {
+    let evaluator_version = payload
+        .get("evaluator_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "historical evaluation version is missing".to_string())?;
+    let legacy_walk_forward = matches!(
+        evaluator_version,
+        "purged-walk-forward-v2"
+            | "purged-walk-forward-v3"
+            | "onnx-purged-walk-forward-v1"
+            | "onnx-purged-walk-forward-v2"
+    );
+    let mut replay_payload = payload.clone();
+    if legacy_walk_forward {
+        match (
+            payload.get("evaluation_protocol"),
+            payload
+                .get("evaluation_protocol_hash")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            (Some(protocol), Some(protocol_hash)) if !protocol.is_null() => {
+                if legacy_protocol_hash(protocol)? != protocol_hash {
+                    return Err("historical evaluation protocol hash mismatch".to_string());
+                }
+            }
+            (None | Some(serde_json::Value::Null), None) => {}
+            _ => return Err("historical evaluation protocol binding is incomplete".to_string()),
+        }
+        replay_payload["evaluation_protocol"] = serde_json::Value::Null;
+        replay_payload["evaluation_protocol_hash"] = serde_json::Value::Null;
+    }
     let evaluation: CandidateEvaluation =
-        serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
+        serde_json::from_value(replay_payload).map_err(|error| error.to_string())?;
     // These exact prior-release schemas may be replayed for search state only.
     let pre_predictive_schema = matches!(
         evaluation.evaluator_version.as_str(),
@@ -1042,6 +1125,8 @@ mod tests {
 
         let mut legacy = malformed_current;
         legacy["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        legacy["evaluation_protocol"] = serde_json::Value::Null;
+        legacy["evaluation_protocol_hash"] = serde_json::Value::Null;
         let restored = historical_evaluation(&legacy).unwrap();
         assert_eq!(restored.score, evaluation.score);
         assert!(restored.metrics.net_sharpe.is_nan());
@@ -1061,6 +1146,57 @@ mod tests {
             historical_evaluation(&serde_json::to_value(&unbound_current).unwrap()).unwrap();
         assert!(restored.validate().is_err());
         assert!(restored.validate_for_historical_search_replay().is_ok());
+    }
+
+    #[test]
+    fn previous_walk_forward_cost_schema_replays_after_raw_hash_validation() {
+        let input = dataset();
+        let proposal = EngineProposal {
+            candidate_id: "candidate-1".to_string(),
+            hypothesis: "fixture".to_string(),
+            artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+            expansions: 1,
+            tokens: 0,
+            elapsed_ms: 1,
+        };
+        let mut evaluation = PassingEvaluator
+            .evaluate(&proposal, &input.engine_context())
+            .unwrap();
+        evaluation.evaluator_version = "purged-walk-forward-v3".to_string();
+        let mut legacy = serde_json::to_value(evaluation).unwrap();
+        for field in [
+            "rebate_bps",
+            "slippage_bps",
+            "cross_spread",
+            "position_notional_usd",
+            "capacity_depth_levels",
+            "max_book_depth_fraction",
+        ] {
+            legacy["evaluation_protocol"]["costs"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        legacy["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_turnover");
+        for fold in legacy["metrics"]["folds"].as_array_mut().unwrap() {
+            fold.as_object_mut().unwrap().remove("total_turnover");
+        }
+        legacy["evaluation_protocol_hash"] =
+            serde_json::json!(legacy_protocol_hash(&legacy["evaluation_protocol"]).unwrap());
+
+        let restored = historical_evaluation(&legacy).unwrap();
+        assert_eq!(restored.evaluator_version, "purged-walk-forward-v3");
+        assert!(restored.evaluation_protocol.is_none());
+        assert!(restored.evaluation_protocol_hash.is_none());
+        assert_eq!(restored.metrics.total_turnover, 0.0);
+
+        legacy["evaluation_protocol"]["costs"]["fee_bps"] = serde_json::json!(2.0);
+        assert!(historical_evaluation(&legacy)
+            .unwrap_err()
+            .contains("protocol hash mismatch"));
     }
 
     #[test]
