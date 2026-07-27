@@ -144,6 +144,10 @@ pub struct EvaluationRecord {
     pub evaluation_id: String,
     pub mission_id: String,
     pub candidate_id: String,
+    #[serde(default)]
+    pub dataset_manifest_id: String,
+    #[serde(default)]
+    pub evaluation_protocol_hash: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
@@ -1054,6 +1058,8 @@ impl AlphaStore {
             && stored.mission_id == mission.mission_id
             && stored.candidate_id == candidate_id
             && stored.evaluation_id == evaluation_id
+            && stored.dataset_manifest_id == mission.dataset_manifest_id.as_str()
+            && stored.evaluation_protocol_hash == protocol_hash
             && evaluation.passed
             && evaluation.evaluator_version == expected_version
             && evaluation.formula_config().map_err(domain_error)? == expected_config)
@@ -2722,6 +2728,27 @@ mod tests {
     use hft_research_manifest::ManifestId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn evaluation_record_hash_binds_dataset_and_protocol() {
+        let record = EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            dataset_manifest_id: "dataset-a".to_string(),
+            evaluation_protocol_hash: "a".repeat(64),
+            payload: serde_json::json!({"score": 1.0}),
+            created_at: Utc::now(),
+        };
+        let original_hash = encoded(&record).unwrap().1;
+        let mut changed_dataset = record.clone();
+        changed_dataset.dataset_manifest_id = "dataset-b".to_string();
+        let mut changed_protocol = record;
+        changed_protocol.evaluation_protocol_hash = "b".repeat(64);
+
+        assert_ne!(encoded(&changed_dataset).unwrap().1, original_hash);
+        assert_ne!(encoded(&changed_protocol).unwrap().1, original_hash);
+    }
+
     fn mission() -> ResearchMission {
         let now = Utc::now();
         ResearchMission {
@@ -2789,6 +2816,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps: 1.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,
@@ -2931,6 +2959,8 @@ mod tests {
             evaluation_id: "evaluation-1".to_string(),
             mission_id: "mission-1".to_string(),
             candidate_id: "candidate-1".to_string(),
+            dataset_manifest_id: "dataset-1".to_string(),
+            evaluation_protocol_hash: walk_forward_protocol.content_hash().unwrap(),
             payload: evaluation_fixture_with_protocol(
                 WALK_FORWARD_EVALUATOR_VERSION,
                 2,
@@ -3398,6 +3428,8 @@ mod tests {
             evaluation_id: "evaluation-1".to_string(),
             mission_id: mission.mission_id.clone(),
             candidate_id: "candidate-1".to_string(),
+            dataset_manifest_id: mission.dataset_manifest_id.as_str().to_string(),
+            evaluation_protocol_hash: evaluation_protocol().content_hash().unwrap(),
             payload,
             created_at: Utc::now(),
         };

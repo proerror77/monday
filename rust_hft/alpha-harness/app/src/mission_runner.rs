@@ -73,6 +73,7 @@ struct ExecutionReport<'a> {
 struct ExecutionModelEvidence {
     schema_version: &'static str,
     fee_bps: f64,
+    rebate_bps: f64,
     funding_bps: f64,
     latency_bps: f64,
     additional_slippage_bps: f64,
@@ -93,8 +94,9 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     fn from(costs: &EvaluationCostsV1) -> Self {
         let capacity_gate_enabled = costs.capacity_enabled();
         Self {
-            schema_version: "execution_cost_model_v1",
+            schema_version: "execution_cost_model_v2",
             fee_bps: costs.fee_bps,
+            rebate_bps: costs.rebate_bps,
             funding_bps: costs.funding_bps,
             latency_bps: costs.latency_bps,
             additional_slippage_bps: costs.slippage_bps,
@@ -272,16 +274,17 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             "evaluations": lineage.evaluations,
         }),
     )?;
-    let kept = governance::validated_walk_forward_candidates(&store, &args.mission_id)?;
+    let selected = governance::selected_walk_forward_candidate(&store, &args.mission_id)?;
     drop(store);
     std::fs::write(
         results_dir.join("kept-candidates.txt"),
-        kept.iter()
+        selected
+            .iter()
             .map(|candidate| format!("{candidate}\n"))
             .collect::<String>(),
     )?;
     let mut sealed = BufWriter::new(File::create(results_dir.join("sealed-evaluations.jsonl"))?);
-    for candidate_id in kept {
+    if let Some(candidate_id) = selected {
         let revision = governance::execute_evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: args.mission_id.clone(),
@@ -797,6 +800,7 @@ mod tests {
     #[test]
     fn execute_records_explicit_taker_costs_in_evidence() {
         let mut fixture = fixture("explicit-taker-costs");
+        fixture.args.validation.rebate_bps = 0.25;
         fixture.args.validation.slippage_bps = 0.75;
         fixture.args.validation.cross_spread = true;
         fixture.args.validation.position_notional_usd = 10_000.0;
@@ -812,6 +816,7 @@ mod tests {
         let costs =
             &evidence["evaluations"][0]["record"]["payload"]["evaluation_protocol"]["costs"];
         assert_eq!(costs["fee_bps"], 2.0);
+        assert_eq!(costs["rebate_bps"], 0.25);
         assert_eq!(costs["latency_bps"], 0.5);
         assert_eq!(costs["slippage_bps"], 0.75);
         assert_eq!(costs["cross_spread"], true);
@@ -825,10 +830,18 @@ mod tests {
                 .iter()
                 .all(|fold| fold["max_book_depth_fraction"].as_f64().unwrap() <= 0.1)
         );
+        assert!(
+            evidence["evaluations"][0]["record"]["payload"]["metrics"]["total_turnover"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
         let execution_model: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.args.work_dir.join("results/execution-model.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(execution_model["schema_version"], "execution_cost_model_v2");
+        assert_eq!(execution_model["rebate_bps"], 0.25);
         assert_eq!(execution_model["additional_slippage_bps"], 0.75);
         assert_eq!(execution_model["queue_position_modeled"], false);
         assert_eq!(execution_model["partial_fills_modeled"], false);
@@ -838,6 +851,18 @@ mod tests {
         assert_eq!(
             execution_model["capacity_gate_model"],
             "same_side_top_n_depth_fraction"
+        );
+        assert!(
+            std::fs::read_to_string(
+                fixture
+                    .args
+                    .work_dir
+                    .join("results/sealed-evaluations.jsonl")
+            )
+            .unwrap()
+            .lines()
+            .count()
+                <= 1
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
@@ -856,6 +881,7 @@ mod tests {
         let evidence = serde_json::to_value(ExecutionModelEvidence::from(&protocol.costs)).unwrap();
 
         assert_eq!(evidence["fee_bps"], 2.0);
+        assert_eq!(evidence["rebate_bps"], 0.0);
         assert_eq!(evidence["latency_bps"], 0.5);
         assert_eq!(evidence["additional_slippage_bps"], 0.0);
         assert_eq!(evidence["cross_spread"], false);
@@ -1118,6 +1144,7 @@ mod tests {
                 embargo_rows: 1,
                 sealed_holdout_rows: 30,
                 fee_bps: 2.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,

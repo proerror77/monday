@@ -221,6 +221,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps: 0.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
                 slippage_bps: 0.0,

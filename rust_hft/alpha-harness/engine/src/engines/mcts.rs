@@ -490,6 +490,7 @@ mod tests {
                 predictive: crate::PredictiveMetrics::from_folds(vec![]),
                 row_count: 1,
                 trade_count: 1,
+                total_turnover: 1.0,
                 mean_net_return: score,
                 cumulative_net_return: score,
                 max_drawdown: 0.0,

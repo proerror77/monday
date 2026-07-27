@@ -54,6 +54,14 @@ pub(crate) fn validated_walk_forward_candidates(
     validated_walk_forward_candidates_in_lineage(&lineage)
 }
 
+pub(crate) fn selected_walk_forward_candidate(
+    store: &AlphaStore,
+    mission_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let lineage = store.mission_lineage(mission_id)?;
+    Ok(selected_walk_forward_candidate_in_lineage(&lineage)?.map(|(candidate_id, _)| candidate_id))
+}
+
 fn validated_walk_forward_candidates_in_lineage(
     lineage: &MissionLineage,
 ) -> anyhow::Result<Vec<String>> {
@@ -63,6 +71,17 @@ fn validated_walk_forward_candidates_in_lineage(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect())
+}
+
+fn selected_walk_forward_candidate_in_lineage(
+    lineage: &MissionLineage,
+) -> anyhow::Result<Option<(String, String)>> {
+    let evidence = validated_walk_forward_evidence_in_lineage(lineage)?;
+    match evidence.as_slice() {
+        [] => Ok(None),
+        [selected] => Ok(Some(selected.clone())),
+        _ => bail!("holdout evaluation requires exactly one canonical walk-forward candidate"),
+    }
 }
 
 fn validated_walk_forward_evidence_in_lineage(
@@ -137,6 +156,11 @@ fn validated_walk_forward_evidence_in_lineage(
                 .with_context(|| {
                     format!("walk-forward evaluation {evaluation_id} has no bound protocol")
                 })?;
+            if stored.record.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
+                || stored.record.evaluation_protocol_hash != protocol_hash
+            {
+                continue;
+            }
             candidates.push((candidate_id.to_string(), protocol_hash.to_string()));
         }
     }
@@ -175,7 +199,6 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
             args.dataset.validation.latency_bps,
         )?,
         &protocol,
-        format!("sealed:{}", manifest.manifest_id()),
     )?;
     let evaluation = OnnxEvaluator::for_mission(&mission)
         .map_err(anyhow::Error::msg)?
@@ -210,6 +233,8 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
         evaluation_id,
         mission_id: args.mission_id.clone(),
         candidate_id: args.candidate_id.clone(),
+        dataset_manifest_id: mission.dataset_manifest_id.as_str().to_string(),
+        evaluation_protocol_hash: protocol.content_hash()?.to_string(),
         payload: serde_json::to_value(&evaluation)?,
         created_at: now,
     };
@@ -249,13 +274,15 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     let labels = manifest.evaluation_label_spec()?;
     let requested_protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let requested_protocol_hash = requested_protocol.content_hash()?;
-    if !validated_walk_forward_evidence_in_lineage(&lineage)?
-        .iter()
-        .any(|(candidate_id, protocol_hash)| {
-            candidate_id == &args.candidate_id && protocol_hash == &requested_protocol_hash
-        })
-    {
+    let Some((selected_candidate_id, selected_protocol_hash)) =
+        selected_walk_forward_candidate_in_lineage(&lineage)?
+    else {
         bail!("candidate lacks canonical walk-forward evidence for this evaluation protocol");
+    };
+    if selected_candidate_id != args.candidate_id
+        || selected_protocol_hash != requested_protocol_hash
+    {
+        bail!("only the selected canonical walk-forward candidate can access holdout");
     }
     store.bind_mission_evaluation_protocol(
         &lineage.mission.mission_id,
@@ -346,11 +373,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         args.dataset.validation.funding_bps,
         args.dataset.validation.latency_bps,
     )?;
-    let dataset = prepare_dataset(
-        rows,
-        &requested_protocol,
-        format!("sealed:{}", manifest.manifest_id()),
-    )?;
+    let dataset = prepare_dataset(rows, &requested_protocol)?;
     let proposal = EngineProposal {
         candidate_id: candidate.candidate_id.clone(),
         hypothesis: iteration.hypothesis.clone(),
@@ -1098,6 +1121,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps: 0.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
                 slippage_bps: 0.0,
@@ -1469,7 +1493,7 @@ mod tests {
     fn sealed_revision_id_is_bound_to_evaluator_version() {
         assert_eq!(
             sealed_evaluation_revision_id("candidate-1", SEALED_HOLDOUT_EVALUATOR_VERSION),
-            "sealed-evaluation:sealed-holdout-v3:candidate-1"
+            "sealed-evaluation:sealed-holdout-v4:candidate-1"
         );
     }
 
@@ -1501,6 +1525,7 @@ mod tests {
             .unwrap();
         assert!(evaluation.passed);
         let created_at = Utc::now();
+        let dataset_manifest_id = mission.dataset_manifest_id.as_str().to_string();
         let lineage = MissionLineage {
             mission,
             iterations: vec![ResearchIteration {
@@ -1535,6 +1560,8 @@ mod tests {
                     evaluation_id: "evaluation-1".to_string(),
                     mission_id: "mission-1".to_string(),
                     candidate_id: "candidate-1".to_string(),
+                    dataset_manifest_id,
+                    evaluation_protocol_hash: evaluation_protocol().content_hash().unwrap(),
                     payload: serde_json::to_value(evaluation).unwrap(),
                     created_at,
                 },
@@ -1545,6 +1572,48 @@ mod tests {
         assert_eq!(
             validated_walk_forward_candidates_in_lineage(&lineage).unwrap(),
             vec!["candidate-1".to_string()]
+        );
+        assert_eq!(
+            selected_walk_forward_candidate_in_lineage(&lineage)
+                .unwrap()
+                .unwrap()
+                .0,
+            "candidate-1"
+        );
+
+        let mut ambiguous = lineage.clone();
+        let mut second_iteration = ambiguous.iterations[0].clone();
+        second_iteration.iteration_id = "iteration-2".to_string();
+        second_iteration.candidate_artifact_id = Some("candidate-2".to_string());
+        second_iteration.evaluation_artifact_id = Some("evaluation-2".to_string());
+        ambiguous.iterations.push(second_iteration);
+        let mut second_candidate = ambiguous.candidates[0].clone();
+        second_candidate.candidate_id = "candidate-2".to_string();
+        second_candidate.iteration_id = "iteration-2".to_string();
+        ambiguous.candidates.push(second_candidate);
+        let mut second_evaluation = ambiguous.evaluations[0].clone();
+        second_evaluation.record.evaluation_id = "evaluation-2".to_string();
+        second_evaluation.record.candidate_id = "candidate-2".to_string();
+        ambiguous.evaluations.push(second_evaluation);
+
+        assert!(selected_walk_forward_candidate_in_lineage(&ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one canonical walk-forward candidate"));
+
+        let mut wrong_dataset = lineage.clone();
+        wrong_dataset.evaluations[0].record.dataset_manifest_id = "other-dataset".to_string();
+        assert!(validated_walk_forward_candidates_in_lineage(&wrong_dataset)
+            .unwrap()
+            .is_empty());
+        let mut wrong_protocol = lineage.clone();
+        wrong_protocol.evaluations[0]
+            .record
+            .evaluation_protocol_hash = "f".repeat(64);
+        assert!(
+            validated_walk_forward_candidates_in_lineage(&wrong_protocol)
+                .unwrap()
+                .is_empty()
         );
 
         let mut legacy_formula_lineage = lineage.clone();

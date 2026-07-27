@@ -271,6 +271,8 @@ pub struct ValidationArgs {
     #[arg(long, default_value_t = 2.0)]
     pub fee_bps: f64,
     #[arg(long, default_value_t = 0.0)]
+    pub rebate_bps: f64,
+    #[arg(long, default_value_t = 0.0)]
     pub funding_bps: f64,
     #[arg(long, default_value_t = 0.5)]
     pub latency_bps: f64,
@@ -316,6 +318,7 @@ impl ValidationArgs {
             },
             EvaluationCostsV1 {
                 fee_bps: self.fee_bps,
+                rebate_bps: self.rebate_bps,
                 funding_bps: self.funding_bps,
                 latency_bps: self.latency_bps,
                 slippage_bps: self.slippage_bps,
@@ -922,6 +925,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             embargo_rows: 1,
             sealed_holdout_rows: 64,
             fee_bps: 1.0,
+            rebate_bps: 0.25,
             funding_bps: 0.0,
             latency_bps: 0.5,
             slippage_bps: 0.0,
@@ -942,6 +946,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
 
         assert_eq!(protocol.labels.horizon_buckets, 5);
         assert_eq!(protocol.labels.observation_frequency_millis, 1_000);
+        assert_eq!(protocol.costs.rebate_bps, 0.25);
         assert_eq!(
             protocol.metrics,
             alpha_domain::EvaluationMetricDefinitionsV1::default()
