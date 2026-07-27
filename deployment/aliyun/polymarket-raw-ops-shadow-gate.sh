@@ -20,6 +20,7 @@ readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
 readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
 readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
+readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
@@ -88,6 +89,35 @@ bundle_sha256() {
     cd "$directory"
     sha256sum "${BUNDLE_ASSETS[@]}" | sha256sum | awk '{print $1}'
   )
+}
+
+release_control_assets() {
+  local control_dir=$1 gate=$1/polymarket-raw-ops-shadow-gate.sh
+  [[ -f $gate && ! -L $gate ]] || return 1
+  awk '
+    $0 == "readonly -a BUNDLE_ASSETS=(" {
+      if (found || inside) exit 2
+      found = 1
+      inside = 1
+      next
+    }
+    inside && $0 == ")" {
+      inside = 0
+      closed = 1
+      next
+    }
+    inside {
+      if ($0 !~ /^  [A-Za-z0-9@._][A-Za-z0-9@._-]*$/) exit 2
+      sub(/^  /, "")
+      if ($0 == "." || $0 == ".." || seen[$0]++) exit 2
+      if ($0 == "polymarket-raw-ops-shadow-gate.sh") has_gate = 1
+      print
+      count += 1
+    }
+    END {
+      if (!found || !closed || inside || count == 0 || !has_gate) exit 2
+    }
+  ' "$gate"
 }
 
 direct_directory() {
@@ -217,6 +247,30 @@ verify_release_binding() {
     | sha256sum --check --strict >/dev/null
 }
 
+verify_control_release() {
+  local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest asset assets
+  local actual_bundle_sha expected_bundle_sha
+  local -a release_assets=()
+  manifest="$control_dir/${RELEASE_MANIFEST##*/}"
+  secure_control_file "$manifest" || return 1
+  verify_release_manifest "$manifest" || return 1
+  assets=$(release_control_assets "$control_dir") || return 1
+  while IFS= read -r asset; do
+    [[ $asset != "${RELEASE_MANIFEST##*/}" ]] || return 1
+    release_assets+=("$asset")
+    secure_control_file "$control_dir/$asset" || return 1
+  done <<<"$assets"
+  actual_bundle_sha=$(
+    cd "$control_dir"
+    sha256sum -- "${release_assets[@]}" | sha256sum | awk '{print $1}'
+  ) || return 1
+  expected_bundle_sha=$(jq -er '.control_manifest.sha256' "$manifest") || return 1
+  [[ $actual_bundle_sha == "$expected_bundle_sha" ]] || return 1
+  [[ $(jq -er '.candidate.sha256' "$manifest") == "$expected_sha" ]] || return 1
+  printf '%s  %s\n' "$expected_sha" "$expected_binary" \
+    | sha256sum --check --strict >/dev/null
+}
+
 effective_exec_argv() {
   local unit=$1 raw argv
   raw=$(systemctl show --property=ExecStart --value "$unit") || return 1
@@ -293,6 +347,34 @@ verify_baseline_identity() {
   printf '%s  %s\n' "$baseline_release_sha" "$baseline_release_path" \
     | sha256sum --check --strict >/dev/null || return 1
   [[ $(readlink -f -- "/proc/$legacy_pid/exe") == "$baseline_release_path" ]]
+}
+
+verify_cutover_target_preflight() {
+  local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
+  local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
+    || return 1
+  secure_root_chain_or_absent "$control_dir" || return 1
+  for unit in polymarket-reference-collector.service \
+    polymarket-reference-upload.service polymarket-reference-upload.timer \
+    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+    expected_fragment="/etc/systemd/system/$unit"
+    fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
+    [[ $fragment == "$expected_fragment" ]] || return 1
+    "$file_verifier" "$expected_fragment" || return 1
+    drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+    [[ -z $drop_ins ]] || return 1
+  done
+  if [[ -e $control_dir || -L $control_dir ]]; then
+    direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
+    assets=$(release_control_assets "$control_dir") || return 1
+    while IFS= read -r asset; do
+      [[ $asset != "$release_manifest_name" ]] || return 1
+      "$file_verifier" "$control_dir/$asset" || return 1
+    done <<<"$assets"
+    "$file_verifier" "$control_dir/$release_manifest_name" || return 1
+  fi
 }
 
 verify_fresh_baseline_health() {
@@ -612,6 +694,12 @@ verify_baseline_identity \
   || die 'active reference collector identity or restart counter is not exact'
 [[ $baseline_mode != rust_release ]] || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
   || die 'active Rust collector health is not fresh and fail-closed clean'
+verify_cutover_target_preflight "$baseline_mode" "$RUST_ACTIVE_BINARY" \
+  "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_control_file \
+  || die 'production cutover target state would reject promotion'
+[[ $baseline_mode != rust_release ]] \
+  || verify_control_release "$CONTROL_DIR" "$baseline_release_sha" "$baseline_release_path" \
+  || die 'global controls do not bind the active Rust baseline'
 
 gate_seconds=${MONDAY_POLYMARKET_GATE_SECONDS:-$MINIMUM_GATE_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'

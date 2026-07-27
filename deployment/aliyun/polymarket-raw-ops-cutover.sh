@@ -79,6 +79,35 @@ bundle_sha256() {
   )
 }
 
+release_control_assets() {
+  local control_dir=$1 gate=$1/polymarket-raw-ops-shadow-gate.sh
+  [[ -f $gate && ! -L $gate ]] || return 1
+  awk '
+    $0 == "readonly -a BUNDLE_ASSETS=(" {
+      if (found || inside) exit 2
+      found = 1
+      inside = 1
+      next
+    }
+    inside && $0 == ")" {
+      inside = 0
+      closed = 1
+      next
+    }
+    inside {
+      if ($0 !~ /^  [A-Za-z0-9@._][A-Za-z0-9@._-]*$/) exit 2
+      sub(/^  /, "")
+      if ($0 == "." || $0 == ".." || seen[$0]++) exit 2
+      if ($0 == "polymarket-raw-ops-shadow-gate.sh") has_gate = 1
+      print
+      count += 1
+    }
+    END {
+      if (!found || !closed || inside || count == 0 || !has_gate) exit 2
+    }
+  ' "$gate"
+}
+
 direct_directory() {
   local path=$1
   [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]
@@ -206,14 +235,60 @@ verify_release_binding() {
 }
 
 verify_control_release() {
-  local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest
+  local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest asset assets
+  local actual_bundle_sha expected_bundle_sha
+  local -a release_assets=()
   manifest="$control_dir/${RELEASE_MANIFEST##*/}"
-  for asset in "${BUNDLE_ASSETS[@]}"; do secure_regular_file "$control_dir/$asset"; done
-  secure_regular_file "$manifest"
-  verify_release_binding "$manifest" "$(sha256sum "$manifest" | awk '{print $1}')" \
-    "$expected_sha" "$(jq -er '.source_revision' "$manifest")" \
-    "$(jq -er '.control_manifest.sha256' "$manifest")" \
-    "$(jq -er '.control_archive.sha256' "$manifest")" "$expected_binary" "$control_dir"
+  secure_regular_file "$manifest" || return 1
+  verify_release_manifest "$manifest" || return 1
+  assets=$(release_control_assets "$control_dir") || return 1
+  while IFS= read -r asset; do
+    [[ $asset != "${RELEASE_MANIFEST##*/}" ]] || return 1
+    release_assets+=("$asset")
+    secure_regular_file "$control_dir/$asset" || return 1
+  done <<<"$assets"
+  actual_bundle_sha=$(
+    cd "$control_dir"
+    sha256sum -- "${release_assets[@]}" | sha256sum | awk '{print $1}'
+  ) || return 1
+  expected_bundle_sha=$(jq -er '.control_manifest.sha256' "$manifest") || return 1
+  [[ $actual_bundle_sha == "$expected_bundle_sha" ]] || return 1
+  [[ $(jq -er '.candidate.sha256' "$manifest") == "$expected_sha" ]] || return 1
+  printf '%s  %s\n' "$expected_sha" "$expected_binary" \
+    | sha256sum --check --strict >/dev/null
+}
+
+rollback_control_files() {
+  local state=$1
+  jq -er --arg gate polymarket-raw-ops-shadow-gate.sh \
+    --arg manifest "${RELEASE_MANIFEST##*/}" '
+      .control_files
+      | select(type == "array" and length >= 2)
+      | . as $files
+      | select(
+          all(.[];
+            type == "string"
+            and test("^[A-Za-z0-9@._][A-Za-z0-9@._-]*$")
+            and . != "." and . != ".."
+          )
+          and (unique | length) == ($files | length)
+          and index($gate) != null
+          and index($manifest) != null
+        )
+      | .[]
+    ' "$state"
+}
+
+remove_snapshotted_control_files() {
+  local state=$1 control_dir_present files asset
+  control_dir_present=$(
+    jq -er '.control_dir_present | select(type == "boolean") | tostring' "$state"
+  ) || return 1
+  [[ $control_dir_present == true ]] || return 0
+  files=$(rollback_control_files "$state") || return 1
+  while IFS= read -r asset; do
+    rm -f -- "$CONTROL_DIR/$asset" || return 1
+  done <<<"$files"
 }
 
 install_control_release() {
@@ -465,6 +540,34 @@ verify_legacy_health() {
   ((now_epoch - success_epoch <= MAX_HEALTH_SILENCE_SECONDS))
 }
 
+verify_cutover_target_preflight() {
+  local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
+  local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
+    || return 1
+  secure_root_chain_or_absent "$control_dir" || return 1
+  for unit in polymarket-reference-collector.service \
+    polymarket-reference-upload.service polymarket-reference-upload.timer \
+    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+    expected_fragment="/etc/systemd/system/$unit"
+    fragment=$(systemctl show --property=FragmentPath --value "$unit") || return 1
+    [[ $fragment == "$expected_fragment" ]] || return 1
+    "$file_verifier" "$expected_fragment" || return 1
+    drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+    [[ -z $drop_ins ]] || return 1
+  done
+  if [[ -e $control_dir || -L $control_dir ]]; then
+    direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
+    assets=$(release_control_assets "$control_dir") || return 1
+    while IFS= read -r asset; do
+      [[ $asset != "$release_manifest_name" ]] || return 1
+      "$file_verifier" "$control_dir/$asset" || return 1
+    done <<<"$assets"
+    "$file_verifier" "$control_dir/$release_manifest_name" || return 1
+  fi
+}
+
 verify_fresh_legacy_runtime() {
   local started_epoch=$1 expected_pid=$2 expected_restarts=$3 expected_invocation_id=$4
   local health_policy=${5:-$LEGACY_HEALTH_POLICY}
@@ -526,7 +629,7 @@ snapshot_legacy() {
   local rollback_dir=$1 baseline_mode=${2:-legacy_python}
   local baseline_release_path=${3:-} baseline_release_sha=${4:-} candidate_sha=${5:-}
   local state_json=$rollback_dir/state.json asset enabled active mode snapshot_asset
-  local control_present=false
+  local control_present=false control_assets control_files
   install -d -m 0750 "$rollback_dir/systemd" "$rollback_dir/bin" \
     "$rollback_dir/config" "$rollback_dir/control"
   secure_root_chain "$rollback_dir" \
@@ -554,15 +657,20 @@ snapshot_legacy() {
   if [[ -d $CONTROL_DIR && ! -L $CONTROL_DIR ]]; then
     secure_root_chain "$CONTROL_DIR" || die 'global control directory is not trusted'
     control_present=true
-    for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
+    control_assets=$(release_control_assets "$CONTROL_DIR") \
+      || die 'global control directory has no valid release-specific asset list'
+    control_files="$control_assets"$'\n'"${RELEASE_MANIFEST##*/}"
+    while IFS= read -r asset; do
       secure_regular_file "$CONTROL_DIR/$asset"
       mode=$(stat -c %a -- "$CONTROL_DIR/$asset")
       snapshot_asset=$asset
       [[ $baseline_mode == legacy_python ]] && snapshot_asset="global-$asset"
       install -m "$mode" "$CONTROL_DIR/$asset" "$rollback_dir/control/$snapshot_asset"
-      jq --arg asset "$asset" --arg mode "$mode" '.control_modes[$asset]=$mode' \
+      jq --arg asset "$asset" --arg mode "$mode" \
+        '.control_modes[$asset]=$mode
+          | .control_files=((.control_files // []) + [$asset])' \
         "$state_json" >"$state_json.tmp"; mv "$state_json.tmp" "$state_json"
-    done
+    done <<<"$control_files"
   fi
   jq --argjson present "$control_present" '.control_dir_present=$present' \
     "$state_json" >"$state_json.tmp"; mv "$state_json.tmp" "$state_json"
@@ -603,6 +711,7 @@ restore_legacy() (
   local rollback_dir=$evidence_dir/rollback active_target actual_manifest_sha asset mode
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts rollback_mode
   local rollback_sha temporary_link previous_health_sha current_health_sha
+  local control_dir_present control_files=
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
   secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
   secure_root_chain "$rollback_dir" || die 'rollback payload directory is not trusted'
@@ -624,6 +733,16 @@ restore_legacy() (
     [[ $actual_manifest_sha == "$expected_manifest_sha" ]] \
       || die 'rollback manifest differs from the completed cutover evidence'
   fi
+  control_dir_present=$(
+    jq -er '.control_dir_present | select(type == "boolean") | tostring' \
+      "$rollback_dir/state.json"
+  ) || die 'rollback snapshot has no valid control directory state'
+  if [[ $control_dir_present == true ]]; then
+    control_files=$(rollback_control_files "$rollback_dir/state.json") \
+      || die 'rollback snapshot has no valid release-specific control list'
+  elif [[ $rollback_mode == rust_release ]]; then
+    die 'Rust rollback snapshot has no control release'
+  fi
 
   systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
   systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
@@ -641,16 +760,15 @@ restore_legacy() (
   done
   mode=$(jq -r '.upload_env_mode // "0640"' "$rollback_dir/state.json")
   atomic_install "$mode" "$rollback_dir/config/polymarket-market-tape-upload.env" "$UPLOAD_ENV"
+  for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
+    rm -f -- "$CONTROL_DIR/$asset"
+  done
   if [[ $rollback_mode == legacy_python ]]; then
-    if jq -e '.control_dir_present == true' "$rollback_dir/state.json" >/dev/null; then
-      for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
+    if [[ $control_dir_present == true ]]; then
+      while IFS= read -r asset; do
         mode=$(jq -er --arg asset "$asset" '.control_modes[$asset]' "$rollback_dir/state.json")
         atomic_install "$mode" "$rollback_dir/control/global-$asset" "$CONTROL_DIR/$asset"
-      done
-    else
-      for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
-        rm -f "$CONTROL_DIR/$asset"
-      done
+      done <<<"$control_files"
     fi
     atomic_install 0755 "$rollback_dir/bin/${PYTHON_ASSETS[0]}" "$LEGACY_COLLECTOR"
     atomic_install 0755 "$rollback_dir/bin/${PYTHON_ASSETS[1]}" "$LEGACY_UPLOADER"
@@ -665,10 +783,10 @@ restore_legacy() (
       || die 'rollback release is not executable'
     printf '%s  %s\n' "$rollback_sha" "$active_target" \
       | sha256sum --check --strict >/dev/null || die 'rollback release checksum failed'
-    for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
+    while IFS= read -r asset; do
       mode=$(jq -er --arg asset "$asset" '.control_modes[$asset]' "$rollback_dir/state.json")
       atomic_install "$mode" "$rollback_dir/control/$asset" "$CONTROL_DIR/$asset"
-    done
+    done <<<"$control_files"
     verify_control_release "$CONTROL_DIR" "$rollback_sha" "$active_target" \
       || die 'restored controls do not bind the rollback release'
     temporary_link="${ACTIVE_BINARY}.new.$$"; rm -f "$temporary_link"
@@ -1028,6 +1146,9 @@ else
   verify_upload_units "$baseline_pinned_upload_env" \
     || die 'active Rust upload units do not bind the baseline release'
 fi
+verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
+  "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
+  || die 'production cutover target state would reject promotion'
 
 install -d -m 0755 /data/monday /data/monday/evidence "$EVIDENCE_ROOT"
 secure_root_chain "$EVIDENCE_ROOT" || die 'cutover evidence root is not trusted'
@@ -1130,6 +1251,8 @@ temporary_link="${ACTIVE_BINARY}.new.$$"
 rm -f "$temporary_link"
 ln -s "$candidate_binary" "$temporary_link"
 mv -Tf "$temporary_link" "$ACTIVE_BINARY"
+remove_snapshotted_control_files "$rollback_dir/state.json" \
+  || die 'could not remove snapshotted baseline controls before promotion'
 install_control_release "$SCRIPT_DIR"
 for asset in "${UNIT_ASSETS[@]}"; do
   case "$asset" in
