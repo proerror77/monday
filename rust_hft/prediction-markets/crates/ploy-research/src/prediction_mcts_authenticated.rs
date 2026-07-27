@@ -159,6 +159,10 @@ pub struct SettlementTaskMetrics {
     pub mean_brier_score: f64,
     pub mean_log_loss: f64,
     pub expected_calibration_error: f64,
+    pub up_executable_count: usize,
+    pub down_executable_count: usize,
+    pub total_up_full_depth_settlement_pnl_usd_micros: i64,
+    pub total_down_full_depth_settlement_pnl_usd_micros: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,17 +197,26 @@ impl AuthenticatedTaskMetrics {
                     && metrics.mean_log_loss.is_finite()
                     && metrics.mean_log_loss >= 0.0
                     && (0.0..=1.0).contains(&metrics.expected_calibration_error)
+                    && metrics.up_executable_count <= metrics.decision_count
+                    && metrics.down_executable_count <= metrics.decision_count
+                    && (metrics.up_executable_count > 0
+                        || metrics.total_up_full_depth_settlement_pnl_usd_micros == 0)
+                    && (metrics.down_executable_count > 0
+                        || metrics.total_down_full_depth_settlement_pnl_usd_micros == 0)
             }
             Self::UpExecution(metrics) | Self::DownExecution(metrics) => {
                 crate::prediction_loop::validate_sha256_id(
                     &metrics.joint_state_sha256,
                     "execution joint state",
                 )?;
+                let expected_fill_rate =
+                    metrics.roundtrip_count as f64 / metrics.decision_count as f64;
                 metrics.event_count > 0
                     && metrics.decision_count >= metrics.event_count
                     && metrics.roundtrip_count <= metrics.decision_count
                     && matches!(metrics.prediction_horizon_secs, 5 | 10 | 15 | 30)
                     && (0.0..=1.0).contains(&metrics.mean_fill_rate)
+                    && metrics.mean_fill_rate == expected_fill_rate
                     && (0.0..=1.0).contains(&metrics.mean_joint_fair_probability)
                     && [
                         metrics.mean_entry_shares,
@@ -242,6 +255,9 @@ pub struct AuthenticatedPredictionResultReceipt {
     pub mission: PredictionResearchMissionV3,
     pub mission_sha256: String,
     pub immutable_image_identity: String,
+    pub run_started_unix_millis: u64,
+    pub held_out_completed_unix_millis: u64,
+    pub result_sealed_unix_millis: u64,
     pub checkpoint_sha256: String,
     pub selected_candidate_sha256: String,
     pub evaluator_artifact_sha256: String,
@@ -273,6 +289,9 @@ impl AuthenticatedPredictionResultReceipt {
             mission: mission.clone(),
             mission_sha256,
             immutable_image_identity: immutable_image_identity.to_string(),
+            run_started_unix_millis: selection.run_started_unix_millis,
+            held_out_completed_unix_millis: selection.held_out_completed_unix_millis,
+            result_sealed_unix_millis: selection.result_sealed_unix_millis,
             checkpoint_sha256: selection.checkpoint_sha256.clone(),
             selected_candidate_sha256: selection.selected_candidate_sha256.clone(),
             evaluator_artifact_sha256: artifact.sha256.clone(),
@@ -307,6 +326,14 @@ impl AuthenticatedPredictionResultReceipt {
         }
         if self.mission_sha256 != prediction_mission_v3_sha256(&self.mission)? {
             return Err("authenticated result receipt Mission digest mismatch".to_string());
+        }
+        if self.run_started_unix_millis == 0
+            || self.held_out_completed_unix_millis < self.run_started_unix_millis
+            || self.result_sealed_unix_millis < self.held_out_completed_unix_millis
+        {
+            return Err(
+                "authenticated result receipt lifecycle timestamps are invalid".to_string(),
+            );
         }
         for (digest, field) in [
             (&self.mission_sha256, "receipt Mission"),
@@ -440,6 +467,8 @@ pub fn read_authenticated_prediction_result_receipt(
 const AUTHENTICATED_EXPERIMENT_MANIFEST_SCHEMA_VERSION: &str =
     "prediction_authenticated_experiment_manifest.v1";
 const MAX_AUTHENTICATED_EXPERIMENT_MANIFEST_BYTES: usize = 1024 * 1024;
+const RESEARCH_TRIAL_PROFITABILITY_CLAIM: &str = "not evaluated by ResearchTrial";
+const RESEARCH_TRIAL_PROMOTION_CLAIM: &str = "outside ResearchTrial authority";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -495,8 +524,8 @@ impl AuthenticatedPredictionExperimentManifest {
             up_execution: receipts.up_execution.0,
             down_execution: receipts.down_execution.0,
             unavailable_claims: AuthenticatedUnavailableClaims {
-                profitability: "not evaluated by ResearchTrial".to_string(),
-                promotion: "outside ResearchTrial authority".to_string(),
+                profitability: RESEARCH_TRIAL_PROFITABILITY_CLAIM.to_string(),
+                promotion: RESEARCH_TRIAL_PROMOTION_CLAIM.to_string(),
             },
             sha256: String::new(),
         };
@@ -542,8 +571,8 @@ impl AuthenticatedPredictionExperimentManifest {
                 .snapshot_hash
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || self.unavailable_claims.profitability.trim().is_empty()
-            || self.unavailable_claims.promotion.trim().is_empty()
+            || self.unavailable_claims.profitability != RESEARCH_TRIAL_PROFITABILITY_CLAIM
+            || self.unavailable_claims.promotion != RESEARCH_TRIAL_PROMOTION_CLAIM
         {
             return Err("authenticated experiment manifest claims are invalid".to_string());
         }
@@ -797,6 +826,39 @@ fn settlement_task_metrics(
     if event_ids != snapshot.market_ids().iter().map(String::as_str).collect() {
         return Err("settlement metrics do not cover every authenticated train market".to_string());
     }
+    let (_, full_depth_rows) = build_full_depth_execution_matrix_with_event_rows(
+        snapshot.observations(),
+        snapshot.pm_book_snapshots(),
+        FullDepthExecutionMatrixOptions {
+            stakes_usd: vec![snapshot.stake_usd()],
+            min_bucket_observations: 1,
+            max_quote_age_secs: snapshot.max_quote_age_secs(),
+            ..Default::default()
+        },
+    );
+    let expected_full_depth_ids = decision_ids
+        .iter()
+        .flat_map(|(market_id, tick_ts)| {
+            [(*market_id, *tick_ts, "up"), (*market_id, *tick_ts, "down")]
+        })
+        .collect::<BTreeSet<_>>();
+    let full_depth_ids = full_depth_rows
+        .iter()
+        .map(|row| (row.market_id.as_str(), row.tick_ts, row.side.as_str()))
+        .collect::<BTreeSet<_>>();
+    if full_depth_ids != expected_full_depth_ids || full_depth_rows.len() != full_depth_ids.len() {
+        return Err("settlement PnL does not cover both books for every decision".to_string());
+    }
+    let up_pnl = full_depth_rows
+        .iter()
+        .filter(|row| row.side == ReviewSide::Up)
+        .filter_map(|row| row.settlement_pnl)
+        .collect::<Vec<_>>();
+    let down_pnl = full_depth_rows
+        .iter()
+        .filter(|row| row.side == ReviewSide::Down)
+        .filter_map(|row| row.settlement_pnl)
+        .collect::<Vec<_>>();
     let mut calibration = BTreeMap::<usize, (usize, f64, f64)>::new();
     for (_, q, win) in &samples {
         let bucket = calibration
@@ -822,6 +884,22 @@ fn settlement_task_metrics(
                     * (*count as f64 / decision_count as f64)
             })
             .sum(),
+        up_executable_count: up_pnl.len(),
+        down_executable_count: down_pnl.len(),
+        total_up_full_depth_settlement_pnl_usd_micros: total_usd_micros(&up_pnl)?,
+        total_down_full_depth_settlement_pnl_usd_micros: total_usd_micros(&down_pnl)?,
+    })
+}
+
+fn total_usd_micros(values: &[f64]) -> Result<i64, String> {
+    values.iter().try_fold(0_i64, |total, value| {
+        let micros = (*value * 1_000_000.0).round();
+        if !micros.is_finite() || micros < i64::MIN as f64 || micros > i64::MAX as f64 {
+            return Err("settlement PnL exceeds fixed-point receipt range".to_string());
+        }
+        total
+            .checked_add(micros as i64)
+            .ok_or_else(|| "settlement PnL receipt total overflow".to_string())
     })
 }
 
@@ -1621,11 +1699,7 @@ mod tests {
 
         let mut no_depth = snapshot.clone();
         no_depth.pm_book_snapshots.clear();
-        assert_eq!(
-            builtin_task_metrics(&settlement_mission, &no_depth)
-                .expect("settlement ignores execution depth"),
-            settlement
-        );
+        assert!(builtin_task_metrics(&settlement_mission, &no_depth).is_err());
 
         let mut flipped_labels = snapshot.clone();
         for row in &mut flipped_labels.observations {
@@ -1781,6 +1855,25 @@ mod tests {
     }
 
     #[test]
+    fn settlement_metrics_bind_both_sides_full_depth_pnl() {
+        let mission = mission(PredictionTaskKind::SettlementProbability, None, None);
+        let AuthenticatedTaskMetrics::Settlement(mut metrics) =
+            builtin_task_metrics(&mission, &authenticated_training_snapshot()).unwrap()
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(metrics.up_executable_count, 2);
+        assert_eq!(metrics.down_executable_count, 2);
+        assert!(metrics.total_up_full_depth_settlement_pnl_usd_micros > 0);
+        assert!(metrics.total_down_full_depth_settlement_pnl_usd_micros < 0);
+        metrics.up_executable_count = metrics.decision_count + 1;
+        assert!(AuthenticatedTaskMetrics::Settlement(metrics)
+            .validate()
+            .is_err());
+    }
+
+    #[test]
     fn synchronous_metric_computation_cannot_outlive_its_timeout() {
         let mission = mission(
             PredictionTaskKind::UpExecution,
@@ -1833,6 +1926,9 @@ mod tests {
         assert!(result_receipt(&up, invalid_up.clone()).is_err());
         if let AuthenticatedTaskMetrics::UpExecution(metrics) = &mut invalid_up {
             metrics.mean_fill_rate = 0.0;
+        }
+        assert!(result_receipt(&up, invalid_up.clone()).is_err());
+        if let AuthenticatedTaskMetrics::UpExecution(metrics) = &mut invalid_up {
             metrics.joint_state_sha256 = "not-a-digest".to_string();
         }
         assert!(result_receipt(&up, invalid_up).is_err());
@@ -1871,6 +1967,15 @@ mod tests {
         assert!(!manifest.unavailable_claims.profitability.trim().is_empty());
         assert!(!manifest.unavailable_claims.promotion.trim().is_empty());
 
+        let mut positive_claim = manifest.clone();
+        positive_claim.unavailable_claims.profitability = "proven profitable".to_string();
+        positive_claim.sha256 = positive_claim.expected_sha256().unwrap();
+        assert!(positive_claim.validate().is_err());
+        positive_claim.unavailable_claims = manifest.unavailable_claims.clone();
+        positive_claim.unavailable_claims.promotion = "approved".to_string();
+        positive_claim.sha256 = positive_claim.expected_sha256().unwrap();
+        assert!(positive_claim.validate().is_err());
+
         let mut changed_settlement_metrics = settlement_metrics;
         let AuthenticatedTaskMetrics::Settlement(metrics) = &mut changed_settlement_metrics else {
             unreachable!()
@@ -1882,6 +1987,19 @@ mod tests {
             read_authenticated_prediction_result_receipt(output, &changed_settlement_ref).unwrap();
         let original_receipt =
             read_authenticated_prediction_result_receipt(output, &manifest.settlement).unwrap();
+        assert!(
+            original_receipt.held_out_completed_unix_millis
+                >= original_receipt.run_started_unix_millis
+        );
+        assert!(
+            original_receipt.result_sealed_unix_millis
+                >= original_receipt.held_out_completed_unix_millis
+        );
+        let mut reversed_lifecycle = original_receipt.clone();
+        reversed_lifecycle.run_started_unix_millis =
+            reversed_lifecycle.held_out_completed_unix_millis + 1;
+        reversed_lifecycle.sha256 = reversed_lifecycle.expected_sha256().unwrap();
+        assert!(reversed_lifecycle.validate().is_err());
         assert_eq!(
             original_receipt.mission_sha256,
             crate::prediction_mission_v3::prediction_mission_v3_sha256(&settlement).unwrap()
@@ -2024,6 +2142,9 @@ mod tests {
         let selection = crate::prediction_mcts_run::PredictionMctsSelectionEvidence {
             held_out_complete: true,
             immutable_image_identity: Some(image.clone()),
+            run_started_unix_millis: 1,
+            held_out_completed_unix_millis: 2,
+            result_sealed_unix_millis: 3,
             checkpoint_sha256: format!("sha256:{}", "8".repeat(64)),
             selected_candidate_sha256: artifact.selected_candidate_sha256.clone(),
         };
@@ -2035,12 +2156,8 @@ mod tests {
         mission: &PredictionResearchMissionV3,
         metrics: AuthenticatedTaskMetrics,
     ) -> AuthenticatedPredictionResultReceiptRef {
-        write_authenticated_prediction_result_receipt(
-            output,
-            &admitted(mission),
-            &result_receipt(mission, metrics).unwrap(),
-        )
-        .unwrap()
+        let receipt = result_receipt(mission, metrics).unwrap();
+        write_authenticated_prediction_result_receipt(output, &admitted(mission), &receipt).unwrap()
     }
 
     fn candidate(mission: &PredictionResearchMissionV3) -> PredictionMctsCandidate {

@@ -22,8 +22,8 @@ use crate::prediction_mcts::{
 };
 use crate::prediction_mission_v3::{AdmittedPredictionMissionV3, PredictionResearchMissionV3};
 
-const RUN_STATE_VERSION: u32 = 4;
-const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v3";
+const RUN_STATE_VERSION: u32 = 5;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v4";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -72,6 +72,8 @@ struct PredictionMctsRunState {
     identity: Option<PredictionMctsIdentity>,
     #[serde(default)]
     immutable_image_identity: Option<String>,
+    #[serde(default)]
+    run_started_unix_millis: u64,
     deadline_unix_millis: u64,
     baseline_complete: bool,
     advisor_call_consumed: bool,
@@ -85,6 +87,10 @@ struct PredictionMctsRunState {
     training: Vec<TrainingRecord>,
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
+    #[serde(default)]
+    held_out_completed_unix_millis: Option<u64>,
+    #[serde(default)]
+    result_sealed_unix_millis: Option<u64>,
     pause_reason: Option<String>,
 }
 
@@ -94,6 +100,7 @@ struct PredictionMctsRunArtifact {
     identity: PredictionMctsIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     immutable_image_identity: Option<String>,
+    run_started_unix_millis: u64,
     prompt_snapshot_id: String,
     search_policy_snapshot_id: String,
     phase: &'static str,
@@ -105,6 +112,10 @@ struct PredictionMctsRunArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held_out_completed_unix_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_sealed_unix_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pause_reason: Option<String>,
 }
@@ -131,6 +142,19 @@ impl PredictionMctsRunState {
     }
 
     fn read_only_artifact(&self) -> Result<PredictionMctsRunArtifact, String> {
+        if self.run_started_unix_millis == 0
+            || self.held_out_complete != self.held_out_completed_unix_millis.is_some()
+            || self.held_out_complete != self.result_sealed_unix_millis.is_some()
+            || self
+                .held_out_completed_unix_millis
+                .is_some_and(|completed| completed < self.run_started_unix_millis)
+            || self.result_sealed_unix_millis.is_some_and(|sealed| {
+                self.held_out_completed_unix_millis
+                    .is_none_or(|completed| sealed < completed)
+            })
+        {
+            return Err("prediction MCTS lifecycle timestamps are invalid".to_string());
+        }
         let identity = self.identity()?;
         let checkpoint_state = self.checkpoint.as_ref();
         let checkpoint = checkpoint_state
@@ -195,6 +219,7 @@ impl PredictionMctsRunState {
             version: RUN_ARTIFACT_VERSION,
             identity,
             immutable_image_identity: self.immutable_image_identity.clone(),
+            run_started_unix_millis: self.run_started_unix_millis,
             prompt_snapshot_id: self.mission.prompt_snapshot_id.clone(),
             search_policy_snapshot_id: self.mission.search_policy_snapshot_id.clone(),
             phase: if self.pause_reason.is_some() {
@@ -220,6 +245,8 @@ impl PredictionMctsRunState {
             training,
             selected: self.selected.clone(),
             held_out_complete: self.held_out_complete,
+            held_out_completed_unix_millis: self.held_out_completed_unix_millis,
+            result_sealed_unix_millis: self.result_sealed_unix_millis,
             pause_reason: self.pause_reason.clone(),
         })
     }
@@ -357,7 +384,8 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         state.identity = Some(identity.clone());
         state
     } else {
-        let deadline_unix_millis = now_unix_millis()
+        let run_started_unix_millis = now_unix_millis();
+        let deadline_unix_millis = run_started_unix_millis
             .checked_add(
                 mission
                     .search_budget
@@ -371,6 +399,7 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             mission: mission.clone(),
             identity: Some(identity.clone()),
             immutable_image_identity: immutable_image_identity.map(str::to_string),
+            run_started_unix_millis,
             deadline_unix_millis,
             baseline_complete: false,
             advisor_call_consumed: false,
@@ -383,6 +412,8 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             training: Vec::new(),
             selected: None,
             held_out_complete: false,
+            held_out_completed_unix_millis: None,
+            result_sealed_unix_millis: None,
             pause_reason: None,
         }
     };
@@ -575,6 +606,9 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             return pause(&mission, &state_path, &mut state, reason);
         }
         state.held_out_complete = true;
+        let completed = now_unix_millis().max(state.run_started_unix_millis);
+        state.held_out_completed_unix_millis = Some(completed);
+        state.result_sealed_unix_millis = Some(now_unix_millis().max(completed));
         checkpoint(&state_path, &mut state)?;
     }
 
@@ -622,6 +656,9 @@ pub(crate) fn task_output_dir(
 pub(crate) struct PredictionMctsSelectionEvidence {
     pub held_out_complete: bool,
     pub immutable_image_identity: Option<String>,
+    pub run_started_unix_millis: u64,
+    pub held_out_completed_unix_millis: u64,
+    pub result_sealed_unix_millis: u64,
     pub checkpoint_sha256: String,
     pub selected_candidate_sha256: String,
 }
@@ -631,7 +668,11 @@ pub(crate) fn authenticated_selection_evidence(
     identity: &PredictionMctsIdentity,
 ) -> Result<PredictionMctsSelectionEvidence, String> {
     let output_dir = task_output_dir(output_dir, identity)?;
-    let state: PredictionMctsRunState = read_json(&output_dir.join("prediction-mcts-state.json"))?;
+    let state_path = output_dir.join("prediction-mcts-state.json");
+    let state: PredictionMctsRunState = read_json(&state_path)?;
+    if state.version != RUN_STATE_VERSION {
+        return Err("prediction MCTS selection state version is incompatible".to_string());
+    }
     if state.identity()? != *identity {
         return Err("prediction MCTS selection identity mismatch".to_string());
     }
@@ -650,6 +691,9 @@ pub(crate) fn authenticated_selection_evidence(
     Ok(PredictionMctsSelectionEvidence {
         held_out_complete: state.held_out_complete,
         immutable_image_identity: state.immutable_image_identity,
+        run_started_unix_millis: state.run_started_unix_millis,
+        held_out_completed_unix_millis: state.held_out_completed_unix_millis.unwrap_or_default(),
+        result_sealed_unix_millis: state.result_sealed_unix_millis.unwrap_or_default(),
         checkpoint_sha256: format!("sha256:{}", checkpoint.sha256),
         selected_candidate_sha256: format!(
             "sha256:{}",
@@ -1470,6 +1514,26 @@ mod tests {
                 sha256_hex(&canonical_json_bytes(&selected).unwrap())
             )
         );
+        assert!(evidence.run_started_unix_millis > 0);
+        assert!(evidence.held_out_completed_unix_millis >= evidence.run_started_unix_millis);
+        assert!(evidence.result_sealed_unix_millis >= evidence.held_out_completed_unix_millis);
+        let resumed_evidence = authenticated_selection_evidence(&output, &identity).unwrap();
+        assert_eq!(
+            resumed_evidence.result_sealed_unix_millis,
+            evidence.result_sealed_unix_millis
+        );
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut missing_seal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        missing_seal["result_sealed_unix_millis"] = serde_json::Value::Null;
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&missing_seal).unwrap(),
+        )
+        .unwrap();
+        let error = authenticated_selection_evidence(&output, &identity)
+            .expect_err("completed selection must retain its result-seal timestamp");
+        assert!(error.contains("lifecycle timestamps"));
     }
 
     #[test]
