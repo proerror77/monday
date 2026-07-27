@@ -99,7 +99,7 @@ pub enum RegisteredResearchDataset {
     Ohlcv(DatasetManifest),
     FeatureMatrix(FeatureDatasetManifest),
     CexReplay {
-        admission: CexReplayDatasetManifestV1,
+        admission: Box<CexReplayDatasetManifestV1>,
         features: FeatureDatasetManifest,
     },
 }
@@ -224,7 +224,7 @@ pub fn read_registered_research_dataset(
             bail!("CEX replay dataset manifest does not match its registered revision");
         }
         return Ok(RegisteredResearchDataset::CexReplay {
-            admission,
+            admission: Box::new(admission),
             features,
         });
     }
