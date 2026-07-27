@@ -127,9 +127,12 @@ fi
 release_manifest_verifier="$tmp_dir/verify-release-manifest.sh"
 sed -n \
   -e '/^verify_release_manifest() {$/,/^}$/p' \
-  -e '/^verify_release_binding() {$/,/^}$/p' "$GATE" \
+  -e '/^verify_release_binding() {$/,/^}$/p' \
+  -e '/^verify_control_release() {$/,/^}$/p' "$GATE" \
   >"$release_manifest_verifier"
 readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
+readonly RELEASE_MANIFEST="$tmp_dir/polymarket-raw-ops-release.json"
+readonly -a BUNDLE_ASSETS=(fixture-control)
 secure_control_file() {
   [[ -f $1 && ! -L $1 ]]
 }
@@ -140,6 +143,7 @@ mkdir "$release_manifest_dir"
 release_manifest="$release_manifest_dir/polymarket-raw-ops-release.json"
 candidate_file="$release_manifest_dir/polymarket-raw-ops"
 printf 'verified candidate\n' >"$candidate_file"
+: >"$release_manifest_dir/fixture-control"
 candidate_sha=$(sha256sum "$candidate_file" | awk '{print $1}')
 source_revision=$(printf 'b%.0s' {1..40})
 bundle_fixture_sha=$(printf 'c%.0s' {1..64})
@@ -169,6 +173,15 @@ verify_release_binding "$release_manifest" "$release_manifest_sha" \
   printf 'release binding rejected a valid immutable release\n' >&2
   exit 1
 }
+verify_control_release "$release_manifest_dir" "$candidate_sha" "$candidate_file" || {
+  printf 'global controls rejected the active Rust baseline release\n' >&2
+  exit 1
+}
+if verify_control_release "$release_manifest_dir" "$(printf '0%.0s' {1..64})" \
+  "$candidate_file"; then
+  printf 'global controls accepted a different Rust baseline release\n' >&2
+  exit 1
+fi
 if verify_release_binding "$release_manifest" "$(printf '0%.0s' {1..64})" \
   "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
   "$control_archive_sha" "$candidate_file"; then
@@ -256,6 +269,133 @@ exercise_rust_baseline_identity() (
   return 0
 )
 exercise_rust_baseline_identity
+
+# The long shadow observation must not start when the production cutover target
+# already contains state that the promotion path will reject. Keep the same
+# read-only contract in both scripts so the Gate and final cutover cannot drift.
+gate_cutover_target_contract=$(sed -n \
+  '/^verify_cutover_target_preflight() {$/,/^}$/p' "$GATE")
+cutover_target_contract=$(sed -n \
+  '/^verify_cutover_target_preflight() {$/,/^}$/p' "$CUTOVER")
+[[ -n $gate_cutover_target_contract \
+  && $gate_cutover_target_contract == "$cutover_target_contract" ]] || {
+  printf 'shadow and cutover target preflight contracts are missing or differ\n' >&2
+  exit 1
+}
+cutover_target_contract_file="$tmp_dir/cutover-target-preflight.sh"
+printf '%s\n' "$gate_cutover_target_contract" >"$cutover_target_contract_file"
+gate_cutover_target_line=$(grep -n '^verify_cutover_target_preflight ' "$GATE" \
+  | cut -d: -f1)
+gate_shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" \
+  | cut -d: -f1)
+gate_started_at_line=$(grep -n '^started_at_unix=' "$GATE" | cut -d: -f1)
+gate_start_uptime_line=$(grep -n '^start_uptime=' "$GATE" | cut -d: -f1)
+gate_rust_control_line=$(grep -n \
+  '^  || verify_control_release "$CONTROL_DIR" "$baseline_release_sha"' "$GATE" \
+  | cut -d: -f1)
+cutover_target_line=$(grep -n '^verify_cutover_target_preflight ' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
+  | cut -d: -f1)
+[[ $gate_cutover_target_line =~ ^[1-9][0-9]*$ \
+  && $gate_shadow_start_line =~ ^[1-9][0-9]*$ \
+  && $gate_started_at_line =~ ^[1-9][0-9]*$ \
+  && $gate_start_uptime_line =~ ^[1-9][0-9]*$ \
+  && $gate_rust_control_line =~ ^[1-9][0-9]*$ \
+  && $cutover_target_line =~ ^[1-9][0-9]*$ \
+  && $cutover_transition_line =~ ^[1-9][0-9]*$ \
+  && $gate_cutover_target_line -lt $gate_started_at_line \
+  && $gate_cutover_target_line -lt $gate_start_uptime_line \
+  && $gate_cutover_target_line -lt $gate_shadow_start_line \
+  && $gate_rust_control_line -lt $gate_started_at_line \
+  && $gate_rust_control_line -lt $gate_start_uptime_line \
+  && $gate_rust_control_line -lt $gate_shadow_start_line \
+  && $cutover_target_line -lt $cutover_transition_line ]] || {
+  printf 'cutover target preflight runs after observation or transition begins\n' >&2
+  exit 1
+}
+(
+  baseline_mode=legacy_python
+  active_binary="$tmp_dir/active-polymarket-raw-ops"
+  control_dir="$tmp_dir/global-control"
+  release_manifest_name=polymarket-raw-ops-release.json
+  readonly -a BUNDLE_ASSETS=(
+    polymarket-raw-ops-shadow-gate.sh
+    polymarket-raw-ops-cutover.sh
+    polymarket-shadow-gate-policy.jq
+  )
+  drop_in_unit=
+  systemctl() {
+    [[ $1 == show && $2 == --property=DropInPaths && $3 == --value && $# -eq 4 ]] \
+      || return 64
+    [[ $4 != "$drop_in_unit" ]] || printf '%s\n' /run/systemd/system.control/stale.conf
+  }
+  direct_directory() { [[ -d $1 && ! -L $1 ]]; }
+  secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
+  secure_test_file() { [[ -f $1 && ! -L $1 ]]; }
+  # shellcheck source=/dev/null
+  source "$cutover_target_contract_file"
+
+  verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file || {
+    printf 'cutover target preflight rejected clean legacy state\n' >&2
+    exit 1
+  }
+
+  mkdir "$control_dir"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted an empty global control directory\n' >&2
+    exit 1
+  fi
+  : >"$control_dir/polymarket-raw-ops-control-assets.sha256"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted an incomplete global control directory\n' >&2
+    exit 1
+  fi
+
+  for asset in "${BUNDLE_ASSETS[@]}" "$release_manifest_name"; do
+    : >"$control_dir/$asset"
+  done
+  verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file || {
+    printf 'cutover target preflight rejected a complete global control directory\n' >&2
+    exit 1
+  }
+
+  for drop_in_unit in polymarket-reference-collector.service \
+    polymarket-reference-upload.service polymarket-reference-upload.timer \
+    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+    if verify_cutover_target_preflight \
+      "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+      secure_test_file; then
+      printf 'cutover target preflight accepted a drop-in for %s\n' \
+        "$drop_in_unit" >&2
+      exit 1
+    fi
+  done
+  drop_in_unit=
+
+  : >"$active_binary"
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a stale Rust target in Python mode\n' >&2
+    exit 1
+  fi
+  baseline_mode=rust_release
+  verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file || {
+    printf 'cutover target preflight rejected a governed Rust baseline target\n' >&2
+    exit 1
+  }
+)
 
 # Both controls must carry the same root-chain contract. Run it with deterministic
 # stat/direct-directory doubles so these macOS-hosted tests cover Linux ownership

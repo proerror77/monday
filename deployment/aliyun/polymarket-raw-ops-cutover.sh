@@ -465,6 +465,26 @@ verify_legacy_health() {
   ((now_epoch - success_epoch <= MAX_HEALTH_SILENCE_SECONDS))
 }
 
+verify_cutover_target_preflight() {
+  local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
+  local file_verifier=$5 unit drop_ins asset
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
+    || return 1
+  for unit in polymarket-reference-collector.service \
+    polymarket-reference-upload.service polymarket-reference-upload.timer \
+    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+    drop_ins=$(systemctl show --property=DropInPaths --value "$unit") || return 1
+    [[ -z $drop_ins ]] || return 1
+  done
+  if [[ -e $control_dir || -L $control_dir ]]; then
+    direct_directory "$control_dir" && secure_root_chain "$control_dir" || return 1
+    for asset in "${BUNDLE_ASSETS[@]}" "$release_manifest_name"; do
+      "$file_verifier" "$control_dir/$asset" || return 1
+    done
+  fi
+}
+
 verify_fresh_legacy_runtime() {
   local started_epoch=$1 expected_pid=$2 expected_restarts=$3 expected_invocation_id=$4
   local health_policy=${5:-$LEGACY_HEALTH_POLICY}
@@ -1028,6 +1048,9 @@ else
   verify_upload_units "$baseline_pinned_upload_env" \
     || die 'active Rust upload units do not bind the baseline release'
 fi
+verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
+  "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
+  || die 'production cutover target state would reject promotion'
 
 install -d -m 0755 /data/monday /data/monday/evidence "$EVIDENCE_ROOT"
 secure_root_chain "$EVIDENCE_ROOT" || die 'cutover evidence root is not trusted'
