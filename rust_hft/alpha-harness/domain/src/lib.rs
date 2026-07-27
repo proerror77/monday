@@ -17,6 +17,7 @@ pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-
 pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v3";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
+pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -82,6 +83,10 @@ pub enum DomainError {
     InvalidStrategyBundle,
     #[error("strategy bundle hash does not match its canonical payload")]
     StrategyBundleHashMismatch,
+    #[error("CEX MCTS research receipt is invalid")]
+    InvalidCexMctsResearchReceipt,
+    #[error("CEX MCTS research receipt hash does not match its canonical payload")]
+    CexMctsResearchReceiptHashMismatch,
     #[error("promotion record does not match its candidate, evidence, or bundle")]
     PromotionBindingMismatch,
     #[error("evaluation evidence is inconsistent")]
@@ -1655,6 +1660,100 @@ impl StrategyBundleArtifact {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexMctsResearchReceiptV1 {
+    pub schema_version: String,
+    pub mission_id: String,
+    pub dataset_manifest_id: ManifestId,
+    pub search_identity_hash: String,
+    pub checkpoint_hash: String,
+    pub selected_candidate_id: String,
+    pub selected_candidate_content_hash: String,
+    pub training_evaluation_id: String,
+    pub training_evaluation_hash: String,
+    pub evaluation_protocol_hash: String,
+    pub sealed_revision_id: String,
+    pub sealed_revision_hash: String,
+    pub receipt_hash: String,
+}
+
+impl CexMctsResearchReceiptV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mission_id: String,
+        dataset_manifest_id: ManifestId,
+        search_identity_hash: String,
+        checkpoint_hash: String,
+        selected_candidate_id: String,
+        selected_candidate_content_hash: String,
+        training_evaluation_id: String,
+        training_evaluation_hash: String,
+        evaluation_protocol_hash: String,
+        sealed_revision_id: String,
+        sealed_revision_hash: String,
+    ) -> Result<Self, DomainError> {
+        let mut receipt = Self {
+            schema_version: CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1.to_string(),
+            mission_id,
+            dataset_manifest_id,
+            search_identity_hash,
+            checkpoint_hash,
+            selected_candidate_id,
+            selected_candidate_content_hash,
+            training_evaluation_id,
+            training_evaluation_hash,
+            evaluation_protocol_hash,
+            sealed_revision_id,
+            sealed_revision_hash,
+            receipt_hash: String::new(),
+        };
+        receipt.validate_fields()?;
+        receipt.receipt_hash = receipt.calculated_hash()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.validate_fields()?;
+        validate_cex_receipt_sha256(&self.receipt_hash)?;
+        if self.receipt_hash != self.calculated_hash()? {
+            return Err(DomainError::CexMctsResearchReceiptHashMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1
+            || self.mission_id.trim().is_empty()
+            || self.selected_candidate_id.trim().is_empty()
+            || self.training_evaluation_id.trim().is_empty()
+            || self.sealed_revision_id.trim().is_empty()
+        {
+            return Err(DomainError::InvalidCexMctsResearchReceipt);
+        }
+        self.dataset_manifest_id
+            .validate()
+            .map_err(|_| DomainError::InvalidCexMctsResearchReceipt)?;
+        for hash in [
+            &self.search_identity_hash,
+            &self.checkpoint_hash,
+            &self.selected_candidate_content_hash,
+            &self.training_evaluation_hash,
+            &self.evaluation_protocol_hash,
+            &self.sealed_revision_hash,
+        ] {
+            validate_cex_receipt_sha256(hash)?;
+        }
+        Ok(())
+    }
+
+    pub fn calculated_hash(&self) -> Result<String, DomainError> {
+        let mut signable = self.clone();
+        signable.receipt_hash.clear();
+        canonical_json_hash(&signable)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrategyBundle {
     pub bundle_id: String,
@@ -2331,6 +2430,17 @@ fn validate_sha256(value: &str) -> Result<(), DomainError> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(DomainError::InvalidStrategyBundle);
+    }
+    Ok(())
+}
+
+fn validate_cex_receipt_sha256(value: &str) -> Result<(), DomainError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DomainError::InvalidCexMctsResearchReceipt);
     }
     Ok(())
 }
@@ -3207,6 +3317,31 @@ mod tests {
         legacy.bundle_hash = legacy.calculated_legacy_hash().unwrap();
         assert!(legacy.validate_for_readback().is_ok());
         assert_eq!(legacy.validate(), Err(DomainError::InvalidStrategyBundle));
+    }
+
+    #[test]
+    fn cex_mcts_research_receipt_rejects_tampered_bindings() {
+        let mut receipt = CexMctsResearchReceiptV1::new(
+            "mission-1".to_string(),
+            ManifestId::new("dataset-1").unwrap(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "candidate-1".to_string(),
+            "c".repeat(64),
+            "evaluation-1".to_string(),
+            "d".repeat(64),
+            "e".repeat(64),
+            "sealed-1".to_string(),
+            "f".repeat(64),
+        )
+        .unwrap();
+        assert!(receipt.validate().is_ok());
+
+        receipt.checkpoint_hash = "0".repeat(64);
+        assert_eq!(
+            receipt.validate(),
+            Err(DomainError::CexMctsResearchReceiptHashMismatch)
+        );
     }
 
     #[test]

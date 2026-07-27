@@ -3,13 +3,21 @@ use crate::{
     evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, ProposalEngineCheckpoint, RemainingBudget,
 };
-use alpha_domain::{CandidateArtifact, EngineKind};
+use alpha_domain::{
+    CandidateArtifact, EngineKind, MissionCompletionPolicy, ResearchMission, SearchBudget,
+    WALK_FORWARD_EVALUATOR_VERSION,
+};
 use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 use hft_search_kernel::{backpropagate, select_expandable, validate_tree, UctNode, UctStats};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const MCTS_CHECKPOINT_VERSION: u32 = 2;
+pub const MCTS_CHECKPOINT_VERSION: u32 = 3;
+const CEX_MCTS_SEARCH_IDENTITY_VERSION: &str = "cex-mcts-search-identity-v1";
+const CEX_MCTS_CANDIDATE_SPACE_ID: &str = "live-factor-ast-add-secondary-v1";
+const CEX_MCTS_STOPPING_RULE_ID: &str = "min-kept-search-budget-or-max-new-iterations-pause-v1";
+const CEX_MCTS_SELECTION_RULE_ID: &str = "one-canonical-walk-forward-candidate-v1";
+const CEX_MCTS_UCT_TIE_BREAK_RULE_ID: &str = "last-child-on-total-cmp-tie-v1";
 
 fn expansion_actions(live_only: bool) -> Vec<usize> {
     if live_only {
@@ -62,23 +70,104 @@ impl UctNode for Node {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MctsConfigV2 {
+struct MctsConfigV3 {
     seed: u64,
     root_ast: FactorAst,
     secondary_field: String,
     exploration: f64,
     max_depth: usize,
     live_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    research_identity: Option<CexMctsSearchIdentityV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MctsCheckpointV2 {
-    config: MctsConfigV2,
+struct MctsCheckpointV3 {
+    config: MctsConfigV3,
     rng: DeterministicRng,
     nodes: Vec<Node>,
     candidates: BTreeMap<String, usize>,
     seen: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexMctsSearchIdentityV1 {
+    pub schema_version: String,
+    pub mission_id: String,
+    pub dataset_manifest_id: String,
+    pub search_policy_snapshot_id: String,
+    pub search_budget: SearchBudget,
+    pub completion_policy: MissionCompletionPolicy,
+    pub max_new_iterations: Option<usize>,
+    pub evaluator_version: String,
+    pub evaluator_config_hash: String,
+    pub evaluation_protocol_hash: String,
+    pub candidate_space_id: String,
+    pub stopping_rule_id: String,
+    pub selection_rule_id: String,
+    pub uct_tie_break_rule_id: String,
+}
+
+impl CexMctsSearchIdentityV1 {
+    pub fn for_mission(
+        mission: &ResearchMission,
+        evaluation_protocol_hash: String,
+        evaluator_config_hash: String,
+        max_new_iterations: Option<usize>,
+    ) -> Result<Self, String> {
+        mission.validate().map_err(|error| error.to_string())?;
+        let identity = Self {
+            schema_version: CEX_MCTS_SEARCH_IDENTITY_VERSION.to_string(),
+            mission_id: mission.mission_id.clone(),
+            dataset_manifest_id: mission.dataset_manifest_id.as_str().to_string(),
+            search_policy_snapshot_id: mission.search_policy_snapshot_id.clone(),
+            search_budget: mission.search_budget.clone(),
+            completion_policy: mission.completion_policy.clone(),
+            max_new_iterations,
+            evaluator_version: WALK_FORWARD_EVALUATOR_VERSION.to_string(),
+            evaluator_config_hash,
+            evaluation_protocol_hash,
+            candidate_space_id: CEX_MCTS_CANDIDATE_SPACE_ID.to_string(),
+            stopping_rule_id: CEX_MCTS_STOPPING_RULE_ID.to_string(),
+            selection_rule_id: CEX_MCTS_SELECTION_RULE_ID.to_string(),
+            uct_tie_break_rule_id: CEX_MCTS_UCT_TIE_BREAK_RULE_ID.to_string(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CEX_MCTS_SEARCH_IDENTITY_VERSION
+            || self.mission_id.trim().is_empty()
+            || self.dataset_manifest_id.trim().is_empty()
+            || self.search_policy_snapshot_id.trim().is_empty()
+            || self.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+            || self.candidate_space_id != CEX_MCTS_CANDIDATE_SPACE_ID
+            || self.stopping_rule_id != CEX_MCTS_STOPPING_RULE_ID
+            || self.selection_rule_id != CEX_MCTS_SELECTION_RULE_ID
+            || self.uct_tie_break_rule_id != CEX_MCTS_UCT_TIE_BREAK_RULE_ID
+            || self.max_new_iterations == Some(0)
+            || !is_sha256(&self.evaluator_config_hash)
+            || !is_sha256(&self.evaluation_protocol_hash)
+        {
+            return Err("invalid CEX MCTS research identity".to_string());
+        }
+        self.search_budget
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.completion_policy
+            .validate()
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +187,7 @@ pub struct MctsEngine {
     max_depth: usize,
     secondary_field: String,
     live_only: bool,
+    research_identity: Option<CexMctsSearchIdentityV1>,
     nodes: Vec<Node>,
     candidates: BTreeMap<String, usize>,
     seen: BTreeSet<String>,
@@ -150,6 +240,20 @@ impl MctsEngine {
         )
     }
 
+    pub fn new_live_bound(
+        seed: u64,
+        root_field: impl Into<String>,
+        secondary_field: impl Into<String>,
+        exploration: f64,
+        max_depth: usize,
+        research_identity: CexMctsSearchIdentityV1,
+    ) -> Result<Self, String> {
+        research_identity.validate()?;
+        let mut engine = Self::new_live(seed, root_field, secondary_field, exploration, max_depth)?;
+        engine.research_identity = Some(research_identity);
+        Ok(engine)
+    }
+
     fn new_with_mode(
         seed: u64,
         root_field: impl Into<String>,
@@ -174,6 +278,7 @@ impl MctsEngine {
             max_depth,
             secondary_field,
             live_only,
+            research_identity: None,
             nodes: vec![Node {
                 ast: FactorAst::Terminal(FactorTerminal::Field(root_field)),
                 parent: None,
@@ -204,8 +309,8 @@ impl MctsEngine {
             .collect()
     }
 
-    fn config(&self) -> Result<MctsConfigV2, String> {
-        Ok(MctsConfigV2 {
+    fn config(&self) -> Result<MctsConfigV3, String> {
+        Ok(MctsConfigV3 {
             seed: self.seed,
             root_ast: self
                 .nodes
@@ -217,6 +322,7 @@ impl MctsEngine {
             exploration: self.exploration,
             max_depth: self.max_depth,
             live_only: self.live_only,
+            research_identity: self.research_identity.clone(),
         })
     }
 
@@ -334,7 +440,7 @@ impl ProposalEngine for MctsEngine {
     }
 
     fn checkpoint(&self) -> Result<ProposalEngineCheckpoint, String> {
-        let state = MctsCheckpointV2 {
+        let state = MctsCheckpointV3 {
             config: self.config()?,
             rng: self.rng.clone(),
             nodes: self.nodes.clone(),
@@ -358,14 +464,14 @@ impl ProposalEngine for MctsEngine {
         if checkpoint.kind != EngineKind::Mcts || checkpoint.version != MCTS_CHECKPOINT_VERSION {
             return Err("MCTS checkpoint kind or version mismatch".to_string());
         }
-        let state: MctsCheckpointV2 = serde_json::from_value(checkpoint.state.clone())
+        let state: MctsCheckpointV3 = serde_json::from_value(checkpoint.state.clone())
             .map_err(|error| format!("invalid MCTS checkpoint state: {error}"))?;
         state.validate()?;
         if state.config != self.config()? {
             return Err("MCTS checkpoint configuration mismatch".to_string());
         }
 
-        let MctsCheckpointV2 {
+        let MctsCheckpointV3 {
             config,
             rng,
             nodes,
@@ -378,6 +484,7 @@ impl ProposalEngine for MctsEngine {
         self.max_depth = config.max_depth;
         self.secondary_field = config.secondary_field;
         self.live_only = config.live_only;
+        self.research_identity = config.research_identity;
         self.nodes = nodes;
         self.candidates = candidates;
         self.seen = seen;
@@ -385,7 +492,7 @@ impl ProposalEngine for MctsEngine {
     }
 }
 
-impl MctsCheckpointV2 {
+impl MctsCheckpointV3 {
     fn validate(&self) -> Result<(), String> {
         if self.config.secondary_field.trim().is_empty()
             || !self.config.exploration.is_finite()
@@ -393,6 +500,9 @@ impl MctsCheckpointV2 {
             || self.config.max_depth == 0
         {
             return Err("invalid MCTS checkpoint configuration".to_string());
+        }
+        if let Some(identity) = &self.config.research_identity {
+            identity.validate()?;
         }
         self.config
             .root_ast
@@ -727,6 +837,142 @@ mod tests {
         let mut cyclic = engine.checkpoint().unwrap();
         cyclic.state["nodes"][0]["children"] = serde_json::json!([0]);
         assert!(restored.restore_checkpoint(&cyclic, &[]).is_err());
+    }
+
+    #[test]
+    fn heldout_mutation_cannot_change_real_mcts_candidate_or_backpropagation() {
+        use crate::evaluation::{prepare_dataset, PreparedDataset, ResearchRow};
+        use alpha_domain::{
+            EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        };
+        use chrono::{Duration, Utc};
+
+        fn dataset(mutate_holdout: bool) -> PreparedDataset {
+            let start = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+            let rows = (0..4)
+                .map(|index| {
+                    let signal = if mutate_holdout && index == 3 {
+                        -1_000.0
+                    } else {
+                        index as f64
+                    };
+                    ResearchRow {
+                        available_time: start + Duration::seconds(index),
+                        signal,
+                        features: BTreeMap::new(),
+                        label: signal,
+                        fee_bps: 0.0,
+                        funding_bps: 0.0,
+                        latency_bps: 0.0,
+                    }
+                })
+                .collect();
+            prepare_dataset(
+                rows,
+                &EvaluationProtocolV1::new(
+                    EvaluationWalkForwardV1 {
+                        initial_train_rows: 1,
+                        validation_rows: 1,
+                        fold_count: 1,
+                        purge_rows: 1,
+                        embargo_rows: 0,
+                        sealed_holdout_rows: 1,
+                    },
+                    EvaluationCostsV1 {
+                        fee_bps: 0.0,
+                        rebate_bps: 0.0,
+                        funding_bps: 0.0,
+                        latency_bps: 0.0,
+                        slippage_bps: 0.0,
+                        cross_spread: false,
+                        position_notional_usd: 0.0,
+                        capacity_depth_levels: 0,
+                        max_book_depth_fraction: 0.0,
+                    },
+                    EvaluationLabelSpecV1 {
+                        horizon_buckets: 1,
+                        observation_frequency_millis: 1_000,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn run(dataset: &PreparedDataset) -> (EngineProposal, ProposalEngineCheckpoint) {
+            let mut engine = MctsEngine::new(7, "signal", "signal", 1.414, 5).unwrap();
+            let proposal = engine
+                .propose("mission-1", 1, &dataset.proposal_context(), &budget())
+                .unwrap();
+            engine.observe(&proposal, &evaluation(0.5));
+            (proposal, engine.checkpoint().unwrap())
+        }
+
+        assert_eq!(run(&dataset(false)), run(&dataset(true)));
+    }
+
+    #[test]
+    fn bound_checkpoint_rejects_snapshot_or_search_identity_drift() {
+        fn identity(dataset: &str, max_candidates: usize) -> CexMctsSearchIdentityV1 {
+            let now = chrono::Utc::now();
+            let mission = alpha_domain::ResearchMission {
+                mission_id: "mission-1".to_string(),
+                objective: "test".to_string(),
+                hypothesis_scope: "test".to_string(),
+                mutable_scope: vec!["factor_ast".to_string()],
+                dataset_manifest_id: hft_research_manifest::ManifestId::new(dataset).unwrap(),
+                baseline_artifact_id: None,
+                validation_mode: alpha_domain::ValidatorMode::MissionValidator,
+                validator_spec: serde_json::json!({}),
+                search_budget: alpha_domain::SearchBudget {
+                    max_candidates,
+                    max_expansions: 32,
+                    max_tokens: 0,
+                    max_seconds: 60,
+                },
+                completion_policy: alpha_domain::MissionCompletionPolicy::default(),
+                prompt_snapshot_id: None,
+                search_policy_snapshot_id: "mcts-lob-pit-v1".to_string(),
+                status: alpha_domain::MissionStatus::Pending,
+                terminal_reason: None,
+                created_at: now,
+                updated_at: now,
+            };
+            CexMctsSearchIdentityV1::for_mission(&mission, "a".repeat(64), "b".repeat(64), Some(1))
+                .unwrap()
+        }
+
+        let engine =
+            MctsEngine::new_live_bound(3, "best_bid", "best_ask", 1.4, 3, identity("dataset-a", 4))
+                .unwrap();
+        let checkpoint = engine.checkpoint().unwrap();
+        assert_eq!(checkpoint.version, 3);
+
+        let mut restored =
+            MctsEngine::new_live_bound(3, "best_bid", "best_ask", 1.4, 3, identity("dataset-a", 4))
+                .unwrap();
+        restored.restore_checkpoint(&checkpoint, &[]).unwrap();
+        assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+
+        for mismatched in [identity("dataset-b", 4), identity("dataset-a", 5)] {
+            let mut restored =
+                MctsEngine::new_live_bound(3, "best_bid", "best_ask", 1.4, 3, mismatched).unwrap();
+            assert!(restored.restore_checkpoint(&checkpoint, &[]).is_err());
+        }
+
+        let mut protocol_drift = identity("dataset-a", 4);
+        protocol_drift.evaluation_protocol_hash = "c".repeat(64);
+        let mut restored =
+            MctsEngine::new_live_bound(3, "best_bid", "best_ask", 1.4, 3, protocol_drift).unwrap();
+        assert!(restored.restore_checkpoint(&checkpoint, &[]).is_err());
+
+        let mut forged_tie_rule = checkpoint.clone();
+        forged_tie_rule.state["config"]["research_identity"]["uct_tie_break_rule_id"] =
+            serde_json::json!("first-child-on-tie");
+        let mut restored =
+            MctsEngine::new_live_bound(3, "best_bid", "best_ask", 1.4, 3, identity("dataset-a", 4))
+                .unwrap();
+        assert!(restored.restore_checkpoint(&forged_tie_rule, &[]).is_err());
     }
 
     #[test]

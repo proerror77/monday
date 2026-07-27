@@ -6,10 +6,12 @@ use crate::{
     data_mission, governance, mission,
 };
 use alpha_domain::{
-    EvaluationCostsV1, EvaluationLabelSpecV1, MissionCompletionPolicy, MissionStatus,
-    ResearchMission, SearchBudget, ValidatorMode,
+    canonical_json_hash, CandidateEvaluation, CexMctsResearchReceiptV1, EngineKind,
+    EvaluationCostsV1, EvaluationLabelSpecV1, IterationVerdict, MissionCompletionPolicy,
+    MissionStatus, ResearchMission, SearchBudget, ValidatorMode,
 };
-use alpha_store::{AlphaStore, StoreError};
+use alpha_engine::engines::{CexMctsSearchIdentityV1, MCTS_CHECKPOINT_VERSION};
+use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, RunCheckpoint, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_research_manifest::{
@@ -67,6 +69,19 @@ struct ExecutionReport<'a> {
     engine: &'static str,
     bundle_bytes: u64,
     bundle_sha256: String,
+    research_receipt_hash: Option<String>,
+}
+
+struct PreparedMctsResearchReceipt {
+    mission_id: String,
+    dataset_manifest_id: ManifestId,
+    search_identity_hash: String,
+    checkpoint_hash: String,
+    selected_candidate_id: String,
+    selected_candidate_content_hash: String,
+    training_evaluation_id: String,
+    training_evaluation_hash: String,
+    evaluation_protocol_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,19 +249,26 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         dataset_manifest: dataset_manifest_path,
         validation: args.validation.clone(),
     };
-    let run_report = mission::execute_mission(
-        &RunMissionArgs {
-            db: db.clone(),
-            mission_id: args.mission_id.clone(),
-            engine: args.engine,
-            seed: args.seed,
-            feature_fields: args.feature_fields.clone(),
-            offline_trace: None,
-            max_new_iterations: Some(args.max_new_iterations),
-            dataset: dataset.clone(),
-        },
-        false,
-    )?;
+    let run_args = RunMissionArgs {
+        db: db.clone(),
+        mission_id: args.mission_id.clone(),
+        engine: args.engine,
+        seed: args.seed,
+        feature_fields: args.feature_fields.clone(),
+        offline_trace: None,
+        max_new_iterations: Some(args.max_new_iterations),
+        dataset: dataset.clone(),
+    };
+    let mut run_report = mission::execute_mission(&run_args, false)?;
+    while run_report.status == MissionStatus::Paused {
+        let previous_iterations = run_report.total_iterations;
+        run_report = mission::execute_mission(&run_args, true)?;
+        if run_report.total_iterations <= previous_iterations
+            && run_report.status == MissionStatus::Paused
+        {
+            bail!("resumed MCTS mission made no progress");
+        }
+    }
     data_mission::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
 
     let store = AlphaStore::open(&db)?;
@@ -284,16 +306,34 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             .collect::<String>(),
     )?;
     let mut sealed = BufWriter::new(File::create(results_dir.join("sealed-evaluations.jsonl"))?);
+    let receipt_path = results_dir.join("mcts-research-receipt.json");
+    if let Err(error) = std::fs::remove_file(&receipt_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("remove stale MCTS research receipt");
+        }
+    }
+    let mut research_receipt_hash = None;
     if let Some(candidate_id) = selected {
+        let prepared_receipt = prepare_mcts_research_receipt(
+            &lineage,
+            checkpoint
+                .as_ref()
+                .context("selected candidate has no durable MCTS checkpoint")?,
+            &candidate_id,
+            args.max_new_iterations,
+        )?;
         let revision = governance::execute_evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: args.mission_id.clone(),
-            candidate_id,
+            candidate_id: candidate_id.clone(),
             model_root: None,
             dataset: dataset.clone(),
         })?;
         serde_json::to_writer(&mut sealed, &revision)?;
         sealed.write_all(b"\n")?;
+        let receipt = finish_mcts_research_receipt(prepared_receipt, &revision)?;
+        data_mission::write_json_atomic(&receipt_path, &receipt)?;
+        research_receipt_hash = Some(receipt.receipt_hash);
     }
     sealed.flush()?;
 
@@ -307,7 +347,159 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         engine: engine_name(args.engine),
         bundle_bytes,
         bundle_sha256,
+        research_receipt_hash,
     })
+}
+
+fn prepare_mcts_research_receipt(
+    lineage: &MissionLineage,
+    checkpoint: &RunCheckpoint,
+    selected_candidate_id: &str,
+    max_new_iterations: usize,
+) -> anyhow::Result<PreparedMctsResearchReceipt> {
+    if checkpoint.mission_id != lineage.mission.mission_id
+        || checkpoint.engine_kind != EngineKind::Mcts
+        || checkpoint.engine_version != MCTS_CHECKPOINT_VERSION
+    {
+        bail!("durable checkpoint is not the selected mission's current MCTS checkpoint");
+    }
+    let checkpoint_protocol_hash = checkpoint
+        .evaluation_protocol_hash
+        .as_deref()
+        .context("durable checkpoint has no evaluation protocol binding")?;
+    let checkpoint_config = checkpoint
+        .engine_state
+        .get("config")
+        .context("durable MCTS checkpoint has no configuration")?;
+    let search_identity: CexMctsSearchIdentityV1 = serde_json::from_value(
+        checkpoint_config
+            .get("research_identity")
+            .cloned()
+            .context("durable MCTS checkpoint has no research identity")?,
+    )
+    .context("durable MCTS checkpoint research identity is malformed")?;
+    search_identity.validate().map_err(anyhow::Error::msg)?;
+    if search_identity.mission_id != lineage.mission.mission_id
+        || search_identity.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
+        || search_identity.search_policy_snapshot_id != lineage.mission.search_policy_snapshot_id
+        || search_identity.search_budget != lineage.mission.search_budget
+        || search_identity.completion_policy != lineage.mission.completion_policy
+        || search_identity.max_new_iterations != Some(max_new_iterations)
+        || search_identity.evaluation_protocol_hash != checkpoint_protocol_hash
+    {
+        bail!("durable MCTS checkpoint research identity does not match the mission");
+    }
+
+    let candidate = lineage
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == selected_candidate_id)
+        .context("selected candidate is missing from mission lineage")?;
+    let iteration = lineage
+        .iterations
+        .iter()
+        .find(|iteration| iteration.candidate_artifact_id.as_deref() == Some(selected_candidate_id))
+        .context("selected candidate iteration is missing")?;
+    if iteration.engine != EngineKind::Mcts || iteration.verdict != IterationVerdict::Keep {
+        bail!("selected candidate was not kept by the MCTS training search");
+    }
+    let training_evaluation_id = iteration
+        .evaluation_artifact_id
+        .as_deref()
+        .context("selected candidate has no training evaluation")?;
+    let training = lineage
+        .evaluations
+        .iter()
+        .find(|stored| {
+            stored.record.evaluation_id == training_evaluation_id
+                && stored.record.candidate_id == selected_candidate_id
+        })
+        .context("selected candidate training evaluation is missing")?;
+    let training_evaluation: CandidateEvaluation =
+        serde_json::from_value(training.record.payload.clone())
+            .context("selected candidate training evaluation is malformed")?;
+    training_evaluation.validate()?;
+    if !training_evaluation.passed
+        || training.record.mission_id != lineage.mission.mission_id
+        || training.record.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
+        || training.record.evaluation_protocol_hash != checkpoint_protocol_hash
+        || training_evaluation.evaluation_protocol_hash.as_deref() != Some(checkpoint_protocol_hash)
+        || training_evaluation.evaluator_version != search_identity.evaluator_version
+        || canonical_json_hash(&training_evaluation.evaluator_config)?
+            != search_identity.evaluator_config_hash
+    {
+        bail!("selected candidate training evidence does not match the MCTS research identity");
+    }
+
+    Ok(PreparedMctsResearchReceipt {
+        mission_id: lineage.mission.mission_id.clone(),
+        dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
+        search_identity_hash: canonical_json_hash(checkpoint_config)?,
+        checkpoint_hash: canonical_json_hash(checkpoint)?,
+        selected_candidate_id: selected_candidate_id.to_string(),
+        selected_candidate_content_hash: candidate.content_hash.clone(),
+        training_evaluation_id: training.record.evaluation_id.clone(),
+        training_evaluation_hash: training.content_hash.clone(),
+        evaluation_protocol_hash: checkpoint_protocol_hash.to_string(),
+    })
+}
+
+fn finish_mcts_research_receipt(
+    prepared: PreparedMctsResearchReceipt,
+    sealed_revision: &RegistryRevision,
+) -> anyhow::Result<CexMctsResearchReceiptV1> {
+    let sealed_evaluation: CandidateEvaluation = serde_json::from_value(
+        sealed_revision
+            .payload
+            .get("evaluation")
+            .cloned()
+            .context("sealed evaluation payload is incomplete")?,
+    )
+    .context("sealed evaluation is malformed")?;
+    sealed_evaluation.validate()?;
+    if sealed_revision.registry_kind != "sealed_evaluation"
+        || sealed_revision.asset_id != prepared.selected_candidate_id
+        || sealed_revision
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(prepared.mission_id.as_str())
+        || sealed_revision
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(prepared.selected_candidate_content_hash.as_str())
+        || sealed_revision
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(prepared.dataset_manifest_id.as_str())
+        || sealed_revision
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(prepared.evaluation_protocol_hash.as_str())
+        || sealed_evaluation.evaluation_protocol_hash.as_deref()
+            != Some(prepared.evaluation_protocol_hash.as_str())
+    {
+        bail!("sealed evaluation does not match the selected MCTS research evidence");
+    }
+
+    let receipt = CexMctsResearchReceiptV1::new(
+        prepared.mission_id,
+        prepared.dataset_manifest_id,
+        prepared.search_identity_hash,
+        prepared.checkpoint_hash,
+        prepared.selected_candidate_id,
+        prepared.selected_candidate_content_hash,
+        prepared.training_evaluation_id,
+        prepared.training_evaluation_hash,
+        prepared.evaluation_protocol_hash,
+        sealed_revision.revision_id.clone(),
+        canonical_json_hash(sealed_revision)?,
+    )?;
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
@@ -329,6 +521,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         .iter()
         .any(|value| value.trim().is_empty())
         || args.feature_fields.is_empty()
+        || args.max_new_iterations == 0
         || args
             .feature_fields
             .iter()
@@ -806,8 +999,15 @@ mod tests {
         fixture.args.validation.position_notional_usd = 10_000.0;
         fixture.args.validation.capacity_depth_levels = 5;
         fixture.args.validation.max_book_depth_fraction = 0.1;
+        let stale_receipt = fixture
+            .args
+            .work_dir
+            .join("results/mcts-research-receipt.json");
+        std::fs::create_dir_all(stale_receipt.parent().unwrap()).unwrap();
+        std::fs::write(&stale_receipt, b"stale\n").unwrap();
 
         execute(fixture.args.clone()).unwrap();
+        assert!(!stale_receipt.exists());
 
         let evidence: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.args.work_dir.join("results/candidates.json")).unwrap(),
@@ -863,6 +1063,79 @@ mod tests {
             .lines()
             .count()
                 <= 1
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_emits_a_bound_mcts_research_receipt() {
+        let mut fixture = fixture("bound-mcts-research-receipt");
+        fixture.args.max_candidates = 2;
+        fixture.args.max_expansions = 2;
+        fixture.args.max_new_iterations = 1;
+        rewrite_features(&mut fixture, |row| {
+            row.features.insert("book_imbalance".to_string(), -1.5);
+            row.features.insert(
+                "spread_bps".to_string(),
+                if row.label > 0.0 { 1.0 } else { 0.0 },
+            );
+        });
+
+        execute(fixture.args.clone()).unwrap();
+
+        let receipt: alpha_domain::CexMctsResearchReceiptV1 = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .args
+                    .work_dir
+                    .join("results/mcts-research-receipt.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        receipt.validate().unwrap();
+        let candidates: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/candidates.json")).unwrap(),
+        )
+        .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/mission-status.json")).unwrap(),
+        )
+        .unwrap();
+        let checkpoint: RunCheckpoint =
+            serde_json::from_value(status["checkpoint"].clone()).unwrap();
+        let run: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/mission-run.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(run["total_iterations"], 2);
+        assert_eq!(receipt.selected_candidate_id, "mission-1-mcts-2");
+        assert_eq!(receipt.mission_id, fixture.args.mission_id);
+        assert_eq!(
+            receipt.dataset_manifest_id.as_str(),
+            candidates["evaluations"][0]["record"]["dataset_manifest_id"]
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(
+            receipt.search_identity_hash,
+            canonical_json_hash(&checkpoint.engine_state["config"]).unwrap()
+        );
+        assert_eq!(
+            receipt.checkpoint_hash,
+            canonical_json_hash(&checkpoint).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                fixture
+                    .args
+                    .work_dir
+                    .join("results/sealed-evaluations.jsonl")
+            )
+            .unwrap()
+            .lines()
+            .count(),
+            1
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
