@@ -260,11 +260,10 @@ fn settlement_task_metrics(
         event_count: event_ids.len(),
         decision_count,
         mean_brier_score: mean_or_zero(samples.iter().map(|(_, q, win)| (*q - *win).powi(2))),
-        mean_log_loss: mean_or_zero(
-            samples
-                .iter()
-                .map(|(_, q, win)| -(*win * q.ln() + (1.0 - *win) * (1.0 - q).ln())),
-        ),
+        mean_log_loss: mean_or_zero(samples.iter().map(|(_, q, win)| {
+            let outcome_probability = if *win == 1.0 { *q } else { 1.0 - *q };
+            -outcome_probability.max(f64::MIN_POSITIVE).ln()
+        })),
         expected_calibration_error: calibration
             .values()
             .map(|(count, q, win)| {
@@ -1187,6 +1186,38 @@ mod tests {
         snapshot.observations.clear();
         snapshot.pm_book_snapshots.clear();
         assert!(builtin_task_metrics(&mission, &snapshot).is_err());
+    }
+
+    #[test]
+    fn settlement_log_loss_stays_finite_at_probability_boundary() {
+        let mission = mission(PredictionTaskKind::SettlementProbability, None, None);
+        let mut snapshot = authenticated_training_snapshot();
+        for row in &mut snapshot.observations {
+            row.pm_up_bid = 1.0 - f64::EPSILON / 2.0;
+            row.pm_up_ask = 1.0 - f64::EPSILON / 2.0;
+            row.pm_down_bid = f64::from_bits(1);
+            row.pm_down_ask = f64::from_bits(1);
+        }
+        assert_eq!(
+            joint_binary_market_probability(
+                snapshot.observations[0].pm_up_bid,
+                snapshot.observations[0].pm_up_ask,
+                snapshot.observations[0].pm_down_bid,
+                snapshot.observations[0].pm_down_ask,
+            ),
+            Some(1.0)
+        );
+        for outcome in [1.0, 0.0] {
+            for row in &mut snapshot.observations {
+                row.settlement_up = outcome;
+            }
+            let AuthenticatedTaskMetrics::Settlement(metrics) =
+                builtin_task_metrics(&mission, &snapshot).expect("boundary settlement metrics")
+            else {
+                panic!("typed settlement metrics");
+            };
+            assert!(metrics.mean_log_loss.is_finite());
+        }
     }
 
     #[test]
