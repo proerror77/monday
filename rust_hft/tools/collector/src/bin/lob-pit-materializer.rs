@@ -5,10 +5,16 @@ use data::binance_lob_replay::{
     source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
 };
 use data::binance_market_tape_artifact::{
-    seal_binance_market_tape_triplet, verify_binance_market_tape, BinanceMarketTapeTriplet,
+    seal_binance_market_tape_triplet,
+    verify_binance_market_tape_with_required_trade_and_lob_summaries, BinanceMarketTapeTriplet,
     BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent, VerifiedBinanceMarketTape,
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
+use hft_research_manifest::{
+    CexReplaySegmentIdentity, CexReplaySnapshotV1, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    CEX_FEATURE_AVAILABILITY_POLICY, CEX_MODALITY_AGGREGATE_TRADE, CEX_MODALITY_LOB,
+    CEX_REPLAY_CLOCK_RECEIVED_AT_NS, CEX_REPLAY_SNAPSHOT_SCHEMA_V1,
+};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -18,8 +24,6 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-
-const MATERIALIZATION_SCHEMA: &str = "binance-lob-pit-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Market {
@@ -119,6 +123,8 @@ struct MaterializationReport {
     last_event_time: DateTime<Utc>,
     artifact_path: PathBuf,
     artifact_sha256: String,
+    snapshot: CexReplaySnapshotV1,
+    snapshot_sha256: String,
     created_at: DateTime<Utc>,
 }
 
@@ -269,6 +275,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .with_context(|| {
             format!("verified market-tape does not contain requested symbol {symbol}")
         })?;
+    if verified
+        .segments()
+        .iter()
+        .all(|segment| !segment.trade_summaries.contains_key(&symbol))
+    {
+        bail!(
+            "verified market-tape does not contain aggregate trades for requested symbol {symbol}"
+        );
+    }
 
     let bucket_ns = args
         .bucket_ms
@@ -299,10 +314,42 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let artifact_sha256 = hex::encode(Sha256::digest(&artifact_bytes));
     let artifact_path = args.artifact_dir.join(format!("{artifact_sha256}.jsonl"));
     publish_immutable(&artifact_path, &artifact_bytes)?;
+    let first_event_time = rows.first().context("feature rows are empty")?.event_time;
+    let last_event_time = rows.last().context("feature rows are empty")?.event_time;
+    let snapshot = CexReplaySnapshotV1 {
+        schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V1.to_string(),
+        venue: "binance".to_string(),
+        instrument_type: args.market.as_str().to_string(),
+        symbol: symbol.clone(),
+        replay_clock: CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
+        required_modalities: BTreeSet::from([
+            CEX_MODALITY_LOB.to_string(),
+            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+        ]),
+        source_segments: source_segments
+            .iter()
+            .map(|segment| CexReplaySegmentIdentity {
+                content_sha256: segment.sha256.clone(),
+                manifest_sha256: segment.collector_manifest_sha256.clone(),
+                start_received_at_ns: segment.start_received_at_ns,
+                end_received_at_ns: segment.end_received_at_ns,
+                events: segment.events,
+            })
+            .collect(),
+        first_event_time,
+        last_event_time,
+        feature_artifact_sha256: artifact_sha256.clone(),
+        feature_availability_policy: CEX_FEATURE_AVAILABILITY_POLICY.to_string(),
+        bucket_ms: args.bucket_ms,
+        label_horizon_buckets: args.label_horizon_buckets,
+        top_depth: args.top_depth,
+    };
+    snapshot.validate().map_err(anyhow::Error::new)?;
+    let snapshot_sha256 = snapshot.sha256();
 
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
-        schema_version: MATERIALIZATION_SCHEMA.to_string(),
+        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2.to_string(),
         mission_id: mission_id.to_string(),
         symbol,
         market: args.market.as_str().to_string(),
@@ -312,10 +359,12 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         source_revision: revision,
         source_segments,
         rows: rows.len(),
-        first_event_time: rows.first().context("feature rows are empty")?.event_time,
-        last_event_time: rows.last().context("feature rows are empty")?.event_time,
+        first_event_time,
+        last_event_time,
         artifact_path,
         artifact_sha256,
+        snapshot,
+        snapshot_sha256,
         created_at,
     };
     let report_bytes = serde_json::to_vec_pretty(&report)?;
@@ -360,7 +409,10 @@ fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<S
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    Ok((verify_binance_market_tape(sealed)?, paths))
+    Ok((
+        verify_binance_market_tape_with_required_trade_and_lob_summaries(sealed)?,
+        paths,
+    ))
 }
 
 fn source_segment_evidence(
@@ -639,6 +691,10 @@ fn datetime_ns(value: u64) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data::binance_market_tape::{
+        AggregateTrade, AggregateTradeSummaryBuilder, LobContinuitySummaryBuilder,
+        AGGREGATE_TRADE_SUMMARY_CONTRACT,
+    };
     use serde_json::{json, Value};
     use std::{
         io::{BufRead, BufReader},
@@ -727,6 +783,23 @@ mod tests {
         ]
     }
 
+    #[rustfmt::skip]
+    fn two_symbol_rows_without_sol_trade() -> Vec<Value> {
+        let mut rows = valid_rows();
+        rows[0]["symbols"] = json!(2);
+        rows[0]["websocket_streams"] = json!(4);
+        rows[1]["shards"] = json!([
+            ["btcusdt@aggTrade", "solusdt@aggTrade"],
+            ["btcusdt@depth@100ms", "solusdt@depth@100ms"]
+        ]);
+        rows.extend([
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(150),"type":"snapshot","session_id":"session-1","symbol":"SOLUSDT","request_started_at_ns":event_ns(100),"snapshot":{"lastUpdateId":200,"bids":[["50","10"]],"asks":[["51","10"]]}}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"SOLUSDT","last_update_id":200,"synced":true,"bridged":false,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["50","10"]],"asks":[["51","10"]],"reason":"test","replay_safe":true}),
+        ]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        rows
+    }
+
     struct Fixture {
         directory: PathBuf,
         data: PathBuf,
@@ -738,6 +811,10 @@ mod tests {
 
     impl Fixture {
         fn new(rows: &[Value]) -> Self {
+            Self::new_for_symbols(rows, &["BTCUSDT"])
+        }
+
+        fn new_for_symbols(rows: &[Value], symbols: &[&str]) -> Self {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let requested_directory = std::env::temp_dir()
                 .join(format!("lob-pit-materializer-{}-{id}", std::process::id()));
@@ -767,6 +844,31 @@ mod tests {
                     .or_insert(0_u64) += 1;
                 counts
             });
+            let mut trade_summaries = AggregateTradeSummaryBuilder::default();
+            let mut lob_continuity = LobContinuitySummaryBuilder::new(
+                symbols.iter().map(|symbol| (*symbol).to_string()),
+            )
+            .unwrap();
+            for row in rows {
+                let raw = row.as_object().unwrap();
+                lob_continuity.observe(raw).unwrap();
+                if row["type"] == "agg_trade" {
+                    let received_at_ns = row["received_at_ns"].as_u64().unwrap();
+                    trade_summaries
+                        .observe(&AggregateTrade::from_archived_event(raw, received_at_ns).unwrap())
+                        .unwrap();
+                }
+            }
+            let declared_symbols = symbols
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect::<BTreeSet<_>>();
+            let checkpointed_symbols = rows
+                .iter()
+                .filter(|row| row["type"] == "checkpoint")
+                .filter_map(|row| row["symbol"].as_str())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
             let manifest_value = json!({
                 "schema": "binance.market_tape.v1",
                 "venue": "binance",
@@ -774,7 +876,7 @@ mod tests {
                 "dataset": "usdm_all",
                 "shard_id": "all",
                 "mode": "diff",
-                "symbols": ["BTCUSDT"],
+                "symbols": symbols,
                 "security_token_symbols": [],
                 "excluded_symbols": [],
                 "snapshot_limit": 1_000,
@@ -783,12 +885,12 @@ mod tests {
                 "events": rows.len(),
                 "event_types": event_types,
                 "has_replay_safe_checkpoint": true,
-                "snapshot_ready_count": 1,
-                "bridged_count": 1,
-                "stream_coverage_verified_count": 1,
+                "snapshot_ready_count": checkpointed_symbols.len(),
+                "bridged_count": checkpointed_symbols.len(),
+                "stream_coverage_verified_count": checkpointed_symbols.len(),
                 "snapshot_only_symbols": [],
-                "all_symbols_bridged": true,
-                "all_stream_coverage_verified": true,
+                "all_symbols_bridged": checkpointed_symbols == declared_symbols,
+                "all_stream_coverage_verified": checkpointed_symbols == declared_symbols,
                 "start_received_at_ns": rows.first().unwrap()["received_at_ns"],
                 "end_received_at_ns": rows.last().unwrap()["received_at_ns"],
                 "date": "2026-07-14",
@@ -797,7 +899,10 @@ mod tests {
                 "bytes": data.metadata().unwrap().len(),
                 "sha256": content_sha256,
                 "trade_representation": "aggregate_trade_only",
-                "price_surface_derivation": "latest aggregate trade price"
+                "price_surface_derivation": "latest aggregate trade price",
+                "trade_summary_contract": AGGREGATE_TRADE_SUMMARY_CONTRACT,
+                "trade_summaries": trade_summaries.finish().unwrap(),
+                "lob_continuity": lob_continuity.finish().unwrap()
             });
             let mut manifest_bytes = serde_json::to_vec(&manifest_value).unwrap();
             manifest_bytes.push(b'\n');
@@ -872,6 +977,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_combined_tape_without_strict_modality_evidence() {
+        let fixture = Fixture::new(&valid_rows());
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("trade_summary_contract");
+        manifest.as_object_mut().unwrap().remove("trade_summaries");
+        manifest.as_object_mut().unwrap().remove("lob_continuity");
+        let mut bytes = serde_json::to_vec(&manifest).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&fixture.manifest, &bytes).unwrap();
+        let mut args = fixture.args();
+        args.segment_manifest_sha256[0] = hex::encode(Sha256::digest(&bytes));
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(error.contains("aggregate-trade summary contract"));
+        assert!(!args.artifact_dir.exists());
+    }
+
+    #[test]
+    fn rejects_selected_symbol_without_aggregate_trades() {
+        let fixture = Fixture::new_for_symbols(
+            &two_symbol_rows_without_sol_trade(),
+            &["BTCUSDT", "SOLUSDT"],
+        );
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".to_string();
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(error.contains("aggregate trades for requested symbol SOLUSDT"));
+        assert!(!args.artifact_dir.exists());
+    }
+
+    #[test]
     fn same_timestamp_snapshot_and_diff_apply_before_one_sample() {
         let received_at_ns = event_ns(1_000);
         let events = vec![
@@ -903,13 +1046,28 @@ mod tests {
         let published = materialize(&fixture.args()).unwrap();
         let output = serde_json::to_value(&published).unwrap();
         let source = &output["report"]["source_segments"][0];
+        let snapshot: hft_research_manifest::CexReplaySnapshotV1 =
+            serde_json::from_value(output["report"]["snapshot"].clone()).unwrap();
         let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
             .lines()
             .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(published.report.schema_version, MATERIALIZATION_SCHEMA);
+        assert_eq!(
+            published.report.schema_version,
+            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2
+        );
         assert_eq!(published.report.rows, 3);
+        snapshot.validate().unwrap();
+        assert_eq!(output["report"]["snapshot_sha256"], snapshot.sha256());
+        assert_eq!(
+            snapshot.source_segments[0].content_sha256,
+            fixture.content_sha256
+        );
+        assert_eq!(
+            snapshot.source_segments[0].manifest_sha256,
+            fixture.manifest_sha256
+        );
         assert_eq!(
             source,
             &json!({
@@ -933,5 +1091,17 @@ mod tests {
         );
         assert!((rows[0].features["mid_price"] - 101.0).abs() < 1e-12);
         assert!((rows[0].label - (101.25 / 101.0 - 1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn same_authenticated_tape_and_parameters_keep_one_snapshot_digest() {
+        let fixture = Fixture::new(&valid_rows());
+        let args = fixture.args();
+
+        let first = materialize(&args).unwrap();
+        let second = materialize(&args).unwrap();
+
+        assert_eq!(first.report.snapshot, second.report.snapshot);
+        assert_eq!(first.report.snapshot_sha256, second.report.snapshot_sha256);
     }
 }

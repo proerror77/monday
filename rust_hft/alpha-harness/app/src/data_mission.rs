@@ -3,8 +3,11 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use hft_collector::{
-    acquire_dataset, import_feature_dataset, read_feature_rows, DataAcquisitionMission,
-    DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+    acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
+    DataAcquisitionMission, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+};
+use hft_research_manifest::{
+    CexReplayDatasetManifestV1, CexReplaySnapshotV1, CEX_REPLAY_DATASET_KIND,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -47,9 +50,87 @@ pub fn import_and_register_features(
     Ok(manifest)
 }
 
+pub fn admit_cex_replay_dataset(
+    store: &mut AlphaStore,
+    features: &FeatureDatasetManifest,
+    snapshot: &CexReplaySnapshotV1,
+) -> anyhow::Result<CexReplayDatasetManifestV1> {
+    validate_cex_replay_features(snapshot, features)?;
+    let manifest = CexReplayDatasetManifestV1::new(features.manifest_id.clone(), snapshot.clone())?;
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: manifest.manifest_id.clone(),
+        registry_kind: "dataset".to_string(),
+        asset_id: snapshot.symbol.clone(),
+        parent_revision_id: Some(features.manifest_id.clone()),
+        payload: serde_json::to_value(&manifest)?,
+        created_at: features.created_at,
+    })?;
+    Ok(manifest)
+}
+
+fn validate_cex_replay_features(
+    snapshot: &CexReplaySnapshotV1,
+    features: &FeatureDatasetManifest,
+) -> anyhow::Result<()> {
+    snapshot.validate()?;
+    if features.symbol != snapshot.symbol
+        || features.artifact_sha256 != snapshot.feature_artifact_sha256
+        || features.label_spec.horizon_buckets != snapshot.label_horizon_buckets
+        || features.label_spec.observation_frequency_millis != snapshot.bucket_ms
+    {
+        bail!("feature lineage or label facts do not match the CEX replay snapshot");
+    }
+    if features.time_bounds.first_event_time != snapshot.first_event_time
+        || features.time_bounds.last_event_time != snapshot.last_event_time
+    {
+        bail!("feature time bounds do not match the CEX replay snapshot");
+    }
+    let last_label_available_ns = u64::try_from(
+        features
+            .time_bounds
+            .last_label_available_time
+            .timestamp_nanos_opt()
+            .context("feature label availability is out of range")?,
+    )
+    .context("feature label availability is out of range")?;
+    if last_label_available_ns
+        > snapshot
+            .source_segments
+            .last()
+            .expect("validated snapshot has source segments")
+            .end_received_at_ns
+    {
+        bail!("feature label availability is outside the CEX replay snapshot");
+    }
+    let source_key = format!("binance-{}-lob", snapshot.instrument_type);
+    let expected_source_revision = source_revision(
+        snapshot
+            .source_segments
+            .iter()
+            .map(|segment| segment.content_sha256.as_str()),
+    );
+    if features.source_revisions.len() != 1
+        || features.source_revisions.get(&source_key) != Some(&expected_source_revision)
+    {
+        bail!("feature source revision does not match the CEX replay snapshot");
+    }
+    let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
+    if rows
+        .iter()
+        .any(|row| row.feature_available_time != row.event_time)
+    {
+        bail!("feature availability does not match the CEX replay decision clock");
+    }
+    Ok(())
+}
+
 pub enum RegisteredResearchDataset {
     Ohlcv(DatasetManifest),
     FeatureMatrix(FeatureDatasetManifest),
+    CexReplay {
+        admission: Box<CexReplayDatasetManifestV1>,
+        features: FeatureDatasetManifest,
+    },
 }
 
 impl RegisteredResearchDataset {
@@ -57,6 +138,7 @@ impl RegisteredResearchDataset {
         match self {
             Self::Ohlcv(manifest) => &manifest.manifest_id,
             Self::FeatureMatrix(manifest) => &manifest.manifest_id,
+            Self::CexReplay { admission, .. } => &admission.manifest_id,
         }
     }
 
@@ -72,6 +154,9 @@ impl RegisteredResearchDataset {
             }
             Self::FeatureMatrix(manifest) => {
                 load_feature_research_rows(manifest, fee_bps, funding_bps, latency_bps)
+            }
+            Self::CexReplay { features, .. } => {
+                load_feature_research_rows(features, fee_bps, funding_bps, latency_bps)
             }
         }
     }
@@ -89,6 +174,13 @@ impl RegisteredResearchDataset {
                 Ok(EvaluationLabelSpecV1 {
                     horizon_buckets: manifest.label_spec.horizon_buckets,
                     observation_frequency_millis: manifest.label_spec.observation_frequency_millis,
+                })
+            }
+            Self::CexReplay { features, .. } => {
+                read_feature_rows(features).map_err(anyhow::Error::msg)?;
+                Ok(EvaluationLabelSpecV1 {
+                    horizon_buckets: features.label_spec.horizon_buckets,
+                    observation_frequency_millis: features.label_spec.observation_frequency_millis,
                 })
             }
         }
@@ -129,6 +221,42 @@ pub fn read_registered_research_dataset(
         .with_context(|| format!("failed to read dataset manifest {}", path.display()))?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).context("dataset manifest is invalid JSON")?;
+    if value
+        .get("dataset_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(CEX_REPLAY_DATASET_KIND)
+    {
+        let admission: CexReplayDatasetManifestV1 = serde_json::from_value(value.clone())?;
+        admission.validate()?;
+        let feature_revision = store
+            .get_registry_revision(&admission.feature_manifest_id)
+            .context("CEX replay feature manifest is not registered")?;
+        let features: FeatureDatasetManifest =
+            serde_json::from_value(feature_revision.payload.clone())?;
+        if feature_revision.registry_kind != "dataset"
+            || feature_revision.asset_id != features.symbol
+            || feature_revision.created_at != features.created_at
+            || features.manifest_id != admission.feature_manifest_id
+        {
+            bail!("CEX replay feature manifest does not match its registered revision");
+        }
+        validate_cex_replay_features(&admission.snapshot, &features)?;
+        let registered = store
+            .get_registry_revision(&admission.manifest_id)
+            .context("CEX replay dataset manifest is not registered")?;
+        if registered.registry_kind != "dataset"
+            || registered.asset_id != admission.snapshot.symbol
+            || registered.parent_revision_id.as_deref()
+                != Some(admission.feature_manifest_id.as_str())
+            || registered.payload != value
+        {
+            bail!("CEX replay dataset manifest does not match its registered revision");
+        }
+        return Ok(RegisteredResearchDataset::CexReplay {
+            admission: Box::new(admission),
+            features,
+        });
+    }
     let dataset = if value
         .get("dataset_kind")
         .and_then(serde_json::Value::as_str)
@@ -148,6 +276,14 @@ pub fn read_registered_research_dataset(
             manifest.manifest_id.as_str(),
             manifest.symbol.as_str(),
             manifest.created_at,
+        ),
+        RegisteredResearchDataset::CexReplay {
+            admission,
+            features,
+        } => (
+            admission.manifest_id.as_str(),
+            admission.snapshot.symbol.as_str(),
+            features.created_at,
         ),
     };
     let registered = store

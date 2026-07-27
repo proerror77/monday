@@ -4969,6 +4969,7 @@ dependencies = [
  "hex",
  "hft-data",
  "hft-engine",
+ "hft-research-manifest",
  "http 0.2.12",
  "libc",
  "lz4",
@@ -5924,6 +5925,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
