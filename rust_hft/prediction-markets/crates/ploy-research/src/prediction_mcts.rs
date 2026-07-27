@@ -401,11 +401,14 @@ enum ExpansionAction {
 }
 
 fn deterministic_actions(profile: SettlementProbabilityComponentProfile) -> Vec<ExpansionAction> {
-    eligible_components(profile)
-        .iter()
-        .copied()
-        .map(|component| ExpansionAction::Increase { component })
-        .collect()
+    match profile {
+        SettlementProbabilityComponentProfile::FullSurface => eligible_components(profile)
+            .iter()
+            .copied()
+            .map(|component| ExpansionAction::Increase { component })
+            .collect(),
+        SettlementProbabilityComponentProfile::MarketMidpointOnly => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -580,7 +583,16 @@ impl PredictionMctsCheckpoint {
             let ordinal = candidate_id
                 .strip_prefix(&prefix)
                 .and_then(|value| value.parse::<usize>().ok());
-            if *node_id == 0
+            let canonical_baseline_pending = *node_id == 0
+                && self.config.component_profile
+                    == SettlementProbabilityComponentProfile::MarketMidpointOnly
+                && self.pending.len() == 1
+                && self.proposed == 1
+                && ordinal == Some(0)
+                && node.visits == 0
+                && node.total_reward == 0.0
+                && node.best_reward.is_none();
+            if (*node_id == 0 && !canonical_baseline_pending)
                 || !pending_nodes.insert(*node_id)
                 || ordinal.is_none_or(|ordinal| {
                     ordinal >= self.proposed || !pending_ordinals.insert(ordinal)
@@ -843,6 +855,12 @@ impl PredictionMctsEngine {
         if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
             return Err("prediction MCTS candidate budget is exhausted".to_string());
         }
+        if self.checkpoint.config.component_profile
+            == SettlementProbabilityComponentProfile::MarketMidpointOnly
+            && self.checkpoint.proposed == 0
+        {
+            return Ok(self.mark_candidate_pending(0));
+        }
         for _ in 0..256 {
             let parent = select_expandable(
                 &self.checkpoint.nodes,
@@ -856,30 +874,39 @@ impl PredictionMctsEngine {
             if !self.checkpoint.seen_blends.insert(blend_key(&blend)) {
                 continue;
             }
-            let probability_blend_sha256 = blend_digest(&blend);
-            let candidate_id = format!(
-                "{}{}",
-                candidate_id_prefix(&self.checkpoint.config, &blend),
-                self.checkpoint.proposed
-            );
-            self.checkpoint.proposed += 1;
-            self.checkpoint
-                .pending
-                .insert(candidate_id.clone(), node_id);
-            return Ok(PredictionMctsCandidate {
-                candidate_id,
-                identity: self.checkpoint.config.identity.clone(),
-                probability_blend_sha256,
-                source: self.checkpoint.nodes[node_id].source,
-                probability_blend: blend,
-            });
+            return Ok(self.mark_candidate_pending(node_id));
         }
         Err("prediction MCTS could not produce a novel candidate".to_string())
+    }
+
+    fn mark_candidate_pending(&mut self, node_id: usize) -> PredictionMctsCandidate {
+        let blend = self.checkpoint.nodes[node_id].blend.clone();
+        let candidate_id = format!(
+            "{}{}",
+            candidate_id_prefix(&self.checkpoint.config, &blend),
+            self.checkpoint.proposed
+        );
+        self.checkpoint.proposed += 1;
+        self.checkpoint
+            .pending
+            .insert(candidate_id.clone(), node_id);
+        PredictionMctsCandidate {
+            candidate_id,
+            identity: self.checkpoint.config.identity.clone(),
+            probability_blend_sha256: blend_digest(&blend),
+            source: self.checkpoint.nodes[node_id].source,
+            probability_blend: blend,
+        }
     }
 
     pub(crate) fn has_expandable_candidate(&self) -> Result<bool, String> {
         if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
             return Ok(false);
+        }
+        if self.checkpoint.config.component_profile
+            == SettlementProbabilityComponentProfile::MarketMidpointOnly
+        {
+            return Ok(self.checkpoint.proposed == 0);
         }
         Ok(select_expandable(
             &self.checkpoint.nodes,
@@ -1170,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn market_midpoint_profile_never_expands_an_unsupported_component() {
+    fn market_midpoint_profile_evaluates_only_its_canonical_baseline() {
         let mut mission = mission();
         mission.search_budget.max_candidates = 3;
         mission.search_budget.max_llm_calls = 1;
@@ -1186,19 +1213,20 @@ mod tests {
         )
         .expect("market-midpoint-only engine");
 
-        for _ in 0..3 {
-            let candidate = engine.propose().expect("eligible deterministic candidate");
-            assert_eq!(candidate.probability_blend.chainlink_digital_weight, 0.0);
-            assert_eq!(candidate.probability_blend.distance_lob_vol_weight, 0.0);
-            assert_eq!(candidate.probability_blend.event_surface_weight, 0.0);
-            assert_eq!(candidate.probability_blend.existing_model_weight, 0.0);
-            let evaluation = FakeEvaluator
-                .evaluate_training(&candidate)
-                .expect("training evidence");
-            engine
-                .observe(&candidate.candidate_id, &evaluation)
-                .expect("observe eligible candidate");
-        }
+        let candidate = engine.propose().expect("canonical baseline candidate");
+        assert_eq!(candidate.source, PredictionExpansionSource::Baseline);
+        assert_eq!(
+            candidate.probability_blend,
+            market_midpoint_blend("baseline").into()
+        );
+        engine.checkpoint().expect("durable pending baseline");
+        let evaluation = FakeEvaluator
+            .evaluate_training(&candidate)
+            .expect("training evidence");
+        engine
+            .observe(&candidate.candidate_id, &evaluation)
+            .expect("observe canonical baseline");
+        assert!(!engine.has_expandable_candidate().unwrap());
 
         let error = PredictionMctsEngine::new_with_component_profile(
             &mission,
