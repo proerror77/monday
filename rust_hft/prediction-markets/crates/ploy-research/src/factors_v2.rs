@@ -9,6 +9,7 @@ use crate::factors::{
     normalized_underlying_symbol, pearson_ic, spearman_ic, FactorObservation,
     ResearchPmBookSnapshot,
 };
+use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
 
 const DEFAULT_STAKE_USD: f64 = 15.0;
 const DEFAULT_TOP_QUANTILE: f64 = 0.2;
@@ -405,30 +406,48 @@ pub struct FullDepthExecutionEventRow {
     pub market_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    pub joint_state_sha256: Option<String>,
     pub token_id: String,
+    pub opposite_token_id: String,
     pub side: ReviewSide,
     pub stake_usd: f64,
+    pub joint_fair_probability: Option<f64>,
+    pub up_down_best_ask_sum: Option<f64>,
     pub book_timestamp: Option<DateTime<Utc>>,
     pub quote_age_secs: Option<f64>,
     pub spread_bps: Option<f64>,
     pub entry_fillable: bool,
+    pub entry_shares: Option<f64>,
+    pub entry_notional_usd: Option<f64>,
+    pub entry_capacity_usd: Option<f64>,
+    pub entry_fee_usd: Option<f64>,
     pub entry_avg_price: Option<f64>,
     pub entry_slippage_bps: Option<f64>,
     pub entry_levels_used: Option<f64>,
+    pub fair_value_usd: Option<f64>,
+    pub fair_edge_usd: Option<f64>,
+    pub complete_set_capacity_shares: Option<f64>,
+    pub complete_set_cost_usd: Option<f64>,
+    pub complete_set_fee_usd: Option<f64>,
+    pub complete_set_edge_usd: Option<f64>,
     pub exit_5s_fillable: bool,
     pub exit_5s_avg_price: Option<f64>,
+    pub exit_5s_fee_usd: Option<f64>,
     pub exit_5s_slippage_bps: Option<f64>,
     pub exit_5s_reprice_pnl: Option<f64>,
     pub exit_10s_fillable: bool,
     pub exit_10s_avg_price: Option<f64>,
+    pub exit_10s_fee_usd: Option<f64>,
     pub exit_10s_slippage_bps: Option<f64>,
     pub exit_10s_reprice_pnl: Option<f64>,
     pub exit_15s_fillable: bool,
     pub exit_15s_avg_price: Option<f64>,
+    pub exit_15s_fee_usd: Option<f64>,
     pub exit_15s_slippage_bps: Option<f64>,
     pub exit_15s_reprice_pnl: Option<f64>,
     pub exit_30s_fillable: bool,
     pub exit_30s_avg_price: Option<f64>,
+    pub exit_30s_fee_usd: Option<f64>,
     pub exit_30s_slippage_bps: Option<f64>,
     pub exit_30s_reprice_pnl: Option<f64>,
     pub settlement_outcome: Option<f64>,
@@ -8332,18 +8351,24 @@ fn sweep_sell_shares_with_config(
 #[derive(Default)]
 struct FullDepthExecutionSample {
     entry_fillable: bool,
+    entry_shares: f64,
+    entry_fee_usd: f64,
     entry_avg_price: f64,
     entry_slippage_bps: f64,
     entry_levels_used: f64,
     exit_5s_fillable: bool,
     exit_5s_avg_price: f64,
+    exit_5s_fee_usd: f64,
     exit_5s_slippage_bps: f64,
     exit_10s_fillable: bool,
     exit_10s_avg_price: f64,
+    exit_10s_fee_usd: f64,
     exit_15s_fillable: bool,
     exit_15s_avg_price: f64,
+    exit_15s_fee_usd: f64,
     exit_30s_fillable: bool,
     exit_30s_avg_price: f64,
+    exit_30s_fee_usd: f64,
     exit_10s_slippage_bps: f64,
     exit_15s_slippage_bps: f64,
     exit_30s_slippage_bps: f64,
@@ -8353,6 +8378,28 @@ struct FullDepthExecutionSample {
     reprice_pnl_30s: Option<f64>,
     settlement_outcome: Option<f64>,
     settlement_pnl: Option<f64>,
+}
+
+#[derive(Default)]
+struct JointBinaryBookMetrics {
+    state_sha256: Option<String>,
+    fair_up_probability: Option<f64>,
+    best_ask_sum: Option<f64>,
+    complete_set_capacity_shares: Option<f64>,
+    complete_set_cost_usd: Option<f64>,
+    complete_set_fee_usd: Option<f64>,
+    complete_set_edge_usd: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct JointBinaryBookIdentity<'a> {
+    schema_version: &'static str,
+    market_id: &'a str,
+    decision_time: DateTime<Utc>,
+    up_token_id: &'a str,
+    down_token_id: &'a str,
+    up_book: &'a ResearchPmBookSnapshot,
+    down_book: &'a ResearchPmBookSnapshot,
 }
 
 pub fn build_full_depth_execution_matrix(
@@ -8410,6 +8457,26 @@ fn build_full_depth_execution_matrix_internal(
         options.stakes_usd.clone()
     };
     for source in source_rows {
+        let up_book = latest_pm_book(
+            &book_index,
+            &source.event_id,
+            &source.up_token_id,
+            ReviewSide::Up,
+            source.tick_ts,
+            options.max_quote_age_secs,
+        );
+        let down_book = latest_pm_book(
+            &book_index,
+            &source.event_id,
+            &source.down_token_id,
+            ReviewSide::Down,
+            source.tick_ts,
+            options.max_quote_age_secs,
+        );
+        let (Some(up_book), Some(down_book)) = (up_book, down_book) else {
+            continue;
+        };
+        let joint = joint_binary_book_metrics(source, up_book, down_book, &options);
         for side in [ReviewSide::Up, ReviewSide::Down] {
             let (entry_ask, exit_bid, settlement_win) = side_market_values(source, side);
             let pm_spread_bps = if valid_price(entry_ask) && valid_price(exit_bid) {
@@ -8417,14 +8484,10 @@ fn build_full_depth_execution_matrix_internal(
             } else {
                 f64::NAN
             };
-            let current_book = latest_pm_book(
-                &book_index,
-                &source.event_id,
-                side_token_id(source, side),
-                side,
-                source.tick_ts,
-                options.max_quote_age_secs,
-            );
+            let current_book = match side {
+                ReviewSide::Up => Some(up_book),
+                ReviewSide::Down => Some(down_book),
+            };
             let quote_age_secs = current_book
                 .map(|book| (source.tick_ts - book.ts).num_milliseconds() as f64 / 1000.0)
                 .unwrap_or(f64::NAN);
@@ -8458,9 +8521,9 @@ fn build_full_depth_execution_matrix_internal(
                         side,
                         stake_usd,
                         current_book,
-                        quote_age_secs,
-                        pm_spread_bps,
                         &sample,
+                        &joint,
+                        &options,
                     ));
                 }
                 groups.entry(key).or_default().push(sample);
@@ -8571,6 +8634,8 @@ fn build_full_depth_execution_sample(
 
     let mut sample = FullDepthExecutionSample {
         entry_fillable: entry_sweep.fillable,
+        entry_shares: entry_sweep.shares,
+        entry_fee_usd: entry_fee,
         entry_avg_price: entry_sweep.avg_price,
         entry_slippage_bps: entry_sweep.slippage_bps,
         entry_levels_used: entry_sweep.levels_used,
@@ -8617,24 +8682,28 @@ fn build_full_depth_execution_sample(
             5 => {
                 sample.exit_5s_fillable = exit_sweep.fillable;
                 sample.exit_5s_avg_price = exit_sweep.avg_price;
+                sample.exit_5s_fee_usd = exit_sweep.fee_usd;
                 sample.exit_5s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_5s = reprice_pnl;
             }
             10 => {
                 sample.exit_10s_fillable = exit_sweep.fillable;
                 sample.exit_10s_avg_price = exit_sweep.avg_price;
+                sample.exit_10s_fee_usd = exit_sweep.fee_usd;
                 sample.exit_10s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_10s = reprice_pnl;
             }
             15 => {
                 sample.exit_15s_fillable = exit_sweep.fillable;
                 sample.exit_15s_avg_price = exit_sweep.avg_price;
+                sample.exit_15s_fee_usd = exit_sweep.fee_usd;
                 sample.exit_15s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_15s = reprice_pnl;
             }
             30 => {
                 sample.exit_30s_fillable = exit_sweep.fillable;
                 sample.exit_30s_avg_price = exit_sweep.avg_price;
+                sample.exit_30s_fee_usd = exit_sweep.fee_usd;
                 sample.exit_30s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_30s = reprice_pnl;
             }
@@ -8649,26 +8718,77 @@ fn build_full_depth_execution_event_row(
     side: ReviewSide,
     stake_usd: f64,
     current_book: Option<&ResearchPmBookSnapshot>,
-    quote_age_secs: f64,
-    spread_bps: f64,
     sample: &FullDepthExecutionSample,
+    joint: &JointBinaryBookMetrics,
+    options: &FullDepthExecutionMatrixOptions,
 ) -> FullDepthExecutionEventRow {
+    let (entry_ask, exit_bid, _) = side_market_values(source, side);
+    let spread_bps = if valid_price(entry_ask) && valid_price(exit_bid) {
+        ((entry_ask - exit_bid).max(0.0) / entry_ask) * 10_000.0
+    } else {
+        f64::NAN
+    };
+    let quote_age_secs = current_book
+        .map(|book| (source.tick_ts - book.ts).num_milliseconds() as f64 / 1000.0)
+        .unwrap_or(f64::NAN);
+    let opposite = match side {
+        ReviewSide::Up => ReviewSide::Down,
+        ReviewSide::Down => ReviewSide::Up,
+    };
+    let joint_fair_probability = joint.fair_up_probability.map(|probability| match side {
+        ReviewSide::Up => probability,
+        ReviewSide::Down => 1.0 - probability,
+    });
+    let entry_shares = sample.entry_fillable.then_some(sample.entry_shares);
+    let entry_notional_usd = sample
+        .entry_fillable
+        .then_some(sample.entry_avg_price * sample.entry_shares);
+    let entry_capacity_usd = current_book.map(|book| {
+        visible_ask_capacity_usd(
+            &book.asks,
+            options.visible_depth_haircut,
+            options.max_levels,
+        )
+    });
+    let entry_fee_usd = sample.entry_fillable.then_some(sample.entry_fee_usd);
+    let fair_value_usd = joint_fair_probability
+        .zip(entry_shares)
+        .map(|(probability, shares)| probability * shares);
+    let fair_edge_usd = fair_value_usd
+        .zip(entry_fee_usd)
+        .map(|(fair_value, fee)| fair_value - stake_usd - fee);
+
     FullDepthExecutionEventRow {
         market_id: source.event_id.clone(),
         symbol: source.symbol.clone(),
         tick_ts: source.tick_ts,
+        joint_state_sha256: joint.state_sha256.clone(),
         token_id: side_token_id(source, side).to_string(),
+        opposite_token_id: side_token_id(source, opposite).to_string(),
         side,
         stake_usd,
+        joint_fair_probability,
+        up_down_best_ask_sum: joint.best_ask_sum,
         book_timestamp: current_book.map(|book| book.ts),
         quote_age_secs: finite_value(quote_age_secs),
         spread_bps: finite_value(spread_bps),
         entry_fillable: sample.entry_fillable,
+        entry_shares,
+        entry_notional_usd,
+        entry_capacity_usd,
+        entry_fee_usd,
         entry_avg_price: sample.entry_fillable.then_some(sample.entry_avg_price),
         entry_slippage_bps: sample.entry_fillable.then_some(sample.entry_slippage_bps),
         entry_levels_used: sample.entry_fillable.then_some(sample.entry_levels_used),
+        fair_value_usd,
+        fair_edge_usd,
+        complete_set_capacity_shares: joint.complete_set_capacity_shares,
+        complete_set_cost_usd: joint.complete_set_cost_usd,
+        complete_set_fee_usd: joint.complete_set_fee_usd,
+        complete_set_edge_usd: joint.complete_set_edge_usd,
         exit_5s_fillable: sample.exit_5s_fillable,
         exit_5s_avg_price: sample.exit_5s_fillable.then_some(sample.exit_5s_avg_price),
+        exit_5s_fee_usd: sample.exit_5s_fillable.then_some(sample.exit_5s_fee_usd),
         exit_5s_slippage_bps: sample
             .exit_5s_fillable
             .then_some(sample.exit_5s_slippage_bps),
@@ -8677,6 +8797,7 @@ fn build_full_depth_execution_event_row(
         exit_10s_avg_price: sample
             .exit_10s_fillable
             .then_some(sample.exit_10s_avg_price),
+        exit_10s_fee_usd: sample.exit_10s_fillable.then_some(sample.exit_10s_fee_usd),
         exit_10s_slippage_bps: sample
             .exit_10s_fillable
             .then_some(sample.exit_10s_slippage_bps),
@@ -8685,6 +8806,7 @@ fn build_full_depth_execution_event_row(
         exit_15s_avg_price: sample
             .exit_15s_fillable
             .then_some(sample.exit_15s_avg_price),
+        exit_15s_fee_usd: sample.exit_15s_fillable.then_some(sample.exit_15s_fee_usd),
         exit_15s_slippage_bps: sample
             .exit_15s_fillable
             .then_some(sample.exit_15s_slippage_bps),
@@ -8693,12 +8815,182 @@ fn build_full_depth_execution_event_row(
         exit_30s_avg_price: sample
             .exit_30s_fillable
             .then_some(sample.exit_30s_avg_price),
+        exit_30s_fee_usd: sample.exit_30s_fillable.then_some(sample.exit_30s_fee_usd),
         exit_30s_slippage_bps: sample
             .exit_30s_fillable
             .then_some(sample.exit_30s_slippage_bps),
         exit_30s_reprice_pnl: sample.reprice_pnl_30s,
         settlement_outcome: sample.settlement_outcome,
         settlement_pnl: sample.settlement_pnl,
+    }
+}
+
+fn joint_binary_book_metrics(
+    source: &FactorObservation,
+    up_book: &ResearchPmBookSnapshot,
+    down_book: &ResearchPmBookSnapshot,
+    options: &FullDepthExecutionMatrixOptions,
+) -> JointBinaryBookMetrics {
+    let identity = JointBinaryBookIdentity {
+        schema_version: "polymarket_joint_binary_book.v1",
+        market_id: &source.event_id,
+        decision_time: source.tick_ts,
+        up_token_id: &source.up_token_id,
+        down_token_id: &source.down_token_id,
+        up_book,
+        down_book,
+    };
+    let Some(state_sha256) = canonical_json_bytes(&identity)
+        .ok()
+        .map(|bytes| format!("sha256:{}", sha256_hex(&bytes)))
+    else {
+        return JointBinaryBookMetrics::default();
+    };
+    let (Some(up_bid), Some(up_ask), Some(down_bid), Some(down_ask)) = (
+        best_valid_bid(&up_book.bids),
+        best_valid_ask(&up_book.asks),
+        best_valid_bid(&down_book.bids),
+        best_valid_ask(&down_book.asks),
+    ) else {
+        return JointBinaryBookMetrics {
+            state_sha256: Some(state_sha256),
+            ..Default::default()
+        };
+    };
+    let fair_up_probability = joint_binary_market_probability(up_bid, up_ask, down_bid, down_ask);
+    let complete_set_capacity_shares = visible_ask_capacity_shares(
+        &up_book.asks,
+        options.visible_depth_haircut,
+        options.max_levels,
+    )
+    .min(visible_ask_capacity_shares(
+        &down_book.asks,
+        options.visible_depth_haircut,
+        options.max_levels,
+    ));
+    let up_sweep = sweep_buy_shares_with_config(
+        &up_book.asks,
+        up_ask,
+        complete_set_capacity_shares,
+        options.visible_depth_haircut,
+        options.max_levels,
+    );
+    let down_sweep = sweep_buy_shares_with_config(
+        &down_book.asks,
+        down_ask,
+        complete_set_capacity_shares,
+        options.visible_depth_haircut,
+        options.max_levels,
+    );
+    let complete_set_fillable = up_sweep.fillable && down_sweep.fillable;
+    let complete_set_cost_usd = complete_set_fillable
+        .then_some(up_sweep.shares * up_sweep.avg_price + down_sweep.shares * down_sweep.avg_price);
+    let complete_set_fee_usd =
+        complete_set_fillable.then_some(up_sweep.fee_usd + down_sweep.fee_usd);
+    let complete_set_edge_usd = complete_set_cost_usd
+        .zip(complete_set_fee_usd)
+        .map(|(cost, fee)| complete_set_capacity_shares - cost - fee);
+    JointBinaryBookMetrics {
+        state_sha256: Some(state_sha256),
+        fair_up_probability,
+        best_ask_sum: Some(up_ask + down_ask),
+        complete_set_capacity_shares: complete_set_fillable.then_some(complete_set_capacity_shares),
+        complete_set_cost_usd,
+        complete_set_fee_usd,
+        complete_set_edge_usd,
+    }
+}
+
+fn best_valid_bid(levels: &[crate::factors::ResearchPmBookLevel]) -> Option<f64> {
+    levels
+        .iter()
+        .filter(|level| valid_price(level.price) && level.size.is_finite() && level.size > 0.0)
+        .map(|level| level.price)
+        .max_by(f64::total_cmp)
+}
+
+fn best_valid_ask(levels: &[crate::factors::ResearchPmBookLevel]) -> Option<f64> {
+    levels
+        .iter()
+        .filter(|level| valid_price(level.price) && level.size.is_finite() && level.size > 0.0)
+        .map(|level| level.price)
+        .min_by(f64::total_cmp)
+}
+
+fn visible_ask_capacity_shares(
+    levels: &[crate::factors::ResearchPmBookLevel],
+    visible_depth_haircut: f64,
+    max_levels: Option<usize>,
+) -> f64 {
+    let haircut = visible_depth_haircut.clamp(0.0, 1.0);
+    levels
+        .iter()
+        .take(max_levels.unwrap_or(usize::MAX))
+        .filter(|level| valid_price(level.price) && level.size.is_finite() && level.size > 0.0)
+        .map(|level| level.size * haircut)
+        .sum()
+}
+
+fn visible_ask_capacity_usd(
+    levels: &[crate::factors::ResearchPmBookLevel],
+    visible_depth_haircut: f64,
+    max_levels: Option<usize>,
+) -> f64 {
+    let haircut = visible_depth_haircut.clamp(0.0, 1.0);
+    levels
+        .iter()
+        .take(max_levels.unwrap_or(usize::MAX))
+        .filter(|level| valid_price(level.price) && level.size.is_finite() && level.size > 0.0)
+        .map(|level| level.price * level.size * haircut)
+        .sum()
+}
+
+fn sweep_buy_shares_with_config(
+    levels: &[crate::factors::ResearchPmBookLevel],
+    reference_price: f64,
+    shares_to_buy: f64,
+    visible_depth_haircut: f64,
+    max_levels: Option<usize>,
+) -> SweepFill {
+    if !valid_price(reference_price) || !shares_to_buy.is_finite() || shares_to_buy <= 0.0 {
+        return SweepFill::default();
+    }
+    let haircut = visible_depth_haircut.clamp(0.0, 1.0);
+    if haircut <= EPS {
+        return SweepFill::default();
+    }
+    let mut remaining = shares_to_buy;
+    let mut spent = 0.0;
+    let mut bought = 0.0;
+    let mut fee_usd = 0.0;
+    let mut levels_used = 0.0;
+    for level in levels
+        .iter()
+        .take(max_levels.unwrap_or(usize::MAX))
+        .filter(|level| valid_price(level.price) && level.size.is_finite() && level.size > 0.0)
+    {
+        if remaining <= EPS {
+            break;
+        }
+        let take_shares = remaining.min(level.size * haircut);
+        spent += take_shares * level.price;
+        bought += take_shares;
+        fee_usd +=
+            ploy_market_contracts::polymarket_crypto_taker_fee_cost(take_shares, level.price);
+        remaining -= take_shares;
+        levels_used += 1.0;
+    }
+    if remaining > EPS || bought <= EPS {
+        return SweepFill::default();
+    }
+    let avg_price = spent / bought;
+    SweepFill {
+        fillable: true,
+        avg_price,
+        shares: bought,
+        fee_usd,
+        levels_used,
+        slippage_bps: ((avg_price - reference_price).max(0.0) / reference_price) * 10_000.0,
     }
 }
 
@@ -9310,11 +9602,30 @@ fn settlement_probability_weighted_components(
 }
 
 fn settlement_market_midpoint_probability(row: &FactorObservationV2) -> Option<f64> {
-    if valid_price(row.entry_ask) && valid_price(row.exit_bid) {
-        Some((row.entry_ask + row.exit_bid) * 0.5)
-    } else {
-        None
+    joint_binary_market_probability(
+        row.exit_bid,
+        row.entry_ask,
+        row.opposite_bid,
+        row.opposite_ask,
+    )
+}
+
+pub(crate) fn joint_binary_market_probability(
+    side_bid: f64,
+    side_ask: f64,
+    opposite_bid: f64,
+    opposite_ask: f64,
+) -> Option<f64> {
+    if !valid_price(side_bid)
+        || !valid_price(side_ask)
+        || !valid_price(opposite_bid)
+        || !valid_price(opposite_ask)
+    {
+        return None;
     }
+    let side_midpoint = (side_bid + side_ask) * 0.5;
+    let opposite_midpoint = (opposite_bid + opposite_ask) * 0.5;
+    Some((side_midpoint + (1.0 - opposite_midpoint)) * 0.5)
 }
 
 fn settlement_distance_lob_vol_probability(row: &FactorObservationV2) -> Option<f64> {
@@ -12041,6 +12352,60 @@ mod tests {
     }
 
     #[test]
+    fn market_midpoint_probability_uses_the_joint_binary_book() {
+        let mut observation = base_obs();
+        observation.pm_up_bid = 0.57;
+        observation.pm_up_ask = 0.63;
+        observation.pm_down_bid = 0.25;
+        observation.pm_down_ask = 0.35;
+        let mut rows =
+            build_factor_observations_v2(&[observation], &FactorReviewOptions::default());
+        make_settlement_probability_eligible(&mut rows);
+
+        for (side, expected) in [(ReviewSide::Up, 0.65), (ReviewSide::Down, 0.35)] {
+            let side_rows = rows
+                .iter()
+                .filter(|row| row.side == side)
+                .cloned()
+                .collect::<Vec<_>>();
+            let report = build_settlement_probability_report(
+                &side_rows,
+                SettlementProbabilityReportOptions {
+                    min_bucket_observations: 1,
+                    component_profile: SettlementProbabilityComponentProfile::MarketMidpointOnly,
+                    ..Default::default()
+                },
+            );
+            let midpoint = report
+                .baselines
+                .iter()
+                .find(|row| row.model == "q_market_midpoint")
+                .expect("joint market midpoint baseline");
+
+            assert!((midpoint.avg_predicted_q - expected).abs() < 1e-12);
+        }
+
+        let mut missing_opposite = base_obs();
+        missing_opposite.pm_down_ask = f64::NAN;
+        let mut rows =
+            build_factor_observations_v2(&[missing_opposite], &FactorReviewOptions::default());
+        make_settlement_probability_eligible(&mut rows);
+        rows.retain(|row| row.side == ReviewSide::Up);
+        let report = build_settlement_probability_report(
+            &rows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                component_profile: SettlementProbabilityComponentProfile::MarketMidpointOnly,
+                ..Default::default()
+            },
+        );
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_market_midpoint"));
+    }
+
+    #[test]
     fn invalid_typed_probability_blends_fail_closed() {
         let options = FactorReviewOptions::default();
         let mut rows = build_factor_observations_v2(&[base_obs()], &options);
@@ -13888,6 +14253,20 @@ mod tests {
             },
             ResearchPmBookSnapshot {
                 event_id: "evt".into(),
+                token_id: "down-token".into(),
+                side: "DOWN".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.49,
+                    size: 10.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.50,
+                    size: 10.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: "evt".into(),
                 token_id: "up-token".into(),
                 side: "UP".into(),
                 ts: future.tick_ts,
@@ -13897,6 +14276,20 @@ mod tests {
                 }],
                 asks: vec![crate::factors::ResearchPmBookLevel {
                     price: 0.72,
+                    size: 10.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: "evt".into(),
+                token_id: "down-token".into(),
+                side: "DOWN".into(),
+                ts: future.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.28,
+                    size: 10.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.30,
                     size: 10.0,
                 }],
             },
@@ -14073,6 +14466,13 @@ mod tests {
         assert_eq!(up.token_id, "token-up");
         assert_eq!(down.market_id, "market-1");
         assert_eq!(down.token_id, "token-down");
+        assert_eq!(up.opposite_token_id, "token-down");
+        assert_eq!(down.opposite_token_id, "token-up");
+        assert_eq!(up.joint_state_sha256, down.joint_state_sha256);
+        assert!(up
+            .joint_state_sha256
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
         assert_eq!(up.side, ReviewSide::Up);
         assert_eq!(down.side, ReviewSide::Down);
         assert_eq!(up.book_timestamp, Some(tick_ts));
@@ -14081,6 +14481,53 @@ mod tests {
         assert!(down.quote_age_secs.unwrap().abs() < EPS);
         assert!((up.entry_avg_price.unwrap() - 0.52).abs() < EPS);
         assert!((down.entry_avg_price.unwrap() - 0.41).abs() < EPS);
+        assert!((up.joint_fair_probability.unwrap() - 0.555).abs() < EPS);
+        assert!((down.joint_fair_probability.unwrap() - 0.445).abs() < EPS);
+        assert!(
+            (up.joint_fair_probability.unwrap() + down.joint_fair_probability.unwrap() - 1.0).abs()
+                < EPS
+        );
+        assert!((up.up_down_best_ask_sum.unwrap() - 0.93).abs() < EPS);
+        assert!((down.up_down_best_ask_sum.unwrap() - 0.93).abs() < EPS);
+        assert!(up.entry_shares.unwrap() > 0.0);
+        assert!(down.entry_shares.unwrap() > 0.0);
+        assert!((up.entry_notional_usd.unwrap() - 5.0).abs() < EPS);
+        assert!((down.entry_notional_usd.unwrap() - 5.0).abs() < EPS);
+        assert!((up.entry_capacity_usd.unwrap() - 10.4).abs() < EPS);
+        assert!((down.entry_capacity_usd.unwrap() - 8.2).abs() < EPS);
+        assert!(up.entry_fee_usd.unwrap() > 0.0);
+        assert!(down.entry_fee_usd.unwrap() > 0.0);
+        assert!(
+            (up.fair_value_usd.unwrap()
+                - up.entry_shares.unwrap() * up.joint_fair_probability.unwrap())
+            .abs()
+                < EPS
+        );
+        assert!(
+            (up.fair_edge_usd.unwrap()
+                - (up.fair_value_usd.unwrap() - up.stake_usd - up.entry_fee_usd.unwrap()))
+            .abs()
+                < EPS
+        );
+        assert!((up.complete_set_capacity_shares.unwrap() - 20.0).abs() < EPS);
+        assert_eq!(
+            up.complete_set_capacity_shares,
+            down.complete_set_capacity_shares
+        );
+        assert!((up.complete_set_cost_usd.unwrap() - 18.6).abs() < EPS);
+        assert_eq!(up.complete_set_cost_usd, down.complete_set_cost_usd);
+        assert!(up.complete_set_fee_usd.unwrap() > 0.0);
+        assert_eq!(up.complete_set_fee_usd, down.complete_set_fee_usd);
+        assert!(
+            (up.complete_set_edge_usd.unwrap()
+                - (up.complete_set_capacity_shares.unwrap()
+                    - up.complete_set_cost_usd.unwrap()
+                    - up.complete_set_fee_usd.unwrap()))
+            .abs()
+                < EPS
+        );
+        assert!(up.complete_set_edge_usd.unwrap() > 0.0);
+        assert_eq!(up.complete_set_edge_usd, down.complete_set_edge_usd);
         assert!((up.exit_10s_avg_price.unwrap() - 0.70).abs() < EPS);
         assert!((down.exit_10s_avg_price.unwrap() - 0.22).abs() < EPS);
         assert!(up.exit_10s_reprice_pnl.unwrap() > 0.0);
@@ -14089,6 +14536,69 @@ mod tests {
         assert!((down.exit_15s_avg_price.unwrap() - 0.18).abs() < EPS);
         assert!(up.exit_15s_reprice_pnl.unwrap() > 0.0);
         assert!(down.exit_15s_reprice_pnl.unwrap() < 0.0);
+
+        let mut changed_settlement = observations.clone();
+        for row in &mut changed_settlement {
+            row.settlement_up = 0.0;
+        }
+        let (_, changed_rows) = build_full_depth_execution_matrix_with_event_rows(
+            &changed_settlement,
+            &books,
+            FullDepthExecutionMatrixOptions {
+                stakes_usd: vec![5.0],
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        let changed_up = changed_rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up && row.tick_ts == tick_ts)
+            .expect("changed-settlement up row");
+        assert_eq!(changed_up.joint_state_sha256, up.joint_state_sha256);
+        assert_eq!(changed_up.joint_fair_probability, up.joint_fair_probability);
+
+        let mut swapped_books = books[..2].to_vec();
+        swapped_books[0].token_id = "token-down".into();
+        swapped_books[1].token_id = "token-up".into();
+        let (_, swapped_rows) = build_full_depth_execution_matrix_with_event_rows(
+            &observations[..1],
+            &swapped_books,
+            FullDepthExecutionMatrixOptions {
+                stakes_usd: vec![5.0],
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        assert!(swapped_rows.is_empty());
+
+        let (_, missing_sibling_rows) = build_full_depth_execution_matrix_with_event_rows(
+            &observations[..1],
+            &books[..1],
+            FullDepthExecutionMatrixOptions {
+                stakes_usd: vec![5.0],
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        assert!(missing_sibling_rows.is_empty());
+
+        let mut low_sum_books = books[..2].to_vec();
+        low_sum_books[0].bids[0].price = 0.48;
+        low_sum_books[0].asks[0].price = 0.50;
+        low_sum_books[1].bids[0].price = 0.47;
+        low_sum_books[1].asks[0].price = 0.49;
+        let (_, low_sum_rows) = build_full_depth_execution_matrix_with_event_rows(
+            &observations[..1],
+            &low_sum_books,
+            FullDepthExecutionMatrixOptions {
+                stakes_usd: vec![5.0],
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        let low_sum = &low_sum_rows[0];
+        assert!(low_sum.up_down_best_ask_sum.unwrap() < 1.0);
+        assert!(low_sum.complete_set_edge_usd.unwrap() < 0.0);
     }
 
     #[test]
