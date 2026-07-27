@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,8 @@ pub struct AuthenticatedTrainingSnapshot {
     market_ids: Vec<String>,
     observations: Vec<FactorObservation>,
     pm_book_snapshots: Vec<ResearchPmBookSnapshot>,
+    max_quote_age_secs: i64,
+    stake_usd: f64,
 }
 
 impl AuthenticatedTrainingSnapshot {
@@ -50,6 +52,14 @@ impl AuthenticatedTrainingSnapshot {
 
     pub fn pm_book_snapshots(&self) -> &[ResearchPmBookSnapshot] {
         &self.pm_book_snapshots
+    }
+
+    pub fn max_quote_age_secs(&self) -> i64 {
+        self.max_quote_age_secs
+    }
+
+    pub fn stake_usd(&self) -> f64 {
+        self.stake_usd
     }
 }
 
@@ -202,6 +212,9 @@ fn builtin_task_metrics(
 fn settlement_task_metrics(
     snapshot: &AuthenticatedTrainingSnapshot,
 ) -> Result<SettlementTaskMetrics, String> {
+    if snapshot.market_ids().is_empty() || snapshot.observations().is_empty() {
+        return Err("settlement metrics require a non-empty authenticated cohort".to_string());
+    }
     let samples = snapshot
         .observations()
         .iter()
@@ -267,6 +280,32 @@ fn execution_task_metrics(
     side: ReviewSide,
     prediction_horizon_secs: u32,
 ) -> Result<ExecutionTaskMetrics, String> {
+    if !snapshot.stake_usd().is_finite()
+        || snapshot.stake_usd() <= 0.0
+        || snapshot.max_quote_age_secs() <= 0
+    {
+        return Err("authenticated execution settings are invalid".to_string());
+    }
+    let decision_observations = snapshot
+        .observations()
+        .iter()
+        .filter(|row| row.time_remaining_secs >= i64::from(prediction_horizon_secs))
+        .collect::<Vec<_>>();
+    let expected_decision_ids = decision_observations
+        .iter()
+        .map(|row| (row.event_id.as_str(), row.tick_ts))
+        .collect::<BTreeSet<_>>();
+    if decision_observations.is_empty()
+        || expected_decision_ids.len() != decision_observations.len()
+    {
+        return Err("execution metrics require unique horizon-eligible decisions".to_string());
+    }
+    validate_execution_horizon_evidence(
+        snapshot,
+        side,
+        prediction_horizon_secs,
+        &decision_observations,
+    )?;
     let mut observations = snapshot.observations().to_vec();
     for row in &mut observations {
         row.settlement_up = f64::NAN;
@@ -276,30 +315,50 @@ fn execution_task_metrics(
         &observations,
         snapshot.pm_book_snapshots(),
         FullDepthExecutionMatrixOptions {
-            stakes_usd: vec![15.0],
+            stakes_usd: vec![snapshot.stake_usd()],
             min_bucket_observations: 1,
+            max_quote_age_secs: snapshot.max_quote_age_secs(),
             ..Default::default()
         },
     );
     let rows = rows
         .iter()
-        .filter(|row| row.side == side)
+        .filter(|row| {
+            row.side == side
+                && expected_decision_ids.contains(&(row.market_id.as_str(), row.tick_ts))
+        })
         .collect::<Vec<_>>();
     let decision_ids = rows
         .iter()
         .map(|row| (row.market_id.as_str(), row.tick_ts))
         .collect::<BTreeSet<_>>();
-    let expected_decision_ids = snapshot
-        .observations()
-        .iter()
-        .map(|row| (row.event_id.as_str(), row.tick_ts))
-        .collect::<BTreeSet<_>>();
+    let has_invalid_joint_depth = rows.iter().any(|row| {
+        row.joint_state_sha256.as_deref().is_none_or(|digest| {
+            crate::prediction_loop::validate_sha256_id(digest, "joint binary book").is_err()
+        }) || row
+            .joint_fair_probability
+            .is_none_or(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || row
+                .up_down_best_ask_sum
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            || row
+                .complete_set_capacity_shares
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            || row
+                .complete_set_cost_usd
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            || row
+                .complete_set_fee_usd
+                .is_none_or(|value| !value.is_finite() || value < 0.0)
+            || row
+                .complete_set_edge_usd
+                .is_none_or(|value| !value.is_finite())
+    });
     if rows.is_empty()
-        || rows.len() != snapshot.observations().len()
+        || rows.len() != decision_observations.len()
         || decision_ids.len() != rows.len()
-        || expected_decision_ids.len() != snapshot.observations().len()
         || decision_ids != expected_decision_ids
-        || rows.iter().any(|row| row.joint_state_sha256.is_none())
+        || has_invalid_joint_depth
     {
         return Err("execution metrics do not exactly cover authenticated train decisions".into());
     }
@@ -367,6 +426,66 @@ fn execution_task_metrics(
             rows.iter().filter_map(|row| row.complete_set_edge_usd),
         ),
     })
+}
+
+fn validate_execution_horizon_evidence(
+    snapshot: &AuthenticatedTrainingSnapshot,
+    side: ReviewSide,
+    prediction_horizon_secs: u32,
+    decision_observations: &[&FactorObservation],
+) -> Result<(), String> {
+    let mut by_event = BTreeMap::<&str, Vec<&FactorObservation>>::new();
+    for row in snapshot.observations() {
+        by_event.entry(row.event_id.as_str()).or_default().push(row);
+    }
+    for rows in by_event.values_mut() {
+        rows.sort_by_key(|row| row.tick_ts);
+    }
+    let max_age_millis = snapshot.max_quote_age_secs().saturating_mul(1_000);
+    let side_key = match side {
+        ReviewSide::Up => "UP",
+        ReviewSide::Down => "DOWN",
+    };
+    for source in decision_observations {
+        let target = source.tick_ts + chrono::Duration::seconds(i64::from(prediction_horizon_secs));
+        let future = by_event
+            .get(source.event_id.as_str())
+            .and_then(|rows| rows.iter().copied().find(|row| row.tick_ts >= target))
+            .ok_or_else(|| {
+                format!(
+                    "execution decision {} at {} has no requested horizon observation",
+                    source.event_id, source.tick_ts
+                )
+            })?;
+        let (token_id, reference_bid) = match side {
+            ReviewSide::Up => (&future.up_token_id, future.pm_up_bid),
+            ReviewSide::Down => (&future.down_token_id, future.pm_down_bid),
+        };
+        if !reference_bid.is_finite() || !(0.0..1.0).contains(&reference_bid) {
+            return Err("execution horizon observation has no valid side bid".to_string());
+        }
+        let book = snapshot
+            .pm_book_snapshots()
+            .iter()
+            .filter(|book| {
+                book.event_id == future.event_id
+                    && book.token_id == *token_id
+                    && book.side.eq_ignore_ascii_case(side_key)
+                    && book.ts <= future.tick_ts
+                    && (future.tick_ts - book.ts).num_milliseconds() <= max_age_millis
+            })
+            .max_by_key(|book| book.ts)
+            .ok_or_else(|| "execution decision has no fresh requested horizon book".to_string())?;
+        if !book.bids.iter().any(|level| {
+            level.price.is_finite()
+                && (0.0..1.0).contains(&level.price)
+                && level.size.is_finite()
+                && level.size > 0.0
+        }) {
+            return Err("execution horizon book has no valid bid depth".to_string());
+        }
+    }
+    Ok(())
 }
 
 type ExecutionHorizonMetrics = (bool, Option<f64>, Option<f64>, Option<f64>);
@@ -449,7 +568,9 @@ impl AuthenticatedPredictionMctsEvaluator for BuiltInAuthenticatedPredictionMcts
             return Err("authenticated training evaluator deadline exhausted".to_string());
         }
         candidate_matches_mission(mission, candidate)?;
+        let started = Instant::now();
         let metrics = builtin_task_metrics(mission, training)?;
+        ensure_metric_computation_within_timeout(started, timeout)?;
         let common = (
             candidate.candidate_id.clone(),
             candidate.identity.clone(),
@@ -494,8 +615,21 @@ impl AuthenticatedPredictionMctsEvaluator for BuiltInAuthenticatedPredictionMcts
             return Err("authenticated held-out evaluator deadline exhausted".to_string());
         }
         candidate_matches_mission(mission, candidate)?;
-        AuthenticatedEvaluationArtifact::new(candidate, builtin_task_metrics(mission, &held_out.0)?)
+        let started = Instant::now();
+        let metrics = builtin_task_metrics(mission, &held_out.0)?;
+        ensure_metric_computation_within_timeout(started, timeout)?;
+        AuthenticatedEvaluationArtifact::new(candidate, metrics)
     }
+}
+
+fn ensure_metric_computation_within_timeout(
+    started: Instant,
+    timeout: Duration,
+) -> Result<(), String> {
+    if timeout.is_zero() || started.elapsed() >= timeout {
+        return Err("authenticated evaluator deadline exhausted during metric computation".into());
+    }
+    Ok(())
 }
 
 fn execution_training_evidence(
@@ -821,6 +955,8 @@ fn snapshot_view(
         market_ids: ordered_market_ids.to_vec(),
         observations,
         pm_book_snapshots,
+        max_quote_age_secs: snapshot.manifest.max_quote_age_secs,
+        stake_usd: snapshot.manifest.stake_usd,
     })
 }
 
@@ -945,9 +1081,8 @@ mod tests {
         let mut missing_quote = snapshot.clone();
         missing_quote.observations[1].pm_up_bid = f64::NAN;
         assert!(builtin_task_metrics(&settlement_mission, &missing_quote).is_err());
-        let missing_book_at = snapshot.observations[1].tick_ts;
         let mut missing_book = snapshot.clone();
-        missing_book.observations[1].tick_ts += chrono::Duration::seconds(21);
+        let missing_book_at = snapshot.observations[0].tick_ts;
         missing_book
             .pm_book_snapshots
             .retain(|book| book.ts != missing_book_at || book.side != "DOWN");
@@ -985,6 +1120,94 @@ mod tests {
             selected.metrics,
             AuthenticatedTaskMetrics::UpExecution(_)
         ));
+    }
+
+    #[test]
+    fn execution_metrics_use_snapshot_bound_stake_and_quote_age() {
+        let mission = mission(
+            PredictionTaskKind::UpExecution,
+            Some(PredictionTokenSide::Up),
+            Some(10),
+        );
+        let mut snapshot = authenticated_training_snapshot();
+        snapshot.stake_usd = 25.0;
+        let AuthenticatedTaskMetrics::UpExecution(metrics) =
+            builtin_task_metrics(&mission, &snapshot).expect("snapshot-bound execution metrics")
+        else {
+            panic!("typed Up metrics");
+        };
+        assert!((metrics.mean_entry_notional_usd - 25.0).abs() < 1e-9);
+
+        let future_ts = snapshot.observations[1].tick_ts;
+        snapshot.max_quote_age_secs = 1;
+        for book in &mut snapshot.pm_book_snapshots {
+            if book.ts == future_ts {
+                book.ts -= chrono::Duration::seconds(2);
+            }
+        }
+        assert!(builtin_task_metrics(&mission, &snapshot).is_err());
+    }
+
+    #[test]
+    fn execution_metrics_reject_a_decision_without_requested_horizon_evidence() {
+        let mission = mission(
+            PredictionTaskKind::UpExecution,
+            Some(PredictionTokenSide::Up),
+            Some(10),
+        );
+        let mut snapshot = authenticated_training_snapshot();
+        snapshot.observations.truncate(1);
+        assert!(builtin_task_metrics(&mission, &snapshot).is_err());
+    }
+
+    #[test]
+    fn execution_metrics_reject_hashed_but_invalid_joint_depth() {
+        let mission = mission(
+            PredictionTaskKind::UpExecution,
+            Some(PredictionTokenSide::Up),
+            Some(10),
+        );
+        let mut snapshot = authenticated_training_snapshot();
+        let decision_ts = snapshot.observations[0].tick_ts;
+        for book in &mut snapshot.pm_book_snapshots {
+            if book.ts == decision_ts {
+                for level in book.bids.iter_mut().chain(&mut book.asks) {
+                    level.size = 0.0;
+                }
+            }
+        }
+        assert!(builtin_task_metrics(&mission, &snapshot).is_err());
+    }
+
+    #[test]
+    fn settlement_metrics_reject_an_empty_held_out_view() {
+        let mission = mission(PredictionTaskKind::SettlementProbability, None, None);
+        let mut snapshot = authenticated_training_snapshot();
+        snapshot.market_ids.clear();
+        snapshot.observations.clear();
+        snapshot.pm_book_snapshots.clear();
+        assert!(builtin_task_metrics(&mission, &snapshot).is_err());
+    }
+
+    #[test]
+    fn synchronous_metric_computation_cannot_outlive_its_timeout() {
+        let mission = mission(
+            PredictionTaskKind::UpExecution,
+            Some(PredictionTokenSide::Up),
+            Some(10),
+        );
+        let snapshot = authenticated_training_snapshot();
+        let candidate = candidate(&mission);
+        let error = BuiltInAuthenticatedPredictionMctsEvaluator
+            .evaluate_training(
+                &mission,
+                &snapshot,
+                Path::new("unused"),
+                &candidate,
+                Duration::from_nanos(1),
+            )
+            .expect_err("expired synchronous computation must fail closed");
+        assert!(error.contains("deadline"));
     }
 
     fn mission(
@@ -1029,12 +1252,15 @@ mod tests {
         current.settlement_up = 1.0;
         let mut future = current.clone();
         future.tick_ts += chrono::Duration::seconds(10);
+        future.time_remaining_secs = 0;
         future.pm_up_bid = 0.70;
         future.pm_down_bid = 0.20;
         AuthenticatedTrainingSnapshot {
             market_ids: vec![current.event_id.clone()],
             observations: vec![current, future],
             pm_book_snapshots: books(tick_ts),
+            max_quote_age_secs: 30,
+            stake_usd: 15.0,
         }
     }
 
