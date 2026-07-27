@@ -119,15 +119,28 @@ impl CexReplaySnapshotV1 {
                 .ok_or_else(|| invalid("event time is out of range"))?,
         )
         .map_err(|_| invalid("event time is out of range"))?;
+        let final_segment_end_ns = self
+            .source_segments
+            .last()
+            .expect("non-empty source segments have a last segment")
+            .end_received_at_ns;
         if first_event_ns < self.source_segments[0].start_received_at_ns
-            || last_event_ns
-                > self
-                    .source_segments
-                    .last()
-                    .expect("non-empty source segments have a last segment")
-                    .end_received_at_ns
+            || last_event_ns > final_segment_end_ns
         {
             return Err(invalid("event range is outside source segments"));
+        }
+        let horizon_buckets = u64::try_from(self.label_horizon_buckets)
+            .map_err(|_| invalid("label horizon is out of range"))?;
+        let horizon_ns = self
+            .bucket_ms
+            .checked_mul(1_000_000)
+            .and_then(|bucket_ns| bucket_ns.checked_mul(horizon_buckets))
+            .ok_or_else(|| invalid("label horizon is out of range"))?;
+        let last_label_available_ns = last_event_ns
+            .checked_add(horizon_ns)
+            .ok_or_else(|| invalid("label horizon is out of range"))?;
+        if last_label_available_ns > final_segment_end_ns {
+            return Err(invalid("label availability is outside source segments"));
         }
         Ok(())
     }
@@ -454,6 +467,19 @@ mod tests {
         assert_eq!(
             snapshot.validate().unwrap_err(),
             ManifestError::InvalidCexReplaySnapshot("source segments are out of order or overlap")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_label_horizon_past_authenticated_tape() {
+        let mut snapshot = cex_snapshot();
+        snapshot.source_segments[0].end_received_at_ns = 1_783_987_208_000_000_000;
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot(
+                "label availability is outside source segments"
+            )
         );
     }
 

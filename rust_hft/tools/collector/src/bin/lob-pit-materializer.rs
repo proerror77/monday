@@ -275,6 +275,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .with_context(|| {
             format!("verified market-tape does not contain requested symbol {symbol}")
         })?;
+    if verified
+        .segments()
+        .iter()
+        .all(|segment| !segment.trade_summaries.contains_key(&symbol))
+    {
+        bail!(
+            "verified market-tape does not contain aggregate trades for requested symbol {symbol}"
+        );
+    }
 
     let bucket_ns = args
         .bucket_ms
@@ -774,6 +783,23 @@ mod tests {
         ]
     }
 
+    #[rustfmt::skip]
+    fn two_symbol_rows_without_sol_trade() -> Vec<Value> {
+        let mut rows = valid_rows();
+        rows[0]["symbols"] = json!(2);
+        rows[0]["websocket_streams"] = json!(4);
+        rows[1]["shards"] = json!([
+            ["btcusdt@aggTrade", "solusdt@aggTrade"],
+            ["btcusdt@depth@100ms", "solusdt@depth@100ms"]
+        ]);
+        rows.extend([
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(150),"type":"snapshot","session_id":"session-1","symbol":"SOLUSDT","request_started_at_ns":event_ns(100),"snapshot":{"lastUpdateId":200,"bids":[["50","10"]],"asks":[["51","10"]]}}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"SOLUSDT","last_update_id":200,"synced":true,"bridged":false,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["50","10"]],"asks":[["51","10"]],"reason":"test","replay_safe":true}),
+        ]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        rows
+    }
+
     struct Fixture {
         directory: PathBuf,
         data: PathBuf,
@@ -785,6 +811,10 @@ mod tests {
 
     impl Fixture {
         fn new(rows: &[Value]) -> Self {
+            Self::new_for_symbols(rows, &["BTCUSDT"])
+        }
+
+        fn new_for_symbols(rows: &[Value], symbols: &[&str]) -> Self {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let requested_directory = std::env::temp_dir()
                 .join(format!("lob-pit-materializer-{}-{id}", std::process::id()));
@@ -815,8 +845,10 @@ mod tests {
                 counts
             });
             let mut trade_summaries = AggregateTradeSummaryBuilder::default();
-            let mut lob_continuity =
-                LobContinuitySummaryBuilder::new(["BTCUSDT".to_string()]).unwrap();
+            let mut lob_continuity = LobContinuitySummaryBuilder::new(
+                symbols.iter().map(|symbol| (*symbol).to_string()),
+            )
+            .unwrap();
             for row in rows {
                 let raw = row.as_object().unwrap();
                 lob_continuity.observe(raw).unwrap();
@@ -827,6 +859,16 @@ mod tests {
                         .unwrap();
                 }
             }
+            let declared_symbols = symbols
+                .iter()
+                .map(|symbol| (*symbol).to_string())
+                .collect::<BTreeSet<_>>();
+            let checkpointed_symbols = rows
+                .iter()
+                .filter(|row| row["type"] == "checkpoint")
+                .filter_map(|row| row["symbol"].as_str())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
             let manifest_value = json!({
                 "schema": "binance.market_tape.v1",
                 "venue": "binance",
@@ -834,7 +876,7 @@ mod tests {
                 "dataset": "usdm_all",
                 "shard_id": "all",
                 "mode": "diff",
-                "symbols": ["BTCUSDT"],
+                "symbols": symbols,
                 "security_token_symbols": [],
                 "excluded_symbols": [],
                 "snapshot_limit": 1_000,
@@ -843,12 +885,12 @@ mod tests {
                 "events": rows.len(),
                 "event_types": event_types,
                 "has_replay_safe_checkpoint": true,
-                "snapshot_ready_count": 1,
-                "bridged_count": 1,
-                "stream_coverage_verified_count": 1,
+                "snapshot_ready_count": checkpointed_symbols.len(),
+                "bridged_count": checkpointed_symbols.len(),
+                "stream_coverage_verified_count": checkpointed_symbols.len(),
                 "snapshot_only_symbols": [],
-                "all_symbols_bridged": true,
-                "all_stream_coverage_verified": true,
+                "all_symbols_bridged": checkpointed_symbols == declared_symbols,
+                "all_stream_coverage_verified": checkpointed_symbols == declared_symbols,
                 "start_received_at_ns": rows.first().unwrap()["received_at_ns"],
                 "end_received_at_ns": rows.last().unwrap()["received_at_ns"],
                 "date": "2026-07-14",
@@ -954,6 +996,21 @@ mod tests {
         let error = materialize(&args).unwrap_err().to_string();
 
         assert!(error.contains("aggregate-trade summary contract"));
+        assert!(!args.artifact_dir.exists());
+    }
+
+    #[test]
+    fn rejects_selected_symbol_without_aggregate_trades() {
+        let fixture = Fixture::new_for_symbols(
+            &two_symbol_rows_without_sol_trade(),
+            &["BTCUSDT", "SOLUSDT"],
+        );
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".to_string();
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(error.contains("aggregate trades for requested symbol SOLUSDT"));
         assert!(!args.artifact_dir.exists());
     }
 

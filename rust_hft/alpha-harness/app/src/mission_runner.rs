@@ -705,6 +705,26 @@ mod tests {
     }
 
     #[test]
+    fn execute_rejects_feature_source_revision_not_bound_to_snapshot_segments() {
+        let mut fixture = fixture("forged-feature-source-revision");
+        rewrite_features(&mut fixture, |row| {
+            row.source_revisions.insert(
+                "binance-usdm-lob".to_string(),
+                "forged-revision".to_string(),
+            );
+        });
+        fixture.materialization["source_revision"] = serde_json::json!("forged-revision");
+        resign_materialization(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("feature source revision does not match the CEX replay snapshot"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn execute_rejects_snapshot_range_that_disagrees_with_feature_rows() {
         let mut fixture = fixture("snapshot-feature-range-mismatch");
         let first_event_time = serde_json::from_value::<chrono::DateTime<Utc>>(
@@ -722,6 +742,37 @@ mod tests {
         assert!(error
             .to_string()
             .contains("feature time bounds do not match the CEX replay snapshot"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_label_availability_past_snapshot_segment_end() {
+        let mut fixture = fixture("label-past-snapshot-segment-end");
+        let last_event_time = serde_json::from_value::<chrono::DateTime<Utc>>(
+            fixture.materialization["last_event_time"].clone(),
+        )
+        .unwrap();
+        let source_end_ns = u64::try_from(
+            (last_event_time + ChronoDuration::seconds(5))
+                .timestamp_nanos_opt()
+                .unwrap(),
+        )
+        .unwrap();
+        fixture.materialization["source_segments"][0]["end_received_at_ns"] =
+            serde_json::json!(source_end_ns);
+        fixture.materialization["snapshot"]["source_segments"][0]["end_received_at_ns"] =
+            serde_json::json!(source_end_ns);
+        rewrite_features(&mut fixture, |row| {
+            if row.event_time == last_event_time {
+                row.label_available_time += ChronoDuration::nanoseconds(1);
+            }
+        });
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("feature label availability is outside the CEX replay snapshot"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -934,6 +985,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let feature_path = root.join("features.jsonl");
         let ingestion_time = Utc::now() - ChronoDuration::seconds(1);
+        let source_content_sha256 = "1".repeat(64);
+        let source_revision =
+            hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
         let rows = (0..160)
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);
@@ -945,7 +999,7 @@ mod tests {
                     symbol: "BTCUSDT".to_string(),
                     source_revisions: BTreeMap::from([(
                         "binance-usdm-lob".to_string(),
-                        "revision-1".to_string(),
+                        source_revision.clone(),
                     )]),
                     modalities: BTreeSet::from([DataModality::Lob]),
                     features: BTreeMap::from([
@@ -986,7 +1040,7 @@ mod tests {
                 hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
             ]),
             source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
-                content_sha256: "1".repeat(64),
+                content_sha256: source_content_sha256.clone(),
                 manifest_sha256: "2".repeat(64),
                 start_received_at_ns: source_start_ns,
                 end_received_at_ns: source_end_ns,
@@ -1011,10 +1065,10 @@ mod tests {
             "bucket_ms": 1000,
             "label_horizon_buckets": 5,
             "top_depth": 5,
-            "source_revision": "revision-1",
+            "source_revision": source_revision,
             "source_segments": [{
                 "path": "segment.jsonl.zst",
-                "sha256": "1".repeat(64),
+                "sha256": source_content_sha256,
                 "collector_manifest_path": "segment.jsonl.zst.manifest.json",
                 "collector_manifest_sha256": "2".repeat(64),
                 "success_marker_path": "segment.jsonl.zst._SUCCESS",

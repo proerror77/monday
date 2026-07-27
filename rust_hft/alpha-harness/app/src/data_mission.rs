@@ -3,8 +3,8 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use hft_collector::{
-    acquire_dataset, import_feature_dataset, read_feature_rows, DataAcquisitionMission,
-    DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+    acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
+    DataAcquisitionMission, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplaySnapshotV1, CEX_REPLAY_DATASET_KIND,
@@ -84,6 +84,35 @@ fn validate_cex_replay_features(
         || features.time_bounds.last_event_time != snapshot.last_event_time
     {
         bail!("feature time bounds do not match the CEX replay snapshot");
+    }
+    let last_label_available_ns = u64::try_from(
+        features
+            .time_bounds
+            .last_label_available_time
+            .timestamp_nanos_opt()
+            .context("feature label availability is out of range")?,
+    )
+    .context("feature label availability is out of range")?;
+    if last_label_available_ns
+        > snapshot
+            .source_segments
+            .last()
+            .expect("validated snapshot has source segments")
+            .end_received_at_ns
+    {
+        bail!("feature label availability is outside the CEX replay snapshot");
+    }
+    let source_key = format!("binance-{}-lob", snapshot.instrument_type);
+    let expected_source_revision = source_revision(
+        snapshot
+            .source_segments
+            .iter()
+            .map(|segment| segment.content_sha256.as_str()),
+    );
+    if features.source_revisions.len() != 1
+        || features.source_revisions.get(&source_key) != Some(&expected_source_revision)
+    {
+        bail!("feature source revision does not match the CEX replay snapshot");
     }
     let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
     if rows
