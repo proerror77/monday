@@ -2,9 +2,12 @@ use crate::{
     cli::{print_json, EngineChoice, LearnMissionArgs, MissionStatusArgs, RunMissionArgs},
     data_mission,
 };
-use alpha_domain::MissionStatus;
+use alpha_domain::{canonical_json_hash, MissionStatus, ResearchMission};
 use alpha_engine::{
-    engines::{GeneticProgrammingEngine, MctsEngine, OfflineRlEngine, OfflineTrace},
+    engines::{
+        CexMctsSearchIdentityV1, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
+        OfflineTrace,
+    },
     evaluation::prepare_dataset,
     formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
@@ -67,8 +70,17 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let dataset = prepare_dataset(rows, &protocol)?;
-    let proposal_engine = build_engine(args, &dataset)?;
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
+    let evaluator_config_hash =
+        canonical_json_hash(&evaluator.config_evidence().map_err(anyhow::Error::msg)?)?;
+    let evaluation_protocol_hash = protocol.content_hash()?;
+    let proposal_engine = build_engine(
+        args,
+        &dataset,
+        &mission,
+        &evaluation_protocol_hash,
+        &evaluator_config_hash,
+    )?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
         &args.mission_id,
@@ -140,6 +152,9 @@ pub fn execute_learning(
 fn build_engine(
     args: &RunMissionArgs,
     dataset: &alpha_engine::evaluation::PreparedDataset,
+    mission: &ResearchMission,
+    evaluation_protocol_hash: &str,
+    evaluator_config_hash: &str,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
     validate_live_mission_args(args)?;
     let fields = args
@@ -168,8 +183,21 @@ fn build_engine(
                 .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Mcts => Box::new(
-            MctsEngine::new_live(args.seed, primary.clone(), secondary, 1.414, 5)
+            MctsEngine::new_live_bound(
+                args.seed,
+                primary.clone(),
+                secondary,
+                1.414,
+                5,
+                CexMctsSearchIdentityV1::for_mission(
+                    mission,
+                    evaluation_protocol_hash.to_string(),
+                    evaluator_config_hash.to_string(),
+                    args.max_new_iterations,
+                )
                 .map_err(anyhow::Error::msg)?,
+            )
+            .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
         EngineChoice::OfflineRl => {
