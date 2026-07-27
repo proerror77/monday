@@ -521,6 +521,22 @@ impl PredictionMctsCheckpoint {
         }) {
             return Err("prediction MCTS baseline identity mismatch".to_string());
         }
+        let market_midpoint_only = self.config.component_profile
+            == SettlementProbabilityComponentProfile::MarketMidpointOnly;
+        if market_midpoint_only && !self.config.llm_advisor_sha256.is_empty() {
+            return Err("market-midpoint-only search does not accept LLM advice".to_string());
+        }
+        if market_midpoint_only
+            && (self.proposed > 1
+                || self.nodes.len() != 1
+                || self.seen_blends.len() != 1
+                || !self.nodes[0].children.is_empty()
+                || !self.nodes[0].unexpanded_actions.is_empty())
+        {
+            return Err(
+                "market-midpoint-only search evaluates only its canonical baseline".to_string(),
+            );
+        }
         validate_tree(&self.nodes, 0, self.config.max_depth)
             .map_err(|error| format!("invalid prediction MCTS tree: {error}"))?;
         for (node_id, node) in self.nodes.iter().enumerate() {
@@ -780,6 +796,11 @@ impl PredictionMctsEngine {
         if mission.search_budget.max_candidates == 0 {
             return Err("prediction MCTS requires a non-zero candidate budget".to_string());
         }
+        if component_profile == SettlementProbabilityComponentProfile::MarketMidpointOnly
+            && !llm_advice.is_empty()
+        {
+            return Err("market-midpoint-only search does not accept LLM advice".to_string());
+        }
         if !llm_advice.is_empty() && mission.search_budget.max_llm_calls == 0 {
             return Err("LLM advice requires a non-zero governed LLM-call budget".to_string());
         }
@@ -857,9 +878,13 @@ impl PredictionMctsEngine {
         }
         if self.checkpoint.config.component_profile
             == SettlementProbabilityComponentProfile::MarketMidpointOnly
-            && self.checkpoint.proposed == 0
         {
-            return Ok(self.mark_candidate_pending(0));
+            if self.checkpoint.proposed == 0 {
+                return Ok(self.mark_candidate_pending(0));
+            }
+            return Err(
+                "market-midpoint-only search evaluates only its canonical baseline".to_string(),
+            );
         }
         for _ in 0..256 {
             let parent = select_expandable(
@@ -1227,19 +1252,48 @@ mod tests {
             .observe(&candidate.candidate_id, &evaluation)
             .expect("observe canonical baseline");
         assert!(!engine.has_expandable_candidate().unwrap());
+        let before = engine.checkpoint().expect("observed baseline checkpoint");
+        let error = engine
+            .propose()
+            .expect_err("market-midpoint-only search must stop after its baseline");
+        assert!(error.contains("canonical baseline"), "{error}");
+        assert_eq!(engine.checkpoint().unwrap(), before);
+
+        let mut forged = before.clone();
+        forged.proposed = 2;
+        let error = engine
+            .restore_checkpoint(forged)
+            .expect_err("expanded midpoint-only checkpoint must fail closed");
+        assert!(error.contains("canonical baseline"), "{error}");
+        assert_eq!(engine.checkpoint().unwrap(), before);
+
+        let advisor = validate_single_proposal(market_midpoint_blend("advisor")).unwrap();
+        let mut forged = before.clone();
+        forged
+            .config
+            .llm_advisor_sha256
+            .push(blend_digest(&advisor));
+        forged.nodes[0]
+            .unexpanded_actions
+            .push(ExpansionAction::LlmAdvisor { blend: advisor });
+        let error = engine
+            .restore_checkpoint(forged)
+            .expect_err("midpoint-only checkpoint must reject LLM authority");
+        assert!(error.contains("does not accept LLM advice"), "{error}");
+        assert_eq!(engine.checkpoint().unwrap(), before);
 
         let error = PredictionMctsEngine::new_with_component_profile(
             &mission,
             market_midpoint_blend("baseline"),
-            vec![blend("invalid_advisor")],
+            vec![market_midpoint_blend("advisor")],
             7,
             1.4,
             3,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
         )
         .err()
-        .expect("unsupported advisor must fail");
-        assert!(error.contains("ineligible"));
+        .expect("market-midpoint-only profile must reject LLM advice");
+        assert!(error.contains("does not accept LLM advice"));
     }
 
     #[test]

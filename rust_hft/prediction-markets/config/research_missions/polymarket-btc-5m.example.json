@@ -15,7 +15,7 @@
   "horizon": "5m",
   "time_cohort_boundary_ms": 0,
   "prompt_snapshot_id": "sha256:2b55ba0e724dfc9f5a040911e397058a09c6229e42064e4998739d617b368dcb",
-  "search_policy_snapshot_id": "sha256:fb89448ee15a3d62d43a4a260b1bb8b4794b6ff9ca7ad93421a8cecd290325e3",
+  "search_policy_snapshot_id": "sha256:3375b087cdaf642916b8a4a99a0816a96200c2860fa042046a12b6741f59bbd3",
   "search_budget": {
     "max_candidates": 6,
     "max_llm_calls": 2,
