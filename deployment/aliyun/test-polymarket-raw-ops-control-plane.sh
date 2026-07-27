@@ -126,13 +126,17 @@ fi
 (
 release_manifest_verifier="$tmp_dir/verify-release-manifest.sh"
 sed -n \
+  -e '/^release_control_assets() {$/,/^}$/p' \
   -e '/^verify_release_manifest() {$/,/^}$/p' \
   -e '/^verify_release_binding() {$/,/^}$/p' \
   -e '/^verify_control_release() {$/,/^}$/p' "$GATE" \
   >"$release_manifest_verifier"
 readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 readonly RELEASE_MANIFEST="$tmp_dir/polymarket-raw-ops-release.json"
-readonly -a BUNDLE_ASSETS=(fixture-control)
+readonly -a BUNDLE_ASSETS=(
+  polymarket-raw-ops-shadow-gate.sh
+  candidate-only-control
+)
 secure_control_file() {
   [[ -f $1 && ! -L $1 ]]
 }
@@ -143,10 +147,21 @@ mkdir "$release_manifest_dir"
 release_manifest="$release_manifest_dir/polymarket-raw-ops-release.json"
 candidate_file="$release_manifest_dir/polymarket-raw-ops"
 printf 'verified candidate\n' >"$candidate_file"
-: >"$release_manifest_dir/fixture-control"
+cat >"$release_manifest_dir/polymarket-raw-ops-shadow-gate.sh" <<'EOF'
+readonly -a BUNDLE_ASSETS=(
+  polymarket-raw-ops-shadow-gate.sh
+  baseline-only-control
+)
+EOF
+: >"$release_manifest_dir/baseline-only-control"
 candidate_sha=$(sha256sum "$candidate_file" | awk '{print $1}')
 source_revision=$(printf 'b%.0s' {1..40})
-bundle_fixture_sha=$(printf 'c%.0s' {1..64})
+bundle_fixture_sha=$(
+  cd "$release_manifest_dir"
+  sha256sum polymarket-raw-ops-shadow-gate.sh baseline-only-control \
+    | sha256sum | awk '{print $1}'
+)
+installed_bundle_sha=$bundle_fixture_sha
 control_archive_sha=$(printf 'd%.0s' {1..64})
 jq -S -n \
   --arg candidate "$candidate_sha" \
@@ -182,12 +197,23 @@ if verify_control_release "$release_manifest_dir" "$(printf '0%.0s' {1..64})" \
   printf 'global controls accepted a different Rust baseline release\n' >&2
   exit 1
 fi
-rm "$release_manifest_dir/fixture-control"
+rm "$release_manifest_dir/baseline-only-control"
 if verify_control_release "$release_manifest_dir" "$candidate_sha" "$candidate_file"; then
   printf 'global controls accepted a missing bundled control asset\n' >&2
   exit 1
 fi
-: >"$release_manifest_dir/fixture-control"
+: >"$release_manifest_dir/baseline-only-control"
+cp "$release_manifest_dir/polymarket-raw-ops-shadow-gate.sh" \
+  "$release_manifest_dir/valid-shadow-gate.sh"
+printf '%s\n' 'readonly -a BUNDLE_ASSETS=(' \
+  '  polymarket-raw-ops-shadow-gate.sh' '  -option-like-control' ')' \
+  >"$release_manifest_dir/polymarket-raw-ops-shadow-gate.sh"
+if release_control_assets "$release_manifest_dir" >/dev/null; then
+  printf 'release control parser accepted an option-like asset name\n' >&2
+  exit 1
+fi
+mv "$release_manifest_dir/valid-shadow-gate.sh" \
+  "$release_manifest_dir/polymarket-raw-ops-shadow-gate.sh"
 if verify_release_binding "$release_manifest" "$(printf '0%.0s' {1..64})" \
   "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
   "$control_archive_sha" "$candidate_file"; then
@@ -215,7 +241,7 @@ if verify_release_binding "$release_manifest" "$release_manifest_sha" \
   printf 'release binding accepted a modified installed control bundle\n' >&2
   exit 1
 fi
-bundle_fixture_sha=$(printf 'c%.0s' {1..64})
+bundle_fixture_sha=$installed_bundle_sha
 jq '.extra = true' "$release_manifest" >"$release_manifest_dir/extra.json"
 if verify_release_manifest "$release_manifest_dir/extra.json"; then
   printf 'release manifest verifier accepted an extra identity field\n' >&2
@@ -289,7 +315,9 @@ cutover_target_contract=$(sed -n \
   exit 1
 }
 cutover_target_contract_file="$tmp_dir/cutover-target-preflight.sh"
-printf '%s\n' "$gate_cutover_target_contract" >"$cutover_target_contract_file"
+sed -n '/^release_control_assets() {$/,/^}$/p' "$GATE" \
+  >"$cutover_target_contract_file"
+printf '%s\n' "$gate_cutover_target_contract" >>"$cutover_target_contract_file"
 gate_cutover_target_line=$(grep -n '^verify_cutover_target_preflight ' "$GATE" \
   | cut -d: -f1)
 gate_shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" \
@@ -331,14 +359,36 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     polymarket-shadow-gate-policy.jq
   )
   drop_in_unit=
+  fragment_drift_unit=
+  insecure_unit_file=
+  unsafe_control_parent=false
   systemctl() {
-    [[ $1 == show && $2 == --property=DropInPaths && $3 == --value && $# -eq 4 ]] \
-      || return 64
-    [[ $4 != "$drop_in_unit" ]] || printf '%s\n' /run/systemd/system.control/stale.conf
+    [[ $1 == show && $3 == --value && $# -eq 4 ]] || return 64
+    case "$2" in
+      --property=DropInPaths)
+        [[ $4 != "$drop_in_unit" ]] \
+          || printf '%s\n' /run/systemd/system.control/stale.conf
+        ;;
+      --property=FragmentPath)
+        if [[ $4 == "$fragment_drift_unit" ]]; then
+          printf '/run/systemd/transient/%s\n' "$4"
+        else
+          printf '/etc/systemd/system/%s\n' "$4"
+        fi
+        ;;
+      *) return 64 ;;
+    esac
   }
   direct_directory() { [[ -d $1 && ! -L $1 ]]; }
   secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
-  secure_test_file() { [[ -f $1 && ! -L $1 ]]; }
+  secure_root_chain_or_absent() { [[ $unsafe_control_parent == false ]]; }
+  secure_test_file() {
+    if [[ $1 == /etc/systemd/system/* ]]; then
+      [[ ${1##*/} != "$insecure_unit_file" ]]
+    else
+      [[ -f $1 && ! -L $1 ]]
+    fi
+  }
   # shellcheck source=/dev/null
   source "$cutover_target_contract_file"
 
@@ -348,6 +398,15 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     printf 'cutover target preflight rejected clean legacy state\n' >&2
     exit 1
   }
+
+  unsafe_control_parent=true
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted an unsafe absent control parent\n' >&2
+    exit 1
+  fi
+  unsafe_control_parent=false
 
   mkdir "$control_dir"
   if verify_cutover_target_preflight \
@@ -364,15 +423,35 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     exit 1
   fi
 
-  for asset in "${BUNDLE_ASSETS[@]}" "$release_manifest_name"; do
-    : >"$control_dir/$asset"
-  done
+  printf '%s\n' 'readonly -a BUNDLE_ASSETS=(' \
+    '  polymarket-raw-ops-shadow-gate.sh' '  baseline-only-control' ')' \
+    >"$control_dir/polymarket-raw-ops-shadow-gate.sh"
+  : >"$control_dir/baseline-only-control"
+  : >"$control_dir/$release_manifest_name"
   verify_cutover_target_preflight \
     "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
     secure_test_file || {
     printf 'cutover target preflight rejected a complete global control directory\n' >&2
     exit 1
   }
+
+  fragment_drift_unit=polymarket-reference-upload.service
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted a noncanonical unit fragment\n' >&2
+    exit 1
+  fi
+  fragment_drift_unit=
+
+  insecure_unit_file=polymarket-reference-upload.timer
+  if verify_cutover_target_preflight \
+    "$baseline_mode" "$active_binary" "$control_dir" "$release_manifest_name" \
+    secure_test_file; then
+    printf 'cutover target preflight accepted an insecure unit file\n' >&2
+    exit 1
+  fi
+  insecure_unit_file=
 
   for drop_in_unit in polymarket-reference-collector.service \
     polymarket-reference-upload.service polymarket-reference-upload.timer \
@@ -402,6 +481,83 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
     exit 1
   }
 )
+
+# Rollback must preserve the baseline release's own control membership rather
+# than substituting the candidate script's BUNDLE_ASSETS.
+rollback_control_contract="$tmp_dir/rollback-control-files.sh"
+sed -n '/^rollback_control_files() {$/,/^}$/p' "$CUTOVER" \
+  >"$rollback_control_contract"
+sed -n '/^remove_snapshotted_control_files() {$/,/^}$/p' "$CUTOVER" \
+  >>"$rollback_control_contract"
+(
+  RELEASE_MANIFEST=/tmp/polymarket-raw-ops-release.json
+  # shellcheck source=/dev/null
+  source "$rollback_control_contract"
+  rollback_state="$tmp_dir/rollback-control-state.json"
+  jq -n '{control_files:["polymarket-raw-ops-shadow-gate.sh",
+      "baseline-only-control","polymarket-raw-ops-release.json"]}' \
+    >"$rollback_state"
+  [[ $(rollback_control_files "$rollback_state") == \
+      $'polymarket-raw-ops-shadow-gate.sh\nbaseline-only-control\npolymarket-raw-ops-release.json' ]] \
+    || {
+      printf 'rollback control list rejected release-specific baseline assets\n' >&2
+      exit 1
+    }
+  jq '.control_files[1] = "-option-like-control"' "$rollback_state" \
+    >"$rollback_state.invalid"
+  if rollback_control_files "$rollback_state.invalid" >/dev/null; then
+    printf 'rollback control list accepted an option-like asset\n' >&2
+    exit 1
+  fi
+  CONTROL_DIR=$tmp_dir/remove-control-files
+  mkdir "$CONTROL_DIR"
+  rm_calls=0
+  rm() {
+    rm_calls=$((rm_calls + 1))
+    [[ $rm_calls -ne 1 ]]
+  }
+  jq '.control_dir_present = true' "$rollback_state" >"$rollback_state.present"
+  if remove_snapshotted_control_files "$rollback_state.present"; then
+    printf 'control cleanup hid an earlier removal failure\n' >&2
+    exit 1
+  fi
+  [[ $rm_calls -eq 1 ]] || {
+    printf 'control cleanup continued after a removal failure\n' >&2
+    exit 1
+  }
+  rm_calls=0
+  if remove_snapshotted_control_files "$rollback_state"; then
+    printf 'control cleanup accepted a missing directory-state field\n' >&2
+    exit 1
+  fi
+  [[ $rm_calls -eq 0 ]] || {
+    printf 'control cleanup removed files with invalid directory state\n' >&2
+    exit 1
+  }
+  jq '.control_dir_present = false' "$rollback_state" >"$rollback_state.absent"
+  remove_snapshotted_control_files "$rollback_state.absent" || {
+    printf 'control cleanup rejected an explicitly absent control directory\n' >&2
+    exit 1
+  }
+  [[ $rm_calls -eq 0 ]] || {
+    printf 'control cleanup removed files for an absent control directory\n' >&2
+    exit 1
+  }
+  jq '.control_dir_present = "false"' "$rollback_state" >"$rollback_state.invalid-state"
+  rm_calls=0
+  if remove_snapshotted_control_files "$rollback_state.invalid-state"; then
+    printf 'control cleanup accepted a non-boolean directory-state field\n' >&2
+    exit 1
+  fi
+  [[ $rm_calls -eq 0 ]] || {
+    printf 'control cleanup removed files with a non-boolean directory state\n' >&2
+    exit 1
+  }
+)
+grep -Fq 'control_assets=$(release_control_assets "$CONTROL_DIR")' "$CUTOVER"
+grep -Fq 'remove_snapshotted_control_files "$rollback_dir/state.json"' "$CUTOVER"
+[[ $(grep -Fc 'control_files=$(rollback_control_files "$rollback_dir/state.json")' \
+  "$CUTOVER") -eq 1 ]]
 
 # Both controls must carry the same root-chain contract. Run it with deterministic
 # stat/direct-directory doubles so these macOS-hosted tests cover Linux ownership
@@ -1011,6 +1167,46 @@ set -e
   && -f $restore_guard_dir/rollback/state.json \
   && -f $restore_guard_dir/rollback/spool.keep ]] || {
   printf 'restore_legacy mutated runtime or deleted saved state before manifest lineage validation\n' >&2
+  exit 1
+}
+
+exercise_restore_control_list_guard() (
+  set +e
+  evidence_dir=$1
+  rollback_dir=$evidence_dir/rollback
+  mutation_log=$evidence_dir/mutation.log
+  mkdir -p "$rollback_dir/control"
+  printf 'legacy health policy\n' >"$rollback_dir/control/polymarket-legacy-health-policy.jq"
+  jq -n '{baseline_mode:"legacy_python",control_dir_present:true}' \
+    >"$rollback_dir/state.json"
+  (
+    cd "$rollback_dir"
+    sha256sum state.json control/polymarket-legacy-health-policy.jq >manifest.sha256
+  )
+  : >"$mutation_log"
+  secure_root_chain() { [[ -e $1 && ! -L $1 ]]; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$mutation_log"; return 0; }
+  rm() { printf 'rm %s\n' "$*" >>"$mutation_log"; return 0; }
+  die() {
+    printf 'restore control-list guard failed: %s\n' "$*" >&2
+    exit 1
+  }
+  # shellcheck source=/dev/null
+  source "$rollback_control_contract"
+  # shellcheck source=/dev/null
+  source "$restore_legacy_contract"
+  restore_legacy "$evidence_dir" >/dev/null 2>&1
+)
+restore_control_guard_dir="$tmp_dir/restore-control-list-guard"
+mkdir "$restore_control_guard_dir"
+set +e
+exercise_restore_control_list_guard "$restore_control_guard_dir"
+restore_control_guard_status=$?
+set -e
+[[ $restore_control_guard_status -ne 0 \
+  && ! -s $restore_control_guard_dir/mutation.log ]] || {
+  printf 'restore_legacy mutated runtime before validating rollback control membership\n' >&2
   exit 1
 }
 
