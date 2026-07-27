@@ -1803,10 +1803,8 @@ mod tests {
 
     #[test]
     fn experiment_manifest_requires_exactly_three_matching_typed_receipts() {
-        let output = std::env::temp_dir().join(format!(
-            "prediction-experiment-manifest-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let output = tempfile::tempdir().expect("create private experiment directory");
+        let output = output.path();
         let settlement = mission(PredictionTaskKind::SettlementProbability, None, None);
         let up = mission(
             PredictionTaskKind::UpExecution,
