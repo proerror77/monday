@@ -4,7 +4,7 @@ metadata:
   name: REPLACE_MISSION_JOB_NAME
   namespace: monday-research
   annotations:
-    research.monday/evaluator-version: purged-walk-forward-v3
+    research.monday/evaluator-version: purged-walk-forward-v4
   labels:
     app.kubernetes.io/name: monday-alpha-mission
     app.kubernetes.io/part-of: monday
@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       annotations:
-        research.monday/evaluator-version: purged-walk-forward-v3
+        research.monday/evaluator-version: purged-walk-forward-v4
       labels:
         app.kubernetes.io/name: monday-alpha-mission
         app.kubernetes.io/part-of: monday
