@@ -11,10 +11,10 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
-pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v3";
-pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v3";
-pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v2";
-pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v2";
+pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v4";
+pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v4";
+pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v3";
+pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v3";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 
@@ -107,17 +107,13 @@ pub struct EvaluationWalkForwardV1 {
 #[serde(deny_unknown_fields)]
 pub struct EvaluationCostsV1 {
     pub fee_bps: f64,
+    pub rebate_bps: f64,
     pub funding_bps: f64,
     pub latency_bps: f64,
-    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub slippage_bps: f64,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub cross_spread: bool,
-    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub position_notional_usd: f64,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub capacity_depth_levels: usize,
-    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub max_book_depth_fraction: f64,
 }
 
@@ -125,18 +121,6 @@ impl EvaluationCostsV1 {
     pub fn capacity_enabled(&self) -> bool {
         self.position_notional_usd > 0.0
     }
-}
-
-fn is_zero_f64(value: &f64) -> bool {
-    *value == 0.0
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +216,7 @@ impl EvaluationProtocolV1 {
             || schedule_end.is_none()
             || [
                 self.costs.fee_bps,
+                self.costs.rebate_bps,
                 self.costs.funding_bps,
                 self.costs.latency_bps,
                 self.costs.slippage_bps,
@@ -412,6 +397,8 @@ pub struct FoldEvaluationMetrics {
     pub fold_index: usize,
     pub row_count: usize,
     pub trade_count: usize,
+    #[serde(default)]
+    pub total_turnover: f64,
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
@@ -527,6 +514,8 @@ pub struct EvaluationMetrics {
     pub predictive: PredictiveMetrics,
     pub row_count: usize,
     pub trade_count: usize,
+    #[serde(default)]
+    pub total_turnover: f64,
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
@@ -563,7 +552,10 @@ impl CandidateEvaluation {
             && self.evaluation_protocol_hash.is_none()
             && matches!(
                 self.evaluator_version.as_str(),
-                WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                WALK_FORWARD_EVALUATOR_VERSION
+                    | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                    | "purged-walk-forward-v3"
+                    | "onnx-purged-walk-forward-v2"
             );
         self.validate_inner(legacy_unbound_walk_forward)
     }
@@ -587,6 +579,7 @@ impl CandidateEvaluation {
             self.metrics.net_sharpe,
             self.metrics.raw_score,
             self.metrics.adjusted_score,
+            self.metrics.total_turnover,
         ]
         .iter()
         .all(|value| value.is_finite())
@@ -597,12 +590,14 @@ impl CandidateEvaluation {
                     fold.max_drawdown,
                     fold.net_sharpe,
                     fold.raw_score,
+                    fold.total_turnover,
                 ]
                 .iter()
                 .all(|value| value.is_finite())
                     && fold.fold_index > 0
                     && fold.row_count > 0
                     && fold.trade_count <= fold.row_count
+                    && fold.total_turnover >= 0.0
                     && fold.max_drawdown >= 0.0
                     && fold
                         .max_book_depth_fraction
@@ -620,6 +615,12 @@ impl CandidateEvaluation {
             .iter()
             .try_fold(0_usize, |total, fold| total.checked_add(fold.trade_count))
             .ok_or(DomainError::InvalidEvaluationEvidence)?;
+        let total_turnover = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.total_turnover)
+            .sum::<f64>();
         let cumulative_net_return = self
             .metrics
             .folds
@@ -660,12 +661,14 @@ impl CandidateEvaluation {
             || !self.score.is_finite()
             || !finite_metrics
             || self.metrics.max_drawdown < 0.0
+            || self.metrics.total_turnover < 0.0
             || !self.metrics.predictive.valid_for(&self.metrics.folds)
             || self.metrics.predictive.row_count != self.metrics.row_count
             || self.score.to_bits() != self.metrics.adjusted_score.to_bits()
             || self.passed != self.failure_reasons.is_empty()
             || row_count != self.metrics.row_count
             || trade_count != self.metrics.trade_count
+            || !approximately_equal(total_turnover, self.metrics.total_turnover)
             || self
                 .metrics
                 .folds
@@ -2768,6 +2771,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps: 1.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,
@@ -2800,34 +2804,46 @@ mod tests {
     }
 
     #[test]
-    fn legacy_protocol_hash_is_stable_and_new_execution_costs_are_bound() {
+    fn execution_cost_assumptions_are_explicit_and_bound() {
         let protocol = evaluation_protocol();
-        let legacy_hash = protocol.content_hash().unwrap();
-        let legacy_json = serde_json::to_value(&protocol).unwrap();
-        assert!(legacy_json["costs"].get("slippage_bps").is_none());
-        assert!(legacy_json["costs"].get("cross_spread").is_none());
-        assert!(legacy_json["costs"].get("position_notional_usd").is_none());
-        assert!(legacy_json["costs"].get("capacity_depth_levels").is_none());
-        assert!(legacy_json["costs"]
-            .get("max_book_depth_fraction")
-            .is_none());
+        let original_hash = protocol.content_hash().unwrap();
+        let protocol_json = serde_json::to_value(&protocol).unwrap();
+        for field in [
+            "fee_bps",
+            "rebate_bps",
+            "funding_bps",
+            "latency_bps",
+            "slippage_bps",
+            "cross_spread",
+            "position_notional_usd",
+            "capacity_depth_levels",
+            "max_book_depth_fraction",
+        ] {
+            let mut incomplete = protocol_json.clone();
+            incomplete["costs"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<EvaluationProtocolV1>(incomplete).is_err());
+        }
 
-        let restored: EvaluationProtocolV1 = serde_json::from_value(legacy_json).unwrap();
-        assert_eq!(restored.content_hash().unwrap(), legacy_hash);
+        let restored: EvaluationProtocolV1 = serde_json::from_value(protocol_json).unwrap();
+        assert_eq!(restored.content_hash().unwrap(), original_hash);
 
         let mut with_slippage = restored.clone();
         with_slippage.costs.slippage_bps = 0.5;
-        assert_ne!(with_slippage.content_hash().unwrap(), legacy_hash);
+        assert_ne!(with_slippage.content_hash().unwrap(), original_hash);
+
+        let mut with_rebate = restored.clone();
+        with_rebate.costs.rebate_bps = 0.5;
+        assert_ne!(with_rebate.content_hash().unwrap(), original_hash);
 
         let mut with_spread_crossing = restored;
         with_spread_crossing.costs.cross_spread = true;
-        assert_ne!(with_spread_crossing.content_hash().unwrap(), legacy_hash);
+        assert_ne!(with_spread_crossing.content_hash().unwrap(), original_hash);
 
         let mut with_capacity = evaluation_protocol();
         with_capacity.costs.position_notional_usd = 10_000.0;
         with_capacity.costs.capacity_depth_levels = 5;
         with_capacity.costs.max_book_depth_fraction = 0.1;
-        assert_ne!(with_capacity.content_hash().unwrap(), legacy_hash);
+        assert_ne!(with_capacity.content_hash().unwrap(), original_hash);
     }
 
     #[test]
@@ -2878,6 +2894,7 @@ mod tests {
                 }]),
                 row_count: 30,
                 trade_count: 30,
+                total_turnover: 30.0,
                 mean_net_return: 0.001,
                 cumulative_net_return: 0.03,
                 max_drawdown: 0.01,
@@ -2888,6 +2905,7 @@ mod tests {
                     fold_index: 1,
                     row_count: 30,
                     trade_count: 30,
+                    total_turnover: 30.0,
                     mean_net_return: 0.001,
                     cumulative_net_return: 0.03,
                     max_drawdown: 0.01,
@@ -2951,6 +2969,7 @@ mod tests {
         ]);
         walk_forward.metrics.row_count = 60;
         walk_forward.metrics.trade_count = 60;
+        walk_forward.metrics.total_turnover = 60.0;
         walk_forward.metrics.cumulative_net_return = 0.06;
         walk_forward
             .evaluation_protocol
@@ -3115,15 +3134,15 @@ mod tests {
 
     #[test]
     fn evaluator_versions_identify_predictive_evidence() {
-        assert_eq!(WALK_FORWARD_EVALUATOR_VERSION, "purged-walk-forward-v3");
-        assert_eq!(SEALED_HOLDOUT_EVALUATOR_VERSION, "sealed-holdout-v3");
+        assert_eq!(WALK_FORWARD_EVALUATOR_VERSION, "purged-walk-forward-v4");
+        assert_eq!(SEALED_HOLDOUT_EVALUATOR_VERSION, "sealed-holdout-v4");
         assert_eq!(
             ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-            "onnx-purged-walk-forward-v2"
+            "onnx-purged-walk-forward-v3"
         );
         assert_eq!(
             ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-            "onnx-sealed-holdout-v2"
+            "onnx-sealed-holdout-v3"
         );
     }
 

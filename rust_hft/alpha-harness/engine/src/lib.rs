@@ -7,14 +7,15 @@ pub mod formula_evaluator;
 pub mod learning;
 pub mod llm;
 
+#[cfg(feature = "kernel")]
+use alpha_domain::{
+    canonical_json_hash, IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration,
+    SearchBudgetLimit,
+};
 use alpha_domain::{CandidateArtifact, EngineKind};
 pub use alpha_domain::{
     CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics, FoldPredictiveMetrics,
     PredictiveMetrics,
-};
-#[cfg(feature = "kernel")]
-use alpha_domain::{
-    IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration, SearchBudgetLimit,
 };
 #[cfg(feature = "kernel")]
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
@@ -409,6 +410,18 @@ where
                                 evaluation_id: evaluation_id.clone(),
                                 mission_id: mission_id.to_string(),
                                 candidate_id: proposal.candidate_id.clone(),
+                                dataset_manifest_id: mission
+                                    .dataset_manifest_id
+                                    .as_str()
+                                    .to_string(),
+                                evaluation_protocol_hash: result
+                                    .evaluation_protocol_hash
+                                    .clone()
+                                    .ok_or_else(|| {
+                                    EngineError::Evaluation(
+                                        "evaluation protocol binding is missing".to_string(),
+                                    )
+                                })?,
                                 payload: serde_json::to_value(&result)
                                     .map_err(|error| EngineError::Evaluation(error.to_string()))?,
                                 created_at,
@@ -609,9 +622,91 @@ fn historical_observations(
 }
 
 #[cfg(feature = "kernel")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvaluationCostsV1 {
+    fee_bps: f64,
+    funding_bps: f64,
+    latency_bps: f64,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    slippage_bps: f64,
+    #[serde(default, skip_serializing_if = "legacy_false")]
+    cross_spread: bool,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    position_notional_usd: f64,
+    #[serde(default, skip_serializing_if = "legacy_zero_usize")]
+    capacity_depth_levels: usize,
+    #[serde(default, skip_serializing_if = "legacy_zero_f64")]
+    max_book_depth_fraction: f64,
+}
+
+#[cfg(feature = "kernel")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvaluationProtocolV1 {
+    version: String,
+    walk_forward: alpha_domain::EvaluationWalkForwardV1,
+    costs: LegacyEvaluationCostsV1,
+    labels: alpha_domain::EvaluationLabelSpecV1,
+    metrics: alpha_domain::EvaluationMetricDefinitionsV1,
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_zero_f64(value: &f64) -> bool {
+    *value == 0.0
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_false(value: &bool) -> bool {
+    !*value
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+#[cfg(feature = "kernel")]
+fn legacy_protocol_hash(protocol: &serde_json::Value) -> Result<String, String> {
+    let protocol: LegacyEvaluationProtocolV1 =
+        serde_json::from_value(protocol.clone()).map_err(|error| error.to_string())?;
+    canonical_json_hash(&protocol).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "kernel")]
 fn historical_evaluation(payload: &serde_json::Value) -> Result<CandidateEvaluation, String> {
+    let evaluator_version = payload
+        .get("evaluator_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "historical evaluation version is missing".to_string())?;
+    let legacy_walk_forward = matches!(
+        evaluator_version,
+        "purged-walk-forward-v2"
+            | "purged-walk-forward-v3"
+            | "onnx-purged-walk-forward-v1"
+            | "onnx-purged-walk-forward-v2"
+    );
+    let mut replay_payload = payload.clone();
+    if legacy_walk_forward {
+        match (
+            payload.get("evaluation_protocol"),
+            payload
+                .get("evaluation_protocol_hash")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            (Some(protocol), Some(protocol_hash)) if !protocol.is_null() => {
+                if legacy_protocol_hash(protocol)? != protocol_hash {
+                    return Err("historical evaluation protocol hash mismatch".to_string());
+                }
+            }
+            (None | Some(serde_json::Value::Null), None) => {}
+            _ => return Err("historical evaluation protocol binding is incomplete".to_string()),
+        }
+        replay_payload["evaluation_protocol"] = serde_json::Value::Null;
+        replay_payload["evaluation_protocol_hash"] = serde_json::Value::Null;
+    }
     let evaluation: CandidateEvaluation =
-        serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
+        serde_json::from_value(replay_payload).map_err(|error| error.to_string())?;
     // These exact prior-release schemas may be replayed for search state only.
     let pre_predictive_schema = matches!(
         evaluation.evaluator_version.as_str(),
@@ -775,6 +870,7 @@ mod tests {
                     }]),
                     row_count: context.rows().len(),
                     trade_count: context.rows().len(),
+                    total_turnover: context.rows().len() as f64,
                     mean_net_return: 1.0,
                     cumulative_net_return: context.rows().len() as f64,
                     max_drawdown: 0.0,
@@ -785,6 +881,7 @@ mod tests {
                         fold_index: 1,
                         row_count: context.rows().len(),
                         trade_count: context.rows().len(),
+                        total_turnover: context.rows().len() as f64,
                         mean_net_return: 1.0,
                         cumulative_net_return: context.rows().len() as f64,
                         max_drawdown: 0.0,
@@ -794,6 +891,23 @@ mod tests {
                     }],
                 },
             })
+        }
+    }
+
+    struct SecondCandidatePassingEvaluator;
+
+    impl CandidateEvaluator for SecondCandidatePassingEvaluator {
+        fn evaluate(
+            &self,
+            proposal: &EngineProposal,
+            context: &EngineContext<'_>,
+        ) -> Result<CandidateEvaluation, String> {
+            let mut evaluation = PassingEvaluator.evaluate(proposal, context)?;
+            if !proposal.candidate_id.ends_with("-2") {
+                evaluation.passed = false;
+                evaluation.failure_reasons = vec!["fixture rejection".to_string()];
+            }
+            Ok(evaluation)
         }
     }
 
@@ -871,16 +985,30 @@ mod tests {
     }
 
     fn dataset_with_frequency(observation_frequency_millis: u64) -> PreparedDataset {
-        let start = Utc::now();
+        dataset_with_holdout_mutation(observation_frequency_millis, false)
+    }
+
+    fn dataset_with_holdout_mutation(
+        observation_frequency_millis: u64,
+        mutate_holdout: bool,
+    ) -> PreparedDataset {
+        let start = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let rows = (0..50)
-            .map(|index| ResearchRow {
-                available_time: start + Duration::seconds(index),
-                signal: index as f64,
-                features: std::collections::BTreeMap::new(),
-                label: index as f64 * 0.01,
-                fee_bps: 1.0,
-                funding_bps: 0.1,
-                latency_bps: 0.2,
+            .map(|index| {
+                let direction = if mutate_holdout && index >= 40 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                ResearchRow {
+                    available_time: start + Duration::seconds(index),
+                    signal: direction * index as f64,
+                    features: std::collections::BTreeMap::new(),
+                    label: direction * index as f64 * 0.01,
+                    fee_bps: 1.0,
+                    funding_bps: 0.1,
+                    latency_bps: 0.2,
+                }
             })
             .collect();
         prepare_dataset(
@@ -896,6 +1024,7 @@ mod tests {
                 },
                 EvaluationCostsV1 {
                     fee_bps: 1.0,
+                    rebate_bps: 0.0,
                     funding_bps: 0.1,
                     latency_bps: 0.2,
                     slippage_bps: 0.0,
@@ -910,7 +1039,6 @@ mod tests {
                 },
             )
             .unwrap(),
-            "holdout-1",
         )
         .unwrap()
     }
@@ -947,6 +1075,7 @@ mod tests {
                 },
                 EvaluationCostsV1 {
                     fee_bps: 0.0,
+                    rebate_bps: 0.0,
                     funding_bps: 0.0,
                     latency_bps: 0.0,
                     slippage_bps: 0.0,
@@ -961,7 +1090,6 @@ mod tests {
                 },
             )
             .unwrap(),
-            "live-contract-holdout",
         )
         .unwrap()
     }
@@ -997,23 +1125,78 @@ mod tests {
 
         let mut legacy = malformed_current;
         legacy["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        legacy["evaluation_protocol"] = serde_json::Value::Null;
+        legacy["evaluation_protocol_hash"] = serde_json::Value::Null;
         let restored = historical_evaluation(&legacy).unwrap();
         assert_eq!(restored.score, evaluation.score);
         assert!(restored.metrics.net_sharpe.is_nan());
         assert!(restored.validate().is_err());
 
-        let mut unbound_v3 = evaluation;
-        unbound_v3.evaluator_version = alpha_domain::WALK_FORWARD_EVALUATOR_VERSION.to_string();
-        unbound_v3.evaluator_config =
+        let mut unbound_current = evaluation;
+        unbound_current.evaluator_version =
+            alpha_domain::WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        unbound_current.evaluator_config =
             serde_json::to_value(alpha_domain::FormulaEvaluatorConfig::for_trials(1).unwrap())
                 .unwrap();
-        unbound_v3.evaluation_protocol = None;
-        unbound_v3.evaluation_protocol_hash = None;
-        unbound_v3.passed = false;
-        unbound_v3.failure_reasons = vec!["legacy walk-forward evidence".to_string()];
-        let restored = historical_evaluation(&serde_json::to_value(&unbound_v3).unwrap()).unwrap();
+        unbound_current.evaluation_protocol = None;
+        unbound_current.evaluation_protocol_hash = None;
+        unbound_current.passed = false;
+        unbound_current.failure_reasons = vec!["legacy walk-forward evidence".to_string()];
+        let restored =
+            historical_evaluation(&serde_json::to_value(&unbound_current).unwrap()).unwrap();
         assert!(restored.validate().is_err());
         assert!(restored.validate_for_historical_search_replay().is_ok());
+    }
+
+    #[test]
+    fn previous_walk_forward_cost_schema_replays_after_raw_hash_validation() {
+        let input = dataset();
+        let proposal = EngineProposal {
+            candidate_id: "candidate-1".to_string(),
+            hypothesis: "fixture".to_string(),
+            artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+            expansions: 1,
+            tokens: 0,
+            elapsed_ms: 1,
+        };
+        let mut evaluation = PassingEvaluator
+            .evaluate(&proposal, &input.engine_context())
+            .unwrap();
+        evaluation.evaluator_version = "purged-walk-forward-v3".to_string();
+        let mut legacy = serde_json::to_value(evaluation).unwrap();
+        for field in [
+            "rebate_bps",
+            "slippage_bps",
+            "cross_spread",
+            "position_notional_usd",
+            "capacity_depth_levels",
+            "max_book_depth_fraction",
+        ] {
+            legacy["evaluation_protocol"]["costs"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        legacy["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_turnover");
+        for fold in legacy["metrics"]["folds"].as_array_mut().unwrap() {
+            fold.as_object_mut().unwrap().remove("total_turnover");
+        }
+        legacy["evaluation_protocol_hash"] =
+            serde_json::json!(legacy_protocol_hash(&legacy["evaluation_protocol"]).unwrap());
+
+        let restored = historical_evaluation(&legacy).unwrap();
+        assert_eq!(restored.evaluator_version, "purged-walk-forward-v3");
+        assert!(restored.evaluation_protocol.is_none());
+        assert!(restored.evaluation_protocol_hash.is_none());
+        assert_eq!(restored.metrics.total_turnover, 0.0);
+
+        legacy["evaluation_protocol"]["costs"]["fee_bps"] = serde_json::json!(2.0);
+        assert!(historical_evaluation(&legacy)
+            .unwrap_err()
+            .contains("protocol hash mismatch"));
     }
 
     #[test]
@@ -1056,11 +1239,77 @@ mod tests {
     }
 
     #[test]
-    fn resume_replays_unbound_v3_history_without_making_it_governance_evidence() {
+    fn holdout_mutation_cannot_change_kernel_comparison_or_selection() {
+        fn run(dataset: &PreparedDataset) -> (MissionLineage, RunCheckpoint) {
+            let mut store = AlphaStore::open_in_memory().unwrap();
+            let mut research_mission = mission();
+            research_mission.completion_policy.min_kept_candidates = 1;
+            store.create_mission(&research_mission).unwrap();
+            let mut kernel = AutoResearchKernel::new(
+                &mut store,
+                CountingEngine {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    crash: false,
+                },
+                SecondCandidatePassingEvaluator,
+            );
+            kernel
+                .run("mission-1", dataset, RunControl::default())
+                .unwrap();
+            (
+                store.mission_lineage("mission-1").unwrap(),
+                store.get_checkpoint("mission-1").unwrap(),
+            )
+        }
+
+        let (original, original_checkpoint) = run(&dataset_with_holdout_mutation(1_000, false));
+        let (mutated, mutated_checkpoint) = run(&dataset_with_holdout_mutation(1_000, true));
+        let stable_lineage = |lineage: &MissionLineage| {
+            (
+                lineage
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.candidate_id.clone(), candidate.artifact.clone()))
+                    .collect::<Vec<_>>(),
+                lineage
+                    .evaluations
+                    .iter()
+                    .map(|evaluation| evaluation.record.payload.clone())
+                    .collect::<Vec<_>>(),
+                lineage
+                    .iterations
+                    .iter()
+                    .map(|iteration| {
+                        (
+                            iteration.verdict.clone(),
+                            iteration.candidate_artifact_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(stable_lineage(&original), stable_lineage(&mutated));
+        assert_eq!(
+            original_checkpoint.engine_state,
+            mutated_checkpoint.engine_state
+        );
+        assert_eq!(
+            original
+                .iterations
+                .iter()
+                .find(|iteration| iteration.verdict == IterationVerdict::Keep)
+                .and_then(|iteration| iteration.candidate_artifact_id.as_deref()),
+            Some("mission-1-candidate-2")
+        );
+    }
+
+    #[test]
+    fn resume_replays_unbound_current_history_without_making_it_governance_evidence() {
         let input = dataset();
         let proposal = EngineProposal {
             candidate_id: "mission-1-candidate-0".to_string(),
-            hypothesis: "legacy v3 fixture".to_string(),
+            hypothesis: "legacy current-version fixture".to_string(),
             artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
             expansions: 1,
             tokens: 0,
@@ -1108,6 +1357,8 @@ mod tests {
             evaluation_id: "mission-1-evaluation-0".to_string(),
             mission_id: "mission-1".to_string(),
             candidate_id: proposal.candidate_id.clone(),
+            dataset_manifest_id: String::new(),
+            evaluation_protocol_hash: String::new(),
             payload: serde_json::to_value(&legacy).unwrap(),
             created_at,
         };

@@ -66,11 +66,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
     )?;
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
-    let dataset = prepare_dataset(
-        rows,
-        &protocol,
-        format!("sealed:{}", manifest.manifest_id()),
-    )?;
+    let dataset = prepare_dataset(rows, &protocol)?;
     let proposal_engine = build_engine(args, &dataset)?;
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
@@ -317,6 +313,7 @@ mod tests {
                             embargo_rows: 0,
                             sealed_holdout_rows: 30,
                             fee_bps: 1.0,
+                            rebate_bps: 0.0,
                             funding_bps: 0.0,
                             latency_bps: 0.5,
                             slippage_bps: 0.0,

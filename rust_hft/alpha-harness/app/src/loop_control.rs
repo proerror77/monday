@@ -291,7 +291,7 @@ fn progress_completed_mission(
         LoopStage::WalkForwardKept,
         LoopStageStatus::Completed,
         format!(
-            "{research_reason}; canonical v3 walk-forward candidates: {}",
+            "{research_reason}; canonical walk-forward candidates: {}",
             walk_forward_candidates.join(",")
         ),
     )?;
@@ -862,6 +862,7 @@ mod tests {
                         embargo_rows: 0,
                         sealed_holdout_rows: 30,
                         fee_bps: 1.0,
+                        rebate_bps: 0.0,
                         funding_bps: 0.0,
                         latency_bps: 0.5,
                         slippage_bps: 0.0,
@@ -895,6 +896,7 @@ mod tests {
                 fold_index,
                 row_count: 30,
                 trade_count: 30,
+                total_turnover: 30.0,
                 mean_net_return: 0.001,
                 cumulative_net_return: 0.03,
                 max_drawdown: 0.01,
@@ -924,6 +926,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps: 1.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,
@@ -951,6 +954,7 @@ mod tests {
                 predictive,
                 row_count: 30 * fold_count,
                 trade_count: 30 * fold_count,
+                total_turnover: 30.0 * fold_count as f64,
                 mean_net_return: 0.001,
                 cumulative_net_return: 0.03 * fold_count as f64,
                 max_drawdown: 0.01,
@@ -1035,6 +1039,8 @@ mod tests {
             evaluation_id,
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
+            dataset_manifest_id: mission.dataset_manifest_id.as_str().to_string(),
+            evaluation_protocol_hash: evaluation.evaluation_protocol_hash.clone().unwrap(),
             payload: serde_json::to_value(evaluation).unwrap(),
             created_at: now,
         };
@@ -1367,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sealed_record_is_not_reported_as_an_idempotent_v3_evaluation() {
+    fn legacy_sealed_record_is_not_reported_as_an_idempotent_current_evaluation() {
         let db = temp_db_path("alpha-loop-legacy-sealed");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-1";
@@ -1592,6 +1598,7 @@ mod tests {
                 embargo_rows: 1,
                 sealed_holdout_rows: 96,
                 fee_bps: 0.0,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
                 slippage_bps: 0.0,
@@ -1613,7 +1620,6 @@ mod tests {
                     observation_frequency_millis: 60_000,
                 })
                 .unwrap(),
-            format!("sealed:{}", manifest.manifest_id),
         )
         .unwrap();
         let walk_forward_evaluation =
@@ -1651,6 +1657,11 @@ mod tests {
             evaluation_id,
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
+            dataset_manifest_id: research_mission.dataset_manifest_id.as_str().to_string(),
+            evaluation_protocol_hash: walk_forward_evaluation
+                .evaluation_protocol_hash
+                .clone()
+                .unwrap(),
             payload: serde_json::to_value(walk_forward_evaluation).unwrap(),
             created_at: now,
         };

@@ -30,9 +30,10 @@ impl PredictiveGateResult {
         signals: &[f64],
         range: std::ops::Range<usize>,
         costs: &EvaluationCostsV1,
-    ) -> (Vec<f64>, usize, Option<f64>) {
+    ) -> (Vec<f64>, usize, f64, Option<f64>) {
         let mut previous_position = 0.0;
         let mut trade_count = 0;
+        let mut total_turnover = 0.0;
         let capacity_features = costs.capacity_enabled().then(|| {
             (
                 format!("bid_depth_top{}", costs.capacity_depth_levels),
@@ -45,6 +46,7 @@ impl PredictiveGateResult {
                 let position = signal_position(signals[index]);
                 let position_change = position - previous_position;
                 let turnover = position_change.abs();
+                total_turnover += turnover;
                 if turnover > f64::EPSILON {
                     trade_count += 1;
                 }
@@ -70,7 +72,7 @@ impl PredictiveGateResult {
                             .max(costs.position_notional_usd * turnover / depth_notional);
                     }
                 }
-                let transaction_cost = (row.fee_bps.max(0.0)
+                let transaction_cost = (row.fee_bps.max(0.0) - costs.rebate_bps
                     + row.latency_bps.max(0.0)
                     + costs.slippage_bps
                     + spread_crossing_bps)
@@ -80,7 +82,12 @@ impl PredictiveGateResult {
                 position * row.label - transaction_cost - funding_cost
             })
             .collect();
-        (returns, trade_count, max_book_depth_fraction)
+        (
+            returns,
+            trade_count,
+            total_turnover,
+            max_book_depth_fraction,
+        )
     }
 }
 
@@ -294,7 +301,7 @@ impl FormulaEvaluator {
         let mut fold_metrics = Vec::with_capacity(ranges.len());
         let mut all_returns = Vec::new();
         for (fold_index, range) in ranges.into_iter().enumerate() {
-            let (returns, trade_count, max_book_depth_fraction) = predictive_stage
+            let (returns, trade_count, total_turnover, max_book_depth_fraction) = predictive_stage
                 .map_positions_to_net_returns(rows, signals, range, &protocol.costs);
             let mean = mean(&returns);
             let net_sharpe = sharpe_ratio(&returns, mean);
@@ -339,6 +346,7 @@ impl FormulaEvaluator {
                 fold_index: fold_index + 1,
                 row_count: returns.len(),
                 trade_count,
+                total_turnover,
                 mean_net_return: mean,
                 cumulative_net_return: returns.iter().sum(),
                 max_drawdown,
@@ -372,6 +380,7 @@ impl FormulaEvaluator {
             predictive,
             row_count: all_returns.len(),
             trade_count: fold_metrics.iter().map(|fold| fold.trade_count).sum(),
+            total_turnover: fold_metrics.iter().map(|fold| fold.total_turnover).sum(),
             mean_net_return: mean(&all_returns),
             cumulative_net_return: all_returns.iter().sum(),
             max_drawdown: fold_metrics
@@ -782,6 +791,7 @@ mod tests {
             },
             EvaluationCostsV1 {
                 fee_bps,
+                rebate_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
                 slippage_bps: 0.0,
@@ -799,7 +809,7 @@ mod tests {
     }
 
     fn dataset(fee_bps: f64) -> PreparedDataset {
-        prepare_dataset(rows(fee_bps), &protocol(fee_bps, 3), "sealed-1").unwrap()
+        prepare_dataset(rows(fee_bps), &protocol(fee_bps, 3)).unwrap()
     }
 
     #[test]
@@ -889,6 +899,7 @@ mod tests {
         let signals = input.iter().map(|row| row.signal).collect::<Vec<_>>();
         let costs = EvaluationCostsV1 {
             fee_bps: 2.0,
+            rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.5,
             slippage_bps: 0.75,
@@ -906,12 +917,57 @@ mod tests {
                 WALK_FORWARD_EVALUATOR_VERSION,
             );
 
-        let (net_returns, trade_count, max_book_depth_fraction) =
+        let (net_returns, trade_count, _, max_book_depth_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 3);
         assert_eq!(max_book_depth_fraction, None);
         assert!((net_returns.iter().sum::<f64>() - 0.028325).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn walk_forward_evidence_reports_rebate_adjusted_return_and_turnover() {
+        let mut evaluation_protocol = protocol(2.0, 1);
+        evaluation_protocol.costs.rebate_bps = 1.0;
+        let dataset = prepare_dataset(rows(2.0), &evaluation_protocol).unwrap();
+        let evaluation = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .evaluate(
+                &proposal(FactorAst::Terminal(FactorTerminal::Field(
+                    "book_imbalance".to_string(),
+                ))),
+                &dataset.engine_context(),
+            )
+            .unwrap();
+
+        assert_eq!(evaluation.metrics.total_turnover, 127.0);
+        assert_eq!(evaluation.metrics.folds[0].total_turnover, 127.0);
+        assert!((evaluation.metrics.cumulative_net_return - 0.6273).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn walk_forward_evidence_ignores_holdout_mutations() {
+        let evaluation_protocol = protocol(0.0, 3);
+        let original = dataset(0.0);
+        let mut mutated_rows = rows(0.0);
+        for row in &mut mutated_rows[436..] {
+            row.features.insert("book_imbalance".to_string(), 0.0);
+            row.label = -row.label;
+        }
+        let mutated = prepare_dataset(mutated_rows, &evaluation_protocol).unwrap();
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let candidate = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "book_imbalance".to_string(),
+        )));
+
+        assert_eq!(
+            evaluator
+                .evaluate(&candidate, &original.engine_context())
+                .unwrap(),
+            evaluator
+                .evaluate(&candidate, &mutated.engine_context())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -924,6 +980,7 @@ mod tests {
         let signals = vec![-1.0, 1.0, 1.0];
         let costs = EvaluationCostsV1 {
             fee_bps: 2.0,
+            rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.5,
             slippage_bps: 0.0,
@@ -941,7 +998,7 @@ mod tests {
                 WALK_FORWARD_EVALUATOR_VERSION,
             );
 
-        let (net_returns, trade_count, _) =
+        let (net_returns, trade_count, _, _) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 2);
@@ -961,6 +1018,7 @@ mod tests {
         let signals = input.iter().map(|row| row.signal).collect::<Vec<_>>();
         let costs = EvaluationCostsV1 {
             fee_bps: 0.0,
+            rebate_bps: 0.0,
             funding_bps: 0.0,
             latency_bps: 0.0,
             slippage_bps: 0.0,
@@ -978,7 +1036,7 @@ mod tests {
                 WALK_FORWARD_EVALUATOR_VERSION,
             );
 
-        let (_, trade_count, max_fraction) =
+        let (_, trade_count, _, max_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 3);
@@ -997,7 +1055,7 @@ mod tests {
         protocol.costs.position_notional_usd = 10_000.0;
         protocol.costs.capacity_depth_levels = 5;
         protocol.costs.max_book_depth_fraction = 0.1;
-        let dataset = prepare_dataset(input, &protocol, "capacity-bound").unwrap();
+        let dataset = prepare_dataset(input, &protocol).unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
 
         let result = evaluator
@@ -1031,7 +1089,7 @@ mod tests {
 
     #[test]
     fn single_fold_walk_forward_records_missing_icir_as_a_failed_evaluation() {
-        let input = prepare_dataset(rows(0.0), &protocol(0.0, 1), "single-fold").unwrap();
+        let input = prepare_dataset(rows(0.0), &protocol(0.0, 1)).unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let result = evaluator
             .evaluate(
@@ -1108,7 +1166,7 @@ mod tests {
         for row in &mut rows {
             row.features.insert("lob_imbalance".to_string(), row.signal);
         }
-        let dataset = prepare_dataset(rows, &protocol(0.0, 3), "sealed-1").unwrap();
+        let dataset = prepare_dataset(rows, &protocol(0.0, 3)).unwrap();
 
         assert_eq!(
             evaluator
@@ -1193,7 +1251,7 @@ mod tests {
         let mut input = rows(0.0);
         let holdout_loss = input.len() - 32;
         input[holdout_loss].label = -0.5 * input[holdout_loss].signal.signum();
-        let dataset = prepare_dataset(input, &protocol(0.0, 3), "sealed-drawdown").unwrap();
+        let dataset = prepare_dataset(input, &protocol(0.0, 3)).unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
             "book_imbalance".to_string(),

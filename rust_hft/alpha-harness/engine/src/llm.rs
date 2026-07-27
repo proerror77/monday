@@ -341,7 +341,6 @@ struct LlmPromptContext {
     prompt_snapshot_id: Option<String>,
     row_count: usize,
     fold_count: usize,
-    sealed_holdout_id: String,
     registered_feature_fields: Vec<String>,
 }
 
@@ -375,7 +374,6 @@ impl LlmPromptContext {
             prompt_snapshot_id: context.prompt_snapshot_id().map(str::to_string),
             row_count: context.row_count(),
             fold_count: context.fold_count(),
-            sealed_holdout_id: context.sealed_holdout_id().to_string(),
             registered_feature_fields: allowed_fields.iter().cloned().collect(),
         })
     }
@@ -590,7 +588,6 @@ mod tests {
             prompt_snapshot_id: Some("research-context-sha256".to_string()),
             row_count: 1_000,
             fold_count: 4,
-            sealed_holdout_id: "sealed-events-v1".to_string(),
             registered_feature_fields: vec!["order_book_imbalance".to_string()],
         };
         let prior_outcomes = vec![LlmProposalOutcome {
