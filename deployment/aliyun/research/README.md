@@ -300,7 +300,7 @@ terminal state.
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that
 SHA-256 and `unzip -t`. For a continuous Mission, confirm every walk-forward
-record reports `purged-walk-forward-v3`; a complete result may legitimately
+record reports `purged-walk-forward-v4`; a complete result may legitimately
 contain zero sealed evaluations when no candidate passes. For a prediction
 Mission, confirm `artifacts/execution-evidence.json` reports lane
 `prediction_market`, the submitted mission and snapshot SHA-256 values, and the
