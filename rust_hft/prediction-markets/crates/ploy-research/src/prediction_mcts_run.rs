@@ -622,6 +622,8 @@ pub(crate) fn task_output_dir(
 pub(crate) struct PredictionMctsSelectionEvidence {
     pub held_out_complete: bool,
     pub immutable_image_identity: Option<String>,
+    pub checkpoint_sha256: String,
+    pub selected_candidate_sha256: String,
 }
 
 pub(crate) fn authenticated_selection_evidence(
@@ -634,9 +636,10 @@ pub(crate) fn authenticated_selection_evidence(
         return Err("prediction MCTS selection identity mismatch".to_string());
     }
     let current_artifact = state.read_only_artifact()?;
-    if state.selected.is_none() {
-        return Err("held-out view is unavailable before candidate selection".to_string());
-    }
+    let selected = state
+        .selected
+        .as_ref()
+        .ok_or_else(|| "held-out view is unavailable before candidate selection".to_string())?;
     let checkpoint = state.checkpoint_artifact.as_ref().ok_or_else(|| {
         "held-out view is unavailable before the selection checkpoint is durable".to_string()
     })?;
@@ -647,6 +650,11 @@ pub(crate) fn authenticated_selection_evidence(
     Ok(PredictionMctsSelectionEvidence {
         held_out_complete: state.held_out_complete,
         immutable_image_identity: state.immutable_image_identity,
+        checkpoint_sha256: format!("sha256:{}", checkpoint.sha256),
+        selected_candidate_sha256: format!(
+            "sha256:{}",
+            sha256_hex(&canonical_json_bytes(selected)?)
+        ),
     })
 }
 
@@ -766,8 +774,8 @@ mod tests {
         PredictionSearchBudget, ProposalCallOutput, PREDICTION_LOOP_TARGET,
         PREDICTION_MISSION_SCHEMA_VERSION,
     };
-    use crate::prediction_loop_fs::sha256_hex;
-    use crate::prediction_mcts::PredictionMctsIdentity;
+    use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
+    use crate::prediction_mcts::{PredictionMctsCandidate, PredictionMctsIdentity};
     use crate::prediction_mission_v3::{
         AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionAuthorityProfile,
         PredictionProductIdentity, PredictionProductSymbol, PredictionRunMode,
@@ -1422,6 +1430,46 @@ mod tests {
         let error = authenticated_selection_evidence(&output, &identity)
             .expect_err("selection must match the durable checkpoint artifact");
         assert!(error.contains("selection checkpoint"));
+    }
+
+    #[test]
+    fn selection_evidence_binds_the_current_checkpoint_and_selected_candidate() {
+        let output = temp_dir("selection-evidence-digests");
+        let configured = mission(1, 1);
+        let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            configured,
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("completed run");
+
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("prediction-mcts-state.json")).unwrap(),
+        )
+        .unwrap();
+        let selected: PredictionMctsCandidate =
+            serde_json::from_value(state["selected"].clone()).unwrap();
+        let evidence = authenticated_selection_evidence(&output, &identity).unwrap();
+
+        assert_eq!(
+            evidence.checkpoint_sha256,
+            format!(
+                "sha256:{}",
+                state["checkpoint_artifact"]["sha256"].as_str().unwrap()
+            )
+        );
+        assert_eq!(
+            evidence.selected_candidate_sha256,
+            format!(
+                "sha256:{}",
+                sha256_hex(&canonical_json_bytes(&selected).unwrap())
+            )
+        );
     }
 
     #[test]
