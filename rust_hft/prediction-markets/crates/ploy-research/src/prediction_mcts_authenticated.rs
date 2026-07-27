@@ -1839,32 +1839,32 @@ mod tests {
         let error = result_receipt(&settlement, up_metrics.clone())
             .expect_err("settlement receipt must reject execution metrics");
         assert!(error.contains("metrics do not match"));
-        let settlement_ref = write_test_receipt(&output, &settlement, settlement_metrics.clone());
-        let up_ref = write_test_receipt(&output, &up, up_metrics);
-        let down_ref = write_test_receipt(&output, &down, down_metrics.clone());
+        let settlement_ref = write_test_receipt(output, &settlement, settlement_metrics.clone());
+        let up_ref = write_test_receipt(output, &up, up_metrics);
+        let down_ref = write_test_receipt(output, &down, down_metrics.clone());
 
         assert!(settlement_ref.path().contains("/settlement/"));
         assert!(up_ref.path().contains("/up-execution-10s/"));
         assert!(down_ref.path().contains("/down-execution-10s/"));
 
         assert!(write_authenticated_prediction_experiment_manifest(
-            &output,
+            output,
             &[settlement_ref.clone(), up_ref.clone()]
         )
         .is_err());
         assert!(write_authenticated_prediction_experiment_manifest(
-            &output,
+            output,
             &[settlement_ref.clone(), up_ref.clone(), up_ref.clone()]
         )
         .is_err());
 
         let manifest_ref = write_authenticated_prediction_experiment_manifest(
-            &output,
+            output,
             &[down_ref.clone(), settlement_ref.clone(), up_ref.clone()],
         )
         .expect("exact-three manifest");
         let manifest =
-            read_authenticated_prediction_experiment_manifest(&output, &manifest_ref).unwrap();
+            read_authenticated_prediction_experiment_manifest(output, &manifest_ref).unwrap();
         assert_eq!(manifest.settlement, settlement_ref);
         assert_eq!(manifest.up_execution, up_ref);
         assert_eq!(manifest.down_execution, down_ref);
@@ -1877,11 +1877,11 @@ mod tests {
         };
         metrics.mean_brier_score += 0.01;
         let changed_settlement_ref =
-            write_test_receipt(&output, &settlement, changed_settlement_metrics);
+            write_test_receipt(output, &settlement, changed_settlement_metrics);
         let changed_receipt =
-            read_authenticated_prediction_result_receipt(&output, &changed_settlement_ref).unwrap();
+            read_authenticated_prediction_result_receipt(output, &changed_settlement_ref).unwrap();
         let original_receipt =
-            read_authenticated_prediction_result_receipt(&output, &manifest.settlement).unwrap();
+            read_authenticated_prediction_result_receipt(output, &manifest.settlement).unwrap();
         assert_eq!(
             original_receipt.mission_sha256,
             crate::prediction_mission_v3::prediction_mission_v3_sha256(&settlement).unwrap()
@@ -1900,7 +1900,7 @@ mod tests {
         );
         assert_ne!(changed_receipt.sha256, original_receipt.sha256);
         let changed_manifest_ref = write_authenticated_prediction_experiment_manifest(
-            &output,
+            output,
             &[
                 changed_settlement_ref,
                 manifest.up_execution,
@@ -1918,16 +1918,16 @@ mod tests {
             unreachable!()
         };
         metrics.joint_state_sha256 = format!("sha256:{}", "9".repeat(64));
-        let drifted_down_ref = write_test_receipt(&output, &down, drifted_down_metrics);
+        let drifted_down_ref = write_test_receipt(output, &down, drifted_down_metrics);
         let error = write_authenticated_prediction_experiment_manifest(
-            &output,
+            output,
             &[settlement_ref, up_ref.clone(), drifted_down_ref],
         )
         .expect_err("Up and Down must bind the same joint state");
         assert!(error.contains("joint state"));
 
         std::fs::write(output.join(up_ref.path()), b"{}\n").unwrap();
-        assert!(read_authenticated_prediction_experiment_manifest(&output, &manifest_ref).is_err());
+        assert!(read_authenticated_prediction_experiment_manifest(output, &manifest_ref).is_err());
     }
 
     fn mission(
