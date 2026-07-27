@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_profile_selects_when_the_tree_exhausts_before_the_budget() {
+    fn reduced_profile_selects_its_only_canonical_candidate() {
         let output = temp_dir("reduced-profile-tree-exhaustion");
         let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
@@ -1393,7 +1393,8 @@ mod tests {
         .expect("tree exhaustion selects the best evaluated candidate");
 
         assert_eq!(evaluator.calls.last().map(String::as_str), Some("held_out"));
-        assert_eq!(evaluator.candidate_ids.len(), 4);
+        assert_eq!(evaluator.candidate_ids.len(), 2);
+        assert_eq!(evaluator.candidate_ids[0], evaluator.candidate_ids[1]);
     }
 
     #[test]
