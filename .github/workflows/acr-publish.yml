@@ -324,13 +324,15 @@ jobs:
             polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
           .github/scripts/polymarket-market-recorder-release-artifact.sh verify \
             polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
+          tar --format=ustar -cf polymarket-market-recorder-linux-amd64.tar \
+            -C polymarket-market-recorder-artifact .
 
       - name: Upload bare-metal Polymarket market recorder
         if: matrix.repository == 'polymarket-market-recorder'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}
-          path: polymarket-market-recorder-artifact/
+          path: polymarket-market-recorder-linux-amd64.tar
           if-no-files-found: error
           retention-days: 90
 
