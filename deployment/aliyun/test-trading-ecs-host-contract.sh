@@ -1205,7 +1205,7 @@ grep -Fq \
   "$WORKFLOW"
 [[ $(grep -Fc \
   'uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
-  "$WORKFLOW") -eq 3 ]]
+  "$WORKFLOW") -eq 4 ]]
 if grep -Eq \
   'uses: (actions/(checkout|upload-artifact)|docker/(setup-buildx-action|login-action|build-push-action))@v[0-9]' \
   "$WORKFLOW"; then
