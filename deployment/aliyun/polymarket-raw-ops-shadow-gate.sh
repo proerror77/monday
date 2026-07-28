@@ -377,17 +377,28 @@ verify_cutover_target_preflight() {
   fi
 }
 
-verify_fresh_baseline_health() {
-  local health=$1 policy=${2:-$LEGACY_HEALTH_POLICY} field timestamp epoch now
+fresh_baseline_health_snapshot() {
+  local health=$1 policy=${2:-$LEGACY_HEALTH_POLICY}
+  local snapshot field timestamp epoch now
   [[ -f $health && ! -L $health ]] || return 1
-  jq -e -f "$policy" "$health" >/dev/null || return 1
+  snapshot=$(jq -cS . "$health") || return 1
+  jq -e -f "$policy" <<<"$snapshot" >/dev/null || return 1
   now=$(date -u +%s) || return 1
   for field in updated_at last_success_at; do
     timestamp=$(jq -er --arg field "$field" \
-      '.[$field] | select(type == "string" and length > 0)' "$health") || return 1
+      '.[$field] | select(type == "string" and length > 0)' <<<"$snapshot") || return 1
     epoch=$(date -u -d "$timestamp" +%s) || return 1
     ((epoch <= now && now - epoch <= MAX_HEALTH_SILENCE_SECONDS)) || return 1
   done
+  printf '%s\n' "$snapshot"
+}
+
+verify_fresh_baseline_health() {
+  fresh_baseline_health_snapshot "$@" >/dev/null
+}
+
+baseline_health_requires_continuous_freshness() {
+  [[ $1 == rust_release ]]
 }
 
 legacy_health_sample_state() {
@@ -692,7 +703,8 @@ legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_U
   || die 'active legacy collector has no verifiable systemd invocation ID'
 verify_baseline_identity \
   || die 'active reference collector identity or restart counter is not exact'
-[[ $baseline_mode != rust_release ]] || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
+! baseline_health_requires_continuous_freshness "$baseline_mode" \
+  || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
   || die 'active Rust collector health is not fresh and fail-closed clean'
 verify_cutover_target_preflight "$baseline_mode" "$RUST_ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_control_file \
@@ -817,6 +829,26 @@ install -m 0644 "$release_control_dir/${SERVICE_TEMPLATE##*/}" \
   /etc/systemd/system/polymarket-reference-collector-shadow@.service
 systemctl daemon-reload
 
+baseline_health_snapshot=null
+baseline_health_started_at=
+baseline_health_completion_snapshot=null
+baseline_health_completion_updated_at=
+baseline_health_start_success_unix=null
+baseline_health_cutoff_unix=null
+if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
+  baseline_health_snapshot=$(fresh_baseline_health_snapshot \
+    "$LEGACY_SPOOL/health.json" \
+    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
+    || die 'active legacy collector health is not fresh and fail-closed clean'
+  baseline_health_started_at=$(jq -er '.updated_at' <<<"$baseline_health_snapshot") \
+    || die 'frozen legacy collector health has no updated_at'
+  baseline_health_start_success_at=$(jq -er '.last_success_at' \
+    <<<"$baseline_health_snapshot") \
+    || die 'frozen legacy collector health has no last_success_at'
+  baseline_health_start_success_unix=$(date -u -d \
+    "$baseline_health_start_success_at" +%s) \
+    || die 'frozen legacy collector last_success_at is invalid'
+fi
 started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
@@ -855,34 +887,66 @@ while :; do
   elapsed=$((now_uptime - start_uptime))
   verify_baseline_identity \
     || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
-  legacy_health="$LEGACY_SPOOL/health.json"
-  [[ -f $legacy_health && ! -L $legacy_health ]] \
-    || die "$baseline_label health is missing"
-  legacy_health_state=$(legacy_health_sample_state \
-    "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
-    "$baseline_mode")
-  legacy_health_result=$(legacy_health_transition \
-    "$legacy_health_state" "$legacy_api_error_started_at" \
-    "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
-  legacy_health_decision=${legacy_health_result%%:*}
-  legacy_api_error_started_at=${legacy_health_result#*:}
-  case "$legacy_health_decision" in
-    advance|wait)
-      ;;
-    expired)
-      die "$baseline_label API errors did not recover within the health budget"
-      ;;
-    *)
-      die "$baseline_label health is not fail-closed clean during shadow"
-      ;;
-  esac
-  current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
-  if [[ $current_legacy_health != "$last_legacy_health" ]]; then
-    last_legacy_health=$current_legacy_health
-    last_legacy_health_change=$now_uptime
+  if baseline_health_requires_continuous_freshness "$baseline_mode"; then
+    legacy_health="$LEGACY_SPOOL/health.json"
+    [[ -f $legacy_health && ! -L $legacy_health ]] \
+      || die "$baseline_label health is missing"
+    legacy_health_state=$(legacy_health_sample_state \
+      "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
+      "$baseline_mode")
+    legacy_health_result=$(legacy_health_transition \
+      "$legacy_health_state" "$legacy_api_error_started_at" \
+      "$now_uptime" "$MAX_HEALTH_SILENCE_SECONDS")
+    legacy_health_decision=${legacy_health_result%%:*}
+    legacy_api_error_started_at=${legacy_health_result#*:}
+    case "$legacy_health_decision" in
+      advance|wait)
+        ;;
+      expired)
+        die "$baseline_label API errors did not recover within the health budget"
+        ;;
+      *)
+        die "$baseline_label health is not fail-closed clean during shadow"
+        ;;
+    esac
+    current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
+    if [[ $current_legacy_health != "$last_legacy_health" ]]; then
+      last_legacy_health=$current_legacy_health
+      last_legacy_health_change=$now_uptime
+    fi
+    ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
+      || die "$baseline_label health stopped advancing during shadow"
+  else
+    legacy_health="$LEGACY_SPOOL/health.json"
+    [[ -f $legacy_health && ! -L $legacy_health ]] \
+      || die "$baseline_label health is missing"
+    current_legacy_health=$(jq -er '.updated_at' "$legacy_health") \
+      || die "$baseline_label health has no updated_at"
+    if [[ $current_legacy_health != "$baseline_health_started_at" \
+      && $current_legacy_health != "$baseline_health_completion_updated_at" ]]; then
+      baseline_health_completion_snapshot=$(fresh_baseline_health_snapshot \
+        "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
+        || die 'post-start legacy collector health is not fresh and fail-closed clean'
+      current_legacy_health=$(jq -er '.updated_at' \
+        <<<"$baseline_health_completion_snapshot") \
+        || die 'post-start legacy collector health has no updated_at'
+      [[ $current_legacy_health != "$baseline_health_started_at" ]] \
+        || die 'post-start legacy collector health did not advance'
+      baseline_health_completion_updated_at=$current_legacy_health
+      legacy_success_at=$(jq -er '.last_success_at' \
+        <<<"$baseline_health_completion_snapshot") \
+        || die 'post-start legacy collector health has no last_success_at'
+      baseline_health_cutoff_unix=$(date -u -d "$legacy_success_at" +%s) \
+        || die 'post-start legacy collector last_success_at is invalid'
+      ((baseline_health_cutoff_unix > baseline_health_start_success_unix)) \
+        || die 'post-start legacy collector last_success_at did not advance'
+      legacy_health_decision='advance'
+    elif [[ $baseline_health_completion_snapshot != null ]]; then
+      legacy_health_decision='advance'
+    else
+      legacy_health_decision='wait'
+    fi
   fi
-  ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
-    || die "$baseline_label health stopped advancing during shadow"
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
   [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
@@ -909,20 +973,29 @@ while :; do
 
     rust_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
       "$health") || die 'Rust health has no last_success_at'
-    legacy_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
-      "$legacy_health") || die "$baseline_label health has no last_success_at"
     rust_success_epoch=$(date -u -d "$rust_success_at" +%s) \
       || die 'Rust last_success_at is invalid'
-    legacy_success_epoch=$(date -u -d "$legacy_success_at" +%s) \
-      || die 'Python last_success_at is invalid'
     now_epoch=$(date -u +%s)
     ((rust_success_epoch <= now_epoch && now_epoch - rust_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die 'Rust last_success_at is stale or from the future'
-    ((legacy_success_epoch <= now_epoch && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
-      || die "$baseline_label last_success_at is stale or from the future"
     if [[ $legacy_health_decision == advance ]]; then
       common_cutoff=$rust_success_epoch
-      ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
+      if baseline_health_requires_continuous_freshness "$baseline_mode"; then
+        legacy_success_at=$(jq -er \
+          '.last_success_at | select(type == "string" and length > 0)' \
+          "$legacy_health") || die "$baseline_label health has no last_success_at"
+        legacy_success_epoch=$(date -u -d "$legacy_success_at" +%s) \
+          || die "$baseline_label last_success_at is invalid"
+        ((legacy_success_epoch <= now_epoch \
+          && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
+          || die "$baseline_label last_success_at is stale or from the future"
+        ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
+      else
+        [[ $baseline_health_cutoff_unix =~ ^[1-9][0-9]*$ ]] \
+          || die 'no post-start legacy collector completion cutoff was observed'
+        ((baseline_health_cutoff_unix < common_cutoff)) \
+          && common_cutoff=$baseline_health_cutoff_unix
+      fi
       if [[ $test_only == false ]]; then
         common_cutoff=$((common_cutoff - PARITY_CUTOFF_LAG_SECONDS))
       fi
@@ -931,6 +1004,12 @@ while :; do
         "$SETTLEMENT_EVENT_LOOKBACK_SECONDS") \
         || die 'could not derive a bounded parity window start'
     fi
+  fi
+
+  if ((elapsed >= gate_seconds)) \
+    && ! baseline_health_requires_continuous_freshness "$baseline_mode" \
+    && [[ $legacy_health_decision != advance ]]; then
+    die 'legacy collector did not complete a clean post-start cycle during the gate'
   fi
 
   if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]] \
@@ -1160,6 +1239,10 @@ jq \
   --argjson parity_window_started_at_unix "$parity_window_started_at" \
   --argjson parity_window_ended_at_unix "$common_cutoff" \
   --argjson production_eligible "$production_eligible" \
+  --argjson baseline_health_snapshot "$baseline_health_snapshot" \
+  --argjson baseline_health_completion_snapshot "$baseline_health_completion_snapshot" \
+  --argjson baseline_health_start_success_unix "$baseline_health_start_success_unix" \
+  --argjson baseline_health_cutoff_unix "$baseline_health_cutoff_unix" \
   --argjson uploaded_segments "$uploaded_segments" \
   --argjson canonical_uploaded_segments "$canonical_uploaded_segments" \
   --argjson market_uploaded_segments "$market_uploaded_segments" \
@@ -1180,6 +1263,10 @@ jq \
     parity_window_started_at_unix:$parity_window_started_at_unix,
     parity_window_ended_at_unix:$parity_window_ended_at_unix,
     production_eligible:$production_eligible,
+    baseline_health_snapshot:$baseline_health_snapshot,
+    baseline_health_completion_snapshot:$baseline_health_completion_snapshot,
+    baseline_health_start_success_unix:$baseline_health_start_success_unix,
+    baseline_health_cutoff_unix:$baseline_health_cutoff_unix,
     legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
         cmdline_sha256:$legacy_cmdline_sha256,
         fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,

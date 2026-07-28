@@ -9,6 +9,17 @@ def runtime_identity($exec; $digest):
   and (.invocation_id | type == "string" and test("^[a-f0-9]{32}$"));
 def nonnegative_sub($left; $right):
   if $left < $right then 0 else ($left - $right) end;
+def legacy_health_snapshot:
+  (.updated_at | type == "string" and length > 0)
+  and (.last_success_at | type == "string" and length > 0)
+  and (.target_markets | positive_integer)
+  and .api_errors == []
+  and .malformed_trade_rows == 0
+  and .truncated_trade_markets == []
+  and .stale_trade_markets == []
+  and .stale_settlement_markets == []
+  and (.overdue_unresolved_markets
+    | type == "array" and all(.[]; type == "string" and length > 0));
 
 .schema == "monday.polymarket_shadow_gate.v1"
 and (.candidate_sha256 | sha256)
@@ -27,6 +38,20 @@ and .passed == true
 and (
   (
     .baseline_mode == "legacy_python"
+    and (.baseline_health_snapshot | legacy_health_snapshot)
+    and (.baseline_health_completion_snapshot | legacy_health_snapshot)
+    and (.baseline_health_completion_snapshot.updated_at
+      != .baseline_health_snapshot.updated_at)
+    and (.baseline_health_start_success_unix | positive_integer)
+    and ((.baseline_health_snapshot.last_success_at | fromdateiso8601?)
+      == .baseline_health_start_success_unix)
+    and (.baseline_health_completion_snapshot.last_success_at
+      != .baseline_health_snapshot.last_success_at)
+    and (.baseline_health_cutoff_unix | positive_integer)
+    and ((.baseline_health_completion_snapshot.last_success_at | fromdateiso8601?)
+      == .baseline_health_cutoff_unix)
+    and .baseline_health_cutoff_unix > .baseline_health_start_success_unix
+    and .parity_window_ended_at_unix <= .baseline_health_cutoff_unix
     and (.legacy_runtime |
       runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
         "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
@@ -35,6 +60,10 @@ and (
   or
   (
     .baseline_mode == "rust_release"
+    and .baseline_health_snapshot == null
+    and .baseline_health_completion_snapshot == null
+    and .baseline_health_start_success_unix == null
+    and .baseline_health_cutoff_unix == null
     and (.legacy_runtime |
       runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference";
         "7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94"))
