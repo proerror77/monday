@@ -9,5 +9,5 @@ anyhow = "1"
 hex = { workspace = true }
 ndarray = "0.15"
 sha2 = { workspace = true }
-tract-onnx = "0.21"
+tract-onnx = "0.22.2"
 tracing = "0.1"
