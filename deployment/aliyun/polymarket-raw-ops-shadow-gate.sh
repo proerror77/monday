@@ -528,7 +528,7 @@ verify_current_oss_config() {
 download_and_verify_oss_triplet() {
   local uri=$1 expected_dataset=$2 target=$3 prefix relative path_sha data_name
   local data manifest success superseded_uri superseded_listing manifest_json
-  local expected_bytes expected_sha source_bytes
+  local expected_bytes expected_sha source_bytes canonical segment_complete
   prefix="oss://$oss_bucket/lake/raw/venue=polymarket/dataset=$expected_dataset/"
   [[ $uri == "$prefix"* ]] || return 1
   relative=${uri#"$prefix"}
@@ -573,6 +573,9 @@ download_and_verify_oss_triplet() {
   expected_bytes=$(jq -er '.bytes' <<<"$manifest_json") || return 1
   expected_sha=$(jq -er '.sha256' <<<"$manifest_json") || return 1
   source_bytes=$(jq -er '.source_bytes' <<<"$manifest_json") || return 1
+  canonical=$(jq -r '.canonical' <<<"$manifest_json") || return 1
+  segment_complete=$(jq -r '.segment_complete' <<<"$manifest_json") || return 1
+  [[ $canonical == "$segment_complete" ]] || return 1
   [[ -z $path_sha || $path_sha == "$expected_sha" ]] || return 1
   [[ $(stat -c %s -- "$data") == "$expected_bytes" ]] || return 1
   [[ $(sha256sum "$data" | awk '{print $1}') == "$expected_sha" ]] || return 1
@@ -583,9 +586,11 @@ download_and_verify_oss_triplet() {
     --arg manifest_sha256 "$(sha256sum "$manifest" | awk '{print $1}')" \
     --arg success_sha256 "$expected_sha" \
     --argjson bytes "$expected_bytes" --argjson source_bytes "$source_bytes" \
+    --argjson canonical "$canonical" --argjson segment_complete "$segment_complete" \
     '{uri:$uri,dataset:$dataset,file:$file,bytes:$bytes,sha256:$sha256,
       source_bytes:$source_bytes,manifest_sha256:$manifest_sha256,
-      success_sha256:$success_sha256}'
+      success_sha256:$success_sha256,canonical:$canonical,
+      segment_complete:$segment_complete}'
 }
 
 real_market_segment_preflight() {
@@ -596,7 +601,7 @@ real_market_segment_preflight() {
   local terminal_status upload_summary
   local source_quote_records source_recorded_hours source_content_sha256 source_bytes
   local source_identity source_mtime
-  local copied_sha256 uploaded_content_sha256
+  local copied_sha256 uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
   secure_collector_directory "$source_spool" || return 1
@@ -688,7 +693,7 @@ real_market_segment_preflight() {
       | select(type == "object"
         and (keys | sort)
           == ["canonical_uploaded_segments", "uploaded_segments"]
-        and (.uploaded_segments | type == "number" and floor == . and . > 0)
+        and (.uploaded_segments | type == "number" and . == 1)
         and (.canonical_uploaded_segments
           | type == "number" and floor == . and . >= 0))' \
       "$candidate_stdout") || candidate_summary=
@@ -748,6 +753,10 @@ real_market_segment_preflight() {
   uploaded_uri=$(jq -er '.last_uploaded_object' <<<"$terminal_status") || return 1
   uploaded_triplet=$(download_and_verify_oss_triplet \
     "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded") || return 1
+  uploaded_canonical=$(jq -er 'if .canonical then 1 else 0 end' \
+    <<<"$uploaded_triplet") || return 1
+  [[ $(jq -er '.canonical_uploaded_segments' <<<"$upload_summary") \
+    == "$uploaded_canonical" ]] || return 1
   [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == "$source_bytes" ]] \
     || return 1
   uploaded_name=$(jq -er '.file' <<<"$uploaded_triplet") || return 1
