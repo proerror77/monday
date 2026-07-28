@@ -14,7 +14,7 @@ readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
-# Production Python full-catalog cycles observed 35–58 minutes; bound admission at 65.
+# Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
 readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
