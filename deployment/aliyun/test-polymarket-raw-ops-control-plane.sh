@@ -26,7 +26,7 @@ if command -v gsha256sum >/dev/null 2>&1; then
 fi
 
 for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum shellcheck \
-  sync wc; do
+  sync wc zstd; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
     exit 2
@@ -59,6 +59,268 @@ fi
 tmp_dir=$(mktemp -d)
 tmp_dir=$(cd -- "$tmp_dir" && pwd -P)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+# A production Gate must exercise the candidate against a real closed segment,
+# not a compatible fixture manufactured by the Gate itself.
+preflight_verifier="$tmp_dir/real-market-preflight.sh"
+sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
+  >"$preflight_verifier"
+sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE" \
+  >>"$preflight_verifier"
+# shellcheck source=/dev/null
+source "$preflight_verifier"
+if ! declare -F download_and_verify_oss_triplet >/dev/null \
+  || ! declare -F real_market_segment_preflight >/dev/null; then
+  printf 'Gate does not expose the real market-segment preflight helpers\n' >&2
+  exit 1
+fi
+
+preflight_root="$tmp_dir/real-market-preflight"
+remote_root="$preflight_root/remote"
+fake_bin="$preflight_root/bin"
+mkdir -p "$remote_root" "$fake_bin"
+
+make_remote_triplet() {
+  local source=$1 uri=$2 dataset=$3 remote_data remote_manifest
+  local data_sha data_bytes source_bytes
+  remote_data="$remote_root/${uri#oss://bucket/}"
+  remote_manifest="${remote_data}.manifest.json"
+  mkdir -p "${remote_data%/*}"
+  zstd -q -T1 -3 -c "$source" >"$remote_data"
+  data_sha=$(sha256sum "$remote_data" | awk '{print $1}')
+  data_bytes=$(wc -c <"$remote_data" | tr -d ' ')
+  source_bytes=$(wc -c <"$source" | tr -d ' ')
+  jq -n --arg dataset "$dataset" --arg file "${remote_data##*/}" \
+    --arg sha "$data_sha" --argjson bytes "$data_bytes" \
+    --argjson source_bytes "$source_bytes" \
+    '{venue:"polymarket",dataset:$dataset,file:$file,bytes:$bytes,
+      sha256:$sha,source_bytes:$source_bytes,canonical:true,
+      segment_complete:true,source_session_closed:true,sequence_gaps:0}' \
+    >"$remote_manifest"
+  printf '%s\n' "$data_sha" >"${remote_data}._SUCCESS"
+}
+
+cat >"$fake_bin/aliyun" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == ossutil ]]
+case "$2" in
+  cp)
+    if [[ $3 == oss://bucket/* ]]; then
+      cp "$FAKE_OSS_ROOT/${3#oss://bucket/}" "$4"
+    elif [[ $4 == oss://bucket/* ]]; then
+      remote="$FAKE_OSS_ROOT/${4#oss://bucket/}"
+      mkdir -p "${remote%/*}"
+      [[ -e $remote ]] || cp "$3" "$remote"
+    else
+      exit 2
+    fi
+    ;;
+  ls)
+    remote="$FAKE_OSS_ROOT/${3#oss://bucket/}"
+    [[ ! -e $remote ]] || printf '%s\n' "$3"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$fake_bin/aliyun"
+
+cat >"$fake_bin/runuser" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $1 != -- ]]; do shift; done
+shift
+exec "$@"
+EOF
+chmod +x "$fake_bin/runuser"
+
+cat >"$fake_bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$fake_bin/chown"
+
+preflight_stat=$(command -v gstat || command -v stat)
+cat >"$fake_bin/stat" <<'EOF'
+#!/usr/bin/env bash
+exec "$PREFLIGHT_STAT" "$@"
+EOF
+chmod +x "$fake_bin/stat"
+
+cat >"$preflight_root/candidate" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+spool= dataset= bucket=
+while (($#)); do
+  case "$1" in
+    --spool-dir) spool=$2; shift 2 ;;
+    --dataset) dataset=$2; shift 2 ;;
+    --bucket) bucket=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+source_file=$(find "$spool" -maxdepth 1 -type f -name 'market-updates.*.ndjson' \
+  | head -n 1)
+if jq -e 'select(.update.kind == "quote"
+    and (.update.request_status != "success"
+      or (.update.collection_result | type != "string")))' \
+    "$source_file" >/dev/null; then
+  printf 'quote requires request_status=success\n' >&2
+  exit 1
+fi
+name=market-updates.20260101T010000.20260101T00.ndjson.zst
+sha=$(jq -er .sha256 "$FAKE_CANDIDATE_TEMPLATE/$name.manifest.json")
+relative="lake/raw/venue=polymarket/dataset=$dataset/date=2026-01-01/hour=00/sha256=$sha/$name"
+destination="$FAKE_OSS_ROOT/$relative"
+mkdir -p "${destination%/*}"
+cp "$FAKE_CANDIDATE_TEMPLATE/$name" "$destination"
+jq --arg dataset "$dataset" '.dataset = $dataset' \
+  "$FAKE_CANDIDATE_TEMPLATE/$name.manifest.json" \
+  >"$destination.manifest.json"
+cp "$FAKE_CANDIDATE_TEMPLATE/$name._SUCCESS" "$destination._SUCCESS"
+uri="oss://$bucket/$relative"
+jq -n --arg uri "$uri" \
+  '{updated_at:"2026-01-01T01:00:00Z",last_success_at:"2026-01-01T01:00:00Z",
+    last_uploaded_object:$uri,uploaded_segments:1,canonical_uploaded_segments:1,
+    pending_segments:0,failed_segments:[],last_error:null,last_error_at:null}' \
+  >"$spool/upload-status.json"
+jq -cn '{uploaded_segments:1,canonical_uploaded_segments:1}'
+EOF
+chmod +x "$preflight_root/candidate"
+
+incompatible="$preflight_root/incompatible.ndjson"
+compatible="$preflight_root/compatible.ndjson"
+no_quote="$preflight_root/no-quote.ndjson"
+unrelated="$preflight_root/unrelated.ndjson"
+printf '%s\n' \
+  '{"sequence":0,"recorded_at":"2026-01-01T00:00:00Z","update":{"kind":"event_discovered","event_id":"event-1","symbol":"BTCUSDT","up_token":"up","down_token":"down","end_time":"2026-01-01T00:05:00Z","window_secs":300,"price_to_beat":"100","resolved_up_won":null}}' \
+  '{"sequence":1,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"up","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"ts":"2026-01-01T00:00:01Z"}}' \
+  >"$incompatible"
+printf '%s\n' \
+  '{"sequence":0,"recorded_at":"2026-01-01T00:00:00Z","update":{"kind":"event_discovered","event_id":"event-1","symbol":"BTCUSDT","up_token":"up","down_token":"down","end_time":"2026-01-01T00:05:00Z","window_secs":300,"price_to_beat":"100","resolved_up_won":null}}' \
+  '{"sequence":1,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"up","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
+  '{"sequence":2,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"down","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
+  >"$compatible"
+head -n 1 "$compatible" >"$no_quote"
+sed 's/"token_id":"up"/"token_id":"unrelated"/' "$compatible" >"$unrelated"
+
+input_bad_uri='oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/market-updates.20260101T010000.20260101T00.ndjson.zst'
+input_good_uri='oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/market-updates.20260101T020000.20260101T00.ndjson.zst'
+input_no_quote_uri='oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/market-updates.20260101T030000.20260101T00.ndjson.zst'
+make_remote_triplet "$incompatible" "$input_bad_uri" crypto_expiry
+make_remote_triplet "$compatible" "$input_good_uri" crypto_expiry
+make_remote_triplet "$no_quote" "$input_no_quote_uri" crypto_expiry
+matching_template_dir="$preflight_root/matching-candidate-template"
+unrelated_template_dir="$preflight_root/unrelated-candidate-template"
+mkdir "$matching_template_dir" "$unrelated_template_dir"
+template_uri='oss://bucket/template/market-updates.20260101T010000.20260101T00.ndjson.zst'
+make_remote_triplet "$compatible" "$template_uri" placeholder
+cp "$remote_root/${template_uri#oss://bucket/}"* "$matching_template_dir/"
+make_remote_triplet "$unrelated" "$template_uri" placeholder
+cp "$remote_root/${template_uri#oss://bucket/}"* "$unrelated_template_dir/"
+
+original_path=$PATH
+export PATH="$fake_bin:$PATH"
+export FAKE_OSS_ROOT="$remote_root"
+export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
+export PREFLIGHT_STAT="$preflight_stat"
+oss_bucket=bucket
+oss_endpoint=endpoint
+oss_region=region
+aliyun_profile=profile
+zstd_timeout_seconds=30
+oss_copy_timeout_seconds=30
+oss_config_sha=$(printf 'd%.0s' {1..64})
+candidate_sha=$(printf 'a%.0s' {1..64})
+source_revision=$(printf 'b%.0s' {1..40})
+deployment_bundle_sha=$(printf 'c%.0s' {1..64})
+release_manifest_sha=$(printf '1%.0s' {1..64})
+control_archive_sha=$(printf '2%.0s' {1..64})
+fake_release_binary="$preflight_root/candidate"
+release_binary="$VERIFY"
+run_id=20260101T000000Z-1
+verify_current_oss_config() { :; }
+
+wrong_path_sha=$(printf '0%.0s' {1..64})
+wrong_path_uri="oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/sha256=$wrong_path_sha/market-updates.20260101T040000.20260101T00.ndjson.zst"
+make_remote_triplet "$compatible" "$wrong_path_uri" crypto_expiry
+if download_and_verify_oss_triplet "$wrong_path_uri" crypto_expiry \
+  "$preflight_root/wrong-path-download" >/dev/null; then
+  printf 'triplet verifier accepted a content-addressed path with the wrong digest\n' >&2
+  exit 1
+fi
+superseded_uri="$input_good_uri.SUPERSEDED.json"
+printf '{}\n' >"$remote_root/${superseded_uri#oss://bucket/}"
+if download_and_verify_oss_triplet "$input_good_uri" crypto_expiry \
+  "$preflight_root/superseded-download" >/dev/null; then
+  printf 'triplet verifier accepted a superseded production segment\n' >&2
+  exit 1
+fi
+rm "$remote_root/${superseded_uri#oss://bucket/}"
+
+bad_case="$preflight_root/bad-case"
+mkdir -p "$bad_case/spool" "$bad_case/download" "$bad_case/evidence"
+jq -n --arg uri "$input_bad_uri" \
+  '{last_uploaded_object:$uri,last_success_at:"2026-01-01T01:00:00Z",
+    failed_segments:[],last_error:null}' >"$bad_case/status.json"
+if real_market_segment_preflight "$bad_case/status.json" "$bad_case/spool" \
+  "$bad_case/download" "$bad_case/evidence"; then
+  printf 'real-segment preflight accepted an incompatible production format\n' >&2
+  exit 1
+fi
+jq -e '.status == "failed" and .candidate_exit_code == 1
+  and .source_triplet.dataset == "crypto_expiry"' \
+  "$bad_case/evidence/real-market-preflight.json" >/dev/null
+grep -Fq 'quote requires request_status=success' \
+  "$bad_case/evidence/real-market-uploader.stderr"
+
+no_quote_case="$preflight_root/no-quote-case"
+mkdir -p "$no_quote_case/spool" "$no_quote_case/download" \
+  "$no_quote_case/evidence"
+jq -n --arg uri "$input_no_quote_uri" \
+  '{last_uploaded_object:$uri,last_success_at:"2026-01-01T03:00:00Z",
+    failed_segments:[],last_error:null}' >"$no_quote_case/status.json"
+if real_market_segment_preflight "$no_quote_case/status.json" \
+  "$no_quote_case/spool" "$no_quote_case/download" "$no_quote_case/evidence"; then
+  printf 'real-segment preflight accepted a segment with no quote records\n' >&2
+  exit 1
+fi
+
+unrelated_case="$preflight_root/unrelated-case"
+mkdir -p "$unrelated_case/spool" "$unrelated_case/download" \
+  "$unrelated_case/evidence"
+jq -n --arg uri "$input_good_uri" \
+  '{last_uploaded_object:$uri,last_success_at:"2026-01-01T02:00:00Z",
+    failed_segments:[],last_error:null}' >"$unrelated_case/status.json"
+export FAKE_CANDIDATE_TEMPLATE="$unrelated_template_dir"
+release_binary="$fake_release_binary"
+if real_market_segment_preflight "$unrelated_case/status.json" \
+  "$unrelated_case/spool" "$unrelated_case/download" \
+  "$unrelated_case/evidence"; then
+  printf 'real-segment preflight accepted output unrelated to its input\n' >&2
+  exit 1
+fi
+export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
+release_binary="$VERIFY"
+
+good_case="$preflight_root/good-case"
+mkdir -p "$good_case/spool" "$good_case/download" "$good_case/evidence"
+jq -n --arg uri "$input_good_uri" \
+  '{last_uploaded_object:$uri,last_success_at:"2026-01-01T02:00:00Z",
+    failed_segments:[],last_error:null}' >"$good_case/status.json"
+real_market_segment_preflight "$good_case/status.json" "$good_case/spool" \
+  "$good_case/download" "$good_case/evidence" || {
+  sed -n '1,20p' "$good_case/evidence/real-market-uploader.stderr" >&2
+  exit 1
+}
+jq -e '.status == "passed"
+  and .source_triplet.dataset == "crypto_expiry"
+  and (.uploaded_triplet.dataset | startswith("crypto_expiry_preflight_"))
+  and .source_quote_records == 2
+  and .source_content_sha256 == .uploaded_content_sha256
+  and .upload_summary.uploaded_segments == 1' \
+  "$good_case/evidence/real-market-preflight.json" >/dev/null
+export PATH=$original_path
 
 # A short test gate must not continue after the settlement-safe clamp places
 # the start at or beyond the common cutoff.
@@ -1393,6 +1655,33 @@ jq \
     release_manifest_sha256:$release_manifest_sha,
     control_archive_sha256:$control_archive_sha,
     oss_config_sha256:$oss_config,
+    real_market_preflight:{
+      schema:"monday.polymarket_real_market_preflight.v1",status:"passed",
+      started_at:"1970-01-01T00:00:00Z",completed_at:"1970-01-01T00:01:00Z",
+      candidate_sha256:$candidate,deployment_source_revision:$source,
+      deployment_bundle_sha256:$bundle,
+      release_manifest_sha256:$release_manifest_sha,
+      control_archive_sha256:$control_archive_sha,oss_config_sha256:$oss_config,
+      dataset:"crypto_expiry_preflight_aaaaaaaaaaaa_run-1",
+      source_quote_records:1,source_content_sha256:$candidate,
+      uploaded_content_sha256:$candidate,
+      source_triplet:{
+        uri:"oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry/date=1970-01-01/hour=00/market-updates.19700101T010000.19700101T00.ndjson.zst",
+        dataset:"crypto_expiry",
+        file:"market-updates.19700101T010000.19700101T00.ndjson.zst",
+        bytes:10,source_bytes:20,sha256:$candidate,
+        manifest_sha256:$bundle,success_sha256:$candidate
+      },
+      uploaded_triplet:{
+        uri:("oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry_preflight_aaaaaaaaaaaa_run-1/date=1970-01-01/hour=00/sha256=" + $candidate + "/market-updates.19700101T010000.19700101T00.ndjson.zst"),
+        dataset:"crypto_expiry_preflight_aaaaaaaaaaaa_run-1",
+        file:"market-updates.19700101T010000.19700101T00.ndjson.zst",
+        bytes:10,source_bytes:20,sha256:$candidate,
+        manifest_sha256:$bundle,success_sha256:$candidate
+      },
+      upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
+        pending_segments:0,failed_segments:[],last_error:null}
+    },
     duration_seconds:4201,
     started_at:"1970-01-01T00:02:00Z",
     parity_window_started_at_unix:100,
@@ -1444,13 +1733,64 @@ jq \
     },
     checks:(.checks + {health_freshness:true,candidate_identity:true,
       memory_events_stable:true,oss_readback_parity:true,
-      market_oss_readback_parity:true}),
+      market_oss_readback_parity:true,real_market_segment_preflight:true}),
     metrics:(.metrics + {
       oss_uploaded_segments:1,oss_canonical_uploaded_segments:1,
       market_oss_uploaded_segments:1,market_oss_canonical_uploaded_segments:1
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq 'del(.real_market_preflight)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-real-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-real-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a real market-segment preflight\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.completed_at = "1970-01-01T00:03:00Z"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/late-real-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/late-real-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a real segment preflight after shadow startup\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.source_triplet.dataset = "synthetic"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/synthetic-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/synthetic-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a synthetic market preflight source\n' >&2
+  exit 1
+fi
+jq --arg wrong "$bundle" \
+  '.real_market_preflight.uploaded_triplet.uri |=
+    sub("/sha256=[a-f0-9]{64}/"; "/sha256=" + $wrong + "/")' \
+  "$tmp_dir/gate.json" >"$tmp_dir/mislabeled-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/mislabeled-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a content-addressed URI with the wrong digest\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.source_triplet.success_sha256 =
+    .real_market_preflight.source_triplet.manifest_sha256' \
+  "$tmp_dir/gate.json" >"$tmp_dir/mismatched-success-marker.json"
+if jq -e -f "$POLICY" "$tmp_dir/mismatched-success-marker.json" >/dev/null; then
+  printf 'gate policy accepted a success marker for different content\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.upload_summary.pending_segments = 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/pending-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/pending-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a preflight with pending segments\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.upload_summary.failed_segments = ["segment"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/failed-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/failed-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a preflight with failed segments\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.upload_summary.last_error = "failed"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/error-market-preflight.json"
+if jq -e -f "$POLICY" "$tmp_dir/error-market-preflight.json" >/dev/null; then
+  printf 'gate policy accepted a preflight with a terminal error\n' >&2
+  exit 1
+fi
 jq '.started_at = "1970-01-01T00:16:40Z"
   | .baseline_health_start_written_at_unix = 900
   | .baseline_health_completion_written_at_unix = 1000' \
@@ -2196,7 +2536,18 @@ grep -Fq 'shadow_spool="$shadow_parent/$run_id"' "$GATE"
 grep -Fq 'MONDAY_POLYMARKET_SHADOW_SPOOL' \
   "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
 grep -Fq 'crypto_expiry_reference_rust_shadow' "$GATE"
-grep -Fq 'crypto_expiry_market_rust_shadow' "$GATE"
+grep -Fq 'crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}' "$GATE"
+if grep -Fq 'crypto_expiry_market_rust_shadow' "$GATE"; then
+  printf 'Gate still substitutes a synthetic market fixture for production input\n' >&2
+  exit 1
+fi
+preflight_line=$(grep -n '^real_market_segment_preflight ' "$GATE" | cut -d: -f1)
+gate_start_line=$(grep -n '^started_at_unix=' "$GATE" | cut -d: -f1)
+shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" | cut -d: -f1)
+((preflight_line < gate_start_line && preflight_line < shadow_start_line)) || {
+  printf 'real market-segment preflight does not finish before shadow startup\n' >&2
+  exit 1
+}
 grep -Fq '.canonical_uploaded_segments' "$GATE"
 grep -Fq 'oss_config_sha256' "$GATE"
 grep -Fq 'oss_config_sha256' "$CUTOVER"
@@ -2206,6 +2557,7 @@ grep -Fq 'polymarket-rust-health-policy.jq' "$GATE"
 grep -Fq 'polymarket-rust-health-policy.jq' "$CUTOVER"
 grep -Fq 'oss_readback_parity:true' "$GATE"
 grep -Fq 'market_oss_readback_parity:true' "$GATE"
+grep -Fq 'real_market_segment_preflight:true' "$GATE"
 grep -Fq 'ControlGroup' "$GATE"
 grep -Fq 'valid_absolute_path "$control_group"' "$GATE"
 grep -Fq '[[ $control_group == /system.slice/*' "$GATE"
