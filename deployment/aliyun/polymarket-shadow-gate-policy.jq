@@ -57,7 +57,7 @@ and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"
 and (.release_manifest_sha256 | sha256)
 and (.control_archive_sha256 | sha256)
 and (.oss_config_sha256 | sha256)
-and .real_market_preflight.schema == "monday.polymarket_real_market_preflight.v1"
+and .real_market_preflight.schema == "monday.polymarket_real_market_preflight.v2"
 and .real_market_preflight.status == "passed"
 and .real_market_preflight.candidate_sha256 == .candidate_sha256
 and (.real_market_preflight.deployment_source_revision
@@ -75,16 +75,22 @@ and (.real_market_preflight.dataset == ("crypto_expiry_preflight_"
   + .candidate_sha256[0:12] + "_" + (.shadow_run_id | ascii_downcase)))
 and (.real_market_preflight.source_quote_records | positive_integer)
 and (.real_market_preflight.source_content_sha256 | sha256)
+and (.real_market_preflight.source_segment as $segment
+  | ($segment.file | type == "string"
+    and test("^market-updates\\.[0-9]{8}T[0-9]{6}([0-9]{6})?(\\.[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12})?\\.ndjson$"))
+  and $segment.path == ("/data/monday/spool/polymarket/" + $segment.file)
+  and ($segment.bytes | positive_integer)
+  and ($segment.sha256 | sha256)
+  and $segment.sha256 == .real_market_preflight.source_content_sha256
+  and ($segment.file_identity | file_identity)
+  and ($segment.modified_at_unix | nonnegative_integer))
 and (.real_market_preflight.uploaded_content_sha256
   == .real_market_preflight.source_content_sha256)
-and (.real_market_preflight.source_triplet | oss_triplet("crypto_expiry"))
 and (.real_market_preflight.uploaded_triplet.dataset
   == .real_market_preflight.dataset)
 and (.real_market_preflight.uploaded_triplet
   | oss_triplet(.dataset))
-and (.real_market_preflight.source_triplet.uri
-  != .real_market_preflight.uploaded_triplet.uri)
-and (.real_market_preflight.source_triplet.source_bytes
+and (.real_market_preflight.source_segment.bytes
   == .real_market_preflight.uploaded_triplet.source_bytes)
 and (.real_market_preflight.upload_summary.uploaded_segments | positive_integer)
 and (.real_market_preflight.upload_summary.canonical_uploaded_segments

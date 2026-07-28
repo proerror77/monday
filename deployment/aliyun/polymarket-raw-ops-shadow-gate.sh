@@ -25,7 +25,7 @@ readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
-readonly MARKET_UPLOAD_STATUS=/data/monday/spool/polymarket/upload-status.json
+readonly MARKET_SPOOL=/data/monday/spool/polymarket
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly SHADOW_ROOT=/data/monday/spool/polymarket-reference-rust-shadow
@@ -588,46 +588,65 @@ download_and_verify_oss_triplet() {
 }
 
 real_market_segment_preflight() {
-  local status_file=$1 spool=$2 download_root=$3 evidence=$4 before after status_json
-  local stable=false source_uri source_triplet source_name source_stamp source_file source_tmp
+  local source_spool=$1 spool=$2 download_root=$3 evidence=$4 before after path name
+  local stable=false source_path source_name source_file source_tmp source_segment
+  local source_stamp source_uuid candidate_stamp candidate_uuid
   local preflight_dataset started_at completed_at candidate_exit candidate_summary
   local terminal_status upload_summary
-  local source_quote_records source_content_sha256 uploaded_content_sha256
+  local source_quote_records source_content_sha256 source_bytes source_identity source_mtime
+  local copied_sha256 uploaded_content_sha256
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
-  [[ -f $status_file && ! -L $status_file ]] || return 1
+  secure_collector_directory "$source_spool" || return 1
+  source_path=
+  source_name=
+  source_stamp=
+  source_uuid=
+  for path in "$source_spool"/market-updates.*.ndjson; do
+    name=${path##*/}
+    [[ $name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.([[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}))?\.ndjson$ ]] \
+      || continue
+    candidate_stamp=${BASH_REMATCH[1]}
+    candidate_uuid=${BASH_REMATCH[4]:-}
+    if [[ -z $source_name || $candidate_stamp > "$source_stamp" \
+      || ( $candidate_stamp == "$source_stamp" \
+        && -n $candidate_uuid && -z $source_uuid ) ]]; then
+      source_path=$path
+      source_name=$name
+      source_stamp=$candidate_stamp
+      source_uuid=$candidate_uuid
+    fi
+  done
+  [[ -n $source_path && -f $source_path && ! -L $source_path ]] || return 1
+  source_file="$spool/$source_name"
+  source_tmp="$source_file.tmp"
   for _ in 1 2 3; do
-    before=$(stat -c '%d:%i:%s:%Y:%Z' "$status_file") || return 1
-    status_json=$(jq -cS . "$status_file") || return 1
-    after=$(stat -c '%d:%i:%s:%Y:%Z' "$status_file") || return 1
-    if [[ $before == "$after" ]]; then
+    before=$(stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    cp -- "$source_path" "$source_tmp" || return 1
+    source_content_sha256=$(sha256sum "$source_path" | awk '{print $1}') \
+      || return 1
+    copied_sha256=$(sha256sum "$source_tmp" | awk '{print $1}') || return 1
+    after=$(stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    if [[ $before == "$after" && $source_content_sha256 == "$copied_sha256" ]]; then
       stable=true
       break
     fi
   done
   [[ $stable == true ]] || return 1
-  source_uri=$(jq -er '
-    select(.last_error == null and .failed_segments == [])
-    | .last_uploaded_object | select(type == "string" and length > 0)' \
-    <<<"$status_json") || return 1
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  source_triplet=$(download_and_verify_oss_triplet \
-    "$source_uri" crypto_expiry "$download_root/source") || return 1
-  source_name=$(jq -er '.file' <<<"$source_triplet") || return 1
-  [[ $source_name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.[A-Za-z0-9._-]+)?\.ndjson\.zst$ ]] \
-    || return 1
-  source_stamp=${BASH_REMATCH[1]}
-  source_file="$spool/market-updates.${source_stamp}.ndjson"
-  source_tmp="$source_file.tmp"
-  zstd -q -d -c "$download_root/source/$source_name" >"$source_tmp" || return 1
-  [[ $(wc -c <"$source_tmp" | tr -d ' ') == \
-    "$(jq -er '.source_bytes' <<<"$source_triplet")" ]] || return 1
   source_quote_records=$(jq -c 'select(.update.kind == "quote")' "$source_tmp" \
     | wc -l | tr -d ' ') || return 1
   [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
-  source_content_sha256=$(sha256sum "$source_tmp" | awk '{print $1}') || return 1
+  source_bytes=$(stat -c %s "$source_tmp") || return 1
+  source_identity=$(stat -c '%d:%i' "$source_path") || return 1
+  source_mtime=$(stat -c %Y "$source_path") || return 1
+  source_segment=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
+    --arg sha256 "$source_content_sha256" --arg identity "$source_identity" \
+    --argjson bytes "$source_bytes" --argjson modified_at_unix "$source_mtime" \
+    '{path:$path,file:$file,bytes:$bytes,sha256:$sha256,
+      file_identity:$identity,modified_at_unix:$modified_at_unix}') || return 1
   mv "$source_tmp" "$source_file"
   chown hftcollector:hftcollector "$source_file"
   chmod 0640 "$source_file"
@@ -694,12 +713,12 @@ real_market_segment_preflight() {
       --arg release_manifest_sha256 "$release_manifest_sha" \
       --arg control_archive_sha256 "$control_archive_sha" \
       --arg oss_config_sha256 "$oss_config_sha" \
-      --arg dataset "$preflight_dataset" --argjson source_triplet "$source_triplet" \
+      --arg dataset "$preflight_dataset" --argjson source_segment "$source_segment" \
       --arg source_content_sha256 "$source_content_sha256" \
       --argjson source_quote_records "$source_quote_records" \
       --arg stderr_sha256 "$(sha256sum "$candidate_stderr" | awk '{print $1}')" \
       --argjson candidate_exit_code "$candidate_exit" \
-      '{schema:"monday.polymarket_real_market_preflight.v1",status:"failed",
+      '{schema:"monday.polymarket_real_market_preflight.v2",status:"failed",
         started_at:$started_at,completed_at:$completed_at,
         candidate_sha256:$candidate_sha256,
         deployment_source_revision:$deployment_source_revision,
@@ -707,7 +726,7 @@ real_market_segment_preflight() {
         release_manifest_sha256:$release_manifest_sha256,
         control_archive_sha256:$control_archive_sha256,
         oss_config_sha256:$oss_config_sha256,dataset:$dataset,
-        source_triplet:$source_triplet,source_quote_records:$source_quote_records,
+        source_segment:$source_segment,source_quote_records:$source_quote_records,
         source_content_sha256:$source_content_sha256,
         candidate_exit_code:$candidate_exit_code,
         candidate_stderr_sha256:$stderr_sha256}' >"$preflight_tmp"
@@ -719,8 +738,8 @@ real_market_segment_preflight() {
   uploaded_uri=$(jq -er '.last_uploaded_object' <<<"$terminal_status") || return 1
   uploaded_triplet=$(download_and_verify_oss_triplet \
     "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded") || return 1
-  [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == \
-    "$(jq -er '.source_bytes' <<<"$source_triplet")" ]] || return 1
+  [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == "$source_bytes" ]] \
+    || return 1
   uploaded_name=$(jq -er '.file' <<<"$uploaded_triplet") || return 1
   uploaded_content_sha256=$(zstd -q -d -c \
     "$download_root/uploaded/$uploaded_name" | sha256sum | awk '{print $1}') \
@@ -738,10 +757,10 @@ real_market_segment_preflight() {
     --arg source_content_sha256 "$source_content_sha256" \
     --arg uploaded_content_sha256 "$uploaded_content_sha256" \
     --argjson source_quote_records "$source_quote_records" \
-    --argjson source_triplet "$source_triplet" \
+    --argjson source_segment "$source_segment" \
     --argjson uploaded_triplet "$uploaded_triplet" \
     --argjson upload_summary "$upload_summary" \
-    '{schema:"monday.polymarket_real_market_preflight.v1",status:"passed",
+    '{schema:"monday.polymarket_real_market_preflight.v2",status:"passed",
       started_at:$started_at,completed_at:$completed_at,
       candidate_sha256:$candidate_sha256,
       deployment_source_revision:$deployment_source_revision,
@@ -752,7 +771,7 @@ real_market_segment_preflight() {
       source_quote_records:$source_quote_records,
       source_content_sha256:$source_content_sha256,
       uploaded_content_sha256:$uploaded_content_sha256,
-      source_triplet:$source_triplet,uploaded_triplet:$uploaded_triplet,
+      source_segment:$source_segment,uploaded_triplet:$uploaded_triplet,
       upload_summary:$upload_summary}' >"$preflight_tmp"
   mv "$preflight_tmp" "$preflight_json"
   sync "$candidate_stdout" "$candidate_stderr" "$preflight_json"
@@ -1124,7 +1143,7 @@ install -m 0644 "$release_control_dir/${SERVICE_TEMPLATE##*/}" \
 systemctl daemon-reload
 
 real_market_preflight_json=
-real_market_segment_preflight "$MARKET_UPLOAD_STATUS" "$market_shadow_spool" \
+real_market_segment_preflight "$MARKET_SPOOL" "$market_shadow_spool" \
   "$market_preflight_download_dir" "$evidence_dir" \
   || die 'candidate rejected a real production closed market segment before shadow startup'
 market_upload_json=$(jq -c '.upload_summary' <<<"$real_market_preflight_json") \
