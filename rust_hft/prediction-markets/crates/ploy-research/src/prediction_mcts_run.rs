@@ -983,8 +983,8 @@ mod tests {
                         probability_blend_sha256: candidate.probability_blend_sha256.clone(),
                         training_cohort_id: "train-before-boundary".to_string(),
                         event_count: 12,
-                        mean_brier_score: 0.2,
-                        mean_log_loss: 0.3,
+                        mean_brier_score: 0.5492666666666667,
+                        mean_log_loss: 1.359634792578074,
                     },
                 ),
             })
@@ -1551,6 +1551,12 @@ mod tests {
 
     #[test]
     fn selection_evidence_binds_the_current_checkpoint_and_selected_candidate() {
+        let checkpoint_reward: f64 = -(0.5492666666666667 + 1.359634792578074);
+        assert_eq!(checkpoint_reward, -1.9089014592447406);
+        let roundtripped: f64 =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint_reward).unwrap()).unwrap();
+        assert_eq!(roundtripped.to_bits(), checkpoint_reward.to_bits());
+
         let output = temp_dir("selection-evidence-digests");
         let configured = mission(1, 1);
         let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
