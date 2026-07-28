@@ -1390,27 +1390,30 @@ jq \
     control_archive_sha256:$control_archive_sha,
     oss_config_sha256:$oss_config,
     duration_seconds:4201,
+    started_at:"1970-01-01T00:02:00Z",
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
-    completed_at:"2026-07-15T00:00:00Z",
+    completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
     baseline_health_snapshot:{
-      updated_at:"1970-01-01T00:01:40Z",
-      last_success_at:"1970-01-01T00:01:40Z",
+      updated_at:"1970-01-01T00:01:40.123456Z",
+      last_success_at:"1970-01-01T00:01:40.123456Z",
       target_markets:14,api_errors:[],malformed_trade_rows:0,
       truncated_trade_markets:[],stale_trade_markets:[],
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_completion_snapshot:{
-      updated_at:"1970-01-01T00:16:40Z",
-      last_success_at:"1970-01-01T00:16:40Z",
+      updated_at:"1970-01-01T00:16:40.654321Z",
+      last_success_at:"1970-01-01T00:16:40.654321Z",
       target_markets:14,api_errors:[],malformed_trade_rows:0,
       truncated_trade_markets:[],stale_trade_markets:[],
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_start_success_unix:100,
     baseline_health_cutoff_unix:1000,
+    baseline_health_start_written_at_unix:110,
+    baseline_health_completion_written_at_unix:1301,
     legacy_runtime:{
       exec_start:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
       cmdline:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
@@ -1454,6 +1457,32 @@ if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-completion.json" >/dev/n
   printf 'gate policy accepted legacy evidence without a post-start clean cycle\n' >&2
   exit 1
 fi
+jq 'del(.baseline_health_start_written_at_unix)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-baseline-health-start-write.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-start-write.json" >/dev/null; then
+  printf 'gate policy accepted legacy evidence without its startup file-write time\n' >&2
+  exit 1
+fi
+jq 'del(.baseline_health_completion_written_at_unix)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-baseline-health-completion-write.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/missing-baseline-health-completion-write.json" >/dev/null; then
+  printf 'gate policy accepted legacy evidence without its completion file-write time\n' >&2
+  exit 1
+fi
+jq '.baseline_health_start_written_at_unix = 121' "$tmp_dir/gate.json" \
+  >"$tmp_dir/post-start-baseline-health-write.json"
+if jq -e -f "$POLICY" "$tmp_dir/post-start-baseline-health-write.json" >/dev/null; then
+  printf 'gate policy accepted a startup health write after the Gate boundary\n' >&2
+  exit 1
+fi
+jq '.baseline_health_completion_written_at_unix = 999' "$tmp_dir/gate.json" \
+  >"$tmp_dir/pre-success-baseline-health-write.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/pre-success-baseline-health-write.json" >/dev/null; then
+  printf 'gate policy accepted a completed health write before its payload cutoff\n' >&2
+  exit 1
+fi
 jq '.baseline_health_completion_snapshot.last_success_at =
       .baseline_health_snapshot.last_success_at' "$tmp_dir/gate.json" \
   >"$tmp_dir/stale-baseline-health-completion.json"
@@ -1471,6 +1500,49 @@ jq '.baseline_health_cutoff_unix = 1001' "$tmp_dir/gate.json" \
   >"$tmp_dir/unbound-baseline-health-cutoff.json"
 if jq -e -f "$POLICY" "$tmp_dir/unbound-baseline-health-cutoff.json" >/dev/null; then
   printf 'gate policy accepted a cutoff after legacy completed-cycle evidence\n' >&2
+  exit 1
+fi
+jq '.baseline_health_completion_snapshot.last_success_at =
+      "1970-01-01T00:16:40.badZ"' "$tmp_dir/gate.json" \
+  >"$tmp_dir/malformed-baseline-health-cutoff.json"
+if jq -e -f "$POLICY" "$tmp_dir/malformed-baseline-health-cutoff.json" \
+  >/dev/null; then
+  printf 'gate policy accepted a malformed fractional legacy success timestamp\n' >&2
+  exit 1
+fi
+jq '.baseline_health_completion_snapshot.last_success_at =
+      "1970-02-30T00:00:00.1Z"
+    | .baseline_health_cutoff_unix = 5184000
+    | .baseline_health_completion_written_at_unix = 5184001
+    | .completed_at = "1970-03-02T00:00:02Z"
+    | .parity_window_ended_at_unix = 1000' "$tmp_dir/gate.json" \
+  >"$tmp_dir/impossible-baseline-health-cutoff.json"
+if jq -e -f "$POLICY" "$tmp_dir/impossible-baseline-health-cutoff.json" \
+  >/dev/null; then
+  printf 'gate policy accepted an impossible legacy success calendar date\n' >&2
+  exit 1
+fi
+jq '.started_at = "1970-02-30T00:00:00Z"
+    | .baseline_health_snapshot.updated_at = "1970-03-01T23:58:20Z"
+    | .baseline_health_snapshot.last_success_at = "1970-03-01T23:58:20Z"
+    | .baseline_health_start_success_unix = 5183900
+    | .baseline_health_start_written_at_unix = 5183901
+    | .baseline_health_completion_snapshot.updated_at = "1970-03-02T00:16:40Z"
+    | .baseline_health_completion_snapshot.last_success_at = "1970-03-02T00:16:40Z"
+    | .baseline_health_cutoff_unix = 5185000
+    | .baseline_health_completion_written_at_unix = 5185001
+    | .completed_at = "1970-03-02T01:12:01Z"
+    | .parity_window_started_at_unix = 5184200
+    | .parity_window_ended_at_unix = 5184900' "$tmp_dir/gate.json" \
+  >"$tmp_dir/impossible-gate-start.json"
+if jq -e -f "$POLICY" "$tmp_dir/impossible-gate-start.json" >/dev/null; then
+  printf 'gate policy accepted an impossible Gate start calendar date\n' >&2
+  exit 1
+fi
+jq '.completed_at = "1970-02-30T00:00:00Z"' "$tmp_dir/gate.json" \
+  >"$tmp_dir/impossible-gate-completion.json"
+if jq -e -f "$POLICY" "$tmp_dir/impossible-gate-completion.json" >/dev/null; then
+  printf 'gate policy accepted an impossible Gate completion calendar date\n' >&2
   exit 1
 fi
 jq '.shadow_runtime.memory_events.start.high = 1
@@ -1731,6 +1803,8 @@ jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
   | .baseline_health_completion_snapshot = null
   | .baseline_health_start_success_unix = null
   | .baseline_health_cutoff_unix = null
+  | .baseline_health_start_written_at_unix = null
+  | .baseline_health_completion_written_at_unix = null
   | .legacy_runtime += {
       exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
       cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
@@ -1812,13 +1886,67 @@ if baseline_health_requires_continuous_freshness legacy_python; then
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
+legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
+sed -n \
+  -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
+  -e '/^fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
+  >"$legacy_health_observer"
+[[ -s $legacy_health_observer ]] || {
+  printf 'Gate has no completed-write freshness verifier for legacy health\n' >&2
+  exit 1
+}
+(
+  if command -v gdate >/dev/null 2>&1; then
+    date() { command gdate "$@"; }
+  fi
+  if command -v gstat >/dev/null 2>&1; then
+    stat() { command gstat "$@"; }
+  fi
+  # shellcheck source=/dev/null
+  source "$legacy_health_observer"
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/atomic-legacy-health.json"
+  mv "$tmp_dir/atomic-legacy-health.json" \
+    "$tmp_dir/freshly-completed-legacy-health.json"
+  observation=$(fresh_legacy_health_observation \
+    "$tmp_dir/freshly-completed-legacy-health.json" "$LEGACY_HEALTH_POLICY")
+  jq -e \
+    --argjson written_at "$(stat -c %Y \
+      "$tmp_dir/freshly-completed-legacy-health.json")" \
+    '.written_at_unix == $written_at
+      and .health.last_success_at == "2026-07-15T00:00:01Z"' \
+    <<<"$observation" >/dev/null || {
+      printf 'Gate rejected a fresh completed legacy cycle with an old cycle-start timestamp\n' >&2
+      exit 1
+    }
+  touch -d '1970-01-01T00:00:00Z' \
+    "$tmp_dir/freshly-completed-legacy-health.json"
+  if fresh_legacy_health_observation \
+    "$tmp_dir/freshly-completed-legacy-health.json" \
+    "$LEGACY_HEALTH_POLICY" >/dev/null 2>&1; then
+    printf 'Gate accepted an old legacy health file write\n' >&2
+    exit 1
+  fi
+  jq '.updated_at = "2999-01-01T00:00:00Z"
+    | .last_success_at = "2999-01-01T00:00:00Z"' \
+    "$tmp_dir/legacy-health.json" >"$tmp_dir/future-legacy-health.json"
+  touch "$tmp_dir/future-legacy-health.json"
+  if fresh_legacy_health_observation "$tmp_dir/future-legacy-health.json" \
+    "$LEGACY_HEALTH_POLICY" >/dev/null 2>&1; then
+    printf 'Gate accepted future legacy health payload timestamps\n' >&2
+    exit 1
+  fi
+)
 daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
-snapshot_line=$(grep -nF 'baseline_health_snapshot=$(fresh_baseline_health_snapshot' \
+snapshot_line=$(grep -nF 'baseline_health_observation=$(fresh_legacy_health_observation' \
+  "$GATE" | cut -d: -f1)
+completion_snapshot_line=$(grep -nF \
+  'baseline_health_completion_observation=$(fresh_legacy_health_observation' \
   "$GATE" | cut -d: -f1)
 gate_start_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "$shadow_unit"' "$GATE" | cut -d: -f1)
 if ! ((daemon_reload_line < snapshot_line && snapshot_line < gate_start_line \
-  && gate_start_line < shadow_start_line)); then
+  && gate_start_line < shadow_start_line \
+  && shadow_start_line < completion_snapshot_line)); then
   printf 'legacy health is not frozen immediately at the shadow Gate start boundary\n' >&2
   exit 1
 fi

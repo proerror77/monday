@@ -393,6 +393,33 @@ fresh_baseline_health_snapshot() {
   printf '%s\n' "$snapshot"
 }
 
+fresh_legacy_health_observation() {
+  local health=$1 policy=$2 before after snapshot field timestamp epoch now
+  local _device _inode _size written_at_unix _changed_at_unix
+  [[ -f $health && ! -L $health ]] || return 1
+  before=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
+  snapshot=$(jq -cS . "$health") || return 1
+  after=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
+  [[ $before == "$after" ]] || return 1
+  jq -e -f "$policy" <<<"$snapshot" >/dev/null || return 1
+  IFS=: read -r _device _inode _size written_at_unix _changed_at_unix \
+    <<<"$before"
+  [[ $written_at_unix =~ ^[0-9]+$ ]] || return 1
+  now=$(date -u +%s) || return 1
+  ((written_at_unix <= now \
+    && now - written_at_unix <= MAX_HEALTH_SILENCE_SECONDS)) || return 1
+  for field in updated_at last_success_at; do
+    timestamp=$(jq -er --arg field "$field" \
+      '.[$field] | select(type == "string" and length > 0)' <<<"$snapshot") \
+      || return 1
+    epoch=$(date -u -d "$timestamp" +%s) || return 1
+    ((epoch <= now)) || return 1
+  done
+  jq -cn --argjson health "$snapshot" \
+    --argjson written_at_unix "$written_at_unix" \
+    '{health:$health,written_at_unix:$written_at_unix}'
+}
+
 verify_fresh_baseline_health() {
   fresh_baseline_health_snapshot "$@" >/dev/null
 }
@@ -831,15 +858,22 @@ systemctl daemon-reload
 
 baseline_health_snapshot=null
 baseline_health_started_at=
+baseline_health_start_written_at_unix=null
 baseline_health_completion_snapshot=null
 baseline_health_completion_updated_at=
+baseline_health_completion_written_at_unix=null
 baseline_health_start_success_unix=null
 baseline_health_cutoff_unix=null
 if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
-  baseline_health_snapshot=$(fresh_baseline_health_snapshot \
+  baseline_health_observation=$(fresh_legacy_health_observation \
     "$LEGACY_SPOOL/health.json" \
     "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
     || die 'active legacy collector health is not fresh and fail-closed clean'
+  baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
+    || die 'frozen legacy collector health observation is invalid'
+  baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
+    <<<"$baseline_health_observation") \
+    || die 'frozen legacy collector health has no write time'
   baseline_health_started_at=$(jq -er '.updated_at' <<<"$baseline_health_snapshot") \
     || die 'frozen legacy collector health has no updated_at'
   baseline_health_start_success_at=$(jq -er '.last_success_at' \
@@ -848,6 +882,8 @@ if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
   baseline_health_start_success_unix=$(date -u -d \
     "$baseline_health_start_success_at" +%s) \
     || die 'frozen legacy collector last_success_at is invalid'
+  ((baseline_health_start_success_unix <= baseline_health_start_written_at_unix)) \
+    || die 'frozen legacy collector success is after its completed write'
 fi
 started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -924,9 +960,17 @@ while :; do
       || die "$baseline_label health has no updated_at"
     if [[ $current_legacy_health != "$baseline_health_started_at" \
       && $current_legacy_health != "$baseline_health_completion_updated_at" ]]; then
-      baseline_health_completion_snapshot=$(fresh_baseline_health_snapshot \
+      baseline_health_completion_observation=$(fresh_legacy_health_observation \
         "$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
         || die 'post-start legacy collector health is not fresh and fail-closed clean'
+      baseline_health_completion_snapshot=$(jq -c '.health' \
+        <<<"$baseline_health_completion_observation") \
+        || die 'post-start legacy collector health observation is invalid'
+      baseline_health_completion_written_at_unix=$(jq -er '.written_at_unix' \
+        <<<"$baseline_health_completion_observation") \
+        || die 'post-start legacy collector health has no write time'
+      ((baseline_health_completion_written_at_unix > started_at_unix)) \
+        || die 'post-start legacy collector health write predates the Gate'
       current_legacy_health=$(jq -er '.updated_at' \
         <<<"$baseline_health_completion_snapshot") \
         || die 'post-start legacy collector health has no updated_at'
@@ -940,6 +984,8 @@ while :; do
         || die 'post-start legacy collector last_success_at is invalid'
       ((baseline_health_cutoff_unix > baseline_health_start_success_unix)) \
         || die 'post-start legacy collector last_success_at did not advance'
+      ((baseline_health_cutoff_unix <= baseline_health_completion_written_at_unix)) \
+        || die 'post-start legacy collector success is after its completed write'
       legacy_health_decision='advance'
     elif [[ $baseline_health_completion_snapshot != null ]]; then
       legacy_health_decision='advance'
@@ -1243,6 +1289,10 @@ jq \
   --argjson baseline_health_completion_snapshot "$baseline_health_completion_snapshot" \
   --argjson baseline_health_start_success_unix "$baseline_health_start_success_unix" \
   --argjson baseline_health_cutoff_unix "$baseline_health_cutoff_unix" \
+  --argjson baseline_health_start_written_at_unix \
+    "$baseline_health_start_written_at_unix" \
+  --argjson baseline_health_completion_written_at_unix \
+    "$baseline_health_completion_written_at_unix" \
   --argjson uploaded_segments "$uploaded_segments" \
   --argjson canonical_uploaded_segments "$canonical_uploaded_segments" \
   --argjson market_uploaded_segments "$market_uploaded_segments" \
@@ -1267,6 +1317,9 @@ jq \
     baseline_health_completion_snapshot:$baseline_health_completion_snapshot,
     baseline_health_start_success_unix:$baseline_health_start_success_unix,
     baseline_health_cutoff_unix:$baseline_health_cutoff_unix,
+    baseline_health_start_written_at_unix:$baseline_health_start_written_at_unix,
+    baseline_health_completion_written_at_unix:
+      $baseline_health_completion_written_at_unix,
     legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
         cmdline_sha256:$legacy_cmdline_sha256,
         fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
