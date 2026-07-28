@@ -103,9 +103,19 @@ make_remote_triplet() {
 cat >"$fake_bin/aliyun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ $1 == ossutil && $3 == oss://bucket/* ]]
+[[ $1 == ossutil ]]
 case "$2" in
-  cp) cp "$FAKE_OSS_ROOT/${3#oss://bucket/}" "$4" ;;
+  cp)
+    if [[ $3 == oss://bucket/* ]]; then
+      cp "$FAKE_OSS_ROOT/${3#oss://bucket/}" "$4"
+    elif [[ $4 == oss://bucket/* ]]; then
+      remote="$FAKE_OSS_ROOT/${4#oss://bucket/}"
+      mkdir -p "${remote%/*}"
+      [[ -e $remote ]] || cp "$3" "$remote"
+    else
+      exit 2
+    fi
+    ;;
   ls)
     remote="$FAKE_OSS_ROOT/${3#oss://bucket/}"
     [[ ! -e $remote ]] || printf '%s\n' "$3"
@@ -174,8 +184,7 @@ jq -n --arg uri "$uri" \
     last_uploaded_object:$uri,uploaded_segments:1,canonical_uploaded_segments:1,
     pending_segments:0,failed_segments:[],last_error:null,last_error_at:null}' \
   >"$spool/upload-status.json"
-jq -cn '{uploaded_segments:1,canonical_uploaded_segments:1,pending_segments:0,
-  failed_segments:[],last_error:null}'
+jq -cn '{uploaded_segments:1,canonical_uploaded_segments:1}'
 EOF
 chmod +x "$preflight_root/candidate"
 
@@ -190,6 +199,7 @@ printf '%s\n' \
 printf '%s\n' \
   '{"sequence":0,"recorded_at":"2026-01-01T00:00:00Z","update":{"kind":"event_discovered","event_id":"event-1","symbol":"BTCUSDT","up_token":"up","down_token":"down","end_time":"2026-01-01T00:05:00Z","window_secs":300,"price_to_beat":"100","resolved_up_won":null}}' \
   '{"sequence":1,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"up","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
+  '{"sequence":2,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"down","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
   >"$compatible"
 head -n 1 "$compatible" >"$no_quote"
 sed 's/"token_id":"up"/"token_id":"unrelated"/' "$compatible" >"$unrelated"
@@ -226,7 +236,8 @@ source_revision=$(printf 'b%.0s' {1..40})
 deployment_bundle_sha=$(printf 'c%.0s' {1..64})
 release_manifest_sha=$(printf '1%.0s' {1..64})
 control_archive_sha=$(printf '2%.0s' {1..64})
-release_binary="$preflight_root/candidate"
+fake_release_binary="$preflight_root/candidate"
+release_binary="$VERIFY"
 run_id=20260101T000000Z-1
 verify_current_oss_config() { :; }
 
@@ -260,6 +271,8 @@ fi
 jq -e '.status == "failed" and .candidate_exit_code == 1
   and .source_triplet.dataset == "crypto_expiry"' \
   "$bad_case/evidence/real-market-preflight.json" >/dev/null
+grep -Fq 'quote requires request_status=success' \
+  "$bad_case/evidence/real-market-uploader.stderr"
 
 no_quote_case="$preflight_root/no-quote-case"
 mkdir -p "$no_quote_case/spool" "$no_quote_case/download" \
@@ -280,6 +293,7 @@ jq -n --arg uri "$input_good_uri" \
   '{last_uploaded_object:$uri,last_success_at:"2026-01-01T02:00:00Z",
     failed_segments:[],last_error:null}' >"$unrelated_case/status.json"
 export FAKE_CANDIDATE_TEMPLATE="$unrelated_template_dir"
+release_binary="$fake_release_binary"
 if real_market_segment_preflight "$unrelated_case/status.json" \
   "$unrelated_case/spool" "$unrelated_case/download" \
   "$unrelated_case/evidence"; then
@@ -287,6 +301,7 @@ if real_market_segment_preflight "$unrelated_case/status.json" \
   exit 1
 fi
 export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
+release_binary="$VERIFY"
 
 good_case="$preflight_root/good-case"
 mkdir -p "$good_case/spool" "$good_case/download" "$good_case/evidence"
@@ -294,11 +309,14 @@ jq -n --arg uri "$input_good_uri" \
   '{last_uploaded_object:$uri,last_success_at:"2026-01-01T02:00:00Z",
     failed_segments:[],last_error:null}' >"$good_case/status.json"
 real_market_segment_preflight "$good_case/status.json" "$good_case/spool" \
-  "$good_case/download" "$good_case/evidence"
+  "$good_case/download" "$good_case/evidence" || {
+  sed -n '1,20p' "$good_case/evidence/real-market-uploader.stderr" >&2
+  exit 1
+}
 jq -e '.status == "passed"
   and .source_triplet.dataset == "crypto_expiry"
   and (.uploaded_triplet.dataset | startswith("crypto_expiry_preflight_"))
-  and .source_quote_records == 1
+  and .source_quote_records == 2
   and .source_content_sha256 == .uploaded_content_sha256
   and .upload_summary.uploaded_segments == 1' \
   "$good_case/evidence/real-market-preflight.json" >/dev/null

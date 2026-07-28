@@ -589,8 +589,9 @@ download_and_verify_oss_triplet() {
 
 real_market_segment_preflight() {
   local status_file=$1 spool=$2 download_root=$3 evidence=$4 before after status_json
-  local stable=false source_uri source_triplet source_name source_file source_tmp
-  local preflight_dataset started_at completed_at candidate_exit upload_summary
+  local stable=false source_uri source_triplet source_name source_stamp source_file source_tmp
+  local preflight_dataset started_at completed_at candidate_exit candidate_summary
+  local terminal_status upload_summary
   local source_quote_records source_content_sha256 uploaded_content_sha256
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
@@ -615,7 +616,10 @@ real_market_segment_preflight() {
   source_triplet=$(download_and_verify_oss_triplet \
     "$source_uri" crypto_expiry "$download_root/source") || return 1
   source_name=$(jq -er '.file' <<<"$source_triplet") || return 1
-  source_file="$spool/${source_name%.zst}"
+  [[ $source_name =~ ^market-updates\.([0-9]{8}T[0-9]{6}([0-9]{6})?)(\.[A-Za-z0-9._-]+)?\.ndjson\.zst$ ]] \
+    || return 1
+  source_stamp=${BASH_REMATCH[1]}
+  source_file="$spool/market-updates.${source_stamp}.ndjson"
   source_tmp="$source_file.tmp"
   zstd -q -d -c "$download_root/source/$source_name" >"$source_tmp" || return 1
   [[ $(wc -c <"$source_tmp" | tr -d ' ') == \
@@ -648,13 +652,40 @@ real_market_segment_preflight() {
   mv "$candidate_stderr_tmp" "$candidate_stderr"
   preflight_json="$evidence/real-market-preflight.json"
   preflight_tmp="$evidence/.real-market-preflight.json.tmp"
-  if ((candidate_exit != 0)) \
-    || ! upload_summary=$(jq -ce '
-      select((.uploaded_segments | type == "number" and floor == . and . > 0)
+  candidate_summary=
+  terminal_status=
+  upload_summary=
+  if ((candidate_exit == 0)); then
+    candidate_summary=$(jq -ce -s '
+      select(length == 1) | .[0]
+      | select(type == "object"
+        and (keys | sort)
+          == ["canonical_uploaded_segments", "uploaded_segments"]
+        and (.uploaded_segments | type == "number" and floor == . and . > 0)
         and (.canonical_uploaded_segments
-          | type == "number" and floor == . and . > 0)
+          | type == "number" and floor == . and . > 0))' \
+      "$candidate_stdout") || candidate_summary=
+  fi
+  if [[ -n $candidate_summary ]]; then
+    terminal_status=$(jq -ce --arg dataset "$preflight_dataset" \
+      --argjson uploaded "$(jq -er '.uploaded_segments' <<<"$candidate_summary")" \
+      --argjson canonical "$(jq -er \
+        '.canonical_uploaded_segments' <<<"$candidate_summary")" '
+      select(.uploaded_segments == $uploaded
+        and .canonical_uploaded_segments == $canonical
         and .pending_segments == 0 and .failed_segments == []
-        and .last_error == null)' "$candidate_stdout"); then
+        and .last_error == null
+        and (.last_uploaded_object | type == "string"
+          and contains("/dataset=" + $dataset + "/")))' \
+      "$spool/upload-status.json") || terminal_status=
+  fi
+  if [[ -n $terminal_status ]]; then
+    upload_summary=$(jq -cn --argjson summary "$candidate_summary" \
+      --argjson status "$terminal_status" '
+      $summary + {pending_segments:$status.pending_segments,
+        failed_segments:$status.failed_segments,last_error:$status.last_error}')
+  fi
+  if [[ -z $upload_summary ]]; then
     completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     jq -n --arg started_at "$started_at" --arg completed_at "$completed_at" \
       --arg candidate_sha256 "$candidate_sha" \
@@ -685,12 +716,7 @@ real_market_segment_preflight() {
     return 1
   fi
 
-  uploaded_uri=$(jq -er --arg dataset "$preflight_dataset" '
-    select(.last_error == null and .failed_segments == []
-      and .uploaded_segments > 0 and .canonical_uploaded_segments > 0)
-    | .last_uploaded_object
-    | select(type == "string" and contains("/dataset=" + $dataset + "/"))' \
-    "$spool/upload-status.json") || return 1
+  uploaded_uri=$(jq -er '.last_uploaded_object' <<<"$terminal_status") || return 1
   uploaded_triplet=$(download_and_verify_oss_triplet \
     "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded") || return 1
   [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == \
