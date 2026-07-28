@@ -1395,6 +1395,13 @@ jq \
     completed_at:"2026-07-15T00:00:00Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    baseline_health_snapshot:{
+      updated_at:"2026-07-15T00:00:00Z",
+      last_success_at:"2026-07-15T00:00:00Z",
+      target_markets:14,api_errors:[],malformed_trade_rows:0,
+      truncated_trade_markets:[],stale_trade_markets:[],
+      stale_settlement_markets:[],overdue_unresolved_markets:[]
+    },
     legacy_runtime:{
       exec_start:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
       cmdline:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
@@ -1426,6 +1433,12 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq 'del(.baseline_health_snapshot)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-baseline-health-snapshot.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-snapshot.json" >/dev/null; then
+  printf 'gate policy accepted legacy evidence without its frozen health snapshot\n' >&2
+  exit 1
+fi
 jq '.shadow_runtime.memory_events.start.high = 1
     | .shadow_runtime.memory_events.end.high = 1' \
   "$tmp_dir/gate.json" >"$tmp_dir/nonzero-memory-high-baseline.json"
@@ -1680,6 +1693,7 @@ if jq -e -f "$POLICY" "$tmp_dir/shadow-once-cmdline.json" >/dev/null; then
 fi
 baseline_sha=$(printf '9%.0s' {1..64})
 jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
+  | .baseline_health_snapshot = null
   | .legacy_runtime += {
       exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
       cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
@@ -1750,11 +1764,27 @@ for mutation in \
 done
 legacy_health_classifier="$tmp_dir/legacy-health-classifier.sh"
 sed -n \
+  -e '/^baseline_health_requires_continuous_freshness()/,/^}/p' \
   -e '/^legacy_health_sample_state()/,/^}/p' \
   -e '/^legacy_health_transition()/,/^}/p' "$GATE" \
   >"$legacy_health_classifier"
 # shellcheck source=/dev/null
 source "$legacy_health_classifier"
+if baseline_health_requires_continuous_freshness legacy_python; then
+  printf 'legacy Python health incorrectly requires continuous 240-second freshness\n' >&2
+  exit 1
+fi
+baseline_health_requires_continuous_freshness rust_release
+daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
+snapshot_line=$(grep -nF 'baseline_health_snapshot=$(fresh_baseline_health_snapshot' \
+  "$GATE" | cut -d: -f1)
+gate_start_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
+shadow_start_line=$(grep -nF 'systemctl start "$shadow_unit"' "$GATE" | cut -d: -f1)
+if ! ((daemon_reload_line < snapshot_line && snapshot_line < gate_start_line \
+  && gate_start_line < shadow_start_line)); then
+  printf 'legacy health is not frozen immediately at the shadow Gate start boundary\n' >&2
+  exit 1
+fi
 [[ $(legacy_health_sample_state \
   "$tmp_dir/legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == clean ]]
 jq '.api_errors = ["trades condition-1: The read operation timed out"]' \
