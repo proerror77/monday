@@ -111,6 +111,9 @@ impl AuthenticatedEvaluationArtifact {
             metrics,
             sha256: String::new(),
         };
+        artifact =
+            serde_json::from_slice(&crate::prediction_loop_fs::canonical_json_bytes(&artifact)?)
+                .map_err(|error| format!("normalize authenticated evaluation artifact: {error}"))?;
         artifact.sha256 = artifact.expected_sha256()?;
         Ok(artifact)
     }
@@ -1927,6 +1930,61 @@ mod tests {
             )
             .expect_err("expired synchronous computation must fail closed");
         assert!(error.contains("deadline"));
+    }
+
+    #[test]
+    fn evaluator_artifact_digest_survives_canonical_json_readback() {
+        let mission = mission(
+            PredictionTaskKind::UpExecution,
+            Some(PredictionTokenSide::Up),
+            Some(10),
+        );
+        let candidate = candidate(&mission);
+        let AuthenticatedTaskMetrics::UpExecution(mut metrics) =
+            builtin_task_metrics(&mission, &authenticated_training_snapshot()).unwrap()
+        else {
+            unreachable!()
+        };
+        metrics.mean_complete_set_edge_usd = -1.0554999999999999;
+        let artifact = AuthenticatedEvaluationArtifact::new(
+            &candidate,
+            AuthenticatedTaskMetrics::UpExecution(metrics),
+        )
+        .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let artifact_ref = write_content_addressed_json(
+            output.path(),
+            output.path(),
+            "prediction-mcts-held-out-evaluation",
+            &artifact,
+        )
+        .unwrap();
+        let readback: AuthenticatedEvaluationArtifact = serde_json::from_slice(
+            &read_verified_artifact_bounded(
+                output.path(),
+                &artifact_ref,
+                MAX_AUTHENTICATED_EVALUATION_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        readback
+            .validate()
+            .expect("canonical JSON readback must preserve the sealed artifact digest");
+        let image = format!("sha256:{}", "7".repeat(64));
+        let mut selection = selection_evidence(&image, &artifact).unwrap();
+        selection.held_out_artifact = Some(artifact_ref);
+        AuthenticatedPredictionResultReceipt::new(
+            &mission,
+            &admitted(&mission),
+            &image,
+            &selection,
+            &readback,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
     }
 
     #[test]
