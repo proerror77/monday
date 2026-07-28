@@ -834,7 +834,7 @@ if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
   baseline_health_snapshot=$(fresh_baseline_health_snapshot \
     "$LEGACY_SPOOL/health.json" \
     "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
-    || die 'active Python collector health is not fresh and fail-closed clean'
+    || die 'active legacy collector health is not fresh and fail-closed clean'
 fi
 started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)

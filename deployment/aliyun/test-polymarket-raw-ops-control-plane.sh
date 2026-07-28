@@ -1771,7 +1771,7 @@ sed -n \
 # shellcheck source=/dev/null
 source "$legacy_health_classifier"
 if baseline_health_requires_continuous_freshness legacy_python; then
-  printf 'legacy Python health incorrectly requires continuous 240-second freshness\n' >&2
+  printf 'legacy collector health incorrectly requires continuous 240-second freshness\n' >&2
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
