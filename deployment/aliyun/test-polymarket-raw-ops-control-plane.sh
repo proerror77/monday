@@ -130,9 +130,10 @@ exit 0
 EOF
 chmod +x "$fake_bin/chown"
 
+preflight_stat=$(command -v gstat || command -v stat)
 cat >"$fake_bin/stat" <<'EOF'
 #!/usr/bin/env bash
-exec gstat "$@"
+exec "$PREFLIGHT_STAT" "$@"
 EOF
 chmod +x "$fake_bin/stat"
 
@@ -212,6 +213,7 @@ original_path=$PATH
 export PATH="$fake_bin:$PATH"
 export FAKE_OSS_ROOT="$remote_root"
 export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
+export PREFLIGHT_STAT="$preflight_stat"
 oss_bucket=bucket
 oss_endpoint=endpoint
 oss_region=region
