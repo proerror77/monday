@@ -39,6 +39,19 @@ and (
   (
     .baseline_mode == "legacy_python"
     and (.baseline_health_snapshot | legacy_health_snapshot)
+    and (.baseline_health_completion_snapshot | legacy_health_snapshot)
+    and (.baseline_health_completion_snapshot.updated_at
+      != .baseline_health_snapshot.updated_at)
+    and (.baseline_health_start_success_unix | positive_integer)
+    and ((.baseline_health_snapshot.last_success_at | fromdateiso8601?)
+      == .baseline_health_start_success_unix)
+    and (.baseline_health_completion_snapshot.last_success_at
+      != .baseline_health_snapshot.last_success_at)
+    and (.baseline_health_cutoff_unix | positive_integer)
+    and ((.baseline_health_completion_snapshot.last_success_at | fromdateiso8601?)
+      == .baseline_health_cutoff_unix)
+    and .baseline_health_cutoff_unix > .baseline_health_start_success_unix
+    and .parity_window_ended_at_unix <= .baseline_health_cutoff_unix
     and (.legacy_runtime |
       runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
         "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
@@ -48,6 +61,9 @@ and (
   (
     .baseline_mode == "rust_release"
     and .baseline_health_snapshot == null
+    and .baseline_health_completion_snapshot == null
+    and .baseline_health_start_success_unix == null
+    and .baseline_health_cutoff_unix == null
     and (.legacy_runtime |
       runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference";
         "7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94"))

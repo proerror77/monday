@@ -1396,12 +1396,21 @@ jq \
     shadow_run_id:"run-1",
     production_eligible:true,
     baseline_health_snapshot:{
-      updated_at:"2026-07-15T00:00:00Z",
-      last_success_at:"2026-07-15T00:00:00Z",
+      updated_at:"1970-01-01T00:01:40Z",
+      last_success_at:"1970-01-01T00:01:40Z",
       target_markets:14,api_errors:[],malformed_trade_rows:0,
       truncated_trade_markets:[],stale_trade_markets:[],
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
+    baseline_health_completion_snapshot:{
+      updated_at:"1970-01-01T00:16:40Z",
+      last_success_at:"1970-01-01T00:16:40Z",
+      target_markets:14,api_errors:[],malformed_trade_rows:0,
+      truncated_trade_markets:[],stale_trade_markets:[],
+      stale_settlement_markets:[],overdue_unresolved_markets:[]
+    },
+    baseline_health_start_success_unix:100,
+    baseline_health_cutoff_unix:1000,
     legacy_runtime:{
       exec_start:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
       cmdline:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
@@ -1437,6 +1446,31 @@ jq 'del(.baseline_health_snapshot)' "$tmp_dir/gate.json" \
   >"$tmp_dir/missing-baseline-health-snapshot.json"
 if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-snapshot.json" >/dev/null; then
   printf 'gate policy accepted legacy evidence without its frozen health snapshot\n' >&2
+  exit 1
+fi
+jq 'del(.baseline_health_completion_snapshot)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-baseline-health-completion.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-completion.json" >/dev/null; then
+  printf 'gate policy accepted legacy evidence without a post-start clean cycle\n' >&2
+  exit 1
+fi
+jq '.baseline_health_completion_snapshot.last_success_at =
+      .baseline_health_snapshot.last_success_at' "$tmp_dir/gate.json" \
+  >"$tmp_dir/stale-baseline-health-completion.json"
+if jq -e -f "$POLICY" "$tmp_dir/stale-baseline-health-completion.json" >/dev/null; then
+  printf 'gate policy accepted updated_at progress without a newer completed legacy cycle\n' >&2
+  exit 1
+fi
+jq '.baseline_health_start_success_unix = 99' "$tmp_dir/gate.json" \
+  >"$tmp_dir/unbound-baseline-health-start.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-baseline-health-start.json" >/dev/null; then
+  printf 'gate policy accepted an unbound legacy startup success epoch\n' >&2
+  exit 1
+fi
+jq '.baseline_health_cutoff_unix = 1001' "$tmp_dir/gate.json" \
+  >"$tmp_dir/unbound-baseline-health-cutoff.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-baseline-health-cutoff.json" >/dev/null; then
+  printf 'gate policy accepted a cutoff after legacy completed-cycle evidence\n' >&2
   exit 1
 fi
 jq '.shadow_runtime.memory_events.start.high = 1
@@ -1694,6 +1728,9 @@ fi
 baseline_sha=$(printf '9%.0s' {1..64})
 jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
   | .baseline_health_snapshot = null
+  | .baseline_health_completion_snapshot = null
+  | .baseline_health_start_success_unix = null
+  | .baseline_health_cutoff_unix = null
   | .legacy_runtime += {
       exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
       cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
