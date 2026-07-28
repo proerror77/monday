@@ -306,6 +306,34 @@ jobs:
           docker run --rm "$IMAGE" --dry-run --help 2>&1 \
             | grep -Fq -- '--dry-run'
 
+      - name: Extract bare-metal Polymarket market recorder
+        if: matrix.repository == 'polymarket-market-recorder'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p polymarket-market-recorder-artifact
+          container_id=$(docker create "$IMAGE")
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/usr/local/bin/new-ploy-runner" \
+            polymarket-market-recorder-artifact/new-ploy-runner
+          chmod 0755 polymarket-market-recorder-artifact/new-ploy-runner
+          .github/scripts/polymarket-market-recorder-release-artifact.sh create \
+            polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
+          .github/scripts/polymarket-market-recorder-release-artifact.sh verify \
+            polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
+
+      - name: Upload bare-metal Polymarket market recorder
+        if: matrix.repository == 'polymarket-market-recorder'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}
+          path: polymarket-market-recorder-artifact/
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Verify research runner image
         if: matrix.repository == 'research-runner'
         env:

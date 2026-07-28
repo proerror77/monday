@@ -360,6 +360,8 @@ jobs:
           ../deployment/aliyun/test-rust-lob-control-plane.sh
           ../deployment/aliyun/test-rust-lob-release-adoption.sh
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
+          MONDAY_TEST_RECORDER_IMAGE=1 SOURCE_REVISION="$GITHUB_SHA" \
+            ../deployment/aliyun/test-polymarket-market-recorder-release.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
