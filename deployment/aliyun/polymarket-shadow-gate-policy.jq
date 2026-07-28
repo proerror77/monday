@@ -3,6 +3,21 @@ def positive_integer: type == "number" and floor == . and . > 0;
 def nonnegative_integer: type == "number" and floor == . and . >= 0;
 def file_identity:
   type == "string" and test("^[0-9]+:[0-9]+$");
+def oss_triplet($dataset):
+  . as $triplet
+  | .dataset == $dataset
+  and ($triplet.uri | type == "string"
+    and test("^oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset="
+      + $dataset
+      + "/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}/"
+      + "(sha256=[a-f0-9]{64}/)?market-updates\\.[A-Za-z0-9._-]+\\.ndjson\\.zst$"))
+  and (.file | type == "string"
+    and test("^market-updates\\.[A-Za-z0-9._-]+\\.ndjson\\.zst$"))
+  and (.bytes | positive_integer) and (.source_bytes | positive_integer)
+  and (.sha256 | sha256) and (.manifest_sha256 | sha256)
+  and .success_sha256 == .sha256
+  and ((($triplet.uri | test("/sha256=")) | not)
+    or ($triplet.uri | contains("/sha256=" + $triplet.sha256 + "/")));
 def utc_iso8601_unix:
   if type == "string"
     and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
@@ -42,6 +57,47 @@ and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"
 and (.release_manifest_sha256 | sha256)
 and (.control_archive_sha256 | sha256)
 and (.oss_config_sha256 | sha256)
+and .real_market_preflight.schema == "monday.polymarket_real_market_preflight.v1"
+and .real_market_preflight.status == "passed"
+and .real_market_preflight.candidate_sha256 == .candidate_sha256
+and (.real_market_preflight.deployment_source_revision
+  == .deployment_source_revision)
+and (.real_market_preflight.deployment_bundle_sha256
+  == .deployment_bundle_sha256)
+and (.real_market_preflight.release_manifest_sha256
+  == .release_manifest_sha256)
+and (.real_market_preflight.control_archive_sha256
+  == .control_archive_sha256)
+and .real_market_preflight.oss_config_sha256 == .oss_config_sha256
+and (.real_market_preflight.dataset | type == "string"
+  and test("^crypto_expiry_preflight_[a-f0-9]{12}_[a-z0-9_-]+$"))
+and (.real_market_preflight.dataset == ("crypto_expiry_preflight_"
+  + .candidate_sha256[0:12] + "_" + (.shadow_run_id | ascii_downcase)))
+and (.real_market_preflight.source_quote_records | positive_integer)
+and (.real_market_preflight.source_content_sha256 | sha256)
+and (.real_market_preflight.uploaded_content_sha256
+  == .real_market_preflight.source_content_sha256)
+and (.real_market_preflight.source_triplet | oss_triplet("crypto_expiry"))
+and (.real_market_preflight.uploaded_triplet.dataset
+  == .real_market_preflight.dataset)
+and (.real_market_preflight.uploaded_triplet
+  | oss_triplet(.dataset))
+and (.real_market_preflight.source_triplet.uri
+  != .real_market_preflight.uploaded_triplet.uri)
+and (.real_market_preflight.source_triplet.source_bytes
+  == .real_market_preflight.uploaded_triplet.source_bytes)
+and (.real_market_preflight.upload_summary.uploaded_segments | positive_integer)
+and (.real_market_preflight.upload_summary.canonical_uploaded_segments
+  | positive_integer)
+and .real_market_preflight.upload_summary.pending_segments == 0
+and .real_market_preflight.upload_summary.failed_segments == []
+and .real_market_preflight.upload_summary.last_error == null
+and (.real_market_preflight.started_at | utc_iso8601_unix | type == "number")
+and (.real_market_preflight.completed_at | utc_iso8601_unix | type == "number")
+and ((.real_market_preflight.started_at | utc_iso8601_unix)
+  <= (.real_market_preflight.completed_at | utc_iso8601_unix))
+and ((.real_market_preflight.completed_at | utc_iso8601_unix)
+  <= (.started_at | utc_iso8601_unix))
 and (.duration_seconds | positive_integer and . >= 4201)
 and (.started_at | utc_iso8601_unix | type == "number")
 and (.parity_window_started_at_unix | positive_integer)
@@ -155,10 +211,15 @@ and .checks.candidate_identity == true
 and .checks.memory_events_stable == true
 and .checks.oss_readback_parity == true
 and .checks.market_oss_readback_parity == true
+and .checks.real_market_segment_preflight == true
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.market_oss_uploaded_segments | positive_integer)
 and (.metrics.market_oss_canonical_uploaded_segments | positive_integer)
+and (.metrics.market_oss_uploaded_segments
+  == .real_market_preflight.upload_summary.uploaded_segments)
+and (.metrics.market_oss_canonical_uploaded_segments
+  == .real_market_preflight.upload_summary.canonical_uploaded_segments)
 and (.metrics.rust_closed_tape_count | positive_integer)
 and (.metrics.legacy_trade_count | positive_integer)
 and (.metrics.rust_trade_count | positive_integer)

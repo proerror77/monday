@@ -25,6 +25,7 @@ readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
+readonly MARKET_UPLOAD_STATUS=/data/monday/spool/polymarket/upload-status.json
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly SHADOW_ROOT=/data/monday/spool/polymarket-reference-rust-shadow
@@ -524,6 +525,214 @@ verify_current_oss_config() {
     || die 'OSS configuration changed during the shadow gate'
 }
 
+download_and_verify_oss_triplet() {
+  local uri=$1 expected_dataset=$2 target=$3 prefix relative path_sha data_name
+  local data manifest success superseded_uri superseded_listing manifest_json
+  local expected_bytes expected_sha source_bytes
+  prefix="oss://$oss_bucket/lake/raw/venue=polymarket/dataset=$expected_dataset/"
+  [[ $uri == "$prefix"* ]] || return 1
+  relative=${uri#"$prefix"}
+  [[ $relative =~ ^date=[0-9]{4}-[0-9]{2}-[0-9]{2}/hour=[0-9]{2}/(sha256=[a-f0-9]{64}/)?(market-updates\.[A-Za-z0-9._-]+\.ndjson\.zst)$ ]] \
+    || return 1
+  path_sha=${BASH_REMATCH[1]#sha256=}
+  path_sha=${path_sha%/}
+  data_name=${BASH_REMATCH[2]}
+  mkdir -m 0750 "$target" || return 1
+  data="$target/$data_name"
+  manifest="$data.manifest.json"
+  success="$data._SUCCESS"
+  superseded_uri="$uri.SUPERSEDED.json"
+  verify_current_oss_config
+  superseded_listing=$(aliyun ossutil ls "$superseded_uri" \
+    --profile "$aliyun_profile" --endpoint "$oss_endpoint" \
+    --region "$oss_region") || return 1
+  if grep -Fq "$superseded_uri" <<<"$superseded_listing"; then
+    return 1
+  fi
+  aliyun ossutil cp "$uri" "$data" --profile "$aliyun_profile" \
+    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
+    || return 1
+  aliyun ossutil cp "$uri.manifest.json" "$manifest" --profile "$aliyun_profile" \
+    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
+    || return 1
+  aliyun ossutil cp "$uri._SUCCESS" "$success" --profile "$aliyun_profile" \
+    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
+    || return 1
+  verify_current_oss_config
+  [[ -f $data && ! -L $data && -f $manifest && ! -L $manifest \
+    && -f $success && ! -L $success ]] || return 1
+  manifest_json=$(jq -ce --arg dataset "$expected_dataset" --arg file "$data_name" '
+    select(.venue == "polymarket" and .dataset == $dataset and .file == $file
+      and (.bytes | type == "number" and floor == . and . > 0)
+      and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and (.source_bytes | type == "number" and floor == . and . > 0)
+      and .canonical == true and .segment_complete == true
+      and .source_session_closed == true and .sequence_gaps == 0)' \
+    "$manifest") || return 1
+  expected_bytes=$(jq -er '.bytes' <<<"$manifest_json") || return 1
+  expected_sha=$(jq -er '.sha256' <<<"$manifest_json") || return 1
+  source_bytes=$(jq -er '.source_bytes' <<<"$manifest_json") || return 1
+  [[ -z $path_sha || $path_sha == "$expected_sha" ]] || return 1
+  [[ $(stat -c %s -- "$data") == "$expected_bytes" ]] || return 1
+  [[ $(sha256sum "$data" | awk '{print $1}') == "$expected_sha" ]] || return 1
+  [[ $(wc -c <"$success" | tr -d ' ') == 65 && $(<"$success") == "$expected_sha" ]] \
+    || return 1
+  jq -cn --arg uri "$uri" --arg dataset "$expected_dataset" \
+    --arg file "$data_name" --arg sha256 "$expected_sha" \
+    --arg manifest_sha256 "$(sha256sum "$manifest" | awk '{print $1}')" \
+    --arg success_sha256 "$expected_sha" \
+    --argjson bytes "$expected_bytes" --argjson source_bytes "$source_bytes" \
+    '{uri:$uri,dataset:$dataset,file:$file,bytes:$bytes,sha256:$sha256,
+      source_bytes:$source_bytes,manifest_sha256:$manifest_sha256,
+      success_sha256:$success_sha256}'
+}
+
+real_market_segment_preflight() {
+  local status_file=$1 spool=$2 download_root=$3 evidence=$4 before after status_json
+  local stable=false source_uri source_triplet source_name source_file source_tmp
+  local preflight_dataset started_at completed_at candidate_exit upload_summary
+  local source_quote_records source_content_sha256 uploaded_content_sha256
+  local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
+  local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
+  [[ -f $status_file && ! -L $status_file ]] || return 1
+  for _ in 1 2 3; do
+    before=$(stat -c '%d:%i:%s:%Y:%Z' "$status_file") || return 1
+    status_json=$(jq -cS . "$status_file") || return 1
+    after=$(stat -c '%d:%i:%s:%Y:%Z' "$status_file") || return 1
+    if [[ $before == "$after" ]]; then
+      stable=true
+      break
+    fi
+  done
+  [[ $stable == true ]] || return 1
+  source_uri=$(jq -er '
+    select(.last_error == null and .failed_segments == [])
+    | .last_uploaded_object | select(type == "string" and length > 0)' \
+    <<<"$status_json") || return 1
+  preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
+  [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  source_triplet=$(download_and_verify_oss_triplet \
+    "$source_uri" crypto_expiry "$download_root/source") || return 1
+  source_name=$(jq -er '.file' <<<"$source_triplet") || return 1
+  source_file="$spool/${source_name%.zst}"
+  source_tmp="$source_file.tmp"
+  zstd -q -d -c "$download_root/source/$source_name" >"$source_tmp" || return 1
+  [[ $(wc -c <"$source_tmp" | tr -d ' ') == \
+    "$(jq -er '.source_bytes' <<<"$source_triplet")" ]] || return 1
+  source_quote_records=$(jq -c 'select(.update.kind == "quote")' "$source_tmp" \
+    | wc -l | tr -d ' ') || return 1
+  [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
+  source_content_sha256=$(sha256sum "$source_tmp" | awk '{print $1}') || return 1
+  mv "$source_tmp" "$source_file"
+  chown hftcollector:hftcollector "$source_file"
+  chmod 0640 "$source_file"
+  sync "$source_file"
+
+  candidate_stdout_tmp="$evidence/.real-market-uploader.json.tmp"
+  candidate_stdout="$evidence/real-market-uploader.json"
+  candidate_stderr_tmp="$evidence/.real-market-uploader.stderr.tmp"
+  candidate_stderr="$evidence/real-market-uploader.stderr"
+  if runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
+    "$release_binary" upload --spool-dir "$spool" \
+    --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 1000 \
+    --bucket "$oss_bucket" --endpoint "$oss_endpoint" --region "$oss_region" \
+    --profile "$aliyun_profile" --zstd-timeout "$zstd_timeout_seconds" \
+    --oss-timeout "$oss_copy_timeout_seconds" \
+    >"$candidate_stdout_tmp" 2>"$candidate_stderr_tmp"; then
+    candidate_exit=0
+  else
+    candidate_exit=$?
+  fi
+  mv "$candidate_stdout_tmp" "$candidate_stdout"
+  mv "$candidate_stderr_tmp" "$candidate_stderr"
+  preflight_json="$evidence/real-market-preflight.json"
+  preflight_tmp="$evidence/.real-market-preflight.json.tmp"
+  if ((candidate_exit != 0)) \
+    || ! upload_summary=$(jq -ce '
+      select((.uploaded_segments | type == "number" and floor == . and . > 0)
+        and (.canonical_uploaded_segments
+          | type == "number" and floor == . and . > 0)
+        and .pending_segments == 0 and .failed_segments == []
+        and .last_error == null)' "$candidate_stdout"); then
+    completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -n --arg started_at "$started_at" --arg completed_at "$completed_at" \
+      --arg candidate_sha256 "$candidate_sha" \
+      --arg deployment_source_revision "$source_revision" \
+      --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
+      --arg release_manifest_sha256 "$release_manifest_sha" \
+      --arg control_archive_sha256 "$control_archive_sha" \
+      --arg oss_config_sha256 "$oss_config_sha" \
+      --arg dataset "$preflight_dataset" --argjson source_triplet "$source_triplet" \
+      --arg source_content_sha256 "$source_content_sha256" \
+      --argjson source_quote_records "$source_quote_records" \
+      --arg stderr_sha256 "$(sha256sum "$candidate_stderr" | awk '{print $1}')" \
+      --argjson candidate_exit_code "$candidate_exit" \
+      '{schema:"monday.polymarket_real_market_preflight.v1",status:"failed",
+        started_at:$started_at,completed_at:$completed_at,
+        candidate_sha256:$candidate_sha256,
+        deployment_source_revision:$deployment_source_revision,
+        deployment_bundle_sha256:$deployment_bundle_sha256,
+        release_manifest_sha256:$release_manifest_sha256,
+        control_archive_sha256:$control_archive_sha256,
+        oss_config_sha256:$oss_config_sha256,dataset:$dataset,
+        source_triplet:$source_triplet,source_quote_records:$source_quote_records,
+        source_content_sha256:$source_content_sha256,
+        candidate_exit_code:$candidate_exit_code,
+        candidate_stderr_sha256:$stderr_sha256}' >"$preflight_tmp"
+    mv "$preflight_tmp" "$preflight_json"
+    sync "$candidate_stdout" "$candidate_stderr" "$preflight_json"
+    return 1
+  fi
+
+  uploaded_uri=$(jq -er --arg dataset "$preflight_dataset" '
+    select(.last_error == null and .failed_segments == []
+      and .uploaded_segments > 0 and .canonical_uploaded_segments > 0)
+    | .last_uploaded_object
+    | select(type == "string" and contains("/dataset=" + $dataset + "/"))' \
+    "$spool/upload-status.json") || return 1
+  uploaded_triplet=$(download_and_verify_oss_triplet \
+    "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded") || return 1
+  [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == \
+    "$(jq -er '.source_bytes' <<<"$source_triplet")" ]] || return 1
+  uploaded_name=$(jq -er '.file' <<<"$uploaded_triplet") || return 1
+  uploaded_content_sha256=$(zstd -q -d -c \
+    "$download_root/uploaded/$uploaded_name" | sha256sum | awk '{print $1}') \
+    || return 1
+  [[ $uploaded_content_sha256 == "$source_content_sha256" ]] || return 1
+  verify_current_oss_config
+  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n --arg started_at "$started_at" --arg completed_at "$completed_at" \
+    --arg candidate_sha256 "$candidate_sha" \
+    --arg deployment_source_revision "$source_revision" \
+    --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
+    --arg release_manifest_sha256 "$release_manifest_sha" \
+    --arg control_archive_sha256 "$control_archive_sha" \
+    --arg oss_config_sha256 "$oss_config_sha" --arg dataset "$preflight_dataset" \
+    --arg source_content_sha256 "$source_content_sha256" \
+    --arg uploaded_content_sha256 "$uploaded_content_sha256" \
+    --argjson source_quote_records "$source_quote_records" \
+    --argjson source_triplet "$source_triplet" \
+    --argjson uploaded_triplet "$uploaded_triplet" \
+    --argjson upload_summary "$upload_summary" \
+    '{schema:"monday.polymarket_real_market_preflight.v1",status:"passed",
+      started_at:$started_at,completed_at:$completed_at,
+      candidate_sha256:$candidate_sha256,
+      deployment_source_revision:$deployment_source_revision,
+      deployment_bundle_sha256:$deployment_bundle_sha256,
+      release_manifest_sha256:$release_manifest_sha256,
+      control_archive_sha256:$control_archive_sha256,
+      oss_config_sha256:$oss_config_sha256,dataset:$dataset,
+      source_quote_records:$source_quote_records,
+      source_content_sha256:$source_content_sha256,
+      uploaded_content_sha256:$uploaded_content_sha256,
+      source_triplet:$source_triplet,uploaded_triplet:$uploaded_triplet,
+      upload_summary:$upload_summary}' >"$preflight_tmp"
+  mv "$preflight_tmp" "$preflight_json"
+  sync "$candidate_stdout" "$candidate_stderr" "$preflight_json"
+  real_market_preflight_json=$(jq -cS . "$preflight_json") || return 1
+}
+
 install_pinned_upload_env() {
   local destination=$1 temporary
   if [[ -e $destination || -L $destination ]]; then
@@ -659,8 +868,8 @@ memory_events_json() {
   exit 2
 }
 
-for command in awk chown chmod date flock grep install journalctl jq mkdir mktemp mountpoint mv \
-  readlink rm runuser sed sha256sum sleep stat sync systemctl tr wc; do
+for command in aliyun awk chown chmod date flock grep install journalctl jq mkdir mktemp \
+  mountpoint mv readlink rm runuser sed sha256sum sleep stat sync systemctl tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -777,6 +986,7 @@ cleanup() {
   fi
   rm -rf "${staging:-}"
   rm -rf "${control_staging:-}"
+  rm -rf "${market_preflight_download_dir:-}"
   rm -f "${shadow_env_file:-}" "${shadow_env_tmp:-}"
   exit "$status"
 }
@@ -852,6 +1062,20 @@ secure_collector_directory "$shadow_spool" \
 secure_collector_directory "$market_shadow_spool" \
   || die 'market shadow spool identity or permissions are unsafe'
 
+evidence_parent="$EVIDENCE_ROOT/$candidate_sha"
+install -d -m 0755 /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"
+for path in /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"; do
+  secure_root_chain "$path" || die "evidence path is not trusted: $path"
+done
+evidence_dir="$evidence_parent/$run_id"
+mkdir -m 0750 "$evidence_dir" || die 'evidence run already exists'
+secure_root_chain "$evidence_dir" || die 'evidence run directory is not trusted'
+market_preflight_download_dir="$shadow_parent/.${run_id}.real-market-preflight"
+mkdir -m 0750 "$market_preflight_download_dir" \
+  || die 'real market preflight download directory already exists'
+secure_root_chain "$market_preflight_download_dir" \
+  || die 'real market preflight download directory is not trusted'
+
 install -d -m 0755 /run/monday
 secure_root_chain /run/monday || die 'runtime environment directory is not trusted'
 shadow_env_file="/run/monday/polymarket-reference-shadow-${candidate_sha}.env"
@@ -872,6 +1096,18 @@ shadow_env_tmp=
 install -m 0644 "$release_control_dir/${SERVICE_TEMPLATE##*/}" \
   /etc/systemd/system/polymarket-reference-collector-shadow@.service
 systemctl daemon-reload
+
+real_market_preflight_json=
+real_market_segment_preflight "$MARKET_UPLOAD_STATUS" "$market_shadow_spool" \
+  "$market_preflight_download_dir" "$evidence_dir" \
+  || die 'candidate rejected a real production closed market segment before shadow startup'
+market_upload_json=$(jq -c '.upload_summary' <<<"$real_market_preflight_json") \
+  || die 'real market preflight upload summary is invalid'
+market_uploaded_segments=$(jq -er '.uploaded_segments' <<<"$market_upload_json") \
+  || die 'real market preflight did not verify a closed segment'
+market_canonical_uploaded_segments=$(jq -er '.canonical_uploaded_segments' \
+  <<<"$market_upload_json") \
+  || die 'real market preflight did not verify a canonical closed segment'
 
 baseline_health_snapshot=null
 baseline_health_started_at=
@@ -1170,14 +1406,6 @@ stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_u
 [[ $stopped_shadow_restarts == 0 ]] \
   || die 'Rust shadow restarted between final verification and stop'
 
-evidence_parent="$EVIDENCE_ROOT/$candidate_sha"
-install -d -m 0755 /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"
-for path in /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"; do
-  secure_root_chain "$path" || die "evidence path is not trusted: $path"
-done
-evidence_dir="$evidence_parent/$run_id"
-mkdir -m 0750 "$evidence_dir" || die 'evidence run already exists'
-secure_root_chain "$evidence_dir" || die 'evidence run directory is not trusted'
 parity_json="$evidence_dir/parity.json"
 "$release_binary" verify-shadow-parity \
   --legacy-spool "$LEGACY_SPOOL" \
@@ -1206,57 +1434,6 @@ uploaded_segments=$(jq -er '.uploaded_segments | select(type == "number" and flo
 canonical_uploaded_segments=$(jq -er \
   '.canonical_uploaded_segments | select(type == "number" and floor == . and . > 0)' \
   <<<"$upload_json") || die 'shadow uploader did not verify a canonical closed segment'
-
-# Exercise the market-tape validation/upload/readback path with a deterministic,
-# closed fixture. A content-addressed rerun must verify the same remote triplet.
-market_fixture="$market_shadow_spool/market-updates.20000101T000003.ndjson"
-{
-  jq -cn '{sequence:0,recorded_at:"2000-01-01T00:00:00Z",update:{
-    kind:"event_discovered",event_id:"shadow-market-upload",symbol:"BTCUSDT",
-    up_token:"shadow-up",down_token:"shadow-down",end_time:"2000-01-01T00:05:00Z",
-    window_secs:300,price_to_beat:"100",resolved_up_won:null}}'
-  jq -cn '{sequence:1,recorded_at:"2000-01-01T00:00:01Z",update:{
-    kind:"quote",token_id:"shadow-up",bid:"0.49",ask:"0.51",
-    bid_size:"10",ask_size:"11",bid_levels:[{price:"0.49",size:"10"}],
-    ask_levels:[{price:"0.51",size:"11"}],request_status:"success",
-    collection_result:"executable",ts:"2000-01-01T00:00:01Z"}}'
-  jq -cn '{sequence:2,recorded_at:"2000-01-01T00:00:01Z",update:{
-    kind:"quote",token_id:"shadow-down",bid:"0.49",ask:"0.51",
-    bid_size:"10",ask_size:"11",bid_levels:[{price:"0.49",size:"10"}],
-    ask_levels:[{price:"0.51",size:"11"}],request_status:"success",
-    collection_result:"executable",ts:"2000-01-01T00:00:01Z"}}'
-  jq -cn '{sequence:3,recorded_at:"2000-01-01T00:00:02Z",update:{
-    kind:"reference_price",symbol:"BTCUSDT",source:"binance",asset_class:"crypto",
-    price:"100",full_accuracy_value:null,is_carried_forward:false,
-    ts:"2000-01-01T00:00:02Z"}}'
-} >"$market_fixture"
-chown hftcollector:hftcollector "$market_fixture"
-chmod 0640 "$market_fixture"
-sync "$market_fixture"
-
-verify_current_oss_config
-market_upload_json=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
-  "$release_binary" upload \
-  --spool-dir "$market_shadow_spool" \
-  --dataset crypto_expiry_market_rust_shadow \
-  --quote-depth-levels 0 \
-  --quote-sample-ms 1000 \
-  --bucket "$oss_bucket" \
-  --endpoint "$oss_endpoint" \
-  --region "$oss_region" \
-  --profile "$aliyun_profile" \
-  --zstd-timeout "$zstd_timeout_seconds" \
-  --oss-timeout "$oss_copy_timeout_seconds") \
-  || die 'market-tape shadow OSS upload/readback failed'
-verify_current_oss_config
-market_uploaded_segments=$(jq -er \
-  '.uploaded_segments | select(type == "number" and floor == . and . > 0)' \
-  <<<"$market_upload_json") \
-  || die 'market-tape shadow uploader did not verify a closed segment'
-market_canonical_uploaded_segments=$(jq -er \
-  '.canonical_uploaded_segments | select(type == "number" and floor == . and . > 0)' \
-  <<<"$market_upload_json") \
-  || die 'market-tape shadow uploader did not verify a canonical closed segment'
 
 if [[ $baseline_mode == legacy_python ]]; then
   verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
@@ -1331,6 +1508,7 @@ jq \
   --argjson canonical_uploaded_segments "$canonical_uploaded_segments" \
   --argjson market_uploaded_segments "$market_uploaded_segments" \
   --argjson market_canonical_uploaded_segments "$market_canonical_uploaded_segments" \
+  --argjson real_market_preflight "$real_market_preflight_json" \
   '. + {
     schema:"monday.polymarket_shadow_gate.v1",
     baseline_mode:$baseline_mode,
@@ -1357,6 +1535,7 @@ jq \
     baseline_health_start_file_identity:$baseline_health_start_file_identity,
     baseline_health_completion_file_identity:
       $baseline_health_completion_file_identity,
+    real_market_preflight:$real_market_preflight,
     legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
         cmdline_sha256:$legacy_cmdline_sha256,
         fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
@@ -1375,7 +1554,8 @@ jq \
       candidate_identity:true,
       memory_events_stable:true,
       oss_readback_parity:true,
-      market_oss_readback_parity:true
+      market_oss_readback_parity:true,
+      real_market_segment_preflight:true
     }),
     metrics:(.metrics + {
       oss_uploaded_segments:$uploaded_segments,
