@@ -175,6 +175,7 @@ while (($#)); do
 done
 source_file=$(find "$spool" -maxdepth 1 -type f -name 'market-updates.*.ndjson' \
   | head -n 1)
+canonical_count=${FAKE_CANONICAL_COUNT:-1}
 if jq -e 'select(.update.kind == "quote"
     and (.update.request_status != "success"
       or (.update.collection_result | type != "string")))' \
@@ -193,17 +194,20 @@ jq --arg dataset "$dataset" '.dataset = $dataset' \
   >"$destination.manifest.json"
 cp "$FAKE_CANDIDATE_TEMPLATE/$name._SUCCESS" "$destination._SUCCESS"
 uri="oss://$bucket/$relative"
-jq -n --arg uri "$uri" \
+jq -n --arg uri "$uri" --argjson canonical_count "$canonical_count" \
   '{updated_at:"2026-01-01T01:00:00Z",last_success_at:"2026-01-01T01:00:00Z",
-    last_uploaded_object:$uri,uploaded_segments:1,canonical_uploaded_segments:1,
+    last_uploaded_object:$uri,uploaded_segments:1,
+    canonical_uploaded_segments:$canonical_count,
     pending_segments:0,failed_segments:[],last_error:null,last_error_at:null}' \
   >"$spool/upload-status.json"
-jq -cn '{uploaded_segments:1,canonical_uploaded_segments:1}'
+jq -cn --argjson canonical_count "$canonical_count" \
+  '{uploaded_segments:1,canonical_uploaded_segments:$canonical_count}'
 EOF
 chmod +x "$preflight_root/candidate"
 
 incompatible="$preflight_root/incompatible.ndjson"
 compatible="$preflight_root/compatible.ndjson"
+noncanonical="$preflight_root/noncanonical.ndjson"
 no_quote="$preflight_root/no-quote.ndjson"
 cross_hour="$preflight_root/cross-hour.ndjson"
 unrelated="$preflight_root/unrelated.ndjson"
@@ -216,6 +220,11 @@ printf '%s\n' \
   '{"sequence":1,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"up","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
   '{"sequence":2,"recorded_at":"2026-01-01T00:00:01Z","update":{"kind":"quote","token_id":"down","bid":"0.49","ask":"0.51","bid_size":"10","ask_size":"10","bid_levels":[],"ask_levels":[],"request_status":"success","collection_result":"executable","ts":"2026-01-01T00:00:01Z"}}' \
   >"$compatible"
+printf '%s\n' \
+  "$(head -n 1 "$compatible")" \
+  "$(sed -n '2p' "$compatible")" \
+  '{"sequence":2,"recorded_at":"2026-01-01T00:00:02Z","update":{"kind":"quote_collection_failure","token_id":"down","request_status":"failure","collection_result":"api_failure","request_started_at":"2026-01-01T00:00:01.900Z","http_status":null,"error_kind":"websocket_receive","ts":"2026-01-01T00:00:02Z"}}' \
+  >"$noncanonical"
 head -n 1 "$compatible" >"$no_quote"
 jq -c 'if .sequence == 2 then
   .recorded_at = "2026-01-01T01:00:01Z"
@@ -332,6 +341,23 @@ fi
 export FAKE_CANDIDATE_TEMPLATE="$matching_template_dir"
 release_binary="$VERIFY"
 
+inconsistent_canonical_case="$preflight_root/inconsistent-canonical-case"
+mkdir -p "$inconsistent_canonical_case/source" \
+  "$inconsistent_canonical_case/spool" "$inconsistent_canonical_case/download" \
+  "$inconsistent_canonical_case/evidence"
+cp "$compatible" \
+  "$inconsistent_canonical_case/source/market-updates.20260101T041000000000.ndjson"
+export FAKE_CANONICAL_COUNT=0
+release_binary="$fake_release_binary"
+if real_market_segment_preflight "$inconsistent_canonical_case/source" \
+  "$inconsistent_canonical_case/spool" "$inconsistent_canonical_case/download" \
+  "$inconsistent_canonical_case/evidence"; then
+  printf 'real-segment preflight accepted a canonical count inconsistent with its manifest\n' >&2
+  exit 1
+fi
+unset FAKE_CANONICAL_COUNT
+release_binary="$VERIFY"
+
 empty_case="$preflight_root/empty-case"
 mkdir -p "$empty_case/source" "$empty_case/spool" "$empty_case/download" \
   "$empty_case/evidence"
@@ -385,12 +411,13 @@ mkdir -p "$good_case/source" "$good_case/spool" "$good_case/download" \
 good_base="$good_case/source/market-updates.20260101T020000000000.ndjson"
 good_uuid="$good_case/source/market-updates.20260101T020000000000.123e4567-e89b-12d3-a456-426614174000.ndjson"
 cp "$no_quote" "$good_base"
-cp "$compatible" "$good_uuid"
+cp "$noncanonical" "$good_uuid"
 jq -n '{last_uploaded_object:null,failed_segments:["legacy uploader rejected it"],
   last_error:"legacy uploader rejected it"}' >"$good_case/source/upload-status.json"
 real_market_segment_preflight "$good_case/source" "$good_case/spool" \
   "$good_case/download" "$good_case/evidence" || {
   sed -n '1,20p' "$good_case/evidence/real-market-uploader.stderr" >&2
+  printf 'real-segment preflight rejected a verified non-canonical upload\n' >&2
   exit 1
 }
 jq -e '.status == "passed"
@@ -402,10 +429,13 @@ jq -e '.status == "passed"
   and .source_segment.sha256 == .source_content_sha256
   and .source_segment.bytes == .uploaded_triplet.source_bytes
   and (.uploaded_triplet.dataset | startswith("crypto_expiry_preflight_"))
-  and .source_quote_records == 2
+  and .uploaded_triplet.canonical == false
+  and .uploaded_triplet.segment_complete == false
+  and .source_quote_records == 1
   and .source_recorded_hours == 1
   and .source_content_sha256 == .uploaded_content_sha256
-  and .upload_summary.uploaded_segments == 1' \
+  and .upload_summary.uploaded_segments == 1
+  and .upload_summary.canonical_uploaded_segments == 0' \
   --arg source "$good_uuid" \
   "$good_case/evidence/real-market-preflight.json" >/dev/null
 export PATH=$original_path
@@ -1764,7 +1794,8 @@ jq \
         dataset:"crypto_expiry_preflight_aaaaaaaaaaaa_run-1",
         file:"market-updates.19700101T010000.19700101T00.ndjson.zst",
         bytes:10,source_bytes:20,sha256:$candidate,
-        manifest_sha256:$bundle,success_sha256:$candidate
+        manifest_sha256:$bundle,success_sha256:$candidate,
+        canonical:true,segment_complete:true
       },
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
@@ -2168,10 +2199,41 @@ if jq -e -f "$POLICY" "$tmp_dir/noncanonical-reference-upload.json" >/dev/null; 
   printf 'gate policy accepted a noncanonical reference upload\n' >&2
   exit 1
 fi
-jq '.metrics.market_oss_canonical_uploaded_segments = 0' "$tmp_dir/gate.json" \
-  >"$tmp_dir/noncanonical-market-upload.json"
-if jq -e -f "$POLICY" "$tmp_dir/noncanonical-market-upload.json" >/dev/null; then
-  printf 'gate policy accepted a noncanonical market-tape upload\n' >&2
+jq '.real_market_preflight.upload_summary.canonical_uploaded_segments = 0
+  | .real_market_preflight.uploaded_triplet.canonical = false
+  | .real_market_preflight.uploaded_triplet.segment_complete = false
+  | .metrics.market_oss_canonical_uploaded_segments = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/noncanonical-market-upload.json"
+if ! jq -e -f "$POLICY" "$tmp_dir/noncanonical-market-upload.json" >/dev/null; then
+  printf 'gate policy rejected a verified noncanonical market-tape upload\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.upload_summary.uploaded_segments = 2
+  | .metrics.market_oss_uploaded_segments = 2' \
+  "$tmp_dir/gate.json" >"$tmp_dir/multiple-market-preflight-uploads.json"
+if jq -e -f "$POLICY" "$tmp_dir/multiple-market-preflight-uploads.json" \
+  >/dev/null; then
+  printf 'gate policy accepted multiple uploads for a one-hour preflight\n' >&2
+  exit 1
+fi
+jq '.real_market_preflight.upload_summary.canonical_uploaded_segments = 0
+  | .metrics.market_oss_canonical_uploaded_segments = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/inconsistent-market-canonical-count.json"
+if jq -e -f "$POLICY" "$tmp_dir/inconsistent-market-canonical-count.json" \
+  >/dev/null; then
+  printf 'gate policy accepted a canonical count inconsistent with its manifest\n' >&2
+  exit 1
+fi
+jq 'del(.real_market_preflight.uploaded_triplet.canonical)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unbound-market-canonical.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-market-canonical.json" >/dev/null; then
+  printf 'gate policy accepted evidence without the uploaded canonical flag\n' >&2
+  exit 1
+fi
+jq '.metrics.market_oss_canonical_uploaded_segments = -1' "$tmp_dir/gate.json" \
+  >"$tmp_dir/invalid-market-upload-count.json"
+if jq -e -f "$POLICY" "$tmp_dir/invalid-market-upload-count.json" >/dev/null; then
+  printf 'gate policy accepted a negative market-tape canonical count\n' >&2
   exit 1
 fi
 jq 'del(.oss_config_sha256)' "$tmp_dir/gate.json" >"$tmp_dir/unbound-oss-config.json"
