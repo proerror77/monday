@@ -16,8 +16,7 @@ use crate::prediction_loop::{
     PREDICTION_MISSION_SCHEMA_VERSION,
 };
 use crate::prediction_loop_fs::{
-    atomic_write_json, read_json, read_verified_artifact_bounded, write_content_addressed_json,
-    ArtifactRef,
+    read_verified_artifact_bounded, write_content_addressed_json, ArtifactRef,
 };
 use crate::prediction_mcts::{
     ExecutionTrainingEvidence, PredictionMctsCandidate, PredictionMctsEvaluation,
@@ -26,7 +25,7 @@ use crate::prediction_mcts::{
 };
 use crate::prediction_mcts_run::{
     authenticated_selection_evidence, run_or_resume_authenticated_prediction_mcts, task_output_dir,
-    PredictionMctsRunEvaluator,
+    PredictionMctsHeldOutArtifact, PredictionMctsRunEvaluator,
 };
 use crate::prediction_mission_v3::{
     admit_prediction_mission_v3, authenticate_prediction_mission_v3_inputs,
@@ -93,6 +92,7 @@ pub struct AuthenticatedEvaluationArtifact {
 }
 
 const AUTHENTICATED_EVALUATION_SCHEMA_VERSION: &str = "prediction_authenticated_evaluation.v1";
+const MAX_AUTHENTICATED_EVALUATION_BYTES: usize = 1024 * 1024;
 
 impl AuthenticatedEvaluationArtifact {
     fn new(
@@ -140,6 +140,16 @@ impl AuthenticatedEvaluationArtifact {
             return Err("held-out evaluator artifact digest mismatch".to_string());
         }
         Ok(())
+    }
+
+    fn content_sha256(&self) -> Result<String, String> {
+        self.validate()?;
+        Ok(format!(
+            "sha256:{}",
+            crate::prediction_loop_fs::sha256_hex(
+                &crate::prediction_loop_fs::canonical_json_bytes(self)?
+            )
+        ))
     }
 }
 
@@ -280,6 +290,21 @@ impl AuthenticatedPredictionResultReceipt {
         {
             return Err("result receipt does not match the durable held-out selection".to_string());
         }
+        let held_out_artifact = selection
+            .held_out_artifact
+            .as_ref()
+            .ok_or_else(|| "result receipt is missing its durable held-out artifact".to_string())?;
+        let evaluator_artifact_sha256 = artifact.content_sha256()?;
+        if held_out_artifact.sha256
+            != evaluator_artifact_sha256
+                .strip_prefix("sha256:")
+                .unwrap_or_default()
+        {
+            return Err(
+                "result receipt evaluator artifact does not match the durable selection"
+                    .to_string(),
+            );
+        }
         let mission_sha256 = prediction_mission_v3_sha256(mission)?;
         if admitted.mission_sha256 != mission_sha256 {
             return Err("result receipt Mission digest does not match admission".to_string());
@@ -294,7 +319,7 @@ impl AuthenticatedPredictionResultReceipt {
             result_sealed_unix_millis: selection.result_sealed_unix_millis,
             checkpoint_sha256: selection.checkpoint_sha256.clone(),
             selected_candidate_sha256: selection.selected_candidate_sha256.clone(),
-            evaluator_artifact_sha256: artifact.sha256.clone(),
+            evaluator_artifact_sha256,
             metrics: artifact.metrics.clone(),
             sha256: String::new(),
         };
@@ -366,13 +391,16 @@ impl AuthenticatedPredictionResultReceipt {
         if !metrics_match {
             return Err("authenticated result receipt metrics do not match its task".to_string());
         }
-        AuthenticatedEvaluationArtifact {
+        let mut artifact = AuthenticatedEvaluationArtifact {
             schema_version: AUTHENTICATED_EVALUATION_SCHEMA_VERSION.to_string(),
             selected_candidate_sha256: self.selected_candidate_sha256.clone(),
             metrics: self.metrics.clone(),
-            sha256: self.evaluator_artifact_sha256.clone(),
+            sha256: String::new(),
+        };
+        artifact.sha256 = artifact.expected_sha256()?;
+        if self.evaluator_artifact_sha256 != artifact.content_sha256()? {
+            return Err("authenticated result receipt evaluator artifact mismatch".to_string());
         }
-        .validate()?;
         if self.sha256 != self.expected_sha256()? {
             return Err("authenticated result receipt digest mismatch".to_string());
         }
@@ -1348,9 +1376,8 @@ pub struct AuthenticatedPredictionMctsTrialRun {
 struct EvaluatorAdapter<'a, E> {
     mission: &'a PredictionResearchMissionV3,
     views: &'a AuthenticatedSnapshotViews,
-    output_dir: &'a Path,
-    identity: &'a PredictionMctsIdentity,
     evaluator: &'a mut E,
+    held_out_artifact: Option<PredictionMctsHeldOutArtifact>,
 }
 
 impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
@@ -1400,12 +1427,12 @@ impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
             timeout,
         )?;
         artifact.validate()?;
-        let task_dir = task_output_dir(self.output_dir, self.identity)?;
-        atomic_write_json(
-            &task_dir.join("authenticated-held-out-evaluation.json"),
-            &artifact,
-        )?;
+        self.held_out_artifact = Some(PredictionMctsHeldOutArtifact::from_serializable(&artifact)?);
         Ok(())
+    }
+
+    fn take_held_out_artifact(&mut self) -> Result<Option<PredictionMctsHeldOutArtifact>, String> {
+        Ok(self.held_out_artifact.take())
     }
 }
 
@@ -1441,9 +1468,8 @@ pub fn run_or_resume_authenticated_prediction_mcts_trial<
         let mut adapter = EvaluatorAdapter {
             mission,
             views: &views,
-            output_dir,
-            identity: &identity,
             evaluator,
+            held_out_artifact: None,
         };
         run_or_resume_authenticated_prediction_mcts(
             bridge,
@@ -1464,8 +1490,17 @@ pub fn run_or_resume_authenticated_prediction_mcts_trial<
     if selection.immutable_image_identity.as_deref() != Some(immutable_image_identity) {
         return Err("immutable evaluator image does not match the durable run".to_string());
     }
+    let artifact_ref = selection
+        .held_out_artifact
+        .as_ref()
+        .ok_or_else(|| "durable held-out evaluation artifact is missing".to_string())?;
     let artifact: AuthenticatedEvaluationArtifact =
-        read_json(&task_dir.join("authenticated-held-out-evaluation.json"))?;
+        serde_json::from_slice(&read_verified_artifact_bounded(
+            &task_dir,
+            artifact_ref,
+            MAX_AUTHENTICATED_EVALUATION_BYTES,
+        )?)
+        .map_err(|error| format!("parse authenticated held-out evaluation: {error}"))?;
     artifact.validate()?;
     let receipt = AuthenticatedPredictionResultReceipt::new(
         mission,
@@ -1895,6 +1930,35 @@ mod tests {
     }
 
     #[test]
+    fn result_receipt_rejects_held_out_artifact_mutated_after_selection_seal() {
+        let mission = mission(PredictionTaskKind::SettlementProbability, None, None);
+        let candidate = candidate(&mission);
+        let metrics = builtin_task_metrics(&mission, &authenticated_training_snapshot()).unwrap();
+        let original = AuthenticatedEvaluationArtifact::new(&candidate, metrics.clone()).unwrap();
+        let image = format!("sha256:{}", "7".repeat(64));
+        let selection = selection_evidence(&image, &original).unwrap();
+        let AuthenticatedTaskMetrics::Settlement(mut changed) = metrics else {
+            unreachable!()
+        };
+        changed.mean_brier_score += 0.01;
+        let changed = AuthenticatedEvaluationArtifact::new(
+            &candidate,
+            AuthenticatedTaskMetrics::Settlement(changed),
+        )
+        .unwrap();
+
+        let error = AuthenticatedPredictionResultReceipt::new(
+            &mission,
+            &admitted(&mission),
+            &image,
+            &selection,
+            &changed,
+        )
+        .expect_err("receipt must reject a held-out artifact changed after selection was sealed");
+        assert!(error.contains("durable selection"));
+    }
+
+    #[test]
     fn experiment_manifest_requires_exactly_three_matching_typed_receipts() {
         let output = tempfile::tempdir().expect("create private experiment directory");
         let output = output.path();
@@ -2139,16 +2203,33 @@ mod tests {
         let candidate = candidate(mission);
         let artifact = AuthenticatedEvaluationArtifact::new(&candidate, metrics)?;
         let image = format!("sha256:{}", "7".repeat(64));
-        let selection = crate::prediction_mcts_run::PredictionMctsSelectionEvidence {
-            held_out_complete: true,
-            immutable_image_identity: Some(image.clone()),
-            run_started_unix_millis: 1,
-            held_out_completed_unix_millis: 2,
-            result_sealed_unix_millis: 3,
-            checkpoint_sha256: format!("sha256:{}", "8".repeat(64)),
-            selected_candidate_sha256: artifact.selected_candidate_sha256.clone(),
-        };
+        let selection = selection_evidence(&image, &artifact)?;
         AuthenticatedPredictionResultReceipt::new(mission, &admitted, &image, &selection, &artifact)
+    }
+
+    fn selection_evidence(
+        image: &str,
+        artifact: &AuthenticatedEvaluationArtifact,
+    ) -> Result<crate::prediction_mcts_run::PredictionMctsSelectionEvidence, String> {
+        Ok(
+            crate::prediction_mcts_run::PredictionMctsSelectionEvidence {
+                held_out_complete: true,
+                immutable_image_identity: Some(image.to_string()),
+                run_started_unix_millis: 1,
+                held_out_completed_unix_millis: 2,
+                result_sealed_unix_millis: 3,
+                held_out_artifact: Some(ArtifactRef {
+                    path: "test-held-out-evaluation.json".to_string(),
+                    sha256: artifact
+                        .content_sha256()?
+                        .strip_prefix("sha256:")
+                        .unwrap()
+                        .to_string(),
+                }),
+                checkpoint_sha256: format!("sha256:{}", "8".repeat(64)),
+                selected_candidate_sha256: artifact.selected_candidate_sha256.clone(),
+            },
+        )
     }
 
     fn write_test_receipt(

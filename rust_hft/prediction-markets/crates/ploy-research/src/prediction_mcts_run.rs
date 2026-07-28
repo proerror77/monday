@@ -22,8 +22,8 @@ use crate::prediction_mcts::{
 };
 use crate::prediction_mission_v3::{AdmittedPredictionMissionV3, PredictionResearchMissionV3};
 
-const RUN_STATE_VERSION: u32 = 5;
-const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v4";
+const RUN_STATE_VERSION: u32 = 6;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v5";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -54,6 +54,21 @@ pub trait PredictionMctsRunEvaluator {
         candidate: &PredictionMctsCandidate,
         timeout: Duration,
     ) -> Result<(), String>;
+
+    fn take_held_out_artifact(&mut self) -> Result<Option<PredictionMctsHeldOutArtifact>, String> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+pub struct PredictionMctsHeldOutArtifact(serde_json::Value);
+
+impl PredictionMctsHeldOutArtifact {
+    pub fn from_serializable<T: Serialize>(value: &T) -> Result<Self, String> {
+        serde_json::to_value(value)
+            .map(Self)
+            .map_err(|error| format!("serialize prediction MCTS held-out artifact: {error}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +103,8 @@ struct PredictionMctsRunState {
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
     #[serde(default)]
+    held_out_artifact: Option<ArtifactRef>,
+    #[serde(default)]
     held_out_completed_unix_millis: Option<u64>,
     #[serde(default)]
     result_sealed_unix_millis: Option<u64>,
@@ -112,6 +129,8 @@ struct PredictionMctsRunArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held_out_artifact: Option<ArtifactRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     held_out_completed_unix_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +175,14 @@ impl PredictionMctsRunState {
             return Err("prediction MCTS lifecycle timestamps are invalid".to_string());
         }
         let identity = self.identity()?;
+        if self.held_out_artifact.is_some() && !self.held_out_complete
+            || identity.sealed_mission_sha256().is_some()
+                && self.held_out_complete != self.held_out_artifact.is_some()
+        {
+            return Err(
+                "sealed prediction MCTS result is missing its held-out artifact".to_string(),
+            );
+        }
         let checkpoint_state = self.checkpoint.as_ref();
         let checkpoint = checkpoint_state
             .map(PredictionMctsCheckpoint::read_only_artifact)
@@ -245,6 +272,7 @@ impl PredictionMctsRunState {
             training,
             selected: self.selected.clone(),
             held_out_complete: self.held_out_complete,
+            held_out_artifact: self.held_out_artifact.clone(),
             held_out_completed_unix_millis: self.held_out_completed_unix_millis,
             result_sealed_unix_millis: self.result_sealed_unix_millis,
             pause_reason: self.pause_reason.clone(),
@@ -412,12 +440,16 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             training: Vec::new(),
             selected: None,
             held_out_complete: false,
+            held_out_artifact: None,
             held_out_completed_unix_millis: None,
             result_sealed_unix_millis: None,
             pause_reason: None,
         }
     };
     state.pause_reason = None;
+    if let Some(artifact) = &state.held_out_artifact {
+        verify_artifact(&output_dir, artifact)?;
+    }
     checkpoint(&state_path, &mut state)?;
 
     if state.budget_exhausted {
@@ -605,6 +637,28 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         ) {
             return pause(&mission, &state_path, &mut state, reason);
         }
+        let held_out_artifact = match evaluator.take_held_out_artifact() {
+            Ok(artifact) => artifact,
+            Err(reason) => return pause(&mission, &state_path, &mut state, reason),
+        };
+        let held_out_artifact = match held_out_artifact {
+            Some(artifact) => Some(write_content_addressed_json(
+                &output_dir,
+                &output_dir,
+                "prediction-mcts-held-out-evaluation",
+                &artifact.0,
+            )?),
+            None if admitted.is_some() => {
+                return pause(
+                    &mission,
+                    &state_path,
+                    &mut state,
+                    "authenticated held-out evaluator emitted no sealable artifact".to_string(),
+                )
+            }
+            None => None,
+        };
+        state.held_out_artifact = held_out_artifact;
         state.held_out_complete = true;
         let completed = now_unix_millis().max(state.run_started_unix_millis);
         state.held_out_completed_unix_millis = Some(completed);
@@ -659,6 +713,7 @@ pub(crate) struct PredictionMctsSelectionEvidence {
     pub run_started_unix_millis: u64,
     pub held_out_completed_unix_millis: u64,
     pub result_sealed_unix_millis: u64,
+    pub held_out_artifact: Option<ArtifactRef>,
     pub checkpoint_sha256: String,
     pub selected_candidate_sha256: String,
 }
@@ -688,12 +743,16 @@ pub(crate) fn authenticated_selection_evidence(
     if checkpoint.sha256 != sha256_hex(&canonical_json_bytes(&current_artifact)?) {
         return Err("selection checkpoint does not match the current durable state".to_string());
     }
+    if let Some(artifact) = &state.held_out_artifact {
+        verify_artifact(&output_dir, artifact)?;
+    }
     Ok(PredictionMctsSelectionEvidence {
         held_out_complete: state.held_out_complete,
         immutable_image_identity: state.immutable_image_identity,
         run_started_unix_millis: state.run_started_unix_millis,
         held_out_completed_unix_millis: state.held_out_completed_unix_millis.unwrap_or_default(),
         result_sealed_unix_millis: state.result_sealed_unix_millis.unwrap_or_default(),
+        held_out_artifact: state.held_out_artifact,
         checkpoint_sha256: format!("sha256:{}", checkpoint.sha256),
         selected_candidate_sha256: format!(
             "sha256:{}",
@@ -808,7 +867,7 @@ fn remaining_time(state: &PredictionMctsRunState) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -821,8 +880,10 @@ mod tests {
     use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
     use crate::prediction_mcts::{PredictionMctsCandidate, PredictionMctsIdentity};
     use crate::prediction_mission_v3::{
-        AdmittedPredictionMissionV3, AdmittedPredictionTask, PredictionAuthorityProfile,
-        PredictionProductIdentity, PredictionProductSymbol, PredictionRunMode,
+        prediction_mission_v3_sha256, AdmittedPredictionMissionV3, AdmittedPredictionTask,
+        PredictionAuthorityProfile, PredictionMissionCapability, PredictionMissionTask,
+        PredictionProductIdentity, PredictionProductSymbol, PredictionRunMode, PredictionTaskKind,
+        PREDICTION_MISSION_V3_SCHEMA_VERSION,
     };
 
     fn mission(max_candidates: usize, max_llm_calls: usize) -> PredictionResearchMission {
@@ -886,6 +947,7 @@ mod tests {
         calls: Vec<String>,
         fail_training: VecDeque<bool>,
         candidate_ids: Vec<String>,
+        held_out_artifact: Option<PredictionMctsHeldOutArtifact>,
     }
 
     impl PredictionMctsRunEvaluator for FakeEvaluator {
@@ -938,7 +1000,18 @@ mod tests {
         ) -> Result<(), String> {
             self.calls.push("held_out".to_string());
             self.candidate_ids.push(candidate.candidate_id.clone());
+            self.held_out_artifact = Some(PredictionMctsHeldOutArtifact::from_serializable(
+                &serde_json::json!({
+                    "selected_candidate_sha256": sha256_hex(&canonical_json_bytes(candidate)?),
+                }),
+            )?);
             Ok(())
+        }
+
+        fn take_held_out_artifact(
+            &mut self,
+        ) -> Result<Option<PredictionMctsHeldOutArtifact>, String> {
+            Ok(self.held_out_artifact.take())
         }
     }
 
@@ -1621,5 +1694,88 @@ mod tests {
         assert!(evaluator.calls.is_empty());
         assert!(!isolated_output.join("prediction-mcts-state.json").exists());
         assert!(!output.join("prediction-mcts-state.json").exists());
+    }
+
+    #[test]
+    fn sealed_run_binds_held_out_artifact_before_result_seal() {
+        let output = temp_dir("sealed-held-out-artifact");
+        let bridge = mission(1, 1);
+        let sealed = PredictionResearchMissionV3 {
+            schema_version: PREDICTION_MISSION_V3_SCHEMA_VERSION.to_string(),
+            mission_id: bridge.mission_id.clone(),
+            product: PredictionProductIdentity {
+                symbol: PredictionProductSymbol::Btc,
+                event_horizon_secs: 300,
+            },
+            task: PredictionMissionTask {
+                kind: PredictionTaskKind::SettlementProbability,
+                side: None,
+                prediction_horizon_secs: None,
+            },
+            run_mode: PredictionRunMode::ResearchTrial,
+            authority_profile: PredictionAuthorityProfile::PolymarketChainlinkBaseline,
+            required_capabilities: BTreeSet::from([
+                PredictionMissionCapability::PolymarketChainlink,
+            ]),
+            cohort_manifest_id: format!("sha256:{}", "2".repeat(64)),
+            partition_digest: format!("sha256:{}", "3".repeat(64)),
+            causal_projection_policy_id: current_prediction_policy_snapshot_id(),
+            snapshot_contract_id: bridge.data_snapshot_id.clone(),
+            snapshot_hash: "6".repeat(16),
+            search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
+            search_budget: bridge.search_budget.clone(),
+        };
+        let admitted = AdmittedPredictionMissionV3 {
+            mission_id: sealed.mission_id.clone(),
+            mission_sha256: prediction_mission_v3_sha256(&sealed).unwrap(),
+            product: sealed.product.clone(),
+            task: AdmittedPredictionTask::SettlementProbability,
+            run_mode: sealed.run_mode,
+            authority_profile: sealed.authority_profile,
+            cohort_manifest_id: sealed.cohort_manifest_id.clone(),
+            partition_digest: sealed.partition_digest.clone(),
+            causal_projection_policy_id: sealed.causal_projection_policy_id.clone(),
+            snapshot_contract_id: sealed.snapshot_contract_id.clone(),
+            snapshot_hash: sealed.snapshot_hash.clone(),
+            search_policy_snapshot_id: sealed.search_policy_snapshot_id.clone(),
+        };
+        let identity = PredictionMctsIdentity::from_admitted_mission(&admitted).unwrap();
+        let task_output = task_output_dir(&output, &identity).unwrap();
+        let image = format!("sha256:{}", "a".repeat(64));
+        let mut client = FakeClient { calls: 0 };
+
+        run_or_resume_authenticated_prediction_mcts(
+            bridge.clone(),
+            identity.clone(),
+            (&sealed, &admitted),
+            &output,
+            &mut client,
+            &mut FakeEvaluator::default(),
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+            &image,
+        )
+        .expect("sealed run");
+
+        let state: serde_json::Value =
+            read_json(&task_output.join("prediction-mcts-state.json")).unwrap();
+        let artifact = state
+            .get("held_out_artifact")
+            .and_then(serde_json::Value::as_object)
+            .expect("sealed result state must bind its held-out artifact");
+        let artifact_path = task_output.join(artifact["path"].as_str().unwrap());
+        std::fs::write(&artifact_path, b"{}\n").unwrap();
+
+        let error = run_or_resume_authenticated_prediction_mcts(
+            bridge,
+            identity,
+            (&sealed, &admitted),
+            &output,
+            &mut client,
+            &mut FakeEvaluator::default(),
+            SettlementProbabilityComponentProfile::MarketMidpointOnly,
+            &image,
+        )
+        .expect_err("tampered held-out artifact must fail closed on resume");
+        assert!(error.contains("evidence hash mismatch"));
     }
 }
