@@ -593,7 +593,8 @@ real_market_segment_preflight() {
   local source_stamp source_uuid candidate_stamp candidate_uuid
   local preflight_dataset started_at completed_at candidate_exit candidate_summary
   local terminal_status upload_summary
-  local source_quote_records source_content_sha256 source_bytes source_identity source_mtime
+  local source_quote_records source_recorded_hours source_content_sha256 source_bytes
+  local source_identity source_mtime
   local copied_sha256 uploaded_content_sha256
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
@@ -639,6 +640,12 @@ real_market_segment_preflight() {
   source_quote_records=$(jq -c 'select(.update.kind == "quote")' "$source_tmp" \
     | wc -l | tr -d ' ') || return 1
   [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
+  source_recorded_hours=$(jq -r '
+    .recorded_at
+    | select(type == "string"
+      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
+    | .[0:13]' "$source_tmp" | sort -u | wc -l | tr -d ' ') || return 1
+  [[ $source_recorded_hours == 1 ]] || return 1
   source_bytes=$(stat -c %s "$source_tmp") || return 1
   source_identity=$(stat -c '%d:%i' "$source_path") || return 1
   source_mtime=$(stat -c %Y "$source_path") || return 1
@@ -716,6 +723,7 @@ real_market_segment_preflight() {
       --arg dataset "$preflight_dataset" --argjson source_segment "$source_segment" \
       --arg source_content_sha256 "$source_content_sha256" \
       --argjson source_quote_records "$source_quote_records" \
+      --argjson source_recorded_hours "$source_recorded_hours" \
       --arg stderr_sha256 "$(sha256sum "$candidate_stderr" | awk '{print $1}')" \
       --argjson candidate_exit_code "$candidate_exit" \
       '{schema:"monday.polymarket_real_market_preflight.v2",status:"failed",
@@ -727,6 +735,7 @@ real_market_segment_preflight() {
         control_archive_sha256:$control_archive_sha256,
         oss_config_sha256:$oss_config_sha256,dataset:$dataset,
         source_segment:$source_segment,source_quote_records:$source_quote_records,
+        source_recorded_hours:$source_recorded_hours,
         source_content_sha256:$source_content_sha256,
         candidate_exit_code:$candidate_exit_code,
         candidate_stderr_sha256:$stderr_sha256}' >"$preflight_tmp"
@@ -757,6 +766,7 @@ real_market_segment_preflight() {
     --arg source_content_sha256 "$source_content_sha256" \
     --arg uploaded_content_sha256 "$uploaded_content_sha256" \
     --argjson source_quote_records "$source_quote_records" \
+    --argjson source_recorded_hours "$source_recorded_hours" \
     --argjson source_segment "$source_segment" \
     --argjson uploaded_triplet "$uploaded_triplet" \
     --argjson upload_summary "$upload_summary" \
@@ -769,6 +779,7 @@ real_market_segment_preflight() {
       control_archive_sha256:$control_archive_sha256,
       oss_config_sha256:$oss_config_sha256,dataset:$dataset,
       source_quote_records:$source_quote_records,
+      source_recorded_hours:$source_recorded_hours,
       source_content_sha256:$source_content_sha256,
       uploaded_content_sha256:$uploaded_content_sha256,
       source_segment:$source_segment,uploaded_triplet:$uploaded_triplet,

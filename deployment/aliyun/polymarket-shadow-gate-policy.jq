@@ -74,6 +74,7 @@ and (.real_market_preflight.dataset | type == "string"
 and (.real_market_preflight.dataset == ("crypto_expiry_preflight_"
   + .candidate_sha256[0:12] + "_" + (.shadow_run_id | ascii_downcase)))
 and (.real_market_preflight.source_quote_records | positive_integer)
+and .real_market_preflight.source_recorded_hours == 1
 and (.real_market_preflight.source_content_sha256 | sha256)
 and (.real_market_preflight.source_segment as $segment
   | ($segment.file | type == "string"
