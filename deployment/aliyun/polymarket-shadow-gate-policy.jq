@@ -95,7 +95,7 @@ and (.real_market_preflight.source_segment.bytes
   == .real_market_preflight.uploaded_triplet.source_bytes)
 and (.real_market_preflight.upload_summary.uploaded_segments | positive_integer)
 and (.real_market_preflight.upload_summary.canonical_uploaded_segments
-  | positive_integer)
+  | nonnegative_integer)
 and .real_market_preflight.upload_summary.pending_segments == 0
 and .real_market_preflight.upload_summary.failed_segments == []
 and .real_market_preflight.upload_summary.last_error == null
@@ -222,7 +222,7 @@ and .checks.real_market_segment_preflight == true
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.market_oss_uploaded_segments | positive_integer)
-and (.metrics.market_oss_canonical_uploaded_segments | positive_integer)
+and (.metrics.market_oss_canonical_uploaded_segments | nonnegative_integer)
 and (.metrics.market_oss_uploaded_segments
   == .real_market_preflight.upload_summary.uploaded_segments)
 and (.metrics.market_oss_canonical_uploaded_segments

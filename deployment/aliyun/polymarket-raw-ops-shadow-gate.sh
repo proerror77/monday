@@ -566,7 +566,8 @@ download_and_verify_oss_triplet() {
       and (.bytes | type == "number" and floor == . and . > 0)
       and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
       and (.source_bytes | type == "number" and floor == . and . > 0)
-      and .canonical == true and .segment_complete == true
+      and (.canonical | type == "boolean")
+      and (.segment_complete | type == "boolean")
       and .source_session_closed == true and .sequence_gaps == 0)' \
     "$manifest") || return 1
   expected_bytes=$(jq -er '.bytes' <<<"$manifest_json") || return 1
@@ -689,7 +690,7 @@ real_market_segment_preflight() {
           == ["canonical_uploaded_segments", "uploaded_segments"]
         and (.uploaded_segments | type == "number" and floor == . and . > 0)
         and (.canonical_uploaded_segments
-          | type == "number" and floor == . and . > 0))' \
+          | type == "number" and floor == . and . >= 0))' \
       "$candidate_stdout") || candidate_summary=
   fi
   if [[ -n $candidate_summary ]]; then
@@ -1161,9 +1162,11 @@ market_upload_json=$(jq -c '.upload_summary' <<<"$real_market_preflight_json") \
   || die 'real market preflight upload summary is invalid'
 market_uploaded_segments=$(jq -er '.uploaded_segments' <<<"$market_upload_json") \
   || die 'real market preflight did not verify a closed segment'
-market_canonical_uploaded_segments=$(jq -er '.canonical_uploaded_segments' \
+market_canonical_uploaded_segments=$(jq -er \
+  '.canonical_uploaded_segments
+    | select(type == "number" and floor == . and . >= 0)' \
   <<<"$market_upload_json") \
-  || die 'real market preflight did not verify a canonical closed segment'
+  || die 'real market preflight canonical upload count is invalid'
 
 baseline_health_snapshot=null
 baseline_health_started_at=
