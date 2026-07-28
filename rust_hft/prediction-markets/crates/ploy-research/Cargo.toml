@@ -32,7 +32,7 @@ ploy-strategy-bundles = { workspace = true, optional = true }
 ploy-trading = { workspace = true, optional = true }
 rust_decimal.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
