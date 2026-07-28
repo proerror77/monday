@@ -854,6 +854,7 @@ jobs:
           cargo check --locked -p ploy-research --features db --bin monday-prediction-evaluator
           cargo test --locked -p ploy-market-data --features audit --lib --examples
           cargo test --locked -p ploy-research --features db --bin monday-prediction-snapshot
+          cargo test --locked -p ploy-research --features db --test polymarket_three_event_e2e
 
       - name: Install SQLx CLI
         run: |
