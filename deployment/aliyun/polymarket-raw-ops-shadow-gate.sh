@@ -3,6 +3,7 @@ set -euo pipefail
 
 umask 027
 export LC_ALL=C
+export TZ=UTC
 
 readonly REQUIRED_DURATION_SECONDS=3600
 # The verifier subtracts a 600-second trade maturity lag and requires a
@@ -393,14 +394,28 @@ fresh_baseline_health_snapshot() {
   printf '%s\n' "$snapshot"
 }
 
+legacy_health_publication_after_gate() {
+  local gate_started_at=$1 start_identity=$2 written_at=$3 completion_identity=$4
+  ((written_at >= gate_started_at)) && [[ $completion_identity != "$start_identity" ]]
+}
+
 fresh_legacy_health_observation() {
   local health=$1 policy=$2 before after snapshot field timestamp epoch now
+  local stable=false
   local _device _inode _size written_at_unix _changed_at_unix
   [[ -f $health && ! -L $health ]] || return 1
-  before=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
-  snapshot=$(jq -cS . "$health") || return 1
-  after=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
-  [[ $before == "$after" ]] || return 1
+  # Payload timestamps describe the cycle; mtime and identity prove its
+  # completed atomic publication. Retry only snapshots that overlap rename.
+  for _ in 1 2 3; do
+    before=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
+    snapshot=$(jq -cS . "$health") || return 1
+    after=$(stat -c '%d:%i:%s:%Y:%Z' "$health") || return 1
+    if [[ $before == "$after" ]]; then
+      stable=true
+      break
+    fi
+  done
+  [[ $stable == true ]] || return 1
   jq -e -f "$policy" <<<"$snapshot" >/dev/null || return 1
   IFS=: read -r _device _inode _size written_at_unix _changed_at_unix \
     <<<"$before"
@@ -417,7 +432,9 @@ fresh_legacy_health_observation() {
   done
   jq -cn --argjson health "$snapshot" \
     --argjson written_at_unix "$written_at_unix" \
-    '{health:$health,written_at_unix:$written_at_unix}'
+    --arg file_identity "$_device:$_inode" \
+    '{health:$health,written_at_unix:$written_at_unix,
+      file_identity:$file_identity}'
 }
 
 verify_fresh_baseline_health() {
@@ -859,9 +876,11 @@ systemctl daemon-reload
 baseline_health_snapshot=null
 baseline_health_started_at=
 baseline_health_start_written_at_unix=null
+baseline_health_start_file_identity=null
 baseline_health_completion_snapshot=null
 baseline_health_completion_updated_at=
 baseline_health_completion_written_at_unix=null
+baseline_health_completion_file_identity=null
 baseline_health_start_success_unix=null
 baseline_health_cutoff_unix=null
 if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
@@ -874,6 +893,10 @@ if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
   baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
     <<<"$baseline_health_observation") \
     || die 'frozen legacy collector health has no write time'
+  baseline_health_start_file_identity=$(jq -ce '.file_identity
+    | select(type == "string" and length > 0)' \
+    <<<"$baseline_health_observation") \
+    || die 'frozen legacy collector health has no file identity'
   baseline_health_started_at=$(jq -er '.updated_at' <<<"$baseline_health_snapshot") \
     || die 'frozen legacy collector health has no updated_at'
   baseline_health_start_success_at=$(jq -er '.last_success_at' \
@@ -969,8 +992,15 @@ while :; do
       baseline_health_completion_written_at_unix=$(jq -er '.written_at_unix' \
         <<<"$baseline_health_completion_observation") \
         || die 'post-start legacy collector health has no write time'
-      ((baseline_health_completion_written_at_unix > started_at_unix)) \
-        || die 'post-start legacy collector health write predates the Gate'
+      baseline_health_completion_file_identity=$(jq -ce '.file_identity
+        | select(type == "string" and length > 0)' \
+        <<<"$baseline_health_completion_observation") \
+        || die 'post-start legacy collector health has no file identity'
+      legacy_health_publication_after_gate "$started_at_unix" \
+        "$baseline_health_start_file_identity" \
+        "$baseline_health_completion_written_at_unix" \
+        "$baseline_health_completion_file_identity" \
+        || die 'post-start legacy collector health predates the Gate or reused its file'
       current_legacy_health=$(jq -er '.updated_at' \
         <<<"$baseline_health_completion_snapshot") \
         || die 'post-start legacy collector health has no updated_at'
@@ -1293,6 +1323,10 @@ jq \
     "$baseline_health_start_written_at_unix" \
   --argjson baseline_health_completion_written_at_unix \
     "$baseline_health_completion_written_at_unix" \
+  --argjson baseline_health_start_file_identity \
+    "$baseline_health_start_file_identity" \
+  --argjson baseline_health_completion_file_identity \
+    "$baseline_health_completion_file_identity" \
   --argjson uploaded_segments "$uploaded_segments" \
   --argjson canonical_uploaded_segments "$canonical_uploaded_segments" \
   --argjson market_uploaded_segments "$market_uploaded_segments" \
@@ -1320,6 +1354,9 @@ jq \
     baseline_health_start_written_at_unix:$baseline_health_start_written_at_unix,
     baseline_health_completion_written_at_unix:
       $baseline_health_completion_written_at_unix,
+    baseline_health_start_file_identity:$baseline_health_start_file_identity,
+    baseline_health_completion_file_identity:
+      $baseline_health_completion_file_identity,
     legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
         cmdline_sha256:$legacy_cmdline_sha256,
         fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,

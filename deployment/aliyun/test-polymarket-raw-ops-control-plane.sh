@@ -34,6 +34,10 @@ for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum shellc
 done
 
 shellcheck "$GATE" "$CUTOVER" "$0"
+grep -Fxq 'export TZ=UTC' "$GATE" || {
+  printf 'Gate does not force UTC for jq date builtins\n' >&2
+  exit 1
+}
 cargo build --quiet --manifest-path "$RUST_MANIFEST" -p hft-collector \
   --bin polymarket-raw-ops --no-default-features --locked
 "$VERIFY" verify-shadow-parity --help >/dev/null
@@ -1414,6 +1418,8 @@ jq \
     baseline_health_cutoff_unix:1000,
     baseline_health_start_written_at_unix:110,
     baseline_health_completion_written_at_unix:1301,
+    baseline_health_start_file_identity:"1:10",
+    baseline_health_completion_file_identity:"1:11",
     legacy_runtime:{
       exec_start:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
       cmdline:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
@@ -1445,6 +1451,22 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq '.started_at = "1970-01-01T00:16:40Z"
+  | .baseline_health_start_written_at_unix = 900
+  | .baseline_health_completion_written_at_unix = 1000' \
+  "$tmp_dir/gate.json" >"$tmp_dir/same-second-baseline-health-write.json"
+jq -e -f "$POLICY" "$tmp_dir/same-second-baseline-health-write.json" \
+  >/dev/null || {
+  printf 'gate policy rejected a distinct atomic health write in the Gate start second\n' >&2
+  exit 1
+}
+jq '.baseline_health_completion_file_identity =
+      .baseline_health_start_file_identity' "$tmp_dir/gate.json" \
+  >"$tmp_dir/reused-baseline-health-file.json"
+if jq -e -f "$POLICY" "$tmp_dir/reused-baseline-health-file.json" >/dev/null; then
+  printf 'gate policy accepted completion evidence from the startup health file\n' >&2
+  exit 1
+fi
 jq 'del(.baseline_health_snapshot)' "$tmp_dir/gate.json" \
   >"$tmp_dir/missing-baseline-health-snapshot.json"
 if jq -e -f "$POLICY" "$tmp_dir/missing-baseline-health-snapshot.json" >/dev/null; then
@@ -1508,6 +1530,14 @@ jq '.baseline_health_completion_snapshot.last_success_at =
 if jq -e -f "$POLICY" "$tmp_dir/malformed-baseline-health-cutoff.json" \
   >/dev/null; then
   printf 'gate policy accepted a malformed fractional legacy success timestamp\n' >&2
+  exit 1
+fi
+jq '.baseline_health_completion_snapshot.updated_at =
+      "1970-02-30T00:00:00Z"' "$tmp_dir/gate.json" \
+  >"$tmp_dir/impossible-baseline-health-updated-at.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/impossible-baseline-health-updated-at.json" >/dev/null; then
+  printf 'gate policy accepted an impossible legacy updated_at timestamp\n' >&2
   exit 1
 fi
 jq '.baseline_health_completion_snapshot.last_success_at =
@@ -1805,6 +1835,8 @@ jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
   | .baseline_health_cutoff_unix = null
   | .baseline_health_start_written_at_unix = null
   | .baseline_health_completion_written_at_unix = null
+  | .baseline_health_start_file_identity = null
+  | .baseline_health_completion_file_identity = null
   | .legacy_runtime += {
       exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
       cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
@@ -1889,6 +1921,7 @@ baseline_health_requires_continuous_freshness rust_release
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
+  -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \
   -e '/^fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
   >"$legacy_health_observer"
 [[ -s $legacy_health_observer ]] || {
@@ -1904,6 +1937,15 @@ sed -n \
   fi
   # shellcheck source=/dev/null
   source "$legacy_health_observer"
+  legacy_health_publication_after_gate 120 start-file 120 completion-file || {
+    printf 'Gate rejected a distinct atomic health write in the Gate start second\n' >&2
+    exit 1
+  }
+  if legacy_health_publication_after_gate 120 start-file 119 completion-file \
+    || legacy_health_publication_after_gate 120 same-file 120 same-file; then
+    printf 'Gate accepted a predating or reused legacy health publication\n' >&2
+    exit 1
+  fi
   cp "$tmp_dir/legacy-health.json" "$tmp_dir/atomic-legacy-health.json"
   mv "$tmp_dir/atomic-legacy-health.json" \
     "$tmp_dir/freshly-completed-legacy-health.json"
@@ -1912,7 +1954,10 @@ sed -n \
   jq -e \
     --argjson written_at "$(stat -c %Y \
       "$tmp_dir/freshly-completed-legacy-health.json")" \
+    --arg file_identity "$(stat -c '%d:%i' \
+      "$tmp_dir/freshly-completed-legacy-health.json")" \
     '.written_at_unix == $written_at
+      and .file_identity == $file_identity
       and .health.last_success_at == "2026-07-15T00:00:01Z"' \
     <<<"$observation" >/dev/null || {
       printf 'Gate rejected a fresh completed legacy cycle with an old cycle-start timestamp\n' >&2
@@ -1935,6 +1980,26 @@ sed -n \
     printf 'Gate accepted future legacy health payload timestamps\n' >&2
     exit 1
   fi
+  (
+    stat_bin=$(command -v gstat || command -v stat)
+    cp "$tmp_dir/legacy-health.json" "$tmp_dir/racy-legacy-health.json"
+    printf '0\n' >"$tmp_dir/racy-stat-calls"
+    stat() {
+      local calls
+      calls=$(($(<"$tmp_dir/racy-stat-calls") + 1))
+      printf '%s\n' "$calls" >"$tmp_dir/racy-stat-calls"
+      if ((calls == 1)); then
+        printf '0:0:0:0:0\n'
+      else
+        command "$stat_bin" "$@"
+      fi
+    }
+    fresh_legacy_health_observation "$tmp_dir/racy-legacy-health.json" \
+      "$LEGACY_HEALTH_POLICY" >/dev/null || {
+      printf 'Gate did not retry a legacy health snapshot across atomic publication\n' >&2
+      exit 1
+    }
+  )
 )
 daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
 snapshot_line=$(grep -nF 'baseline_health_observation=$(fresh_legacy_health_observation' \

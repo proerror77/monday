@@ -1,6 +1,8 @@
 def sha256: type == "string" and test("^[a-f0-9]{64}$");
 def positive_integer: type == "number" and floor == . and . > 0;
 def nonnegative_integer: type == "number" and floor == . and . >= 0;
+def file_identity:
+  type == "string" and test("^[0-9]+:[0-9]+$");
 def utc_iso8601_unix:
   if type == "string"
     and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")
@@ -22,7 +24,7 @@ def runtime_identity($exec; $digest):
 def nonnegative_sub($left; $right):
   if $left < $right then 0 else ($left - $right) end;
 def legacy_health_snapshot:
-  (.updated_at | type == "string" and length > 0)
+  (.updated_at | utc_iso8601_unix | type == "number")
   and (.last_success_at | type == "string" and length > 0)
   and (.target_markets | positive_integer)
   and .api_errors == []
@@ -59,6 +61,7 @@ and (
     and ((.baseline_health_snapshot.last_success_at | utc_iso8601_unix)
       == .baseline_health_start_success_unix)
     and (.baseline_health_start_written_at_unix | positive_integer)
+    and (.baseline_health_start_file_identity | file_identity)
     and .baseline_health_start_success_unix
       <= .baseline_health_start_written_at_unix
     and .baseline_health_start_written_at_unix
@@ -72,10 +75,13 @@ and (
       == .baseline_health_cutoff_unix)
     and .baseline_health_cutoff_unix > .baseline_health_start_success_unix
     and (.baseline_health_completion_written_at_unix | positive_integer)
+    and (.baseline_health_completion_file_identity | file_identity)
+    and .baseline_health_completion_file_identity
+      != .baseline_health_start_file_identity
     and .baseline_health_cutoff_unix
       <= .baseline_health_completion_written_at_unix
     and .baseline_health_completion_written_at_unix
-      > (.started_at | utc_iso8601_unix)
+      >= (.started_at | utc_iso8601_unix)
     and .baseline_health_completion_written_at_unix
       <= (.completed_at | utc_iso8601_unix)
     and .parity_window_ended_at_unix <= .baseline_health_cutoff_unix
@@ -93,6 +99,8 @@ and (
     and .baseline_health_cutoff_unix == null
     and .baseline_health_start_written_at_unix == null
     and .baseline_health_completion_written_at_unix == null
+    and .baseline_health_start_file_identity == null
+    and .baseline_health_completion_file_identity == null
     and (.legacy_runtime |
       runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference";
         "7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94"))
