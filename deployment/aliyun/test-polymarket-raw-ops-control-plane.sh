@@ -1007,15 +1007,23 @@ grep -Fq 'verify_gate_terminal_receipt() {' "$terminal_receipt_verifier" || {
     exit 1
   }
   IFS='|' read -r bound_invocation bound_source bound_receipt_sha \
-    bound_gate_json bound_receipt extra <<<"$binding"
+    bound_gate_sha bound_gate_json bound_receipt extra <<<"$binding"
   [[ $bound_invocation == "$invocation" \
     && $bound_source == "$source_revision" \
     && $bound_receipt_sha == "$(sha256sum "$receipt" | awk '{print $1}')" \
+    && $bound_gate_sha == "$(sha256sum "$gate_json" | awk '{print $1}')" \
     && $bound_gate_json == "$gate_json" && $bound_receipt == "$receipt" \
     && -z $extra ]] || {
     printf 'cutover terminal-receipt verifier returned the wrong binding\n' >&2
     exit 1
   }
+  jq '.passed = false' "$gate_json" >"$gate_json.tmp"
+  mv "$gate_json.tmp" "$gate_json"
+  if [[ $(sha256sum "$gate_json" | awk '{print $1}') == "$bound_gate_sha" ]]; then
+    printf 'cutover Gate digest did not detect post-admission evidence drift\n' >&2
+    exit 1
+  fi
+  write_gate
 
   rm "$receipt"
   if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then

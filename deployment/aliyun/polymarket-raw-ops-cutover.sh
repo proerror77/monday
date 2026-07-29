@@ -438,7 +438,7 @@ verify_gate_marker() {
 
 verify_gate_terminal_receipt() {
   local receipt=$1 candidate_sha=$2 invocation source_revision receipt_dir
-  local expected_receipt gate_dir gate_json receipt_sha
+  local expected_receipt gate_dir gate_json gate_json_sha receipt_sha
   [[ -f $receipt && ! -L $receipt ]] || return 1
   receipt=$(readlink -f -- "$receipt") || return 1
   secure_regular_file "$receipt" || return 1
@@ -486,9 +486,10 @@ verify_gate_terminal_receipt() {
     and .shadow_run_id == $invocation
     and .production_eligible == true and .passed == true
   ' "$gate_json" >/dev/null || return 1
+  gate_json_sha=$(sha256sum "$gate_json" | awk '{print $1}') || return 1
   [[ $(sha256sum "$receipt" | awk '{print $1}') == "$receipt_sha" ]] || return 1
-  printf '%s|%s|%s|%s|%s\n' "$invocation" "$source_revision" \
-    "$receipt_sha" "$gate_json" "$receipt"
+  printf '%s|%s|%s|%s|%s|%s\n' "$invocation" "$source_revision" \
+    "$receipt_sha" "$gate_json_sha" "$gate_json" "$receipt"
 }
 
 verify_named_marker() {
@@ -1244,10 +1245,12 @@ candidate_sha=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 terminal_binding=$(verify_gate_terminal_receipt "$3" "$candidate_sha") \
   || die 'Gate terminal receipt is invalid or not passed'
 IFS='|' read -r gate_systemd_invocation_id gate_receipt_source_revision \
-  gate_terminal_receipt_sha256 gate_json gate_terminal_receipt extra_binding \
+  gate_terminal_receipt_sha256 gate_json_sha256 gate_json \
+  gate_terminal_receipt extra_binding \
   <<<"$terminal_binding"
 [[ -n $gate_systemd_invocation_id && -n $gate_receipt_source_revision \
-  && -n $gate_terminal_receipt_sha256 && -n $gate_json \
+  && -n $gate_terminal_receipt_sha256 && -n $gate_json_sha256 \
+  && -n $gate_json \
   && -n $gate_terminal_receipt && -z $extra_binding ]] \
   || die 'Gate terminal receipt binding is malformed'
 secure_regular_file "$gate_json"
@@ -1400,6 +1403,8 @@ trap on_exit EXIT
 [[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
   == "$gate_terminal_receipt_sha256" ]] \
   || die 'Gate terminal receipt changed before cutover transition'
+[[ $(sha256sum "$gate_json" | awk '{print $1}') == "$gate_json_sha256" ]] \
+  || die 'Gate evidence changed before cutover transition'
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed before the cutover transition'
 transition_started=true
@@ -1569,6 +1574,8 @@ rollback_sha=$(sha256sum "$rollback_dir/manifest.sha256" | awk '{print $1}')
 [[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
   == "$gate_terminal_receipt_sha256" ]] \
   || die 'Gate terminal receipt changed before cutover evidence publication'
+[[ $(sha256sum "$gate_json" | awk '{print $1}') == "$gate_json_sha256" ]] \
+  || die 'Gate evidence changed before cutover evidence publication'
 jq -n \
   --arg schema monday.polymarket_cutover.v1 \
   --arg baseline_mode "$baseline_mode" \
@@ -1578,7 +1585,7 @@ jq -n \
   --arg release_manifest_sha256 "$gate_release_manifest_sha" \
   --arg control_archive_sha256 "$gate_control_archive_sha" \
   --arg oss_config_sha256 "$gate_oss_config_sha" \
-  --arg gate_json_sha256 "$(sha256sum "$gate_json" | awk '{print $1}')" \
+  --arg gate_json_sha256 "$gate_json_sha256" \
   --arg gate_terminal_receipt_sha256 "$gate_terminal_receipt_sha256" \
   --arg gate_systemd_invocation_id "$gate_systemd_invocation_id" \
   --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
