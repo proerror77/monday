@@ -1,0 +1,39 @@
+name: Issue Lifecycle
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  issue-lifecycle:
+    name: Issue Lifecycle
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Verify workflow contract
+        run: ruby .github/scripts/test-issue-lifecycle-workflow.rb
+      - name: Audit current pull request
+        if: github.event_name == 'pull_request'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          ruby .github/scripts/issue-lifecycle-audit.rb
+          --repo "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --summary "$GITHUB_STEP_SUMMARY"
+      - name: Audit live repository
+        if: github.event_name != 'pull_request'
+        run: >-
+          ruby .github/scripts/issue-lifecycle-audit.rb
+          --repo "$GITHUB_REPOSITORY"
+          --summary "$GITHUB_STEP_SUMMARY"
