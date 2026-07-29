@@ -78,11 +78,12 @@ impl PortfolioBudgetRiskManager {
         }
     }
 
-    fn filter(
+    fn filter_items<T>(
         &self,
-        intents: Vec<ports::OrderIntent>,
+        items: Vec<T>,
         account: &ports::AccountView,
-    ) -> Vec<ports::OrderIntent> {
+        intent_of: impl Fn(&T) -> &ports::OrderIntent,
+    ) -> Vec<T> {
         let specs: HashMap<&str, &PortfolioSpec> = self
             .manager
             .portfolio_specs()
@@ -90,12 +91,13 @@ impl PortfolioBudgetRiskManager {
             .map(|spec| (spec.name.as_str(), spec))
             .collect();
         let mut projectors: HashMap<String, ExposureProjector> = HashMap::new();
-        let mut approved = Vec::with_capacity(intents.len());
+        let mut approved = Vec::with_capacity(items.len());
 
-        for intent in intents {
+        for item in items {
+            let intent = intent_of(&item);
             let portfolio_names = self.manager.portfolios_for_strategy(&intent.strategy_id);
             if portfolio_names.is_empty() {
-                approved.push(intent);
+                approved.push(item);
                 continue;
             }
 
@@ -142,10 +144,18 @@ impl PortfolioBudgetRiskManager {
             for (portfolio_name, projector) in projections {
                 projectors.insert(portfolio_name, projector);
             }
-            approved.push(intent);
+            approved.push(item);
         }
 
         approved
+    }
+
+    fn filter(
+        &self,
+        intents: Vec<ports::OrderIntent>,
+        account: &ports::AccountView,
+    ) -> Vec<ports::OrderIntent> {
+        self.filter_items(intents, account, |intent| intent)
     }
 }
 
@@ -166,7 +176,7 @@ mod tests {
             max_drawdown_pct: 5.0,
             ..Default::default()
         });
-        let manager = PortfolioBudgetRiskManager::new(
+        let mut manager = PortfolioBudgetRiskManager::new(
             base,
             vec![PortfolioSpec {
                 name: "shared".to_string(),
@@ -190,12 +200,23 @@ mod tests {
             )
         };
 
-        let approved = manager.filter(
-            vec![intent("alpha-a"), intent("alpha-b")],
+        let envelope = |intent, emitted_at| {
+            let mut lifecycle = ports::OrderIntentLifecycle::default();
+            lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
+            ports::OrderIntentEnvelope::new(intent, lifecycle)
+        };
+        let specs = HashMap::from([(VenueId::BINANCE, ports::VenueSpec::binance_spot())]);
+        let approved = manager.review_envelopes_with_venue_specs(
+            vec![
+                envelope(intent("alpha-a"), 1),
+                envelope(intent("alpha-b"), 2),
+            ],
             &ports::AccountView::default(),
+            &specs,
         );
 
         assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].lifecycle.timing.intent_emitted_mono_us, Some(1));
     }
 }
 
@@ -230,6 +251,17 @@ impl RiskManager for PortfolioBudgetRiskManager {
         let filtered = self.filter(intents, account);
         self.base_risk_manager
             .review_with_venue_specs(filtered, account, venue_specs)
+    }
+
+    fn review_envelopes_with_venue_specs(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        account: &ports::AccountView,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let filtered = self.filter_items(envelopes, account, |envelope| &envelope.intent);
+        self.base_risk_manager
+            .review_envelopes_with_venue_specs(filtered, account, venue_specs)
     }
 
     fn on_execution_event(&mut self, event: &ports::ExecutionEvent) {

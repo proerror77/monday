@@ -14,23 +14,95 @@ Push epic and tasks to GitHub as issues.
 ## Quick Check
 
 ```bash
-# Verify epic exists
-test -f .claude/epics/$ARGUMENTS/epic.md || echo "❌ Epic not found. Run: /pm:prd-parse $ARGUMENTS"
+case "$ARGUMENTS" in
+  ''|*[!A-Za-z0-9._-]*)
+    echo "❌ Epic name must be a simple path-safe slug" >&2
+    exit 1
+    ;;
+esac
 
-# Count task files
-ls .claude/epics/$ARGUMENTS/*.md 2>/dev/null | grep -v epic.md | wc -l
+epic_dir=".claude/epics/$ARGUMENTS"
+if [ ! -f "$epic_dir/epic.md" ]; then
+  echo "❌ Epic not found. Run: /pm:prd-parse $ARGUMENTS" >&2
+  exit 1
+fi
+
+task_source_id() {
+  source_id=$(sed -n '2,/^---$/s/^monday_source: *//p' "$1")
+  [ -n "$source_id" ] || source_id=$(basename "$1" .md)
+  case "$source_id" in
+    [0-9][0-9][0-9]) printf '%s\n' "$source_id" ;;
+    *) echo "❌ Invalid source task identity in $1" >&2; exit 1 ;;
+  esac
+}
+
+set_frontmatter_field() {
+  field_file="$1"
+  field_name="$2"
+  field_value="$3"
+  field_tmp="${field_file}.tmp.$$"
+  awk -v name="$field_name" -v value="$field_value" '
+    NR == 1 && $0 == "---" { in_frontmatter=1; print; next }
+    in_frontmatter && $0 == "---" {
+      if (!updated) print name ": " value
+      in_frontmatter=0
+      print
+      next
+    }
+    in_frontmatter && $0 ~ ("^" name ":") {
+      print name ": " value
+      updated=1
+      next
+    }
+    { print }
+  ' "$field_file" > "$field_tmp"
+  mv "$field_tmp" "$field_file"
+}
+
+task_count=$(find "$epic_dir" -maxdepth 1 -type f -name '[0-9]*.md' | awk 'END { print NR }')
+if [ "$task_count" -eq 0 ]; then
+  echo "❌ No tasks to sync. Run: /pm:epic-decompose $ARGUMENTS" >&2
+  exit 1
+fi
+
+epic_sync_parent="${MONDAY_EPIC_SYNC_TMP_PARENT:-${TMPDIR:-/tmp}}"
+if ! mkdir -p "$epic_sync_parent" ||
+  ! epic_sync_tmp=$(mktemp -d "$epic_sync_parent/monday-epic-sync.XXXXXX"); then
+  echo "❌ Could not create a fresh epic-sync scratch directory" >&2
+  exit 1
+fi
+export MONDAY_EPIC_SYNC_TMP="$epic_sync_tmp"
+trap 'rm -rf -- "$MONDAY_EPIC_SYNC_TMP"' EXIT
 ```
 
-If no tasks found: "❌ No tasks to sync. Run: /pm:epic-decompose $ARGUMENTS"
+Keep `MONDAY_EPIC_SYNC_TMP` in the controller environment for every step and
+parallel batch. Each run owns a fresh scratch root; an optional
+`MONDAY_EPIC_SYNC_TMP_PARENT` chooses only its parent directory.
+
+## Native Relationship Preflight
+
+Run this before any `gh issue create`:
+
+```bash
+if ! gh issue create --help | grep -q -- '--parent' ||
+  ! gh issue edit --help | grep -q -- '--add-blocked-by'; then
+  echo "❌ gh lacks native --parent or --add-blocked-by support; upgrade GitHub CLI" >&2
+  exit 1
+fi
+```
 
 ## Instructions
 
-### 1. Create Epic Issue
+### 1. Create or Resume Epic Issue
 
 Strip frontmatter and prepare GitHub issue body:
 ```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+: > "$epic_sync_tmp/task-mapping.txt"
+
 # Extract content without frontmatter
-sed '1,/^---$/d; 1,/^---$/d' .claude/epics/$ARGUMENTS/epic.md > /tmp/epic-body-raw.md
+sed '1,/^---$/d; 1,/^---$/d' "$epic_dir/epic.md" \
+  > "$epic_sync_tmp/epic-body-raw.md"
 
 # Remove "## Tasks Created" section and replace with Stats
 awk '
@@ -69,78 +141,95 @@ awk '
       if (total_effort) print "Estimated total effort: " total_effort
     }
   }
-' /tmp/epic-body-raw.md > /tmp/epic-body.md
+' "$epic_sync_tmp/epic-body-raw.md" > "$epic_sync_tmp/epic-body.md"
 
-# Determine epic type (feature vs bug) from content
-if grep -qi "bug\|fix\|issue\|problem\|error" /tmp/epic-body.md; then
-  epic_type="bug"
-else
-  epic_type="feature"
+epic_marker="<!-- monday-source: epic:$ARGUMENTS -->"
+printf '\n%s\n' "$epic_marker" >> "$epic_sync_tmp/epic-body.md"
+issue_category="enhancement"
+
+if ! epic_urls=$(gh api --paginate 'repos/{owner}/{repo}/issues?state=all&per_page=100' \
+  --jq ".[] | select((has(\"pull_request\") | not) and .body != null and (.body | contains(\"$epic_marker\"))) | .html_url"); then
+  echo "❌ Could not look up an existing tracking issue" >&2
+  exit 1
+fi
+epic_match_count=$(printf '%s\n' "$epic_urls" | awk 'NF { count++ } END { print count + 0 }')
+if [ "$epic_match_count" -gt 1 ]; then
+  echo "❌ Multiple tracking issues use $epic_marker" >&2
+  exit 1
+elif [ "$epic_match_count" -eq 1 ]; then
+  epic_url="$epic_urls"
+elif ! epic_url=$(gh issue create \
+  --title "Epic: $ARGUMENTS" \
+  --body-file "$epic_sync_tmp/epic-body.md" \
+  --label "$issue_category,needs-triage,tracking"); then
+  echo "❌ Could not create the tracking issue" >&2
+  exit 1
 fi
 
-# Create epic issue with labels
-epic_number=$(gh issue create \
-  --title "Epic: $ARGUMENTS" \
-  --body-file /tmp/epic-body.md \
-  --label "epic,epic:$ARGUMENTS,$epic_type" \
-  --json number -q .number)
+epic_number="${epic_url##*/}"
+case "$epic_number" in
+  ''|*[!0-9]*) echo "❌ Could not parse issue number from $epic_url" >&2; exit 1 ;;
+esac
+
+if ! published_epic_body=$(gh issue view "$epic_number" --json body --jq .body) ||
+  ! published_epic_labels=$(gh issue view "$epic_number" --json labels --jq '.labels[].name'); then
+  echo "❌ Could not read back the published tracking issue" >&2
+  exit 1
+fi
+epic_category_count=$(printf '%s\n' "$published_epic_labels" | awk '$0 == "bug" || $0 == "enhancement" { count++ } END { print count + 0 }')
+epic_state_count=$(printf '%s\n' "$published_epic_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { count++ } END { print count + 0 }')
+if [ "$published_epic_body" != "$(cat "$epic_sync_tmp/epic-body.md")" ] ||
+  [ "$epic_category_count" -ne 1 ] || [ "$epic_state_count" -ne 1 ] ||
+  ! printf '%s\n' "$published_epic_labels" | grep -Fxq enhancement ||
+  ! printf '%s\n' "$published_epic_labels" | grep -Fxq tracking; then
+  echo "❌ Published tracking issue body or labels do not match" >&2
+  exit 1
+fi
 ```
 
 Store the returned issue number for epic frontmatter update.
 
-### 2. Create Task Sub-Issues
-
-Check if gh-sub-issue is available:
-```bash
-if gh extension list | grep -q "yahsan2/gh-sub-issue"; then
-  use_subissues=true
-else
-  use_subissues=false
-  echo "⚠️ gh-sub-issue not installed. Using fallback mode."
-fi
-```
-
-Count task files to determine strategy:
-```bash
-task_count=$(ls .claude/epics/$ARGUMENTS/[0-9][0-9][0-9].md 2>/dev/null | wc -l)
-```
-
-### For Small Batches (< 5 tasks): Sequential Creation
+### 2. Create or Resume Native Task Sub-Issues
 
 ```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
 if [ "$task_count" -lt 5 ]; then
-  # Create sequentially for small batches
-  for task_file in .claude/epics/$ARGUMENTS/[0-9][0-9][0-9].md; do
+  for task_file in "$epic_dir"/[0-9]*.md; do
     [ -f "$task_file" ] || continue
-    
-    # Extract task name from frontmatter
+
+    source_id=$(task_source_id "$task_file")
     task_name=$(grep '^name:' "$task_file" | sed 's/^name: *//')
-    
-    # Strip frontmatter from task content
-    sed '1,/^---$/d; 1,/^---$/d' "$task_file" > /tmp/task-body.md
-    
-    # Create sub-issue with labels
-    if [ "$use_subissues" = true ]; then
-      task_number=$(gh sub-issue create \
-        --parent "$epic_number" \
-        --title "$task_name" \
-        --body-file /tmp/task-body.md \
-        --label "task,epic:$ARGUMENTS" \
-        --json number -q .number)
-    else
-      task_number=$(gh issue create \
-        --title "$task_name" \
-        --body-file /tmp/task-body.md \
-        --label "task,epic:$ARGUMENTS" \
-        --json number -q .number)
+    task_marker="<!-- monday-source: epic:$ARGUMENTS/task:$source_id -->"
+    task_body="$epic_sync_tmp/task-$source_id-body.md"
+    sed '1,/^---$/d; 1,/^---$/d' "$task_file" > "$task_body"
+    printf '\n%s\n' "$task_marker" >> "$task_body"
+
+    if ! task_urls=$(gh api --paginate 'repos/{owner}/{repo}/issues?state=all&per_page=100' \
+      --jq ".[] | select((has(\"pull_request\") | not) and .body != null and (.body | contains(\"$task_marker\"))) | .html_url"); then
+      echo "❌ Could not look up a published issue for $task_file" >&2
+      exit 1
     fi
-    
-    # Record mapping for renaming
-    echo "$task_file:$task_number" >> /tmp/task-mapping.txt
+    task_match_count=$(printf '%s\n' "$task_urls" | awk 'NF { count++ } END { print count + 0 }')
+    if [ "$task_match_count" -gt 1 ]; then
+      echo "❌ Multiple issues use $task_marker" >&2
+      exit 1
+    elif [ "$task_match_count" -eq 1 ]; then
+      task_url="$task_urls"
+    elif ! task_url=$(gh issue create \
+      --parent "$epic_number" \
+      --title "$task_name" \
+      --body-file "$task_body" \
+      --label "$issue_category,needs-triage"); then
+      echo "❌ Could not create a native sub-issue for $task_file" >&2
+      exit 1
+    fi
+
+    task_number="${task_url##*/}"
+    case "$task_number" in
+      ''|*[!0-9]*) echo "❌ Could not parse issue number from $task_url" >&2; exit 1 ;;
+    esac
+    printf '%s:%s\n' "$task_file" "$task_number" >> "$epic_sync_tmp/task-mapping.txt"
   done
-  
-  # After creating all issues, update references and rename files
-  # This follows the same process as step 3 below
 fi
 ```
 
@@ -149,17 +238,6 @@ fi
 ```bash
 if [ "$task_count" -ge 5 ]; then
   echo "Creating $task_count sub-issues in parallel..."
-  
-  # Check if gh-sub-issue is available for parallel agents
-  if gh extension list | grep -q "yahsan2/gh-sub-issue"; then
-    subissue_cmd="gh sub-issue create --parent $epic_number"
-  else
-    subissue_cmd="gh issue create"
-  fi
-  
-  # Batch tasks for parallel processing
-  # Spawn agents to create sub-issues in parallel with proper labels
-  # Each agent must use: --label "task,epic:$ARGUMENTS"
 fi
 ```
 
@@ -171,111 +249,266 @@ Task:
   prompt: |
     Create GitHub sub-issues for tasks in epic $ARGUMENTS
     Parent epic issue: #$epic_number
+    Scratch root: $epic_sync_tmp/batch-{X}
     
     Tasks to process:
     - {list of 3-4 task files}
     
     For each task file:
-    1. Extract task name from frontmatter
-    2. Strip frontmatter using: sed '1,/^---$/d; 1,/^---$/d'
-    3. Create sub-issue using:
-       - If gh-sub-issue available: 
-         gh sub-issue create --parent $epic_number --title "$task_name" \
-           --body-file /tmp/task-body.md --label "task,epic:$ARGUMENTS"
-       - Otherwise: 
-         gh issue create --title "$task_name" --body-file /tmp/task-body.md \
-           --label "task,epic:$ARGUMENTS"
-    4. Record: task_file:issue_number
+    1. Extract task name and stable source ID (`monday_source`, otherwise filename)
+    2. Strip frontmatter into the batch body file, then append the stable marker:
+       <!-- monday-source: epic:$ARGUMENTS/task:{source_id} -->
+    3. Search every paginated issue page for that exact marker. Fail if more than
+       one matches; resume the one match; otherwise create with:
+       gh issue create --parent $epic_number --title "$task_name" \
+         --body-file {batch_body_file} \
+         --label "$issue_category,needs-triage"
+    4. Parse the returned or resumed URL and record exactly one line:
+       task_file:issue_number
+       in "$epic_sync_tmp/batch-{X}/mapping.txt".
     
-    IMPORTANT: Always include --label parameter with "task,epic:$ARGUMENTS"
+    IMPORTANT: Stop on lookup or creation failure. Do not rename source files.
     
     Return mapping of files to issue numbers.
 ```
 
 Consolidate results from parallel agents:
 ```bash
-# Collect all mappings from agents
-cat /tmp/batch-*/mapping.txt >> /tmp/task-mapping.txt
-
-# IMPORTANT: After consolidation, follow step 3 to:
-# 1. Build old->new ID mapping
-# 2. Update all task references (depends_on, conflicts_with)
-# 3. Rename files with proper frontmatter updates
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+for batch_mapping in "$epic_sync_tmp"/batch-*/mapping.txt; do
+  [ -f "$batch_mapping" ] || continue
+  cat "$batch_mapping" >> "$epic_sync_tmp/task-mapping.txt"
+done
 ```
 
-### 3. Rename Task Files and Update References
+### 2b. Validate Complete Mapping
+
+Do this before any relationship readback or source rename:
+
+```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+mapping_file="$epic_sync_tmp/task-mapping.txt"
+expected_mapping_count="$task_count"
+actual_mapping_count=$(awk 'NF { count++ } END { print count + 0 }' "$mapping_file")
+if [ "$actual_mapping_count" -ne "$expected_mapping_count" ]; then
+  echo "❌ Expected $expected_mapping_count mappings, got $actual_mapping_count" >&2
+  exit 1
+fi
+
+while IFS=: read -r mapped_file mapped_number extra; do
+  case "$mapped_file:$mapped_number:$extra" in
+    "$epic_dir"/[0-9]*.md:[0-9]*:) ;;
+    *) echo "❌ Invalid task mapping: $mapped_file:$mapped_number" >&2; exit 1 ;;
+  esac
+  if [ ! -f "$mapped_file" ]; then
+    echo "❌ Invalid task mapping: $mapped_file:$mapped_number" >&2
+    exit 1
+  fi
+  case "$mapped_number" in
+    ''|*[!0-9]*) echo "❌ Invalid issue number: $mapped_number" >&2; exit 1 ;;
+  esac
+done < "$mapping_file"
+
+unique_issue_count=$(awk -F: 'NF && !seen[$2]++ { count++ } END { print count + 0 }' "$mapping_file")
+if [ "$unique_issue_count" -ne "$expected_mapping_count" ]; then
+  echo "❌ Task mappings reuse a GitHub issue number" >&2
+  exit 1
+fi
+for task_file in "$epic_dir"/[0-9]*.md; do
+  source_mapping_count=$(awk -F: -v source="$task_file" '$1 == source { count++ } END { print count + 0 }' "$mapping_file")
+  if [ "$source_mapping_count" -ne 1 ]; then
+    echo "❌ $task_file has $source_mapping_count mappings" >&2
+    exit 1
+  fi
+done
+```
+
+### 2c. Verify Native Publications
+
+Read back exact bodies, labels, and native parent relationships:
+
+```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+mapping_file="$epic_sync_tmp/task-mapping.txt"
+if ! published_subissues=$(gh issue view "$epic_number" --json subIssues \
+  --jq '.subIssues.nodes[].number'); then
+  echo "❌ Could not read back native sub-issues" >&2
+  exit 1
+fi
+expected_subissues=$(awk -F: 'NF { print $2 }' "$mapping_file" | LC_ALL=C sort -n)
+actual_subissues=$(printf '%s\n' "$published_subissues" | awk 'NF' | LC_ALL=C sort -n)
+if [ "$actual_subissues" != "$expected_subissues" ]; then
+  echo "❌ Native sub-issue membership does not match this publication" >&2
+  exit 1
+fi
+
+while IFS=: read -r task_file task_number; do
+  source_id=$(task_source_id "$task_file")
+  expected_task_body="$epic_sync_tmp/expected-task-$source_id.md"
+  sed '1,/^---$/d; 1,/^---$/d' "$task_file" > "$expected_task_body"
+  printf '\n<!-- monday-source: epic:%s/task:%s -->\n' "$ARGUMENTS" "$source_id" \
+    >> "$expected_task_body"
+
+  if ! published_task_body=$(gh issue view "$task_number" --json body --jq .body) ||
+    ! published_task_labels=$(gh issue view "$task_number" --json labels --jq '.labels[].name') ||
+    ! published_parent=$(gh issue view "$task_number" --json parent --jq '.parent.number'); then
+    echo "❌ Could not read back task #$task_number" >&2
+    exit 1
+  fi
+  task_category_count=$(printf '%s\n' "$published_task_labels" | awk '$0 == "bug" || $0 == "enhancement" { count++ } END { print count + 0 }')
+  task_state_count=$(printf '%s\n' "$published_task_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { count++ } END { print count + 0 }')
+  if [ "$published_task_body" != "$(cat "$expected_task_body")" ] ||
+    [ "$task_category_count" -ne 1 ] || [ "$task_state_count" -ne 1 ] ||
+    ! printf '%s\n' "$published_task_labels" | grep -Fxq enhancement ||
+    [ "$published_parent" != "$epic_number" ]; then
+    echo "❌ Published task #$task_number does not match body, labels, or parent" >&2
+    exit 1
+  fi
+done < "$mapping_file"
+```
+
+### 3. Publish and Verify Native Dependencies
+
+Resolve source `depends_on` values through the validated mapping. Publish and
+read back the exact blocked-by set before touching local filenames:
+
+```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+mapping_file="$epic_sync_tmp/task-mapping.txt"
+while IFS=: read -r task_file task_number; do
+  expected_blockers="$epic_sync_tmp/expected-blockers-$task_number.txt"
+  : > "$expected_blockers"
+  dependencies=$(sed -n 's/^depends_on: *\[\(.*\)\].*/\1/p' "$task_file" | tr -d ' ')
+  old_ifs=$IFS
+  IFS=,
+  for source_dependency in $dependencies; do
+    dependency_file="$epic_dir/$source_dependency.md"
+    if [ ! -f "$dependency_file" ]; then
+      dependency_file=$(grep -lFx "monday_source: $source_dependency" "$epic_dir"/[0-9]*.md || true)
+      case "$dependency_file" in *$'\n'*) echo "❌ Duplicate source task $source_dependency" >&2; exit 1 ;; esac
+    fi
+    dependency_number=$(awk -F: -v source="$dependency_file" '$1 == source { print $2 }' "$mapping_file")
+    case "$dependency_number" in
+      ''|*[!0-9]*)
+        echo "❌ No published issue for dependency $source_dependency" >&2
+        exit 1
+        ;;
+    esac
+    printf '%s\n' "$dependency_number" >> "$expected_blockers"
+  done
+  IFS=$old_ifs
+  LC_ALL=C sort -nu -o "$expected_blockers" "$expected_blockers"
+
+  if ! published_blockers=$(gh issue view "$task_number" --json blockedBy \
+    --jq '.blockedBy.nodes[].number'); then
+    echo "❌ Could not read blockers for #$task_number" >&2
+    exit 1
+  fi
+  while IFS= read -r dependency_number; do
+    [ -n "$dependency_number" ] || continue
+    if ! printf '%s\n' "$published_blockers" | grep -Fxq "$dependency_number"; then
+      if ! gh issue edit "$task_number" --add-blocked-by "$dependency_number"; then
+        echo "❌ Could not publish #$task_number blocked by #$dependency_number" >&2
+        exit 1
+      fi
+    fi
+  done < "$expected_blockers"
+
+  if ! published_blockers=$(gh issue view "$task_number" --json blockedBy \
+    --jq '.blockedBy.nodes[].number'); then
+    echo "❌ Could not verify blockers for #$task_number" >&2
+    exit 1
+  fi
+  actual_blockers=$(printf '%s\n' "$published_blockers" | awk 'NF' | LC_ALL=C sort -nu)
+  if [ "$actual_blockers" != "$(cat "$expected_blockers")" ]; then
+    echo "❌ Native blockers for #$task_number do not match depends_on" >&2
+    exit 1
+  fi
+done < "$mapping_file"
+```
+
+### 4. Rename Task Files and Update References
 
 First, build a mapping of old numbers to new issue IDs:
 ```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
 # Create mapping from old task numbers (001, 002, etc.) to new issue IDs
-> /tmp/id-mapping.txt
+> "$epic_sync_tmp/id-mapping.txt"
 while IFS=: read -r task_file task_number; do
-  # Extract old number from filename (e.g., 001 from 001.md)
-  old_num=$(basename "$task_file" .md)
-  echo "$old_num:$task_number" >> /tmp/id-mapping.txt
-done < /tmp/task-mapping.txt
+  old_num=$(task_source_id "$task_file")
+  echo "$old_num:$task_number" >> "$epic_sync_tmp/id-mapping.txt"
+done < "$epic_sync_tmp/task-mapping.txt"
 ```
 
 Then rename files and update all references:
 ```bash
-# Process each task file
-while IFS=: read -r task_file task_number; do
-  new_name="$(dirname "$task_file")/${task_number}.md"
-  
-  # Read the file content
-  content=$(cat "$task_file")
-  
-  # Update depends_on and conflicts_with references
-  while IFS=: read -r old_num new_num; do
-    # Update arrays like [001, 002] to use new issue numbers
-    content=$(echo "$content" | sed "s/\b$old_num\b/$new_num/g")
-  done < /tmp/id-mapping.txt
-  
-  # Write updated content to new file
-  echo "$content" > "$new_name"
-  
-  # Remove old file if different from new
-  [ "$task_file" != "$new_name" ] && rm "$task_file"
-  
-  # Update github field in frontmatter
-  # Add the GitHub URL to the frontmatter
-  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  github_url="https://github.com/$repo/issues/$task_number"
-  
-  # Update frontmatter with GitHub URL and current timestamp
-  current_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  
-  # Use sed to update the github and updated fields
-  sed -i.bak "/^github:/c\github: $github_url" "$new_name"
-  sed -i.bak "/^updated:/c\updated: $current_date" "$new_name"
-  rm "${new_name}.bak"
-done < /tmp/task-mapping.txt
-```
-
-### 4. Update Epic with Task List (Fallback Only)
-
-If NOT using gh-sub-issue, add task list to epic:
-
-```bash
-if [ "$use_subissues" = false ]; then
-  # Get current epic body
-  gh issue view {epic_number} --json body -q .body > /tmp/epic-body.md
-  
-  # Append task list
-  cat >> /tmp/epic-body.md << 'EOF'
-  
-  ## Tasks
-  - [ ] #{task1_number} {task1_name}
-  - [ ] #{task2_number} {task2_name}
-  - [ ] #{task3_number} {task3_name}
-  EOF
-  
-  # Update epic issue
-  gh issue edit {epic_number} --body-file /tmp/epic-body.md
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
+rename_stage="$epic_sync_tmp/rename-stage"
+mkdir -p "$rename_stage"
+if ! repo=$(gh repo view --json nameWithOwner -q .nameWithOwner); then
+  echo "❌ Could not resolve repository identity" >&2
+  exit 1
 fi
-```
+current_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-With gh-sub-issue, this is automatic!
+# Prepare every destination before removing any source file.
+while IFS=: read -r task_file task_number; do
+  staged_file="$rename_stage/${task_number}.md"
+  content=$(cat "$task_file")
+  source_id=$(task_source_id "$task_file")
+  grep -q '^monday_source:' "$task_file" ||
+    content=$(printf '%s\n' "$content" | awk -v id="$source_id" 'NR == 2 { print "monday_source: " id } { print }')
+
+  while IFS=: read -r old_num new_num; do
+    content=$(printf '%s\n' "$content" | sed -E "s/(\[|, ?)$old_num(,|\])/\1$new_num\2/g")
+  done < "$epic_sync_tmp/id-mapping.txt"
+
+  printf '%s\n' "$content" > "$staged_file"
+  github_url="https://github.com/$repo/issues/$task_number"
+  set_frontmatter_field "$staged_file" github "$github_url"
+  set_frontmatter_field "$staged_file" updated "$current_date"
+done < "$epic_sync_tmp/task-mapping.txt"
+
+rename_recovery=$(mktemp -d "$(dirname "$epic_dir")/.${ARGUMENTS}-rename-recovery.XXXXXX")
+restore_sources() {
+  restore_ok=1
+  while IFS=: read -r task_file _; do
+    backup_file="$rename_recovery/$(basename "$task_file")"
+    [ ! -e "$backup_file" ] || mv "$backup_file" "$task_file" || restore_ok=0
+  done < "$epic_sync_tmp/task-mapping.txt"
+  [ "$restore_ok" -eq 1 ]
+}
+
+while IFS=: read -r task_file _; do
+  if ! mv "$task_file" "$rename_recovery/$(basename "$task_file")"; then
+    if restore_sources; then
+      rmdir "$rename_recovery"
+    else
+      echo "❌ Source recovery remains at $rename_recovery" >&2
+    fi
+    exit 1
+  fi
+done < "$epic_sync_tmp/task-mapping.txt"
+
+: > "$epic_sync_tmp/installed-task-files.txt"
+while IFS=: read -r task_file task_number; do
+  final_file="$(dirname "$task_file")/${task_number}.md"
+  if ! mv "$rename_stage/${task_number}.md" "$final_file"; then
+    while IFS= read -r installed_file; do
+      rm -f "$installed_file"
+    done < "$epic_sync_tmp/installed-task-files.txt"
+    if restore_sources; then
+      rmdir "$rename_recovery"
+    else
+      echo "❌ Source recovery remains at $rename_recovery" >&2
+    fi
+    exit 1
+  fi
+  printf '%s\n' "$final_file" >> "$epic_sync_tmp/installed-task-files.txt"
+done < "$epic_sync_tmp/task-mapping.txt"
+rm -rf "$rename_recovery"
+rmdir "$rename_stage"
+```
 
 ### 5. Update Epic File
 
@@ -296,8 +529,9 @@ rm .claude/epics/$ARGUMENTS/epic.md.bak
 
 #### 5b. Update Tasks Created Section
 ```bash
+epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
 # Create a temporary file with the updated Tasks Created section
-cat > /tmp/tasks-section.md << 'EOF'
+cat > "$epic_sync_tmp/tasks-section.md" << 'EOF'
 ## Tasks Created
 EOF
 
@@ -315,7 +549,7 @@ for task_file in .claude/epics/$ARGUMENTS/[0-9]*.md; do
   parallel=$(grep '^parallel:' "$task_file" | sed 's/^parallel: *//')
   
   # Add to tasks section
-  echo "- [ ] #${issue_num} - ${task_name} (parallel: ${parallel})" >> /tmp/tasks-section.md
+  echo "- [ ] #${issue_num} - ${task_name} (parallel: ${parallel})" >> "$epic_sync_tmp/tasks-section.md"
 done
 
 # Add summary statistics
@@ -323,7 +557,7 @@ total_count=$(ls .claude/epics/$ARGUMENTS/[0-9]*.md 2>/dev/null | wc -l)
 parallel_count=$(grep -l '^parallel: true' .claude/epics/$ARGUMENTS/[0-9]*.md 2>/dev/null | wc -l)
 sequential_count=$((total_count - parallel_count))
 
-cat >> /tmp/tasks-section.md << EOF
+cat >> "$epic_sync_tmp/tasks-section.md" << EOF
 
 Total tasks: ${total_count}
 Parallel tasks: ${parallel_count}
@@ -335,11 +569,11 @@ EOF
 cp .claude/epics/$ARGUMENTS/epic.md .claude/epics/$ARGUMENTS/epic.md.backup
 
 # Use awk to replace the section
-awk '
+awk -v tasks_section="$epic_sync_tmp/tasks-section.md" '
   /^## Tasks Created/ { 
     skip=1
-    while ((getline line < "/tmp/tasks-section.md") > 0) print line
-    close("/tmp/tasks-section.md")
+    while ((getline line < tasks_section) > 0) print line
+    close(tasks_section)
   }
   /^## / && !/^## Tasks Created/ { skip=0 }
   !skip && !/^## Tasks Created/ { print }
@@ -347,7 +581,7 @@ awk '
 
 # Clean up
 rm .claude/epics/$ARGUMENTS/epic.md.backup
-rm /tmp/tasks-section.md
+rm "$epic_sync_tmp/tasks-section.md"
 ```
 
 ### 6. Create Mapping File
@@ -389,7 +623,7 @@ its dedicated worktree through `/rules/worktree-operations.md`.
 ✅ Synced to GitHub
   - Epic: #{epic_number} - {epic_title}
   - Tasks: {count} sub-issues created
-  - Labels applied: epic, task, epic:{name}
+  - Labels applied: enhancement + needs-triage; tracking on the epic
   - Files renamed: 001.md → {issue_id}.md
   - References updated: depends_on/conflicts_with now use issue IDs
   - Worktrees: one dedicated path per ready issue
@@ -412,6 +646,6 @@ If any issue creation fails:
 ## Important Notes
 
 - Trust GitHub CLI authentication
-- Don't pre-check for duplicates
+- Resume issues by their stable `monday-source` marker
 - Update frontmatter only after successful creation
 - Keep operations simple and atomic

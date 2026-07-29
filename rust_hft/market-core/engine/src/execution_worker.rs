@@ -103,7 +103,7 @@ pub struct ExecutionWorkerStats {
     pub orders_failed: u64,
     pub events_sent: u64,
     pub queue_full_events: u64,
-    /// 最近的執行延遲（用於實時監控）
+    /// Most recent proven userspace write-return to synchronous-response span.
     pub recent_execution_latency_micros: Option<u64>,
 }
 
@@ -124,6 +124,86 @@ struct PendingAck {
     symbol: Symbol,
     submitted_at: Instant,
     cancel_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExecutionSpanSnapshot {
+    intent_to_risk_us: Option<u64>,
+    risk_to_write_us: Option<u64>,
+    userspace_write_us: Option<u64>,
+    write_to_response_us: Option<u64>,
+    write_to_private_ack_us: Option<u64>,
+    write_to_private_report_us: Option<u64>,
+    intent_to_private_report_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExecutionTimeline {
+    client_idx: usize,
+    intent_emitted_mono_us: Option<u64>,
+    risk_completed_mono_us: Option<u64>,
+    write_started_mono_us: Option<u64>,
+    write_returned_mono_us: Option<u64>,
+    response_received_mono_us: Option<u64>,
+    private_ack_received_mono_us: Option<u64>,
+    private_report_received_mono_us: Option<u64>,
+}
+
+impl ExecutionTimeline {
+    fn from_lifecycle(lifecycle: &ports::OrderIntentLifecycle, client_idx: usize) -> Self {
+        Self {
+            client_idx,
+            intent_emitted_mono_us: lifecycle.timing.intent_emitted_mono_us,
+            risk_completed_mono_us: lifecycle.timing.risk_completed_mono_us,
+            ..Self::default()
+        }
+    }
+
+    fn apply_submission(&mut self, attempt: &ports::ExecutionSubmissionAttempt) {
+        self.write_started_mono_us = attempt.userspace_write_started_mono_us;
+        self.write_returned_mono_us = attempt.userspace_write_returned_mono_us;
+        self.response_received_mono_us = attempt.response_received_mono_us;
+    }
+
+    fn apply_private(&mut self, kind: ports::PrivateOrderEventKind, received_mono_us: u64) {
+        match kind {
+            ports::PrivateOrderEventKind::Ack => {
+                self.private_ack_received_mono_us = Some(received_mono_us)
+            }
+            ports::PrivateOrderEventKind::Report => {
+                self.private_report_received_mono_us = Some(received_mono_us)
+            }
+        }
+    }
+
+    fn spans(&self) -> ExecutionSpanSnapshot {
+        let elapsed = |start: Option<u64>, end: Option<u64>| {
+            start
+                .zip(end)
+                .and_then(|(start, end)| end.checked_sub(start))
+        };
+        ExecutionSpanSnapshot {
+            intent_to_risk_us: elapsed(self.intent_emitted_mono_us, self.risk_completed_mono_us),
+            risk_to_write_us: elapsed(self.risk_completed_mono_us, self.write_started_mono_us),
+            userspace_write_us: elapsed(self.write_started_mono_us, self.write_returned_mono_us),
+            write_to_response_us: elapsed(
+                self.write_returned_mono_us,
+                self.response_received_mono_us,
+            ),
+            write_to_private_ack_us: elapsed(
+                self.write_returned_mono_us,
+                self.private_ack_received_mono_us,
+            ),
+            write_to_private_report_us: elapsed(
+                self.write_returned_mono_us,
+                self.private_report_received_mono_us,
+            ),
+            intent_to_private_report_us: elapsed(
+                self.intent_emitted_mono_us,
+                self.private_report_received_mono_us,
+            ),
+        }
+    }
 }
 
 /// 执行 Worker - 在独立 Tokio 任务中运行
@@ -148,6 +228,7 @@ pub struct ExecutionWorker {
     venue_to_client: HashMap<VenueId, usize>,
     /// 等待 Ack 的訂單。超時後保持追蹤，直到收到交易所終態。
     pending_acks: FxHashMap<OrderId, PendingAck>,
+    execution_timelines: FxHashMap<OrderId, ExecutionTimeline>,
     /// 上次對帳時間
     last_reconcile: Instant,
     /// 策略到客戶端索引的映射（同交易所多帳戶路由）
@@ -255,6 +336,7 @@ impl ExecutionWorker {
             router: None, // 使用舊的硬編碼邏輯
             venue_to_client: HashMap::new(),
             pending_acks: FxHashMap::default(),
+            execution_timelines: FxHashMap::default(),
             last_reconcile: Instant::now(),
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
@@ -299,6 +381,7 @@ impl ExecutionWorker {
             router: Some(router),
             venue_to_client,
             pending_acks: FxHashMap::default(),
+            execution_timelines: FxHashMap::default(),
             last_reconcile: Instant::now(),
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
@@ -533,8 +616,6 @@ impl ExecutionWorker {
                 self.reject_for_disabled_intake(&envelope).await;
                 continue;
             }
-            let execution_start = now_micros();
-
             let client_idx = match self.select_execution_client(intent) {
                 Ok(idx) => idx,
                 Err(reason) => {
@@ -549,32 +630,49 @@ impl ExecutionWorker {
                     continue;
                 }
             };
+            let trace_id = OrderId(envelope.client_order_id.clone());
+            self.execution_timelines.insert(
+                trace_id.clone(),
+                ExecutionTimeline::from_lifecycle(&envelope.lifecycle, client_idx),
+            );
 
-            match self.execution_clients[client_idx]
-                .place_order_envelope(&envelope)
-                .await
+            let attempt = self.execution_clients[client_idx]
+                .place_order_envelope_traced(&envelope)
+                .await;
+            let timeline = self
+                .execution_timelines
+                .get_mut(&trace_id)
+                .expect("timeline inserted before submission");
+            timeline.apply_submission(&attempt);
+            let spans = timeline.spans();
+            self.stats.recent_execution_latency_micros = spans.write_to_response_us;
+            if let Some(end_to_end) = envelope
+                .lifecycle
+                .timing
+                .intent_emitted_mono_us
+                .zip(attempt.response_received_mono_us)
+                .and_then(|(start, end)| end.checked_sub(start))
             {
-                Ok(order_id) => {
-                    let submitted_at = now_micros();
-                    let execution_latency = submitted_at.saturating_sub(execution_start);
-                    let end_to_end_latency =
-                        submitted_at.saturating_sub(envelope.lifecycle.created_ts);
-                    self.latency_monitor
-                        .record_latency(LatencyStage::Submission, execution_latency);
-                    self.latency_monitor
-                        .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
-                    self.stats.recent_execution_latency_micros = Some(execution_latency);
-                    #[cfg(feature = "metrics")]
-                    infra_metrics::MetricsRegistry::global()
-                        .record_submission_latency(execution_latency as f64);
-                    #[cfg(feature = "metrics")]
-                    infra_metrics::MetricsRegistry::global()
-                        .record_end_to_end_latency(end_to_end_latency as f64);
+                self.latency_monitor
+                    .record_latency(LatencyStage::EndToEnd, end_to_end);
+            }
+            #[cfg(feature = "metrics")]
+            Self::record_submission_timeline_metrics(*timeline);
 
+            match attempt.outcome {
+                Ok(order_id) => {
                     self.stats.orders_placed += 1;
                     if self.latch_duplicate_order_id(&order_id, client_idx) {
+                        self.execution_timelines.remove(&trace_id);
                         self.stats.orders_failed += 1;
                         continue;
+                    }
+                    if order_id != trace_id {
+                        let timeline = self
+                            .execution_timelines
+                            .remove(&trace_id)
+                            .expect("timeline retained through successful submission");
+                        self.execution_timelines.insert(order_id.clone(), timeline);
                     }
                     self.order_to_client.insert(order_id.clone(), client_idx);
 
@@ -628,7 +726,10 @@ impl ExecutionWorker {
                     };
                     self.queues.send_event_reliable(new_event).await;
 
-                    debug!("訂單執行成功，延遲: {}μs", execution_latency);
+                    debug!(
+                        write_to_response_us = ?spans.write_to_response_us,
+                        "order submission response received"
+                    );
 
                     // 標記等待 Ack
                     self.pending_acks.insert(
@@ -641,9 +742,6 @@ impl ExecutionWorker {
                     );
                 }
                 Err(e) => {
-                    let execution_latency = now_micros().saturating_sub(execution_start);
-                    self.stats.recent_execution_latency_micros = Some(execution_latency);
-
                     self.stats.orders_failed += 1;
                     let outcome_unknown = Self::submission_outcome_may_be_unknown(&e);
                     if outcome_unknown {
@@ -710,6 +808,7 @@ impl ExecutionWorker {
                         e
                     );
                     if !outcome_unknown {
+                        self.execution_timelines.remove(&trace_id);
                         let reject_event = ExecutionEvent::OrderReject {
                             order_id: OrderId(envelope.client_order_id.clone()),
                             reason: format!("Worker 下单失败: {}", e),
@@ -791,9 +890,71 @@ impl ExecutionWorker {
                 | HftError::RateLimit(_)
                 | HftError::Exchange(_)
                 | HftError::OrderNotFound(_)
-                | HftError::Parse(_)
-                | HftError::Serialization(_)
         )
+    }
+
+    #[cfg(feature = "metrics")]
+    fn record_submission_timeline_metrics(timeline: ExecutionTimeline) {
+        let spans = timeline.spans();
+        let metrics = infra_metrics::MetricsRegistry::global();
+        if let Some(value) = spans.intent_to_risk_us {
+            metrics.record_execution_intent_to_risk(value as f64);
+        }
+        if let Some(value) = spans.risk_to_write_us {
+            metrics.record_execution_risk_to_write(value as f64);
+        }
+        if let Some(value) = spans.userspace_write_us {
+            metrics.record_execution_userspace_write(value as f64);
+        }
+        if let Some(value) = spans.write_to_response_us {
+            metrics.record_execution_write_to_response(value as f64);
+        }
+    }
+
+    fn capture_private_timing(&mut self, client_idx: usize, event: &ExecutionEvent) -> bool {
+        let ExecutionEvent::PrivateOrderTiming {
+            order_id,
+            kind,
+            received_mono_us,
+        } = event
+        else {
+            return false;
+        };
+        if let Some(timeline) = self.execution_timelines.get_mut(order_id) {
+            if timeline.client_idx != client_idx {
+                error!(
+                    order_id = %order_id.0,
+                    expected_client_idx = timeline.client_idx,
+                    conflicting_client_idx = client_idx,
+                    "discarded private timing from the wrong execution client"
+                );
+                self.emergency_latched = true;
+                self.latch_stream_recovery();
+                return true;
+            }
+            timeline.apply_private(*kind, *received_mono_us);
+            #[cfg(feature = "metrics")]
+            match kind {
+                ports::PrivateOrderEventKind::Ack => {
+                    if let Some(value) = timeline.spans().write_to_private_ack_us {
+                        infra_metrics::MetricsRegistry::global()
+                            .record_execution_write_to_private_ack(value as f64);
+                    }
+                }
+                ports::PrivateOrderEventKind::Report => {
+                    let spans = timeline.spans();
+                    if let Some(value) = spans.write_to_private_report_us {
+                        infra_metrics::MetricsRegistry::global()
+                            .record_execution_write_to_private_report(value as f64);
+                    }
+                    if let Some(value) = spans.intent_to_private_report_us {
+                        infra_metrics::MetricsRegistry::global()
+                            .record_execution_intent_to_private_report(value as f64);
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn latch_duplicate_order_id(&mut self, order_id: &OrderId, client_idx: usize) -> bool {
@@ -825,6 +986,10 @@ impl ExecutionWorker {
                     client_idx,
                     result: Ok(event),
                 })) => {
+                    if self.capture_private_timing(client_idx, &event) {
+                        events_count += 1;
+                        continue;
+                    }
                     if !self.private_order_event_matches_client(client_idx, &event) {
                         events_count += 1;
                         continue;
@@ -874,6 +1039,9 @@ impl ExecutionWorker {
                 client_idx,
                 result: Ok(event),
             }) => {
+                if self.capture_private_timing(client_idx, &event) {
+                    return;
+                }
                 if !self.private_order_event_matches_client(client_idx, &event) {
                     return;
                 }
@@ -1052,7 +1220,8 @@ impl ExecutionWorker {
             | ExecutionEvent::OrderReject { order_id, .. }
             | ExecutionEvent::OrderCompleted { order_id, .. }
             | ExecutionEvent::OrderCanceled { order_id, .. }
-            | ExecutionEvent::OrderModified { order_id, .. } => order_id,
+            | ExecutionEvent::OrderModified { order_id, .. }
+            | ExecutionEvent::PrivateOrderTiming { order_id, .. } => order_id,
             _ => return true,
         };
         let Some(expected_client_idx) = self.order_to_client.get(order_id).copied() else {
@@ -1186,6 +1355,7 @@ impl ExecutionWorker {
                     self.pending_acks.remove(order_id);
                     self.order_to_client.remove(order_id);
                     self.tracked_orders.remove(order_id);
+                    self.execution_timelines.remove(order_id);
                 }
             }
             ExecutionEvent::OrderCanceled { order_id, .. }
@@ -1194,6 +1364,7 @@ impl ExecutionWorker {
                 self.pending_acks.remove(order_id);
                 self.order_to_client.remove(order_id);
                 self.tracked_orders.remove(order_id);
+                self.execution_timelines.remove(order_id);
             }
             _ => {}
         }
@@ -1529,6 +1700,7 @@ impl ExecutionWorker {
                     report.failures.push(CancelFailure {
                         order_id: target.order_id,
                         reason,
+                        outcome_unknown: false,
                     });
                     continue;
                 }
@@ -1537,6 +1709,7 @@ impl ExecutionWorker {
                 report.failures.push(CancelFailure {
                     order_id: target.order_id,
                     reason: format!("execution client index {client_idx} is unavailable"),
+                    outcome_unknown: false,
                 });
                 continue;
             };
@@ -1549,10 +1722,18 @@ impl ExecutionWorker {
                     );
                     report.submitted.push(target.order_id);
                 }
-                Err(error) => report.failures.push(CancelFailure {
-                    order_id: target.order_id,
-                    reason: error.to_string(),
-                }),
+                Err(error) => {
+                    let outcome_unknown = Self::submission_outcome_may_be_unknown(&error);
+                    if outcome_unknown {
+                        self.accepting_intents = false;
+                        self.emergency_latched = true;
+                    }
+                    report.failures.push(CancelFailure {
+                        order_id: target.order_id,
+                        reason: error.to_string(),
+                        outcome_unknown,
+                    });
+                }
             }
         }
 
@@ -1641,6 +1822,7 @@ pub struct CancelTarget {
 pub struct CancelFailure {
     pub order_id: OrderId,
     pub reason: String,
+    pub outcome_unknown: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2063,6 +2245,9 @@ mod tests {
         ));
         assert!(ExecutionWorker::submission_outcome_may_be_unknown(
             &HftError::Execution("accepted response was malformed".to_string())
+        ));
+        assert!(ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::Serialization("malformed response".to_string())
         ));
     }
 
@@ -3144,6 +3329,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn private_ack_keeps_its_actual_ordering_around_sync_response() {
+        let lifecycle = ports::OrderIntentLifecycle {
+            timing: ports::ExecutionTiming {
+                intent_emitted_mono_us: Some(10),
+                risk_completed_mono_us: Some(20),
+                ..Default::default()
+            },
+            ..ports::OrderIntentLifecycle::default()
+        };
+        let receipt = ports::ExecutionSubmissionAttempt {
+            outcome: Ok(OrderId("client-42".to_string())),
+            userspace_write_started_mono_us: Some(30),
+            userspace_write_returned_mono_us: Some(35),
+            response_received_mono_us: Some(50),
+        };
+
+        let mut before = ExecutionTimeline::from_lifecycle(&lifecycle, 0);
+        before.apply_submission(&receipt);
+        before.apply_private(ports::PrivateOrderEventKind::Ack, 40);
+        assert_eq!(before.spans().write_to_response_us, Some(15));
+        assert_eq!(before.spans().write_to_private_ack_us, Some(5));
+        before.apply_private(ports::PrivateOrderEventKind::Report, 45);
+        assert_eq!(before.spans().write_to_private_report_us, Some(10));
+        assert_eq!(before.spans().intent_to_private_report_us, Some(35));
+
+        let mut after = ExecutionTimeline::from_lifecycle(&lifecycle, 0);
+        after.apply_submission(&receipt);
+        after.apply_private(ports::PrivateOrderEventKind::Ack, 60);
+        assert_eq!(after.spans().write_to_response_us, Some(15));
+        assert_eq!(after.spans().write_to_private_ack_us, Some(25));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_cancel_latches_intake_and_reports_unknown_outcome() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: true,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let order_id = OrderId("client-42".to_string());
+
+        let report = worker
+            .dispatch_cancellations(vec![CancelTarget {
+                order_id: order_id.clone(),
+                symbol: Symbol::new("BTCUSDT"),
+                venue: None,
+                account_id: None,
+            }])
+            .await;
+
+        assert!(!worker.accepting_intents);
+        assert!(worker.emergency_latched);
+        assert!(matches!(
+            report.failures.as_slice(),
+            [CancelFailure {
+                order_id: failed_id,
+                outcome_unknown: true,
+                ..
+            }] if failed_id == &order_id
+        ));
+    }
+
     #[tokio::test]
     async fn duplicate_order_id_across_clients_latches_without_overwriting_first_order() {
         let first_state = Arc::new(StdMutex::new(MockExecutionState::default()));
@@ -3208,6 +3466,8 @@ mod tests {
             Some(&Symbol::new("BTCUSDT"))
         );
         assert!(worker.pending_acks.contains_key(&order_id));
+        assert_eq!(worker.execution_timelines.len(), 1);
+        assert!(worker.execution_timelines.contains_key(&order_id));
         assert_eq!(
             worker
                 .tracked_orders
