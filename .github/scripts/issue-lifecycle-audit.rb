@@ -144,9 +144,9 @@ end
 
 def literal_escaped_newline_artifact?(body)
   text = body.to_s
-  return false unless text.include?("\\n")
+  return false if text.scan(/\\n/).length < 3
 
-  !text.include?("\n") && text.scan(/\\n/).length >= 3
+  !text.include?("\n") || text.match?(/(?:\A|\n)[#]{1,6}[ \t]+[^\\\r\n]+\\n(?:\\n)?/)
 end
 
 def active_owner_violation(issue)

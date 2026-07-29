@@ -58,6 +58,9 @@ cases = {
   "valid_closes" => data([
     issue(11, %w[enhancement ready-for-agent], issue_body, ["agent"])
   ], [pull_request(22, "Closes #11", "main", [{ "sha" => "fix", "message" => "Fixes #11" }])]),
+  "valid_title_closes" => data([
+    issue(16, %w[enhancement ready-for-agent], issue_body, ["agent"])
+  ], [pull_request(42, "Closes #16", "main", [], "", "Fixes #16")]),
   "valid_none" => data([], [pull_request(23, "<!-- Refs #1 and Closes #1 -->\nNone")], false),
   "valid_needs_info" => data([issue(13, %w[bug needs-info])]),
   "valid_wontfix" => data([issue(14, %w[enhancement wontfix])]),
@@ -80,6 +83,9 @@ cases = {
   ]),
   "valid_literal_escaped_newline" => data([
     issue(35, %w[enhancement ready-for-human], issue_body + "\n\n```json\n{\"pattern\":\"line\\\\nnext\"}\n```\n")
+  ]),
+  "mixed_literal_escaped_newline" => data([
+    issue(60, %w[enhancement ready-for-human], "Normal preface.\n\n## Parent\\n\\nNone\\n\\n## Blocked by\\n\\nNone")
   ]),
   "tracking_agent_queue" => data([issue(35, %w[enhancement ready-for-agent tracking])]),
   "runtime_missing_control" => data([issue(36, %w[enhancement ready-for-agent runtime])]),
@@ -197,6 +203,7 @@ run_fail() {
 
 run_pass valid_refs
 run_pass valid_closes
+run_pass valid_title_closes
 run_pass valid_none "automatic-linked-issue-closing: disabled (fixture)"
 run_pass valid_needs_info
 run_pass valid_wontfix
@@ -213,6 +220,7 @@ conflicting_category|Issue #31: expected exactly one category label
 missing_state|Issue #32: expected exactly one triage state label
 conflicting_state|Issue #33: expected exactly one triage state label
 literal_escaped_newline|Issue #34: body contains a literal escaped newline
+mixed_literal_escaped_newline|Issue #60: body contains a literal escaped newline
 tracking_agent_queue|Issue #35: tracking issues cannot use ready-for-agent
 runtime_missing_control|Issue #36: runtime ready-for-agent is missing Runtime control
 runtime_open_blocker|Issue #37: runtime ready-for-agent has open native blocker #99
