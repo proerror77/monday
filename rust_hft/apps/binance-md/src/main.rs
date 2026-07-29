@@ -1095,7 +1095,7 @@ fn write_latency_evidence(
             websocket_endpoint,
             protocol: "websocket_tls",
             streams: "diff_depth_100ms_and_book_ticker",
-            receive_boundary: "after_websocket_message_to_owned_bytes",
+            receive_boundary: "before_websocket_message_to_owned_bytes",
             clock: "std_time_instant_monotonic",
             unit: "nanoseconds",
             eligible_observation: "post_bridge_applied_depth_update",
@@ -1104,7 +1104,7 @@ fn write_latency_evidence(
                 SpanCaptureLocation {
                     stage: "parse",
                     producer: "std_time_instant_monotonic",
-                    start: "after_websocket_message_to_owned_bytes",
+                    start: "before_websocket_message_to_owned_bytes",
                     end: "after_depth_json_normalization",
                 },
                 SpanCaptureLocation {
@@ -1128,7 +1128,7 @@ fn write_latency_evidence(
                 SpanCaptureLocation {
                     stage: "total",
                     producer: "std_time_instant_monotonic",
-                    start: "after_websocket_message_to_owned_bytes",
+                    start: "before_websocket_message_to_owned_bytes",
                     end: "after_signal_evaluation",
                 },
             ],
@@ -1705,6 +1705,18 @@ mod tests {
             serde_json::from_reader(File::open(&path).unwrap()).unwrap();
         assert!(written);
         assert_eq!(artifact["evidence_kind"], "benchmark");
+        assert_eq!(
+            artifact["capture_provenance"]["receive_boundary"],
+            "before_websocket_message_to_owned_bytes"
+        );
+        assert_eq!(
+            artifact["capture_provenance"]["span_capture_locations"][0]["start"],
+            "before_websocket_message_to_owned_bytes"
+        );
+        assert_eq!(
+            artifact["capture_provenance"]["span_capture_locations"][4]["start"],
+            "before_websocket_message_to_owned_bytes"
+        );
     }
 
     #[test]
