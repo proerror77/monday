@@ -131,6 +131,7 @@ impl MessageConverter {
     /// 轉換 K 線事件
     pub fn convert_kline_event(kline_event: KlineEvent) -> HftResult<AggregatedBar> {
         let symbol = Symbol::from(kline_event.symbol);
+        let exchange_event_time_us = Self::millis_to_micros(kline_event.event_time, "kline event")?;
         let kline = &kline_event.kline;
 
         let open = Self::parse_price(&kline.open_price)?;
@@ -155,6 +156,11 @@ impl MessageConverter {
             volume,
             trade_count: kline.trade_count,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
+                exchange_trade: None,
+                local_receive: None,
+            },
         })
     }
 

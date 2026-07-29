@@ -13,6 +13,8 @@ readonly POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
 readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
+readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
+readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
@@ -25,15 +27,445 @@ if command -v gsha256sum >/dev/null 2>&1; then
   }
 fi
 
-for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum shellcheck sort \
-  sync wc zstd; do
+for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum \
+  shellcheck sort sync wc zstd; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
     exit 2
   }
 done
 
-shellcheck "$GATE" "$CUTOVER" "$0"
+[[ -x $GATE_CONTROL && -f $GATE_UNIT ]] || {
+  printf 'missing supervised Gate control-plane assets\n' >&2
+  exit 1
+}
+shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
+for unit_line in \
+  'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
+  'TimeoutStopSec=120' \
+  'ExecStartPre=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} prepare %i' \
+  'ExecStart=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} run %i' \
+  'ExecStopPost=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} finalize %i'; do
+  grep -Fxq "$unit_line" "$GATE_UNIT"
+done
+if grep -Eq '^\[(Install)\]$|^(Wants|Requires|Conflicts)=.*polymarket-reference' \
+  "$GATE_UNIT"; then
+  printf 'Gate supervisor must not install, start, or conflict with a collector\n' >&2
+  exit 1
+fi
+grep -Fq "trap 'exit 143' HUP INT TERM" "$GATE"
+grep -Fq 'run_id=$supervised_invocation_id' "$GATE"
+if ! awk '
+  /^verify_gate_supervisor "\$candidate_sha" "\$supervised_invocation_id"/ {guard=NR}
+  /^real_market_preflight_json=$/ {preflight=NR}
+  /^systemctl start "\$shadow_unit"$/ && !shadow {shadow=NR}
+  END {exit !(guard && guard < preflight && preflight < shadow)}
+' "$GATE"; then
+  printf 'unmanaged Gate can reach preflight or shadow startup\n' >&2
+  exit 1
+fi
+grep -Fq 'pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"' "$GATE"
+if grep -Fq 'marker="$evidence_dir/PASSED.sha256"' "$GATE"; then
+  printf 'running Gate publishes the official pass marker before finalization\n' >&2
+  exit 1
+fi
+
+supervisor_tmp=$(mktemp -d)
+trap 'rm -rf "$supervisor_tmp"' EXIT
+supervisor_root="$supervisor_tmp/root"
+supervisor_fake_bin="$supervisor_tmp/bin"
+supervisor_control_dir="$supervisor_tmp/control"
+supervisor_control="$supervisor_control_dir/${GATE_CONTROL##*/}"
+supervisor_state="$supervisor_tmp/systemctl"
+supervisor_calls="$supervisor_tmp/systemctl.calls"
+supervisor_gate_calls="$supervisor_tmp/gate.calls"
+supervisor_candidate="$supervisor_tmp/polymarket-raw-ops"
+supervisor_source=$(printf 'b%.0s' {1..40})
+supervisor_invocation=$(printf '1%.0s' {1..32})
+mkdir -p "$supervisor_fake_bin" "$supervisor_control_dir" \
+  "$supervisor_root/etc/systemd/system" \
+  "$supervisor_root/run/monday" \
+  "$supervisor_root/data/monday/evidence"
+cp "$GATE_CONTROL" "$supervisor_control"
+cp "$GATE_UNIT" "$supervisor_control_dir/${GATE_UNIT##*/}"
+cat >"$supervisor_control_dir/${GATE##*/}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s|%s\n' "$*" "${INVOCATION_ID:-}" \
+  "${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}" >>"$FAKE_GATE_CALLS"
+exit "${FAKE_GATE_EXIT:-0}"
+EOF
+chmod 0755 "$supervisor_control" \
+  "$supervisor_control_dir/${GATE##*/}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$supervisor_candidate"
+chmod 0755 "$supervisor_candidate"
+supervisor_candidate_sha=$(sha256sum "$supervisor_candidate" | awk '{print $1}')
+supervisor_unit="polymarket-raw-ops-gate@${supervisor_candidate_sha}.service"
+mkdir "$supervisor_state"
+printf 'inactive\n' >"$supervisor_state/active"
+printf '%s\n' "$supervisor_invocation" >"$supervisor_state/invocation"
+printf 'inactive\n' >"$supervisor_state/shadow"
+: >"$supervisor_calls"
+: >"$supervisor_gate_calls"
+
+cat >"$supervisor_fake_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+read_state() { tr -d '\n' <"$FAKE_SYSTEMCTL_STATE/$1"; }
+write_state() { printf '%s\n' "$2" >"$FAKE_SYSTEMCTL_STATE/$1"; }
+
+printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_CALLS"
+case "${1:-}" in
+  daemon-reload)
+    [[ $# -eq 1 ]] || exit 2
+    ;;
+  start)
+    [[ $# -eq 2 ]] || exit 2
+    unit=${2:-}
+    candidate=${unit#polymarket-raw-ops-gate@}
+    candidate=${candidate%.service}
+    INVOCATION_ID=$(read_state invocation) \
+      "$FAKE_GATE_CONTROL" prepare "$candidate"
+    write_state active active
+    ;;
+  stop)
+    [[ $# -ge 2 ]] || exit 2
+    unit=${!#}
+    if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+      [[ ${FAKE_SHADOW_STOP_FAIL:-0} != 1 ]] || exit 5
+      write_state shadow inactive
+    elif [[ $unit == polymarket-raw-ops-gate@* ]]; then
+      candidate=${unit#polymarket-raw-ops-gate@}
+      candidate=${candidate%.service}
+      invocation=$(read_state invocation)
+      write_state active inactive
+      INVOCATION_ID=$invocation \
+        SERVICE_RESULT=signal \
+        EXIT_CODE=killed \
+        EXIT_STATUS=15 \
+        "$FAKE_GATE_CONTROL" finalize "$candidate" >/dev/null
+    else
+      exit 2
+    fi
+    ;;
+  show)
+    [[ $# -ge 2 ]] || exit 2
+    unit=${2:-}
+    property=
+    for argument in "${@:3}"; do
+      [[ $argument == --property=* ]] && property=${argument#--property=}
+    done
+    [[ ${FAKE_SHOW_FAIL:-} != "$property" ]] || exit 9
+    case "$property" in
+      ActiveState)
+        if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+          read_state shadow
+        else
+          read_state active
+        fi
+        ;;
+      InvocationID) read_state invocation ;;
+      MainPID)
+        if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+          [[ $(read_state shadow) == active ]] && printf '5252\n' || printf '0\n'
+        else
+          [[ $(read_state active) == active ]] && printf '4242\n' || printf '0\n'
+        fi
+        ;;
+      FragmentPath) printf '/etc/systemd/system/polymarket-raw-ops-gate@.service\n' ;;
+      DropInPaths) printf '\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$supervisor_fake_bin/systemctl"
+cat >"$supervisor_fake_bin/flock" <<'EOF'
+#!/usr/bin/perl
+use Fcntl qw(LOCK_EX LOCK_NB);
+open my $lock, '<&=', $ARGV[-1] or die "dup lock fd: $!\n";
+my $operation = LOCK_EX;
+$operation |= LOCK_NB if grep { $_ eq '-n' } @ARGV;
+exit(flock($lock, $operation) ? 0 : 1);
+EOF
+chmod 0755 "$supervisor_fake_bin/flock"
+cat >"$supervisor_fake_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination=${!#}
+[[ ${FAKE_MV_FAIL_RECEIPT_STAGE:-0} != 1 \
+  || $destination != */.receipt.json.ready ]] \
+  || exit 74
+[[ ${FAKE_MV_FAIL_RECEIPT:-0} != 1 || $destination != */receipt.json ]] \
+  || exit 75
+exec /bin/mv "$@"
+EOF
+chmod 0755 "$supervisor_fake_bin/mv"
+cat >"$supervisor_fake_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination=${!#}
+[[ ${FAKE_RM_FAIL_RECEIPT_READY:-0} != 1 \
+  || $destination != */.receipt.json.ready ]] \
+  || exit 75
+exec /bin/rm "$@"
+EOF
+chmod 0755 "$supervisor_fake_bin/rm"
+
+flock_probe="$supervisor_tmp/flock-probe.lock"
+exec 7>"$flock_probe"
+"$supervisor_fake_bin/flock" 7
+exec 8>"$flock_probe"
+if "$supervisor_fake_bin/flock" -n 8; then
+  printf 'fake flock did not preserve the parent-held lock\n' >&2
+  exit 1
+fi
+exec 7>&-
+"$supervisor_fake_bin/flock" -n 8 || {
+  printf 'fake flock did not release the closed parent lock\n' >&2
+  exit 1
+}
+exec 8>&-
+
+gate_control_env=(
+  MONDAY_ALLOW_POLYMARKET_GATE_CONTROL_TEST_MODE=1
+  MONDAY_POLYMARKET_GATE_CONTROL_TEST_ROOT="$supervisor_root"
+  FAKE_SYSTEMCTL_STATE="$supervisor_state"
+  FAKE_SYSTEMCTL_CALLS="$supervisor_calls"
+  FAKE_GATE_CALLS="$supervisor_gate_calls"
+  FAKE_GATE_CONTROL="$supervisor_control"
+  PATH="$supervisor_fake_bin:$PATH"
+)
+gate_control() { env "${gate_control_env[@]}" "$supervisor_control" "$@"; }
+set_supervisor_state() { printf '%s\n' "$2" >"$supervisor_state/$1"; }
+reject() { if "$@" >/dev/null 2>&1; then return 1; fi; }
+start_supervisor() {
+  set_supervisor_state invocation "$1"
+  set_supervisor_state active inactive
+  gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
+    "$supervisor_source"
+}
+make_supervisor_ready() {
+  local invocation=$1 evidence
+  evidence="$supervisor_root/data/monday/evidence/polymarket-shadow-gates/$supervisor_candidate_sha/$invocation"
+  mkdir -p "$evidence"
+  jq -n --arg candidate "$supervisor_candidate_sha" \
+    --arg source "$supervisor_source" --arg invocation "$invocation" \
+    '{candidate_sha256:$candidate,deployment_source_revision:$source,
+      shadow_run_id:$invocation,production_eligible:true,passed:true}' \
+    >"$evidence/gate.json"
+  (cd "$evidence" && sha256sum gate.json >.PASSED.sha256.ready)
+  printf '%s\n' "$evidence"
+}
+assert_terminal() { jq -e --arg state "$2" '.phase == "terminal" and .terminal_state == $state' "$1" >/dev/null; }
+assert_running_status() {
+  gate_control status "$supervisor_candidate_sha" "$1" \
+    | jq -e '.phase == "running" and .terminal_state == null' >/dev/null
+}
+assert_terminal_status() {
+  gate_control status "$supervisor_candidate_sha" "$1" \
+    | jq -e --arg state "$2" '.phase == "terminal" and .terminal_state == $state' >/dev/null
+}
+finalize_supervisor() {
+  env "${gate_control_env[@]}" INVOCATION_ID="$1" SERVICE_RESULT="$2" \
+    EXIT_CODE="$3" EXIT_STATUS="$4" "$supervisor_control" finalize \
+    "$supervisor_candidate_sha"
+}
+installed_supervisor_unit="$supervisor_root/etc/systemd/system/${GATE_UNIT##*/}"
+gate_control install >"$supervisor_tmp/install.json"
+jq -e '.validated == true' "$supervisor_tmp/install.json" >/dev/null
+cmp -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'Gate unit install left a partial temporary file\n' >&2
+  exit 1
+fi
+printf 'mismatch\n' >"$installed_supervisor_unit"
+reject gate_control install
+rm "$installed_supervisor_unit"
+ln -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+reject gate_control install
+rm "$installed_supervisor_unit"
+gate_control install >/dev/null
+start_supervisor "$supervisor_invocation" >"$supervisor_tmp/start.json"
+jq -e --arg unit "$supervisor_unit" --arg invocation "$supervisor_invocation" '
+  .unit == $unit and .systemd_invocation_id == $invocation
+  and .phase == "running" and .terminal_state == null' \
+  "$supervisor_tmp/start.json" >/dev/null
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+assert_running_status "$supervisor_invocation"
+reject gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source"
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+if env "${gate_control_env[@]}" INVOCATION_ID="$supervisor_invocation" \
+  FAKE_GATE_EXIT=17 "$supervisor_control" run "$supervisor_candidate_sha" \
+  >/dev/null 2>&1; then
+  printf 'fake Gate unexpectedly passed\n' >&2
+  exit 1
+else
+  supervisor_run_status=$?
+fi
+[[ $supervisor_run_status == 17 ]]
+grep -Fqx \
+  "$supervisor_candidate $supervisor_candidate_sha $supervisor_source|$supervisor_invocation|$supervisor_invocation" \
+  "$supervisor_gate_calls"
+set_supervisor_state active inactive
+failed_evidence=$(make_supervisor_ready "$supervisor_invocation")
+printf 'partial\n' >"$failed_evidence/..PASSED.sha256.ready.tmp"
+FAKE_SHADOW_STOP_FAIL=1 finalize_supervisor "$supervisor_invocation" \
+  exit-code exited 17 \
+  >"$supervisor_tmp/failed.json"
+assert_terminal "$supervisor_tmp/failed.json" failed
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+[[ ! -e $failed_evidence/PASSED.sha256 \
+  && ! -e $failed_evidence/.PASSED.sha256.ready \
+  && ! -e $failed_evidence/..PASSED.sha256.ready.tmp ]]
+assert_terminal_status "$supervisor_invocation" failed
+supervisor_start_query_invocation=$(printf '4%.0s' {1..32})
+set_supervisor_state invocation "$supervisor_start_query_invocation"
+set_supervisor_state active inactive
+reject env "${gate_control_env[@]}" FAKE_SHOW_FAIL=InvocationID \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source"
+[[ $(<"$supervisor_state/active") == inactive ]]
+start_query_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_start_query_invocation"
+assert_terminal "$start_query_dir/receipt.json" failed
+reject env "${gate_control_env[@]}" FAKE_SHOW_FAIL=ActiveState \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source"
+supervisor_finalize_query_invocation=$(printf '5%.0s' {1..32})
+start_supervisor "$supervisor_finalize_query_invocation" >/dev/null
+set_supervisor_state shadow active
+finalize_query_evidence=$(make_supervisor_ready \
+  "$supervisor_finalize_query_invocation")
+set_supervisor_state active inactive
+env "${gate_control_env[@]}" INVOCATION_ID="$supervisor_finalize_query_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_SHOW_FAIL=ActiveState "$supervisor_control" finalize \
+  "$supervisor_candidate_sha" >"$supervisor_tmp/finalize-query-failed.json"
+assert_terminal "$supervisor_tmp/finalize-query-failed.json" failed
+jq -e '
+  .shadow.stop_result == "success"
+  and .shadow.containment == "unverified"
+  and .shadow.active_state == "query-error"
+  and .shadow.main_pid == "0"
+' "$supervisor_tmp/finalize-query-failed.json" >/dev/null
+[[ ! -e $finalize_query_evidence/PASSED.sha256 \
+  && ! -e $finalize_query_evidence/.PASSED.sha256.ready ]]
+assert_terminal_status "$supervisor_finalize_query_invocation" failed
+supervisor_cancel_invocation=$(printf '2%.0s' {1..32})
+start_supervisor "$supervisor_cancel_invocation" >/dev/null
+set_supervisor_state shadow active
+cancel_evidence=$(make_supervisor_ready "$supervisor_cancel_invocation")
+gate_control cancel "$supervisor_candidate_sha" \
+  "$supervisor_cancel_invocation" >"$supervisor_tmp/cancelled.json"
+assert_terminal "$supervisor_tmp/cancelled.json" cancelled
+cancel_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_cancel_invocation"
+[[ -f $cancel_dir/cancel.requested ]]
+[[ ! -e $cancel_evidence/PASSED.sha256 \
+  && ! -e $cancel_evidence/.PASSED.sha256.ready ]]
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+
+supervisor_prepare_invocation=$(printf '8%.0s' {1..32})
+start_supervisor "$supervisor_prepare_invocation" >/dev/null
+set_supervisor_state shadow active
+prepare_evidence=$(make_supervisor_ready "$supervisor_prepare_invocation")
+set_supervisor_state active inactive
+prepare_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_prepare_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_prepare_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_MV_FAIL_RECEIPT_STAGE=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'receipt staging interruption unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ ! -e $prepare_evidence/PASSED.sha256 \
+  && -f $prepare_evidence/.PASSED.sha256.ready \
+  && ! -e $prepare_dir/receipt.json \
+  && ! -e $prepare_dir/.receipt.json.ready \
+  && -f $prepare_dir/.receipt.json.tmp ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_prepare_invocation" >"$supervisor_tmp/prepare-recovered.json"
+assert_terminal "$supervisor_tmp/prepare-recovered.json" passed
+[[ -f $prepare_evidence/PASSED.sha256 \
+  && -f $prepare_dir/receipt.json \
+  && ! -e $prepare_dir/.receipt.json.ready \
+  && ! -e $prepare_dir/.receipt.json.tmp ]]
+
+supervisor_precommit_invocation=$(printf '7%.0s' {1..32})
+start_supervisor "$supervisor_precommit_invocation" >/dev/null
+set_supervisor_state shadow active
+precommit_evidence=$(make_supervisor_ready "$supervisor_precommit_invocation")
+set_supervisor_state active inactive
+precommit_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_precommit_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_precommit_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_MV_FAIL_RECEIPT=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'pre-receipt Gate finalization interruption unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ ! -e $precommit_evidence/PASSED.sha256 \
+  && -f $precommit_evidence/.PASSED.sha256.ready \
+  && ! -e $precommit_dir/receipt.json \
+  && -f $precommit_dir/.receipt.json.ready \
+  && -f $precommit_dir/.receipt.json.commit ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_precommit_invocation" >"$supervisor_tmp/precommit-recovered.json"
+assert_terminal "$supervisor_tmp/precommit-recovered.json" passed
+[[ -f $precommit_evidence/PASSED.sha256 \
+  && -f $precommit_dir/receipt.json \
+  && ! -e $precommit_dir/.receipt.json.ready \
+  && ! -e $precommit_dir/.receipt.json.commit ]]
+
+supervisor_recovery_invocation=$(printf '6%.0s' {1..32})
+start_supervisor "$supervisor_recovery_invocation" >/dev/null
+set_supervisor_state shadow active
+recovery_evidence=$(make_supervisor_ready "$supervisor_recovery_invocation")
+set_supervisor_state active inactive
+recovery_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_recovery_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_recovery_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_RM_FAIL_RECEIPT_READY=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'interrupted Gate finalization unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ -f $recovery_evidence/PASSED.sha256 \
+  && -f $recovery_dir/receipt.json \
+  && -f $recovery_dir/.receipt.json.ready ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_recovery_invocation" >"$supervisor_tmp/recovered.json"
+assert_terminal "$supervisor_tmp/recovered.json" passed
+[[ -f $recovery_dir/receipt.json \
+  && ! -e $recovery_dir/.receipt.json.ready ]]
+
+supervisor_pass_invocation=$(printf '3%.0s' {1..32})
+start_supervisor "$supervisor_pass_invocation" >/dev/null
+set_supervisor_state shadow active
+pass_evidence=$(make_supervisor_ready "$supervisor_pass_invocation")
+set_supervisor_state active inactive
+finalize_supervisor "$supervisor_pass_invocation" success exited 0 \
+  >"$supervisor_tmp/passed.json"
+assert_terminal "$supervisor_tmp/passed.json" passed
+(cd "$pass_evidence" && sha256sum --check --strict PASSED.sha256 >/dev/null)
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+rm "$pass_evidence/PASSED.sha256"
+reject gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_pass_invocation"
+if grep -Fq 'polymarket-reference-collector.service' "$supervisor_calls"; then
+  printf 'Gate supervisor mutated the legacy baseline\n' >&2
+  exit 1
+fi
+
+rm -rf "$supervisor_tmp"
+trap - EXIT
 grep -Fxq 'export TZ=UTC' "$GATE" || {
   printf 'Gate does not force UTC for jq date builtins\n' >&2
   exit 1
@@ -63,8 +495,13 @@ trap 'rm -rf "$tmp_dir"' EXIT
 # A production Gate must exercise the candidate against a real closed segment,
 # not a compatible fixture manufactured by the Gate itself.
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
-sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
+sed -n \
+  -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+  -e '/^run_before_deadline() {$/,/^}$/p' "$GATE" \
   >"$preflight_verifier"
+sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
+  >>"$preflight_verifier"
 sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE" \
   >>"$preflight_verifier"
 # shellcheck source=/dev/null
@@ -268,19 +705,25 @@ fake_release_binary="$preflight_root/candidate"
 release_binary="$VERIFY"
 run_id=20260101T000000Z-1
 verify_current_oss_config() { :; }
+timeout() {
+  shift 2
+  "$@"
+}
 
 wrong_path_sha=$(printf '0%.0s' {1..64})
 wrong_path_uri="oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/sha256=$wrong_path_sha/market-updates.20260101T040000.20260101T00.ndjson.zst"
 make_remote_triplet "$compatible" "$wrong_path_uri" crypto_expiry
 if download_and_verify_oss_triplet "$wrong_path_uri" crypto_expiry \
-  "$preflight_root/wrong-path-download" >/dev/null; then
+  "$preflight_root/wrong-path-download" \
+  "$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))" >/dev/null; then
   printf 'triplet verifier accepted a content-addressed path with the wrong digest\n' >&2
   exit 1
 fi
 superseded_uri="$input_good_uri.SUPERSEDED.json"
 printf '{}\n' >"$remote_root/${superseded_uri#oss://bucket/}"
 if download_and_verify_oss_triplet "$input_good_uri" crypto_expiry \
-  "$preflight_root/superseded-download" >/dev/null; then
+  "$preflight_root/superseded-download" \
+  "$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))" >/dev/null; then
   printf 'triplet verifier accepted a superseded production segment\n' >&2
   exit 1
 fi
@@ -2414,6 +2857,182 @@ if baseline_health_requires_continuous_freshness legacy_python; then
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
+legacy_runtime_budget_contract="$tmp_dir/legacy-runtime-budget.sh"
+sed -n \
+  -e '/^readonly REQUIRED_DURATION_SECONDS=/p' \
+  -e '/^readonly PARITY_TAIL_SECONDS=/p' \
+  -e '/^readonly MINIMUM_GATE_SECONDS=/p' \
+  -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
+  -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
+  -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
+  -e '/^readonly LEGACY_UNIT=/p' \
+  -e '/^monotonic_uptime_seconds() {$/,/^}$/p' \
+  -e '/^legacy_runtime_budget_observation() {$/,/^}$/p' \
+  -e '/^run_budgeted_real_market_preflight() {$/,/^}$/p' "$GATE" \
+  >"$legacy_runtime_budget_contract"
+[[ -s $legacy_runtime_budget_contract ]] || {
+  printf 'Gate has no legacy RuntimeMaxSec budget verifier\n' >&2
+  exit 1
+}
+budgeted_preflight_line=$(grep -n '^real_market_preflight_json=$(run_budgeted_real_market_preflight' \
+  "$GATE" | cut -d: -f1 || true)
+shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"' "$GATE" \
+  | cut -d: -f1 || true)
+[[ $budgeted_preflight_line =~ ^[1-9][0-9]*$ \
+  && $shadow_start_line =~ ^[1-9][0-9]*$ \
+  && $budgeted_preflight_line -lt $shadow_start_line ]] || {
+  printf 'Gate does not verify legacy runtime budget before real preflight\n' >&2
+  exit 1
+}
+grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' \
+  "$GATE" || {
+  printf 'Gate runtime budget does not bind the configured upload timeouts\n' >&2
+  exit 1
+}
+(
+  # shellcheck source=/dev/null
+  source "$legacy_runtime_budget_contract"
+  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
+    && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
+    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 ]] || {
+    printf 'Gate runtime budget does not bind the reviewed preflight and unit limits\n' >&2
+    exit 1
+  }
+  systemctl() {
+    case "$*" in
+      *RuntimeMaxUSec*) printf '6h\n' ;;
+      *ActiveEnterTimestampMonotonic*) printf '1000000\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  monotonic_uptime_seconds() { printf '20906\n'; }
+  required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+    + LEGACY_HEALTH_START_WAIT_SECONDS + MINIMUM_GATE_SECONDS \
+    + LEGACY_RUNTIME_RESERVE_SECONDS))
+  if observation=$(legacy_runtime_budget_observation "$required"); then
+    printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
+      "$required" >&2
+    exit 1
+  fi
+  [[ $observation == "remaining=695 required=$required" ]] || {
+    printf 'Gate runtime rejection does not report remaining and required seconds\n' >&2
+    exit 1
+  }
+  monotonic_uptime_seconds() { printf '7200\n'; }
+  if observation=$(legacy_runtime_budget_observation "$required"); then
+    printf 'Gate admitted the unreserved exact runtime boundary\n' >&2
+    exit 1
+  fi
+  [[ $observation == "remaining=14401 required=$required" ]] || {
+    printf 'Gate reserve-boundary evidence is not exact\n' >&2
+    exit 1
+  }
+  monotonic_uptime_seconds() { printf '600\n'; }
+  observation=$(legacy_runtime_budget_observation "$required") || {
+    printf 'Gate rejected a fresh legacy baseline with sufficient runtime\n' >&2
+    exit 1
+  }
+  [[ $observation == "remaining=21001 required=$required" ]] || {
+    printf 'Gate sufficient-runtime evidence is not exact\n' >&2
+    exit 1
+  }
+
+  baseline_mode=legacy_python
+  gate_seconds=$MINIMUM_GATE_SECONDS
+  candidate_sha=unused run_id=unused release_binary=unused
+  oss_bucket=unused oss_endpoint=unused oss_region=unused aliyun_profile=unused
+  zstd_timeout_seconds=300 oss_copy_timeout_seconds=300 oss_config_sha=unused
+  source_revision=unused deployment_bundle_sha=unused release_manifest_sha=unused
+  control_archive_sha=unused
+  preflight_calls=0
+  identity_checks=0
+  timeout_args=
+  verify_baseline_identity() { identity_checks=$((identity_checks + 1)); }
+  timeout() {
+    preflight_calls=$((preflight_calls + 1))
+    timeout_args=$*
+    printf '{}\n'
+  }
+  legacy_runtime_budget_observation() {
+    printf 'remaining=695 required=%s\n' "$1"
+    return 1
+  }
+  admission_error="$tmp_dir/runtime-budget-admission.err"
+  if run_budgeted_real_market_preflight source spool download evidence \
+    2>"$admission_error"; then
+    printf 'Gate admitted an insufficient legacy runtime budget\n' >&2
+    exit 1
+  fi
+  [[ $preflight_calls -eq 0 && $identity_checks -eq 1 ]] || {
+    printf 'Gate attempted real preflight after runtime admission failed\n' >&2
+    exit 1
+  }
+  grep -Fq "remaining=695 required=$required" "$admission_error" || {
+    printf 'Gate admission failure omitted exact runtime evidence\n' >&2
+    exit 1
+  }
+  legacy_runtime_budget_observation() {
+    printf 'remaining=21001 required=%s\n' "$1"
+  }
+  run_budgeted_real_market_preflight source spool download evidence >/dev/null || {
+    printf 'Gate rejected a sufficient runtime budget at the admission seam\n' >&2
+    exit 1
+  }
+  [[ $preflight_calls -eq 1 && $identity_checks -eq 3 ]] || {
+    printf 'Gate did not bind preflight between two identity checks\n' >&2
+    exit 1
+  }
+  [[ $timeout_args == '--signal=KILL 6300 env '* ]] || {
+    printf 'Gate real preflight does not have an exact hard deadline\n' >&2
+    exit 1
+  }
+)
+preflight_deadline_contract="$tmp_dir/preflight-deadline.sh"
+sed -n \
+  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+  -e '/^run_before_deadline() {$/,/^}$/p' "$GATE" \
+  >"$preflight_deadline_contract"
+grep -Fq 'run_before_deadline() {' "$preflight_deadline_contract" || {
+  printf 'Gate has no bounded command runner for real preflight\n' >&2
+  exit 1
+}
+grep -Fq 'preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))' \
+  "$GATE" || {
+  printf 'Gate real preflight has no overall deadline\n' >&2
+  exit 1
+}
+grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
+  printf 'Gate candidate preflight uploader is not deadline bounded\n' >&2
+  exit 1
+}
+[[ $(grep -Fc 'run_before_deadline "$deadline" aliyun ossutil' "$GATE") -eq 4 ]] || {
+  printf 'Gate OSS triplet readback is not fully deadline bounded\n' >&2
+  exit 1
+}
+(
+  # shellcheck source=/dev/null
+  source "$preflight_deadline_contract"
+  timeout_log="$tmp_dir/preflight-timeout.log"
+  timeout() {
+    printf '%s\n' "$*" >"$timeout_log"
+    shift 2
+    "$@"
+  }
+  SECONDS=20
+  [[ $(run_before_deadline 30 printf 'bounded') == bounded ]] || {
+    printf 'Gate bounded command runner rejected remaining time\n' >&2
+    exit 1
+  }
+  grep -Fq -- '--signal=KILL 10 printf bounded' "$timeout_log" || {
+    printf 'Gate bounded command runner did not use the exact remaining deadline\n' >&2
+    exit 1
+  }
+  SECONDS=30
+  if run_before_deadline 30 true; then
+    printf 'Gate bounded command runner accepted an expired deadline\n' >&2
+    exit 1
+  fi
+)
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
@@ -2753,7 +3372,9 @@ if grep -Fq 'crypto_expiry_market_rust_shadow' "$GATE"; then
   printf 'Gate still substitutes a synthetic market fixture for production input\n' >&2
   exit 1
 fi
-preflight_line=$(grep -n '^real_market_segment_preflight ' "$GATE" | cut -d: -f1)
+preflight_line=$(grep -n \
+  '^real_market_preflight_json=$(run_budgeted_real_market_preflight' "$GATE" \
+  | cut -d: -f1)
 gate_start_line=$(grep -n '^started_at_unix=' "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" | cut -d: -f1)
 ((preflight_line < gate_start_line && preflight_line < shadow_start_line)) || {
@@ -3203,15 +3824,15 @@ grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GAT
 grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"
 gate_final_binding_line=$(grep -n '^  verify_release_binding "\$pinned_release_manifest"' "$GATE" \
   | tail -1 | cut -d: -f1)
-gate_marker_line=$(grep -n '^  marker="\$evidence_dir/PASSED.sha256"$' "$GATE" \
+gate_marker_line=$(grep -n '^  pass_ready_marker="\$evidence_dir/.PASSED.sha256.ready"$' "$GATE" \
   | cut -d: -f1)
-gate_marker_sync_line=$(grep -n '^  sync "\$marker"$' "$GATE" | cut -d: -f1)
+gate_marker_sync_line=$(grep -n '^  sync "\$pass_ready_marker"$' "$GATE" | cut -d: -f1)
 gate_marker_dir_sync_line=$(grep -n '^  sync -f "\$evidence_dir"$' "$GATE" \
   | tail -1 | cut -d: -f1)
 ((gate_final_binding_line < gate_marker_line \
   && gate_marker_line < gate_marker_sync_line \
   && gate_marker_sync_line < gate_marker_dir_sync_line)) || {
-  printf 'gate publishes success before revalidating the immutable release binding\n' >&2
+  printf 'gate stages success before revalidating the immutable release binding\n' >&2
   exit 1
 }
 cutover_binding_line=$(grep -n '^verify_release_binding "\$RELEASE_MANIFEST"' "$CUTOVER" \

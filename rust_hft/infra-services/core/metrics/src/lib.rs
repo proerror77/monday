@@ -116,6 +116,11 @@ impl MetricsRegistry {
         Self::init()
     }
 
+    /// 建立獨立的 Prometheus registry。
+    pub fn isolated() -> Self {
+        Self::create_with_prometheus()
+    }
+
     fn create_with_prometheus() -> Self {
         let registry = Registry::new();
 
@@ -752,69 +757,6 @@ impl MetricsRegistry {
         self.risk_halted.store(s.risk_halted, Ordering::Relaxed);
         self.data_integrity_gaps
             .store(s.data_integrity_gaps, Ordering::Relaxed);
-        self.note_activity();
-    }
-
-    /// 从 LatencyMonitor 批量更新指标
-    pub fn update_from_latency_monitor(
-        &self,
-        latency_stats: &std::collections::HashMap<
-            hft_core::latency::LatencyStage,
-            hft_core::latency::LatencyStageStats,
-        >,
-    ) {
-        use hft_core::latency::LatencyStage;
-
-        for (stage, stats) in latency_stats {
-            match stage {
-                LatencyStage::WsReceive => {
-                    for _ in 0..stats.count {
-                        self.latency_ws_receive.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Parsing => {
-                    for _ in 0..stats.count {
-                        self.latency_parsing.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Ingestion => {
-                    // 更新所有样本到直方图
-                    for _ in 0..stats.count {
-                        self.latency_ingestion.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Aggregation => {
-                    for _ in 0..stats.count {
-                        self.latency_aggregation.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Strategy => {
-                    for _ in 0..stats.count {
-                        self.latency_strategy.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Risk => {
-                    for _ in 0..stats.count {
-                        self.latency_risk.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Execution => {
-                    for _ in 0..stats.count {
-                        self.latency_execution.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::Submission => {
-                    for _ in 0..stats.count {
-                        self.latency_submission.observe(stats.mean_micros);
-                    }
-                }
-                LatencyStage::EndToEnd => {
-                    for _ in 0..stats.count {
-                        self.latency_end_to_end.observe(stats.mean_micros);
-                    }
-                }
-            }
-        }
         self.note_activity();
     }
 }

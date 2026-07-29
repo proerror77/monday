@@ -16,6 +16,12 @@ readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GR
 readonly MAX_HEALTH_SILENCE_SECONDS=240
 # Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
 readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
+# One real-segment upload can spend one 300-second compression timeout, fifteen
+# candidate OSS operations, four independent Gate readbacks, and 300 seconds
+# of local processing reserve.
+readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=6300
+readonly LEGACY_RUNTIME_MAX_SECONDS=21600
+readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
 readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900
@@ -32,6 +38,7 @@ readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly SHADOW_ROOT=/data/monday/spool/polymarket-reference-rust-shadow
 readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
+readonly GATE_JOB_ROOT=/data/monday/evidence/polymarket-gate-jobs
 readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
 readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -207,6 +214,40 @@ secure_control_file() {
   (( (8#$mode & 022) == 0 )) || die "control-plane file is group/world writable: $path"
 }
 
+verify_supervised_candidate() {
+  local candidate_path=$1 candidate_sha=$2 parent=${1%/*}
+  [[ $candidate_path == /* && $candidate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ -n $parent ]] || parent=/
+  secure_root_chain "$parent" || return 1
+  secure_control_file "$candidate_path"
+  [[ -x $candidate_path ]] || return 1
+  [[ $(sha256sum "$candidate_path" | awk '{print $1}') == "$candidate_sha" ]]
+}
+
+verify_gate_supervisor() {
+  local candidate_sha=$1 invocation=$2
+  local unit="polymarket-raw-ops-gate@${candidate_sha}.service"
+  local invocation_dir="$GATE_JOB_ROOT/$candidate_sha/$invocation"
+  local request="$invocation_dir/request.json" fragment drop_ins
+  [[ $invocation =~ ^[a-f0-9]{32}$ \
+    && ${MONDAY_POLYMARKET_GATE_INVOCATION_DIR:-} == "$invocation_dir" ]] \
+    || return 1
+  secure_root_chain "$invocation_dir" || return 1
+  secure_control_file "$request"
+  jq -e --arg candidate "$candidate_sha" --arg invocation "$invocation" '
+    .schema == "monday.polymarket_gate_request.v1"
+    and .candidate_sha256 == $candidate
+    and .systemd_invocation_id == $invocation
+  ' "$request" >/dev/null || return 1
+  [[ $(systemctl show "$unit" --property=InvocationID --value) == "$invocation" \
+    && $(systemctl show "$unit" --property=MainPID --value) == "$$" ]] \
+    || return 1
+  fragment=$(systemctl show "$unit" --property=FragmentPath --value) || return 1
+  drop_ins=$(systemctl show "$unit" --property=DropInPaths --value) || return 1
+  [[ $fragment == /etc/systemd/system/polymarket-raw-ops-gate@.service \
+    && -z $drop_ins ]]
+}
+
 verify_release_manifest() {
   local manifest=$1
   secure_control_file "$manifest" || return 1
@@ -334,6 +375,33 @@ verify_runtime_identity() {
 
 verify_legacy_identity() {
   verify_runtime_identity "$LEGACY_EXEC" "$@"
+}
+
+monotonic_uptime_seconds() {
+  local uptime _
+  read -r uptime _ </proc/uptime || return 1
+  [[ $uptime =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "${uptime%%.*}"
+}
+
+legacy_runtime_budget_observation() {
+  local required=$1 runtime_max active_enter_us now started elapsed remaining
+  [[ $required =~ ^[1-9][0-9]*$ ]] || return 1
+  runtime_max=$(systemctl show --property=RuntimeMaxUSec --value "$LEGACY_UNIT") \
+    || return 1
+  [[ $runtime_max == 6h ]] || return 1
+  active_enter_us=$(systemctl show \
+    --property=ActiveEnterTimestampMonotonic --value "$LEGACY_UNIT") || return 1
+  [[ $active_enter_us =~ ^[1-9][0-9]*$ ]] || return 1
+  now=$(monotonic_uptime_seconds) || return 1
+  [[ $now =~ ^[1-9][0-9]*$ ]] || return 1
+  started=$((active_enter_us / 1000000))
+  ((now >= started)) || return 1
+  elapsed=$((now - started))
+  ((elapsed <= LEGACY_RUNTIME_MAX_SECONDS)) || return 1
+  remaining=$((LEGACY_RUNTIME_MAX_SECONDS - elapsed))
+  printf 'remaining=%s required=%s\n' "$remaining" "$required"
+  ((remaining >= required))
 }
 
 verify_baseline_identity() {
@@ -532,6 +600,8 @@ load_oss_config_snapshot() {
   aliyun_profile=$(env_value ALIYUN_PROFILE)
   zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS)
   oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS)
+  [[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]] \
+    || die 'real market preflight budget requires 300-second upload timeouts'
   oss_config_sha=$(printf '%s\n' \
     "OSS_BUCKET=$oss_bucket" \
     "OSS_ENDPOINT=$oss_endpoint" \
@@ -549,8 +619,24 @@ verify_current_oss_config() {
     || die 'OSS configuration changed during the shadow gate'
 }
 
+remaining_seconds_before_deadline() {
+  local deadline=$1 remaining
+  [[ $deadline =~ ^[1-9][0-9]*$ ]] || return 1
+  remaining=$((deadline - SECONDS))
+  ((remaining > 0)) || return 124
+  printf '%s\n' "$remaining"
+}
+
+run_before_deadline() {
+  local deadline=$1 remaining
+  shift
+  remaining=$(remaining_seconds_before_deadline "$deadline") || return $?
+  timeout --signal=KILL "$remaining" "$@"
+}
+
 download_and_verify_oss_triplet() {
-  local uri=$1 expected_dataset=$2 target=$3 prefix relative path_sha data_name
+  local uri=$1 expected_dataset=$2 target=$3 deadline=$4
+  local prefix relative path_sha data_name
   local data manifest success superseded_uri superseded_listing manifest_json
   local expected_bytes expected_sha source_bytes canonical segment_complete
   prefix="oss://$oss_bucket/lake/raw/venue=polymarket/dataset=$expected_dataset/"
@@ -567,19 +653,23 @@ download_and_verify_oss_triplet() {
   success="$data._SUCCESS"
   superseded_uri="$uri.SUPERSEDED.json"
   verify_current_oss_config
-  superseded_listing=$(aliyun ossutil ls "$superseded_uri" \
+  superseded_listing=$(run_before_deadline "$deadline" aliyun ossutil ls \
+    "$superseded_uri" \
     --profile "$aliyun_profile" --endpoint "$oss_endpoint" \
     --region "$oss_region") || return 1
   if grep -Fq "$superseded_uri" <<<"$superseded_listing"; then
     return 1
   fi
-  aliyun ossutil cp "$uri" "$data" --profile "$aliyun_profile" \
+  run_before_deadline "$deadline" aliyun ossutil cp "$uri" "$data" \
+    --profile "$aliyun_profile" \
     --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
     || return 1
-  aliyun ossutil cp "$uri.manifest.json" "$manifest" --profile "$aliyun_profile" \
+  run_before_deadline "$deadline" aliyun ossutil cp \
+    "$uri.manifest.json" "$manifest" --profile "$aliyun_profile" \
     --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
     || return 1
-  aliyun ossutil cp "$uri._SUCCESS" "$success" --profile "$aliyun_profile" \
+  run_before_deadline "$deadline" aliyun ossutil cp \
+    "$uri._SUCCESS" "$success" --profile "$aliyun_profile" \
     --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
     || return 1
   verify_current_oss_config
@@ -628,6 +718,8 @@ real_market_segment_preflight() {
   local copied_sha256 uploaded_content_sha256 uploaded_canonical
   local uploaded_uri uploaded_triplet uploaded_name preflight_tmp preflight_json
   local candidate_stdout_tmp candidate_stdout candidate_stderr_tmp candidate_stderr
+  local preflight_deadline
+  preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))
   secure_collector_directory "$source_spool" || return 1
   source_path=
   source_name=
@@ -652,12 +744,17 @@ real_market_segment_preflight() {
   source_file="$spool/$source_name"
   source_tmp="$source_file.tmp"
   for _ in 1 2 3; do
-    before=$(stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
-    cp -- "$source_path" "$source_tmp" || return 1
-    source_content_sha256=$(sha256sum "$source_path" | awk '{print $1}') \
+    before=$(run_before_deadline "$preflight_deadline" \
+      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    run_before_deadline "$preflight_deadline" cp -- "$source_path" "$source_tmp" \
       || return 1
-    copied_sha256=$(sha256sum "$source_tmp" | awk '{print $1}') || return 1
-    after=$(stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
+    source_content_sha256=$(run_before_deadline "$preflight_deadline" \
+      sha256sum "$source_path" | awk '{print $1}') \
+      || return 1
+    copied_sha256=$(run_before_deadline "$preflight_deadline" \
+      sha256sum "$source_tmp" | awk '{print $1}') || return 1
+    after=$(run_before_deadline "$preflight_deadline" \
+      stat -c '%d:%i:%s:%Y:%Z' "$source_path") || return 1
     if [[ $before == "$after" && $source_content_sha256 == "$copied_sha256" ]]; then
       stable=true
       break
@@ -667,18 +764,22 @@ real_market_segment_preflight() {
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  source_quote_records=$(jq -c 'select(.update.kind == "quote")' "$source_tmp" \
+  source_quote_records=$(run_before_deadline "$preflight_deadline" \
+    jq -c 'select(.update.kind == "quote")' "$source_tmp" \
     | wc -l | tr -d ' ') || return 1
   [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
-  source_recorded_hours=$(jq -r '
+  source_recorded_hours=$(run_before_deadline "$preflight_deadline" jq -r '
     .recorded_at
     | select(type == "string"
       and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
     | .[0:13]' "$source_tmp" | sort -u | wc -l | tr -d ' ') || return 1
   [[ $source_recorded_hours == 1 ]] || return 1
-  source_bytes=$(stat -c %s "$source_tmp") || return 1
-  source_identity=$(stat -c '%d:%i' "$source_path") || return 1
-  source_mtime=$(stat -c %Y "$source_path") || return 1
+  source_bytes=$(run_before_deadline "$preflight_deadline" \
+    stat -c %s "$source_tmp") || return 1
+  source_identity=$(run_before_deadline "$preflight_deadline" \
+    stat -c '%d:%i' "$source_path") || return 1
+  source_mtime=$(run_before_deadline "$preflight_deadline" \
+    stat -c %Y "$source_path") || return 1
   source_segment=$(jq -cn --arg path "$source_path" --arg file "$source_name" \
     --arg sha256 "$source_content_sha256" --arg identity "$source_identity" \
     --argjson bytes "$source_bytes" --argjson modified_at_unix "$source_mtime" \
@@ -693,7 +794,8 @@ real_market_segment_preflight() {
   candidate_stdout="$evidence/real-market-uploader.json"
   candidate_stderr_tmp="$evidence/.real-market-uploader.stderr.tmp"
   candidate_stderr="$evidence/real-market-uploader.stderr"
-  if runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
+  if run_before_deadline "$preflight_deadline" runuser \
+    -u hftcollector -- env HOME=/var/lib/hft-collector \
     "$release_binary" upload --spool-dir "$spool" \
     --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 1000 \
     --bucket "$oss_bucket" --endpoint "$oss_endpoint" --region "$oss_region" \
@@ -776,7 +878,8 @@ real_market_segment_preflight() {
 
   uploaded_uri=$(jq -er '.last_uploaded_object' <<<"$terminal_status") || return 1
   uploaded_triplet=$(download_and_verify_oss_triplet \
-    "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded") || return 1
+    "$uploaded_uri" "$preflight_dataset" "$download_root/uploaded" \
+    "$preflight_deadline") || return 1
   uploaded_canonical=$(jq -er 'if .canonical then 1 else 0 end' \
     <<<"$uploaded_triplet") || return 1
   [[ $(jq -er '.canonical_uploaded_segments' <<<"$upload_summary") \
@@ -784,7 +887,8 @@ real_market_segment_preflight() {
   [[ $(jq -er '.source_bytes' <<<"$uploaded_triplet") == "$source_bytes" ]] \
     || return 1
   uploaded_name=$(jq -er '.file' <<<"$uploaded_triplet") || return 1
-  uploaded_content_sha256=$(zstd -q -d -c \
+  uploaded_content_sha256=$(run_before_deadline "$preflight_deadline" \
+    zstd -q -d -c \
     "$download_root/uploaded/$uploaded_name" | sha256sum | awk '{print $1}') \
     || return 1
   [[ $uploaded_content_sha256 == "$source_content_sha256" ]] || return 1
@@ -821,6 +925,46 @@ real_market_segment_preflight() {
   mv "$preflight_tmp" "$preflight_json"
   sync "$candidate_stdout" "$candidate_stderr" "$preflight_json"
   real_market_preflight_json=$(jq -cS . "$preflight_json") || return 1
+}
+
+run_budgeted_real_market_preflight() {
+  local legacy_runtime_budget_required observation
+  if [[ $baseline_mode == legacy_python ]]; then
+    verify_baseline_identity || {
+      printf 'legacy baseline identity changed before real preflight\n' >&2
+      return 1
+    }
+    legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+      + LEGACY_HEALTH_START_WAIT_SECONDS + gate_seconds \
+      + LEGACY_RUNTIME_RESERVE_SECONDS))
+    if observation=$(legacy_runtime_budget_observation \
+      "$legacy_runtime_budget_required"); then
+      :
+    elif [[ -n $observation ]]; then
+      printf 'legacy baseline runtime budget is insufficient: %s\n' \
+        "$observation" >&2
+      return 1
+    else
+      printf 'legacy baseline RuntimeMaxSec budget cannot be verified\n' >&2
+      return 1
+    fi
+    verify_baseline_identity || {
+      printf 'legacy baseline identity changed during runtime admission\n' >&2
+      return 1
+    }
+  fi
+  timeout --signal=KILL "$REAL_MARKET_PREFLIGHT_BUDGET_SECONDS" env \
+    "candidate_sha=$candidate_sha" "run_id=$run_id" \
+    "release_binary=$release_binary" "oss_bucket=$oss_bucket" \
+    "oss_endpoint=$oss_endpoint" "oss_region=$oss_region" \
+    "aliyun_profile=$aliyun_profile" \
+    "zstd_timeout_seconds=$zstd_timeout_seconds" \
+    "oss_copy_timeout_seconds=$oss_copy_timeout_seconds" \
+    "oss_config_sha=$oss_config_sha" "source_revision=$source_revision" \
+    "deployment_bundle_sha=$deployment_bundle_sha" \
+    "release_manifest_sha=$release_manifest_sha" \
+    "control_archive_sha=$control_archive_sha" \
+    "$0" --real-market-preflight-worker "$@"
 }
 
 install_pinned_upload_env() {
@@ -952,14 +1096,23 @@ memory_events_json() {
       oom_group_kill:$oom_group_kill}'
 }
 
+if [[ ${1:-} == --real-market-preflight-worker ]]; then
+  [[ ${EUID} -eq 0 && $# -eq 5 ]] || exit 2
+  real_market_segment_preflight "$2" "$3" "$4" "$5" || exit
+  printf '%s\n' "$real_market_preflight_json"
+  exit
+fi
+
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
 [[ $# -eq 3 ]] || {
   usage >&2
   exit 2
 }
+trap 'exit 143' HUP INT TERM
 
 for command in aliyun awk chown chmod date flock grep install journalctl jq mkdir mktemp \
-  mountpoint mv readlink rm runuser sed sha256sum sleep stat sync systemctl tr wc zstd; do
+  mountpoint mv readlink rm runuser sed sha256sum sleep stat sync systemctl timeout \
+  tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -991,10 +1144,11 @@ release_manifest_sha=$(sha256sum "$RELEASE_MANIFEST" | awk '{print $1}')
 [[ $source_revision =~ ^[a-f0-9]{40,64}$ ]] || die 'source revision is invalid'
 [[ $control_archive_sha =~ ^[a-f0-9]{64}$ ]] \
   || die 'control archive identity is invalid'
-[[ -f $candidate_source && ! -L $candidate_source && -x $candidate_source ]] \
-  || die 'candidate must be a direct executable regular file'
-printf '%s  %s\n' "$candidate_sha" "$candidate_source" \
-  | sha256sum --check --strict >/dev/null || die 'candidate checksum mismatch'
+supervised_invocation_id=${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}
+verify_gate_supervisor "$candidate_sha" "$supervised_invocation_id" \
+  || die 'Gate is not owned by the exact systemd supervisor invocation'
+verify_supervised_candidate "$candidate_source" "$candidate_sha" \
+  || die 'candidate is not a trusted immutable executable'
 
 for asset in "${BUNDLE_ASSETS[@]}"; do
   secure_control_file "$SCRIPT_DIR/$asset"
@@ -1064,7 +1218,6 @@ if ((gate_seconds < MINIMUM_GATE_SECONDS)); then
     || die 'short gates require MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1'
   test_only=true
 fi
-
 release_dir="$RELEASE_ROOT/$candidate_sha"
 release_binary="$release_dir/polymarket-raw-ops"
 cleanup() {
@@ -1078,6 +1231,10 @@ cleanup() {
   rm -rf "${control_staging:-}"
   rm -rf "${market_preflight_download_dir:-}"
   rm -f "${shadow_env_file:-}" "${shadow_env_tmp:-}"
+  if ((status != 0)) && [[ -n ${pass_ready_marker:-} ]]; then
+    rm -f -- "$pass_ready_marker" \
+      "${pass_ready_marker%/*}/.${pass_ready_marker##*/}.tmp"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -1132,7 +1289,7 @@ verify_release_binding "$pinned_release_manifest" "$release_manifest_sha" \
 pinned_upload_env="$release_dir/polymarket-upload-env-$oss_config_sha.env"
 install_pinned_upload_env "$pinned_upload_env"
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+run_id=$supervised_invocation_id
 shadow_parent="$SHADOW_ROOT/$candidate_sha"
 shadow_spool="$shadow_parent/$run_id"
 market_shadow_spool="$shadow_parent/${run_id}-market-upload"
@@ -1188,8 +1345,9 @@ install -m 0644 "$release_control_dir/${SERVICE_TEMPLATE##*/}" \
 systemctl daemon-reload
 
 real_market_preflight_json=
-real_market_segment_preflight "$MARKET_SPOOL" "$market_shadow_spool" \
-  "$market_preflight_download_dir" "$evidence_dir" \
+real_market_preflight_json=$(run_budgeted_real_market_preflight \
+  "$MARKET_SPOOL" "$market_shadow_spool" "$market_preflight_download_dir" \
+  "$evidence_dir") \
   || die 'candidate rejected a real production closed market segment before shadow startup'
 market_upload_json=$(jq -c '.upload_summary' <<<"$real_market_preflight_json") \
   || die 'real market preflight upload summary is invalid'
@@ -1674,13 +1832,13 @@ if [[ $production_eligible == true ]]; then
   verify_current_oss_config
   jq -e -f "$release_control_dir/${GATE_POLICY##*/}" "$gate_json" >/dev/null \
     || die 'combined gate evidence failed the production policy'
-  marker="$evidence_dir/PASSED.sha256"
+  pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"
   (
     cd "$evidence_dir"
-    sha256sum gate.json >".${marker##*/}.tmp"
-    mv ".${marker##*/}.tmp" "${marker##*/}"
+    sha256sum gate.json >".${pass_ready_marker##*/}.tmp"
+    mv ".${pass_ready_marker##*/}.tmp" "${pass_ready_marker##*/}"
   )
-  sync "$marker"
+  sync "$pass_ready_marker"
   sync -f "$evidence_dir"
 fi
 

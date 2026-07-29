@@ -4,6 +4,9 @@
 //! `MarketUpdate` broadcast channel consumed by `LiveFeed`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -40,6 +43,10 @@ use crate::reference_prices::{
 
 const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
 const POLYMARKET_CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
+const POLYMARKET_CLOB_FAILURE_CAPTURE_ENV: &str = "MONDAY_POLYMARKET_CLOB_FAILURE_CAPTURE_PATH";
+const POLYMARKET_CLOB_CROSSED_BOOK_ERROR: &str =
+    "Polymarket price-change batch produced a crossed book";
+const MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES: usize = 1_048_576;
 const NEAR_DEPTH_PCT_RANGE: f64 = 0.001;
 const DB_POLYMARKET_SETTLEMENT_RETRY_LOOKBACK_SECS: i64 = 30 * 60;
 
@@ -946,6 +953,9 @@ fn book_levels_from_json(value: &Value, ascending: bool) -> Vec<BookLevel> {
 struct ClobBookState {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
+    bid_timestamps: BTreeMap<Decimal, i64>,
+    ask_timestamps: BTreeMap<Decimal, i64>,
+    snapshot_timestamp: Option<i64>,
     initialized: bool,
 }
 
@@ -966,6 +976,9 @@ impl ClobBookState {
             .iter()
             .map(|level| (level.price, level.size))
             .collect();
+        self.bid_timestamps.clear();
+        self.ask_timestamps.clear();
+        self.snapshot_timestamp = Some(book.timestamp);
         self.initialized = true;
         Ok(())
     }
@@ -983,14 +996,22 @@ impl ClobBookState {
         Ok(())
     }
 
-    fn apply(&mut self, entry: &PriceChangeBatchEntry) {
+    fn level_timestamp(&self, entry: &PriceChangeBatchEntry) -> Option<i64> {
+        match entry.side {
+            Side::Buy => self.bid_timestamps.get(&entry.price).copied(),
+            Side::Sell => self.ask_timestamps.get(&entry.price).copied(),
+            _ => None,
+        }
+    }
+
+    fn apply(&mut self, entry: &PriceChangeBatchEntry, timestamp: i64) {
         let size = entry.size.expect("price change was validated");
         if !self.initialized {
             return;
         }
-        let levels = match entry.side {
-            Side::Buy => &mut self.bids,
-            Side::Sell => &mut self.asks,
+        let (levels, timestamps) = match entry.side {
+            Side::Buy => (&mut self.bids, &mut self.bid_timestamps),
+            Side::Sell => (&mut self.asks, &mut self.ask_timestamps),
             _ => unreachable!("price change side was validated"),
         };
         if size > Decimal::ZERO {
@@ -998,6 +1019,7 @@ impl ClobBookState {
         } else {
             levels.remove(&entry.price);
         }
+        timestamps.insert(entry.price, timestamp);
     }
 
     fn quote(
@@ -1107,18 +1129,34 @@ fn market_updates_from_price_change(
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
-        if last_timestamp
-            .get(&token_id)
-            .is_some_and(|last| change.timestamp < *last)
-        {
-            return Err("Polymarket price-change source time moved backwards".to_string());
-        }
         books.entry(token_id).or_default().validate_change(entry)?;
     }
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
-        books.entry(token_id.clone()).or_default().apply(entry);
+        if books[&token_id]
+            .snapshot_timestamp
+            .is_some_and(|last| change.timestamp < last)
+        {
+            continue;
+        }
+        if last_timestamp
+            .get(&token_id)
+            .is_some_and(|last| change.timestamp < *last)
+        {
+            let state = &books[&token_id];
+            if state
+                .level_timestamp(entry)
+                .is_some_and(|last| change.timestamp < last)
+            {
+                continue;
+            }
+            return Err("Polymarket price-change source time moved backwards".to_string());
+        }
+        books
+            .entry(token_id.clone())
+            .or_default()
+            .apply(entry, change.timestamp);
         last_timestamp.insert(token_id.clone(), change.timestamp);
         if last_entries.insert(token_id.clone(), entry).is_none() {
             updated_tokens.push(token_id);
@@ -1141,9 +1179,46 @@ fn market_updates_from_price_change(
             } if bid > ask
         )
     }) {
-        return Err("Polymarket price-change batch produced a crossed book".to_string());
+        return Err(POLYMARKET_CLOB_CROSSED_BOOK_ERROR.to_string());
     }
     Ok(updates)
+}
+
+fn persist_clob_failure_payload(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("capture payload exceeds {MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES} bytes"),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path has no parent directory",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture parent must be a direct canonical directory",
+        ));
+    }
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn send_quote_collection_failure_and_empty(
@@ -1218,6 +1293,55 @@ fn forward_clob_ws_payload(
     Ok(true)
 }
 
+async fn capture_crossed_clob_failure_and_empty(
+    tx: &broadcast::Sender<MarketUpdate>,
+    token_ids: &[U256],
+    request_started_at: DateTime<Utc>,
+    failure_capture_path: Option<&Path>,
+    payload: &[u8],
+    failure: &str,
+) -> bool {
+    let Some(path) = failure_capture_path.filter(|_| failure == POLYMARKET_CLOB_CROSSED_BOOK_ERROR)
+    else {
+        return false;
+    };
+
+    let _ = send_quote_collection_failure_and_empty(
+        tx,
+        token_ids,
+        request_started_at,
+        "websocket_payload",
+    );
+    let owned_path = path.to_owned();
+    let owned_payload = payload.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        persist_clob_failure_payload(&owned_path, &owned_payload)
+    })
+    .await
+    {
+        Ok(Ok(())) => warn!(
+            path = %path.display(),
+            bytes = payload.len(),
+            "Captured first crossed-book CLOB payload; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => warn!(
+            path = %path.display(),
+            "Crossed-book CLOB payload capture already exists; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture failed; stopping diagnostic feed"
+        ),
+        Err(error) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture task failed; stopping diagnostic feed"
+        ),
+    }
+    true
+}
+
 /// Publish Polymarket CLOB book and BBA ticks directly to the strategy runtime.
 ///
 /// Disconnects publish empty quotes so the strategy fails closed until a fresh
@@ -1231,6 +1355,8 @@ pub fn spawn_clob_ws_quote_feed_until(
     tokio::spawn(async move {
         let mut last_timestamp: HashMap<String, i64> = HashMap::new();
         let mut books_by_token: HashMap<String, ClobBookState> = HashMap::new();
+        let failure_capture_path =
+            std::env::var_os(POLYMARKET_CLOB_FAILURE_CAPTURE_ENV).map(PathBuf::from);
         let endpoint = format!(
             "{}/ws/market",
             POLYMARKET_CLOB_WS_ENDPOINT.trim_end_matches('/')
@@ -1324,6 +1450,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        text.as_bytes(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -1339,6 +1475,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path binary payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        bytes.as_ref(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -1978,11 +2124,12 @@ fn parse_agg_trade_msg(v: &serde_json::Value) -> Option<AggTradeMsg> {
 #[cfg(test)]
 mod tests {
     use super::{
-        book_quote_from_rest, db_polymarket_poll_intervals, equity_price_subscription,
-        l2_updates_from_book, mark_db_event_expired_if_resolved, market_update_from_clob_book,
+        book_quote_from_rest, capture_crossed_clob_failure_and_empty, db_polymarket_poll_intervals,
+        equity_price_subscription, forward_clob_ws_payload, l2_updates_from_book,
+        mark_db_event_expired_if_resolved, market_update_from_clob_book,
         market_updates_from_price_change, parse_agg_trade_msg, parse_equity_price_payload,
         rtds_market_data_ws_config, send_quote_collection_failure_and_empty, ClobBookState,
-        RestBook, U256,
+        RestBook, POLYMARKET_CLOB_CROSSED_BOOK_ERROR, U256,
     };
     use chrono::Utc;
     use ploy_market_contracts::MarketUpdate;
@@ -2364,8 +2511,125 @@ mod tests {
         .is_err());
     }
 
+    #[tokio::test]
+    async fn clob_failure_capture_is_byte_exact_create_once_and_only_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        let snapshot = br#"{
+            "event_type":"book",
+            "asset_id":"7",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600100",
+            "bids":[{"price":"0.40","size":"7"}],
+            "asks":[{"price":"0.60","size":"9"}]
+        }"#;
+        let crossed = br#"{
+            "event_type":"price_change",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600200",
+            "price_changes":[{
+                "asset_id":"7","price":"0.61","size":"10","side":"BUY",
+                "best_bid":"0.61","best_ask":"0.60"
+            }]
+        }"#;
+
+        assert!(forward_clob_ws_payload(snapshot, &tx, &mut books, &mut timestamps,).unwrap());
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote { token_id, .. } if token_id.as_ref() == "7"
+        ));
+        assert!(
+            !capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                b"not captured",
+                "websocket_receive",
+            )
+            .await
+        );
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let error = forward_clob_ws_payload(crossed, &tx, &mut books, &mut timestamps).unwrap_err();
+        assert!(error.contains("crossed book"));
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                crossed,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(&capture).unwrap(), crossed);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::QuoteCollectionFailure { token_id, .. }
+                if token_id.as_ref() == "7"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: None,
+                ask: None,
+                ..
+            } if token_id.as_ref() == "7"
+        ));
+
+        let crossed_again = crossed
+            .strip_suffix(b"}")
+            .unwrap()
+            .iter()
+            .copied()
+            .chain(b" }".iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &crossed_again,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(capture).unwrap(), crossed);
+    }
+
+    #[tokio::test]
+    async fn clob_failure_capture_rejects_an_unbounded_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, _rx) = tokio::sync::broadcast::channel(2);
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &vec![b' '; 1_048_577],
+                POLYMARKET_CLOB_CROSSED_BOOK_ERROR,
+            )
+            .await
+        );
+        assert!(!capture.exists());
+    }
+
     #[test]
-    fn stale_clob_price_change_fails_before_mutating_cached_book() {
+    fn stale_clob_price_change_is_skipped_without_dropping_fresh_batch_entries() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -2387,15 +2651,21 @@ mod tests {
             }]
         }))
         .expect("newer price change");
-        let stale = serde_json::from_value(json!({
+        let mixed = serde_json::from_value(json!({
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600200",
-            "price_changes": [{
-                "asset_id": "7", "price": "0.53", "size": "100", "side": "SELL",
-                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
-            }]
+            "price_changes": [
+                {
+                    "asset_id": "7", "price": "0.53", "size": "100", "side": "SELL",
+                    "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+                },
+                {
+                    "asset_id": "8", "price": "0.45", "size": "12", "side": "BUY",
+                    "hash": null, "best_bid": "0.45", "best_ask": "0.50"
+                }
+            ]
         }))
-        .expect("stale price change");
+        .expect("mixed stale and fresh price change");
         let same_millisecond = serde_json::from_value(json!({
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600300",
@@ -2408,8 +2678,25 @@ mod tests {
 
         let mut state = ClobBookState::default();
         market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
-        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
-        let mut timestamps = std::collections::HashMap::from([("7".to_string(), book.timestamp)]);
+        let second_book = serde_json::from_value(json!({
+            "asset_id": "8",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.40", "size": "5"}],
+            "asks": [{"price": "0.50", "size": "6"}],
+            "hash": null
+        }))
+        .expect("valid second CLOB book update");
+        let mut second_state = ClobBookState::default();
+        market_update_from_clob_book(&second_book, &mut second_state).expect("second snapshot");
+        let mut books = std::collections::HashMap::from([
+            ("7".to_string(), state),
+            ("8".to_string(), second_state),
+        ]);
+        let mut timestamps = std::collections::HashMap::from([
+            ("7".to_string(), book.timestamp),
+            ("8".to_string(), second_book.timestamp),
+        ]);
         assert_eq!(
             market_updates_from_price_change(&newer, &mut books, &mut timestamps)
                 .expect("valid newer price change")
@@ -2423,7 +2710,13 @@ mod tests {
             1,
             "distinct deltas sharing a wire millisecond must not be dropped"
         );
-        assert!(market_updates_from_price_change(&stale, &mut books, &mut timestamps).is_err());
+        let updates = market_updates_from_price_change(&mixed, &mut books, &mut timestamps)
+            .expect("stale entry is superseded without rejecting the fresh entry");
+        assert!(matches!(
+            updates.as_slice(),
+            [MarketUpdate::Quote { token_id, bid: Some(bid), .. }]
+                if token_id.as_ref() == "8" && *bid == dec!(0.45)
+        ));
 
         let quote = books["7"].quote(
             "7".to_string(),
@@ -2435,6 +2728,90 @@ mod tests {
             MarketUpdate::Quote { ask: Some(ask), ask_size: Some(size), .. }
                 if ask == dec!(0.54) && size == dec!(30)
         ));
+    }
+
+    #[test]
+    fn malformed_stale_clob_price_change_still_fails_closed() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.53", "side": "SELL",
+                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+            }]
+        }))
+        .expect("syntactically valid malformed price change");
+        let mut timestamps =
+            std::collections::HashMap::from([("7".to_string(), 1_712_205_600_300)]);
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut seeded_clob_books(),
+            &mut timestamps,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_clob_price_change_for_an_unrelated_level_still_fails_closed() {
+        let newer = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600300",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.52", "size": "8", "side": "BUY",
+                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+            }]
+        }))
+        .expect("newer price change");
+        let stale = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.53", "size": "0", "side": "SELL",
+                "hash": null, "best_bid": "0.52", "best_ask": "0.54"
+            }]
+        }))
+        .expect("stale unrelated-level price change");
+        let mut books = seeded_clob_books();
+        let mut timestamps =
+            std::collections::HashMap::from([("7".to_string(), 1_712_205_600_100)]);
+
+        market_updates_from_price_change(&newer, &mut books, &mut timestamps)
+            .expect("newer price change applies");
+        assert!(market_updates_from_price_change(&stale, &mut books, &mut timestamps).is_err());
+    }
+
+    #[test]
+    fn first_price_change_older_than_a_full_snapshot_is_skipped() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600300",
+            "bids": [{"price": "0.52", "size": "7.25"}],
+            "asks": [{"price": "0.53", "size": "9.5"}],
+            "hash": null
+        }))
+        .expect("newer full snapshot");
+        let stale = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.54", "size": "20", "side": "BUY",
+                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+            }]
+        }))
+        .expect("stale price change");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("snapshot applies");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+        let mut timestamps = std::collections::HashMap::new();
+
+        assert!(
+            market_updates_from_price_change(&stale, &mut books, &mut timestamps)
+                .expect("full snapshot proves stale delta is superseded")
+                .is_empty()
+        );
+        assert!(!books["7"].bids.contains_key(&dec!(0.54)));
     }
 
     #[test]

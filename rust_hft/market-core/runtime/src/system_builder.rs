@@ -1346,7 +1346,7 @@ impl SystemRuntime {
                     let (cash, pos, unr, rlz, stats) = {
                         let eng = engine_arc.lock().await;
                         #[cfg(feature = "metrics")]
-                        eng.sync_latency_metrics_to_prometheus();
+                        eng.sync_metrics_to_prometheus();
                         let av = eng.get_account_view();
                         let st = eng.get_statistics();
                         (

@@ -372,6 +372,7 @@ impl BarBuilder {
                 volume: self.volume,
                 trade_count: self.trade_count,
                 source_venue: self.source_venue,
+                timestamps: Default::default(),
             })
         } else {
             None
