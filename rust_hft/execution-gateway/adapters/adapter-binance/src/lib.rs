@@ -18,7 +18,8 @@ use integration::{
     signing::{BinanceCredentials, BinanceSigner},
 };
 use ports::{
-    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
+    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, ExecutionSubmissionAttempt,
+    OpenOrder, OrderIntentEnvelope, PrivateOrderEventKind,
 };
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -58,6 +59,7 @@ pub struct BinanceExecutionClient {
     next_client_order_id: Option<String>,
     ws_order: Option<BinanceWsOrderClient>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    last_submission_timing: Option<(Option<u64>, Option<u64>, Option<u64>)>,
 }
 
 fn uses_exchange_api(mode: ExecutionMode) -> bool {
@@ -239,8 +241,9 @@ async fn run_binance_private_ws(
                 }
                 message = ws.next() => match message {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        let received_mono_us = hft_core::monotonic_micros();
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            publish_binance_execution_report(&event_tx, &value);
+                            publish_binance_execution_report(&event_tx, &value, received_mono_us);
                         }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
@@ -307,6 +310,7 @@ fn classify_binance_http_error(
 fn publish_binance_execution_report(
     tx: &broadcast::Sender<ExecutionEvent>,
     value: &serde_json::Value,
+    received_mono_us: u64,
 ) {
     if value.get("e").and_then(|entry| entry.as_str()) != Some("executionReport") {
         return;
@@ -335,68 +339,85 @@ fn publish_binance_execution_report(
         .get("X")
         .and_then(|entry| entry.as_str())
         .unwrap_or("");
+    let execution_type = value
+        .get("x")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("");
+    let publish_timing = |kind| {
+        let _ = tx.send(ExecutionEvent::PrivateOrderTiming {
+            order_id: order_id.clone(),
+            kind,
+            received_mono_us,
+        });
+    };
 
-    match status {
-        "NEW" => {
+    match (execution_type, status) {
+        ("NEW", "NEW") => {
+            publish_timing(PrivateOrderEventKind::Ack);
             let _ = tx.send(ExecutionEvent::OrderAck {
                 order_id: order_id.clone(),
                 timestamp,
             });
         }
-        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
+        ("CANCELED", "CANCELED")
+        | ("EXPIRED", "EXPIRED")
+        | ("TRADE_PREVENTION", "EXPIRED_IN_MATCH") => {
+            publish_timing(PrivateOrderEventKind::Report);
             let _ = tx.send(ExecutionEvent::OrderCanceled {
                 order_id: order_id.clone(),
                 timestamp,
             });
         }
-        "REJECTED" => {
+        ("REJECTED", "REJECTED") => {
             let reason = value
                 .get("r")
                 .and_then(|entry| entry.as_str())
                 .filter(|reason| !reason.is_empty() && *reason != "NONE")
                 .unwrap_or("Exchange rejected")
                 .to_string();
+            publish_timing(PrivateOrderEventKind::Report);
             let _ = tx.send(ExecutionEvent::OrderReject {
                 order_id: order_id.clone(),
                 reason,
                 timestamp,
             });
         }
-        _ => {}
-    }
-
-    if value.get("x").and_then(|entry| entry.as_str()) != Some("TRADE") {
-        return;
-    }
-    let quantity = value
-        .get("l")
-        .and_then(|entry| entry.as_str())
-        .and_then(|value| Quantity::from_str(value).ok())
-        .filter(|quantity| *quantity > Quantity::zero());
-    let price = value
-        .get("L")
-        .and_then(|entry| entry.as_str())
-        .and_then(|value| Price::from_str(value).ok())
-        .filter(|price| *price > Price::zero());
-    let execution_id = value
-        .get("t")
-        .and_then(|entry| entry.as_i64())
-        .filter(|trade_id| *trade_id >= 0)
-        .map(|trade_id| trade_id.to_string())
-        .or_else(|| {
-            value
-                .get("I")
+        ("TRADE", "PARTIALLY_FILLED" | "FILLED") => {
+            let quantity = value
+                .get("l")
+                .and_then(|entry| entry.as_str())
+                .and_then(|value| Quantity::from_str(value).ok())
+                .filter(|quantity| *quantity > Quantity::zero());
+            let price = value
+                .get("L")
+                .and_then(|entry| entry.as_str())
+                .and_then(|value| Price::from_str(value).ok())
+                .filter(|price| *price > Price::zero());
+            let execution_id = value
+                .get("t")
                 .and_then(|entry| entry.as_i64())
-                .map(|execution_id| execution_id.to_string())
-        });
-    if let (Some(quantity), Some(price), Some(execution_id)) = (quantity, price, execution_id) {
-        let _ = tx.send(ExecutionEvent::Fill {
-            fill_id: format!("BNFILL-{}-{execution_id}", order_id.0),
-            order_id,
-            price,
-            quantity,
-            timestamp,
-        });
+                .filter(|trade_id| *trade_id >= 0)
+                .map(|trade_id| trade_id.to_string())
+                .or_else(|| {
+                    value
+                        .get("I")
+                        .and_then(|entry| entry.as_i64())
+                        .map(|execution_id| execution_id.to_string())
+                });
+            if let (Some(quantity), Some(price), Some(execution_id)) =
+                (quantity, price, execution_id)
+            {
+                publish_timing(PrivateOrderEventKind::Report);
+                let _ = tx.send(ExecutionEvent::Fill {
+                    fill_id: format!("BNFILL-{}-{execution_id}", order_id.0),
+                    order_id,
+                    price,
+                    quantity,
+                    timestamp,
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -670,6 +691,7 @@ impl BinanceExecutionClient {
             next_client_order_id: None,
             ws_order: None,
             shutdown_tx: None,
+            last_submission_timing: None,
         }
     }
 
@@ -806,6 +828,7 @@ impl BinanceExecutionClient {
 #[async_trait]
 impl ExecutionClient for BinanceExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        self.last_submission_timing = None;
         let client_order_id = self.next_client_order_id.take().unwrap_or_else(|| {
             if matches!(self.mode, ExecutionMode::Paper) {
                 format!("BINANCE_PAPER_{:x}", hft_core::now_micros())
@@ -841,8 +864,36 @@ impl ExecutionClient for BinanceExecutionClient {
             let ws_order = self.ws_order.as_ref().ok_or_else(|| {
                 hft_core::HftError::Network("Binance WS order channel is not connected".to_string())
             })?;
-            let response = ws_order.submit(client_order_id.clone(), payload).await?;
-            return parse_binance_ws_order_response(response, &client_order_id);
+            let receipt = ws_order.submit(client_order_id.clone(), payload).await?;
+            let response = match receipt.outcome {
+                Ok(response) => response,
+                Err(error) => {
+                    self.last_submission_timing = Some((
+                        receipt.write_started_mono_us,
+                        receipt.write_returned_mono_us,
+                        None,
+                    ));
+                    return Err(error);
+                }
+            };
+            let outcome = parse_binance_ws_order_response(response, &client_order_id);
+            // Preserve the decoded-message boundary, but expose it only after semantic validation.
+            let response_received_mono_us = (receipt.decoded_response_mono_us.is_some()
+                && matches!(
+                    &outcome,
+                    Ok(_)
+                        | Err(hft_core::HftError::RateLimit(_))
+                        | Err(hft_core::HftError::Authentication(_))
+                        | Err(hft_core::HftError::Exchange(_))
+                ))
+            .then_some(receipt.decoded_response_mono_us)
+            .flatten();
+            self.last_submission_timing = Some((
+                receipt.write_started_mono_us,
+                receipt.write_returned_mono_us,
+                response_received_mono_us,
+            ));
+            return outcome;
         }
 
         // Paper: 立即回傳訂單ID並廣播 ACK/Fill
@@ -889,6 +940,25 @@ impl ExecutionClient for BinanceExecutionClient {
     async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
         self.next_client_order_id = Some(envelope.client_order_id.clone());
         self.place_order(envelope.intent.clone()).await
+    }
+
+    async fn place_order_envelope_traced(
+        &mut self,
+        envelope: &OrderIntentEnvelope,
+    ) -> ExecutionSubmissionAttempt {
+        self.next_client_order_id = Some(envelope.client_order_id.clone());
+        let outcome = self.place_order(envelope.intent.clone()).await;
+        let Some((write_started, write_returned, response_received)) =
+            self.last_submission_timing.take()
+        else {
+            return ExecutionSubmissionAttempt::without_transport_timing(outcome);
+        };
+        ExecutionSubmissionAttempt {
+            outcome,
+            userspace_write_started_mono_us: write_started,
+            userspace_write_returned_mono_us: write_returned,
+            response_received_mono_us: response_received,
+        }
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
@@ -1355,9 +1425,24 @@ mod tests {
                     "l": "0.1",
                     "L": "100"
                 }),
+                hft_core::monotonic_micros(),
             );
         }
+        assert!(matches!(
+            rx.try_recv().expect("first private timing"),
+            ExecutionEvent::PrivateOrderTiming {
+                kind: PrivateOrderEventKind::Report,
+                ..
+            }
+        ));
         let first = rx.try_recv().expect("first fill");
+        assert!(matches!(
+            rx.try_recv().expect("second private timing"),
+            ExecutionEvent::PrivateOrderTiming {
+                kind: PrivateOrderEventKind::Report,
+                ..
+            }
+        ));
         let second = rx.try_recv().expect("second fill");
         let (
             ExecutionEvent::Fill { fill_id: first, .. },
@@ -1384,7 +1469,15 @@ mod tests {
                 "l": "0",
                 "L": "0"
             }),
+            hft_core::monotonic_micros(),
         );
+        assert!(matches!(
+            rx.try_recv().expect("expiry timing"),
+            ExecutionEvent::PrivateOrderTiming {
+                kind: PrivateOrderEventKind::Report,
+                ..
+            }
+        ));
         assert!(matches!(
             rx.try_recv().expect("expiry event"),
             ExecutionEvent::OrderCanceled { .. }
@@ -1404,12 +1497,68 @@ mod tests {
                 "i": 7,
                 "c": "client-42"
             }),
+            42,
         );
 
+        assert!(matches!(
+            rx.try_recv().expect("ack timing"),
+            ExecutionEvent::PrivateOrderTiming {
+                order_id,
+                kind: PrivateOrderEventKind::Ack,
+                received_mono_us: 42,
+            } if order_id == OrderId("client-42".to_string())
+        ));
         assert!(matches!(
             rx.try_recv().expect("ack event"),
             ExecutionEvent::OrderAck { order_id, .. }
                 if order_id == OrderId("client-42".to_string())
+        ));
+    }
+
+    #[test]
+    fn malformed_private_reports_do_not_publish_authoritative_timing() {
+        let (tx, mut rx) = broadcast::channel(4);
+        for report in [
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "PARTIALLY_FILLED",
+                "i": 7,
+                "t": 41,
+                "l": "0",
+                "L": "100"
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "UNKNOWN",
+                "X": "UNKNOWN",
+                "i": 7
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "NEW",
+                "i": 7,
+                "t": 42,
+                "l": "0.1",
+                "L": "100"
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "CANCELED",
+                "i": 7,
+                "t": 43,
+                "l": "0.1",
+                "L": "100"
+            }),
+        ] {
+            publish_binance_execution_report(&tx, &report, 42);
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
     }
 

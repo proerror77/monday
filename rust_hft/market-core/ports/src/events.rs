@@ -354,6 +354,40 @@ impl OrderIntent {
     }
 }
 
+/// Process-local monotonic evidence carried with one execution intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionTiming {
+    #[serde(default)]
+    pub intent_emitted_mono_us: Option<u64>,
+    #[serde(default)]
+    pub risk_completed_mono_us: Option<u64>,
+    /// Separate causality provenance; absent unless the source is a receive-latency cohort.
+    #[serde(default)]
+    pub source_market_receive_wall_us: Option<Timestamp>,
+    #[serde(default)]
+    pub source_market_capture_boundary: LatencyCaptureBoundary,
+}
+
+/// One submission outcome plus proven userspace boundaries. `None` means unavailable evidence.
+#[derive(Debug)]
+pub struct ExecutionSubmissionAttempt {
+    pub outcome: HftResult<OrderId>,
+    pub userspace_write_started_mono_us: Option<u64>,
+    pub userspace_write_returned_mono_us: Option<u64>,
+    pub response_received_mono_us: Option<u64>,
+}
+
+impl ExecutionSubmissionAttempt {
+    pub fn without_transport_timing(outcome: HftResult<OrderId>) -> Self {
+        Self {
+            outcome,
+            userspace_write_started_mono_us: None,
+            userspace_write_returned_mono_us: None,
+            response_received_mono_us: None,
+        }
+    }
+}
+
 /// OrderIntent 的生命週期元資料。
 ///
 /// 策略仍可輸出穩定的 `OrderIntent`；live/paper/shadow 路徑在進入風控或
@@ -375,6 +409,8 @@ pub struct OrderIntentLifecycle {
     pub max_order_quantity: Option<rust_decimal::Decimal>,
     #[serde(default)]
     pub reduce_only: bool,
+    #[serde(skip, default)]
+    pub timing: ExecutionTiming,
 }
 
 impl Default for OrderIntentLifecycle {
@@ -389,6 +425,7 @@ impl Default for OrderIntentLifecycle {
             max_order_notional: None,
             max_order_quantity: None,
             reduce_only: false,
+            timing: ExecutionTiming::default(),
         }
     }
 }
@@ -667,6 +704,13 @@ pub enum ExecutionEvent {
         balance: Quantity,
         timestamp: Timestamp,
     },
+    /// Local monotonic evidence captured by the private-stream producer before parsing fan-out.
+    /// It is diagnostic side-band data and not an order-state transition.
+    PrivateOrderTiming {
+        order_id: OrderId,
+        kind: PrivateOrderEventKind,
+        received_mono_us: u64,
+    },
     /// 連線狀態
     ConnectionStatus {
         connected: bool,
@@ -696,6 +740,12 @@ pub enum ExecutionEvent {
         reason: String,
         timestamp: Timestamp,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrivateOrderEventKind {
+    Ack,
+    Report,
 }
 
 /// 套利機會事件

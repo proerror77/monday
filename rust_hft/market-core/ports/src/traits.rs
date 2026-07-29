@@ -81,6 +81,17 @@ pub trait ExecutionClient: Send + Sync {
         self.place_order(envelope.intent.clone()).await
     }
 
+    /// Placement with adapter-proven userspace boundaries. The default explicitly supplies no
+    /// transport evidence instead of timing the outer async call and mislabeling it as a write.
+    async fn place_order_envelope_traced(
+        &mut self,
+        envelope: &OrderIntentEnvelope,
+    ) -> ExecutionSubmissionAttempt {
+        ExecutionSubmissionAttempt::without_transport_timing(
+            self.place_order_envelope(envelope).await,
+        )
+    }
+
     /// 帶 VenueSpec 校驗的下單
     async fn place_order_with_spec(
         &mut self,
@@ -621,6 +632,54 @@ pub trait RiskManager: Send + Sync {
         }
 
         approved_intents
+    }
+
+    /// Review intents without detaching their execution lifecycle metadata.
+    fn review_envelopes_with_venue_specs(
+        &mut self,
+        envelopes: Vec<OrderIntentEnvelope>,
+        account: &AccountView,
+        venue_specs: &std::collections::HashMap<VenueId, VenueSpec>,
+    ) -> Vec<OrderIntentEnvelope> {
+        let mut approved_envelopes = Vec::new();
+        let mut projected_account = account.clone();
+
+        for envelope in envelopes {
+            let OrderIntentEnvelope {
+                intent,
+                lifecycle,
+                client_order_id,
+            } = envelope;
+            let reviewed =
+                self.review_with_venue_specs(vec![intent], &projected_account, venue_specs);
+            for approved in reviewed {
+                let signed_quantity = match approved.side {
+                    Side::Buy => approved.quantity.0,
+                    Side::Sell => -approved.quantity.0,
+                };
+                let position = projected_account
+                    .positions
+                    .entry(approved.symbol.clone())
+                    .or_insert_with(|| Position {
+                        symbol: approved.symbol.clone(),
+                        quantity: Quantity::zero(),
+                        avg_price: approved.price.unwrap_or_else(Price::zero),
+                        unrealized_pnl: rust_decimal::Decimal::ZERO,
+                        realized_pnl: rust_decimal::Decimal::ZERO,
+                    });
+                position.quantity.0 += signed_quantity;
+                if let Some(price) = approved.price {
+                    position.avg_price = price;
+                }
+                approved_envelopes.push(OrderIntentEnvelope {
+                    intent: approved,
+                    lifecycle,
+                    client_order_id: client_order_id.clone(),
+                });
+            }
+        }
+
+        approved_envelopes
     }
 
     /// 處理執行事件
