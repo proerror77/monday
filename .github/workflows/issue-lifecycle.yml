@@ -1,7 +1,7 @@
 name: Issue Lifecycle
 
 "on":
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, edited, ready_for_review]
   schedule:
     - cron: "17 3 * * *"
@@ -20,10 +20,22 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
       - name: Verify workflow contract
         run: ruby .github/scripts/test-issue-lifecycle-workflow.rb
+      - name: Verify proposed workflow contract
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/$PR_HEAD_REPOSITORY/contents/.github/workflows/issue-lifecycle.yml?ref=$PR_HEAD_SHA" \
+            > "$RUNNER_TEMP/issue-lifecycle.yml"
+          ruby .github/scripts/test-issue-lifecycle-workflow.rb "$RUNNER_TEMP/issue-lifecycle.yml"
       - name: Audit current pull request
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: >-
@@ -32,7 +44,7 @@ jobs:
           --pr "$PR_NUMBER"
           --summary "$GITHUB_STEP_SUMMARY"
       - name: Audit live repository
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request_target'
         run: >-
           ruby .github/scripts/issue-lifecycle-audit.rb
           --repo "$GITHUB_REPOSITORY"
