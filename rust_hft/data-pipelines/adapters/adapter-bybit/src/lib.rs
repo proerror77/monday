@@ -927,6 +927,7 @@ mod tests {
             side: hft_core::Side::Buy,
             trade_id: "old".to_string(),
             source_venue: Some(VenueId::BYBIT),
+            timestamps: Default::default(),
         });
         data_tx
             .try_send(QueuedMarketEvent {
@@ -949,6 +950,7 @@ mod tests {
             side: hft_core::Side::Buy,
             trade_id: "fresh".to_string(),
             source_venue: Some(VenueId::BYBIT),
+            timestamps: Default::default(),
         });
         data_tx
             .try_send(QueuedMarketEvent {
