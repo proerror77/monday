@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyTrace {
+    /// WS-library complete-message delivery offset on the app-local monotonic clock.
     pub recv_ns: i64,
     pub parse_done_ns: i64,
     pub book_done_ns: i64,

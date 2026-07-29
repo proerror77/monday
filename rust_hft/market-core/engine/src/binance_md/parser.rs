@@ -29,6 +29,7 @@ pub struct BinanceDepthUpdate<'a> {
 pub struct ParsedDepthUpdate {
     pub symbol_id: u32,
     pub exchange_ts_ns: i64,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
     pub receive_ts_ns: i64,
     pub first_update_id: u64,
     pub final_update_id: u64,

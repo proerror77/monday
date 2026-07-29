@@ -1,12 +1,15 @@
-use engine::{create_execution_queues, Engine, EngineConfig, ExecutionQueueConfig};
+use engine::{
+    create_execution_queues, dataflow::EventIngester, Engine, EngineConfig, ExecutionQueueConfig,
+};
 use hft_core::{
-    now_micros, AssetClass, ComplianceContext, HftError, OrderType, Price, ProductType, Quantity,
-    Side, Symbol, TimeInForce, VenueId, VenueSymbol,
+    monotonic_micros, now_micros, AssetClass, ComplianceContext, HftError, LatencyCaptureBoundary,
+    LatencyStage, LatencyTracker, OrderType, Price, ProductType, Quantity, Side, Symbol,
+    TimeInForce, VenueId, VenueSymbol,
 };
 use ports::{
     AccountView, ArbitrageOpportunity, BookLevel, BookUpdate, ExecutionEvent, MarketEvent,
     MarketSnapshot, OrderIntent, RiskManager, RiskMetrics, Strategy, StrategyContext, TopOfBook,
-    Trade, VenueSpec,
+    TrackedMarketEvent, Trade, VenueSpec,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -259,6 +262,136 @@ fn level(price: f64, quantity: f64) -> BookLevel {
         price: Price::from_f64(price).expect("valid price"),
         quantity: Quantity::from_f64(quantity).expect("valid quantity"),
     }
+}
+
+#[tokio::test]
+async fn receive_latency_cohort_excludes_non_receive_boundaries() {
+    let mut config = EngineConfig::default();
+    config.ingestion.stale_threshold_us = 1_000_000;
+    let mut engine = Engine::new(config.clone());
+    let (mut ingester, consumer) = EventIngester::new(config.ingestion);
+    engine.register_event_consumer(consumer);
+    let symbol = Symbol::new("BTCUSDT");
+    let adapter_publish = TrackedMarketEvent::new(MarketEvent::Snapshot(MarketSnapshot {
+        symbol: symbol.clone(),
+        timestamp: now_micros(),
+        bids: vec![level(100.0, 1.0)],
+        asks: vec![level(101.0, 1.0)],
+        sequence: 1,
+        source_venue: Some(VenueId::BINANCE),
+        timestamps: Default::default(),
+    }));
+    assert_eq!(
+        adapter_publish.tracker.capture_boundary,
+        LatencyCaptureBoundary::AdapterPublish
+    );
+    ingester
+        .ingest_tracked_lossless(adapter_publish)
+        .await
+        .expect("adapter publish accepted");
+    engine.tick().expect("adapter publish tick");
+    assert!(engine
+        .get_latency_stats()
+        .get(&LatencyStage::Ingestion)
+        .is_none());
+    assert!(engine
+        .get_latency_stats()
+        .get(&LatencyStage::EndToEnd)
+        .is_none());
+
+    ingester
+        .ingest_tracked_lossless(TrackedMarketEvent::from_snapshot_completion(
+            MarketEvent::Snapshot(MarketSnapshot {
+                symbol: symbol.clone(),
+                timestamp: now_micros(),
+                bids: vec![level(100.0, 1.0)],
+                asks: vec![level(101.0, 1.0)],
+                sequence: 2,
+                source_venue: Some(VenueId::BINANCE),
+                timestamps: Default::default(),
+            }),
+        ))
+        .await
+        .expect("snapshot accepted");
+    engine.tick().expect("snapshot tick");
+    assert!(engine
+        .get_latency_stats()
+        .get(&LatencyStage::Ingestion)
+        .is_none());
+    assert!(engine
+        .get_latency_stats()
+        .get(&LatencyStage::EndToEnd)
+        .is_none());
+
+    let mut tracker = LatencyTracker::from_userspace_websocket_message_delivery(monotonic_micros());
+    tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+    tracker.record_stage_with_offset(LatencyStage::Parsing, 1);
+    ingester
+        .ingest_tracked_lossless(TrackedMarketEvent {
+            event: MarketEvent::Update(BookUpdate {
+                symbol,
+                timestamp: now_micros(),
+                bids: vec![level(100.0, 2.0)],
+                asks: vec![],
+                first_sequence: Some(3),
+                sequence: 3,
+                is_snapshot: false,
+                source_venue: Some(VenueId::BINANCE),
+                timestamps: Default::default(),
+            }),
+            tracker,
+        })
+        .await
+        .expect("userspace WebSocket message accepted");
+    engine.tick().expect("userspace WebSocket message tick");
+    assert_eq!(
+        engine
+            .get_latency_stats()
+            .get(&LatencyStage::Ingestion)
+            .expect("userspace ingestion cohort")
+            .count,
+        1
+    );
+    assert_eq!(
+        engine
+            .get_latency_stats()
+            .get(&LatencyStage::EndToEnd)
+            .expect("userspace end-to-end cohort")
+            .count,
+        1
+    );
+
+    ingester
+        .ingest_tracked_lossless(TrackedMarketEvent::new(MarketEvent::Update(BookUpdate {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 3.0)],
+            asks: vec![],
+            first_sequence: Some(4),
+            sequence: 4,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
+        })))
+        .await
+        .expect("later adapter publish accepted");
+    engine.tick().expect("later adapter publish tick");
+    assert_eq!(
+        engine
+            .get_latency_stats()
+            .get(&LatencyStage::Ingestion)
+            .expect("receive ingestion cohort remains isolated")
+            .count,
+        1
+    );
+    assert_eq!(
+        engine
+            .get_latency_stats()
+            .get(&LatencyStage::EndToEnd)
+            .expect("receive end-to-end cohort remains isolated")
+            .count,
+        1
+    );
 }
 
 #[test]

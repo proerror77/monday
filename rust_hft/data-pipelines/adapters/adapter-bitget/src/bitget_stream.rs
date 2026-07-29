@@ -18,7 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 use infra_metrics::MetricsRegistry;
 
 use hft_core::*;
-use integration::latency::WsFrameMetrics;
+use integration::latency::WsMessageMetrics;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
@@ -782,7 +782,7 @@ impl MessageHandler for BitgetMessageHandler {
     fn handle_message(
         &mut self,
         message: String,
-        mut metrics: WsFrameMetrics,
+        mut metrics: WsMessageMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("收到 Bitget 消息: {}", message);
 

@@ -494,10 +494,9 @@ impl MarketStream for BybitMarketStream {
                                                     attempts = 0;
                                                 }
                                                 for event in events {
-                                                    let mut tracker =
-                                                        LatencyTracker::from_monotonic(
-                                                            metrics.received_at_us,
-                                                        );
+                                                    let mut tracker = LatencyTracker::from_userspace_websocket_message_delivery(
+                                                        metrics.received_at_us,
+                                                    );
                                                     tracker.record_stage_with_offset(
                                                         LatencyStage::WsReceive,
                                                         0,

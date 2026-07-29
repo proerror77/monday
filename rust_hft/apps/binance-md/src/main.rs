@@ -509,6 +509,9 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
             break;
         };
         let message = message?;
+        // Sample before materializing the Tungstenite message into owned bytes.
+        let userspace_ws_message_delivery_ts_ns = now_ns();
+        let userspace_ws_message_delivery_offset_ns = elapsed_ns(&start);
         let bytes = match message {
             Message::Text(text) => text.to_string().into_bytes(),
             Message::Binary(bytes) => bytes.to_vec(),
@@ -518,9 +521,6 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
                 break;
             }
         };
-        let recv_ts_ns = now_ns();
-        let recv_latency_ns = elapsed_ns(&start);
-
         match classify_stream(&bytes) {
             StreamKind::BookTicker => {
                 stats.book_ticker_messages += 1;
@@ -536,7 +536,11 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         }
 
         let depth: DepthEnvelope<'_> = serde_json::from_slice(&bytes)?;
-        let update = normalize_depth_update(depth.data, args.symbol_id, recv_ts_ns)?;
+        let update = normalize_depth_update(
+            depth.data,
+            args.symbol_id,
+            userspace_ws_message_delivery_ts_ns,
+        )?;
 
         if !snapshot_bridged {
             stats.warmup_depth_updates += 1;
@@ -574,7 +578,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         }
 
         let latency = LatencyTrace {
-            recv_ns: recv_latency_ns,
+            recv_ns: userspace_ws_message_delivery_offset_ns,
             parse_done_ns: elapsed_ns(&start),
             ..LatencyTrace::default()
         };

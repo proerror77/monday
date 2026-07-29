@@ -35,7 +35,7 @@ impl ExchangeTradeTimestamp {
     }
 }
 
-/// Local userspace frame-delivery time projected onto the host Unix clock, in microseconds.
+/// Local WS-library-delivered complete-message time on the host Unix clock, in microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LocalReceiveTimestamp(Timestamp);

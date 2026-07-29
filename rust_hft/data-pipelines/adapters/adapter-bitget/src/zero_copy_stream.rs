@@ -11,7 +11,7 @@
 
 use adapters_common::ws_helpers::constants;
 use async_trait::async_trait;
-use integration::latency::WsFrameMetrics;
+use integration::latency::WsMessageMetrics;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -316,7 +316,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
     fn handle_message(
         &mut self,
         message: String,
-        mut metrics: WsFrameMetrics,
+        mut metrics: WsMessageMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 零拷貝解析 JSON - 將 buffer 聲明在函數級別以延長生命週期
         #[cfg(feature = "json-simd")]
@@ -352,9 +352,6 @@ impl MessageHandler for ZeroCopyMessageHandler {
 
         let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
         trace!("零拷貝解析完成，耗時 {}μs", parse_latency);
-        let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
-        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
-        tracker.record_stage_with_offset(LatencyStage::Parsing, parse_latency);
 
         #[cfg(feature = "metrics")]
         MetricsRegistry::global().record_parsing_latency(parse_latency as f64);

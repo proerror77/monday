@@ -40,8 +40,11 @@ pub struct SymbolLobContinuitySummary {
     pub last_update_id: Option<u64>,
     pub first_source_time_ms: Option<u64>,
     pub last_source_time_ms: Option<u64>,
+    /// Event observation range: WS delivery for diffs, REST completion for snapshots,
+    /// and local generation for checkpoints; not a homogeneous receive-latency cohort.
     pub first_received_at_ns: Option<u64>,
     pub last_received_at_ns: Option<u64>,
+    /// Venue E to WS-library complete-message delivery; not pure network latency.
     pub min_source_latency_ms: Option<i64>,
     pub max_source_latency_ms: Option<i64>,
     pub min_bid_levels: Option<u64>,
@@ -138,7 +141,10 @@ impl LobContinuitySummaryBuilder {
                     .get_or_insert(clock.event_time_ms);
                 summary.last_source_time_ms = Some(clock.event_time_ms);
                 summary.observe_received_at(received_at_ns);
-                summary.observe_latency(source_latency_ms(received_at_ns, clock.event_time_ms)?);
+                summary.observe_latency(venue_to_userspace_ws_message_latency_ms(
+                    received_at_ns,
+                    clock.event_time_ms,
+                )?);
             }
             "checkpoint" => {
                 let symbol = self.row_symbol(raw)?;
@@ -281,7 +287,10 @@ fn book_depth(raw: &Map<String, Value>) -> Result<(u64, u64)> {
     Ok((bids.len() as u64, asks.len() as u64))
 }
 
-fn source_latency_ms(received_at_ns: u64, source_time_ms: u64) -> Result<i64> {
+fn venue_to_userspace_ws_message_latency_ms(
+    received_at_ns: u64,
+    source_time_ms: u64,
+) -> Result<i64> {
     let received_at_ms = received_at_ns / 1_000_000;
     let latency = i128::from(received_at_ms) - i128::from(source_time_ms);
     i64::try_from(latency).context("LOB source latency exceeds its numeric range")
@@ -326,6 +335,7 @@ pub struct DepthSourceClock {
     pub previous_final_update_id: Option<u64>,
     pub event_time_ms: u64,
     pub transaction_time_ms: Option<u64>,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
     pub received_at_ns: u64,
 }
 
@@ -435,6 +445,7 @@ pub struct AggregateTrade {
     pub event_time_ms: u64,
     pub trade_time_ms: u64,
     pub is_buyer_maker: bool,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
     pub received_at_ns: u64,
 }
 
