@@ -1107,17 +1107,17 @@ fn market_updates_from_price_change(
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
-        if last_timestamp
-            .get(&token_id)
-            .is_some_and(|last| change.timestamp < *last)
-        {
-            return Err("Polymarket price-change source time moved backwards".to_string());
-        }
         books.entry(token_id).or_default().validate_change(entry)?;
     }
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
+        if last_timestamp
+            .get(&token_id)
+            .is_some_and(|last| change.timestamp < *last)
+        {
+            continue;
+        }
         books.entry(token_id.clone()).or_default().apply(entry);
         last_timestamp.insert(token_id.clone(), change.timestamp);
         if last_entries.insert(token_id.clone(), entry).is_none() {
@@ -2365,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_clob_price_change_fails_before_mutating_cached_book() {
+    fn stale_clob_price_change_is_skipped_without_dropping_fresh_batch_entries() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -2387,15 +2387,21 @@ mod tests {
             }]
         }))
         .expect("newer price change");
-        let stale = serde_json::from_value(json!({
+        let mixed = serde_json::from_value(json!({
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600200",
-            "price_changes": [{
-                "asset_id": "7", "price": "0.53", "size": "100", "side": "SELL",
-                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
-            }]
+            "price_changes": [
+                {
+                    "asset_id": "7", "price": "0.53", "size": "100", "side": "SELL",
+                    "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+                },
+                {
+                    "asset_id": "8", "price": "0.45", "size": "12", "side": "BUY",
+                    "hash": null, "best_bid": "0.45", "best_ask": "0.50"
+                }
+            ]
         }))
-        .expect("stale price change");
+        .expect("mixed stale and fresh price change");
         let same_millisecond = serde_json::from_value(json!({
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600300",
@@ -2408,8 +2414,25 @@ mod tests {
 
         let mut state = ClobBookState::default();
         market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
-        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
-        let mut timestamps = std::collections::HashMap::from([("7".to_string(), book.timestamp)]);
+        let second_book = serde_json::from_value(json!({
+            "asset_id": "8",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.40", "size": "5"}],
+            "asks": [{"price": "0.50", "size": "6"}],
+            "hash": null
+        }))
+        .expect("valid second CLOB book update");
+        let mut second_state = ClobBookState::default();
+        market_update_from_clob_book(&second_book, &mut second_state).expect("second snapshot");
+        let mut books = std::collections::HashMap::from([
+            ("7".to_string(), state),
+            ("8".to_string(), second_state),
+        ]);
+        let mut timestamps = std::collections::HashMap::from([
+            ("7".to_string(), book.timestamp),
+            ("8".to_string(), second_book.timestamp),
+        ]);
         assert_eq!(
             market_updates_from_price_change(&newer, &mut books, &mut timestamps)
                 .expect("valid newer price change")
@@ -2423,7 +2446,13 @@ mod tests {
             1,
             "distinct deltas sharing a wire millisecond must not be dropped"
         );
-        assert!(market_updates_from_price_change(&stale, &mut books, &mut timestamps).is_err());
+        let updates = market_updates_from_price_change(&mixed, &mut books, &mut timestamps)
+            .expect("stale entry is superseded without rejecting the fresh entry");
+        assert!(matches!(
+            updates.as_slice(),
+            [MarketUpdate::Quote { token_id, bid: Some(bid), .. }]
+                if token_id.as_ref() == "8" && *bid == dec!(0.45)
+        ));
 
         let quote = books["7"].quote(
             "7".to_string(),
@@ -2435,6 +2464,28 @@ mod tests {
             MarketUpdate::Quote { ask: Some(ask), ask_size: Some(size), .. }
                 if ask == dec!(0.54) && size == dec!(30)
         ));
+    }
+
+    #[test]
+    fn malformed_stale_clob_price_change_still_fails_closed() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.53", "side": "SELL",
+                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+            }]
+        }))
+        .expect("syntactically valid malformed price change");
+        let mut timestamps =
+            std::collections::HashMap::from([("7".to_string(), 1_712_205_600_300)]);
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut seeded_clob_books(),
+            &mut timestamps,
+        )
+        .is_err());
     }
 
     #[test]
