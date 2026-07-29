@@ -9,6 +9,7 @@ CATEGORIES = %w[bug enhancement].freeze
 TRIAGE_STATES = %w[needs-triage needs-info ready-for-agent ready-for-human wontfix].freeze
 RUNTIME_CONTROL_FIELDS = {
   "Target" => /\A(?:[-*]\s*)?(?:\*\*)?(?:Target|Exact target identity)(?:\*\*)?\s*:\s*(.+)\z/i,
+  "Candidate" => /\A(?:[-*]\s*)?(?:\*\*)?(?:Candidate|Candidate and configuration identity)(?:\*\*)?\s*:\s*(.+)\z/i,
   "Controller" => /\A(?:[-*]\s*)?(?:\*\*)?(?:Controller|Named controller)(?:\*\*)?\s*:\s*(.+)\z/i,
   "Stop rule" => /\A(?:[-*]\s*)?(?:\*\*)?Stop rules?(?:\*\*)?\s*:\s*(.+)\z/i,
   "Rollback" => /\A(?:[-*]\s*)?(?:\*\*)?(?:Rollback|Rollback identity)(?:\*\*)?\s*:\s*(.+)\z/i
@@ -17,7 +18,7 @@ CLOSING_KEYWORD_SOURCE = "(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)"
 QUALIFIED_ISSUE_REFERENCE = "(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\\d+)\\b"
 CLOSING_PATTERN = Regexp.new("\\b(#{CLOSING_KEYWORD_SOURCE})\\s*:?\\s+#{QUALIFIED_ISSUE_REFERENCE}", Regexp::IGNORECASE)
 NEGATED_CLOSING_PATTERN = Regexp.new(
-  "\\b(?:(?:do(?:es)?|did|will|would|should|can|could|must)\\s+not|cannot|doesn't|don't|didn't|won't|can't|never|not)\\s+#{CLOSING_KEYWORD_SOURCE}\\s*:?\\s+#{QUALIFIED_ISSUE_REFERENCE}",
+  "\\b(?:(?:do(?:es)?|did|will|would|should|can|could|must)\\s+not|cannot|doesn't|don't|didn't|won't|can't|never|not)(?:\\s+[A-Za-z-]+){0,3}\\s+#{CLOSING_KEYWORD_SOURCE}\\s*:?\\s+#{QUALIFIED_ISSUE_REFERENCE}",
   Regexp::IGNORECASE
 )
 
@@ -128,6 +129,7 @@ def missing_runtime_control(body)
   unless section
     field_values = {
       "Target" => issue_form_value(body, "Exact target identity", "Target"),
+      "Candidate" => issue_form_value(body, "Candidate and configuration identity", "Candidate"),
       "Controller" => issue_form_value(body, "Named controller", "Controller"),
       "Stop rule" => issue_form_value(body, "Stop rules", "Stop rule"),
       "Rollback" => issue_form_value(body, "Rollback identity and procedure", "Rollback identity", "Rollback")
@@ -144,7 +146,7 @@ end
 
 def literal_escaped_newline_artifact?(body)
   text = body.to_s
-  return false if text.scan(/\\n/).length < 3
+  return false unless text.include?("\\n")
 
   !text.include?("\n") || text.match?(/(?:\A|\n)[#]{1,6}[ \t]+[^\\\r\n]+\\n(?:\\n)?/)
 end
@@ -376,16 +378,17 @@ def render(data, label, violations, fixture)
 end
 
 options = {}
-OptionParser.new do |parser|
+parser = OptionParser.new do |parser|
   parser.banner = "Usage: issue-lifecycle-audit.rb [--repo OWNER/REPO [--pr N] | --fixture FILE --case NAME]"
   parser.on("--repo OWNER/REPO", "Audit live GitHub data") { |value| options[:repo] = value }
   parser.on("--pr NUMBER", Integer, "Audit only one open pull request") { |value| options[:pr] = value }
   parser.on("--fixture FILE", "Read a fixture matrix instead of GitHub") { |value| options[:fixture] = value }
   parser.on("--case NAME", "Audit one named fixture case") { |value| options[:case] = value }
   parser.on("--summary FILE", "Append Markdown output to FILE") { |value| options[:summary] = value }
-end.parse!
+end
 
 begin
+  parser.parse!
   fixture = !!options[:fixture]
   if fixture
     raise "--fixture requires --case" unless options[:case]
@@ -424,12 +427,12 @@ begin
   end
 
   output = render(data, label, violations, fixture)
-  puts output
   File.open(options[:summary], "a") { |file| file.write(output) } if options[:summary]
+  puts output
   exit(violations.empty? ? 0 : 1)
 rescue StandardError => error
   output = "ERROR issue lifecycle audit\n# Issue Lifecycle Audit\n\n- Result: **ERROR**\n- #{error.message}\n"
   warn output
-  File.open(options[:summary], "a") { |file| file.write(output) } if options[:summary]
+  File.open(options[:summary], "a") { |file| file.write(output) } if options[:summary] rescue nil
   exit 2
 end

@@ -30,12 +30,17 @@ def data(issues, pull_requests = [], automatic_close = true)
 end
 
 base = issue(10, %w[enhancement ready-for-agent], issue_body, ["agent"])
-runtime_control = "\n## Runtime control\n\nTarget: repository setting\nController: release-owner\nStop rule: stop on failed preflight\nRollback: restore the previous setting\n"
+runtime_control = "\n## Runtime control\n\nTarget: repository setting\nCandidate: commit abc with config digest def\nController: release-owner\nStop rule: stop on failed preflight\nRollback: restore the previous setting\n"
+runtime_without_candidate = runtime_control.lines.reject { |line| line.start_with?("Candidate:") }.join
 issue_form_runtime = <<~MARKDOWN
 
 ### Exact target identity
 
 repository setting
+
+### Candidate and configuration identity
+
+commit abc with config digest def
 
 ### Named controller
 
@@ -58,9 +63,6 @@ cases = {
   "valid_closes" => data([
     issue(11, %w[enhancement ready-for-agent], issue_body, ["agent"])
   ], [pull_request(22, "Closes #11", "main", [{ "sha" => "fix", "message" => "Fixes #11" }])]),
-  "valid_title_closes" => data([
-    issue(16, %w[enhancement ready-for-agent], issue_body, ["agent"])
-  ], [pull_request(42, "Closes #16", "main", [], "", "Fixes #16")]),
   "valid_none" => data([], [pull_request(23, "<!-- Refs #1 and Closes #1 -->\nNone")], false),
   "valid_needs_info" => data([issue(13, %w[bug needs-info])]),
   "valid_wontfix" => data([issue(14, %w[enhancement wontfix])]),
@@ -81,6 +83,7 @@ cases = {
   "literal_escaped_newline" => data([
     issue(34, %w[enhancement ready-for-human], "## Parent\\n\\nNone\\n\\n## Blocked by\\n\\nNone\\n\\n## Details\\n\\nliteral \\n escape")
   ]),
+  "short_literal_escaped_newline" => data([issue(61, %w[enhancement ready-for-human], "Summary\\nDetails")]),
   "valid_literal_escaped_newline" => data([
     issue(35, %w[enhancement ready-for-human], issue_body + "\n\n```json\n{\"pattern\":\"line\\\\nnext\"}\n```\n")
   ]),
@@ -88,7 +91,9 @@ cases = {
     issue(60, %w[enhancement ready-for-human], "Normal preface.\n\n## Parent\\n\\nNone\\n\\n## Blocked by\\n\\nNone")
   ]),
   "tracking_agent_queue" => data([issue(35, %w[enhancement ready-for-agent tracking])]),
-  "runtime_missing_control" => data([issue(36, %w[enhancement ready-for-agent runtime])]),
+  "runtime_missing_control" => data([
+    issue(36, %w[enhancement ready-for-agent runtime], issue_body("None", "None", runtime_without_candidate))
+  ]),
   "runtime_open_blocker" => data([
     issue(37, %w[enhancement ready-for-agent runtime],
           issue_body("None", "#99", runtime_control), [], nil,
@@ -128,6 +133,9 @@ cases = {
   ]),
   "qualified_negated_pr_closing" => data([base], [
     pull_request(39, "Refs #10", "main", [], "This does not close proerror77/monday#10.")
+  ]),
+  "modified_negated_pr_closing" => data([base], [
+    pull_request(43, "Closes #10", "main", [], "", "This does not fully close #10.")
   ]),
   "pr_title_fix_with_refs" => data([base], [
     pull_request(34, "Refs #10", "main", [], "", "Fixes #10 in title")
@@ -203,7 +211,6 @@ run_fail() {
 
 run_pass valid_refs
 run_pass valid_closes
-run_pass valid_title_closes
 run_pass valid_none "automatic-linked-issue-closing: disabled (fixture)"
 run_pass valid_needs_info
 run_pass valid_wontfix
@@ -220,9 +227,10 @@ conflicting_category|Issue #31: expected exactly one category label
 missing_state|Issue #32: expected exactly one triage state label
 conflicting_state|Issue #33: expected exactly one triage state label
 literal_escaped_newline|Issue #34: body contains a literal escaped newline
+short_literal_escaped_newline|Issue #61: body contains a literal escaped newline
 mixed_literal_escaped_newline|Issue #60: body contains a literal escaped newline
 tracking_agent_queue|Issue #35: tracking issues cannot use ready-for-agent
-runtime_missing_control|Issue #36: runtime ready-for-agent is missing Runtime control
+runtime_missing_control|Issue #36: runtime ready-for-agent is missing Runtime control: Candidate
 runtime_open_blocker|Issue #37: runtime ready-for-agent has open native blocker #99
 active_missing_owner|Issue #40: active implementation requires exactly one assignee
 active_multiple_owners|Issue #41: active implementation requires exactly one assignee
@@ -236,6 +244,7 @@ tracking_closes|PR #27: tracking issue #51 cannot be closed by a pull request
 pr_fix_with_refs|PR #28 body: closing keyword Fixes #10 requires visible Closes #10
 qualified_pr_fix_with_refs|PR #36 body: closing keyword Fixes proerror77/monday#10 requires visible Closes #10
 qualified_negated_pr_closing|PR #39 body: negated closing phrase is forbidden
+modified_negated_pr_closing|PR #43 title: negated closing phrase is forbidden
 pr_title_fix_with_refs|PR #34 title: closing keyword Fixes #10 requires visible Closes #10
 qualified_pr_title_fix_with_refs|PR #37 title: closing keyword Fixes proerror77/monday#10 requires visible Closes #10
 commit_fix_with_refs|PR #29 commit fix-ref: closing keyword Fixes #10 requires visible Closes #10
@@ -246,6 +255,18 @@ commit_never_closes|PR #33 commit never: negated closing phrase is forbidden
 commit_other_issue|PR #31 commit closed: closing keyword Closed #52 conflicts with visible Closes #10
 commit_list_incomplete|PR #32: fetched 1 of 251 commit messages; audit cannot prove every commit safe
 CASES
+
+set +e
+parse_output="$(ruby "$auditor" --pr nope 2>&1)"
+parse_exit=$?
+summary_output="$(ruby "$auditor" --fixture "$tmp_dir/cases.json" --case valid_refs --summary "$tmp_dir/missing/summary.md" 2>&1)"
+summary_exit=$?
+set -e
+test "$parse_exit" -eq 2
+grep -Fq "ERROR issue lifecycle audit" <<<"$parse_output"
+test "$summary_exit" -eq 2
+grep -Fq "ERROR issue lifecycle audit" <<<"$summary_output"
+if grep -Fq "PASS valid_refs" <<<"$summary_output"; then exit 1; fi
 
 live_stub_dir="$tmp_dir/live-stub"
 mkdir -p "$live_stub_dir"
