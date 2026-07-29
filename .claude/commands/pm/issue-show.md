@@ -4,88 +4,40 @@ allowed-tools: Bash, Read, LS
 
 # Issue Show
 
-Display issue and sub-issues with detailed information.
+Display one issue and its live GitHub relationships.
 
 ## Usage
-```
+
+```text
 /pm:issue-show <issue_number>
 ```
 
-## Instructions
+GitHub is authoritative. Run this without requiring `.claude/epics`:
 
-You are displaying comprehensive information about a GitHub issue and related sub-issues for: **Issue #$ARGUMENTS**
+```bash
+issue_number="${ARGUMENTS%% *}"
+case "$issue_number" in
+  ''|*[!0-9]*) echo "❌ A numeric issue number is required" >&2; exit 1 ;;
+esac
 
-### 1. Fetch Issue Data
-- Use `gh issue view #$ARGUMENTS` to get GitHub issue details
-- Look for local task file: first check `.claude/epics/*/$ARGUMENTS.md` (new naming)
-- If not found, search for file with `github:.*issues/$ARGUMENTS` in frontmatter (old naming)
-- Check for related issues and sub-tasks
+gh issue view "$issue_number" \
+  --json number,title,state,stateReason,body,labels,assignees,parent,subIssues,blockedBy,blocking,closedByPullRequestsReferences,comments,createdAt,updatedAt,closedAt,url || exit 1
 
-### 2. Issue Overview
-Display issue header:
-```
-🎫 Issue #$ARGUMENTS: {Issue Title}
-   Status: {open/closed}
-   Labels: {labels}
-   Assignee: {assignee}
-   Created: {creation_date}
-   Updated: {last_update}
-   
-📝 Description:
-{issue_description}
-```
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 1
+closing_prs=$(gh issue view "$issue_number" --json closedByPullRequestsReferences \
+  --jq '.closedByPullRequestsReferences[].url') || exit 1
+referencing_prs=$(gh api --paginate "repos/$repo/issues/$issue_number/timeline" \
+  --jq '.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null) | .source.issue.html_url') || exit 1
+linked_prs=$(printf '%s\n%s\n' "$closing_prs" "$referencing_prs" | awk 'NF && !seen[$0]++')
 
-### 3. Local File Mapping
-If local task file exists:
-```
-📁 Local Files:
-   Task file: .claude/epics/{epic_name}/{task_file}
-   Updates: .claude/epics/{epic_name}/updates/$ARGUMENTS/
-   Last local update: {timestamp}
+while IFS= read -r pr_url; do
+  [ -n "$pr_url" ] || continue
+  gh pr view "$pr_url" \
+    --json number,title,state,isDraft,mergedAt,headRefName,baseRefName,url || exit 1
+done <<< "$linked_prs"
 ```
 
-### 4. Sub-Issues and Dependencies
-Show related issues:
-```
-🔗 Related Issues:
-   Parent Epic: #{epic_issue_number}
-   Dependencies: #{dep1}, #{dep2}
-   Blocking: #{blocked1}, #{blocked2}
-   Sub-tasks: #{sub1}, #{sub2}
-```
-
-### 5. Recent Activity
-Display recent comments and updates:
-```
-💬 Recent Activity:
-   {timestamp} - {author}: {comment_preview}
-   {timestamp} - {author}: {comment_preview}
-   
-   View full thread: gh issue view #$ARGUMENTS --comments
-```
-
-### 6. Progress Tracking
-If task file exists, show progress:
-```
-✅ Acceptance Criteria:
-   ✅ Criterion 1 (completed)
-   🔄 Criterion 2 (in progress)
-   ⏸️ Criterion 3 (blocked)
-   □ Criterion 4 (not started)
-```
-
-### 7. Quick Actions
-```
-🚀 Quick Actions:
-   Start work: /pm:issue-start $ARGUMENTS
-   Sync updates: /pm:issue-sync $ARGUMENTS
-   Add comment: gh issue comment #$ARGUMENTS --body "your comment"
-   View in browser: gh issue view #$ARGUMENTS --web
-```
-
-### 8. Error Handling
-- Handle invalid issue numbers gracefully
-- Check for network/authentication issues
-- Provide helpful error messages and alternatives
-
-Provide comprehensive issue information to help developers understand context and current status for Issue #$ARGUMENTS.
+Present labels, assignees, parent, sub-issues, blocked-by, blocking, linked pull
+requests, comments, and timestamps. Use `None` for empty native relationships.
+An existing local mirror may be listed afterward as optional enrichment; its
+absence and its status never override GitHub.
