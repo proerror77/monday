@@ -284,6 +284,7 @@ fn live_delta_updates_market_view_and_runs_strategy() {
             asks: vec![level(101.0, 2.0), level(102.0, 1.0), level(103.0, 1.0)],
             sequence: 100,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     let first = engine.tick().expect("snapshot tick");
@@ -302,6 +303,7 @@ fn live_delta_updates_market_view_and_runs_strategy() {
             sequence: 101,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("delta accepted");
     let second = engine.tick().expect("delta tick");
@@ -344,6 +346,7 @@ fn live_delta_updates_market_view_and_runs_strategy() {
             sequence: 103,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("gap event accepted");
     let gap = engine.tick().expect("gap tick");
@@ -377,6 +380,7 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
             asks: vec![level(102.0, 1.0), level(103.0, 2.0), level(104.0, 3.0)],
             sequence: 100,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -391,6 +395,7 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
             bid: level(100.0, 5.0),
             ask: level(103.0, 6.0),
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("quote accepted");
     let tick = engine.tick().expect("quote tick");
@@ -455,6 +460,7 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
             asks: vec![level(101.0, 1.0), level(102.0, 1.0)],
             sequence: 20,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -470,6 +476,7 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
             bid: level(100.0, 10.0),
             ask: level(101.0, 1.0),
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("quote accepted");
     engine.tick().expect("quote tick");
@@ -500,6 +507,7 @@ fn crossed_realtime_quote_invalidates_the_venue_book() {
             asks: vec![level(101.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -515,6 +523,7 @@ fn crossed_realtime_quote_invalidates_the_venue_book() {
             bid: level(102.0, 1.0),
             ask: level(101.0, 1.0),
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("quote accepted");
     engine.tick().expect("quote tick");
@@ -552,6 +561,7 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
             asks: vec![level(101.0, 2.0), level(102.0, 1.0)],
             sequence: 10,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -572,6 +582,7 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
             sequence: 11,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("delta accepted");
     engine.tick().expect("delta tick");
@@ -615,6 +626,7 @@ fn cross_venue_delta_recomputes_and_publishes_arbitrage_opportunity() {
                 asks: vec![level(101.0, 2.0)],
                 sequence,
                 source_venue: Some(venue),
+                timestamps: Default::default(),
             }))
             .expect("snapshot accepted");
         engine.tick().expect("snapshot tick");
@@ -633,6 +645,7 @@ fn cross_venue_delta_recomputes_and_publishes_arbitrage_opportunity() {
             sequence: 2,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("delta accepted");
     engine.tick().expect("delta tick");
@@ -665,6 +678,7 @@ fn deleting_top_level_refills_published_top_n_from_canonical_depth() {
             asks: vec![level(101.0, 1.0), level(102.0, 2.0), level(103.0, 3.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -681,6 +695,7 @@ fn deleting_top_level_refills_published_top_n_from_canonical_depth() {
             sequence: 2,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("delta accepted");
     engine.tick().expect("delta tick");
@@ -714,6 +729,7 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
             asks: vec![level(101.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -730,6 +746,7 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
                 sequence,
                 is_snapshot: false,
                 source_venue: Some(VenueId::BINANCE),
+                timestamps: Default::default(),
             }))
             .expect("delta accepted");
     }
@@ -767,6 +784,7 @@ fn market_order_is_priced_from_event_lob_before_risk_review() {
             asks: vec![level(101.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -801,6 +819,7 @@ fn venue_disconnect_invalidates_stale_books_until_a_fresh_snapshot() {
             asks: vec![level(101.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BYBIT),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("snapshot tick");
@@ -842,6 +861,7 @@ fn trade_event_runs_strategy_without_waiting_for_a_book_snapshot() {
             side: Side::Buy,
             trade_id: "trade-1".to_string(),
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("trade accepted");
     let tick = engine.tick().expect("trade tick");
@@ -870,6 +890,7 @@ fn strategy_order_reaches_worker_with_lifecycle_and_idempotency_key() {
             asks: vec![level(101.0, 2.0)],
             sequence: 700,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     engine.tick().expect("strategy tick");
@@ -904,6 +925,7 @@ fn intent_from_an_older_event_in_the_same_batch_is_rejected() {
             asks: vec![level(101.0, 2.0)],
             sequence: 700,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("snapshot accepted");
     ingester
@@ -916,6 +938,7 @@ fn intent_from_an_older_event_in_the_same_batch_is_rejected() {
             sequence: 701,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .expect("delta accepted");
     drop(ingester);
@@ -942,6 +965,7 @@ fn market_consumers_rotate_without_exceeding_the_global_tick_budget() {
             asks: vec![level(101.0, 2.0)],
             sequence,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         })
     };
     first
@@ -961,6 +985,7 @@ fn market_consumers_rotate_without_exceeding_the_global_tick_budget() {
             sequence: 2,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .unwrap();
     second

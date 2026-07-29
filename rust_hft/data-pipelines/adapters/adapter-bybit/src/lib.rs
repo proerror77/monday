@@ -255,6 +255,7 @@ fn convert_message_with_fast_bbo(
                 bid,
                 ask,
                 source_venue: Some(VenueId::BYBIT),
+                timestamps: Default::default(),
             })]);
         }
         let is_snapshot = message.ty.as_deref() == Some("snapshot") || data.u == 1;
@@ -277,6 +278,7 @@ fn convert_message_with_fast_bbo(
                 asks,
                 sequence: cross_sequence,
                 source_venue: Some(VenueId::BYBIT),
+                timestamps: Default::default(),
             })])
         } else {
             Ok(vec![MarketEvent::Update(BookUpdate {
@@ -288,6 +290,7 @@ fn convert_message_with_fast_bbo(
                 sequence: cross_sequence,
                 is_snapshot: false,
                 source_venue: Some(VenueId::BYBIT),
+                timestamps: Default::default(),
             })])
         }
     } else if topic.starts_with("publicTrade.") {
@@ -312,6 +315,7 @@ fn convert_message_with_fast_bbo(
                     },
                     trade_id: trade.i,
                     source_venue: Some(VenueId::BYBIT),
+                    timestamps: Default::default(),
                 }))
             })
             .collect()
@@ -923,6 +927,7 @@ mod tests {
             side: hft_core::Side::Buy,
             trade_id: "old".to_string(),
             source_venue: Some(VenueId::BYBIT),
+            timestamps: Default::default(),
         });
         data_tx
             .try_send(QueuedMarketEvent {
@@ -945,6 +950,7 @@ mod tests {
             side: hft_core::Side::Buy,
             trade_id: "fresh".to_string(),
             source_venue: Some(VenueId::BYBIT),
+            timestamps: Default::default(),
         });
         data_tx
             .try_send(QueuedMarketEvent {

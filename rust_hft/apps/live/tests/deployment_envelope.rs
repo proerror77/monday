@@ -458,6 +458,7 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
             asks: vec![BookLevel::new_unchecked(100.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         }))
         .unwrap();
 

@@ -70,6 +70,7 @@ impl MarketStream for MockMarketStream {
                 volume: Quantity::from_f64((counter % 10 + 1) as f64).unwrap(), // 變化的成交量
                 trade_count: (counter % 5 + 1) as u32,
                 source_venue: Some(VenueId::MOCK), // Mock adapter always uses MOCK venue
+                timestamps: Default::default(),
             };
 
             tracing::info!(
