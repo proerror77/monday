@@ -27,11 +27,16 @@ if [ ! -f "$epic_dir/epic.md" ]; then
   exit 1
 fi
 
-task_count=0
-for task_file in "$epic_dir"/[0-9][0-9][0-9].md; do
-  [ -f "$task_file" ] || continue
-  task_count=$((task_count + 1))
-done
+task_source_id() {
+  source_id=$(sed -n '2,/^---$/s/^monday_source: *//p' "$1")
+  [ -n "$source_id" ] || source_id=$(basename "$1" .md)
+  case "$source_id" in
+    [0-9][0-9][0-9]) printf '%s\n' "$source_id" ;;
+    *) echo "❌ Invalid source task identity in $1" >&2; exit 1 ;;
+  esac
+}
+
+task_count=$(find "$epic_dir" -maxdepth 1 -type f -name '[0-9]*.md' | awk 'END { print NR }')
 if [ "$task_count" -eq 0 ]; then
   echo "❌ No tasks to sync. Run: /pm:epic-decompose $ARGUMENTS" >&2
   exit 1
@@ -165,10 +170,10 @@ Store the returned issue number for epic frontmatter update.
 ```bash
 epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
 if [ "$task_count" -lt 5 ]; then
-  for task_file in "$epic_dir"/[0-9][0-9][0-9].md; do
+  for task_file in "$epic_dir"/[0-9]*.md; do
     [ -f "$task_file" ] || continue
 
-    source_id=$(basename "$task_file" .md)
+    source_id=$(task_source_id "$task_file")
     task_name=$(grep '^name:' "$task_file" | sed 's/^name: *//')
     task_marker="<!-- monday-source: epic:$ARGUMENTS/task:$source_id -->"
     task_body="$epic_sync_tmp/task-$source_id-body.md"
@@ -209,8 +214,6 @@ fi
 ```bash
 if [ "$task_count" -ge 5 ]; then
   echo "Creating $task_count sub-issues in parallel..."
-  # Give each batch a distinct directory below this run's fresh scratch root.
-  # The controller assigns every source task to exactly one batch.
 fi
 ```
 
@@ -228,7 +231,7 @@ Task:
     - {list of 3-4 task files}
     
     For each task file:
-    1. Extract task name from frontmatter
+    1. Extract task name and stable source ID (`monday_source`, otherwise filename)
     2. Strip frontmatter into the batch body file, then append the stable marker:
        <!-- monday-source: epic:$ARGUMENTS/task:{source_id} -->
     3. Search every paginated issue page for that exact marker. Fail if more than
@@ -270,7 +273,7 @@ fi
 
 while IFS=: read -r mapped_file mapped_number extra; do
   case "$mapped_file:$mapped_number:$extra" in
-    "$epic_dir"/[0-9][0-9][0-9].md:[0-9]*:) ;;
+    "$epic_dir"/[0-9]*.md:[0-9]*:) ;;
     *) echo "❌ Invalid task mapping: $mapped_file:$mapped_number" >&2; exit 1 ;;
   esac
   if [ ! -f "$mapped_file" ]; then
@@ -287,7 +290,7 @@ if [ "$unique_issue_count" -ne "$expected_mapping_count" ]; then
   echo "❌ Task mappings reuse a GitHub issue number" >&2
   exit 1
 fi
-for task_file in "$epic_dir"/[0-9][0-9][0-9].md; do
+for task_file in "$epic_dir"/[0-9]*.md; do
   source_mapping_count=$(awk -F: -v source="$task_file" '$1 == source { count++ } END { print count + 0 }' "$mapping_file")
   if [ "$source_mapping_count" -ne 1 ]; then
     echo "❌ $task_file has $source_mapping_count mappings" >&2
@@ -316,7 +319,7 @@ if [ "$actual_subissues" != "$expected_subissues" ]; then
 fi
 
 while IFS=: read -r task_file task_number; do
-  source_id=$(basename "$task_file" .md)
+  source_id=$(task_source_id "$task_file")
   expected_task_body="$epic_sync_tmp/expected-task-$source_id.md"
   sed '1,/^---$/d; 1,/^---$/d' "$task_file" > "$expected_task_body"
   printf '\n<!-- monday-source: epic:%s/task:%s -->\n' "$ARGUMENTS" "$source_id" \
@@ -356,6 +359,10 @@ while IFS=: read -r task_file task_number; do
   IFS=,
   for source_dependency in $dependencies; do
     dependency_file="$epic_dir/$source_dependency.md"
+    if [ ! -f "$dependency_file" ]; then
+      dependency_file=$(grep -lFx "monday_source: $source_dependency" "$epic_dir"/[0-9]*.md || true)
+      case "$dependency_file" in *$'\n'*) echo "❌ Duplicate source task $source_dependency" >&2; exit 1 ;; esac
+    fi
     dependency_number=$(awk -F: -v source="$dependency_file" '$1 == source { print $2 }' "$mapping_file")
     case "$dependency_number" in
       ''|*[!0-9]*)
@@ -404,8 +411,7 @@ epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
 # Create mapping from old task numbers (001, 002, etc.) to new issue IDs
 > "$epic_sync_tmp/id-mapping.txt"
 while IFS=: read -r task_file task_number; do
-  # Extract old number from filename (e.g., 001 from 001.md)
-  old_num=$(basename "$task_file" .md)
+  old_num=$(task_source_id "$task_file")
   echo "$old_num:$task_number" >> "$epic_sync_tmp/id-mapping.txt"
 done < "$epic_sync_tmp/task-mapping.txt"
 ```
@@ -419,6 +425,9 @@ while IFS=: read -r task_file task_number; do
   
   # Read the file content
   content=$(cat "$task_file")
+  source_id=$(task_source_id "$task_file")
+  grep -q '^monday_source:' "$task_file" ||
+    content=$(printf '%s\n' "$content" | awk -v id="$source_id" 'NR == 2 { print "monday_source: " id } { print }')
   
   # Update depends_on and conflicts_with references
   while IFS=: read -r old_num new_num; do

@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
 epic_sync="$repo_root/.claude/commands/pm/epic-sync.md"
 init="$repo_root/.claude/scripts/pm/init.sh"
-
 extract_bash_after() {
   local file="$1"
   local heading="$2"
-
   awk -v heading="$heading" '
     $0 == heading { found=1; next }
     found && /^```bash$/ { in_block=1; next }
@@ -17,11 +14,9 @@ extract_bash_after() {
     in_block { print }
   ' "$file"
 }
-
 write_publication_script() {
   local target="$1"
   shift
-
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\nARGUMENTS=feature\n'
     for heading in "$@"; do
@@ -33,12 +28,10 @@ write_publication_script() {
   } > "$target"
   chmod +x "$target"
 }
-
 write_section_script() {
   local target="$1"
   local setup="$2"
   local heading="$3"
-
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\nARGUMENTS=feature\n'
     printf '%s\n' "$setup"
@@ -46,13 +39,10 @@ write_section_script() {
   } > "$target"
   chmod +x "$target"
 }
-
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/project" "$scratch/run-parent"
-
 write_publication_script "$scratch/quick-check.sh" "## Quick Check"
-
 if (
   cd "$scratch/project"
   RUN_ROOT_OUTPUT="$scratch/missing-root" \
@@ -62,7 +52,6 @@ if (
   echo "epic publication accepted a missing local epic mirror" >&2
   exit 1
 fi
-
 mkdir -p "$scratch/project/.claude/epics/feature"
 cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
 ---
@@ -77,7 +66,6 @@ depends_on: []
 ---
 # First task
 EOF
-
 for run in 1 2; do
   (
     cd "$scratch/project"
@@ -87,7 +75,6 @@ for run in 1 2; do
       bash "$scratch/quick-check.sh"
   ) > /dev/null
 done
-
 first_root="$(cat "$scratch/run-1")"
 second_root="$(cat "$scratch/run-2")"
 if [ "$first_root" = "$second_root" ] ||
@@ -97,7 +84,6 @@ if [ "$first_root" = "$second_root" ] ||
   echo "epic publication reused a scratch root" >&2
   exit 1
 fi
-
 if grep -Eq 'gh(-| )sub-issue' "$epic_sync" "$init"; then
   echo "native publication still requires the legacy extension" >&2
   exit 1
@@ -229,6 +215,11 @@ if run_publication "$scratch/partial-root" > /dev/null 2>&1; then
   echo "partial publication did not surface a child creation failure" >&2
   exit 1
 fi
+sed '1a\
+monday_source: 001
+' "$scratch/project/.claude/epics/feature/001.md" > \
+  "$scratch/project/.claude/epics/feature/501.md"
+rm "$scratch/project/.claude/epics/feature/001.md"
 printf '%s\n' enhancement ready-for-agent tracking > "$scratch/gh-state/500.labels"
 printf '%s\n' enhancement ready-for-agent > "$scratch/gh-state/501.labels"
 run_publication "$scratch/resumed-root" > /dev/null
@@ -261,7 +252,7 @@ write_section_script "$scratch/validate-mapping.sh" "$mapping_setup" \
 for mapping_case in incomplete duplicate; do
   mapping_root="$scratch/mapping-$mapping_case"
   mkdir -p "$mapping_root"
-  printf '%s\n' '.claude/epics/feature/001.md:501' > "$mapping_root/task-mapping.txt"
+  printf '%s\n' '.claude/epics/feature/501.md:501' > "$mapping_root/task-mapping.txt"
   if [ "$mapping_case" = duplicate ]; then
     printf '%s\n' '.claude/epics/feature/002.md:501' >> "$mapping_root/task-mapping.txt"
   fi
