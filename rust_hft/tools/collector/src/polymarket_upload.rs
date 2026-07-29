@@ -884,6 +884,7 @@ fn scan_tape_with_identity_at(
     let mut symbols = BTreeSet::new();
     let mut token_ids = BTreeSet::new();
     let mut known_event_tokens = BTreeSet::new();
+    let mut event_end_times = BTreeMap::<String, DateTime<Utc>>::new();
     let mut event_token_lifecycles = BTreeMap::new();
     let mut expired_before_discovery_tokens = BTreeSet::new();
     let mut quoted_token_ids = BTreeSet::new();
@@ -994,6 +995,20 @@ fn scan_tape_with_identity_at(
             token_ids.insert(token_id.to_owned());
         }
         if kind == "event_discovered" {
+            let up_token = update
+                .get("up_token")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let down_token = update
+                .get("down_token")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let (Some(up_token), Some(down_token)) = (up_token, down_token) else {
+                bail!("line {line_number}: event_discovered requires distinct outcome tokens");
+            };
+            if up_token == down_token {
+                bail!("line {line_number}: event_discovered requires distinct outcome tokens");
+            }
             let event_id = update
                 .get("event_id")
                 .and_then(Value::as_str)
@@ -1004,31 +1019,63 @@ fn scan_tape_with_identity_at(
                 .and_then(Value::as_str)
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|end_time| end_time.with_timezone(&Utc));
+            if let (Some(event_id), Some(end_time)) = (event_id.as_ref(), end_time.as_ref()) {
+                match event_end_times.get(event_id) {
+                    Some(previous) if previous != end_time => {
+                        bail!(
+                            "line {line_number}: event lifecycle end_time changed within segment"
+                        );
+                    }
+                    None => {
+                        event_end_times.insert(event_id.clone(), *end_time);
+                    }
+                    Some(_) => {}
+                }
+            }
             let expired_before_discovery = event_id.is_some()
+                && recorded_at <= validation_time
                 && end_time
                     .as_ref()
                     .is_some_and(|end_time| end_time < &recorded_at);
             let lifecycle = (event_id, end_time);
-            for field in ["up_token", "down_token"] {
-                if let Some(token) = update
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                {
-                    known_event_tokens.insert(token.to_owned());
-                    match event_token_lifecycles.get(token) {
-                        None => {
-                            event_token_lifecycles.insert(token.to_owned(), lifecycle.clone());
-                            if expired_before_discovery {
-                                expired_before_discovery_tokens.insert(token.to_owned());
-                            }
+            for token in [up_token, down_token] {
+                known_event_tokens.insert(token.to_owned());
+                match event_token_lifecycles.get(token) {
+                    None => {
+                        event_token_lifecycles.insert(token.to_owned(), lifecycle.clone());
+                        if expired_before_discovery {
+                            expired_before_discovery_tokens.insert(token.to_owned());
                         }
-                        Some(previous) if previous != &lifecycle => {
-                            // Conflicting event association or end time is not safe to exempt.
-                            expired_before_discovery_tokens.remove(token);
-                        }
-                        Some(_) => {}
                     }
+                    Some(previous) if previous != &lifecycle => {
+                        // Conflicting event association or end time is not safe to exempt.
+                        expired_before_discovery_tokens.remove(token);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if kind == "event_expired" {
+            let event_id = update
+                .get("event_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let end_time = update
+                .get("end_time")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|end_time| end_time.with_timezone(&Utc));
+            if let (Some(event_id), Some(end_time)) = (event_id, end_time) {
+                match event_end_times.get(event_id) {
+                    Some(previous) if previous != &end_time => {
+                        bail!(
+                            "line {line_number}: event lifecycle end_time changed within segment"
+                        );
+                    }
+                    None => {
+                        event_end_times.insert(event_id.to_owned(), end_time);
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -2505,6 +2552,96 @@ mod tests {
         assert_eq!(manifest["quote_coverage_complete"], true);
         assert_eq!(manifest["segment_complete"], true);
         assert_eq!(manifest["canonical"], true);
+    }
+
+    #[test]
+    fn keeps_future_skewed_discovery_in_quote_coverage() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[record(
+                0,
+                "2026-07-15T01:10:00Z",
+                json!({
+                    "kind": "event_discovered", "event_id": "event-1", "symbol": "BTCUSDT",
+                    "up_token": "up-1", "down_token": "down-1",
+                    "end_time": "2026-07-15T01:09:00Z", "window_secs": 300,
+                }),
+            )],
+        );
+        let validation_time = DateTime::parse_from_rfc3339("2026-07-15T01:08:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let manifest =
+            scan_tape_with_identity_at(&tape, "crypto_expiry", 1, 1_000, validation_time)
+                .unwrap()
+                .manifest;
+
+        assert_eq!(manifest["expired_before_discovery_tokens"], json!([]));
+        assert_eq!(manifest["canonical"], false);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_equal_event_token_pairs() {
+        for (up_token, down_token) in [(json!("up-1"), Value::Null), (json!("same"), json!("same"))]
+        {
+            let root = TestDir::new();
+            let tape = write_tape(
+                root.path(),
+                "market-updates.20260715T010000.ndjson",
+                &[record(
+                    0,
+                    "2026-07-15T01:10:00Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "event-1", "symbol": "BTCUSDT",
+                        "up_token": up_token, "down_token": down_token,
+                        "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    }),
+                )],
+            );
+
+            let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("event_discovered requires distinct outcome tokens"));
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_event_expiration_time() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[
+                record(
+                    0,
+                    "2026-07-15T01:10:00Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "event-1", "symbol": "BTCUSDT",
+                        "up_token": "up-1", "down_token": "down-1",
+                        "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    }),
+                ),
+                record(
+                    1,
+                    "2026-07-15T01:10:01Z",
+                    json!({
+                        "kind": "event_expired", "event_id": "event-1",
+                        "end_time": "2026-07-15T01:06:00Z",
+                    }),
+                ),
+            ],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("event lifecycle end_time changed within segment"));
     }
 
     #[test]
