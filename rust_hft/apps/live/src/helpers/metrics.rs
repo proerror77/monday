@@ -42,7 +42,7 @@ async fn run_axum_metrics_server(
 
             if let Ok(engine) = sync_engine_arc.try_lock() {
                 if engine.get_statistics().is_running {
-                    engine.sync_latency_metrics_to_prometheus();
+                    engine.sync_metrics_to_prometheus();
                 }
             }
         }
@@ -62,7 +62,7 @@ async fn generate_basic_metrics(engine_arc: Arc<Mutex<Engine>>) -> String {
         let engine = engine_arc.lock().await;
         #[cfg(feature = "metrics")]
         {
-            engine.sync_latency_metrics_to_prometheus();
+            engine.sync_metrics_to_prometheus();
         }
         (engine.get_account_view(), engine.get_statistics())
     };

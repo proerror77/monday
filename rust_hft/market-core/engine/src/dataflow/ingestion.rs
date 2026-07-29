@@ -20,6 +20,17 @@ const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
 const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
 const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 
+#[cfg(feature = "metrics")]
+fn record_stale_metrics(metrics: &infra_metrics::MetricsRegistry, delay_us: u64) {
+    metrics.inc_events_stale();
+    metrics.record_staleness(delay_us as f64 / 1000.0);
+}
+
+#[cfg(feature = "metrics")]
+fn record_ingestion_metric(metrics: &infra_metrics::MetricsRegistry, delay_us: u64) {
+    metrics.record_ingestion_latency(delay_us as f64);
+}
+
 /// 事件攝取配置
 #[derive(Debug, Clone)]
 pub struct IngestionConfig {
@@ -253,7 +264,7 @@ impl EventIngester {
         if let Some(delay) = Self::event_latency_us(&event) {
             self.metrics.record_latency(delay);
             #[cfg(feature = "metrics")]
-            infra_metrics::MetricsRegistry::global().record_ingestion_latency(delay as f64);
+            record_ingestion_metric(infra_metrics::MetricsRegistry::global(), delay);
         }
 
         // Compatibility timestamp only controls ordering/staleness; it is not latency evidence.
@@ -265,11 +276,7 @@ impl EventIngester {
             if delay > self.config.stale_threshold_us {
                 self.metrics.events_stale += 1;
                 #[cfg(feature = "metrics")]
-                {
-                    infra_metrics::MetricsRegistry::global().inc_events_stale();
-                    infra_metrics::MetricsRegistry::global()
-                        .record_staleness(delay as f64 / 1000.0);
-                }
+                record_stale_metrics(infra_metrics::MetricsRegistry::global(), delay);
                 // Hot path: already throttled via record_stale_warn; trace only for deep diagnostics.
                 if let Some(suppressed) =
                     self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
@@ -405,6 +412,8 @@ impl EventIngester {
         let received_at = current_timestamp_us();
         if let Some(delay) = Self::event_latency_us(&tracked_event.event) {
             self.metrics.record_latency(delay);
+            #[cfg(feature = "metrics")]
+            record_ingestion_metric(infra_metrics::MetricsRegistry::global(), delay);
         }
         let event_ts = self.extract_timestamp(&tracked_event.event);
         if let Some(timestamp) = event_ts {
@@ -762,6 +771,28 @@ mod tests {
         assert_eq!(ingester.metrics().events_stale, 1);
     }
 
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn stale_metrics_do_not_mix_staleness_into_ingestion_latency() {
+        let metrics = infra_metrics::MetricsRegistry::isolated();
+
+        record_stale_metrics(&metrics, 10_000);
+
+        assert_eq!(metrics.events_stale.get(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_count(), 0);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn ingestion_metric_exports_each_real_sample_once() {
+        let metrics = infra_metrics::MetricsRegistry::isolated();
+
+        record_ingestion_metric(&metrics, 100);
+
+        assert_eq!(metrics.latency_ingestion.get_sample_count(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_sum(), 100.0);
+    }
+
     #[test]
     fn ingestion_latency_uses_event_time_e_and_rejects_trade_time_t() {
         let snapshot = |timestamps| {
@@ -794,6 +825,7 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(ingester.metrics().recent_latency_micros, Some(100));
+        assert_eq!(ingester.metrics().latency_histogram().len(), 1);
 
         let (mut ingester, _consumer) = EventIngester::new(IngestionConfig::default());
         ingester
@@ -804,6 +836,33 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(ingester.metrics().recent_latency_micros, None);
+    }
+
+    #[test]
+    fn stale_typed_event_records_one_valid_ingestion_sample() {
+        let (mut ingester, _consumer) = EventIngester::new(IngestionConfig {
+            stale_threshold_us: 1,
+            ..IngestionConfig::default()
+        });
+        let event = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 0,
+            bids: vec![],
+            asks: vec![],
+            sequence: 1,
+            source_venue: None,
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(900)),
+                exchange_trade: None,
+                local_receive: Some(LocalReceiveTimestamp::new(1_000)),
+            },
+        });
+
+        ingester.ingest(event).unwrap();
+
+        assert_eq!(ingester.metrics().events_stale, 1);
+        assert_eq!(ingester.metrics().latency_histogram().len(), 1);
+        assert_eq!(ingester.metrics().recent_latency_micros, Some(100));
     }
 
     #[tokio::test]
