@@ -17,8 +17,8 @@ use aggregation::{AggregationEngine, MarketView, TopNSnapshot};
 use dataflow::{EventConsumer, IngestionConfig};
 use execution_queues::EngineQueues;
 use hft_core::{
-    now_micros, AccountId, HftError, HftResult, LatencyCaptureBoundary, LatencyStage,
-    LatencyTracker, OrderType, Side, Symbol, Timestamp, VenueId, VenueSymbol,
+    monotonic_micros, now_micros, AccountId, HftError, HftResult, LatencyCaptureBoundary,
+    LatencyStage, LatencyTracker, OrderType, Side, Symbol, Timestamp, VenueId, VenueSymbol,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use ports::Trade as MarketTrade;
@@ -905,6 +905,7 @@ impl Engine {
         self.ensure_accepting_new_intents()?;
         let now = now_micros();
         let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
+        lifecycle.timing.intent_emitted_mono_us = Some(monotonic_micros());
         self.apply_intent_execution_limits(&mut lifecycle);
         let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
         if let Some(queues) = &mut self.execution_queues {
@@ -1490,7 +1491,6 @@ impl Engine {
                 account: &account_view,
                 book: l2_book,
             };
-
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
 
@@ -1569,6 +1569,10 @@ impl Engine {
 
                 intents_work_buf.extend(intents);
             }
+            // Strategy returns a whole Vec, so the batch handoff is the first observable emission
+            // boundary. One timestamp also preserves the existing portfolio-level risk batch.
+            let intent_emitted_wall_us = now_micros();
+            let intent_emitted_mono_us = monotonic_micros();
 
             // 記錄策略階段完成和延遲
             event_tracker.record_stage(LatencyStage::Strategy);
@@ -1615,6 +1619,7 @@ impl Engine {
             };
 
             let risk_latency = now_micros().saturating_sub(_risk_start);
+            let risk_completed_mono_us = monotonic_micros();
             event_tracker.record_stage(LatencyStage::Risk);
             self.latency_monitor
                 .record_latency(LatencyStage::Risk, risk_latency);
@@ -1657,11 +1662,10 @@ impl Engine {
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
                 for intent in intents_to_send.drain(..) {
-                    let created_ts = received_at;
                     let max_latency_us = self.config.intent_max_latency_us.max(1);
                     let mut lifecycle = ports::OrderIntentLifecycle::new(
-                        created_ts,
-                        created_ts.saturating_add(max_latency_us),
+                        intent_emitted_wall_us,
+                        intent_emitted_wall_us.saturating_add(max_latency_us),
                     );
                     lifecycle.max_latency_us = Some(max_latency_us);
                     lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
@@ -1674,6 +1678,14 @@ impl Engine {
                         ports::MarketEvent::Quote(quote) => Some(quote.sequence),
                         _ => None,
                     });
+                    lifecycle.timing = ports::ExecutionTiming {
+                        intent_emitted_mono_us: Some(intent_emitted_mono_us),
+                        risk_completed_mono_us: Some(risk_completed_mono_us),
+                        source_market_receive_wall_us: capture_boundary
+                            .is_receive_latency_cohort()
+                            .then_some(received_at),
+                        source_market_capture_boundary: capture_boundary,
+                    };
                     let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
                     if queues
                         .send_lifecycle_intent_with_book_seq(
@@ -2635,6 +2647,11 @@ mod tests {
             .expect("40 notional order stays within configured ceiling");
         let intents = worker_queues.receive_envelopes();
         assert_eq!(intents.len(), 1);
+        assert!(intents[0].lifecycle.timing.intent_emitted_mono_us.is_some());
+        assert_eq!(
+            intents[0].lifecycle.timing.risk_completed_mono_us, None,
+            "direct dry-run submission has no risk-stage evidence"
+        );
         assert_eq!(intents[0].lifecycle.max_slippage_bps, Some(25));
         assert_eq!(
             intents[0].lifecycle.max_order_notional,

@@ -81,6 +81,17 @@ pub trait ExecutionClient: Send + Sync {
         self.place_order(envelope.intent.clone()).await
     }
 
+    /// Placement with adapter-proven userspace boundaries. The default explicitly supplies no
+    /// transport evidence instead of timing the outer async call and mislabeling it as a write.
+    async fn place_order_envelope_traced(
+        &mut self,
+        envelope: &OrderIntentEnvelope,
+    ) -> ExecutionSubmissionAttempt {
+        ExecutionSubmissionAttempt::without_transport_timing(
+            self.place_order_envelope(envelope).await,
+        )
+    }
+
     /// 帶 VenueSpec 校驗的下單
     async fn place_order_with_spec(
         &mut self,

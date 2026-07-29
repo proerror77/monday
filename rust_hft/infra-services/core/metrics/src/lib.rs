@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tracing::debug;
 
-use prometheus::{Gauge, Histogram, HistogramOpts, IntCounter, Registry};
+use prometheus::{Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, Registry};
 
 /// 全局指標註冊表
 static METRICS_REGISTRY: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -29,6 +29,7 @@ pub struct MetricsRegistry {
     pub latency_risk: Histogram,
     pub latency_execution: Histogram,
     pub latency_submission: Histogram,
+    pub execution_latency_spans: HistogramVec,
     pub latency_end_to_end: Histogram,
     pub latency_order_ack: Histogram,
     pub latency_order_fill: Histogram,
@@ -186,11 +187,21 @@ impl MetricsRegistry {
         let latency_submission = Histogram::with_opts(
             HistogramOpts::new(
                 "hft_latency_submission_microseconds",
-                "訂單送出至交易所延遲 (微秒)",
+                "Deprecated aggregate submission metric; no longer records outer async-call timing",
             )
             .buckets(latency_buckets.clone()),
         )
         .expect("創建提交延遲直方圖失敗");
+
+        let execution_latency_spans = HistogramVec::new(
+            HistogramOpts::new(
+                "hft_execution_span_microseconds",
+                "Monotonic execution spans; userspace_write excludes kernel and NIC TX",
+            )
+            .buckets(latency_buckets.clone()),
+            &["span"],
+        )
+        .expect("創建 execution span 直方圖失敗");
 
         let latency_end_to_end = Histogram::with_opts(
             HistogramOpts::new("hft_latency_end_to_end_microseconds", "端到端總延遲 (微秒)")
@@ -349,6 +360,9 @@ impl MetricsRegistry {
             .register(Box::new(latency_submission.clone()))
             .expect("註冊提交延遲指標失敗");
         registry
+            .register(Box::new(execution_latency_spans.clone()))
+            .expect("註冊 execution span 指標失敗");
+        registry
             .register(Box::new(latency_end_to_end.clone()))
             .expect("註冊端到端延遲指標失敗");
         registry
@@ -473,6 +487,7 @@ impl MetricsRegistry {
             latency_risk,
             latency_execution,
             latency_submission,
+            execution_latency_spans,
             latency_end_to_end,
             latency_order_ack,
             latency_order_fill,
@@ -560,6 +575,42 @@ impl MetricsRegistry {
     pub fn record_submission_latency(&self, latency_us: f64) {
         self.latency_submission.observe(latency_us);
         self.note_activity();
+    }
+
+    pub fn record_execution_intent_to_risk(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["intent_to_risk"])
+            .observe(latency_us);
+    }
+
+    pub fn record_execution_risk_to_write(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["risk_to_userspace_write"])
+            .observe(latency_us);
+    }
+
+    pub fn record_execution_userspace_write(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["userspace_write"])
+            .observe(latency_us);
+    }
+
+    pub fn record_execution_write_to_response(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["write_to_sync_response"])
+            .observe(latency_us);
+    }
+
+    pub fn record_execution_write_to_private_ack(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["write_to_private_ack"])
+            .observe(latency_us);
+    }
+
+    pub fn record_execution_write_to_private_report(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["write_to_private_report"])
+            .observe(latency_us);
     }
 
     /// 記錄下單→Ack 延遲
