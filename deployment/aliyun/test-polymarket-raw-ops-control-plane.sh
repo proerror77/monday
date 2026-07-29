@@ -63,8 +63,13 @@ trap 'rm -rf "$tmp_dir"' EXIT
 # A production Gate must exercise the candidate against a real closed segment,
 # not a compatible fixture manufactured by the Gate itself.
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
-sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
+sed -n \
+  -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+  -e '/^run_before_deadline() {$/,/^}$/p' "$GATE" \
   >"$preflight_verifier"
+sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
+  >>"$preflight_verifier"
 sed -n '/^real_market_segment_preflight() {$/,/^}$/p' "$GATE" \
   >>"$preflight_verifier"
 # shellcheck source=/dev/null
@@ -268,19 +273,25 @@ fake_release_binary="$preflight_root/candidate"
 release_binary="$VERIFY"
 run_id=20260101T000000Z-1
 verify_current_oss_config() { :; }
+timeout() {
+  shift 2
+  "$@"
+}
 
 wrong_path_sha=$(printf '0%.0s' {1..64})
 wrong_path_uri="oss://bucket/lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-01-01/hour=00/sha256=$wrong_path_sha/market-updates.20260101T040000.20260101T00.ndjson.zst"
 make_remote_triplet "$compatible" "$wrong_path_uri" crypto_expiry
 if download_and_verify_oss_triplet "$wrong_path_uri" crypto_expiry \
-  "$preflight_root/wrong-path-download" >/dev/null; then
+  "$preflight_root/wrong-path-download" \
+  "$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))" >/dev/null; then
   printf 'triplet verifier accepted a content-addressed path with the wrong digest\n' >&2
   exit 1
 fi
 superseded_uri="$input_good_uri.SUPERSEDED.json"
 printf '{}\n' >"$remote_root/${superseded_uri#oss://bucket/}"
 if download_and_verify_oss_triplet "$input_good_uri" crypto_expiry \
-  "$preflight_root/superseded-download" >/dev/null; then
+  "$preflight_root/superseded-download" \
+  "$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))" >/dev/null; then
   printf 'triplet verifier accepted a superseded production segment\n' >&2
   exit 1
 fi
@@ -2414,6 +2425,182 @@ if baseline_health_requires_continuous_freshness legacy_python; then
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
+legacy_runtime_budget_contract="$tmp_dir/legacy-runtime-budget.sh"
+sed -n \
+  -e '/^readonly REQUIRED_DURATION_SECONDS=/p' \
+  -e '/^readonly PARITY_TAIL_SECONDS=/p' \
+  -e '/^readonly MINIMUM_GATE_SECONDS=/p' \
+  -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
+  -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
+  -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
+  -e '/^readonly LEGACY_UNIT=/p' \
+  -e '/^monotonic_uptime_seconds() {$/,/^}$/p' \
+  -e '/^legacy_runtime_budget_observation() {$/,/^}$/p' \
+  -e '/^run_budgeted_real_market_preflight() {$/,/^}$/p' "$GATE" \
+  >"$legacy_runtime_budget_contract"
+[[ -s $legacy_runtime_budget_contract ]] || {
+  printf 'Gate has no legacy RuntimeMaxSec budget verifier\n' >&2
+  exit 1
+}
+budgeted_preflight_line=$(grep -n '^real_market_preflight_json=$(run_budgeted_real_market_preflight' \
+  "$GATE" | cut -d: -f1 || true)
+shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"' "$GATE" \
+  | cut -d: -f1 || true)
+[[ $budgeted_preflight_line =~ ^[1-9][0-9]*$ \
+  && $shadow_start_line =~ ^[1-9][0-9]*$ \
+  && $budgeted_preflight_line -lt $shadow_start_line ]] || {
+  printf 'Gate does not verify legacy runtime budget before real preflight\n' >&2
+  exit 1
+}
+grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' \
+  "$GATE" || {
+  printf 'Gate runtime budget does not bind the configured upload timeouts\n' >&2
+  exit 1
+}
+(
+  # shellcheck source=/dev/null
+  source "$legacy_runtime_budget_contract"
+  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
+    && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
+    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 ]] || {
+    printf 'Gate runtime budget does not bind the reviewed preflight and unit limits\n' >&2
+    exit 1
+  }
+  systemctl() {
+    case "$*" in
+      *RuntimeMaxUSec*) printf '6h\n' ;;
+      *ActiveEnterTimestampMonotonic*) printf '1000000\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  monotonic_uptime_seconds() { printf '20906\n'; }
+  required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
+    + LEGACY_HEALTH_START_WAIT_SECONDS + MINIMUM_GATE_SECONDS \
+    + LEGACY_RUNTIME_RESERVE_SECONDS))
+  if observation=$(legacy_runtime_budget_observation "$required"); then
+    printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
+      "$required" >&2
+    exit 1
+  fi
+  [[ $observation == "remaining=695 required=$required" ]] || {
+    printf 'Gate runtime rejection does not report remaining and required seconds\n' >&2
+    exit 1
+  }
+  monotonic_uptime_seconds() { printf '7200\n'; }
+  if observation=$(legacy_runtime_budget_observation "$required"); then
+    printf 'Gate admitted the unreserved exact runtime boundary\n' >&2
+    exit 1
+  fi
+  [[ $observation == "remaining=14401 required=$required" ]] || {
+    printf 'Gate reserve-boundary evidence is not exact\n' >&2
+    exit 1
+  }
+  monotonic_uptime_seconds() { printf '600\n'; }
+  observation=$(legacy_runtime_budget_observation "$required") || {
+    printf 'Gate rejected a fresh legacy baseline with sufficient runtime\n' >&2
+    exit 1
+  }
+  [[ $observation == "remaining=21001 required=$required" ]] || {
+    printf 'Gate sufficient-runtime evidence is not exact\n' >&2
+    exit 1
+  }
+
+  baseline_mode=legacy_python
+  gate_seconds=$MINIMUM_GATE_SECONDS
+  candidate_sha=unused run_id=unused release_binary=unused
+  oss_bucket=unused oss_endpoint=unused oss_region=unused aliyun_profile=unused
+  zstd_timeout_seconds=300 oss_copy_timeout_seconds=300 oss_config_sha=unused
+  source_revision=unused deployment_bundle_sha=unused release_manifest_sha=unused
+  control_archive_sha=unused
+  preflight_calls=0
+  identity_checks=0
+  timeout_args=
+  verify_baseline_identity() { identity_checks=$((identity_checks + 1)); }
+  timeout() {
+    preflight_calls=$((preflight_calls + 1))
+    timeout_args=$*
+    printf '{}\n'
+  }
+  legacy_runtime_budget_observation() {
+    printf 'remaining=695 required=%s\n' "$1"
+    return 1
+  }
+  admission_error="$tmp_dir/runtime-budget-admission.err"
+  if run_budgeted_real_market_preflight source spool download evidence \
+    2>"$admission_error"; then
+    printf 'Gate admitted an insufficient legacy runtime budget\n' >&2
+    exit 1
+  fi
+  [[ $preflight_calls -eq 0 && $identity_checks -eq 1 ]] || {
+    printf 'Gate attempted real preflight after runtime admission failed\n' >&2
+    exit 1
+  }
+  grep -Fq "remaining=695 required=$required" "$admission_error" || {
+    printf 'Gate admission failure omitted exact runtime evidence\n' >&2
+    exit 1
+  }
+  legacy_runtime_budget_observation() {
+    printf 'remaining=21001 required=%s\n' "$1"
+  }
+  run_budgeted_real_market_preflight source spool download evidence >/dev/null || {
+    printf 'Gate rejected a sufficient runtime budget at the admission seam\n' >&2
+    exit 1
+  }
+  [[ $preflight_calls -eq 1 && $identity_checks -eq 3 ]] || {
+    printf 'Gate did not bind preflight between two identity checks\n' >&2
+    exit 1
+  }
+  [[ $timeout_args == '--signal=KILL 6300 env '* ]] || {
+    printf 'Gate real preflight does not have an exact hard deadline\n' >&2
+    exit 1
+  }
+)
+preflight_deadline_contract="$tmp_dir/preflight-deadline.sh"
+sed -n \
+  -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
+  -e '/^run_before_deadline() {$/,/^}$/p' "$GATE" \
+  >"$preflight_deadline_contract"
+grep -Fq 'run_before_deadline() {' "$preflight_deadline_contract" || {
+  printf 'Gate has no bounded command runner for real preflight\n' >&2
+  exit 1
+}
+grep -Fq 'preflight_deadline=$((SECONDS + REAL_MARKET_PREFLIGHT_BUDGET_SECONDS))' \
+  "$GATE" || {
+  printf 'Gate real preflight has no overall deadline\n' >&2
+  exit 1
+}
+grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
+  printf 'Gate candidate preflight uploader is not deadline bounded\n' >&2
+  exit 1
+}
+[[ $(grep -Fc 'run_before_deadline "$deadline" aliyun ossutil' "$GATE") -eq 4 ]] || {
+  printf 'Gate OSS triplet readback is not fully deadline bounded\n' >&2
+  exit 1
+}
+(
+  # shellcheck source=/dev/null
+  source "$preflight_deadline_contract"
+  timeout_log="$tmp_dir/preflight-timeout.log"
+  timeout() {
+    printf '%s\n' "$*" >"$timeout_log"
+    shift 2
+    "$@"
+  }
+  SECONDS=20
+  [[ $(run_before_deadline 30 printf 'bounded') == bounded ]] || {
+    printf 'Gate bounded command runner rejected remaining time\n' >&2
+    exit 1
+  }
+  grep -Fq -- '--signal=KILL 10 printf bounded' "$timeout_log" || {
+    printf 'Gate bounded command runner did not use the exact remaining deadline\n' >&2
+    exit 1
+  }
+  SECONDS=30
+  if run_before_deadline 30 true; then
+    printf 'Gate bounded command runner accepted an expired deadline\n' >&2
+    exit 1
+  fi
+)
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
@@ -2753,7 +2940,9 @@ if grep -Fq 'crypto_expiry_market_rust_shadow' "$GATE"; then
   printf 'Gate still substitutes a synthetic market fixture for production input\n' >&2
   exit 1
 fi
-preflight_line=$(grep -n '^real_market_segment_preflight ' "$GATE" | cut -d: -f1)
+preflight_line=$(grep -n \
+  '^real_market_preflight_json=$(run_budgeted_real_market_preflight' "$GATE" \
+  | cut -d: -f1)
 gate_start_line=$(grep -n '^started_at_unix=' "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" | cut -d: -f1)
 ((preflight_line < gate_start_line && preflight_line < shadow_start_line)) || {

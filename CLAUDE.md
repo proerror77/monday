@@ -60,6 +60,12 @@ Issues are tracked in GitHub Issues for `proerror77/monday`; external pull reque
 
 Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
 
+### Issue lifecycle
+
+GitHub issue metadata is the source of truth. Follow the publication,
+relationship, ownership, and closure contract in
+`docs/agents/issue-tracker.md`.
+
 ### Domain docs
 
 Use the repository's single-context domain-doc layout. See `docs/agents/domain.md`.
