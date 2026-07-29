@@ -202,10 +202,10 @@ gate_invocation=$(jq -er '.systemd_invocation_id' <<<"$gate_status")
 # Run this status command after the supervised systemd Gate becomes terminal.
 gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")
 jq -e '.terminal_state == "passed"' <<<"$gate_terminal" >/dev/null
-gate_json="/data/monday/evidence/polymarket-shadow-gates/$candidate_sha/$gate_invocation/gate.json"
+gate_receipt="/data/monday/evidence/polymarket-gate-jobs/$candidate_sha/$gate_invocation/receipt.json"
 pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"
 sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
-  cutover "$candidate_sha" "$gate_json"
+  cutover "$candidate_sha" "$gate_receipt"
 ```
 
 Staging does not replace active global controls or production units. The Gate pins
