@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt;
 use hft_core::{
-    now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker, ProductType,
-    Symbol,
+    now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker,
+    LocalReceiveTimestamp, ProductType, Symbol,
 };
 use integration::WsFrameMetrics;
 use ports::events::MarketSnapshot;
@@ -325,8 +325,7 @@ impl BinanceMarketStream {
             let depth = rest_client
                 .get_depth(symbol, Some(Self::snapshot_depth()))
                 .await?;
-            // 使用本地時間（毫秒）轉換為微秒
-            let timestamp = (chrono::Utc::now().timestamp_millis() as u64) * 1000;
+            let timestamp = now_micros();
 
             let snapshot =
                 MessageConverter::convert_depth_snapshot(symbol.clone(), depth, timestamp)?;
@@ -337,27 +336,40 @@ impl BinanceMarketStream {
         Ok(snapshots)
     }
 
-    fn parse_socket_event(bytes: bytes::Bytes) -> HftResult<Option<MarketEvent>> {
-        let mut bytes = match bytes.try_into_mut() {
-            Ok(bytes) => bytes,
-            Err(bytes) => BytesMut::from(bytes.as_ref()),
-        };
-        MessageConverter::parse_stream_message_bytes(&mut bytes)
-    }
-
     fn parse_tracked_socket_event(
         bytes: bytes::Bytes,
         mut metrics: WsFrameMetrics,
     ) -> HftResult<Option<TrackedMarketEvent>> {
-        let event = Self::parse_socket_event(bytes)?;
+        let mut bytes = match bytes.try_into_mut() {
+            Ok(bytes) => bytes,
+            Err(bytes) => BytesMut::from(bytes.as_ref()),
+        };
+        let event = MessageConverter::parse_stream_message_bytes(&mut bytes)?;
         metrics.mark_parsed();
-        Ok(event.map(|event| {
+        Ok(event.map(|mut event| {
             let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
             tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(
                 LatencyStage::Parsing,
                 metrics.parsed_at_us.saturating_sub(metrics.received_at_us),
             );
+            let has_exchange_event = event
+                .timestamps()
+                .and_then(|timestamps| timestamps.exchange_event)
+                .is_some();
+            let local_receive = metrics.received_at_unix_us.map(LocalReceiveTimestamp::new);
+            if let Some(timestamps) = event.timestamps_mut() {
+                timestamps.local_receive = local_receive;
+            }
+
+            if !has_exchange_event {
+                if let (MarketEvent::Quote(quote), Some(local_receive)) =
+                    (&mut event, local_receive)
+                {
+                    quote.timestamp = local_receive.as_micros();
+                }
+            }
+
             TrackedMarketEvent { event, tracker }
         }))
     }
@@ -935,6 +947,7 @@ mod tests {
             asks: Vec::new(),
             sequence: 100,
             source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
         }];
         let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots);
         let update = |first_sequence, sequence| {
@@ -947,6 +960,7 @@ mod tests {
                 sequence,
                 is_snapshot: false,
                 source_venue: Some(hft_core::VenueId::BINANCE),
+                timestamps: Default::default(),
             })
         };
 
@@ -966,6 +980,7 @@ mod tests {
             sequence: 101,
             is_snapshot: false,
             source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
         });
         let quote = MarketEvent::Quote(ports::TopOfBook {
             symbol: Symbol::new("BTCUSDT"),
@@ -974,6 +989,7 @@ mod tests {
             bid: ports::BookLevel::new_unchecked(100.0, 1.0),
             ask: ports::BookLevel::new_unchecked(101.0, 1.0),
             source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
         });
 
         assert!(BinanceMarketStream::buffer_during_snapshot_sync(update).is_some());
@@ -1002,6 +1018,7 @@ mod tests {
                 asks: Vec::new(),
                 sequence,
                 source_venue: Some(hft_core::VenueId::BINANCE),
+                timestamps: Default::default(),
             }))
         };
         data_tx
@@ -1057,5 +1074,74 @@ mod tests {
             .tracker
             .get_measurement(LatencyStage::Parsing)
             .is_some());
+    }
+
+    #[test]
+    fn tracked_timestamps_keep_depth_e_trade_e_t_and_local_receive_distinct() {
+        let parse = |message| {
+            BinanceMarketStream::parse_tracked_socket_event(
+                bytes::Bytes::from_static(message),
+                WsFrameMetrics::new_with_unix(
+                    hft_core::monotonic_micros(),
+                    hft_core::now_micros(),
+                    0,
+                ),
+            )
+            .unwrap()
+            .expect("tracked Binance event")
+        };
+
+        let depth = parse(
+            br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":123456789,"s":"BTCUSDT","U":100,"u":101,"b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]}}"#,
+        );
+        assert_eq!(
+            depth
+                .event
+                .timestamps()
+                .unwrap()
+                .exchange_event
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456789000)
+        );
+        assert!(depth.event.timestamps().unwrap().exchange_trade.is_none());
+        assert!(depth.event.timestamps().unwrap().local_receive.is_some());
+
+        let trade = parse(
+            br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":123456790,"s":"BTCUSDT","t":12345,"p":"45000.00","q":"0.1","T":123456789,"m":false}}"#,
+        );
+        assert_eq!(
+            trade
+                .event
+                .timestamps()
+                .unwrap()
+                .exchange_event
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456790000)
+        );
+        assert_eq!(
+            trade
+                .event
+                .timestamps()
+                .unwrap()
+                .exchange_trade
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456789000)
+        );
+
+        let ticker = parse(
+            br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}}"#,
+        );
+        assert!(ticker.event.timestamps().unwrap().exchange_event.is_none());
+        assert!(ticker.event.timestamps().unwrap().exchange_trade.is_none());
+        let local_receive = ticker
+            .event
+            .timestamps()
+            .unwrap()
+            .local_receive
+            .expect("local receive timestamp");
+        let MarketEvent::Quote(quote) = ticker.event else {
+            panic!("expected bookTicker quote");
+        };
+        assert_eq!(quote.timestamp, local_receive.as_micros());
     }
 }

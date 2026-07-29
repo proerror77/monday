@@ -664,6 +664,7 @@ impl AggregationEngine {
                         asks: update.asks,
                         sequence: update.sequence,
                         source_venue: Some(venue),
+                        timestamps: update.timestamps,
                     };
                     self.process_market_event_into(MarketEvent::Snapshot(snapshot), output_events);
                     return;

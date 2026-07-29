@@ -37,7 +37,7 @@ pub struct TradeEvent {
     #[serde(rename = "e")]
     pub _event_type: String, // "trade"
     #[serde(rename = "E")]
-    pub _event_time: u64, // Event time
+    pub event_time: u64, // Event time
     #[serde(rename = "s")]
     pub symbol: String, // Symbol
     #[serde(rename = "t")]

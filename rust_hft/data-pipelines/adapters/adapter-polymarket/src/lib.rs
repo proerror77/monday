@@ -228,6 +228,7 @@ fn convert_message(
                 asks,
                 sequence,
                 source_venue: Some(VenueId::POLYMARKET),
+                timestamps: Default::default(),
             })])
         }
         WsMessage::PriceChange(change) => {
@@ -263,6 +264,7 @@ fn convert_message(
                     sequence,
                     is_snapshot: false,
                     source_venue: Some(VenueId::POLYMARKET),
+                    timestamps: Default::default(),
                 }));
             }
             Ok(events)
@@ -310,6 +312,7 @@ fn convert_message(
                     trade.market, trade.timestamp, trade.price
                 ),
                 source_venue: Some(VenueId::POLYMARKET),
+                timestamps: Default::default(),
             })])
         }
         _ => Ok(Vec::new()),

@@ -145,15 +145,7 @@ impl UltraEventIngester {
     #[inline(always)]
     pub unsafe fn ingest_fast(&self, event: MarketEvent) {
         // 1. 提取時間戳（內聯後 ~2-3ns）
-        let event_ts = match &event {
-            MarketEvent::Snapshot(s) => s.timestamp,
-            MarketEvent::Update(u) => u.timestamp,
-            MarketEvent::Quote(q) => q.timestamp,
-            MarketEvent::Trade(t) => t.timestamp,
-            MarketEvent::Bar(b) => b.close_time,
-            MarketEvent::Arbitrage(a) => a.timestamp,
-            MarketEvent::Disconnect { .. } => now_micros(), // 冷路徑
-        };
+        let event_ts = event.ordering_timestamp_us().unwrap_or_else(now_micros);
 
         // 2. 陳舊度檢查（單次減法 + 比較 ~2-3ns）
         let now = now_micros();
@@ -199,15 +191,7 @@ impl UltraEventIngester {
 
         for event in events {
             // 提取時間戳
-            let event_ts = match &event {
-                MarketEvent::Snapshot(s) => s.timestamp,
-                MarketEvent::Update(u) => u.timestamp,
-                MarketEvent::Quote(q) => q.timestamp,
-                MarketEvent::Trade(t) => t.timestamp,
-                MarketEvent::Bar(b) => b.close_time,
-                MarketEvent::Arbitrage(a) => a.timestamp,
-                MarketEvent::Disconnect { .. } => now,
-            };
+            let event_ts = event.ordering_timestamp_us().unwrap_or(now);
 
             // 陳舊度檢查
             let delay = now.saturating_sub(event_ts);
@@ -251,15 +235,7 @@ impl UltraEventIngester {
         }
 
         // 2. 提取時間戳
-        let event_ts = match &event {
-            MarketEvent::Snapshot(s) => s.timestamp,
-            MarketEvent::Update(u) => u.timestamp,
-            MarketEvent::Quote(q) => q.timestamp,
-            MarketEvent::Trade(t) => t.timestamp,
-            MarketEvent::Bar(b) => b.close_time,
-            MarketEvent::Arbitrage(a) => a.timestamp,
-            MarketEvent::Disconnect { .. } => now_micros(),
-        };
+        let event_ts = event.ordering_timestamp_us().unwrap_or_else(now_micros);
 
         // 3. 陳舊度檢查
         let now = now_micros();
@@ -434,6 +410,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 安全寫入
@@ -455,6 +432,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 快速路徑：預檢查容量
@@ -487,6 +465,7 @@ mod tests {
             asks: vec![],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 應該被拒絕
@@ -511,6 +490,7 @@ mod tests {
                     asks: vec![],
                     sequence: i,
                     source_venue: None,
+                    timestamps: Default::default(),
                 })
             })
             .collect();

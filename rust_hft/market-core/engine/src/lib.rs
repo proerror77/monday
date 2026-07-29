@@ -1967,14 +1967,7 @@ impl Engine {
 
     /// 從市場事件中提取時間戳
     fn extract_event_timestamp(&self, event: &ports::MarketEvent) -> Option<u64> {
-        match event {
-            ports::MarketEvent::Bar(bar) => Some(bar.close_time),
-            ports::MarketEvent::Trade(trade) => Some(trade.timestamp),
-            ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.timestamp),
-            ports::MarketEvent::Update(update) => Some(update.timestamp),
-            ports::MarketEvent::Quote(quote) => Some(quote.timestamp),
-            _ => None,
-        }
+        event.ordering_timestamp_us()
     }
 
     /// 獲取引擎統計

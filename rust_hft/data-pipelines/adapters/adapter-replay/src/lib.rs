@@ -141,6 +141,7 @@ impl MarketStream for ClickhouseReplayStream {
                     asks,
                     sequence: 0,
                     source_venue: Some(hft_core::VenueId::MOCK),
+                    timestamps: Default::default(),
                 };
                 let _ = tx.send(MarketEvent::Snapshot(snapshot));
             } else {
@@ -232,6 +233,7 @@ impl MarketStream for ClickhouseReplayStream {
                     asks,
                     sequence: 0,
                     source_venue: Some(hft_core::VenueId::MOCK),
+                    timestamps: Default::default(),
                 };
                 if tx.send(MarketEvent::Snapshot(snapshot)).is_err() {
                     break;

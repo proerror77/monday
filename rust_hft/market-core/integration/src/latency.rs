@@ -3,13 +3,15 @@
 //! 使用單調時鐘（CLOCK_MONOTONIC）量測 `received` → `parsed` 的耗時，
 //! 提供後續延遲追蹤與監控。
 
-use hft_core::monotonic_micros;
+use hft_core::{monotonic_micros, now_micros};
 
 /// 儲存單一 WS 幀的接收與解析時間戳（微秒）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WsFrameMetrics {
     /// epoll 喚醒 / 接收到幀的時間（microseconds，自系統啟動以來遞增）
     pub received_at_us: u64,
+    /// 同一接收邊界的 Unix 時間，僅用於和交易所事件時間比較。
+    pub received_at_unix_us: Option<u64>,
     /// JSON 解析完成時間（microseconds，自系統啟動以來遞增）
     pub parsed_at_us: u64,
 }
@@ -22,6 +24,19 @@ impl WsFrameMetrics {
     pub const fn new(received_at_us: u64, parsed_at_us: u64) -> Self {
         Self {
             received_at_us,
+            received_at_unix_us: None,
+            parsed_at_us,
+        }
+    }
+
+    pub const fn new_with_unix(
+        received_at_us: u64,
+        received_at_unix_us: u64,
+        parsed_at_us: u64,
+    ) -> Self {
+        Self {
+            received_at_us,
+            received_at_unix_us: Some(received_at_unix_us),
             parsed_at_us,
         }
     }
@@ -30,6 +45,7 @@ impl WsFrameMetrics {
     pub fn record_receive() -> Self {
         Self {
             received_at_us: monotonic_micros(),
+            received_at_unix_us: Some(now_micros()),
             parsed_at_us: 0,
         }
     }
@@ -61,11 +77,17 @@ mod tests {
 
     #[test]
     fn validate_metrics() {
+        let before_unix_us = now_micros();
         let mut metrics = WsFrameMetrics::record_receive();
+        let after_unix_us = now_micros();
         thread::sleep(Duration::from_micros(10));
         metrics.mark_parsed();
         assert!(metrics.validate());
         assert!(metrics.parsed_at_us >= metrics.received_at_us);
+        assert!(matches!(
+            metrics.received_at_unix_us,
+            Some(timestamp) if timestamp >= before_unix_us && timestamp <= after_unix_us
+        ));
     }
 
     #[test]
