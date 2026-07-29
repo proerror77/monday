@@ -1127,17 +1127,20 @@ fn market_updates_from_price_change(
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
+        if books[&token_id]
+            .snapshot_timestamp
+            .is_some_and(|last| change.timestamp < last)
+        {
+            continue;
+        }
         if last_timestamp
             .get(&token_id)
             .is_some_and(|last| change.timestamp < *last)
         {
             let state = &books[&token_id];
             if state
-                .snapshot_timestamp
+                .level_timestamp(entry)
                 .is_some_and(|last| change.timestamp < last)
-                || state
-                    .level_timestamp(entry)
-                    .is_some_and(|last| change.timestamp < last)
             {
                 continue;
             }
@@ -2546,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn price_change_older_than_a_full_snapshot_is_skipped() {
+    fn first_price_change_older_than_a_full_snapshot_is_skipped() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -2560,7 +2563,7 @@ mod tests {
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600200",
             "price_changes": [{
-                "asset_id": "7", "price": "0.54", "size": "20", "side": "SELL",
+                "asset_id": "7", "price": "0.54", "size": "20", "side": "BUY",
                 "hash": null, "best_bid": "0.52", "best_ask": "0.53"
             }]
         }))
@@ -2568,14 +2571,14 @@ mod tests {
         let mut state = ClobBookState::default();
         market_update_from_clob_book(&book, &mut state).expect("snapshot applies");
         let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
-        let mut timestamps = std::collections::HashMap::from([("7".to_string(), book.timestamp)]);
+        let mut timestamps = std::collections::HashMap::new();
 
         assert!(
             market_updates_from_price_change(&stale, &mut books, &mut timestamps)
                 .expect("full snapshot proves stale delta is superseded")
                 .is_empty()
         );
-        assert!(!books["7"].asks.contains_key(&dec!(0.54)));
+        assert!(!books["7"].bids.contains_key(&dec!(0.54)));
     }
 
     #[test]
