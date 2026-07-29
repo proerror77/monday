@@ -4,6 +4,9 @@
 //! `MarketUpdate` broadcast channel consumed by `LiveFeed`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -40,6 +43,10 @@ use crate::reference_prices::{
 
 const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
 const POLYMARKET_CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
+const POLYMARKET_CLOB_FAILURE_CAPTURE_ENV: &str = "MONDAY_POLYMARKET_CLOB_FAILURE_CAPTURE_PATH";
+const POLYMARKET_CLOB_CROSSED_BOOK_ERROR: &str =
+    "Polymarket price-change batch produced a crossed book";
+const MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES: usize = 1_048_576;
 const NEAR_DEPTH_PCT_RANGE: f64 = 0.001;
 const DB_POLYMARKET_SETTLEMENT_RETRY_LOOKBACK_SECS: i64 = 30 * 60;
 
@@ -980,9 +987,16 @@ impl ClobBookState {
         let Some(size) = entry.size else {
             return Err("Polymarket price change is missing size".to_string());
         };
+        let invalid_bba = entry
+            .best_bid
+            .is_some_and(|price| !(Decimal::ZERO..=Decimal::ONE).contains(&price))
+            || entry
+                .best_ask
+                .is_some_and(|price| !(Decimal::ZERO..=Decimal::ONE).contains(&price));
         if size < Decimal::ZERO
             || !(Decimal::ZERO..=Decimal::ONE).contains(&entry.price)
             || !matches!(entry.side, Side::Buy | Side::Sell)
+            || invalid_bba
         {
             return Err("Polymarket price change contains an invalid field".to_string());
         }
@@ -1013,6 +1027,28 @@ impl ClobBookState {
             levels.remove(&entry.price);
         }
         timestamps.insert(entry.price, timestamp);
+        let Some((best_bid, best_ask)) = entry.best_bid.zip(entry.best_ask) else {
+            return;
+        };
+        if best_bid > best_ask {
+            return;
+        }
+        let bid_timestamps = &mut self.bid_timestamps;
+        self.bids.retain(|price, _| {
+            let keep = *price <= best_bid;
+            if !keep {
+                bid_timestamps.insert(*price, timestamp);
+            }
+            keep
+        });
+        let ask_timestamps = &mut self.ask_timestamps;
+        self.asks.retain(|price, _| {
+            let keep = *price >= best_ask;
+            if !keep {
+                ask_timestamps.insert(*price, timestamp);
+            }
+            keep
+        });
     }
 
     fn quote(
@@ -1117,17 +1153,19 @@ fn market_updates_from_price_change(
     let Some(ts) = DateTime::from_timestamp_millis(change.timestamp) else {
         return Err("Polymarket price-change timestamp is out of range".to_string());
     };
+    let default_state = ClobBookState::default();
+    let mut applicable_entries = Vec::new();
     let mut updated_tokens = Vec::new();
     let mut last_entries = HashMap::new();
 
     for entry in &change.price_changes {
-        let token_id = entry.asset_id.to_string();
-        books.entry(token_id).or_default().validate_change(entry)?;
+        default_state.validate_change(entry)?;
     }
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
-        if books[&token_id]
+        let state = books.get(&token_id).unwrap_or(&default_state);
+        if state
             .snapshot_timestamp
             .is_some_and(|last| change.timestamp < last)
         {
@@ -1137,7 +1175,6 @@ fn market_updates_from_price_change(
             .get(&token_id)
             .is_some_and(|last| change.timestamp < *last)
         {
-            let state = &books[&token_id];
             if state
                 .level_timestamp(entry)
                 .is_some_and(|last| change.timestamp < last)
@@ -1146,6 +1183,27 @@ fn market_updates_from_price_change(
             }
             return Err("Polymarket price-change source time moved backwards".to_string());
         }
+        if entry
+            .best_bid
+            .zip(entry.best_ask)
+            .is_some_and(|(bid, ask)| bid > ask)
+        {
+            return Err(POLYMARKET_CLOB_CROSSED_BOOK_ERROR.to_string());
+        }
+        let size = entry.size.expect("price change was validated");
+        if size > Decimal::ZERO
+            && match entry.side {
+                Side::Buy => entry.best_bid.is_some_and(|best| entry.price > best),
+                Side::Sell => entry.best_ask.is_some_and(|best| entry.price < best),
+                _ => unreachable!("price change side was validated"),
+            }
+        {
+            return Err("Polymarket price change contains an invalid field".to_string());
+        }
+        applicable_entries.push((token_id, entry));
+    }
+
+    for (token_id, entry) in applicable_entries {
         books
             .entry(token_id.clone())
             .or_default()
@@ -1154,6 +1212,19 @@ fn market_updates_from_price_change(
         if last_entries.insert(token_id.clone(), entry).is_none() {
             updated_tokens.push(token_id);
         }
+    }
+
+    if last_entries.iter().any(|(token_id, entry)| {
+        let state = &books[token_id];
+        state.initialized
+            && (entry
+                .best_bid
+                .is_some_and(|price| pm_tradeable_price(price) && !state.bids.contains_key(&price))
+                || entry.best_ask.is_some_and(|price| {
+                    pm_tradeable_price(price) && !state.asks.contains_key(&price)
+                }))
+    }) {
+        return Err("Polymarket price-change BBA is missing from cached depth".to_string());
     }
 
     let updates = updated_tokens
@@ -1172,9 +1243,46 @@ fn market_updates_from_price_change(
             } if bid > ask
         )
     }) {
-        return Err("Polymarket price-change batch produced a crossed book".to_string());
+        return Err(POLYMARKET_CLOB_CROSSED_BOOK_ERROR.to_string());
     }
     Ok(updates)
+}
+
+fn persist_clob_failure_payload(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("capture payload exceeds {MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES} bytes"),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path has no parent directory",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture parent must be a direct canonical directory",
+        ));
+    }
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn send_quote_collection_failure_and_empty(
@@ -1249,6 +1357,55 @@ fn forward_clob_ws_payload(
     Ok(true)
 }
 
+async fn capture_crossed_clob_failure_and_empty(
+    tx: &broadcast::Sender<MarketUpdate>,
+    token_ids: &[U256],
+    request_started_at: DateTime<Utc>,
+    failure_capture_path: Option<&Path>,
+    payload: &[u8],
+    failure: &str,
+) -> bool {
+    let Some(path) = failure_capture_path.filter(|_| failure == POLYMARKET_CLOB_CROSSED_BOOK_ERROR)
+    else {
+        return false;
+    };
+
+    let _ = send_quote_collection_failure_and_empty(
+        tx,
+        token_ids,
+        request_started_at,
+        "websocket_payload",
+    );
+    let owned_path = path.to_owned();
+    let owned_payload = payload.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        persist_clob_failure_payload(&owned_path, &owned_payload)
+    })
+    .await
+    {
+        Ok(Ok(())) => warn!(
+            path = %path.display(),
+            bytes = payload.len(),
+            "Captured first crossed-book CLOB payload; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => warn!(
+            path = %path.display(),
+            "Crossed-book CLOB payload capture already exists; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture failed; stopping diagnostic feed"
+        ),
+        Err(error) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture task failed; stopping diagnostic feed"
+        ),
+    }
+    true
+}
+
 /// Publish Polymarket CLOB book and BBA ticks directly to the strategy runtime.
 ///
 /// Disconnects publish empty quotes so the strategy fails closed until a fresh
@@ -1262,6 +1419,8 @@ pub fn spawn_clob_ws_quote_feed_until(
     tokio::spawn(async move {
         let mut last_timestamp: HashMap<String, i64> = HashMap::new();
         let mut books_by_token: HashMap<String, ClobBookState> = HashMap::new();
+        let failure_capture_path =
+            std::env::var_os(POLYMARKET_CLOB_FAILURE_CAPTURE_ENV).map(PathBuf::from);
         let endpoint = format!(
             "{}/ws/market",
             POLYMARKET_CLOB_WS_ENDPOINT.trim_end_matches('/')
@@ -1355,6 +1514,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        text.as_bytes(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -1370,6 +1539,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path binary payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        bytes.as_ref(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -2009,11 +2188,12 @@ fn parse_agg_trade_msg(v: &serde_json::Value) -> Option<AggTradeMsg> {
 #[cfg(test)]
 mod tests {
     use super::{
-        book_quote_from_rest, db_polymarket_poll_intervals, equity_price_subscription,
-        l2_updates_from_book, mark_db_event_expired_if_resolved, market_update_from_clob_book,
+        book_quote_from_rest, capture_crossed_clob_failure_and_empty, db_polymarket_poll_intervals,
+        equity_price_subscription, forward_clob_ws_payload, l2_updates_from_book,
+        mark_db_event_expired_if_resolved, market_update_from_clob_book,
         market_updates_from_price_change, parse_agg_trade_msg, parse_equity_price_payload,
         rtds_market_data_ws_config, send_quote_collection_failure_and_empty, ClobBookState,
-        RestBook, U256,
+        RestBook, POLYMARKET_CLOB_CROSSED_BOOK_ERROR, U256,
     };
     use chrono::Utc;
     use ploy_market_contracts::MarketUpdate;
@@ -2396,6 +2576,341 @@ mod tests {
     }
 
     #[test]
+    fn clob_positive_level_outside_reported_bba_fails_closed() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.61", "size": "10", "side": "BUY",
+                "hash": null, "best_bid": "0.60", "best_ask": "0.62"
+            }]
+        }))
+        .expect("syntactically valid but inconsistent price change");
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn clob_missing_reported_bba_requires_fresh_snapshot() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}, {"price": "0.38", "size": "5"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.41", "size": "10", "side": "SELL",
+                "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+            }]
+        }))
+        .expect("valid price change whose reported bid is missing locally");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        let error = market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect_err("missing authoritative BBA level must require a fresh snapshot");
+        assert!(error.contains("missing from cached depth"));
+    }
+
+    #[test]
+    fn clob_cancellation_bba_prunes_only_more_competitive_stale_depth() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [
+                {"price": "0.40", "size": "7"},
+                {"price": "0.35", "size": "6"},
+                {"price": "0.30", "size": "5"}
+            ],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.35", "size": "0", "side": "BUY",
+                "hash": null, "best_bid": "0.30", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid cancellation with post-event BBA");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        let updates = market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect("cancellation BBA should reconcile stale top levels");
+        assert!(matches!(
+            updates.as_slice(),
+            [MarketUpdate::Quote {
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            }] if *bid == dec!(0.30)
+                && *ask == dec!(0.60)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.30), dec!(5))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.60), dec!(9))]
+        ));
+        assert!(!books["7"].bids.contains_key(&dec!(0.40)));
+        assert!(!books["7"].bids.contains_key(&dec!(0.35)));
+        assert!(books["7"].bids.contains_key(&dec!(0.30)));
+    }
+
+    #[test]
+    fn clob_invalid_later_bba_does_not_mutate_prior_token() {
+        let first_book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.38", "size": "2"}],
+            "asks": [{"price": "0.39", "size": "1"}, {"price": "0.41", "size": "3"}],
+            "hash": null
+        }))
+        .expect("valid first CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [
+                {
+                    "asset_id": "7", "price": "0.40", "size": "10", "side": "BUY",
+                    "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+                },
+                {
+                    "asset_id": "8", "price": "0.61", "size": "10", "side": "BUY",
+                    "hash": null, "best_bid": "0.60", "best_ask": "0.62"
+                }
+            ]
+        }))
+        .expect("syntactically valid batch with an inconsistent later entry");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&first_book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
+        assert!(!books["7"].bids.contains_key(&dec!(0.40)));
+        assert!(books["7"].asks.contains_key(&dec!(0.39)));
+        assert!(!books.contains_key("8"));
+    }
+
+    #[test]
+    fn clob_price_change_bba_prunes_stale_crossed_levels_per_token() {
+        use sha2::Digest;
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        let up_token =
+            "41542505488057268747646102765538559787092195571513884627130758935628213319126";
+        let down_token =
+            "7335525875962923702441063748642161498788112653863579087206891242613686090845";
+        let up_snapshot = br#"{"event_type":"book","asset_id":"41542505488057268747646102765538559787092195571513884627130758935628213319126","market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47","timestamp":"1785328736000","bids":[{"price":"0.38","size":"2"}],"asks":[{"price":"0.39","size":"1"},{"price":"0.41","size":"3"}]}"#;
+        let down_snapshot = br#"{"event_type":"book","asset_id":"7335525875962923702441063748642161498788112653863579087206891242613686090845","market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47","timestamp":"1785328736000","bids":[{"price":"0.61","size":"1"},{"price":"0.59","size":"4"}],"asks":[{"price":"0.62","size":"5"}]}"#;
+        let payload = br#"{"market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47", "price_changes":[{"asset_id":"41542505488057268747646102765538559787092195571513884627130758935628213319126", "price":"0.4", "size":"566.56", "side":"BUY", "hash":"4d147f0d1fc447309a9fbfe2ead47ad805f70133", "best_bid":"0.4", "best_ask":"0.41"}, {"asset_id":"7335525875962923702441063748642161498788112653863579087206891242613686090845", "price":"0.6", "size":"566.56", "side":"SELL", "hash":"d4344ba2f0f8e944ddb9fdd722cd7ff0e791abd2", "best_bid":"0.59", "best_ask":"0.6"}], "timestamp":"1785328736855", "event_type":"price_change"}"#;
+
+        assert_eq!(payload.len(), 611);
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(payload)),
+            "a69df924185368799f86d441c9250083ede2ca7fc943084e6524c03600f4f2df"
+        );
+        assert!(forward_clob_ws_payload(up_snapshot, &tx, &mut books, &mut timestamps).unwrap());
+        assert!(forward_clob_ws_payload(down_snapshot, &tx, &mut books, &mut timestamps).unwrap());
+        rx.try_recv().expect("up snapshot quote");
+        rx.try_recv().expect("down snapshot quote");
+
+        assert!(
+            forward_clob_ws_payload(payload, &tx, &mut books, &mut timestamps)
+                .expect("provider BBA should reconcile stale cached top levels")
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            } if token_id.as_ref() == up_token
+                && bid == dec!(0.4)
+                && ask == dec!(0.41)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.4), dec!(566.56)), (dec!(0.38), dec!(2))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.41), dec!(3))]
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            } if token_id.as_ref() == down_token
+                && bid == dec!(0.59)
+                && ask == dec!(0.6)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.59), dec!(4))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.6), dec!(566.56)), (dec!(0.62), dec!(5))]
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn clob_failure_capture_is_byte_exact_create_once_and_only_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        let snapshot = br#"{
+            "event_type":"book",
+            "asset_id":"7",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600100",
+            "bids":[{"price":"0.40","size":"7"}],
+            "asks":[{"price":"0.60","size":"9"}]
+        }"#;
+        let crossed = br#"{
+            "event_type":"price_change",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600200",
+            "price_changes":[{
+                "asset_id":"7","price":"0.61","size":"10","side":"BUY",
+                "best_bid":"0.61","best_ask":"0.60"
+            }]
+        }"#;
+
+        assert!(forward_clob_ws_payload(snapshot, &tx, &mut books, &mut timestamps,).unwrap());
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote { token_id, .. } if token_id.as_ref() == "7"
+        ));
+        assert!(
+            !capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                b"not captured",
+                "websocket_receive",
+            )
+            .await
+        );
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let error = forward_clob_ws_payload(crossed, &tx, &mut books, &mut timestamps).unwrap_err();
+        assert!(error.contains("crossed book"));
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                crossed,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(&capture).unwrap(), crossed);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::QuoteCollectionFailure { token_id, .. }
+                if token_id.as_ref() == "7"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: None,
+                ask: None,
+                ..
+            } if token_id.as_ref() == "7"
+        ));
+
+        let crossed_again = crossed
+            .strip_suffix(b"}")
+            .unwrap()
+            .iter()
+            .copied()
+            .chain(b" }".iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &crossed_again,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(capture).unwrap(), crossed);
+    }
+
+    #[tokio::test]
+    async fn clob_failure_capture_rejects_an_unbounded_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, _rx) = tokio::sync::broadcast::channel(2);
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &vec![b' '; 1_048_577],
+                POLYMARKET_CLOB_CROSSED_BOOK_ERROR,
+            )
+            .await
+        );
+        assert!(!capture.exists());
+    }
+
+    #[test]
     fn stale_clob_price_change_is_skipped_without_dropping_fresh_batch_entries() {
         let book = serde_json::from_value(json!({
             "asset_id": "7",
@@ -2526,7 +3041,7 @@ mod tests {
             "timestamp": "1712205600300",
             "price_changes": [{
                 "asset_id": "7", "price": "0.52", "size": "8", "side": "BUY",
-                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+                "hash": null, "best_bid": "0.52", "best_ask": "0.60"
             }]
         }))
         .expect("newer price change");

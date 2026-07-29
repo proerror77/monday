@@ -39,6 +39,15 @@ use ports::{MarketEvent, TrackedMarketEvent};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[inline(always)]
+fn tracker_origin_time(event: &MarketEvent, fallback: u64) -> u64 {
+    event
+        .timestamps()
+        .and_then(|timestamps| timestamps.local_receive)
+        .map(|timestamp| timestamp.as_micros())
+        .unwrap_or(fallback)
+}
+
 /// 極簡配置（僅關鍵參數）
 #[derive(Debug, Clone)]
 pub struct UltraIngestionConfig {
@@ -145,15 +154,7 @@ impl UltraEventIngester {
     #[inline(always)]
     pub unsafe fn ingest_fast(&self, event: MarketEvent) {
         // 1. 提取時間戳（內聯後 ~2-3ns）
-        let event_ts = match &event {
-            MarketEvent::Snapshot(s) => s.timestamp,
-            MarketEvent::Update(u) => u.timestamp,
-            MarketEvent::Quote(q) => q.timestamp,
-            MarketEvent::Trade(t) => t.timestamp,
-            MarketEvent::Bar(b) => b.close_time,
-            MarketEvent::Arbitrage(a) => a.timestamp,
-            MarketEvent::Disconnect { .. } => now_micros(), // 冷路徑
-        };
+        let event_ts = event.ordering_timestamp_us().unwrap_or_else(now_micros);
 
         // 2. 陳舊度檢查（單次減法 + 比較 ~2-3ns）
         let now = now_micros();
@@ -164,7 +165,8 @@ impl UltraEventIngester {
         }
 
         // 3. 創建追蹤事件（零拷貝：移動所有權）
-        let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+        let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -199,15 +201,7 @@ impl UltraEventIngester {
 
         for event in events {
             // 提取時間戳
-            let event_ts = match &event {
-                MarketEvent::Snapshot(s) => s.timestamp,
-                MarketEvent::Update(u) => u.timestamp,
-                MarketEvent::Quote(q) => q.timestamp,
-                MarketEvent::Trade(t) => t.timestamp,
-                MarketEvent::Bar(b) => b.close_time,
-                MarketEvent::Arbitrage(a) => a.timestamp,
-                MarketEvent::Disconnect { .. } => now,
-            };
+            let event_ts = event.ordering_timestamp_us().unwrap_or(now);
 
             // 陳舊度檢查
             let delay = now.saturating_sub(event_ts);
@@ -216,7 +210,8 @@ impl UltraEventIngester {
             }
 
             // 創建追蹤事件（移動 event 所有權）
-            let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+            let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+            tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
             tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
             tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -251,15 +246,7 @@ impl UltraEventIngester {
         }
 
         // 2. 提取時間戳
-        let event_ts = match &event {
-            MarketEvent::Snapshot(s) => s.timestamp,
-            MarketEvent::Update(u) => u.timestamp,
-            MarketEvent::Quote(q) => q.timestamp,
-            MarketEvent::Trade(t) => t.timestamp,
-            MarketEvent::Bar(b) => b.close_time,
-            MarketEvent::Arbitrage(a) => a.timestamp,
-            MarketEvent::Disconnect { .. } => now_micros(),
-        };
+        let event_ts = event.ordering_timestamp_us().unwrap_or_else(now_micros);
 
         // 3. 陳舊度檢查
         let now = now_micros();
@@ -270,7 +257,8 @@ impl UltraEventIngester {
         }
 
         // 4. 創建追蹤事件
-        let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+        let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -420,7 +408,7 @@ impl UltraEventConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::Symbol;
+    use hft_core::{LocalReceiveTimestamp, MarketDataTimestamps, Symbol};
     use ports::{BookLevel, MarketSnapshot};
 
     #[test]
@@ -434,6 +422,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 安全寫入
@@ -442,6 +431,25 @@ mod tests {
         // 安全讀取
         let received = consumer.recv();
         assert!(received.is_some());
+    }
+
+    #[test]
+    fn tracker_origin_uses_local_receive_provenance() {
+        let local_receive = now_micros().saturating_sub(100);
+        let event = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![],
+            asks: vec![],
+            sequence: 1,
+            source_venue: None,
+            timestamps: MarketDataTimestamps {
+                local_receive: Some(LocalReceiveTimestamp::new(local_receive)),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(tracker_origin_time(&event, now_micros()), local_receive);
     }
 
     #[test]
@@ -455,6 +463,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 快速路徑：預檢查容量
@@ -487,6 +496,7 @@ mod tests {
             asks: vec![],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 應該被拒絕
@@ -511,6 +521,7 @@ mod tests {
                     asks: vec![],
                     sequence: i,
                     source_venue: None,
+                    timestamps: Default::default(),
                 })
             })
             .collect();

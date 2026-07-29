@@ -270,6 +270,7 @@ impl HyperliquidMarketStream {
                         asks,
                         sequence: book.time, // 使用時間戳作為序列號
                         source_venue: Some(VenueId::HYPERLIQUID),
+                        timestamps: Default::default(),
                     };
 
                     return Some(MarketEvent::Snapshot(snapshot));
@@ -310,6 +311,7 @@ impl HyperliquidMarketStream {
                         .clone()
                         .unwrap_or_else(|| format!("HL_{}", trade.time)),
                     source_venue: Some(VenueId::HYPERLIQUID),
+                    timestamps: Default::default(),
                 };
 
                 return Some(MarketEvent::Trade(trade_event));

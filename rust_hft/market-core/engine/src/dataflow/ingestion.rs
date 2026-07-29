@@ -20,6 +20,17 @@ const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
 const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
 const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 
+#[cfg(feature = "metrics")]
+fn record_stale_metrics(metrics: &infra_metrics::MetricsRegistry, delay_us: u64) {
+    metrics.inc_events_stale();
+    metrics.record_staleness(delay_us as f64 / 1000.0);
+}
+
+#[cfg(feature = "metrics")]
+fn record_ingestion_metric(metrics: &infra_metrics::MetricsRegistry, delay_us: u64) {
+    metrics.record_ingestion_latency(delay_us as f64);
+}
+
 /// 事件攝取配置
 #[derive(Debug, Clone)]
 pub struct IngestionConfig {
@@ -250,34 +261,22 @@ impl EventIngester {
         let _ingestion_start = now_micros();
         self.metrics.events_received += 1;
 
-        // 先檢查陳舊度與記錄延遲，再構造帶追蹤事件（避免多餘拷貝）
+        if let Some(delay) = Self::event_latency_us(&event) {
+            self.metrics.record_latency(delay);
+            #[cfg(feature = "metrics")]
+            record_ingestion_metric(infra_metrics::MetricsRegistry::global(), delay);
+        }
+
+        // Compatibility timestamp only controls ordering/staleness; it is not latency evidence.
         let event_ts_opt = self.extract_timestamp(&event);
         if let Some(event_ts) = event_ts_opt {
             let now = current_timestamp_us();
             let delay = now.saturating_sub(event_ts);
 
-            // 記錄攝取延遲統計
-            self.metrics.record_latency(delay);
-            #[cfg(feature = "metrics")]
-            infra_metrics::MetricsRegistry::global().record_ingestion_latency(delay as f64);
-
-            // Prometheus 直方圖打點（可選）
-
-            // 記錄每個事件的延遲情況
-            trace!(
-                "EventIngester 攝取延遲: {}μs, 閾值: {}μs",
-                delay,
-                self.config.stale_threshold_us
-            );
-
             if delay > self.config.stale_threshold_us {
                 self.metrics.events_stale += 1;
                 #[cfg(feature = "metrics")]
-                {
-                    infra_metrics::MetricsRegistry::global().inc_events_stale();
-                    infra_metrics::MetricsRegistry::global()
-                        .record_staleness(delay as f64 / 1000.0);
-                }
+                record_stale_metrics(infra_metrics::MetricsRegistry::global(), delay);
                 // Hot path: already throttled via record_stale_warn; trace only for deep diagnostics.
                 if let Some(suppressed) =
                     self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
@@ -296,13 +295,13 @@ impl EventIngester {
         // 創建延遲追蹤器（若事件有時間戳，使用其作為起點）
         let mut tracker = if let Some(tracker) = provided_tracker {
             tracker
-        } else if let Some(event_ts) = event_ts_opt {
-            let mut tracker = LatencyTracker::from_time(event_ts);
-            tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
-            tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
-            tracker
         } else {
-            let mut tracker = LatencyTracker::new();
+            let origin_time = event
+                .timestamps()
+                .and_then(|timestamps| timestamps.local_receive)
+                .map_or_else(current_timestamp_us, |timestamp| timestamp.as_micros());
+            let mut tracker = LatencyTracker::from_time(origin_time);
+            tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
             tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
             tracker
@@ -399,6 +398,7 @@ impl EventIngester {
     pub async fn ingest_lossless(&mut self, event: MarketEvent) -> Result<(), HftError> {
         let received_at = current_timestamp_us();
         let mut tracker = LatencyTracker::from_time(received_at);
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
         self.ingest_tracked_lossless(TrackedMarketEvent { event, tracker })
@@ -412,10 +412,14 @@ impl EventIngester {
     ) -> Result<(), HftError> {
         self.metrics.events_received += 1;
         let received_at = current_timestamp_us();
+        if let Some(delay) = Self::event_latency_us(&tracked_event.event) {
+            self.metrics.record_latency(delay);
+            #[cfg(feature = "metrics")]
+            record_ingestion_metric(infra_metrics::MetricsRegistry::global(), delay);
+        }
         let event_ts = self.extract_timestamp(&tracked_event.event);
         if let Some(timestamp) = event_ts {
             let delay = received_at.saturating_sub(timestamp);
-            self.metrics.record_latency(delay);
             if delay > self.config.stale_threshold_us {
                 self.metrics.events_stale += 1;
             }
@@ -469,15 +473,17 @@ impl EventIngester {
 
     /// 提取事件時間戳
     fn extract_timestamp(&self, event: &MarketEvent) -> Option<u64> {
-        match event {
-            MarketEvent::Snapshot(s) => Some(s.timestamp),
-            MarketEvent::Update(u) => Some(u.timestamp),
-            MarketEvent::Quote(q) => Some(q.timestamp),
-            MarketEvent::Trade(t) => Some(t.timestamp),
-            MarketEvent::Bar(b) => Some(b.close_time),
-            MarketEvent::Arbitrage(a) => Some(a.timestamp),
-            MarketEvent::Disconnect { .. } => Some(current_timestamp_us()),
-        }
+        event
+            .ordering_timestamp_us()
+            .or_else(|| matches!(event, MarketEvent::Disconnect { .. }).then(current_timestamp_us))
+    }
+
+    fn event_latency_us(event: &MarketEvent) -> Option<u64> {
+        let timestamps = event.timestamps()?;
+        let latency = timestamps
+            .local_receive?
+            .latency_since_event(timestamps.exchange_event?);
+        u64::try_from(latency).ok()
     }
 
     /// 獲取攝取統計
@@ -704,7 +710,10 @@ fn current_timestamp_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::Symbol;
+    use hft_core::{
+        ExchangeEventTimestamp, ExchangeTradeTimestamp, LocalReceiveTimestamp,
+        MarketDataTimestamps, Symbol,
+    };
     use ports::{BookLevel, MarketEvent, MarketSnapshot, TrackedMarketEvent};
 
     #[test]
@@ -720,6 +729,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 攝取事件
@@ -753,6 +763,7 @@ mod tests {
             asks: vec![],
             sequence: 1,
             source_venue: None,
+            timestamps: Default::default(),
         };
 
         // 應該被拒絕但不返回錯誤
@@ -760,6 +771,100 @@ mod tests {
             .ingest(MarketEvent::Snapshot(stale_snapshot))
             .is_ok());
         assert_eq!(ingester.metrics().events_stale, 1);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn stale_metrics_do_not_mix_staleness_into_ingestion_latency() {
+        let metrics = infra_metrics::MetricsRegistry::isolated();
+
+        record_stale_metrics(&metrics, 10_000);
+
+        assert_eq!(metrics.events_stale.get(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_count(), 0);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn ingestion_metric_exports_each_real_sample_once() {
+        let metrics = infra_metrics::MetricsRegistry::isolated();
+
+        record_ingestion_metric(&metrics, 100);
+
+        assert_eq!(metrics.latency_ingestion.get_sample_count(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_sum(), 100.0);
+    }
+
+    #[test]
+    fn ingestion_latency_uses_event_time_e_and_rejects_trade_time_t() {
+        let snapshot = |timestamps| {
+            MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: current_timestamp_us(),
+                bids: vec![],
+                asks: vec![],
+                sequence: 1,
+                source_venue: None,
+                timestamps,
+            })
+        };
+        let (mut ingester, _consumer) = EventIngester::new(IngestionConfig::default());
+
+        ingester
+            .ingest(snapshot(MarketDataTimestamps {
+                exchange_event: None,
+                exchange_trade: Some(ExchangeTradeTimestamp::new(900)),
+                local_receive: Some(LocalReceiveTimestamp::new(1_000)),
+            }))
+            .unwrap();
+        assert_eq!(ingester.metrics().recent_latency_micros, None);
+
+        ingester
+            .ingest(snapshot(MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(900)),
+                exchange_trade: None,
+                local_receive: Some(LocalReceiveTimestamp::new(1_000)),
+            }))
+            .unwrap();
+        assert_eq!(ingester.metrics().recent_latency_micros, Some(100));
+        assert_eq!(ingester.metrics().latency_histogram().len(), 1);
+
+        let (mut ingester, _consumer) = EventIngester::new(IngestionConfig::default());
+        ingester
+            .ingest(snapshot(MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(1_100)),
+                exchange_trade: None,
+                local_receive: Some(LocalReceiveTimestamp::new(1_000)),
+            }))
+            .unwrap();
+        assert_eq!(ingester.metrics().recent_latency_micros, None);
+    }
+
+    #[test]
+    fn stale_typed_event_records_one_valid_ingestion_sample() {
+        let (mut ingester, _consumer) = EventIngester::new(IngestionConfig {
+            stale_threshold_us: 1,
+            ..IngestionConfig::default()
+        });
+        let event = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 0,
+            bids: vec![],
+            asks: vec![],
+            sequence: 1,
+            source_venue: None,
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(900)),
+                exchange_trade: None,
+                local_receive: Some(LocalReceiveTimestamp::new(1_000)),
+            },
+        });
+
+        ingester.ingest(event).unwrap();
+
+        assert_eq!(ingester.metrics().events_stale, 1);
+        assert_eq!(ingester.metrics().latency_histogram().len(), 1);
+        assert_eq!(ingester.metrics().recent_latency_micros, Some(100));
     }
 
     #[tokio::test]
@@ -778,6 +883,7 @@ mod tests {
                 asks: vec![],
                 sequence,
                 source_venue: None,
+                timestamps: Default::default(),
             })
         };
         for sequence in 1..=3 {
@@ -826,6 +932,7 @@ mod tests {
                 asks: vec![],
                 sequence: 1,
                 source_venue: None,
+                timestamps: Default::default(),
             }))
             .await
             .unwrap();
@@ -858,6 +965,7 @@ mod tests {
                 asks: vec![],
                 sequence: 1,
                 source_venue: None,
+                timestamps: Default::default(),
             }),
             tracker,
         };

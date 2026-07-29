@@ -1,42 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "Getting status..."
-echo ""
-echo ""
+issue_count() {
+  # ponytail: this quick dashboard caps at 1000; use gh api pagination above it.
+  gh issue list "$@" --limit 1000 --json number --jq length
+}
 
+echo "📊 GitHub Issues (live)"
+echo "======================="
+echo "GitHub is authoritative; local mirrors are optional."
 
-echo "📊 Project Status"
-echo "================"
-echo ""
-
-echo "📄 PRDs:"
-if [ -d ".claude/prds" ]; then
-  total=$(ls .claude/prds/*.md 2>/dev/null | wc -l)
-  echo "  Total: $total"
-else
-  echo "  No PRDs found"
+if ! open=$(issue_count --state open) ||
+  ! closed=$(issue_count --state closed) ||
+  ! tracking=$(issue_count --state open --label tracking) ||
+  ! runtime=$(issue_count --state open --label runtime); then
+  echo "❌ GitHub status failed. Check repository access and gh auth status." >&2
+  exit 1
 fi
 
-echo ""
-echo "📚 Epics:"
-if [ -d ".claude/epics" ]; then
-  total=$(ls -d .claude/epics/*/ 2>/dev/null | wc -l)
-  echo "  Total: $total"
-else
-  echo "  No epics found"
-fi
-
-echo ""
-echo "📝 Tasks:"
-if [ -d ".claude/epics" ]; then
-  total=$(find .claude/epics -name "[0-9]*.md" 2>/dev/null | wc -l)
-  open=$(find .claude/epics -name "[0-9]*.md" -exec grep -l "^status: *open" {} \; 2>/dev/null | wc -l)
-  closed=$(find .claude/epics -name "[0-9]*.md" -exec grep -l "^status: *closed" {} \; 2>/dev/null | wc -l)
-  echo "  Open: $open"
-  echo "  Closed: $closed"
-  echo "  Total: $total"
-else
-  echo "  No tasks found"
-fi
-
-exit 0
+echo "  Open: $open"
+echo "  Closed: $closed"
+echo "  Total: $((open + closed))"
+echo "  Tracking: $tracking open"
+echo "  Runtime: $runtime open"

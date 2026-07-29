@@ -300,6 +300,7 @@ mod tests {
             side: Side::Buy,
             trade_id: "test_trade".to_string(),
             source_venue: Some(hft_core::VenueId::HYPERLIQUID),
+            timestamps: Default::default(),
         };
 
         let event = MarketEvent::Trade(trade);

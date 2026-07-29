@@ -39,7 +39,7 @@ fn monotonic_now() -> Instant {
 /// 延遲階段定義
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LatencyStage {
-    /// WebSocket frame 接收（epoll 喚醒 → 緩衝前）
+    /// WS-library-delivered complete-message boundary marker in userspace.
     WsReceive,
     /// JSON 解析完成
     Parsing,
@@ -57,6 +57,22 @@ pub enum LatencyStage {
     Submission,
     /// 端到端：從接收到發送的完整鏈路（兼容指標）
     EndToEnd,
+}
+
+/// Local capture boundary that anchors a latency tracker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LatencyCaptureBoundary {
+    #[default]
+    Unspecified,
+    UserspaceWebSocketMessageDelivery,
+    AdapterPublish,
+    SnapshotCompletion,
+}
+
+impl LatencyCaptureBoundary {
+    pub const fn is_receive_latency_cohort(self) -> bool {
+        matches!(self, Self::UserspaceWebSocketMessageDelivery)
+    }
 }
 
 impl LatencyStage {
@@ -147,6 +163,8 @@ impl LatencyMeasurement {
 pub struct LatencyTracker {
     /// 起始時間戳
     pub origin_time: MicrosTimestamp,
+    #[serde(default)]
+    pub capture_boundary: LatencyCaptureBoundary,
     #[serde(skip, default = "monotonic_now")]
     origin_instant: Instant,
     /// 各階段時間偏移（相對於起點，微秒）
@@ -158,6 +176,7 @@ impl LatencyTracker {
     pub fn new() -> Self {
         Self {
             origin_time: now_micros(),
+            capture_boundary: LatencyCaptureBoundary::Unspecified,
             origin_instant: Instant::now(),
             stage_offsets: Vec::new(),
         }
@@ -167,12 +186,13 @@ impl LatencyTracker {
     pub fn from_time(origin_time: MicrosTimestamp) -> Self {
         Self {
             origin_time,
+            capture_boundary: LatencyCaptureBoundary::Unspecified,
             origin_instant: Instant::now(),
             stage_offsets: Vec::new(),
         }
     }
 
-    /// 從 monotonic 時刻開始追蹤（例如 WsFrameMetrics）
+    /// 從 monotonic 時刻開始追蹤（例如 WsMessageMetrics）
     pub fn from_monotonic(origin_micros: MicrosTimestamp) -> Self {
         let now_mono = monotonic_micros();
         let delta = now_mono.saturating_sub(origin_micros);
@@ -180,9 +200,17 @@ impl LatencyTracker {
         let origin_wall = now_micros().saturating_sub(delta);
         Self {
             origin_time: origin_wall,
+            capture_boundary: LatencyCaptureBoundary::Unspecified,
             origin_instant,
             stage_offsets: Vec::new(),
         }
+    }
+
+    /// Starts when the WS library delivers a complete WebSocket message into userspace.
+    pub fn from_userspace_websocket_message_delivery(origin_micros: MicrosTimestamp) -> Self {
+        let mut tracker = Self::from_monotonic(origin_micros);
+        tracker.capture_boundary = LatencyCaptureBoundary::UserspaceWebSocketMessageDelivery;
+        tracker
     }
 
     /// 記錄階段時間點

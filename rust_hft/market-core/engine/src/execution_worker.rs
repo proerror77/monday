@@ -557,16 +557,19 @@ impl ExecutionWorker {
                 Ok(order_id) => {
                     let submitted_at = now_micros();
                     let execution_latency = submitted_at.saturating_sub(execution_start);
+                    let end_to_end_latency =
+                        submitted_at.saturating_sub(envelope.lifecycle.created_ts);
                     self.latency_monitor
                         .record_latency(LatencyStage::Submission, execution_latency);
-                    self.latency_monitor.record_latency(
-                        LatencyStage::EndToEnd,
-                        submitted_at.saturating_sub(envelope.lifecycle.created_ts),
-                    );
+                    self.latency_monitor
+                        .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
                     #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
                         .record_submission_latency(execution_latency as f64);
+                    #[cfg(feature = "metrics")]
+                    infra_metrics::MetricsRegistry::global()
+                        .record_end_to_end_latency(end_to_end_latency as f64);
 
                     self.stats.orders_placed += 1;
                     if self.latch_duplicate_order_id(&order_id, client_idx) {
