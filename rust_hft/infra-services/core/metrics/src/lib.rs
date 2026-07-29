@@ -123,9 +123,33 @@ impl MetricsRegistry {
     fn create_with_prometheus() -> Self {
         let registry = Registry::new();
 
-        // 延遲直方圖 - 使用微秒，覆蓋 1μs 到 10ms 範圍
+        // 延遲直方圖 - 使用微秒，有限桶覆蓋到監控器聲明的 120 秒上限
         let latency_buckets = vec![
-            1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            20.0,
+            50.0,
+            100.0,
+            200.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            20_000.0,
+            50_000.0,
+            100_000.0,
+            200_000.0,
+            500_000.0,
+            1_000_000.0,
+            2_000_000.0,
+            5_000_000.0,
+            10_000_000.0,
+            30_000_000.0,
+            60_000_000.0,
+            120_000_000.0,
         ];
 
         let latency_ws_receive = Histogram::with_opts(
@@ -199,7 +223,7 @@ impl MetricsRegistry {
 
         let latency_end_to_end = Histogram::with_opts(
             HistogramOpts::new("hft_latency_end_to_end_microseconds", "端到端總延遲 (微秒)")
-                .buckets(latency_buckets),
+                .buckets(latency_buckets.clone()),
         )
         .expect("創建端到端延遲直方圖失敗");
 
@@ -209,10 +233,7 @@ impl MetricsRegistry {
                 "hft_order_ack_latency_microseconds",
                 "下單到 Ack 延遲 (微秒)",
             )
-            .buckets(vec![
-                1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0,
-                50_000.0, 100_000.0, 500_000.0,
-            ]),
+            .buckets(latency_buckets.clone()),
         )
         .expect("創建 Ack 延遲直方圖失敗");
 
@@ -221,10 +242,7 @@ impl MetricsRegistry {
                 "hft_order_fill_latency_microseconds",
                 "下單到 Fill 延遲 (微秒)",
             )
-            .buckets(vec![
-                1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0,
-                50_000.0, 100_000.0, 500_000.0,
-            ]),
+            .buckets(latency_buckets),
         )
         .expect("創建 Fill 延遲直方圖失敗");
 
@@ -869,5 +887,26 @@ mod tests {
         record_latency!(ingestion, start);
         record_latency!(aggregation, start);
         record_latency!(strategy, start);
+    }
+
+    #[test]
+    fn latency_histogram_has_a_finite_bucket_for_declared_tail_range() {
+        let metrics = MetricsRegistry::isolated();
+        metrics.record_end_to_end_latency(120_000_000.0);
+
+        let family = metrics
+            .registry()
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "hft_latency_end_to_end_microseconds")
+            .expect("end-to-end latency metric");
+        let histogram = family.get_metric()[0].get_histogram();
+        let tail_bucket = histogram
+            .get_bucket()
+            .iter()
+            .find(|bucket| bucket.upper_bound() == 120_000_000.0)
+            .expect("finite 120 second latency bucket");
+
+        assert_eq!(tail_bucket.cumulative_count(), 1);
     }
 }

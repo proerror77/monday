@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use hdrhistogram::Histogram;
 use hft_core::{now_micros, Symbol};
 use serde::de::Error as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -26,6 +26,8 @@ use tracing::{debug, info, warn};
 
 const BINANCE_SPOT_WS: &str = "wss://stream.binance.com:9443/stream";
 const BTCUSDT_ID: u32 = 1;
+const LATENCY_HISTOGRAM_MAX_NS: u64 = 120_000_000_000;
+const MIN_P999_SAMPLES: u64 = 10_000;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -54,6 +56,9 @@ struct LiveArgs {
     depth_levels: u16,
     #[arg(long)]
     replay_out: Option<PathBuf>,
+    /// Write benchmark-grade latency evidence after a bounded live run.
+    #[arg(long)]
+    latency_report_out: Option<PathBuf>,
     #[arg(long, default_value_t = 60)]
     report_every_secs: u64,
     #[arg(long)]
@@ -119,31 +124,139 @@ enum StreamKind {
     Other,
 }
 
+struct EvidenceHistogram {
+    histogram: Histogram<u64>,
+    excluded_negative: u64,
+    excluded_overflow: u64,
+}
+
+impl EvidenceHistogram {
+    fn new() -> Self {
+        Self {
+            histogram: Histogram::new_with_max(LATENCY_HISTOGRAM_MAX_NS, 3)
+                .expect("valid latency evidence histogram"),
+            excluded_negative: 0,
+            excluded_overflow: 0,
+        }
+    }
+
+    fn record(&mut self, value: i64) {
+        if value < 0 {
+            self.excluded_negative += 1;
+        } else if value as u64 > LATENCY_HISTOGRAM_MAX_NS
+            || self.histogram.record(value as u64).is_err()
+        {
+            self.excluded_overflow += 1;
+        }
+    }
+
+    fn report(&self, stage: &'static str) -> LatencyEvidenceStage {
+        let count = self.histogram.len();
+        let benchmark_gate_eligible = count >= MIN_P999_SAMPLES;
+        LatencyEvidenceStage {
+            stage,
+            count,
+            p50_ns: self.histogram.value_at_quantile(0.50),
+            p95_ns: self.histogram.value_at_quantile(0.95),
+            p99_ns: self.histogram.value_at_quantile(0.99),
+            p999_ns: self.histogram.value_at_quantile(0.999),
+            max_ns: self.histogram.max(),
+            p999_sample_status: if benchmark_gate_eligible {
+                P999SampleStatus::Sufficient
+            } else {
+                P999SampleStatus::InsufficientSample
+            },
+            benchmark_gate_eligible,
+            exclusions: LatencyExclusions {
+                negative_duration: self.excluded_negative,
+                above_histogram_range: self.excluded_overflow,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum P999SampleStatus {
+    Sufficient,
+    InsufficientSample,
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyExclusions {
+    negative_duration: u64,
+    above_histogram_range: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyEvidenceStage {
+    stage: &'static str,
+    count: u64,
+    p50_ns: u64,
+    p95_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+    max_ns: u64,
+    p999_sample_status: P999SampleStatus,
+    benchmark_gate_eligible: bool,
+    exclusions: LatencyExclusions,
+}
+
+#[derive(Serialize)]
+struct LatencyEvidenceArtifact<'a> {
+    schema_version: u8,
+    evidence_kind: &'static str,
+    generated_at_micros: u64,
+    minimum_p999_samples: u64,
+    capture_provenance: CaptureProvenance<'a>,
+    capture_exclusions: CaptureExclusions,
+    stages: [LatencyEvidenceStage; 5],
+}
+
+#[derive(Serialize)]
+struct CaptureProvenance<'a> {
+    venue: &'static str,
+    symbol: &'a str,
+    websocket_endpoint: &'a str,
+    streams: &'static str,
+    receive_boundary: &'static str,
+    clock: &'static str,
+    unit: &'static str,
+    eligible_observation: &'static str,
+    artifact_emission_policy: &'static str,
+}
+
+#[derive(Serialize)]
+struct CaptureExclusions {
+    warmup_depth_updates: u64,
+    post_bridge_sequence_gap_updates: u64,
+}
+
 struct LatencyHistograms {
-    parse: Histogram<u64>,
-    book: Histogram<u64>,
-    feature: Histogram<u64>,
-    signal: Histogram<u64>,
-    total: Histogram<u64>,
+    parse: EvidenceHistogram,
+    book: EvidenceHistogram,
+    feature: EvidenceHistogram,
+    signal: EvidenceHistogram,
+    total: EvidenceHistogram,
 }
 
 impl LatencyHistograms {
     fn new() -> Self {
         Self {
-            parse: Histogram::new(3).expect("valid parse histogram"),
-            book: Histogram::new(3).expect("valid book histogram"),
-            feature: Histogram::new(3).expect("valid feature histogram"),
-            signal: Histogram::new(3).expect("valid signal histogram"),
-            total: Histogram::new(3).expect("valid total histogram"),
+            parse: EvidenceHistogram::new(),
+            book: EvidenceHistogram::new(),
+            feature: EvidenceHistogram::new(),
+            signal: EvidenceHistogram::new(),
+            total: EvidenceHistogram::new(),
         }
     }
 
     fn record(&mut self, latency: LatencyTrace) {
-        record_non_negative(&mut self.parse, latency.parse_latency_ns());
-        record_non_negative(&mut self.book, latency.book_latency_ns());
-        record_non_negative(&mut self.feature, latency.feature_latency_ns());
-        record_non_negative(&mut self.signal, latency.signal_latency_ns());
-        record_non_negative(&mut self.total, latency.total_latency_ns());
+        self.parse.record(latency.parse_latency_ns());
+        self.book.record(latency.book_latency_ns());
+        self.feature.record(latency.feature_latency_ns());
+        self.signal.record(latency.signal_latency_ns());
+        self.total.record(latency.total_latency_ns());
     }
 
     fn print(&self, label: &str) {
@@ -153,10 +266,35 @@ impl LatencyHistograms {
         print_histogram(label, "signal", &self.signal);
         print_histogram(label, "total", &self.total);
     }
+
+    fn reports(&self) -> [LatencyEvidenceStage; 5] {
+        [
+            self.parse.report("parse"),
+            self.book.report("book"),
+            self.feature.report("feature"),
+            self.signal.report("signal"),
+            self.total.report("total"),
+        ]
+    }
+}
+
+fn record_evidence_sample(
+    histograms: &mut LatencyHistograms,
+    stats: &mut LiveStats,
+    latency: LatencyTrace,
+    sequence_gap: bool,
+) {
+    if sequence_gap {
+        stats.evidence_sequence_gap_exclusions += 1;
+    } else {
+        histograms.record(latency);
+    }
 }
 
 struct LiveStats {
     depth_messages: u64,
+    warmup_depth_updates: u64,
+    evidence_sequence_gap_exclusions: u64,
     book_ticker_messages: u64,
     signals: u64,
     rebuilds: u64,
@@ -169,6 +307,8 @@ impl LiveStats {
     fn new() -> Self {
         Self {
             depth_messages: 0,
+            warmup_depth_updates: 0,
+            evidence_sequence_gap_exclusions: 0,
             book_ticker_messages: 0,
             signals: 0,
             rebuilds: 0,
@@ -246,6 +386,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
     let start = Instant::now();
     let mut last_report = Instant::now();
     let mut snapshot_bridged = false;
+    let mut bounded_capture_complete = false;
     let mut latest_book_ticker: Option<BookTickerSnapshot> = None;
 
     loop {
@@ -253,16 +394,28 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
             .max_runtime_secs
             .is_some_and(|secs| start.elapsed() >= Duration::from_secs(secs))
         {
+            bounded_capture_complete = true;
             break;
         }
         if args
             .max_messages
             .is_some_and(|max| stats.depth_messages >= max)
         {
+            bounded_capture_complete = true;
             break;
         }
 
-        let Some(message) = ws.next().await else {
+        let remaining = args
+            .max_runtime_secs
+            .map(|secs| Duration::from_secs(secs).saturating_sub(start.elapsed()));
+        let next_message = match await_with_optional_timeout(ws.next(), remaining).await {
+            Ok(message) => message,
+            Err(()) => {
+                bounded_capture_complete = true;
+                break;
+            }
+        };
+        let Some(message) = next_message else {
             warn!("websocket stream ended");
             break;
         };
@@ -297,6 +450,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         let update = normalize_depth_update(depth.data, args.symbol_id, recv_ts_ns)?;
 
         if !snapshot_bridged {
+            stats.warmup_depth_updates += 1;
             lane.buffer_depth_update(update);
             let snapshot = fetch_snapshot(&symbol, args.depth_levels).await?;
             let bridge = lane.apply_snapshot_bridge(
@@ -343,7 +497,6 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
             let outcome = lane
                 .process_depth_update_fast_with_clock(&update, latency, &mut || elapsed_ns(&start));
             stats.depth_messages += 1;
-            histograms.record(outcome.latency);
             if outcome.signal.is_some() {
                 stats.signals += 1;
             }
@@ -353,7 +506,9 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
                     stats.book_ticker_mismatches += 1;
                 }
             }
-            if lane.sync().state() == BookSyncState::RebuildRequired {
+            let sequence_gap = lane.sync().state() == BookSyncState::RebuildRequired;
+            record_evidence_sample(&mut histograms, &mut stats, outcome.latency, sequence_gap);
+            if sequence_gap {
                 stats.rebuilds += 1;
                 let snapshot = fetch_snapshot(&symbol, args.depth_levels).await?;
                 let replay = lane.apply_replay_snapshot(
@@ -369,7 +524,6 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         let outcome = outcome.expect("record_replay path produces process outcome");
 
         stats.depth_messages += 1;
-        histograms.record(outcome.latency);
         if outcome.signal.is_some() {
             stats.signals += 1;
         }
@@ -382,7 +536,9 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
 
         write_batch(&mut replay_writer, &outcome.replay, &mut stats)?;
 
-        if lane.sync().state() == BookSyncState::RebuildRequired {
+        let sequence_gap = lane.sync().state() == BookSyncState::RebuildRequired;
+        record_evidence_sample(&mut histograms, &mut stats, outcome.latency, sequence_gap);
+        if sequence_gap {
             stats.rebuilds += 1;
             let snapshot = fetch_snapshot(&symbol, args.depth_levels).await?;
             let replay = lane.apply_replay_snapshot(
@@ -404,6 +560,16 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         writer.flush()?;
     }
     report_live(&stats, &histograms);
+    if let Some(path) = &args.latency_report_out {
+        write_latency_evidence_if_complete(
+            bounded_capture_complete,
+            path,
+            &symbol,
+            &ws_url,
+            &stats,
+            &histograms,
+        )?;
+    }
     Ok(())
 }
 
@@ -690,32 +856,98 @@ fn elapsed_ns(origin: &Instant) -> i64 {
     origin.elapsed().as_nanos() as i64
 }
 
-fn record_non_negative(histogram: &mut Histogram<u64>, value: i64) {
-    if value >= 0 {
-        let _ = histogram.record(value as u64);
+async fn await_with_optional_timeout<F: std::future::Future>(
+    future: F,
+    timeout: Option<Duration>,
+) -> Result<F::Output, ()> {
+    match timeout {
+        Some(timeout) if timeout.is_zero() => Err(()),
+        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| ()),
+        None => Ok(future.await),
     }
 }
 
-fn print_histogram(label: &str, stage: &str, histogram: &Histogram<u64>) {
-    if histogram.len() == 0 {
+fn print_histogram(label: &str, stage: &'static str, histogram: &EvidenceHistogram) {
+    let report = histogram.report(stage);
+    if report.count == 0 {
         info!("{label} {stage}: no samples");
         return;
     }
     info!(
-        "{label} {stage}: p50={}ns p95={}ns p99={}ns p999={}ns max={}ns count={}",
-        histogram.value_at_quantile(0.50),
-        histogram.value_at_quantile(0.95),
-        histogram.value_at_quantile(0.99),
-        histogram.value_at_quantile(0.999),
-        histogram.max(),
-        histogram.len()
+        "{label} {stage}: p50={}ns p95={}ns p99={}ns p999={}ns max={}ns count={} p999_sample_status={:?} gate_eligible={} excluded_negative={} excluded_overflow={}",
+        report.p50_ns,
+        report.p95_ns,
+        report.p99_ns,
+        report.p999_ns,
+        report.max_ns,
+        report.count,
+        report.p999_sample_status,
+        report.benchmark_gate_eligible,
+        report.exclusions.negative_duration,
+        report.exclusions.above_histogram_range
     );
+}
+
+fn write_latency_evidence(
+    path: &PathBuf,
+    symbol: &str,
+    websocket_endpoint: &str,
+    stats: &LiveStats,
+    histograms: &LatencyHistograms,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let artifact = LatencyEvidenceArtifact {
+        schema_version: 1,
+        evidence_kind: "benchmark",
+        generated_at_micros: now_micros(),
+        minimum_p999_samples: MIN_P999_SAMPLES,
+        capture_provenance: CaptureProvenance {
+            venue: "binance_spot",
+            symbol,
+            websocket_endpoint,
+            streams: "diff_depth_100ms_and_book_ticker",
+            receive_boundary: "after_websocket_message_to_owned_bytes",
+            clock: "std_time_instant_monotonic",
+            unit: "nanoseconds",
+            eligible_observation: "post_bridge_depth_update_without_sequence_gap",
+            artifact_emission_policy: "bounded_capture_success_only",
+        },
+        capture_exclusions: CaptureExclusions {
+            warmup_depth_updates: stats.warmup_depth_updates,
+            post_bridge_sequence_gap_updates: stats.evidence_sequence_gap_exclusions,
+        },
+        stages: histograms.reports(),
+    };
+    let mut writer = BufWriter::new(File::create(path)?);
+    serde_json::to_writer_pretty(&mut writer, &artifact)?;
+    writer.flush()?;
+    info!("wrote latency evidence: {}", path.display());
+    Ok(())
+}
+
+fn write_latency_evidence_if_complete(
+    bounded_capture_complete: bool,
+    path: &PathBuf,
+    symbol: &str,
+    websocket_endpoint: &str,
+    stats: &LiveStats,
+    histograms: &LatencyHistograms,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if !bounded_capture_complete {
+        warn!(
+            "latency evidence not written because the capture did not reach its configured bound"
+        );
+        return Ok(false);
+    }
+    write_latency_evidence(path, symbol, websocket_endpoint, stats, histograms)?;
+    Ok(true)
 }
 
 fn report_live(stats: &LiveStats, histograms: &LatencyHistograms) {
     info!(
-        "live stats: depth={} bookTicker={} signals={} rebuilds={} bookTicker_mismatch={} replay_records={}",
+        "live stats: depth={} warmup_depth_excluded={} sequence_gap_excluded={} bookTicker={} signals={} rebuilds={} bookTicker_mismatch={} replay_records={}",
         stats.depth_messages,
+        stats.warmup_depth_updates,
+        stats.evidence_sequence_gap_exclusions,
         stats.book_ticker_messages,
         stats.signals,
         stats.rebuilds,
@@ -1022,5 +1254,89 @@ mod tests {
             classify_stream(br#"{"stream":"btcusdt@trade","data":{}}"#),
             StreamKind::Other
         );
+    }
+
+    #[test]
+    fn evidence_report_separates_tail_sufficiency_and_exclusions() {
+        let mut sufficient = EvidenceHistogram::new();
+        for _ in 0..9_989 {
+            sufficient.record(100);
+        }
+        for _ in 0..11 {
+            sufficient.record(100_000);
+        }
+
+        let sufficient_report = sufficient.report("total");
+        assert_eq!(sufficient_report.count, 10_000);
+        assert!(sufficient_report.p99_ns < sufficient_report.p999_ns);
+        assert_eq!(
+            sufficient_report.p999_sample_status,
+            P999SampleStatus::Sufficient
+        );
+        assert!(sufficient_report.benchmark_gate_eligible);
+
+        let mut insufficient = EvidenceHistogram::new();
+        for _ in 0..9_999 {
+            insufficient.record(100);
+        }
+        insufficient.record(-1);
+        insufficient.record(LATENCY_HISTOGRAM_MAX_NS as i64 + 1);
+
+        let insufficient_report = insufficient.report("parse");
+        assert_eq!(insufficient_report.count, 9_999);
+        assert_eq!(
+            insufficient_report.p999_sample_status,
+            P999SampleStatus::InsufficientSample
+        );
+        assert!(!insufficient_report.benchmark_gate_eligible);
+        assert_eq!(insufficient_report.exclusions.negative_duration, 1);
+        assert_eq!(insufficient_report.exclusions.above_histogram_range, 1);
+    }
+
+    #[test]
+    fn sequence_gap_is_excluded_from_evidence_samples() {
+        let mut histograms = LatencyHistograms::new();
+        let mut stats = LiveStats::new();
+
+        record_evidence_sample(&mut histograms, &mut stats, LatencyTrace::default(), true);
+
+        assert_eq!(histograms.total.report("total").count, 0);
+        assert_eq!(stats.evidence_sequence_gap_exclusions, 1);
+    }
+
+    #[test]
+    fn incomplete_capture_does_not_write_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "hft-latency-evidence-{}-{}.json",
+            std::process::id(),
+            now_micros()
+        ));
+        let written = write_latency_evidence_if_complete(
+            false,
+            &path,
+            "BTCUSDT",
+            BINANCE_SPOT_WS,
+            &LiveStats::new(),
+            &LatencyHistograms::new(),
+        )
+        .unwrap();
+        let exists = path.exists();
+        if exists {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        assert!(!written);
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn runtime_bound_interrupts_a_stalled_receive() {
+        let result = await_with_optional_timeout(
+            std::future::pending::<()>(),
+            Some(Duration::from_millis(1)),
+        )
+        .await;
+
+        assert_eq!(result, Err(()));
     }
 }

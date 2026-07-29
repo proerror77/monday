@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 pub struct LatencyMonitorConfig {
     /// 各階段延遲告警閾值（微秒）
     pub alert_thresholds: HashMap<LatencyStage, u64>,
-    /// 統計窗口大小（樣本數）
+    /// 運維健康窗口大小（樣本數；不得作為 benchmark 證據）
     pub window_size: usize,
     /// 統計報告間隔（毫秒）
     pub report_interval_ms: u64,
@@ -188,11 +188,14 @@ impl LatencyMonitor {
         let all_stats = self.get_all_stats();
 
         if all_stats.is_empty() {
-            debug!("延遲監控報告: 暫無數據");
+            debug!("延遲運維窗口報告: 暫無數據");
             return;
         }
 
-        info!("=== 延遲監控報告 ===");
+        info!(
+            "=== 延遲運維窗口報告（最近最多 {} 個樣本；非 benchmark 證據）===",
+            self.config.window_size
+        );
 
         // 按階段順序輸出（含 EndToEnd）
         for stage in LatencyStage::all_stages().iter() {
@@ -212,9 +215,12 @@ impl LatencyMonitor {
         // 檢查端到端延遲是否達標
         if let Some(e2e_stats) = all_stats.get(&LatencyStage::EndToEnd) {
             if e2e_stats.p99_micros <= 25000 {
-                info!("🎯 端到端延遲達標: p99={}μs ≤ 25ms", e2e_stats.p99_micros);
+                info!("端到端運維窗口正常: p99={}μs ≤ 25ms", e2e_stats.p99_micros);
             } else {
-                warn!("⚠️  端到端延遲超標: p99={}μs > 25ms", e2e_stats.p99_micros);
+                warn!(
+                    "端到端運維窗口超閾值: p99={}μs > 25ms",
+                    e2e_stats.p99_micros
+                );
             }
         }
     }
