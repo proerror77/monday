@@ -31,6 +31,7 @@ fn create_test_event(id: u64) -> MarketEvent {
         }],
         sequence: id,
         source_venue: Some(hft_core::VenueId::BINANCE),
+        timestamps: Default::default(),
     })
 }
 

@@ -470,6 +470,7 @@ mod tests {
             }],
             sequence: 1,
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 
@@ -868,6 +869,7 @@ mod tests {
             sequence: 2,
             is_snapshot: false,
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         });
 
         let orders = strategy.on_market_event_with_context(&event, &context);
