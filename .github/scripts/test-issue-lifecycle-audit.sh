@@ -17,8 +17,9 @@ def issue(number, labels, body = issue_body, assignees = [], parent = nil, block
     "blocked_by" => blocked_by }
 end
 
-def pull_request(number, relationship, base = "main", commits = [], extra = "")
+def pull_request(number, relationship, base = "main", commits = [], extra = "", title = "Fixture PR #{number}")
   { "number" => number, "base" => base,
+    "title" => title,
     "body" => "## Issue relationship\n\n#{relationship}\n\n## Focused validation\n\nFixture proof.\n#{extra}\n",
     "commits" => commits }
 end
@@ -30,6 +31,24 @@ end
 
 base = issue(10, %w[enhancement ready-for-agent], issue_body, ["agent"])
 runtime_control = "\n## Runtime control\n\nTarget: repository setting\nController: release-owner\nStop rule: stop on failed preflight\nRollback: restore the previous setting\n"
+issue_form_runtime = <<~MARKDOWN
+
+### Exact target identity
+
+repository setting
+
+### Named controller
+
+release-owner
+
+### Rollback identity and procedure
+
+restore the previous setting
+
+### Stop rules
+
+stop on failed preflight
+MARKDOWN
 incomplete_commits = pull_request(32, "Refs #10", "main", [
   { "sha" => "first", "message" => "Safe fetched commit" }
 ])
@@ -47,12 +66,20 @@ cases = {
           issue_body("None", "#99", runtime_control), [], nil,
           [{ "number" => 99, "state" => "closed" }])
   ]),
+  "authorized_runtime_ready_issue_form" => data([
+    issue(15, %w[enhancement ready-for-agent runtime],
+          issue_body("None", "#99", issue_form_runtime), [], nil,
+          [{ "number" => 99, "state" => "closed" }])
+  ]),
   "missing_category" => data([issue(30, %w[ready-for-human])]),
   "conflicting_category" => data([issue(31, %w[bug enhancement ready-for-human])]),
   "missing_state" => data([issue(32, %w[enhancement])]),
   "conflicting_state" => data([issue(33, %w[enhancement needs-triage ready-for-human])]),
   "literal_escaped_newline" => data([
-    issue(34, %w[enhancement ready-for-human], issue_body + "literal \\n escape")
+    issue(34, %w[enhancement ready-for-human], "## Parent\\n\\nNone\\n\\n## Blocked by\\n\\nNone\\n\\n## Details\\n\\nliteral \\n escape")
+  ]),
+  "valid_literal_escaped_newline" => data([
+    issue(35, %w[enhancement ready-for-human], issue_body + "\n\n```json\n{\"pattern\":\"line\\\\nnext\"}\n```\n")
   ]),
   "tracking_agent_queue" => data([issue(35, %w[enhancement ready-for-agent tracking])]),
   "runtime_missing_control" => data([issue(36, %w[enhancement ready-for-agent runtime])]),
@@ -89,6 +116,9 @@ cases = {
   ], [pull_request(27, "Closes #51")]),
   "pr_fix_with_refs" => data([base], [
     pull_request(28, "Refs #10", "main", [], "Fixes #10")
+  ]),
+  "pr_title_fix_with_refs" => data([base], [
+    pull_request(34, "Refs #10", "main", [], "", "Fixes #10 in title")
   ]),
   "commit_fix_with_refs" => data([base], [
     pull_request(29, "Refs #10", "main", [
@@ -147,6 +177,8 @@ run_pass valid_none "automatic-linked-issue-closing: disabled (fixture)"
 run_pass valid_needs_info
 run_pass valid_wontfix
 run_pass authorized_runtime_ready
+run_pass authorized_runtime_ready_issue_form
+run_pass valid_literal_escaped_newline
 
 while IFS='|' read -r name expected; do
   run_fail "$name" "$expected"
@@ -169,6 +201,7 @@ non_default_closes|PR #25: Closes #10 targets stack, not default branch main
 runtime_closes|PR #26: runtime issue #50 cannot be closed by a pull request
 tracking_closes|PR #27: tracking issue #51 cannot be closed by a pull request
 pr_fix_with_refs|PR #28 body: closing keyword Fixes #10 requires visible Closes #10
+pr_title_fix_with_refs|PR #34 title: closing keyword Fixes #10 requires visible Closes #10
 commit_fix_with_refs|PR #29 commit fix-ref: closing keyword Fixes #10 requires visible Closes #10
 commit_negated_resolve|PR #30 commit resolve: negated closing phrase is forbidden
 commit_never_closes|PR #33 commit never: negated closing phrase is forbidden

@@ -62,7 +62,7 @@ class GitHubReadOnly
 end
 
 def markdown_section(markdown, title)
-  match = markdown.to_s.match(/^##[ \t]+#{Regexp.escape(title)}[ \t]*\r?\n(?<body>.*?)(?=^##[ \t]|\z)/mi)
+  match = markdown.to_s.match(/^##(?:#)?[ \t]+#{Regexp.escape(title)}[ \t]*\r?\n(?<body>.*?)(?=^##(?:#)?[ \t]+|\z)/mi)
   match && match[:body]
 end
 
@@ -94,15 +94,46 @@ def references(numbers)
   Array(numbers).empty? ? "None" : Array(numbers).map { |number| "##{number}" }.join(", ")
 end
 
+def invalid_control_value?(value)
+  value.to_s.strip.empty? || value.to_s.strip.match?(/\A(?:none|n\/a|tbd|unknown|-)\z/i)
+end
+
+def issue_form_value(body, *titles)
+  titles.each do |title|
+    section = markdown_section(visible_markdown(body), title)
+    next unless section
+
+    value = section.lines.map(&:strip).reject(&:empty?).join(" ")
+    return value unless value.empty?
+  end
+
+  nil
+end
+
 def missing_runtime_control(body)
   section = markdown_section(visible_markdown(body), "Runtime control")
-  return RUNTIME_CONTROL_FIELDS.keys unless section
+  unless section
+    field_values = {
+      "Target" => issue_form_value(body, "Exact target identity", "Target"),
+      "Controller" => issue_form_value(body, "Named controller", "Controller"),
+      "Stop rule" => issue_form_value(body, "Stop rules", "Stop rule"),
+      "Rollback" => issue_form_value(body, "Rollback identity and procedure", "Rollback identity", "Rollback")
+    }
+    return field_values.each_with_object([]) { |(name, value), missing| missing << name if invalid_control_value?(value) }
+  end
 
   lines = section.lines.map(&:strip).reject(&:empty?)
   RUNTIME_CONTROL_FIELDS.each_with_object([]) do |(name, pattern), missing|
     value = lines.map { |line| line.match(pattern) }.compact.map { |match| match[1].strip }.first
-    missing << name unless value && value !~ /\A(?:none|n\/a|tbd|unknown|-)\z/i
+    missing << name if invalid_control_value?(value)
   end
+end
+
+def literal_escaped_newline_artifact?(body)
+  text = body.to_s
+  return false unless text.include?("\\n")
+
+  !text.include?("\n") && text.scan(/\\n/).length >= 3
 end
 
 def active_owner_violation(issue)
@@ -121,7 +152,7 @@ def audit_issue(issue, has_open_pr)
 
   violations << "Issue ##{number}: expected exactly one category label; found #{categories.empty? ? "none" : categories.join(", ")}" unless categories.length == 1
   violations << "Issue ##{number}: expected exactly one triage state label; found #{states.empty? ? "none" : states.join(", ")}" unless states.length == 1
-  violations << "Issue ##{number}: body contains a literal escaped newline (\\n); publish multiline Markdown through a body file" if issue["body"].to_s.include?("\\n")
+  violations << "Issue ##{number}: body contains a literal escaped newline (\\n); publish multiline Markdown through a body file" if literal_escaped_newline_artifact?(issue["body"])
   violations << "Issue ##{number}: tracking issues cannot use ready-for-agent" if labels.include?("tracking") && labels.include?("ready-for-agent")
 
   if labels.include?("runtime") && labels.include?("ready-for-agent")
@@ -192,7 +223,10 @@ def audit_pull_request(pull_request, issues, default_branch)
   violations = []
   visible_body = visible_markdown(pull_request["body"])
   body_closings = closing_keywords(visible_body)
+  title = pull_request["title"].to_s
+  title_closings = closing_keywords(title)
   violations << "PR ##{number} body: negated closing phrase is forbidden" if visible_body.match?(NEGATED_CLOSING_PATTERN)
+  violations << "PR ##{number} title: negated closing phrase is forbidden" if title.match?(NEGATED_CLOSING_PATTERN)
 
   if relationship["kind"] == "closes"
     expected_number = relationship["number"]
@@ -200,9 +234,16 @@ def audit_pull_request(pull_request, issues, default_branch)
     if unexpected.any? || body_closings.length != 1
       violations << "PR ##{number} body: visible Closes ##{expected_number} must be the only closing keyword relationship"
     end
+    unexpected_title = title_closings.reject { |closing| closing["number"] == expected_number }
+    if unexpected_title.any? || title_closings.length > 1
+      violations << "PR ##{number} title: visible Closes ##{expected_number} must be the only closing keyword relationship"
+    end
   else
     body_closings.each do |closing|
       violations << "PR ##{number} body: closing keyword #{closing["keyword"]} ##{closing["number"]} requires visible Closes ##{closing["number"]}"
+    end
+    title_closings.each do |closing|
+      violations << "PR ##{number} title: closing keyword #{closing["keyword"]} ##{closing["number"]} requires visible Closes ##{closing["number"]}"
     end
   end
 
