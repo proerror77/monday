@@ -4,99 +4,152 @@ allowed-tools: Bash, Read, Write, LS
 
 # Issue Close
 
-Mark an issue as complete and close it on GitHub.
+Validate completion evidence, then close an eligible GitHub issue.
 
 ## Usage
-```
-/pm:issue-close <issue_number> [completion_notes]
-```
 
-## Instructions
-
-### 1. Find Local Task File
-
-First check if `.claude/epics/*/$ARGUMENTS.md` exists (new naming).
-If not found, search for task file with `github:.*issues/$ARGUMENTS` in frontmatter (old naming).
-If not found: "❌ No local task for issue #$ARGUMENTS"
-
-### 2. Update Local Status
-
-Get current datetime: `date -u +"%Y-%m-%dT%H:%M:%SZ"`
-
-Update task file frontmatter:
-```yaml
-status: closed
-updated: {current_datetime}
+```text
+/pm:issue-close <issue_number> <completion_evidence>
 ```
 
-### 3. Update Progress File
+GitHub is authoritative. Local task files are optional and never gate closure.
+Completion evidence uses anchored `Field: value` entries separated by newlines
+or semicolons.
 
-If progress file exists at `.claude/epics/{epic}/updates/$ARGUMENTS/progress.md`:
-- Set completion: 100%
-- Add completion note with timestamp
-- Update last_sync with current datetime
-
-### 4. Close on GitHub
-
-Add completion comment and close:
-```bash
-# Add final comment
-echo "✅ Task completed
-
-$ARGUMENTS
-
----
-Closed at: {timestamp}" | gh issue comment $ARGUMENTS --body-file -
-
-# Close the issue
-gh issue close $ARGUMENTS
-```
-
-### 5. Update Epic Task List on GitHub
-
-Check the task checkbox in the epic issue:
+Run validation and mutation as one block:
 
 ```bash
-# Get epic name from local task file path
-epic_name={extract_from_path}
+issue_number="${ARGUMENTS%% *}"
+completion_evidence="${ARGUMENTS#"$issue_number"}"
+completion_evidence="${completion_evidence# }"
 
-# Get epic issue number from epic.md
-epic_issue=$(grep 'github:' .claude/epics/$epic_name/epic.md | grep -oE '[0-9]+$')
+case "$issue_number" in
+  ''|*[!0-9]*) echo "❌ A numeric issue number is required" >&2; exit 1 ;;
+esac
 
-if [ ! -z "$epic_issue" ]; then
-  # Get current epic body
-  gh issue view $epic_issue --json body -q .body > /tmp/epic-body.md
-  
-  # Check off this task
-  sed -i "s/- \[ \] #$ARGUMENTS/- [x] #$ARGUMENTS/" /tmp/epic-body.md
-  
-  # Update epic issue
-  gh issue edit $epic_issue --body-file /tmp/epic-body.md
-  
-  echo "✓ Updated epic progress on GitHub"
+field_value() {
+  local field="$1"
+  local record="$2"
+
+  printf '%s\n' "$record" | tr ';' '\n' | awk -v wanted="$field" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    {
+      line=$0
+      sub(/^[[:space:]]*[-+][[:space:]]+/, "", line)
+      separator=index(line, ":")
+      if (!separator) next
+      name=trim(substr(line, 1, separator - 1))
+      if (tolower(name) == tolower(wanted)) value=trim(substr(line, separator + 1))
+    }
+    END { if (value != "") print value }
+  '
+}
+
+normalized_value() {
+  # Backticks are literal Markdown wrappers, not command substitutions.
+  # shellcheck disable=SC2016
+  printf '%s' "$1" |
+    sed -E 's/^[[:space:]]+//; s/[[:space:].,;!?]+$//; s/^([*_~`]+)[[:space:]]*//; s/[[:space:]]*([*_~`]+)$//; s/^[[:space:]]+//; s/[[:space:].,;!?]+$//' |
+    tr '[:upper:]' '[:lower:]' |
+    tr -d '[:space:]'
+}
+
+is_chained_field() {
+  local value
+  value=$(printf '%s' "$1" | tr -d '*_`~' | tr '[:upper:]' '[:lower:]' |
+    sed -E 's/^[[:space:]]*[-+][[:space:]]+//; s/^[[:space:]]+//; s/[[:space:]]+:/:/')
+  case "$value" in
+    'acceptance check:'*|'acceptance checks:'*|'result:'*|'parent acceptance audit:'*|'exact target:'*|'named controller:'*|'candidate identity:'*|'configuration identity:'*|'rollback identity:'*|'rollback procedure:'*|'stop rules:'*|'terminal result:'*|'cleanup evidence:'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+has_meaningful_field() {
+  local value normalized
+  value=$(field_value "$1" "$2")
+  [ -n "$value" ] || return 1
+  is_chained_field "$value" && return 1
+  normalized=$(normalized_value "$value")
+  case "$normalized" in
+    ''|'-'|'--'|'---'|'tbd'|'todo'|'pending'|'unknown'|'none'|'n/a'|'na'|'missing'|'absent'|'failed'|'failure'|'error'|'false'|'no'|'nil'|'null'|'unavailable'|'notavailable'|'notconfigured'|'notdone'|'notfound'|'notperformed'|'notrun'|'notset'|'incomplete') return 1 ;;
+  esac
+}
+
+field_passed() {
+  local value normalized
+  value=$(field_value "$1" "$2")
+  [ -n "$value" ] || return 1
+  is_chained_field "$value" && return 1
+  normalized=$(normalized_value "$value")
+  case "$normalized" in
+    pass|passed|success|successful|succeeded|complete|completed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! has_meaningful_field "Acceptance checks" "$completion_evidence" &&
+  ! has_meaningful_field "Acceptance check" "$completion_evidence"; then
+  echo "❌ Completion evidence requires meaningful anchored Acceptance checks" >&2
+  exit 1
 fi
+if ! field_passed "Result" "$completion_evidence"; then
+  echo "❌ Completion evidence requires Result: passed" >&2
+  exit 1
+fi
+
+issue_state=$(gh issue view "$issue_number" --json state --jq .state) || exit 1
+[ "$issue_state" = OPEN ] || { echo "❌ Issue is not open" >&2; exit 1; }
+open_blockers=$(gh api --paginate "repos/{owner}/{repo}/issues/$issue_number/dependencies/blocked_by" \
+  --jq '.[] | select(.state != "closed") | .number') || exit 1
+[ -z "$open_blockers" ] || { echo "❌ Native blockers remain open" >&2; exit 1; }
+issue_labels=$(gh issue view "$issue_number" --json labels --jq '.labels[].name') || exit 1
+category_count=$(printf '%s\n' "$issue_labels" | awk '$0 == "bug" || $0 == "enhancement" { n++ } END { print n + 0 }')
+triage_count=$(printf '%s\n' "$issue_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { n++ } END { print n + 0 }')
+[ "$category_count" -eq 1 ] && [ "$triage_count" -eq 1 ] || { echo "❌ Issue labels violate the lifecycle contract" >&2; exit 1; }
+
+if printf '%s\n' "$issue_labels" | grep -Fxq tracking; then
+  open_children=$(gh api --paginate "repos/{owner}/{repo}/issues/$issue_number/sub_issues" \
+    --jq '.[] | select(.state != "closed") | .number') || exit 1
+  [ -z "$open_children" ] || { echo "❌ Tracking issue has open sub-issues" >&2; exit 1; }
+  field_passed "Parent acceptance audit" "$completion_evidence" || {
+    echo "❌ Tracking closure requires Parent acceptance audit: passed" >&2
+    exit 1
+  }
+fi
+
+if printf '%s\n' "$issue_labels" | grep -Fxq runtime; then
+  runtime_record=$(gh issue view "$issue_number" --json comments \
+    --jq '[.comments[].body] | join("\n")') || exit 1
+  runtime_record="$runtime_record
+$completion_evidence"
+  for field in "Exact target" "Named controller" "Candidate identity" \
+    "Configuration identity" "Rollback identity" "Rollback procedure" \
+    "Stop rules" "Cleanup evidence"; do
+    has_meaningful_field "$field" "$runtime_record" || {
+      echo "❌ Runtime closure requires meaningful $field" >&2
+      exit 1
+    }
+  done
+  field_passed "Terminal result" "$runtime_record" || {
+    echo "❌ Runtime closure requires Terminal result: passed" >&2
+    exit 1
+  }
+fi
+
+evidence_file=$(mktemp)
+trap 'rm -f "$evidence_file"' EXIT
+printf '## Completion evidence\n\n%s\n' "$completion_evidence" > "$evidence_file"
+gh issue comment "$issue_number" --body-file "$evidence_file" || exit 1
+gh issue close "$issue_number" --reason completed || exit 1
+closed_state=$(gh issue view "$issue_number" --json state --jq .state) || exit 1
+[ "$closed_state" = CLOSED ] || { echo "❌ GitHub readback is not CLOSED" >&2; exit 1; }
+gh issue view "$issue_number" --json state,closedAt,comments,url
 ```
 
-### 6. Update Epic Progress
-
-- Count total tasks in epic
-- Count closed tasks
-- Calculate new progress percentage
-- Update epic.md frontmatter progress field
-
-### 7. Output
-
-```
-✅ Closed issue #$ARGUMENTS
-  Local: Task marked complete
-  GitHub: Issue closed & epic updated
-  Epic progress: {new_progress}% ({closed}/{total} tasks complete)
-  
-Next: Run /pm:next for next priority task
-```
-
-## Important Notes
-
-Follow `/rules/frontmatter-operations.md` for updates.
-Follow `/rules/github-operations.md` for GitHub commands.
-Always sync local state before GitHub.
+Only after the `CLOSED` readback may an existing local mirror be marked stale
+or refreshed as optional enrichment. Do not close a parent as a child-side
+effect.

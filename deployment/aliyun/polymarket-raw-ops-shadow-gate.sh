@@ -49,6 +49,8 @@ readonly GATE_POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
 readonly -a BUNDLE_ASSETS=(
+  polymarket-raw-ops-gate-control.sh
+  polymarket-raw-ops-gate@.service
   polymarket-raw-ops-shadow-gate.sh
   polymarket-raw-ops-cutover.sh
   polymarket-shadow-gate-policy.jq
