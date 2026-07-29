@@ -36,6 +36,26 @@ substitute for a scoped work item.
   rollout unit. Create or update the relevant issue instead of extending the
   active one.
 
+### GitHub Issue Lifecycle
+
+- GitHub issue metadata is authoritative. Local PRD/epic files may add context
+  but must not gate issue status, close, or reopen operations.
+- Publish issue bodies through `--body-file`; do not encode multiline Markdown
+  as escaped shell text. Every issue must have exactly one category (`bug` or
+  `enhancement`) and one triage state. Use `tracking` for PRD/parent issues and
+  `runtime` for contracts that require live mutation or evidence.
+- Record parent/sub-issue and blocked-by relationships with GitHub's native
+  issue relationships. Prose sections remain readable summaries, not the
+  dependency source of truth.
+- Partial or stacked work uses `Refs #N`. Only a PR targeting `main` that
+  completes the whole code contract may use `Closes #N`. The same restriction
+  applies to the `close`, `fix`, and `resolve` keyword families in commit
+  messages.
+- A `runtime` or `tracking` issue is never closed by a PR. Runtime closure
+  requires target, controller, candidate/configuration, rollback, stop-rule,
+  result, and cleanup evidence. Parent closure requires a separate acceptance
+  audit after its final direct sub-issue closes.
+
 For the Polymarket research lane specifically, collector deployment, cohort and
 snapshot construction, evaluator/MCTS execution, and result publication are
 separate issues. A deployment gate must not become an excuse to modify research
