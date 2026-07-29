@@ -22,8 +22,8 @@ case "$issue_number" in
   ''|*[!0-9]*) echo "❌ A numeric issue number is required" >&2; exit 1 ;;
 esac
 
-gh issue view "$issue_number" --json number,title,state,url || exit 1
-gh issue reopen "$issue_number" || exit 1
+issue_state=$(gh issue view "$issue_number" --json state --jq .state) || exit 1
+case "$issue_state" in CLOSED) gh issue reopen "$issue_number" || exit 1 ;; OPEN) ;; *) echo "❌ Unknown GitHub issue state" >&2; exit 1 ;; esac
 reopened_state=$(gh issue view "$issue_number" --json state --jq .state) || exit 1
 [ "$reopened_state" = OPEN ] || { echo "❌ GitHub readback is not OPEN" >&2; exit 1; }
 
