@@ -1,0 +1,32 @@
+name: Bug report
+description: Report reproducible broken behavior for triage
+labels: ["bug", "needs-triage"]
+body:
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current behavior
+      description: Describe what is broken and where it was observed.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Focused reproduction
+      description: Provide the smallest repeatable steps and exact evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: Describe the correct observable result.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Safety and scope boundary
+      description: Name affected trust domains and work that must remain unchanged.
+    validations:
+      required: true
