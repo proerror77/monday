@@ -209,11 +209,21 @@ load_invocation_request() {
 
 print_status() {
   local candidate_sha=$1 expected_invocation=$2 request unit receipt
-  local source_revision evidence_dir
+  local source_revision evidence_dir directory prepared_receipt staged_receipt
   local active_state invocation main_pid fragment drop_ins phase
   request=$(load_invocation_request "$candidate_sha" "$expected_invocation")
   unit=$(unit_for "$candidate_sha")
-  receipt="${request%/request.json}/receipt.json"
+  directory=${request%/request.json}
+  receipt="$directory/receipt.json"
+  prepared_receipt="$directory/.receipt.json.tmp"
+  staged_receipt="$directory/.receipt.json.ready"
+  if [[ -e $receipt || -L $receipt \
+    || -e $prepared_receipt || -L $prepared_receipt \
+    || -e $staged_receipt || -L $staged_receipt ]]; then
+    exec 8>>"$directory/commit.lock"
+    flock -x 8
+    commit_terminal_receipt "$candidate_sha" "$expected_invocation" "$request"
+  fi
   if [[ -e $receipt || -L $receipt ]]; then
     secure_control_file "$receipt"
     jq -e --arg candidate "$candidate_sha" --arg invocation "$expected_invocation" \
@@ -315,13 +325,113 @@ valid_pass_marker() {
   ' "$gate_json" >/dev/null
 }
 
+validate_terminal_receipt() {
+  local receipt=$1 candidate_sha=$2 source_revision=$3 invocation=$4
+  secure_control_file "$receipt"
+  jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" \
+    --arg invocation "$invocation" '
+    .schema == "monday.polymarket_gate_receipt.v1"
+    and .candidate_sha256 == $candidate
+    and .source_revision == $source
+    and .systemd_invocation_id == $invocation
+    and .phase == "terminal"
+    and (.terminal_state == "passed" or .terminal_state == "failed"
+      or .terminal_state == "cancelled")
+    and (if .terminal_state == "passed" then
+      .systemd.result == "success" and .systemd.exit_code == "exited"
+      and .systemd.exit_status == "0" and .shadow.containment == "contained"
+    else true end)' "$receipt" >/dev/null
+}
+
+commit_terminal_receipt() {
+  local candidate_sha=$1 invocation=$2 request=$3 directory receipt
+  local prepared_receipt staged_receipt
+  local commit_tmp source_revision terminal_state evidence_dir marker ready_marker
+  local ready_tmp
+  directory=${request%/request.json}
+  receipt="$directory/receipt.json"
+  prepared_receipt="$directory/.receipt.json.tmp"
+  staged_receipt="$directory/.receipt.json.ready"
+  source_revision=$(jq -er .source_revision "$request")
+  evidence_dir="$GATE_EVIDENCE_ROOT/$candidate_sha/$invocation"
+  marker="$evidence_dir/PASSED.sha256"
+  ready_marker="$evidence_dir/.PASSED.sha256.ready"
+  ready_tmp="$evidence_dir/..PASSED.sha256.ready.tmp"
+
+  if [[ -e $prepared_receipt || -L $prepared_receipt ]]; then
+    validate_terminal_receipt "$prepared_receipt" "$candidate_sha" \
+      "$source_revision" "$invocation"
+    if [[ -e $staged_receipt || -L $staged_receipt ]]; then
+      cmp -s "$prepared_receipt" "$staged_receipt" \
+        || die 'prepared and staged Gate receipts differ'
+    elif [[ -e $receipt || -L $receipt ]]; then
+      cmp -s "$prepared_receipt" "$receipt" \
+        || die 'prepared and published Gate receipts differ'
+    else
+      mv "$prepared_receipt" "$staged_receipt"
+      sync_file "$staged_receipt"
+      sync_dir "$directory"
+    fi
+  fi
+  if [[ -e $staged_receipt || -L $staged_receipt ]]; then
+    validate_terminal_receipt "$staged_receipt" "$candidate_sha" \
+      "$source_revision" "$invocation"
+  fi
+  if [[ -e $receipt || -L $receipt ]]; then
+    validate_terminal_receipt "$receipt" "$candidate_sha" \
+      "$source_revision" "$invocation"
+    [[ ! -e $staged_receipt && ! -L $staged_receipt ]] \
+      || cmp -s "$staged_receipt" "$receipt" \
+      || die 'staged and published Gate receipts differ'
+  else
+    [[ -f $staged_receipt && ! -L $staged_receipt ]] \
+      || die 'terminal Gate receipt is missing'
+    terminal_state=$(jq -er .terminal_state "$staged_receipt")
+    if [[ $terminal_state != passed ]]; then
+      rm -f -- "$marker" "$ready_marker" "$ready_tmp"
+      [[ ! -d $evidence_dir ]] || sync_dir "$evidence_dir"
+    fi
+    commit_tmp="$directory/.receipt.json.commit"
+    rm -f -- "$commit_tmp"
+    install -m 0444 "$staged_receipt" "$commit_tmp"
+    sync_file "$commit_tmp"
+    mv "$commit_tmp" "$receipt"
+    sync_file "$receipt"
+    sync_dir "$directory"
+  fi
+
+  terminal_state=$(jq -er .terminal_state "$receipt")
+  if [[ $terminal_state == passed ]]; then
+    if [[ -e $marker || -L $marker ]]; then
+      valid_pass_marker "$evidence_dir" "$candidate_sha" "$source_revision" \
+        "$invocation" || die 'published Gate pass marker is invalid'
+    else
+      valid_pass_marker "$evidence_dir" "$candidate_sha" "$source_revision" \
+        "$invocation" ".${marker##*/}.ready" \
+        || die 'staged Gate pass marker is invalid'
+      mv "$ready_marker" "$marker"
+      sync_file "$marker"
+      sync_dir "$evidence_dir"
+    fi
+    rm -f -- "$ready_tmp"
+  else
+    rm -f -- "$marker" "$ready_marker" "$ready_tmp"
+    [[ ! -d $evidence_dir ]] || sync_dir "$evidence_dir"
+  fi
+  if [[ -e $prepared_receipt || -L $prepared_receipt \
+    || -e $staged_receipt || -L $staged_receipt ]]; then
+    rm -f -- "$prepared_receipt" "$staged_receipt"
+    sync_dir "$directory"
+  fi
+}
+
 finalize_gate() {
   local candidate_sha=$1 invocation=${INVOCATION_ID:-}
   local service_result=${SERVICE_RESULT:-} exit_code=${EXIT_CODE:-}
   local exit_status=${EXIT_STATUS:-} request directory receipt temporary
-  local unit source_revision shadow_unit shadow_state shadow_pid evidence_dir marker
+  local unit source_revision shadow_unit shadow_state shadow_pid evidence_dir
   local ready_marker terminal_state shadow_stop_result shadow_containment
-  local shadow_state_ok=false shadow_pid_ok=false
+  local staged_receipt shadow_state_ok=false shadow_pid_ok=false
   if ! valid_candidate "$candidate_sha" || ! valid_invocation "$invocation"; then
     die 'systemd finalizer has no exact candidate/invocation identity'
   fi
@@ -330,10 +440,14 @@ finalize_gate() {
   request=$(load_invocation_request "$candidate_sha" "$invocation")
   directory=${request%/request.json}
   receipt="$directory/receipt.json"
+  temporary="$directory/.receipt.json.tmp"
+  staged_receipt="$directory/.receipt.json.ready"
   exec 8>>"$directory/commit.lock"
   flock -x 8
-  if [[ -e $receipt || -L $receipt ]]; then
-    secure_control_file "$receipt"
+  if [[ -e $receipt || -L $receipt \
+    || -e $temporary || -L $temporary \
+    || -e $staged_receipt || -L $staged_receipt ]]; then
+    commit_terminal_receipt "$candidate_sha" "$invocation" "$request"
     jq -c . "$receipt"
     return
   fi
@@ -367,7 +481,6 @@ finalize_gate() {
     shadow_containment=unverified
   fi
   evidence_dir="$GATE_EVIDENCE_ROOT/$candidate_sha/$invocation"
-  marker="$evidence_dir/PASSED.sha256"
   ready_marker="$evidence_dir/.PASSED.sha256.ready"
   terminal_state=failed
   if [[ $shadow_containment != contained ]]; then
@@ -379,20 +492,9 @@ finalize_gate() {
   elif [[ $service_result == success && $exit_code == exited \
     && $exit_status == 0 ]] \
     && valid_pass_marker "$evidence_dir" "$candidate_sha" "$source_revision" \
-      "$invocation" ".${marker##*/}.ready"; then
+      "$invocation" ".PASSED.sha256.ready"; then
     terminal_state=passed
   fi
-  if [[ $terminal_state == passed ]]; then
-    [[ ! -e $marker && ! -L $marker ]] \
-      || die 'official Gate pass marker already exists before finalization'
-    mv "$ready_marker" "$marker"
-    sync_file "$marker"
-    sync_dir "$evidence_dir"
-  else
-    rm -f -- "$marker" "$ready_marker" "$evidence_dir/.PASSED.sha256.tmp"
-    [[ ! -d $evidence_dir ]] || sync_dir "$evidence_dir"
-  fi
-  temporary="$directory/.receipt.json.tmp"
   jq -n --arg unit "$unit" --arg candidate "$candidate_sha" \
     --arg source "$source_revision" --arg invocation "$invocation" \
     --arg terminal_state "$terminal_state" --arg result "$service_result" \
@@ -410,9 +512,11 @@ finalize_gate() {
         main_pid:$shadow_pid}}
   ' >"$temporary"
   chmod 0444 "$temporary"
-  mv "$temporary" "$receipt"
-  sync_file "$receipt"
+  sync_file "$temporary"
+  mv "$temporary" "$staged_receipt"
+  sync_file "$staged_receipt"
   sync_dir "$directory"
+  commit_terminal_receipt "$candidate_sha" "$invocation" "$request"
   jq -c . "$receipt"
   [[ $shadow_containment != active ]] \
     || die 'candidate shadow remains active after Gate finalization'

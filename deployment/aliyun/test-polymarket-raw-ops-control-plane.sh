@@ -191,6 +191,28 @@ $operation |= LOCK_NB if grep { $_ eq '-n' } @ARGV;
 exit(flock($lock, $operation) ? 0 : 1);
 EOF
 chmod 0755 "$supervisor_fake_bin/flock"
+cat >"$supervisor_fake_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination=${!#}
+[[ ${FAKE_MV_FAIL_RECEIPT_STAGE:-0} != 1 \
+  || $destination != */.receipt.json.ready ]] \
+  || exit 74
+[[ ${FAKE_MV_FAIL_RECEIPT:-0} != 1 || $destination != */receipt.json ]] \
+  || exit 75
+exec /bin/mv "$@"
+EOF
+chmod 0755 "$supervisor_fake_bin/mv"
+cat >"$supervisor_fake_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination=${!#}
+[[ ${FAKE_RM_FAIL_RECEIPT_READY:-0} != 1 \
+  || $destination != */.receipt.json.ready ]] \
+  || exit 75
+exec /bin/rm "$@"
+EOF
+chmod 0755 "$supervisor_fake_bin/rm"
 
 flock_probe="$supervisor_tmp/flock-probe.lock"
 exec 7>"$flock_probe"
@@ -292,13 +314,15 @@ grep -Fqx \
   "$supervisor_gate_calls"
 set_supervisor_state active inactive
 failed_evidence=$(make_supervisor_ready "$supervisor_invocation")
+printf 'partial\n' >"$failed_evidence/..PASSED.sha256.ready.tmp"
 FAKE_SHADOW_STOP_FAIL=1 finalize_supervisor "$supervisor_invocation" \
   exit-code exited 17 \
   >"$supervisor_tmp/failed.json"
 assert_terminal "$supervisor_tmp/failed.json" failed
 [[ $(<"$supervisor_state/shadow") == inactive ]]
 [[ ! -e $failed_evidence/PASSED.sha256 \
-  && ! -e $failed_evidence/.PASSED.sha256.ready ]]
+  && ! -e $failed_evidence/.PASSED.sha256.ready \
+  && ! -e $failed_evidence/..PASSED.sha256.ready.tmp ]]
 assert_terminal_status "$supervisor_invocation" failed
 supervisor_start_query_invocation=$(printf '4%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_start_query_invocation"
@@ -344,6 +368,83 @@ cancel_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervis
 [[ ! -e $cancel_evidence/PASSED.sha256 \
   && ! -e $cancel_evidence/.PASSED.sha256.ready ]]
 [[ $(<"$supervisor_state/shadow") == inactive ]]
+
+supervisor_prepare_invocation=$(printf '8%.0s' {1..32})
+start_supervisor "$supervisor_prepare_invocation" >/dev/null
+set_supervisor_state shadow active
+prepare_evidence=$(make_supervisor_ready "$supervisor_prepare_invocation")
+set_supervisor_state active inactive
+prepare_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_prepare_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_prepare_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_MV_FAIL_RECEIPT_STAGE=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'receipt staging interruption unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ ! -e $prepare_evidence/PASSED.sha256 \
+  && -f $prepare_evidence/.PASSED.sha256.ready \
+  && ! -e $prepare_dir/receipt.json \
+  && ! -e $prepare_dir/.receipt.json.ready \
+  && -f $prepare_dir/.receipt.json.tmp ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_prepare_invocation" >"$supervisor_tmp/prepare-recovered.json"
+assert_terminal "$supervisor_tmp/prepare-recovered.json" passed
+[[ -f $prepare_evidence/PASSED.sha256 \
+  && -f $prepare_dir/receipt.json \
+  && ! -e $prepare_dir/.receipt.json.ready \
+  && ! -e $prepare_dir/.receipt.json.tmp ]]
+
+supervisor_precommit_invocation=$(printf '7%.0s' {1..32})
+start_supervisor "$supervisor_precommit_invocation" >/dev/null
+set_supervisor_state shadow active
+precommit_evidence=$(make_supervisor_ready "$supervisor_precommit_invocation")
+set_supervisor_state active inactive
+precommit_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_precommit_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_precommit_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_MV_FAIL_RECEIPT=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'pre-receipt Gate finalization interruption unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ ! -e $precommit_evidence/PASSED.sha256 \
+  && -f $precommit_evidence/.PASSED.sha256.ready \
+  && ! -e $precommit_dir/receipt.json \
+  && -f $precommit_dir/.receipt.json.ready \
+  && -f $precommit_dir/.receipt.json.commit ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_precommit_invocation" >"$supervisor_tmp/precommit-recovered.json"
+assert_terminal "$supervisor_tmp/precommit-recovered.json" passed
+[[ -f $precommit_evidence/PASSED.sha256 \
+  && -f $precommit_dir/receipt.json \
+  && ! -e $precommit_dir/.receipt.json.ready \
+  && ! -e $precommit_dir/.receipt.json.commit ]]
+
+supervisor_recovery_invocation=$(printf '6%.0s' {1..32})
+start_supervisor "$supervisor_recovery_invocation" >/dev/null
+set_supervisor_state shadow active
+recovery_evidence=$(make_supervisor_ready "$supervisor_recovery_invocation")
+set_supervisor_state active inactive
+recovery_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_recovery_invocation"
+if env "${gate_control_env[@]}" \
+  INVOCATION_ID="$supervisor_recovery_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_RM_FAIL_RECEIPT_READY=1 \
+  "$supervisor_control" finalize "$supervisor_candidate_sha" >/dev/null 2>&1; then
+  printf 'interrupted Gate finalization unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ -f $recovery_evidence/PASSED.sha256 \
+  && -f $recovery_dir/receipt.json \
+  && -f $recovery_dir/.receipt.json.ready ]]
+gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_recovery_invocation" >"$supervisor_tmp/recovered.json"
+assert_terminal "$supervisor_tmp/recovered.json" passed
+[[ -f $recovery_dir/receipt.json \
+  && ! -e $recovery_dir/.receipt.json.ready ]]
 
 supervisor_pass_invocation=$(printf '3%.0s' {1..32})
 start_supervisor "$supervisor_pass_invocation" >/dev/null
