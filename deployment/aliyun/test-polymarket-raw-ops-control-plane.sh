@@ -2417,11 +2417,17 @@ baseline_health_requires_continuous_freshness rust_release
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
+  -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
   -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \
-  -e '/^fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
+  -e '/^fresh_legacy_health_observation() {$/,/^}$/p' \
+  -e '/^wait_for_fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
   >"$legacy_health_observer"
 [[ -s $legacy_health_observer ]] || {
   printf 'Gate has no completed-write freshness verifier for legacy health\n' >&2
+  exit 1
+}
+grep -Fq 'wait_for_fresh_legacy_health_observation() {' "$GATE" || {
+  printf 'Gate has no bounded legacy health admission wait\n' >&2
   exit 1
 }
 (
@@ -2433,6 +2439,56 @@ sed -n \
   fi
   # shellcheck source=/dev/null
   source "$legacy_health_observer"
+  [[ $LEGACY_HEALTH_START_WAIT_SECONDS -eq 3900 ]] || {
+    printf 'Gate legacy health admission wait is not bounded to 3900 seconds\n' >&2
+    exit 1
+  }
+  verify_baseline_identity() { return 0; }
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/waiting-legacy-health.json"
+  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/waiting-legacy-health.json"
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/pending-legacy-health.json"
+  printf '0\n' >"$tmp_dir/legacy-health-wait-sleeps"
+  sleep() {
+    local calls
+    calls=$(($(<"$tmp_dir/legacy-health-wait-sleeps") + 1))
+    printf '%s\n' "$calls" >"$tmp_dir/legacy-health-wait-sleeps"
+    if ((calls == 1)); then
+      mv "$tmp_dir/pending-legacy-health.json" "$tmp_dir/waiting-legacy-health.json"
+    fi
+  }
+  wait_observation=$(wait_for_fresh_legacy_health_observation \
+    "$tmp_dir/waiting-legacy-health.json" "$LEGACY_HEALTH_POLICY") || {
+    printf 'Gate did not wait for the next completed legacy health publication\n' >&2
+    exit 1
+  }
+  [[ $(<"$tmp_dir/legacy-health-wait-sleeps") -eq 1 ]] || {
+    printf 'Gate legacy health admission did not wait exactly once for completion\n' >&2
+    exit 1
+  }
+  jq -e '.health.last_success_at == "2026-07-15T00:00:01Z"' \
+    <<<"$wait_observation" >/dev/null
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/timed-out-legacy-health.json"
+  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/timed-out-legacy-health.json"
+  SECONDS=0
+  sleep() { SECONDS=$((SECONDS + LEGACY_HEALTH_START_WAIT_SECONDS)); }
+  if wait_for_fresh_legacy_health_observation \
+    "$tmp_dir/timed-out-legacy-health.json" "$LEGACY_HEALTH_POLICY" >/dev/null; then
+    printf 'Gate accepted legacy health after its bounded admission wait expired\n' >&2
+    exit 1
+  fi
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/late-legacy-health.json"
+  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/late-legacy-health.json"
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/late-pending-legacy-health.json"
+  SECONDS=0
+  sleep() {
+    mv "$tmp_dir/late-pending-legacy-health.json" "$tmp_dir/late-legacy-health.json"
+    SECONDS=$LEGACY_HEALTH_START_WAIT_SECONDS
+  }
+  if wait_for_fresh_legacy_health_observation \
+    "$tmp_dir/late-legacy-health.json" "$LEGACY_HEALTH_POLICY" >/dev/null; then
+    printf 'Gate accepted legacy health published after its bounded admission wait expired\n' >&2
+    exit 1
+  fi
   legacy_health_publication_after_gate 120 start-file 120 completion-file || {
     printf 'Gate rejected a distinct atomic health write in the Gate start second\n' >&2
     exit 1
@@ -2498,7 +2554,7 @@ sed -n \
   )
 )
 daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
-snapshot_line=$(grep -nF 'baseline_health_observation=$(fresh_legacy_health_observation' \
+snapshot_line=$(grep -nF 'baseline_health_observation=$(wait_for_fresh_legacy_health_observation' \
   "$GATE" | cut -d: -f1)
 completion_snapshot_line=$(grep -nF \
   'baseline_health_completion_observation=$(fresh_legacy_health_observation' \

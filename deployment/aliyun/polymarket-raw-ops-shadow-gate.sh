@@ -14,6 +14,8 @@ readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
+# Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
+readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
 readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900
@@ -436,6 +438,28 @@ fresh_legacy_health_observation() {
     --arg file_identity "$_device:$_inode" \
     '{health:$health,written_at_unix:$written_at_unix,
       file_identity:$file_identity}'
+}
+
+wait_for_fresh_legacy_health_observation() {
+  local health=$1 policy=$2 observation deadline remaining
+  deadline=$((SECONDS + LEGACY_HEALTH_START_WAIT_SECONDS))
+  while true; do
+    ((SECONDS < deadline)) || return 1
+    verify_baseline_identity || return 1
+    if observation=$(fresh_legacy_health_observation "$health" "$policy"); then
+      ((SECONDS < deadline)) || return 1
+      verify_baseline_identity || return 1
+      ((SECONDS < deadline)) || return 1
+      printf '%s\n' "$observation"
+      return 0
+    fi
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || return 1
+    if ((remaining > 5)); then
+      remaining=5
+    fi
+    sleep "$remaining"
+  done
 }
 
 verify_fresh_baseline_health() {
@@ -1188,10 +1212,10 @@ baseline_health_completion_file_identity=null
 baseline_health_start_success_unix=null
 baseline_health_cutoff_unix=null
 if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
-  baseline_health_observation=$(fresh_legacy_health_observation \
+  baseline_health_observation=$(wait_for_fresh_legacy_health_observation \
     "$LEGACY_SPOOL/health.json" \
     "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
-    || die 'active legacy collector health is not fresh and fail-closed clean'
+    || die 'active legacy collector did not publish fresh health before shadow startup'
   baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
     || die 'frozen legacy collector health observation is invalid'
   baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
