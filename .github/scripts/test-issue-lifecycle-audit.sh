@@ -190,6 +190,8 @@ ruby -ryaml -e '
   abort "expected one workflow job" unless jobs.length == 1
   job = jobs.values.first
   abort "unstable check name" unless job["name"] == "Issue Lifecycle"
+  checkout = job.fetch("steps").find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+  abort "checkout action is not pinned" unless checkout && checkout["uses"].match?(/\Aactions\/checkout@[0-9a-f]{40}\z/)
   runs = job.fetch("steps").map { |step| step["run"] }.compact
   abort "PR event does not target one PR" unless runs.any? { |run| run.include?("--pr") }
   abort "audit does not write step summary" unless runs.all? { |run| run.include?("--summary") }
