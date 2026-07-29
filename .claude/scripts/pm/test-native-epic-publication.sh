@@ -14,6 +14,17 @@ extract_bash_after() {
     in_block { print }
   ' "$file"
 }
+extract_bash_section() {
+  local file="$1"
+  local heading="$2"
+  awk -v heading="$heading" '
+    $0 == heading { found=1; next }
+    found && /^### / { exit }
+    found && /^```bash$/ { in_block=1; next }
+    found && in_block && /^```$/ { in_block=0; next }
+    found && in_block { print }
+  ' "$file"
+}
 write_publication_script() {
   local target="$1"
   shift
@@ -80,8 +91,8 @@ second_root="$(cat "$scratch/run-2")"
 if [ "$first_root" = "$second_root" ] ||
   [ "$first_root" = "$scratch/stale-root" ] ||
   [ "$second_root" = "$scratch/stale-root" ] ||
-  [ ! -d "$first_root" ] || [ ! -d "$second_root" ]; then
-  echo "epic publication reused a scratch root" >&2
+  [ -e "$first_root" ] || [ -e "$second_root" ]; then
+  echo "epic publication reused or retained a scratch root" >&2
   exit 1
 fi
 if grep -Eq 'gh(-| )sub-issue' "$epic_sync" "$init"; then
@@ -117,6 +128,10 @@ case "$*" in
     ;;
   "api --paginate"*"epic:feature"*)
     [ ! -f "$state/500.body" ] || echo "https://github.com/example/repo/issues/500"
+    exit 0
+    ;;
+  "repo view --json nameWithOwner -q .nameWithOwner")
+    echo "example/repo"
     exit 0
     ;;
 esac
@@ -182,6 +197,17 @@ echo "unexpected gh invocation: $*" >&2
 exit 1
 EOF
 chmod +x "$scratch/bin/gh"
+cat > "$scratch/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${MV_FAIL_INSTALL:-0}" = 1 ]; then
+  case "$1" in
+    */rename-stage/501.md) exit 1 ;;
+  esac
+fi
+exec /bin/mv "$@"
+EOF
+chmod +x "$scratch/bin/mv"
 
 cat > "$scratch/project/.claude/epics/feature/002.md" <<'EOF'
 ---
@@ -215,6 +241,10 @@ if run_publication "$scratch/partial-root" > /dev/null 2>&1; then
   echo "partial publication did not surface a child creation failure" >&2
   exit 1
 fi
+if [ -n "$(find "$scratch/run-parent" -mindepth 1 -print -quit)" ]; then
+  echo "failed publication retained its scratch root" >&2
+  exit 1
+fi
 sed '1a\
 monday_source: 001
 ' "$scratch/project/.claude/epics/feature/001.md" > \
@@ -238,6 +268,85 @@ for readback in "500 --json subIssues" "501 --json labels" \
 done
 if [ "$(cat "$scratch/gh-state/502.blockers")" != 501 ]; then
   echo "native blocked-by relationship was not published" >&2
+  exit 1
+fi
+
+rename_project="$scratch/rename-project"
+rename_root="$scratch/rename-root"
+mkdir -p "$rename_project/.claude/epics/feature" "$rename_root"
+cat > "$rename_project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+---
+# Feature
+EOF
+cat > "$rename_project/.claude/epics/feature/001.md" <<'EOF'
+---
+name: First original
+github:
+updated:
+---
+# First original
+EOF
+cat > "$rename_project/.claude/epics/feature/002.md" <<'EOF'
+---
+name: Second original
+github:
+updated:
+---
+# Second original
+EOF
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nARGUMENTS=feature\n'
+  extract_bash_after "$epic_sync" "## Quick Check"
+  cat <<'EOF'
+cat > "$epic_sync_tmp/task-mapping.txt" <<'MAPPINGS'
+.claude/epics/feature/001.md:002
+.claude/epics/feature/002.md:501
+MAPPINGS
+EOF
+  extract_bash_section "$epic_sync" "### 4. Rename Task Files and Update References"
+} > "$scratch/rename.sh"
+chmod +x "$scratch/rename.sh"
+(
+  cd "$rename_project"
+  GH_LOG="$gh_log" GH_STATE_DIR="$scratch/gh-state" \
+    PATH="$scratch/bin:$PATH" MONDAY_EPIC_SYNC_TMP_PARENT="$rename_root" \
+    bash "$scratch/rename.sh"
+) > /dev/null
+if [ -e "$rename_project/.claude/epics/feature/001.md" ] ||
+  ! grep -Fq '# First original' "$rename_project/.claude/epics/feature/002.md" ||
+  ! grep -Fq 'monday_source: 001' "$rename_project/.claude/epics/feature/002.md" ||
+  ! grep -Fq '# Second original' "$rename_project/.claude/epics/feature/501.md" ||
+  ! grep -Fq 'monday_source: 002' "$rename_project/.claude/epics/feature/501.md"; then
+  echo "task renaming overwrote a pending source task" >&2
+  exit 1
+fi
+
+failure_project="$scratch/rename-failure-project"
+failure_root="$scratch/rename-failure-root"
+mkdir -p "$failure_project/.claude/epics/feature" "$failure_root"
+cp "$rename_project/.claude/epics/feature/epic.md" \
+  "$failure_project/.claude/epics/feature/epic.md"
+cp "$rename_project/.claude/epics/feature/002.md" \
+  "$failure_project/.claude/epics/feature/001.md"
+cp "$rename_project/.claude/epics/feature/501.md" \
+  "$failure_project/.claude/epics/feature/002.md"
+if (
+  cd "$failure_project"
+  GH_LOG="$gh_log" GH_STATE_DIR="$scratch/gh-state" MV_FAIL_INSTALL=1 \
+    PATH="$scratch/bin:$PATH" MONDAY_EPIC_SYNC_TMP_PARENT="$failure_root" \
+    bash "$scratch/rename.sh"
+) > /dev/null 2>&1; then
+  echo "task rename did not surface an install failure" >&2
+  exit 1
+fi
+if ! grep -Fq '# First original' "$failure_project/.claude/epics/feature/001.md" ||
+  ! grep -Fq '# Second original' "$failure_project/.claude/epics/feature/002.md" ||
+  [ -e "$failure_project/.claude/epics/feature/501.md" ] ||
+  find "$failure_project/.claude/epics" -maxdepth 1 \
+    -name '.feature-rename-recovery.*' -print -quit | grep -q .; then
+  echo "failed task rename did not restore the source files" >&2
   exit 1
 fi
 

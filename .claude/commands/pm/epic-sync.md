@@ -36,6 +36,29 @@ task_source_id() {
   esac
 }
 
+set_frontmatter_field() {
+  field_file="$1"
+  field_name="$2"
+  field_value="$3"
+  field_tmp="${field_file}.tmp.$$"
+  awk -v name="$field_name" -v value="$field_value" '
+    NR == 1 && $0 == "---" { in_frontmatter=1; print; next }
+    in_frontmatter && $0 == "---" {
+      if (!updated) print name ": " value
+      in_frontmatter=0
+      print
+      next
+    }
+    in_frontmatter && $0 ~ ("^" name ":") {
+      print name ": " value
+      updated=1
+      next
+    }
+    { print }
+  ' "$field_file" > "$field_tmp"
+  mv "$field_tmp" "$field_file"
+}
+
 task_count=$(find "$epic_dir" -maxdepth 1 -type f -name '[0-9]*.md' | awk 'END { print NR }')
 if [ "$task_count" -eq 0 ]; then
   echo "❌ No tasks to sync. Run: /pm:epic-decompose $ARGUMENTS" >&2
@@ -49,6 +72,7 @@ if ! mkdir -p "$epic_sync_parent" ||
   exit 1
 fi
 export MONDAY_EPIC_SYNC_TMP="$epic_sync_tmp"
+trap 'rm -rf -- "$MONDAY_EPIC_SYNC_TMP"' EXIT
 ```
 
 Keep `MONDAY_EPIC_SYNC_TMP` in the controller environment for every step and
@@ -419,41 +443,71 @@ done < "$epic_sync_tmp/task-mapping.txt"
 Then rename files and update all references:
 ```bash
 epic_sync_tmp="${MONDAY_EPIC_SYNC_TMP:?Run the Quick Check first}"
-# Process each task file
+rename_stage="$epic_sync_tmp/rename-stage"
+mkdir -p "$rename_stage"
+if ! repo=$(gh repo view --json nameWithOwner -q .nameWithOwner); then
+  echo "❌ Could not resolve repository identity" >&2
+  exit 1
+fi
+current_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Prepare every destination before removing any source file.
 while IFS=: read -r task_file task_number; do
-  new_name="$(dirname "$task_file")/${task_number}.md"
-  
-  # Read the file content
+  staged_file="$rename_stage/${task_number}.md"
   content=$(cat "$task_file")
   source_id=$(task_source_id "$task_file")
   grep -q '^monday_source:' "$task_file" ||
     content=$(printf '%s\n' "$content" | awk -v id="$source_id" 'NR == 2 { print "monday_source: " id } { print }')
-  
-  # Update depends_on and conflicts_with references
+
   while IFS=: read -r old_num new_num; do
-    # Update arrays like [001, 002] to use new issue numbers
-    content=$(echo "$content" | sed -E "s/(\[|, ?)$old_num(,|\])/\1$new_num\2/g")
+    content=$(printf '%s\n' "$content" | sed -E "s/(\[|, ?)$old_num(,|\])/\1$new_num\2/g")
   done < "$epic_sync_tmp/id-mapping.txt"
-  
-  # Write updated content to new file
-  echo "$content" > "$new_name"
-  
-  # Remove old file if different from new
-  [ "$task_file" != "$new_name" ] && rm "$task_file"
-  
-  # Update github field in frontmatter
-  # Add the GitHub URL to the frontmatter
-  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+
+  printf '%s\n' "$content" > "$staged_file"
   github_url="https://github.com/$repo/issues/$task_number"
-  
-  # Update frontmatter with GitHub URL and current timestamp
-  current_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  
-  # Use sed to update the github and updated fields
-  sed -i.bak "/^github:/c\github: $github_url" "$new_name"
-  sed -i.bak "/^updated:/c\updated: $current_date" "$new_name"
-  rm "${new_name}.bak"
+  set_frontmatter_field "$staged_file" github "$github_url"
+  set_frontmatter_field "$staged_file" updated "$current_date"
 done < "$epic_sync_tmp/task-mapping.txt"
+
+rename_recovery=$(mktemp -d "$(dirname "$epic_dir")/.${ARGUMENTS}-rename-recovery.XXXXXX")
+restore_sources() {
+  restore_ok=1
+  while IFS=: read -r task_file _; do
+    backup_file="$rename_recovery/$(basename "$task_file")"
+    [ ! -e "$backup_file" ] || mv "$backup_file" "$task_file" || restore_ok=0
+  done < "$epic_sync_tmp/task-mapping.txt"
+  [ "$restore_ok" -eq 1 ]
+}
+
+while IFS=: read -r task_file _; do
+  if ! mv "$task_file" "$rename_recovery/$(basename "$task_file")"; then
+    if restore_sources; then
+      rmdir "$rename_recovery"
+    else
+      echo "❌ Source recovery remains at $rename_recovery" >&2
+    fi
+    exit 1
+  fi
+done < "$epic_sync_tmp/task-mapping.txt"
+
+: > "$epic_sync_tmp/installed-task-files.txt"
+while IFS=: read -r task_file task_number; do
+  final_file="$(dirname "$task_file")/${task_number}.md"
+  if ! mv "$rename_stage/${task_number}.md" "$final_file"; then
+    while IFS= read -r installed_file; do
+      rm -f "$installed_file"
+    done < "$epic_sync_tmp/installed-task-files.txt"
+    if restore_sources; then
+      rmdir "$rename_recovery"
+    else
+      echo "❌ Source recovery remains at $rename_recovery" >&2
+    fi
+    exit 1
+  fi
+  printf '%s\n' "$final_file" >> "$epic_sync_tmp/installed-task-files.txt"
+done < "$epic_sync_tmp/task-mapping.txt"
+rm -rf "$rename_recovery"
+rmdir "$rename_stage"
 ```
 
 ### 5. Update Epic File
