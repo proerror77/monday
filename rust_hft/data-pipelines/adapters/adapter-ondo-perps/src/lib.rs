@@ -165,6 +165,7 @@ fn parse_message(text: &str) -> HftResult<Vec<MarketSnapshot>> {
                 asks,
                 sequence: 0,
                 source_venue: Some(VenueId::ONDO_PERPS),
+                timestamps: Default::default(),
             })
         })
         .collect()

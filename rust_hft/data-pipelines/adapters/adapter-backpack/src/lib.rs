@@ -392,6 +392,7 @@ fn handle_depth_event(
             asks,
             sequence,
             source_venue: Some(VenueId::BACKPACK),
+            timestamps: Default::default(),
         }))
     } else {
         if bids.is_empty() && asks.is_empty() {
@@ -406,6 +407,7 @@ fn handle_depth_event(
             sequence,
             is_snapshot: false,
             source_venue: Some(VenueId::BACKPACK),
+            timestamps: Default::default(),
         }))
     }
 }
@@ -431,6 +433,7 @@ fn handle_trade_event(
         side,
         trade_id: evt.trade_id.to_string(),
         source_venue: Some(VenueId::BACKPACK),
+        timestamps: Default::default(),
     }))
 }
 

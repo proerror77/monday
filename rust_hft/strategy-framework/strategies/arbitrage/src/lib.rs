@@ -414,6 +414,7 @@ mod tests {
             asks: vec![BookLevel::new_unchecked(50100.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         };
 
         let venue_snap = VenueSnapshot::from_market_snapshot("BINANCE".to_string(), &snapshot);

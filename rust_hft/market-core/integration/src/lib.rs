@@ -11,4 +11,4 @@ pub mod reconnect;
 pub mod signing;
 pub mod ws;
 
-pub use latency::WsFrameMetrics;
+pub use latency::WsMessageMetrics;

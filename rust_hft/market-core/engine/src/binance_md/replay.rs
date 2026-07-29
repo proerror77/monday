@@ -21,6 +21,7 @@ pub struct ReplayRecord {
     pub kind: ReplayKind,
     pub symbol_id: u32,
     pub exchange_ts_ns: i64,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
     pub receive_ts_ns: i64,
     pub first_update_id: u64,
     pub final_update_id: u64,
@@ -34,6 +35,7 @@ pub struct ReplayRecord {
 pub struct ReplayBridgeUpdate {
     pub symbol_id: u32,
     pub exchange_ts_ns: i64,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
     pub receive_ts_ns: i64,
     pub first_update_id: u64,
     pub final_update_id: u64,

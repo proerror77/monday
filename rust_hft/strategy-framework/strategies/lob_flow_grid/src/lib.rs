@@ -1008,6 +1008,7 @@ mod tests {
             ],
             sequence: 1,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         };
 
         strategy.handle_snapshot(&snapshot.bids, &snapshot.asks, snapshot.timestamp);
@@ -1072,6 +1073,7 @@ mod tests {
             sequence: 11,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         });
 
         let _ = strategy.on_market_event_with_context(&event, &context);
@@ -1097,6 +1099,7 @@ mod tests {
             volume: Quantity::from_f64(1.0).unwrap(),
             trade_count: 1,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         });
 
         assert_eq!(strategy.state.bids, vec![(100.0, 2.0)]);

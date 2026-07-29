@@ -12,9 +12,11 @@ readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
 readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 readonly RELEASE_MANIFEST="$SCRIPT_DIR/polymarket-raw-ops-release.json"
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
+readonly CANDIDATE_ROOT=/opt/monday/candidates/polymarket-raw-ops
 readonly ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-cutovers
+readonly GATE_RECEIPT_ROOT=/data/monday/evidence/polymarket-gate-jobs
 readonly GATE_EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
 readonly MAX_GATE_AGE_SECONDS=86400
 readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
@@ -46,6 +48,8 @@ readonly -a PYTHON_ASSETS=(
   polymarket_market_tape_upload.py
 )
 readonly -a BUNDLE_ASSETS=(
+  polymarket-raw-ops-gate-control.sh
+  polymarket-raw-ops-gate@.service
   polymarket-raw-ops-shadow-gate.sh
   polymarket-raw-ops-cutover.sh
   polymarket-shadow-gate-policy.jq
@@ -58,6 +62,17 @@ readonly -a BUNDLE_ASSETS=(
   polymarket-market-tape-upload.service
   polymarket-market-tape-upload.timer
 )
+readonly -a STAGE_ARTIFACT_ASSETS=(
+  polymarket-raw-ops
+  polymarket-raw-ops.sha256
+  source-revision.txt
+  deployment-bundle.sha256
+  polymarket-raw-ops-release.json
+  polymarket-raw-ops-release.json.sha256
+  polymarket-raw-ops-control-assets.sha256
+  polymarket-raw-ops-control.tar.gz
+  polymarket-raw-ops-control.tar.gz.sha256
+)
 
 die() {
   printf 'Polymarket cutover failed: %s\n' "$*" >&2
@@ -67,7 +82,8 @@ die() {
 usage() {
   printf '%s\n' \
     'Usage:' \
-    '  polymarket-raw-ops-cutover.sh cutover <candidate-sha256> <gate.json>' \
+    '  polymarket-raw-ops-cutover.sh stage <artifact-directory> <expected-source-revision>' \
+    '  polymarket-raw-ops-cutover.sh cutover <candidate-sha256> <receipt.json>' \
     '  polymarket-raw-ops-cutover.sh rollback <cutover-evidence-directory>'
 }
 
@@ -234,6 +250,109 @@ verify_release_binding() {
     | sha256sum --check --strict >/dev/null
 }
 
+stage_release() (
+  local artifact_dir=$1 candidate_root=$2 expected_source_revision=$3
+  local manifest manifest_sha candidate_sha
+  local source_revision bundle_sha archive_sha destination staging='' published=''
+  local control_extract expected_entries actual_entries expected_control_manifest
+  local asset mode
+  artifact_dir=$(readlink -f -- "$artifact_dir")
+  secure_root_chain "$artifact_dir" || die 'artifact directory is not trusted'
+  secure_root_chain "$candidate_root" || die 'candidate root is not trusted'
+  for asset in "${STAGE_ARTIFACT_ASSETS[@]}"; do
+    secure_regular_file "$artifact_dir/$asset"
+  done
+
+  manifest="$artifact_dir/polymarket-raw-ops-release.json"
+  verify_release_manifest "$manifest" || die 'release manifest is invalid'
+  manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
+  [[ $(wc -l <"$artifact_dir/polymarket-raw-ops-release.json.sha256") -eq 1 \
+    && $(<"$artifact_dir/polymarket-raw-ops-release.json.sha256") \
+      == "$manifest_sha  polymarket-raw-ops-release.json" ]] \
+    || die 'release manifest checksum sidecar is invalid'
+  candidate_sha=$(jq -er '.candidate.sha256' "$manifest")
+  source_revision=$(jq -er '.source_revision' "$manifest")
+  [[ $expected_source_revision =~ ^[a-f0-9]{40,64}$ \
+    && $source_revision == "$expected_source_revision" ]] \
+    || die 'release manifest differs from the trusted source revision'
+  bundle_sha=$(jq -er '.control_manifest.sha256' "$manifest")
+  archive_sha=$(jq -er '.control_archive.sha256' "$manifest")
+  [[ $(wc -l <"$artifact_dir/polymarket-raw-ops.sha256") -eq 1 \
+    && $(<"$artifact_dir/polymarket-raw-ops.sha256") \
+      == "$candidate_sha  polymarket-raw-ops" ]] \
+    || die 'candidate checksum sidecar is invalid'
+  printf '%s  %s\n' "$candidate_sha" "$artifact_dir/polymarket-raw-ops" \
+    | sha256sum --check --strict >/dev/null || die 'candidate checksum mismatch'
+  [[ -x $artifact_dir/polymarket-raw-ops ]] || die 'candidate is not executable'
+  [[ $(wc -l <"$artifact_dir/source-revision.txt") -eq 1 \
+    && $(<"$artifact_dir/source-revision.txt") == "$source_revision" ]] \
+    || die 'source revision sidecar differs from the release manifest'
+  [[ $(wc -l <"$artifact_dir/deployment-bundle.sha256") -eq 1 \
+    && $(<"$artifact_dir/deployment-bundle.sha256") == "$bundle_sha" ]] \
+    || die 'deployment bundle sidecar differs from the release manifest'
+  [[ $(sha256sum "$artifact_dir/polymarket-raw-ops-control-assets.sha256" \
+      | awk '{print $1}') == "$bundle_sha" ]] \
+    || die 'control manifest checksum differs from the release manifest'
+  [[ $(wc -l <"$artifact_dir/polymarket-raw-ops-control.tar.gz.sha256") -eq 1 \
+    && $(<"$artifact_dir/polymarket-raw-ops-control.tar.gz.sha256") \
+      == "$archive_sha  polymarket-raw-ops-control.tar.gz" ]] \
+    || die 'control archive checksum sidecar is invalid'
+  printf '%s  %s\n' "$archive_sha" "$artifact_dir/polymarket-raw-ops-control.tar.gz" \
+    | sha256sum --check --strict >/dev/null || die 'control archive checksum mismatch'
+
+  destination="$candidate_root/$manifest_sha"
+  [[ ! -e $destination && ! -L $destination ]] \
+    || die 'immutable candidate destination already exists'
+  staging=$(mktemp -d "$candidate_root/.${manifest_sha}.new.XXXXXX")
+  published=
+  trap '[[ -z ${staging:-} ]] || rm -rf -- "$staging"; \
+    [[ -z ${published:-} ]] || rm -rf -- "$published"' EXIT
+  control_extract="$staging/.controls"
+  mkdir -m 0700 "$control_extract"
+  expected_entries="$staging/.expected-entries"
+  actual_entries="$staging/.actual-entries"
+  printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort >"$expected_entries"
+  tar -tzf "$artifact_dir/polymarket-raw-ops-control.tar.gz" | sort >"$actual_entries"
+  cmp -s "$expected_entries" "$actual_entries" \
+    || die 'control archive entries differ from the governed bundle'
+  tar --no-same-owner --no-same-permissions \
+    -xzf "$artifact_dir/polymarket-raw-ops-control.tar.gz" -C "$control_extract"
+  expected_control_manifest="$staging/.control-assets.sha256"
+  for asset in "${BUNDLE_ASSETS[@]}"; do
+    [[ -f $control_extract/$asset && ! -L $control_extract/$asset ]] \
+      || die "control archive entry is not a direct regular file: $asset"
+    secure_regular_file "$SCRIPT_DIR/$asset"
+    cmp -s "$SCRIPT_DIR/$asset" "$control_extract/$asset" \
+      || die "control archive entry differs from the trusted source: $asset"
+  done
+  (
+    cd "$control_extract"
+    sha256sum "${BUNDLE_ASSETS[@]}"
+  ) >"$expected_control_manifest"
+  cmp -s "$expected_control_manifest" \
+    "$artifact_dir/polymarket-raw-ops-control-assets.sha256" \
+    || die 'extracted controls differ from the signed control manifest'
+  for asset in "${STAGE_ARTIFACT_ASSETS[@]}"; do
+    mode=0444; [[ $asset == polymarket-raw-ops ]] && mode=0755
+    install -m "$mode" "$artifact_dir/$asset" "$staging/$asset"
+  done
+  for asset in "${BUNDLE_ASSETS[@]}"; do
+    mode=0644; [[ $asset == *.sh ]] && mode=0755
+    install -m "$mode" "$control_extract/$asset" "$staging/$asset"
+  done
+  rm -rf -- "$control_extract" "$expected_entries" "$actual_entries" \
+    "$expected_control_manifest"
+  chmod 0755 "$staging"
+  mv -T -n "$staging" "$destination"
+  [[ ! -e $staging && -d $destination && ! -L $destination ]] \
+    || die 'immutable candidate destination appeared during atomic publication'
+  staging=
+  published=$destination
+  sync -f "$candidate_root"
+  published=
+  printf '%s\n' "$destination"
+)
+
 verify_control_release() {
   local control_dir=$1 expected_sha=$2 expected_binary=$3 manifest asset assets
   local actual_bundle_sha expected_bundle_sha
@@ -315,6 +434,62 @@ verify_gate_marker() {
     cd "$gate_dir"
     sha256sum --check --strict PASSED.sha256 >/dev/null
   )
+}
+
+verify_gate_terminal_receipt() {
+  local receipt=$1 candidate_sha=$2 invocation source_revision receipt_dir
+  local expected_receipt gate_dir gate_json gate_json_sha receipt_sha
+  [[ -f $receipt && ! -L $receipt ]] || return 1
+  receipt=$(readlink -f -- "$receipt") || return 1
+  secure_regular_file "$receipt" || return 1
+  receipt_sha=$(sha256sum "$receipt" | awk '{print $1}') || return 1
+  jq -e -s --arg candidate "$candidate_sha" '
+    length == 1 and (.[0] |
+      keys == ["candidate_sha256","phase","schema","shadow",
+        "source_revision","systemd","systemd_invocation_id","terminal_state",
+        "unit"]
+      and (.systemd | keys == ["exit_code","exit_status","result"])
+      and (.shadow | keys == ["active_state","containment","main_pid",
+        "stop_result","unit"])
+      and .schema == "monday.polymarket_gate_receipt.v1"
+      and .candidate_sha256 == $candidate
+      and (.source_revision | type == "string"
+        and test("^[a-f0-9]{40,64}$"))
+      and (.systemd_invocation_id | type == "string"
+        and test("^[a-f0-9]{32}$"))
+      and .unit == ("polymarket-raw-ops-gate@" + $candidate + ".service")
+      and .phase == "terminal" and .terminal_state == "passed"
+      and .systemd.result == "success" and .systemd.exit_code == "exited"
+      and .systemd.exit_status == "0"
+      and .shadow.unit ==
+        ("polymarket-reference-collector-shadow@" + $candidate + ".service")
+      and .shadow.stop_result == "success"
+      and .shadow.containment == "contained"
+      and (.shadow.active_state == "inactive" or .shadow.active_state == "failed")
+      and .shadow.main_pid == "0")' "$receipt" >/dev/null || return 1
+  invocation=$(jq -er .systemd_invocation_id "$receipt") || return 1
+  source_revision=$(jq -er .source_revision "$receipt") || return 1
+  receipt_dir="$GATE_RECEIPT_ROOT/$candidate_sha/$invocation"
+  expected_receipt="$receipt_dir/receipt.json"
+  [[ $receipt == "$expected_receipt" ]] || return 1
+  secure_root_chain "$receipt_dir" || return 1
+  gate_dir="$GATE_EVIDENCE_ROOT/$candidate_sha/$invocation"
+  gate_json="$gate_dir/gate.json"
+  secure_root_chain "$gate_dir" || return 1
+  secure_regular_file "$gate_json" || return 1
+  secure_regular_file "$gate_dir/PASSED.sha256" || return 1
+  verify_gate_marker "$gate_dir" || return 1
+  jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" \
+    --arg invocation "$invocation" '
+    .candidate_sha256 == $candidate
+    and .deployment_source_revision == $source
+    and .shadow_run_id == $invocation
+    and .production_eligible == true and .passed == true
+  ' "$gate_json" >/dev/null || return 1
+  gate_json_sha=$(sha256sum "$gate_json" | awk '{print $1}') || return 1
+  [[ $(sha256sum "$receipt" | awk '{print $1}') == "$receipt_sha" ]] || return 1
+  printf '%s|%s|%s|%s|%s|%s\n' "$invocation" "$source_revision" \
+    "$receipt_sha" "$gate_json_sha" "$gate_json" "$receipt"
 }
 
 verify_named_marker() {
@@ -888,12 +1063,18 @@ restore_legacy() (
 )
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
-for command in awk date dirname flock grep install journalctl jq ln mkdir mountpoint \
-  mv readlink rm sed seq sha256sum sleep stat sync systemctl tr wc; do
+for command in awk cmp date dirname flock grep install journalctl jq ln mkdir mktemp mountpoint \
+  mv readlink rm sed seq sha256sum sleep sort stat sync systemctl tar tr wc; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 mode=${1:-}
 case "$mode" in
+  stage)
+    [[ $# -eq 3 ]] || {
+      usage >&2
+      exit 2
+    }
+    ;;
   rollback)
     [[ $# -eq 2 ]] || {
       usage >&2
@@ -911,12 +1092,33 @@ case "$mode" in
     exit 2
     ;;
 esac
+if [[ $mode == stage ]]; then
+  [[ -d $2 && ! -L $2 ]] || die 'artifact must be a direct directory'
+  artifact_dir=$(readlink -f -- "$2")
+  stage_script=$(readlink -f -- "$0")
+  [[ -f $0 && ! -L $0 \
+    && $stage_script == "$SCRIPT_DIR/polymarket-raw-ops-cutover.sh" ]] \
+    || die 'stage command must be the direct script from a trusted source tree'
+  for path in "$SCRIPT_DIR" "$artifact_dir" /opt/monday /opt/monday/candidates \
+    "$CANDIDATE_ROOT" /run/monday; do
+    secure_root_chain_or_absent "$path" \
+      || die "trusted path chain is not root-owned and non-writable: $path"
+  done
+  secure_regular_file "$stage_script"
+  install -d -m 0755 /opt/monday/candidates "$CANDIDATE_ROOT" /run/monday
+  secure_root_chain "$CANDIDATE_ROOT" || die 'candidate root is not trusted'
+  secure_root_chain /run/monday || die 'runtime control directory is not trusted'
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die 'another Polymarket release operation is running'
+  stage_release "$artifact_dir" "$CANDIDATE_ROOT" "$3"
+  exit
+fi
 mountpoint -q /data || die '/data must be a mount point'
 for path in "$SCRIPT_DIR" /etc/monday /etc/systemd/system /opt/monday \
   /opt/monday/bin /opt/monday/control "$CONTROL_DIR" /opt/monday/releases "$RELEASE_ROOT" \
   /data /data/monday \
   /data/monday/spool /data/monday/evidence "$EVIDENCE_ROOT" \
-  "$GATE_EVIDENCE_ROOT" /run/monday; do
+  "$GATE_RECEIPT_ROOT" "$GATE_EVIDENCE_ROOT" /run/monday; do
   secure_root_chain_or_absent "$path" \
     || die "trusted path chain is not root-owned and non-writable: $path"
 done
@@ -1039,11 +1241,18 @@ deployment_bundle_sha=$(bundle_sha256)
 current_oss_config_sha=$(oss_config_sha256)
 
 candidate_sha=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-[[ -f $3 && ! -L $3 ]] || die 'gate evidence must be a direct regular file'
-gate_json=$(readlink -f -- "$3")
 [[ $candidate_sha =~ ^[a-f0-9]{64}$ ]] || die 'candidate SHA-256 is invalid'
-[[ $gate_json == "$GATE_EVIDENCE_ROOT"/*/gate.json ]] \
-  || die 'gate evidence is outside the fixed shadow evidence root'
+terminal_binding=$(verify_gate_terminal_receipt "$3" "$candidate_sha") \
+  || die 'Gate terminal receipt is invalid or not passed'
+IFS='|' read -r gate_systemd_invocation_id gate_receipt_source_revision \
+  gate_terminal_receipt_sha256 gate_json_sha256 gate_json \
+  gate_terminal_receipt extra_binding \
+  <<<"$terminal_binding"
+[[ -n $gate_systemd_invocation_id && -n $gate_receipt_source_revision \
+  && -n $gate_terminal_receipt_sha256 && -n $gate_json_sha256 \
+  && -n $gate_json \
+  && -n $gate_terminal_receipt && -z $extra_binding ]] \
+  || die 'Gate terminal receipt binding is malformed'
 secure_regular_file "$gate_json"
 gate_dir=$(dirname "$gate_json")
 secure_root_chain "$gate_dir" || die 'gate evidence directory is not trusted'
@@ -1064,6 +1273,10 @@ gate_control_archive_sha=$(jq -er \
 gate_source_revision=$(jq -er \
   '.deployment_source_revision | select(type == "string" and test("^[a-f0-9]{40,64}$"))' \
   "$gate_json") || die 'shadow gate is missing the source revision identity'
+[[ $gate_source_revision == "$gate_receipt_source_revision" ]] \
+  || die 'Gate receipt source differs from shadow evidence'
+[[ $(jq -er .shadow_run_id "$gate_json") == "$gate_systemd_invocation_id" ]] \
+  || die 'Gate receipt invocation differs from shadow evidence'
 gate_oss_config_sha=$(jq -er '.oss_config_sha256 | select(type == "string")' "$gate_json") \
   || die 'shadow gate is missing the OSS configuration identity'
 [[ $gate_oss_config_sha == "$current_oss_config_sha" ]] \
@@ -1187,6 +1400,11 @@ on_exit() {
 trap on_exit EXIT
 
 # Drain with the still-installed legacy uploader before changing any unit.
+[[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
+  == "$gate_terminal_receipt_sha256" ]] \
+  || die 'Gate terminal receipt changed before cutover transition'
+[[ $(sha256sum "$gate_json" | awk '{print $1}') == "$gate_json_sha256" ]] \
+  || die 'Gate evidence changed before cutover transition'
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed before the cutover transition'
 transition_started=true
@@ -1353,6 +1571,11 @@ verify_rust_health_file "$health_file" "$started_epoch" \
 health_sha=$(sha256sum "$health_file" | awk '{print $1}')
 journal_sha=$(sha256sum "$journal_file" | awk '{print $1}')
 rollback_sha=$(sha256sum "$rollback_dir/manifest.sha256" | awk '{print $1}')
+[[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
+  == "$gate_terminal_receipt_sha256" ]] \
+  || die 'Gate terminal receipt changed before cutover evidence publication'
+[[ $(sha256sum "$gate_json" | awk '{print $1}') == "$gate_json_sha256" ]] \
+  || die 'Gate evidence changed before cutover evidence publication'
 jq -n \
   --arg schema monday.polymarket_cutover.v1 \
   --arg baseline_mode "$baseline_mode" \
@@ -1362,7 +1585,9 @@ jq -n \
   --arg release_manifest_sha256 "$gate_release_manifest_sha" \
   --arg control_archive_sha256 "$gate_control_archive_sha" \
   --arg oss_config_sha256 "$gate_oss_config_sha" \
-  --arg gate_json_sha256 "$(sha256sum "$gate_json" | awk '{print $1}')" \
+  --arg gate_json_sha256 "$gate_json_sha256" \
+  --arg gate_terminal_receipt_sha256 "$gate_terminal_receipt_sha256" \
+  --arg gate_systemd_invocation_id "$gate_systemd_invocation_id" \
   --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg health_sha256 "$health_sha" \
   --arg journal_sha256 "$journal_sha" \
@@ -1375,7 +1600,10 @@ jq -n \
     release_manifest_sha256:$release_manifest_sha256,
     control_archive_sha256:$control_archive_sha256,
     oss_config_sha256:$oss_config_sha256,
-    gate_json_sha256:$gate_json_sha256,completed_at:$completed_at,
+    gate_json_sha256:$gate_json_sha256,
+    gate_terminal_receipt_sha256:$gate_terminal_receipt_sha256,
+    gate_systemd_invocation_id:$gate_systemd_invocation_id,
+    completed_at:$completed_at,
     collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,
       health_sha256:$health_sha256,
       journal_sha256:$journal_sha256},

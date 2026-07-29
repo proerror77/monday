@@ -222,6 +222,7 @@ mod tests {
             }],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         })
     }
 

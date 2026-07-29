@@ -1120,6 +1120,7 @@ mod tests {
                 asks: vec![BookLevel::new(mid + 1.0, 1.0).unwrap()],
                 sequence: 1,
                 source_venue: Some(VenueId::BITGET),
+                timestamps: Default::default(),
             };
             let mut topn = TopNSnapshot::new(Symbol::new(*symbol), 1);
             topn.update_from_snapshot(&snapshot);
