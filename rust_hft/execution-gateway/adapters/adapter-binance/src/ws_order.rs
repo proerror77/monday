@@ -13,7 +13,7 @@ pub struct BinanceWsOrderAttempt {
     pub outcome: HftResult<Value>,
     pub write_started_mono_us: Option<u64>,
     pub write_returned_mono_us: Option<u64>,
-    pub response_received_mono_us: Option<u64>,
+    pub decoded_response_mono_us: Option<u64>,
 }
 
 struct Command {
@@ -134,7 +134,7 @@ async fn send_request(
             ))),
             write_started_mono_us: Some(write_started_mono_us),
             write_returned_mono_us: None,
-            response_received_mono_us: None,
+            decoded_response_mono_us: None,
         };
     }
     let write_returned_mono_us = hft_core::monotonic_micros();
@@ -143,17 +143,14 @@ async fn send_request(
         loop {
             match socket.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    let response_received_mono_us = hft_core::monotonic_micros();
                     let value: Value = match serde_json::from_str(&text) {
                         Ok(value) => value,
                         Err(error) => {
-                            return (
-                                Err(HftError::Serialization(error.to_string())),
-                                Some(response_received_mono_us),
-                            )
+                            return (Err(HftError::Serialization(error.to_string())), None)
                         }
                     };
                     if value.get("id").and_then(Value::as_str) == Some(id) {
+                        let response_received_mono_us = hft_core::monotonic_micros();
                         return (Ok(value), Some(response_received_mono_us));
                     }
                 }
@@ -183,7 +180,7 @@ async fn send_request(
         }
     })
     .await;
-    let (outcome, response_received_mono_us) = response.unwrap_or_else(|_| {
+    let (outcome, decoded_response_mono_us) = response.unwrap_or_else(|_| {
         (
             Err(HftError::Timeout(
                 "Binance WS order outcome unknown".to_string(),
@@ -195,7 +192,7 @@ async fn send_request(
         outcome,
         write_started_mono_us: Some(write_started_mono_us),
         write_returned_mono_us: Some(write_returned_mono_us),
-        response_received_mono_us,
+        decoded_response_mono_us,
     }
 }
 
@@ -243,7 +240,7 @@ mod tests {
         assert!(receipt.outcome.is_ok());
         let write_started = receipt.write_started_mono_us.unwrap();
         let write_returned = receipt.write_returned_mono_us.unwrap();
-        let response_received = receipt.response_received_mono_us.unwrap();
+        let response_received = receipt.decoded_response_mono_us.unwrap();
         assert!(write_started <= write_returned);
         assert!(write_returned < response_received);
         assert!(
@@ -278,6 +275,35 @@ mod tests {
         assert!(matches!(attempt.outcome, Err(HftError::Timeout(_))));
         assert!(attempt.write_started_mono_us.is_some());
         assert!(attempt.write_returned_mono_us.is_some());
-        assert!(attempt.response_received_mono_us.is_none());
+        assert!(attempt.decoded_response_mono_us.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_response_is_not_a_validated_response_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _request = socket.next().await.unwrap().unwrap();
+            socket.send(Message::Text("not-json".into())).await.unwrap();
+        });
+
+        let client =
+            BinanceWsOrderClient::connect(format!("ws://{address}"), Duration::from_millis(200))
+                .await
+                .unwrap();
+        let attempt = client
+            .submit(
+                "client-malformed".to_string(),
+                serde_json::json!({"id": "client-malformed"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(attempt.outcome, Err(HftError::Serialization(_))));
+        assert!(attempt.write_started_mono_us.is_some());
+        assert!(attempt.write_returned_mono_us.is_some());
+        assert!(attempt.decoded_response_mono_us.is_none());
     }
 }

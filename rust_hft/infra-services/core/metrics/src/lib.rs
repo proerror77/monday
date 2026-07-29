@@ -128,6 +128,27 @@ impl MetricsRegistry {
         let latency_buckets = vec![
             1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
         ];
+        let execution_span_buckets = vec![
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            20.0,
+            50.0,
+            100.0,
+            200.0,
+            500.0,
+            1_000.0,
+            2_000.0,
+            5_000.0,
+            10_000.0,
+            20_000.0,
+            50_000.0,
+            100_000.0,
+            200_000.0,
+            500_000.0,
+            1_000_000.0,
+        ];
 
         let latency_ws_receive = Histogram::with_opts(
             HistogramOpts::new(
@@ -203,7 +224,7 @@ impl MetricsRegistry {
                 "hft_execution_span_microseconds",
                 "Monotonic execution spans; userspace_write excludes kernel and NIC TX",
             )
-            .buckets(latency_buckets.clone()),
+            .buckets(execution_span_buckets),
             &["span"],
         )
         .expect("創建 execution span 直方圖失敗");
@@ -618,6 +639,12 @@ impl MetricsRegistry {
             .observe(latency_us);
     }
 
+    pub fn record_execution_intent_to_private_report(&self, latency_us: f64) {
+        self.execution_latency_spans
+            .with_label_values(&["intent_to_private_report"])
+            .observe(latency_us);
+    }
+
     /// 記錄下單→Ack 延遲
     pub fn record_order_ack_latency(&self, latency_us: f64) {
         self.latency_order_ack.observe(latency_us);
@@ -920,5 +947,28 @@ mod tests {
         record_latency!(ingestion, start);
         record_latency!(aggregation, start);
         record_latency!(strategy, start);
+    }
+
+    #[test]
+    fn execution_spans_retain_remote_response_tail_resolution() {
+        let metrics = MetricsRegistry::isolated();
+        metrics.record_execution_intent_to_private_report(50_000.0);
+
+        let family = metrics
+            .registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "hft_execution_span_microseconds")
+            .unwrap();
+        let histogram = family.metric[0].histogram.as_ref().unwrap();
+        assert_eq!(
+            histogram
+                .bucket
+                .iter()
+                .find(|bucket| bucket.upper_bound() == 50_000.0)
+                .unwrap()
+                .cumulative_count(),
+            1
+        );
     }
 }

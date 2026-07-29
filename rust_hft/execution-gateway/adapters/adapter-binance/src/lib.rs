@@ -858,12 +858,35 @@ impl ExecutionClient for BinanceExecutionClient {
                 hft_core::HftError::Network("Binance WS order channel is not connected".to_string())
             })?;
             let receipt = ws_order.submit(client_order_id.clone(), payload).await?;
+            let response = match receipt.outcome {
+                Ok(response) => response,
+                Err(error) => {
+                    self.last_submission_timing = Some((
+                        receipt.write_started_mono_us,
+                        receipt.write_returned_mono_us,
+                        None,
+                    ));
+                    return Err(error);
+                }
+            };
+            let outcome = parse_binance_ws_order_response(response, &client_order_id);
+            // Preserve the decoded-message boundary, but expose it only after semantic validation.
+            let response_received_mono_us = (receipt.decoded_response_mono_us.is_some()
+                && matches!(
+                    &outcome,
+                    Ok(_)
+                        | Err(hft_core::HftError::RateLimit(_))
+                        | Err(hft_core::HftError::Authentication(_))
+                        | Err(hft_core::HftError::Exchange(_))
+                ))
+            .then_some(receipt.decoded_response_mono_us)
+            .flatten();
             self.last_submission_timing = Some((
                 receipt.write_started_mono_us,
                 receipt.write_returned_mono_us,
-                receipt.response_received_mono_us,
+                response_received_mono_us,
             ));
-            return parse_binance_ws_order_response(receipt.outcome?, &client_order_id);
+            return outcome;
         }
 
         // Paper: 立即回傳訂單ID並廣播 ACK/Fill

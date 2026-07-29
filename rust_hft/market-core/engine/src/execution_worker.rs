@@ -134,6 +134,7 @@ struct ExecutionSpanSnapshot {
     write_to_response_us: Option<u64>,
     write_to_private_ack_us: Option<u64>,
     write_to_private_report_us: Option<u64>,
+    intent_to_private_report_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -195,6 +196,10 @@ impl ExecutionTimeline {
             ),
             write_to_private_report_us: elapsed(
                 self.write_returned_mono_us,
+                self.private_report_received_mono_us,
+            ),
+            intent_to_private_report_us: elapsed(
+                self.intent_emitted_mono_us,
                 self.private_report_received_mono_us,
             ),
         }
@@ -937,9 +942,14 @@ impl ExecutionWorker {
                     }
                 }
                 ports::PrivateOrderEventKind::Report => {
-                    if let Some(value) = timeline.spans().write_to_private_report_us {
+                    let spans = timeline.spans();
+                    if let Some(value) = spans.write_to_private_report_us {
                         infra_metrics::MetricsRegistry::global()
                             .record_execution_write_to_private_report(value as f64);
+                    }
+                    if let Some(value) = spans.intent_to_private_report_us {
+                        infra_metrics::MetricsRegistry::global()
+                            .record_execution_intent_to_private_report(value as f64);
                     }
                 }
             }
@@ -3343,6 +3353,7 @@ mod tests {
         assert_eq!(before.spans().write_to_private_ack_us, Some(5));
         before.apply_private(ports::PrivateOrderEventKind::Report, 45);
         assert_eq!(before.spans().write_to_private_report_us, Some(10));
+        assert_eq!(before.spans().intent_to_private_report_us, Some(35));
 
         let mut after = ExecutionTimeline::from_lifecycle(&lifecycle, 0);
         after.apply_submission(&receipt);

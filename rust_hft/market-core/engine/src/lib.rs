@@ -267,6 +267,8 @@ pub struct Engine {
     aggregation_events_buf: Vec<ports::MarketEvent>,
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
     intents_work_buf: Vec<ports::OrderIntent>,
+    /// Per-strategy observable intent handoff for the current event.
+    intent_emission_mono_by_strategy: FxHashMap<String, Option<u64>>,
     /// 復用的執行事件緩衝，避免每 tick 分配
     execution_events_buf: Vec<ExecutionEvent>,
     /// 事件驱动唤醒通知器
@@ -360,6 +362,7 @@ impl Engine {
             pending_market_events: Vec::new(),
             aggregation_events_buf: Vec::with_capacity(4),
             intents_work_buf: Vec::new(),
+            intent_emission_mono_by_strategy: FxHashMap::default(),
             execution_events_buf: Vec::new(),
             wakeup_notify: Arc::new(Notify::new()),
             order_submit_ts: FxHashMap::default(),
@@ -1477,6 +1480,9 @@ impl Engine {
             // 復用策略意圖工作緩衝，避免熱路徑重分配
             let mut intents_work_buf = std::mem::take(&mut self.intents_work_buf);
             intents_work_buf.clear();
+            for emitted_at in self.intent_emission_mono_by_strategy.values_mut() {
+                *emitted_at = None;
+            }
             let expected_capacity = self.strategies.len().saturating_mul(4);
             if intents_work_buf.capacity() < expected_capacity {
                 intents_work_buf.reserve(expected_capacity - intents_work_buf.capacity());
@@ -1578,12 +1584,21 @@ impl Engine {
                     }
                 }
 
+                let emitted_at = monotonic_micros();
+                for intent in &intents {
+                    if let Some(timestamp) = self
+                        .intent_emission_mono_by_strategy
+                        .get_mut(&intent.strategy_id)
+                    {
+                        *timestamp = Some(emitted_at);
+                    } else {
+                        self.intent_emission_mono_by_strategy
+                            .insert(intent.strategy_id.clone(), Some(emitted_at));
+                    }
+                }
+
                 intents_work_buf.extend(intents);
             }
-            // Strategy returns a whole Vec, so the batch handoff is the first observable emission
-            // boundary. One timestamp also preserves the existing portfolio-level risk batch.
-            let intent_emitted_wall_us = now_micros();
-            let intent_emitted_mono_us = monotonic_micros();
 
             // 記錄策略階段完成和延遲
             event_tracker.record_stage(LatencyStage::Strategy);
@@ -1616,26 +1631,28 @@ impl Engine {
             }
 
             // 通過風控審核（如果有配置風控管理器）
-            let _risk_start = now_micros();
             let intents_total_before_risk = intents_work_buf.len();
-            let mut intents_to_send = if let Some(risk_manager) = &mut self.risk_manager {
+            let (mut intents_to_send, risk_completed_mono_us) = if let Some(risk_manager) =
+                &mut self.risk_manager
+            {
+                let risk_start = now_micros();
                 // 使用新的 venue-specific 風控方法
-                risk_manager.review_with_venue_specs(
+                let reviewed = risk_manager.review_with_venue_specs(
                     intents_work_buf,
                     &account_view,
                     &self.venue_specs,
-                )
+                );
+                let risk_latency = now_micros().saturating_sub(risk_start);
+                let completed_at = monotonic_micros();
+                event_tracker.record_stage(LatencyStage::Risk);
+                self.latency_monitor
+                    .record_latency(LatencyStage::Risk, risk_latency);
+                #[cfg(feature = "metrics")]
+                infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency as f64);
+                (reviewed, Some(completed_at))
             } else {
-                intents_work_buf // 沒有風控則全部通過（移動所有權）
+                (intents_work_buf, None) // 沒有風控則全部通過（移動所有權）
             };
-
-            let risk_latency = now_micros().saturating_sub(_risk_start);
-            let risk_completed_mono_us = monotonic_micros();
-            event_tracker.record_stage(LatencyStage::Risk);
-            self.latency_monitor
-                .record_latency(LatencyStage::Risk, risk_latency);
-            #[cfg(feature = "metrics")]
-            infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency as f64);
 
             let orders_count = intents_to_send.len() as u32;
             result.orders_generated += orders_count;
@@ -1675,8 +1692,8 @@ impl Engine {
                 for intent in intents_to_send.drain(..) {
                     let max_latency_us = self.config.intent_max_latency_us.max(1);
                     let mut lifecycle = ports::OrderIntentLifecycle::new(
-                        intent_emitted_wall_us,
-                        intent_emitted_wall_us.saturating_add(max_latency_us),
+                        received_at,
+                        received_at.saturating_add(max_latency_us),
                     );
                     lifecycle.max_latency_us = Some(max_latency_us);
                     lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
@@ -1690,8 +1707,12 @@ impl Engine {
                         _ => None,
                     });
                     lifecycle.timing = ports::ExecutionTiming {
-                        intent_emitted_mono_us: Some(intent_emitted_mono_us),
-                        risk_completed_mono_us: Some(risk_completed_mono_us),
+                        intent_emitted_mono_us: self
+                            .intent_emission_mono_by_strategy
+                            .get(&intent.strategy_id)
+                            .copied()
+                            .flatten(),
+                        risk_completed_mono_us,
                         source_market_receive_wall_us: capture_boundary
                             .is_receive_latency_cohort()
                             .then_some(received_at),
@@ -2403,6 +2424,94 @@ mod tests {
             strategy_id: "test".to_string(),
             target_venue: Some(VenueId::MOCK),
         }
+    }
+
+    struct EmittingStrategy {
+        id: String,
+        delay: std::time::Duration,
+    }
+
+    impl ports::Strategy for EmittingStrategy {
+        fn on_market_event(
+            &mut self,
+            _event: &ports::MarketEvent,
+            _account: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            std::thread::sleep(self.delay);
+            let mut intent = test_intent();
+            intent.strategy_id = self.id.clone();
+            vec![intent]
+        }
+
+        fn on_execution_event(
+            &mut self,
+            _event: &ports::ExecutionEvent,
+            _account: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+    }
+
+    #[test]
+    fn strategy_handoffs_are_distinct_but_quote_age_stays_at_market_receive() {
+        let config = EngineConfig {
+            intent_max_latency_us: 100_000,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config);
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        engine.register_strategy(EmittingStrategy {
+            id: "first".to_string(),
+            delay: std::time::Duration::ZERO,
+        });
+        engine.register_strategy(EmittingStrategy {
+            id: "second".to_string(),
+            delay: std::time::Duration::from_millis(2),
+        });
+
+        let received_at = now_micros();
+        engine.pending_market_events.push(PendingMarketEvent {
+            event: MarketEvent::Bar(AggregatedBar {
+                symbol: Symbol::new("BTCUSDT"),
+                interval_ms: 60_000,
+                open_time: received_at,
+                close_time: received_at,
+                open: Price::from_f64(100.0).unwrap(),
+                high: Price::from_f64(100.0).unwrap(),
+                low: Price::from_f64(100.0).unwrap(),
+                close: Price::from_f64(100.0).unwrap(),
+                volume: Quantity::from_f64(1.0).unwrap(),
+                trade_count: 1,
+                source_venue: Some(VenueId::MOCK),
+                timestamps: Default::default(),
+            }),
+            received_at,
+            capture_boundary: LatencyCaptureBoundary::AdapterPublish,
+            book: None,
+        });
+
+        engine
+            .run_strategies_sync(&mut EngineTickResult::default())
+            .unwrap();
+        let envelopes = worker_queues.receive_envelopes();
+        assert_eq!(envelopes.len(), 2);
+        let first = &envelopes[0].lifecycle;
+        let second = &envelopes[1].lifecycle;
+        assert_eq!(first.created_ts, received_at);
+        assert_eq!(second.created_ts, received_at);
+        assert_eq!(first.valid_until, received_at + 100_000);
+        assert_eq!(first.timing.risk_completed_mono_us, None);
+        assert_eq!(second.timing.risk_completed_mono_us, None);
+        assert!(
+            first.timing.intent_emitted_mono_us.unwrap()
+                < second.timing.intent_emitted_mono_us.unwrap()
+        );
     }
 
     #[test]
