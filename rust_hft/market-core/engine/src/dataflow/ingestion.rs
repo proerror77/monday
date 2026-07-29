@@ -258,10 +258,6 @@ impl EventIngester {
 
             // 記錄攝取延遲統計
             self.metrics.record_latency(delay);
-            #[cfg(feature = "metrics")]
-            infra_metrics::MetricsRegistry::global().record_ingestion_latency(delay as f64);
-
-            // Prometheus 直方圖打點（可選）
 
             // 記錄每個事件的延遲情況
             trace!(
