@@ -884,6 +884,8 @@ fn scan_tape_with_identity_at(
     let mut symbols = BTreeSet::new();
     let mut token_ids = BTreeSet::new();
     let mut known_event_tokens = BTreeSet::new();
+    let mut event_token_lifecycles = BTreeMap::new();
+    let mut expired_before_discovery_tokens = BTreeSet::new();
     let mut quoted_token_ids = BTreeSet::new();
     let mut attempted_quote_token_ids = BTreeSet::new();
     let mut contextless_quote_tokens = BTreeSet::new();
@@ -992,6 +994,21 @@ fn scan_tape_with_identity_at(
             token_ids.insert(token_id.to_owned());
         }
         if kind == "event_discovered" {
+            let event_id = update
+                .get("event_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let end_time = update
+                .get("end_time")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|end_time| end_time.with_timezone(&Utc));
+            let expired_before_discovery = event_id.is_some()
+                && end_time
+                    .as_ref()
+                    .is_some_and(|end_time| end_time < &recorded_at);
+            let lifecycle = (event_id, end_time);
             for field in ["up_token", "down_token"] {
                 if let Some(token) = update
                     .get(field)
@@ -999,6 +1016,19 @@ fn scan_tape_with_identity_at(
                     .filter(|v| !v.is_empty())
                 {
                     known_event_tokens.insert(token.to_owned());
+                    match event_token_lifecycles.get(token) {
+                        None => {
+                            event_token_lifecycles.insert(token.to_owned(), lifecycle.clone());
+                            if expired_before_discovery {
+                                expired_before_discovery_tokens.insert(token.to_owned());
+                            }
+                        }
+                        Some(previous) if previous != &lifecycle => {
+                            // Conflicting event association or end time is not safe to exempt.
+                            expired_before_discovery_tokens.remove(token);
+                        }
+                        Some(_) => {}
+                    }
                 }
             }
         }
@@ -1297,11 +1327,15 @@ fn scan_tape_with_identity_at(
         .expect("recorded_at was validated")
         .with_timezone(&Utc);
     let event_context_complete = contextless_quotes == 0;
-    let missing_quote_tokens = known_event_tokens
+    let quote_obligation_tokens = known_event_tokens
+        .difference(&expired_before_discovery_tokens)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let missing_quote_tokens = quote_obligation_tokens
         .difference(&quoted_token_ids)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let missing_quote_attempt_tokens = known_event_tokens
+    let missing_quote_attempt_tokens = quote_obligation_tokens
         .difference(&attempted_quote_token_ids)
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -1402,6 +1436,7 @@ fn scan_tape_with_identity_at(
         "event_context_complete": event_context_complete,
         "quote_coverage_complete": quote_coverage_complete,
         "quote_quality_complete": quote_quality_complete,
+        "expired_before_discovery_tokens": expired_before_discovery_tokens,
         "missing_quote_tokens": missing_quote_tokens,
         "missing_quote_attempt_tokens": missing_quote_attempt_tokens,
         "contextless_quote_tokens": contextless_quote_tokens,
@@ -2439,6 +2474,148 @@ mod tests {
         assert_eq!(manifest["quote_coverage_complete"], false);
         assert_eq!(manifest["missing_quote_tokens"], json!(["down-1"]));
         assert_eq!(manifest["segment_complete"], false);
+    }
+
+    #[test]
+    fn excludes_events_expired_before_discovery_from_quote_coverage() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[record(
+                0,
+                "2026-07-15T01:10:00Z",
+                json!({
+                    "kind": "event_discovered", "event_id": "event-1", "symbol": "BTCUSDT",
+                    "up_token": "up-1", "down_token": "down-1",
+                    "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    "price_to_beat": "100", "resolved_up_won": null,
+                }),
+            )],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(
+            manifest["expired_before_discovery_tokens"],
+            json!(["down-1", "up-1"])
+        );
+        assert_eq!(manifest["missing_quote_tokens"], json!([]));
+        assert_eq!(manifest["missing_quote_attempt_tokens"], json!([]));
+        assert_eq!(manifest["quote_coverage_complete"], true);
+        assert_eq!(manifest["segment_complete"], true);
+        assert_eq!(manifest["canonical"], true);
+    }
+
+    #[test]
+    fn classifies_only_active_tokens_as_mixed_lifecycle_obligations() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[
+                record(
+                    0,
+                    "2026-07-15T01:10:00Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "expired", "symbol": "BTCUSDT",
+                        "up_token": "expired-up", "down_token": "expired-down",
+                        "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    }),
+                ),
+                record(
+                    1,
+                    "2026-07-15T01:10:01Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "active", "symbol": "BTCUSDT",
+                        "up_token": "expired-up", "down_token": "active-down",
+                        "end_time": "2026-07-15T01:15:00Z", "window_secs": 300,
+                    }),
+                ),
+            ],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(
+            manifest["expired_before_discovery_tokens"],
+            json!(["expired-down"])
+        );
+        assert_eq!(
+            manifest["missing_quote_tokens"],
+            json!(["active-down", "expired-up"])
+        );
+        assert_eq!(
+            manifest["missing_quote_attempt_tokens"],
+            json!(["active-down", "expired-up"])
+        );
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["canonical"], false);
+    }
+
+    #[test]
+    fn keeps_ambiguous_and_missing_end_times_in_quote_coverage() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[
+                record(
+                    0,
+                    "2026-07-15T01:10:00Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "equal", "symbol": "BTCUSDT",
+                        "up_token": "equal-up", "down_token": "equal-down",
+                        "end_time": "2026-07-15T01:10:00Z", "window_secs": 300,
+                    }),
+                ),
+                record(
+                    1,
+                    "2026-07-15T01:10:01Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "missing", "symbol": "BTCUSDT",
+                        "up_token": "missing-up", "down_token": "missing-down",
+                        "end_time": null, "window_secs": 300,
+                    }),
+                ),
+                record(
+                    2,
+                    "2026-07-15T01:10:02Z",
+                    json!({
+                        "kind": "event_discovered", "event_id": "invalid", "symbol": "BTCUSDT",
+                        "up_token": "invalid-up", "down_token": "invalid-down",
+                        "end_time": "not-a-timestamp", "window_secs": 300,
+                    }),
+                ),
+                record(
+                    3,
+                    "2026-07-15T01:10:03Z",
+                    json!({
+                        "kind": "event_discovered", "symbol": "BTCUSDT",
+                        "up_token": "unidentified-up", "down_token": "unidentified-down",
+                        "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    }),
+                ),
+            ],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        let required = json!([
+            "equal-down",
+            "equal-up",
+            "invalid-down",
+            "invalid-up",
+            "missing-down",
+            "missing-up",
+            "unidentified-down",
+            "unidentified-up"
+        ]);
+
+        assert_eq!(manifest["expired_before_discovery_tokens"], json!([]));
+        assert_eq!(manifest["missing_quote_tokens"], required);
+        assert_eq!(manifest["missing_quote_attempt_tokens"], required);
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["canonical"], false);
     }
 
     #[test]
