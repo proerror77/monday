@@ -19,6 +19,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+[dev-dependencies]
+tempfile = "3.10"
+
 [[bin]]
 name = "hft-binance-md"
 path = "src/main.rs"

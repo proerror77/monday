@@ -1609,14 +1609,13 @@ mod tests {
 
     #[test]
     fn invalid_context_removes_stale_evidence_before_returning() {
-        let id = format!("{}-{}", std::process::id(), now_micros());
-        let report_path = std::env::temp_dir().join(format!("hft-latency-report-{id}.json"));
-        let context_path = std::env::temp_dir().join(format!("hft-latency-context-{id}.json"));
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        let context_path = dir.path().join("context.json");
         std::fs::write(&report_path, b"stale evidence").unwrap();
         std::fs::write(&context_path, b"not-json").unwrap();
 
         let result = prepare_benchmark_context(Some(&report_path), Some(&context_path));
-        let _ = std::fs::remove_file(context_path);
 
         assert!(result.is_err());
         assert!(!report_path.exists());
@@ -1624,19 +1623,14 @@ mod tests {
 
     #[test]
     fn aliased_report_and_context_path_is_rejected_without_deletion() {
-        let path = std::env::temp_dir().join(format!(
-            "hft-latency-aliased-path-{}-{}.json",
-            std::process::id(),
-            now_micros()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.json");
         std::fs::write(&path, serde_json::to_vec(&benchmark_context()).unwrap()).unwrap();
 
         let result = prepare_benchmark_context(Some(&path), Some(&path));
-        let still_exists = path.exists();
-        std::fs::remove_file(path).unwrap();
 
         assert!(result.is_err());
-        assert!(still_exists);
+        assert!(path.exists());
     }
 
     #[test]
@@ -1665,11 +1659,8 @@ mod tests {
 
     #[test]
     fn incomplete_capture_does_not_write_evidence() {
-        let path = std::env::temp_dir().join(format!(
-            "hft-latency-evidence-{}-{}.json",
-            std::process::id(),
-            now_micros()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
         std::fs::write(&path, b"stale evidence").unwrap();
         let written = write_latency_evidence_if_complete(
             false,
@@ -1683,22 +1674,15 @@ mod tests {
             &LatencyHistograms::new(),
         )
         .unwrap();
-        let exists = path.exists();
-        if exists {
-            let _ = std::fs::remove_file(&path);
-        }
 
         assert!(!written);
-        assert!(!exists);
+        assert!(!path.exists());
     }
 
     #[test]
     fn complete_capture_publishes_one_atomic_benchmark_artifact() {
-        let path = std::env::temp_dir().join(format!(
-            "hft-latency-evidence-complete-{}-{}.json",
-            std::process::id(),
-            now_micros()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
         let mut stats = LiveStats::new();
         stats.warmup_duration_micros = Some(500);
         let written = write_latency_evidence_if_complete(
@@ -1717,17 +1701,12 @@ mod tests {
             serde_json::from_reader(File::open(&path).unwrap()).unwrap();
         assert!(written);
         assert_eq!(artifact["evidence_kind"], "benchmark");
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn failed_atomic_publish_leaves_no_partial_file() {
-        let root = std::env::temp_dir().join(format!(
-            "hft-latency-evidence-failure-{}-{}",
-            std::process::id(),
-            now_micros()
-        ));
-        let path = root.join("report.json");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("report.json");
         std::fs::create_dir_all(&path).unwrap();
 
         let result = write_latency_evidence(
@@ -1743,8 +1722,7 @@ mod tests {
             },
             &LatencyHistograms::new(),
         );
-        let entries: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
-        std::fs::remove_dir_all(&root).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
 
         assert!(result.is_err());
         assert_eq!(entries.len(), 1);
