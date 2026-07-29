@@ -7,14 +7,17 @@ ARTIFACT_HELPER_DIR=$(cd -- "$SCRIPT_DIR/../../.github/scripts" && pwd -P)
 readonly ARTIFACT_HELPER_DIR
 readonly ARTIFACT_HELPER="$ARTIFACT_HELPER_DIR/polymarket-market-recorder-release-artifact.sh"
 readonly UNIT_NAME=polymarket-market-tape.service
+readonly MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
 readonly UNIT_TEMPLATE="$SCRIPT_DIR/$UNIT_NAME"
 readonly UNIT_BINARY_MARKER=/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner
 readonly RELEASE_SUBDIR=/opt/monday/releases/polymarket-market-recorder
 readonly UNIT_SUBPATH="/etc/systemd/system/$UNIT_NAME"
+readonly MARKET_UPLOAD_UNIT_SUBPATH="/etc/systemd/system/$MARKET_UPLOAD_UNIT"
 readonly OUTPUT_SUBDIR=/data/monday/spool/polymarket
 readonly LOCK_SUBPATH=/run/lock/monday-polymarket-market-recorder-deploy.lock
 readonly STATE_SUBPATH=/opt/monday/state/polymarket-market-recorder-deploy.json
 readonly EXPECTED_ARGS='--config /etc/monday/polymarket-market-tape.toml --deployment-id polymarket-market-data-ecs --dry-run'
+readonly EXPECTED_MARKET_UPLOAD_EXEC='/opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 1000'
 readonly MAX_OUTPUT_AGE_SECONDS=120
 
 test_root=${MONDAY_MARKET_RECORDER_DEPLOY_TEST_ROOT:-}
@@ -139,6 +142,15 @@ verify_fresh_output() {
     -name 'market-updates*.ndjson' -print)
   now=$(date +%s)
   ((latest > 0 && latest >= not_before && latest <= now))
+}
+verify_market_upload_runtime() {
+  local fragment drop_ins exec_argv
+  fragment=$(systemctl_value "$MARKET_UPLOAD_UNIT" FragmentPath) || return 1
+  drop_ins=$(systemctl_value "$MARKET_UPLOAD_UNIT" DropInPaths) || return 1
+  exec_argv=$(effective_exec_argv "$MARKET_UPLOAD_UNIT") || return 1
+  [[ $fragment == "$test_root$MARKET_UPLOAD_UNIT_SUBPATH" && -z $drop_ins \
+    && $exec_argv == "$EXPECTED_MARKET_UPLOAD_EXEC" ]] || die \
+    "market-tape uploader runtime is not the Rust raw-ops uploader: unit=$MARKET_UPLOAD_UNIT fragment=${fragment:-<none>} expected_fragment=$test_root$MARKET_UPLOAD_UNIT_SUBPATH drop_ins=${drop_ins:-<none>} exec_start=$exec_argv expected=$EXPECTED_MARKET_UPLOAD_EXEC"
 }
 capture_runtime() {
   local configured_exec actual_exe
@@ -342,6 +354,8 @@ pre_mutation_feasibility() {
     || die 'immutable release root is not owned by root'
   (( (8#$(stat_mode "$RELEASE_ROOT") & 8#022) == 0 )) \
     || die 'immutable release root is writable outside its owner'
+  verify_market_upload_runtime \
+    || die 'market-tape uploader runtime identity is not exact'
   capture_runtime || die 'current market-recorder runtime identity is not exact'
   now=$(date +%s)
   verify_fresh_output "$((now - MAX_OUTPUT_AGE_SECONDS))" \

@@ -107,6 +107,7 @@ release_dir="$fixture/artifact"
 archive="$fixture/polymarket-market-recorder-linux-amd64.tar"
 baseline_binary="$fixture/opt/monday/bin/new-ploy-runner"
 unit="$fixture/etc/systemd/system/polymarket-market-tape.service"
+market_upload_unit="$fixture/etc/systemd/system/polymarket-market-tape-upload.service"
 output="$fixture/data/monday/spool/polymarket/market-updates.ndjson"
 mkdir -p "$fake_bin" "$release_dir" "${baseline_binary%/*}" "${unit%/*}" \
   "$fixture/proc/4101" "$fixture/run/lock" \
@@ -154,6 +155,11 @@ baseline_sha=$(sha256sum "$baseline_binary" | awk '{print $1}')
 sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner|$baseline_binary|" \
   "$SERVICE" >"$unit"
 chmod 0644 "$unit"
+cat >"$market_upload_unit" <<'UPLOAD_UNIT'
+[Service]
+ExecStart=/usr/bin/python3 /opt/monday/bin/polymarket_market_tape_upload.py --quote-depth-levels 0 --quote-sample-ms 1000
+UPLOAD_UNIT
+chmod 0644 "$market_upload_unit"
 ln -s "$baseline_binary" "$fixture/proc/4101/exe"
 printf '{"fixture":"fresh"}\n' >"$output"
 
@@ -175,7 +181,17 @@ case "$command" in
     ;;
   show)
     property=${1#--property=}
+    unit=${3:-}
     [[ ${FAKE_SYSTEMCTL_QUERY_ERROR_PROPERTY:-} != "$property" ]] || exit 1
+    if [[ $unit == polymarket-market-tape-upload.service ]]; then
+      case "$property" in
+        FragmentPath) printf '%s\n' "$FAKE_MARKET_UPLOAD_UNIT" ;;
+        DropInPaths) printf '%s\n' "${FAKE_MARKET_UPLOAD_DROP_INS:-}" ;;
+        ExecStart) printf '{ argv[]=%s ; }\n' "$FAKE_MARKET_UPLOAD_EXEC" ;;
+        *) exit 2 ;;
+      esac
+      exit 0
+    fi
     case "$property" in
       ActiveState)
         if jq -e .active "$FAKE_SYSTEMCTL_STATE" >/dev/null; then
@@ -241,7 +257,9 @@ export MONDAY_MARKET_RECORDER_DEPLOY_TEST_ROOT="$fixture" \
   MONDAY_MARKET_RECORDER_VERIFY_SLEEP_SECONDS=0 \
   FAKE_SYSTEMCTL_STATE="$state" FAKE_SYSTEMCTL_MUTATION_LOG="$mutation_log" \
   FAKE_SYSTEMCTL_ROOT="$fixture" FAKE_SYSTEMCTL_UNIT="$unit" \
-  FAKE_SYSTEMCTL_OUTPUT="$output" FAKE_SYSTEMCTL_EXPECTED_ARGS="$service_args"
+  FAKE_SYSTEMCTL_OUTPUT="$output" FAKE_SYSTEMCTL_EXPECTED_ARGS="$service_args" \
+  FAKE_MARKET_UPLOAD_UNIT="$market_upload_unit" \
+  FAKE_MARKET_UPLOAD_EXEC="/usr/bin/python3 /opt/monday/bin/polymarket_market_tape_upload.py --quote-depth-levels 0 --quote-sample-ms 1000"
 run_deploy() {
   FAKE_SYSTEMCTL_BAD_ONCE_FILE="${bad_once:-}" \
   FAKE_SYSTEMCTL_BAD_PROC_EXE="${bad_proc_exe:-}" \
@@ -262,6 +280,17 @@ chmod 0755 "$SCRIPT_DIR"
 chmod 0777 "${ARTIFACT_HELPER%/*}"
 run_deploy preflight "$archive" "$source_revision" "$image_digest" >/dev/null 2>&1 && exit 1
 chmod 0755 "${ARTIFACT_HELPER%/*}"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/legacy-uploader-preflight.out" 2>&1 && exit 1
+grep -Fq 'market-tape uploader runtime is not the Rust raw-ops uploader' \
+  "$fixture/legacy-uploader-preflight.out"
+run_deploy install "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/legacy-uploader-install.out" 2>&1 && exit 1
+grep -Fq 'market-tape uploader runtime is not the Rust raw-ops uploader' \
+  "$fixture/legacy-uploader-install.out"
+[[ ! -s $mutation_log ]]
+[[ ! -e $fixture/opt/monday/releases/polymarket-market-recorder/$candidate_sha ]]
+export FAKE_MARKET_UPLOAD_EXEC="/opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 1000"
 run_deploy preflight "$archive" "$source_revision" "$image_digest"
 [[ ! -s $mutation_log ]]
 [[ ! -e $fixture/opt/monday/releases/polymarket-market-recorder/$candidate_sha ]]
