@@ -1099,6 +1099,7 @@ mod tests {
             volume: Quantity::from_f64(1.0).unwrap(),
             trade_count: 1,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         });
 
         assert_eq!(strategy.state.bids, vec![(100.0, 2.0)]);

@@ -119,6 +119,8 @@ pub struct AggregatedBar {
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// 統一市場事件
@@ -160,6 +162,7 @@ impl MarketEvent {
             Self::Update(update) => Some(&update.timestamps),
             Self::Quote(quote) => Some(&quote.timestamps),
             Self::Trade(trade) => Some(&trade.timestamps),
+            Self::Bar(bar) => Some(&bar.timestamps),
             _ => None,
         }
     }
@@ -170,6 +173,7 @@ impl MarketEvent {
             Self::Update(update) => Some(&mut update.timestamps),
             Self::Quote(quote) => Some(&mut quote.timestamps),
             Self::Trade(trade) => Some(&mut trade.timestamps),
+            Self::Bar(bar) => Some(&mut bar.timestamps),
             _ => None,
         }
     }

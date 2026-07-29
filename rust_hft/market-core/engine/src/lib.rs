@@ -2526,6 +2526,7 @@ mod tests {
             volume: Quantity::from_f64(10.0).unwrap(),
             trade_count: 100,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         });
 
         let account = AccountView::default();

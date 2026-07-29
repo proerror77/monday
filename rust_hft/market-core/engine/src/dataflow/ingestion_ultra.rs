@@ -39,6 +39,15 @@ use ports::{MarketEvent, TrackedMarketEvent};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[inline(always)]
+fn tracker_origin_time(event: &MarketEvent, fallback: u64) -> u64 {
+    event
+        .timestamps()
+        .and_then(|timestamps| timestamps.local_receive)
+        .map(|timestamp| timestamp.as_micros())
+        .unwrap_or(fallback)
+}
+
 /// 極簡配置（僅關鍵參數）
 #[derive(Debug, Clone)]
 pub struct UltraIngestionConfig {
@@ -156,7 +165,7 @@ impl UltraEventIngester {
         }
 
         // 3. 創建追蹤事件（零拷貝：移動所有權）
-        let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+        let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -200,7 +209,7 @@ impl UltraEventIngester {
             }
 
             // 創建追蹤事件（移動 event 所有權）
-            let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+            let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
             tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
             tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -246,7 +255,7 @@ impl UltraEventIngester {
         }
 
         // 4. 創建追蹤事件
-        let mut tracker = hft_core::LatencyTracker::from_time(event_ts);
+        let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -396,7 +405,7 @@ impl UltraEventConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::Symbol;
+    use hft_core::{LocalReceiveTimestamp, MarketDataTimestamps, Symbol};
     use ports::{BookLevel, MarketSnapshot};
 
     #[test]
@@ -419,6 +428,25 @@ mod tests {
         // 安全讀取
         let received = consumer.recv();
         assert!(received.is_some());
+    }
+
+    #[test]
+    fn tracker_origin_uses_local_receive_provenance() {
+        let local_receive = now_micros().saturating_sub(100);
+        let event = MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![],
+            asks: vec![],
+            sequence: 1,
+            source_venue: None,
+            timestamps: MarketDataTimestamps {
+                local_receive: Some(LocalReceiveTimestamp::new(local_receive)),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(tracker_origin_time(&event, now_micros()), local_receive);
     }
 
     #[test]

@@ -363,10 +363,16 @@ impl BinanceMarketStream {
             }
 
             if !has_exchange_event {
-                if let (MarketEvent::Quote(quote), Some(local_receive)) =
-                    (&mut event, local_receive)
-                {
-                    quote.timestamp = local_receive.as_micros();
+                if let Some(local_receive) = local_receive {
+                    match &mut event {
+                        MarketEvent::Quote(quote) => {
+                            quote.timestamp = local_receive.as_micros();
+                        }
+                        MarketEvent::Snapshot(snapshot) => {
+                            snapshot.timestamp = local_receive.as_micros();
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -1078,14 +1084,11 @@ mod tests {
 
     #[test]
     fn tracked_timestamps_keep_depth_e_trade_e_t_and_local_receive_distinct() {
+        let received_at_unix_us = 123_456_999_000;
         let parse = |message| {
             BinanceMarketStream::parse_tracked_socket_event(
                 bytes::Bytes::from_static(message),
-                WsFrameMetrics::new_with_unix(
-                    hft_core::monotonic_micros(),
-                    hft_core::now_micros(),
-                    0,
-                ),
+                WsFrameMetrics::new_with_unix(hft_core::monotonic_micros(), received_at_unix_us, 0),
             )
             .unwrap()
             .expect("tracked Binance event")
@@ -1105,6 +1108,14 @@ mod tests {
         );
         assert!(depth.event.timestamps().unwrap().exchange_trade.is_none());
         assert!(depth.event.timestamps().unwrap().local_receive.is_some());
+
+        let partial_depth = parse(
+            br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#,
+        );
+        let MarketEvent::Snapshot(snapshot) = partial_depth.event else {
+            panic!("expected partial depth snapshot");
+        };
+        assert_eq!(snapshot.timestamp, received_at_unix_us);
 
         let trade = parse(
             br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":123456790,"s":"BTCUSDT","t":12345,"p":"45000.00","q":"0.1","T":123456789,"m":false}}"#,
@@ -1143,5 +1154,27 @@ mod tests {
             panic!("expected bookTicker quote");
         };
         assert_eq!(quote.timestamp, local_receive.as_micros());
+
+        let kline = parse(
+            br#"{"stream":"btcusdt@kline_1m","data":{"e":"kline","E":123456791,"s":"BTCUSDT","k":{"t":123456000,"T":123515999,"s":"BTCUSDT","i":"1m","f":100,"L":200,"o":"45000.00","c":"45001.00","h":"45002.00","l":"44999.00","v":"1.0","n":10,"x":false,"q":"45000.0","V":"0.5","Q":"22500.0","B":"0"}}}"#,
+        );
+        assert_eq!(
+            kline
+                .event
+                .timestamps()
+                .unwrap()
+                .exchange_event
+                .map(|timestamp| timestamp.as_micros()),
+            Some(123456791000)
+        );
+        assert_eq!(
+            kline
+                .event
+                .timestamps()
+                .unwrap()
+                .local_receive
+                .map(|timestamp| timestamp.as_micros()),
+            Some(received_at_unix_us)
+        );
     }
 }
