@@ -487,6 +487,7 @@ mod tests {
             volume: Quantity(Decimal::from(5)),
             trade_count: 10,
             source_venue: Some(VenueId::BINANCE_SPOT),
+            timestamps: Default::default(),
         })
     }
 

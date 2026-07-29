@@ -2,6 +2,15 @@
 
 <!-- One behavior and one reason it is needed. -->
 
+## Issue relationship
+
+<!-- Replace None with exactly one relationship. Examples: Refs #123 for
+partial/runtime/tracking work or a non-main stack; Closes #123 only when this
+PR completes the whole code contract on main. The same rule applies to commit
+messages and the close/fix/resolve keyword families. -->
+
+None
+
 ## Out of scope
 
 <!-- Name adjacent work deliberately left out. -->

@@ -101,6 +101,7 @@ impl MessageConverter {
             volume,
             trade_count: kline.trade_count,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         })
     }
 

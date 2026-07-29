@@ -40,7 +40,8 @@ pub struct SymbolLobContinuitySummary {
     pub last_update_id: Option<u64>,
     pub first_source_time_ms: Option<u64>,
     pub last_source_time_ms: Option<u64>,
-    /// WS-library complete-message delivery range in userspace; not kernel or NIC RX.
+    /// Event observation range: WS delivery for diffs, REST completion for snapshots,
+    /// and local generation for checkpoints; not a homogeneous receive-latency cohort.
     pub first_received_at_ns: Option<u64>,
     pub last_received_at_ns: Option<u64>,
     /// Venue E to WS-library complete-message delivery; not pure network latency.
