@@ -987,9 +987,16 @@ impl ClobBookState {
         let Some(size) = entry.size else {
             return Err("Polymarket price change is missing size".to_string());
         };
+        let invalid_bba = entry
+            .best_bid
+            .is_some_and(|price| !(Decimal::ZERO..=Decimal::ONE).contains(&price))
+            || entry
+                .best_ask
+                .is_some_and(|price| !(Decimal::ZERO..=Decimal::ONE).contains(&price));
         if size < Decimal::ZERO
             || !(Decimal::ZERO..=Decimal::ONE).contains(&entry.price)
             || !matches!(entry.side, Side::Buy | Side::Sell)
+            || invalid_bba
         {
             return Err("Polymarket price change contains an invalid field".to_string());
         }
@@ -1020,6 +1027,28 @@ impl ClobBookState {
             levels.remove(&entry.price);
         }
         timestamps.insert(entry.price, timestamp);
+        let Some((best_bid, best_ask)) = entry.best_bid.zip(entry.best_ask) else {
+            return;
+        };
+        if best_bid > best_ask {
+            return;
+        }
+        let bid_timestamps = &mut self.bid_timestamps;
+        self.bids.retain(|price, _| {
+            let keep = *price <= best_bid;
+            if !keep {
+                bid_timestamps.insert(*price, timestamp);
+            }
+            keep
+        });
+        let ask_timestamps = &mut self.ask_timestamps;
+        self.asks.retain(|price, _| {
+            let keep = *price >= best_ask;
+            if !keep {
+                ask_timestamps.insert(*price, timestamp);
+            }
+            keep
+        });
     }
 
     fn quote(
@@ -1124,17 +1153,19 @@ fn market_updates_from_price_change(
     let Some(ts) = DateTime::from_timestamp_millis(change.timestamp) else {
         return Err("Polymarket price-change timestamp is out of range".to_string());
     };
+    let default_state = ClobBookState::default();
+    let mut applicable_entries = Vec::new();
     let mut updated_tokens = Vec::new();
     let mut last_entries = HashMap::new();
 
     for entry in &change.price_changes {
-        let token_id = entry.asset_id.to_string();
-        books.entry(token_id).or_default().validate_change(entry)?;
+        default_state.validate_change(entry)?;
     }
 
     for entry in &change.price_changes {
         let token_id = entry.asset_id.to_string();
-        if books[&token_id]
+        let state = books.get(&token_id).unwrap_or(&default_state);
+        if state
             .snapshot_timestamp
             .is_some_and(|last| change.timestamp < last)
         {
@@ -1144,7 +1175,6 @@ fn market_updates_from_price_change(
             .get(&token_id)
             .is_some_and(|last| change.timestamp < *last)
         {
-            let state = &books[&token_id];
             if state
                 .level_timestamp(entry)
                 .is_some_and(|last| change.timestamp < last)
@@ -1153,6 +1183,27 @@ fn market_updates_from_price_change(
             }
             return Err("Polymarket price-change source time moved backwards".to_string());
         }
+        if entry
+            .best_bid
+            .zip(entry.best_ask)
+            .is_some_and(|(bid, ask)| bid > ask)
+        {
+            return Err(POLYMARKET_CLOB_CROSSED_BOOK_ERROR.to_string());
+        }
+        let size = entry.size.expect("price change was validated");
+        if size > Decimal::ZERO
+            && match entry.side {
+                Side::Buy => entry.best_bid.is_some_and(|best| entry.price > best),
+                Side::Sell => entry.best_ask.is_some_and(|best| entry.price < best),
+                _ => unreachable!("price change side was validated"),
+            }
+        {
+            return Err("Polymarket price change contains an invalid field".to_string());
+        }
+        applicable_entries.push((token_id, entry));
+    }
+
+    for (token_id, entry) in applicable_entries {
         books
             .entry(token_id.clone())
             .or_default()
@@ -1161,6 +1212,19 @@ fn market_updates_from_price_change(
         if last_entries.insert(token_id.clone(), entry).is_none() {
             updated_tokens.push(token_id);
         }
+    }
+
+    if last_entries.iter().any(|(token_id, entry)| {
+        let state = &books[token_id];
+        state.initialized
+            && (entry
+                .best_bid
+                .is_some_and(|price| pm_tradeable_price(price) && !state.bids.contains_key(&price))
+                || entry.best_ask.is_some_and(|price| {
+                    pm_tradeable_price(price) && !state.asks.contains_key(&price)
+                }))
+    }) {
+        return Err("Polymarket price-change BBA is missing from cached depth".to_string());
     }
 
     let updates = updated_tokens
@@ -2511,6 +2575,224 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn clob_positive_level_outside_reported_bba_fails_closed() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.61", "size": "10", "side": "BUY",
+                "hash": null, "best_bid": "0.60", "best_ask": "0.62"
+            }]
+        }))
+        .expect("syntactically valid but inconsistent price change");
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn clob_missing_reported_bba_requires_fresh_snapshot() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}, {"price": "0.38", "size": "5"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.41", "size": "10", "side": "SELL",
+                "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+            }]
+        }))
+        .expect("valid price change whose reported bid is missing locally");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        let error = market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect_err("missing authoritative BBA level must require a fresh snapshot");
+        assert!(error.contains("missing from cached depth"));
+    }
+
+    #[test]
+    fn clob_cancellation_bba_prunes_only_more_competitive_stale_depth() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [
+                {"price": "0.40", "size": "7"},
+                {"price": "0.35", "size": "6"},
+                {"price": "0.30", "size": "5"}
+            ],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.35", "size": "0", "side": "BUY",
+                "hash": null, "best_bid": "0.30", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid cancellation with post-event BBA");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        let updates = market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect("cancellation BBA should reconcile stale top levels");
+        assert!(matches!(
+            updates.as_slice(),
+            [MarketUpdate::Quote {
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            }] if *bid == dec!(0.30)
+                && *ask == dec!(0.60)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.30), dec!(5))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.60), dec!(9))]
+        ));
+        assert!(!books["7"].bids.contains_key(&dec!(0.40)));
+        assert!(!books["7"].bids.contains_key(&dec!(0.35)));
+        assert!(books["7"].bids.contains_key(&dec!(0.30)));
+    }
+
+    #[test]
+    fn clob_invalid_later_bba_does_not_mutate_prior_token() {
+        let first_book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.38", "size": "2"}],
+            "asks": [{"price": "0.39", "size": "1"}, {"price": "0.41", "size": "3"}],
+            "hash": null
+        }))
+        .expect("valid first CLOB book update");
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [
+                {
+                    "asset_id": "7", "price": "0.40", "size": "10", "side": "BUY",
+                    "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+                },
+                {
+                    "asset_id": "8", "price": "0.61", "size": "10", "side": "BUY",
+                    "hash": null, "best_bid": "0.60", "best_ask": "0.62"
+                }
+            ]
+        }))
+        .expect("syntactically valid batch with an inconsistent later entry");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&first_book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
+        assert!(!books["7"].bids.contains_key(&dec!(0.40)));
+        assert!(books["7"].asks.contains_key(&dec!(0.39)));
+        assert!(!books.contains_key("8"));
+    }
+
+    #[test]
+    fn clob_price_change_bba_prunes_stale_crossed_levels_per_token() {
+        use sha2::Digest;
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        let up_token =
+            "41542505488057268747646102765538559787092195571513884627130758935628213319126";
+        let down_token =
+            "7335525875962923702441063748642161498788112653863579087206891242613686090845";
+        let up_snapshot = br#"{"event_type":"book","asset_id":"41542505488057268747646102765538559787092195571513884627130758935628213319126","market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47","timestamp":"1785328736000","bids":[{"price":"0.38","size":"2"}],"asks":[{"price":"0.39","size":"1"},{"price":"0.41","size":"3"}]}"#;
+        let down_snapshot = br#"{"event_type":"book","asset_id":"7335525875962923702441063748642161498788112653863579087206891242613686090845","market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47","timestamp":"1785328736000","bids":[{"price":"0.61","size":"1"},{"price":"0.59","size":"4"}],"asks":[{"price":"0.62","size":"5"}]}"#;
+        let payload = br#"{"market":"0xa37566a917002ef3c9267135f9de9a3ba64c0c422ba764cb20a44f5f36451f47", "price_changes":[{"asset_id":"41542505488057268747646102765538559787092195571513884627130758935628213319126", "price":"0.4", "size":"566.56", "side":"BUY", "hash":"4d147f0d1fc447309a9fbfe2ead47ad805f70133", "best_bid":"0.4", "best_ask":"0.41"}, {"asset_id":"7335525875962923702441063748642161498788112653863579087206891242613686090845", "price":"0.6", "size":"566.56", "side":"SELL", "hash":"d4344ba2f0f8e944ddb9fdd722cd7ff0e791abd2", "best_bid":"0.59", "best_ask":"0.6"}], "timestamp":"1785328736855", "event_type":"price_change"}"#;
+
+        assert_eq!(payload.len(), 611);
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(payload)),
+            "a69df924185368799f86d441c9250083ede2ca7fc943084e6524c03600f4f2df"
+        );
+        assert!(forward_clob_ws_payload(up_snapshot, &tx, &mut books, &mut timestamps).unwrap());
+        assert!(forward_clob_ws_payload(down_snapshot, &tx, &mut books, &mut timestamps).unwrap());
+        rx.try_recv().expect("up snapshot quote");
+        rx.try_recv().expect("down snapshot quote");
+
+        assert!(
+            forward_clob_ws_payload(payload, &tx, &mut books, &mut timestamps)
+                .expect("provider BBA should reconcile stale cached top levels")
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            } if token_id.as_ref() == up_token
+                && bid == dec!(0.4)
+                && ask == dec!(0.41)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.4), dec!(566.56)), (dec!(0.38), dec!(2))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.41), dec!(3))]
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            } if token_id.as_ref() == down_token
+                && bid == dec!(0.59)
+                && ask == dec!(0.6)
+                && bid_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.59), dec!(4))]
+                && ask_levels.iter().map(|level| (level.price, level.size)).collect::<Vec<_>>()
+                    == vec![(dec!(0.6), dec!(566.56)), (dec!(0.62), dec!(5))]
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn clob_failure_capture_is_byte_exact_create_once_and_only_on_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -2759,7 +3041,7 @@ mod tests {
             "timestamp": "1712205600300",
             "price_changes": [{
                 "asset_id": "7", "price": "0.52", "size": "8", "side": "BUY",
-                "hash": null, "best_bid": "0.52", "best_ask": "0.53"
+                "hash": null, "best_bid": "0.52", "best_ask": "0.60"
             }]
         }))
         .expect("newer price change");
