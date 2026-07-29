@@ -27,7 +27,7 @@ if command -v gsha256sum >/dev/null 2>&1; then
   }
 fi
 
-for command in cargo chmod cp grep jq ln mkdir mktemp mv python3 rm sed sha256sum \
+for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum \
   shellcheck sort sync wc zstd; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
@@ -109,84 +109,103 @@ printf 'inactive\n' >"$supervisor_state/shadow"
 : >"$supervisor_gate_calls"
 
 cat >"$supervisor_fake_bin/systemctl" <<'EOF'
-#!/usr/bin/env python3
-import os
-import subprocess
-import sys
-from pathlib import Path
+#!/usr/bin/env bash
+set -euo pipefail
 
-state_dir = Path(os.environ["FAKE_SYSTEMCTL_STATE"])
-argv = sys.argv[1:]
-Path(os.environ["FAKE_SYSTEMCTL_CALLS"]).open("a").write(" ".join(argv) + "\n")
+read_state() { tr -d '\n' <"$FAKE_SYSTEMCTL_STATE/$1"; }
+write_state() { printf '%s\n' "$2" >"$FAKE_SYSTEMCTL_STATE/$1"; }
 
-def read(name: str) -> str:
-    return (state_dir / name).read_text().strip()
-
-def write(name: str, value: str) -> None:
-    (state_dir / name).write_text(f"{value}\n")
-
-match argv:
-    case ["daemon-reload"]:
-        pass
-    case ["start", unit]:
-        candidate = unit.removeprefix("polymarket-raw-ops-gate@").removesuffix(".service")
-        invocation = read("invocation")
-        subprocess.run(
-            [os.environ["FAKE_GATE_CONTROL"], "prepare", candidate],
-            check=True,
-            env={**os.environ, "INVOCATION_ID": invocation},
-        )
-        write("active", "active")
-    case ["stop", *_, unit] if unit.startswith("polymarket-reference-collector-shadow@"):
-        if os.environ.get("FAKE_SHADOW_STOP_FAIL") == "1":
-            raise SystemExit(5)
-        write("shadow", "inactive")
-    case ["stop", *_, unit] if unit.startswith("polymarket-raw-ops-gate@"):
-        candidate = unit.removeprefix("polymarket-raw-ops-gate@").removesuffix(".service")
-        invocation = read("invocation")
-        write("active", "inactive")
-        subprocess.run(
-            [os.environ["FAKE_GATE_CONTROL"], "finalize", candidate],
-            check=True,
-            env={
-                **os.environ,
-                "INVOCATION_ID": invocation,
-                "SERVICE_RESULT": "signal",
-                "EXIT_CODE": "killed",
-                "EXIT_STATUS": "15",
-            },
-            stdout=subprocess.DEVNULL,
-        )
-    case ["show", unit, *rest]:
-        prop = next((item.split("=", 1)[1] for item in rest if item.startswith("--property=")), "")
-        if os.environ.get("FAKE_SHOW_FAIL") == prop:
-            raise SystemExit(9)
-        if prop == "ActiveState":
-            print(read("shadow" if unit.startswith("polymarket-reference-collector-shadow@") else "active"))
-        elif prop == "InvocationID":
-            print(read("invocation"))
-        elif prop == "MainPID":
-            if unit.startswith("polymarket-reference-collector-shadow@"):
-                print("5252" if read("shadow") == "active" else "0")
-            else:
-                print("4242" if read("active") == "active" else "0")
-        elif prop == "FragmentPath":
-            print("/etc/systemd/system/polymarket-raw-ops-gate@.service")
-        elif prop == "DropInPaths":
-            print("")
-        else:
-            raise SystemExit(2)
-    case _:
-        raise SystemExit(2)
+printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_CALLS"
+case "${1:-}" in
+  daemon-reload)
+    [[ $# -eq 1 ]] || exit 2
+    ;;
+  start)
+    [[ $# -eq 2 ]] || exit 2
+    unit=${2:-}
+    candidate=${unit#polymarket-raw-ops-gate@}
+    candidate=${candidate%.service}
+    INVOCATION_ID=$(read_state invocation) \
+      "$FAKE_GATE_CONTROL" prepare "$candidate"
+    write_state active active
+    ;;
+  stop)
+    [[ $# -ge 2 ]] || exit 2
+    unit=${!#}
+    if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+      [[ ${FAKE_SHADOW_STOP_FAIL:-0} != 1 ]] || exit 5
+      write_state shadow inactive
+    elif [[ $unit == polymarket-raw-ops-gate@* ]]; then
+      candidate=${unit#polymarket-raw-ops-gate@}
+      candidate=${candidate%.service}
+      invocation=$(read_state invocation)
+      write_state active inactive
+      INVOCATION_ID=$invocation \
+        SERVICE_RESULT=signal \
+        EXIT_CODE=killed \
+        EXIT_STATUS=15 \
+        "$FAKE_GATE_CONTROL" finalize "$candidate" >/dev/null
+    else
+      exit 2
+    fi
+    ;;
+  show)
+    [[ $# -ge 2 ]] || exit 2
+    unit=${2:-}
+    property=
+    for argument in "${@:3}"; do
+      [[ $argument == --property=* ]] && property=${argument#--property=}
+    done
+    [[ ${FAKE_SHOW_FAIL:-} != "$property" ]] || exit 9
+    case "$property" in
+      ActiveState)
+        if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+          read_state shadow
+        else
+          read_state active
+        fi
+        ;;
+      InvocationID) read_state invocation ;;
+      MainPID)
+        if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
+          [[ $(read_state shadow) == active ]] && printf '5252\n' || printf '0\n'
+        else
+          [[ $(read_state active) == active ]] && printf '4242\n' || printf '0\n'
+        fi
+        ;;
+      FragmentPath) printf '/etc/systemd/system/polymarket-raw-ops-gate@.service\n' ;;
+      DropInPaths) printf '\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
 EOF
 chmod 0755 "$supervisor_fake_bin/systemctl"
 cat >"$supervisor_fake_bin/flock" <<'EOF'
-#!/usr/bin/env python3
-import fcntl
-import sys
-fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+#!/usr/bin/perl
+use Fcntl qw(LOCK_EX LOCK_NB);
+open my $lock, '<&=', $ARGV[-1] or die "dup lock fd: $!\n";
+my $operation = LOCK_EX;
+$operation |= LOCK_NB if grep { $_ eq '-n' } @ARGV;
+exit(flock($lock, $operation) ? 0 : 1);
 EOF
 chmod 0755 "$supervisor_fake_bin/flock"
+
+flock_probe="$supervisor_tmp/flock-probe.lock"
+exec 7>"$flock_probe"
+"$supervisor_fake_bin/flock" 7
+exec 8>"$flock_probe"
+if "$supervisor_fake_bin/flock" -n 8; then
+  printf 'fake flock did not preserve the parent-held lock\n' >&2
+  exit 1
+fi
+exec 7>&-
+"$supervisor_fake_bin/flock" -n 8 || {
+  printf 'fake flock did not release the closed parent lock\n' >&2
+  exit 1
+}
+exec 8>&-
 
 gate_control_env=(
   MONDAY_ALLOW_POLYMARKET_GATE_CONTROL_TEST_MODE=1
@@ -340,7 +359,7 @@ rm "$pass_evidence/PASSED.sha256"
 reject gate_control status "$supervisor_candidate_sha" \
   "$supervisor_pass_invocation"
 if grep -Fq 'polymarket-reference-collector.service' "$supervisor_calls"; then
-  printf 'Gate supervisor mutated the Python baseline\n' >&2
+  printf 'Gate supervisor mutated the legacy baseline\n' >&2
   exit 1
 fi
 
