@@ -4,6 +4,9 @@
 //! `MarketUpdate` broadcast channel consumed by `LiveFeed`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -40,6 +43,10 @@ use crate::reference_prices::{
 
 const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
 const POLYMARKET_CLOB_HTTP_ENDPOINT: &str = "https://clob.polymarket.com";
+const POLYMARKET_CLOB_FAILURE_CAPTURE_ENV: &str = "MONDAY_POLYMARKET_CLOB_FAILURE_CAPTURE_PATH";
+const POLYMARKET_CLOB_CROSSED_BOOK_ERROR: &str =
+    "Polymarket price-change batch produced a crossed book";
+const MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES: usize = 1_048_576;
 const NEAR_DEPTH_PCT_RANGE: f64 = 0.001;
 const DB_POLYMARKET_SETTLEMENT_RETRY_LOOKBACK_SECS: i64 = 30 * 60;
 
@@ -1172,9 +1179,46 @@ fn market_updates_from_price_change(
             } if bid > ask
         )
     }) {
-        return Err("Polymarket price-change batch produced a crossed book".to_string());
+        return Err(POLYMARKET_CLOB_CROSSED_BOOK_ERROR.to_string());
     }
     Ok(updates)
+}
+
+fn persist_clob_failure_payload(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("capture payload exceeds {MAX_POLYMARKET_CLOB_FAILURE_CAPTURE_BYTES} bytes"),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture path has no parent directory",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture parent must be a direct canonical directory",
+        ));
+    }
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn send_quote_collection_failure_and_empty(
@@ -1249,6 +1293,55 @@ fn forward_clob_ws_payload(
     Ok(true)
 }
 
+async fn capture_crossed_clob_failure_and_empty(
+    tx: &broadcast::Sender<MarketUpdate>,
+    token_ids: &[U256],
+    request_started_at: DateTime<Utc>,
+    failure_capture_path: Option<&Path>,
+    payload: &[u8],
+    failure: &str,
+) -> bool {
+    let Some(path) = failure_capture_path.filter(|_| failure == POLYMARKET_CLOB_CROSSED_BOOK_ERROR)
+    else {
+        return false;
+    };
+
+    let _ = send_quote_collection_failure_and_empty(
+        tx,
+        token_ids,
+        request_started_at,
+        "websocket_payload",
+    );
+    let owned_path = path.to_owned();
+    let owned_payload = payload.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        persist_clob_failure_payload(&owned_path, &owned_payload)
+    })
+    .await
+    {
+        Ok(Ok(())) => warn!(
+            path = %path.display(),
+            bytes = payload.len(),
+            "Captured first crossed-book CLOB payload; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => warn!(
+            path = %path.display(),
+            "Crossed-book CLOB payload capture already exists; stopping diagnostic feed"
+        ),
+        Ok(Err(error)) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture failed; stopping diagnostic feed"
+        ),
+        Err(error) => error!(
+            %error,
+            path = %path.display(),
+            "Crossed-book CLOB payload capture task failed; stopping diagnostic feed"
+        ),
+    }
+    true
+}
+
 /// Publish Polymarket CLOB book and BBA ticks directly to the strategy runtime.
 ///
 /// Disconnects publish empty quotes so the strategy fails closed until a fresh
@@ -1262,6 +1355,8 @@ pub fn spawn_clob_ws_quote_feed_until(
     tokio::spawn(async move {
         let mut last_timestamp: HashMap<String, i64> = HashMap::new();
         let mut books_by_token: HashMap<String, ClobBookState> = HashMap::new();
+        let failure_capture_path =
+            std::env::var_os(POLYMARKET_CLOB_FAILURE_CAPTURE_ENV).map(PathBuf::from);
         let endpoint = format!(
             "{}/ws/market",
             POLYMARKET_CLOB_WS_ENDPOINT.trim_end_matches('/')
@@ -1355,6 +1450,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        text.as_bytes(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -1370,6 +1475,16 @@ pub fn spawn_clob_ws_quote_feed_until(
                                 Ok(false) => return,
                                 Err(error) => {
                                     warn!(%error, "Polymarket hot-path binary payload parse failed; reconnecting for a fresh snapshot");
+                                    if capture_crossed_clob_failure_and_empty(
+                                        &tx,
+                                        &token_ids,
+                                        request_started_at,
+                                        failure_capture_path.as_deref(),
+                                        bytes.as_ref(),
+                                        &error,
+                                    ).await {
+                                        return;
+                                    }
                                     break "websocket_payload";
                                 }
                             }
@@ -2009,11 +2124,12 @@ fn parse_agg_trade_msg(v: &serde_json::Value) -> Option<AggTradeMsg> {
 #[cfg(test)]
 mod tests {
     use super::{
-        book_quote_from_rest, db_polymarket_poll_intervals, equity_price_subscription,
-        l2_updates_from_book, mark_db_event_expired_if_resolved, market_update_from_clob_book,
+        book_quote_from_rest, capture_crossed_clob_failure_and_empty, db_polymarket_poll_intervals,
+        equity_price_subscription, forward_clob_ws_payload, l2_updates_from_book,
+        mark_db_event_expired_if_resolved, market_update_from_clob_book,
         market_updates_from_price_change, parse_agg_trade_msg, parse_equity_price_payload,
         rtds_market_data_ws_config, send_quote_collection_failure_and_empty, ClobBookState,
-        RestBook, U256,
+        RestBook, POLYMARKET_CLOB_CROSSED_BOOK_ERROR, U256,
     };
     use chrono::Utc;
     use ploy_market_contracts::MarketUpdate;
@@ -2393,6 +2509,123 @@ mod tests {
             &mut std::collections::HashMap::new(),
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn clob_failure_capture_is_byte_exact_create_once_and_only_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        let snapshot = br#"{
+            "event_type":"book",
+            "asset_id":"7",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600100",
+            "bids":[{"price":"0.40","size":"7"}],
+            "asks":[{"price":"0.60","size":"9"}]
+        }"#;
+        let crossed = br#"{
+            "event_type":"price_change",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp":"1712205600200",
+            "price_changes":[{
+                "asset_id":"7","price":"0.61","size":"10","side":"BUY",
+                "best_bid":"0.61","best_ask":"0.60"
+            }]
+        }"#;
+
+        assert!(forward_clob_ws_payload(snapshot, &tx, &mut books, &mut timestamps,).unwrap());
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote { token_id, .. } if token_id.as_ref() == "7"
+        ));
+        assert!(
+            !capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                b"not captured",
+                "websocket_receive",
+            )
+            .await
+        );
+        assert!(!capture.exists());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let error = forward_clob_ws_payload(crossed, &tx, &mut books, &mut timestamps).unwrap_err();
+        assert!(error.contains("crossed book"));
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                crossed,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(&capture).unwrap(), crossed);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::QuoteCollectionFailure { token_id, .. }
+                if token_id.as_ref() == "7"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            MarketUpdate::Quote {
+                token_id,
+                bid: None,
+                ask: None,
+                ..
+            } if token_id.as_ref() == "7"
+        ));
+
+        let crossed_again = crossed
+            .strip_suffix(b"}")
+            .unwrap()
+            .iter()
+            .copied()
+            .chain(b" }".iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &crossed_again,
+                &error,
+            )
+            .await
+        );
+        assert_eq!(std::fs::read(capture).unwrap(), crossed);
+    }
+
+    #[tokio::test]
+    async fn clob_failure_capture_rejects_an_unbounded_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().canonicalize().unwrap().join("clob-failure.raw");
+        let (tx, _rx) = tokio::sync::broadcast::channel(2);
+        assert!(
+            capture_crossed_clob_failure_and_empty(
+                &tx,
+                &[U256::from(7)],
+                Utc::now(),
+                Some(&capture),
+                &vec![b' '; 1_048_577],
+                POLYMARKET_CLOB_CROSSED_BOOK_ERROR,
+            )
+            .await
+        );
+        assert!(!capture.exists());
     }
 
     #[test]
