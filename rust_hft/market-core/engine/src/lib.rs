@@ -2301,7 +2301,6 @@ mod tests {
             Engine::receive_latency_anchor(LatencyCaptureBoundary::AdapterPublish, 20);
         assert_eq!(engine.recent_market_event_timestamp, None);
     }
-
     struct SingleVenueStub {
         id: String,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
