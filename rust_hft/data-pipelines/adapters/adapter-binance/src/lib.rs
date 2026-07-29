@@ -9,7 +9,7 @@ use hft_core::{
     now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker,
     LocalReceiveTimestamp, ProductType, Symbol,
 };
-use integration::WsFrameMetrics;
+use integration::WsMessageMetrics;
 use ports::events::MarketSnapshot;
 use ports::{
     BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream, TrackedMarketEvent,
@@ -338,7 +338,7 @@ impl BinanceMarketStream {
 
     fn parse_tracked_socket_event(
         bytes: bytes::Bytes,
-        mut metrics: WsFrameMetrics,
+        mut metrics: WsMessageMetrics,
     ) -> HftResult<Option<TrackedMarketEvent>> {
         let mut bytes = match bytes.try_into_mut() {
             Ok(bytes) => bytes,
@@ -347,7 +347,8 @@ impl BinanceMarketStream {
         let event = MessageConverter::parse_stream_message_bytes(&mut bytes)?;
         metrics.mark_parsed();
         Ok(event.map(|mut event| {
-            let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
+            let mut tracker =
+                LatencyTracker::from_userspace_websocket_message_delivery(metrics.received_at_us);
             tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(
                 LatencyStage::Parsing,
@@ -507,7 +508,9 @@ impl MarketStream for BinanceMarketStream {
                                     match try_queue_market_event(
                                         &tx,
                                         &task_generation,
-                                        TrackedMarketEvent::new(MarketEvent::Snapshot(snapshot)),
+                                        TrackedMarketEvent::from_snapshot_completion(
+                                            MarketEvent::Snapshot(snapshot),
+                                        ),
                                     ) {
                                         Ok(()) => {}
                                         Err(QueuePublishError::Closed) => return,
@@ -1064,7 +1067,7 @@ mod tests {
 
         let tracked = BinanceMarketStream::parse_tracked_socket_event(
             message,
-            WsFrameMetrics::new(received_at, 0),
+            WsMessageMetrics::new(received_at, 0),
         )
         .unwrap()
         .expect("tracked depth event");
@@ -1081,7 +1084,7 @@ mod tests {
         let parse = |message| {
             BinanceMarketStream::parse_tracked_socket_event(
                 bytes::Bytes::from_static(message),
-                WsFrameMetrics::new_with_unix(
+                WsMessageMetrics::new_with_unix(
                     hft_core::monotonic_micros(),
                     hft_core::now_micros(),
                     0,

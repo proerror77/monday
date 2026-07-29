@@ -126,7 +126,7 @@ impl MetricsRegistry {
         let latency_ws_receive = Histogram::with_opts(
             HistogramOpts::new(
                 "hft_latency_ws_receive_microseconds",
-                "WebSocket 喚醒到收包延遲 (微秒)",
+                "WS-library complete-message delivery boundary duration in userspace; excludes kernel and NIC RX (microseconds)",
             )
             .buckets(latency_buckets.clone()),
         )
@@ -514,7 +514,7 @@ impl MetricsRegistry {
         }
     }
 
-    /// 記錄 WS 接收延遲
+    /// Record WS-library complete-message delivery duration in userspace, never kernel/NIC RX.
     pub fn record_ws_receive_latency(&self, latency_us: f64) {
         self.latency_ws_receive.observe(latency_us);
         self.note_activity();

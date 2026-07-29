@@ -294,6 +294,7 @@ impl EventIngester {
                 .and_then(|timestamps| timestamps.local_receive)
                 .map_or_else(current_timestamp_us, |timestamp| timestamp.as_micros());
             let mut tracker = LatencyTracker::from_time(origin_time);
+            tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
             tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
             tracker
@@ -390,6 +391,7 @@ impl EventIngester {
     pub async fn ingest_lossless(&mut self, event: MarketEvent) -> Result<(), HftError> {
         let received_at = current_timestamp_us();
         let mut tracker = LatencyTracker::from_time(received_at);
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
         self.ingest_tracked_lossless(TrackedMarketEvent { event, tracker })

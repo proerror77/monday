@@ -17,8 +17,8 @@ use aggregation::{AggregationEngine, MarketView, TopNSnapshot};
 use dataflow::{EventConsumer, IngestionConfig};
 use execution_queues::EngineQueues;
 use hft_core::{
-    now_micros, AccountId, HftError, HftResult, LatencyStage, LatencyTracker, OrderType, Side,
-    Symbol, Timestamp, VenueId, VenueSymbol,
+    now_micros, AccountId, HftError, HftResult, LatencyCaptureBoundary, LatencyStage,
+    LatencyTracker, OrderType, Side, Symbol, Timestamp, VenueId, VenueSymbol,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use ports::Trade as MarketTrade;
@@ -211,6 +211,7 @@ struct PendingMarketEvent {
     event: ports::MarketEvent,
     /// Local adapter-boundary timestamp used for latency and order lifecycle validation.
     received_at: Timestamp,
+    capture_boundary: hft_core::LatencyCaptureBoundary,
     /// Canonical L2 immediately after this event was applied, before any later batched delta.
     book: Option<(VenueId, Arc<TopNSnapshot>)>,
 }
@@ -434,6 +435,15 @@ impl Engine {
     /// 设置执行队列系统（Runtime 设置）
     pub fn set_execution_queues(&mut self, queues: EngineQueues) {
         self.execution_queues = Some(queues);
+    }
+
+    fn receive_latency_anchor(
+        capture_boundary: LatencyCaptureBoundary,
+        received_at: Timestamp,
+    ) -> Option<Timestamp> {
+        capture_boundary
+            .is_receive_latency_cohort()
+            .then_some(received_at)
     }
 
     /// 設置訂單管理器（依賴注入）
@@ -991,18 +1001,19 @@ impl Engine {
                 total_events += 1;
                 result.events_processed += 1;
 
-                // 記錄接入階段延遲（從事件原始時間戳到現在）
-                let ingestion_latency = now_micros().saturating_sub(event.tracker.origin_time);
-                self.latency_monitor
-                    .record_latency(LatencyStage::Ingestion, ingestion_latency);
+                let capture_boundary = event.tracker.capture_boundary;
+                if capture_boundary.is_receive_latency_cohort() {
+                    let ingestion_latency = now_micros().saturating_sub(event.tracker.origin_time);
+                    self.latency_monitor
+                        .record_latency(LatencyStage::Ingestion, ingestion_latency);
+                }
 
                 // 記錄聚合階段開始（零拷貝：直接使用隊列彈出的事件所有權）
                 let mut tracked_event = event;
                 tracked_event.record_stage(hft_core::latency::LatencyStage::Aggregation);
                 let received_at = tracked_event.tracker.origin_time;
-
-                // 更新市場事件時間戳供端到端延遲計算
-                self.recent_market_event_timestamp = Some(tracked_event.tracker.origin_time);
+                self.recent_market_event_timestamp =
+                    Self::receive_latency_anchor(capture_boundary, received_at);
 
                 // 日誌降噪：逐事件日誌改為 debug 級別
                 let (event_kind, symbol) = match &tracked_event.event {
@@ -1068,6 +1079,7 @@ impl Engine {
                             self.pending_market_events.push(PendingMarketEvent {
                                 event,
                                 received_at,
+                                capture_boundary,
                                 book,
                             });
                         }
@@ -1434,7 +1446,9 @@ impl Engine {
             let event = &pending.event;
             let exchange_timestamp = self.extract_event_timestamp(event);
             let received_at = pending.received_at;
-            self.recent_market_event_timestamp = Some(received_at);
+            let capture_boundary = pending.capture_boundary;
+            self.recent_market_event_timestamp =
+                Self::receive_latency_anchor(capture_boundary, received_at);
             let mut event_tracker = LatencyTracker::from_time(received_at);
 
             // 日誌降噪：逐事件改為 debug 級別
@@ -1694,10 +1708,12 @@ impl Engine {
                 .record_latency(LatencyStage::Execution, execution_latency);
 
             // 如果有起始時間戳，計算端到端延遲
-            let end_to_end_latency = now_micros().saturating_sub(received_at);
             event_tracker.record_stage(LatencyStage::EndToEnd);
-            self.latency_monitor
-                .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
+            if capture_boundary.is_receive_latency_cohort() {
+                let end_to_end_latency = now_micros().saturating_sub(received_at);
+                self.latency_monitor
+                    .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
+            }
 
             // 記錄執行延遲到 Prometheus
             #[cfg(feature = "metrics")]
@@ -2213,6 +2229,20 @@ mod tests {
     use ports::{
         AggregatedBar, MarketEvent, OrderIntent, OrderIntentEnvelope, OrderIntentLifecycle,
     };
+
+    #[test]
+    fn non_receive_boundary_clears_prior_receive_latency_anchor() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.recent_market_event_timestamp = Engine::receive_latency_anchor(
+            LatencyCaptureBoundary::UserspaceWebSocketMessageDelivery,
+            10,
+        );
+        assert_eq!(engine.recent_market_event_timestamp, Some(10));
+
+        engine.recent_market_event_timestamp =
+            Engine::receive_latency_anchor(LatencyCaptureBoundary::AdapterPublish, 20);
+        assert_eq!(engine.recent_market_event_timestamp, None);
+    }
 
     struct SingleVenueStub {
         id: String,

@@ -185,12 +185,18 @@ pub struct TrackedMarketEvent {
 }
 
 impl TrackedMarketEvent {
-    /// 創建帶追蹤的市場事件
+    /// Track an adapter's event-publish boundary. This cohort is not WS receive latency.
     pub fn new(event: MarketEvent) -> Self {
-        Self {
-            event,
-            tracker: LatencyTracker::new(),
-        }
+        let mut tracker = LatencyTracker::new();
+        tracker.capture_boundary = LatencyCaptureBoundary::AdapterPublish;
+        Self { event, tracker }
+    }
+
+    /// Track REST snapshot completion separately from userspace WS message delivery.
+    pub fn from_snapshot_completion(event: MarketEvent) -> Self {
+        let mut tracker = LatencyTracker::new();
+        tracker.capture_boundary = LatencyCaptureBoundary::SnapshotCompletion;
+        Self { event, tracker }
     }
 
     /// 從指定時間創建帶追蹤的市場事件
