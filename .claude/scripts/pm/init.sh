@@ -53,14 +53,16 @@ else
   gh auth login
 fi
 
-# Check for gh-sub-issue extension
+# Verify native GitHub issue relationships.
 echo ""
-echo "📦 Checking gh extensions..."
-if gh extension list | grep -q "yahsan2/gh-sub-issue"; then
-  echo "  ✅ gh-sub-issue extension installed"
+echo "🔗 Checking native GitHub issue relationships..."
+if gh issue create --help | grep -q -- '--parent' &&
+  gh issue edit --help | grep -q -- '--add-blocked-by'; then
+  echo "  ✅ Native parent and blocked-by operations available"
 else
-  echo "  📥 Installing gh-sub-issue extension..."
-  gh extension install yahsan2/gh-sub-issue
+  echo "  ❌ GitHub CLI lacks --parent or --add-blocked-by support"
+  echo "  Upgrade GitHub CLI before publishing PRD issues"
+  exit 1
 fi
 
 # Create directory structure
@@ -74,7 +76,7 @@ mkdir -p .claude/scripts/pm
 echo "  ✅ Directories created"
 
 # Copy scripts if in main repo
-if [ -d "scripts/pm" ] && [ ! "$(pwd)" = *"/.claude"* ]; then
+if [ -d "scripts/pm" ] && [[ "$(pwd)" != *"/.claude"* ]]; then
   echo ""
   echo "📝 Copying PM scripts..."
   cp -r scripts/pm/* .claude/scripts/pm/
@@ -133,8 +135,8 @@ echo "=========================="
 echo ""
 echo "📊 System Status:"
 gh --version | head -1
-echo "  Extensions: $(gh extension list | wc -l) installed"
 echo "  Auth: $(gh auth status 2>&1 | grep -o 'Logged in to [^ ]*' || echo 'Not authenticated')"
+echo "  GitHub issue relationships: native"
 echo ""
 echo "🎯 Next Steps:"
 echo "  1. Create your first PRD: /pm:prd-new <feature-name>"
