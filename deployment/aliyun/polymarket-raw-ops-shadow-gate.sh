@@ -38,6 +38,7 @@ readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly SHADOW_ROOT=/data/monday/spool/polymarket-reference-rust-shadow
 readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
+readonly GATE_JOB_ROOT=/data/monday/evidence/polymarket-gate-jobs
 readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
 readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -211,6 +212,40 @@ secure_control_file() {
   mode=$(stat -c %a -- "$path")
   [[ $owner == 0 ]] || die "control-plane file is not root-owned: $path"
   (( (8#$mode & 022) == 0 )) || die "control-plane file is group/world writable: $path"
+}
+
+verify_supervised_candidate() {
+  local candidate_path=$1 candidate_sha=$2 parent=${1%/*}
+  [[ $candidate_path == /* && $candidate_sha =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ -n $parent ]] || parent=/
+  secure_root_chain "$parent" || return 1
+  secure_control_file "$candidate_path"
+  [[ -x $candidate_path ]] || return 1
+  [[ $(sha256sum "$candidate_path" | awk '{print $1}') == "$candidate_sha" ]]
+}
+
+verify_gate_supervisor() {
+  local candidate_sha=$1 invocation=$2
+  local unit="polymarket-raw-ops-gate@${candidate_sha}.service"
+  local invocation_dir="$GATE_JOB_ROOT/$candidate_sha/$invocation"
+  local request="$invocation_dir/request.json" fragment drop_ins
+  [[ $invocation =~ ^[a-f0-9]{32}$ \
+    && ${MONDAY_POLYMARKET_GATE_INVOCATION_DIR:-} == "$invocation_dir" ]] \
+    || return 1
+  secure_root_chain "$invocation_dir" || return 1
+  secure_control_file "$request"
+  jq -e --arg candidate "$candidate_sha" --arg invocation "$invocation" '
+    .schema == "monday.polymarket_gate_request.v1"
+    and .candidate_sha256 == $candidate
+    and .systemd_invocation_id == $invocation
+  ' "$request" >/dev/null || return 1
+  [[ $(systemctl show "$unit" --property=InvocationID --value) == "$invocation" \
+    && $(systemctl show "$unit" --property=MainPID --value) == "$$" ]] \
+    || return 1
+  fragment=$(systemctl show "$unit" --property=FragmentPath --value) || return 1
+  drop_ins=$(systemctl show "$unit" --property=DropInPaths --value) || return 1
+  [[ $fragment == /etc/systemd/system/polymarket-raw-ops-gate@.service \
+    && -z $drop_ins ]]
 }
 
 verify_release_manifest() {
@@ -1073,6 +1108,7 @@ fi
   usage >&2
   exit 2
 }
+trap 'exit 143' HUP INT TERM
 
 for command in aliyun awk chown chmod date flock grep install journalctl jq mkdir mktemp \
   mountpoint mv readlink rm runuser sed sha256sum sleep stat sync systemctl timeout \
@@ -1108,10 +1144,11 @@ release_manifest_sha=$(sha256sum "$RELEASE_MANIFEST" | awk '{print $1}')
 [[ $source_revision =~ ^[a-f0-9]{40,64}$ ]] || die 'source revision is invalid'
 [[ $control_archive_sha =~ ^[a-f0-9]{64}$ ]] \
   || die 'control archive identity is invalid'
-[[ -f $candidate_source && ! -L $candidate_source && -x $candidate_source ]] \
-  || die 'candidate must be a direct executable regular file'
-printf '%s  %s\n' "$candidate_sha" "$candidate_source" \
-  | sha256sum --check --strict >/dev/null || die 'candidate checksum mismatch'
+supervised_invocation_id=${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}
+verify_gate_supervisor "$candidate_sha" "$supervised_invocation_id" \
+  || die 'Gate is not owned by the exact systemd supervisor invocation'
+verify_supervised_candidate "$candidate_source" "$candidate_sha" \
+  || die 'candidate is not a trusted immutable executable'
 
 for asset in "${BUNDLE_ASSETS[@]}"; do
   secure_control_file "$SCRIPT_DIR/$asset"
@@ -1194,6 +1231,10 @@ cleanup() {
   rm -rf "${control_staging:-}"
   rm -rf "${market_preflight_download_dir:-}"
   rm -f "${shadow_env_file:-}" "${shadow_env_tmp:-}"
+  if ((status != 0)) && [[ -n ${pass_ready_marker:-} ]]; then
+    rm -f -- "$pass_ready_marker" \
+      "${pass_ready_marker%/*}/.${pass_ready_marker##*/}.tmp"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -1248,7 +1289,7 @@ verify_release_binding "$pinned_release_manifest" "$release_manifest_sha" \
 pinned_upload_env="$release_dir/polymarket-upload-env-$oss_config_sha.env"
 install_pinned_upload_env "$pinned_upload_env"
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+run_id=$supervised_invocation_id
 shadow_parent="$SHADOW_ROOT/$candidate_sha"
 shadow_spool="$shadow_parent/$run_id"
 market_shadow_spool="$shadow_parent/${run_id}-market-upload"
@@ -1791,13 +1832,13 @@ if [[ $production_eligible == true ]]; then
   verify_current_oss_config
   jq -e -f "$release_control_dir/${GATE_POLICY##*/}" "$gate_json" >/dev/null \
     || die 'combined gate evidence failed the production policy'
-  marker="$evidence_dir/PASSED.sha256"
+  pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"
   (
     cd "$evidence_dir"
-    sha256sum gate.json >".${marker##*/}.tmp"
-    mv ".${marker##*/}.tmp" "${marker##*/}"
+    sha256sum gate.json >".${pass_ready_marker##*/}.tmp"
+    mv ".${pass_ready_marker##*/}.tmp" "${pass_ready_marker##*/}"
   )
-  sync "$marker"
+  sync "$pass_ready_marker"
   sync -f "$evidence_dir"
 fi
 
