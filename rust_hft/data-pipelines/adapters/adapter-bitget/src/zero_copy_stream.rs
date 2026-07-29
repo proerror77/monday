@@ -180,6 +180,7 @@ impl ZeroCopyBitgetStream {
             asks,
             sequence: 0, // Bitget 暫時沒有序列號
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 
@@ -259,6 +260,7 @@ impl ZeroCopyBitgetStream {
             side,
             trade_id,
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 }
@@ -392,6 +394,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                         asks: Vec::new(),
                         sequence: 0,
                         source_venue: Some(VenueId::BITGET),
+                        timestamps: Default::default(),
                     };
 
                     let event = MarketEvent::Snapshot(snapshot);
@@ -464,6 +467,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                                 side,
                                 trade_id,
                                 source_venue: Some(VenueId::BITGET),
+                                timestamps: Default::default(),
                             });
                             self.send_event(event);
                         }

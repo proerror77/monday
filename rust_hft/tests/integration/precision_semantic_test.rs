@@ -3,13 +3,13 @@
 //! 测试完整的事件流：Adapter -> OMS -> Engine -> Portfolio
 //! 确保精度保持和语义一致性
 
-use std::collections::HashMap;
-use rust_decimal::Decimal;
-use hft_core::{OrderId, Price, Quantity, Symbol, Side};
-use ports::{ExecutionEvent, AccountView};
+use hft_core::{OrderId, Price, Quantity, Side, Symbol};
+use hft_engine::Engine;
 use oms_core::{OmsCore, OrderStatus};
 use portfolio_core::Portfolio;
-use hft_engine::Engine;
+use ports::{AccountView, ExecutionEvent};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_fill_precision_preservation() {
@@ -23,7 +23,15 @@ async fn test_fill_precision_preservation() {
     let quantity = Quantity::from_str("0.00123456789").unwrap(); // 高精度数量
 
     // 1. 注册订单到OMS和Portfolio
-    oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, quantity, None, Some("test_strategy".to_string()));
+    oms.register_order(
+        order_id.clone(),
+        None,
+        symbol.clone(),
+        Side::Buy,
+        quantity,
+        None,
+        Some("test_strategy".to_string()),
+    );
     portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
 
     // 2. 模拟Ack事件
@@ -75,7 +83,15 @@ async fn test_weighted_average_price_precision() {
     let symbol = Symbol::new("BTCUSDT");
     let total_qty = Quantity::from_str("1.0").unwrap();
 
-    oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, total_qty, None, Some("test_strategy".to_string()));
+    oms.register_order(
+        order_id.clone(),
+        None,
+        symbol.clone(),
+        Side::Buy,
+        total_qty,
+        None,
+        Some("test_strategy".to_string()),
+    );
     portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
 
     // Ack订单
@@ -97,7 +113,10 @@ async fn test_weighted_average_price_precision() {
     let update1 = oms.on_execution_event(&fill1).unwrap();
     assert_eq!(update1.status, OrderStatus::PartiallyFilled);
     assert_eq!(update1.cum_qty, Quantity::from_str("0.4").unwrap());
-    assert_eq!(update1.avg_price.unwrap(), Price::from_str("67188.123456").unwrap());
+    assert_eq!(
+        update1.avg_price.unwrap(),
+        Price::from_str("67188.123456").unwrap()
+    );
 
     portfolio.on_execution_event(&fill1);
 
@@ -115,9 +134,10 @@ async fn test_weighted_average_price_precision() {
     assert_eq!(update2.cum_qty, Quantity::from_str("1.0").unwrap());
 
     // 验证加权平均价格：(67188.123456 * 0.4 + 67190.654321 * 0.6) / 1.0
-    let expected_avg = (Decimal::from_str("67188.123456").unwrap() * Decimal::from_str("0.4").unwrap()
-                       + Decimal::from_str("67190.654321").unwrap() * Decimal::from_str("0.6").unwrap())
-                       / Decimal::from_str("1.0").unwrap();
+    let expected_avg = (Decimal::from_str("67188.123456").unwrap()
+        * Decimal::from_str("0.4").unwrap()
+        + Decimal::from_str("67190.654321").unwrap() * Decimal::from_str("0.6").unwrap())
+        / Decimal::from_str("1.0").unwrap();
 
     assert_eq!(update2.avg_price.unwrap().0, expected_avg);
 
@@ -136,7 +156,15 @@ async fn test_fill_deduplication() {
     let symbol = Symbol::new("BTCUSDT");
     let quantity = Quantity::from_str("1.0").unwrap();
 
-    oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, quantity, None, Some("test_strategy".to_string()));
+    oms.register_order(
+        order_id.clone(),
+        None,
+        symbol.clone(),
+        Side::Buy,
+        quantity,
+        None,
+        Some("test_strategy".to_string()),
+    );
 
     // 首次Fill
     let fill_event = ExecutionEvent::Fill {
@@ -207,23 +235,27 @@ async fn test_order_completed_event_generation() {
 #[tokio::test]
 async fn test_unified_timestamp_handling() {
     // 测试UnifiedTimestamp的使用
-    use hft_core::UnifiedTimestamp;
+    use hft_core::{ExchangeEventTimestamp, LocalReceiveTimestamp, UnifiedTimestamp};
 
     let exchange_ts = 1640995200_000_000u64; // 交易所时间戳
-    let local_ts = 1640995200_001_500u64;    // 本地时间戳（晚1.5ms）
+    let local_ts = 1640995200_001_500u64; // 本地时间戳（晚1.5ms）
 
     let unified = UnifiedTimestamp::new(exchange_ts, local_ts);
 
     // 测试时间戳选择
     assert_eq!(unified.primary_ts(), exchange_ts);
-    assert_eq!(unified.network_latency_us(), Some(1500)); // 1.5ms网络延迟
+    assert_eq!(
+        LocalReceiveTimestamp::new(local_ts)
+            .latency_since_event(ExchangeEventTimestamp::new(exchange_ts)),
+        1500
+    );
 
     // 测试时间戳验证
     assert!(unified.validate());
 
     // 测试陈旧检测
     assert!(!unified.is_stale(2000)); // 2ms阈值，不陈旧
-    assert!(unified.is_stale(1000));  // 1ms阈值，陈旧
+    assert!(unified.is_stale(1000)); // 1ms阈值，陈旧
 }
 
 #[tokio::test]
@@ -281,7 +313,15 @@ async fn test_full_event_chain_precision() {
     let qty2 = Quantity::from_str("0.876543211").unwrap();
     let total_qty = Quantity(qty1.0 + qty2.0);
 
-    oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, total_qty, None, Some("test_strategy".to_string()));
+    oms.register_order(
+        order_id.clone(),
+        None,
+        symbol.clone(),
+        Side::Buy,
+        total_qty,
+        None,
+        Some("test_strategy".to_string()),
+    );
     portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
 
     // 多次部分成交

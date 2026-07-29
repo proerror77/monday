@@ -35,6 +35,7 @@ impl BookLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketSnapshot {
     pub symbol: Symbol,
+    /// Legacy ordering/staleness projection; not a latency-evidence timestamp.
     pub timestamp: Timestamp,
     pub bids: Vec<BookLevel>, // 按價格降序
     pub asks: Vec<BookLevel>, // 按價格升序
@@ -42,12 +43,15 @@ pub struct MarketSnapshot {
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// 訂單簿增量更新
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookUpdate {
     pub symbol: Symbol,
+    /// Legacy ordering/staleness projection; Binance maps exchange event time `E` here.
     pub timestamp: Timestamp,
     pub bids: Vec<BookLevel>, // 變更的檔位
     pub asks: Vec<BookLevel>,
@@ -60,6 +64,8 @@ pub struct BookUpdate {
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// Sequence-tagged best bid/ask update.
@@ -69,18 +75,22 @@ pub struct BookUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopOfBook {
     pub symbol: Symbol,
+    /// Legacy ordering/staleness projection; feeds without `E` map local receive time here.
     pub timestamp: Timestamp,
     pub sequence: u64,
     pub bid: BookLevel,
     pub ask: BookLevel,
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// 交易事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     pub symbol: Symbol,
+    /// Legacy ordering/staleness projection; Binance maps exchange trade time `T` here.
     pub timestamp: Timestamp,
     pub price: Price,
     pub quantity: Quantity,
@@ -89,6 +99,8 @@ pub struct Trade {
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// 聚合K線
@@ -107,6 +119,8 @@ pub struct AggregatedBar {
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
     #[serde(default)]
     pub source_venue: Option<VenueId>,
+    #[serde(default)]
+    pub timestamps: MarketDataTimestamps,
 }
 
 /// 統一市場事件
@@ -125,6 +139,44 @@ pub enum MarketEvent {
         #[serde(default)]
         symbol: Option<Symbol>,
     },
+}
+
+impl MarketEvent {
+    /// Compatibility timestamp for ordering and staleness only; never use for latency evidence.
+    #[inline]
+    pub fn ordering_timestamp_us(&self) -> Option<Timestamp> {
+        match self {
+            Self::Snapshot(snapshot) => Some(snapshot.timestamp),
+            Self::Update(update) => Some(update.timestamp),
+            Self::Quote(quote) => Some(quote.timestamp),
+            Self::Trade(trade) => Some(trade.timestamp),
+            Self::Bar(bar) => Some(bar.close_time),
+            Self::Arbitrage(arbitrage) => Some(arbitrage.timestamp),
+            Self::Disconnect { .. } => None,
+        }
+    }
+
+    pub fn timestamps(&self) -> Option<&MarketDataTimestamps> {
+        match self {
+            Self::Snapshot(snapshot) => Some(&snapshot.timestamps),
+            Self::Update(update) => Some(&update.timestamps),
+            Self::Quote(quote) => Some(&quote.timestamps),
+            Self::Trade(trade) => Some(&trade.timestamps),
+            Self::Bar(bar) => Some(&bar.timestamps),
+            _ => None,
+        }
+    }
+
+    pub fn timestamps_mut(&mut self) -> Option<&mut MarketDataTimestamps> {
+        match self {
+            Self::Snapshot(snapshot) => Some(&mut snapshot.timestamps),
+            Self::Update(update) => Some(&mut update.timestamps),
+            Self::Quote(quote) => Some(&mut quote.timestamps),
+            Self::Trade(trade) => Some(&mut trade.timestamps),
+            Self::Bar(bar) => Some(&mut bar.timestamps),
+            _ => None,
+        }
+    }
 }
 
 /// 帶延遲追蹤的市場事件 - 用於端到端延遲測量
