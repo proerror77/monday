@@ -703,16 +703,6 @@ impl Engine {
     }
 
     #[cfg(feature = "metrics")]
-    fn record_ingestion_latency_sample(
-        latency_monitor: &LatencyMonitor,
-        metrics: &infra_metrics::MetricsRegistry,
-        latency_us: u64,
-    ) {
-        latency_monitor.record_latency(LatencyStage::Ingestion, latency_us);
-        metrics.record_ingestion_latency(latency_us as f64);
-    }
-
-    #[cfg(feature = "metrics")]
     fn record_end_to_end_latency_sample(
         latency_monitor: &LatencyMonitor,
         metrics: &infra_metrics::MetricsRegistry,
@@ -1014,13 +1004,6 @@ impl Engine {
 
                 // 記錄接入階段延遲（從事件原始時間戳到現在）
                 let ingestion_latency = now_micros().saturating_sub(event.tracker.origin_time);
-                #[cfg(feature = "metrics")]
-                Self::record_ingestion_latency_sample(
-                    &self.latency_monitor,
-                    infra_metrics::MetricsRegistry::global(),
-                    ingestion_latency,
-                );
-                #[cfg(not(feature = "metrics"))]
                 self.latency_monitor
                     .record_latency(LatencyStage::Ingestion, ingestion_latency);
 
@@ -2002,14 +1985,7 @@ impl Engine {
 
     /// 從市場事件中提取時間戳
     fn extract_event_timestamp(&self, event: &ports::MarketEvent) -> Option<u64> {
-        match event {
-            ports::MarketEvent::Bar(bar) => Some(bar.close_time),
-            ports::MarketEvent::Trade(trade) => Some(trade.timestamp),
-            ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.timestamp),
-            ports::MarketEvent::Update(update) => Some(update.timestamp),
-            ports::MarketEvent::Quote(quote) => Some(quote.timestamp),
-            _ => None,
-        }
+        event.ordering_timestamp_us()
     }
 
     /// 獲取引擎統計
@@ -2258,26 +2234,23 @@ mod tests {
 
     #[cfg(feature = "metrics")]
     #[test]
-    fn production_recording_and_sync_preserve_real_latency_samples() {
+    fn production_recording_and_sync_preserve_real_end_to_end_samples() {
         let engine = Engine::new(EngineConfig::default());
         let metrics = infra_metrics::MetricsRegistry::isolated();
 
         for sample in [1_u64, 1, 1_000] {
-            Engine::record_ingestion_latency_sample(&engine.latency_monitor, &metrics, sample);
             Engine::record_end_to_end_latency_sample(&engine.latency_monitor, &metrics, sample);
         }
 
         engine.sync_metrics_to_registry(&metrics);
 
-        assert_eq!(metrics.latency_ingestion.get_sample_count(), 3);
-        assert_eq!(metrics.latency_ingestion.get_sample_sum(), 1_002.0);
         assert_eq!(metrics.latency_end_to_end.get_sample_count(), 3);
         assert_eq!(metrics.latency_end_to_end.get_sample_sum(), 1_002.0);
         let family = metrics
             .registry
             .gather()
             .into_iter()
-            .find(|family| family.name() == "hft_latency_ingestion_microseconds")
+            .find(|family| family.name() == "hft_latency_end_to_end_microseconds")
             .unwrap();
         let histogram = family.metric[0].histogram.as_ref().unwrap();
         assert_eq!(
@@ -2612,6 +2585,7 @@ mod tests {
             volume: Quantity::from_f64(10.0).unwrap(),
             trade_count: 100,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
         });
 
         let account = AccountView::default();

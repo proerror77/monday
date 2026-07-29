@@ -199,6 +199,7 @@ fn snapshot_from_levels(
         asks,
         sequence,
         source_venue: Some(VenueId::BINANCE_PREDICTION),
+        timestamps: Default::default(),
     })
 }
 

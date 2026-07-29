@@ -30,6 +30,7 @@ impl MessageConverter {
             first_sequence: Some(update.first_update_id),
             sequence: update.final_update_id,
             is_snapshot: false,
+            timestamps: Default::default(),
         })
     }
 
@@ -48,6 +49,7 @@ impl MessageConverter {
             asks,
             sequence: snapshot.last_update_id,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         })
     }
 
@@ -71,6 +73,7 @@ impl MessageConverter {
             side,
             trade_id: trade.trade_id.to_string(),
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         })
     }
 
@@ -98,6 +101,7 @@ impl MessageConverter {
             volume,
             trade_count: kline.trade_count,
             source_venue: Some(VenueId::ASTERDEX),
+            timestamps: Default::default(),
         })
     }
 

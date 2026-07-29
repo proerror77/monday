@@ -1,9 +1,86 @@
 //! 統一時間戳處理
 //!
-//! 提供交易所時間戳與本地時間戳的統一處理，支持延遲計算和時間戳選擇策略
+//! Legacy compatibility projection plus provenance-bearing timestamp types.
 
 use crate::Timestamp;
 use serde::{Deserialize, Serialize};
+
+/// Binance `E`: exchange event time in Unix microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExchangeEventTimestamp(Timestamp);
+
+impl ExchangeEventTimestamp {
+    pub const fn new(micros: Timestamp) -> Self {
+        Self(micros)
+    }
+
+    pub const fn as_micros(self) -> Timestamp {
+        self.0
+    }
+}
+
+/// Binance `T`: exchange match/trade time in Unix microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExchangeTradeTimestamp(Timestamp);
+
+impl ExchangeTradeTimestamp {
+    pub const fn new(micros: Timestamp) -> Self {
+        Self(micros)
+    }
+
+    pub const fn as_micros(self) -> Timestamp {
+        self.0
+    }
+}
+
+/// Local userspace frame-delivery time projected onto the host Unix clock, in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LocalReceiveTimestamp(Timestamp);
+
+impl LocalReceiveTimestamp {
+    pub const fn new(micros: Timestamp) -> Self {
+        Self(micros)
+    }
+
+    pub const fn as_micros(self) -> Timestamp {
+        self.0
+    }
+
+    /// Same-message-family `local-E`; clock-discipline evidence is still required externally.
+    ///
+    /// `ExchangeTradeTimestamp` cannot be passed accidentally:
+    ///
+    /// ```compile_fail
+    /// use hft_core::{ExchangeTradeTimestamp, LocalReceiveTimestamp};
+    /// let local = LocalReceiveTimestamp::new(2);
+    /// let trade = ExchangeTradeTimestamp::new(1);
+    /// let _ = local.latency_since_event(trade);
+    /// ```
+    pub const fn latency_since_event(self, event: ExchangeEventTimestamp) -> i128 {
+        self.0 as i128 - event.0 as i128
+    }
+}
+
+/// Timestamp provenance attached to a canonical market event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketDataTimestamps {
+    pub exchange_event: Option<ExchangeEventTimestamp>,
+    pub exchange_trade: Option<ExchangeTradeTimestamp>,
+    pub local_receive: Option<LocalReceiveTimestamp>,
+}
+
+impl MarketDataTimestamps {
+    pub const fn local_only(local_receive: LocalReceiveTimestamp) -> Self {
+        Self {
+            exchange_event: None,
+            exchange_trade: None,
+            local_receive: Some(local_receive),
+        }
+    }
+}
 
 /// 統一時間戳結構
 ///
@@ -58,27 +135,6 @@ impl UnifiedTimestamp {
             self.exchange_ts
         } else {
             self.local_ts
-        }
-    }
-
-    /// 計算網路延遲 (本地時間 - 交易所時間)
-    /// 返回 None 如果交易所時間戳無效
-    pub fn network_latency_us(&self) -> Option<i64> {
-        if self.exchange_ts == 0 {
-            None
-        } else {
-            Some(self.local_ts as i64 - self.exchange_ts as i64)
-        }
-    }
-
-    /// 計算總處理延遲 (當前時間 - 交易所時間)
-    /// 返回 None 如果交易所時間戳無效
-    pub fn total_latency_us(&self) -> Option<i64> {
-        if self.exchange_ts == 0 {
-            None
-        } else {
-            let now = Self::current_timestamp();
-            Some(now as i64 - self.exchange_ts as i64)
         }
     }
 
@@ -183,12 +239,15 @@ mod tests {
         let exchange_ts = 1000000; // 1秒
         let local_ts = 1001000; // 1.001秒 (1ms延遲)
 
-        let unified = UnifiedTimestamp::new(exchange_ts, local_ts);
-        assert_eq!(unified.network_latency_us(), Some(1000)); // 1ms = 1000µs
-
-        // 無交易所時間戳時返回 None
-        let unified_no_exchange = UnifiedTimestamp::new(0, local_ts);
-        assert_eq!(unified_no_exchange.network_latency_us(), None);
+        assert_eq!(
+            LocalReceiveTimestamp::new(local_ts)
+                .latency_since_event(ExchangeEventTimestamp::new(exchange_ts)),
+            1000
+        );
+        assert_eq!(
+            MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(local_ts)).exchange_event,
+            None
+        );
     }
 
     #[test]
