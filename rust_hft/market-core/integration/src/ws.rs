@@ -1,6 +1,6 @@
 //! WebSocket 基元 - 高性能 WebSocket 客戶端
 //! 專為 HFT 場景優化：TCP_NODELAY + 禁用壓縮 + 持久連接 + 零拷貝消息接口
-use crate::latency::WsFrameMetrics;
+use crate::latency::WsMessageMetrics;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
@@ -155,11 +155,13 @@ impl WsClient {
 
     pub async fn receive_message(
         &mut self,
-    ) -> Result<Option<(String, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, WsMessageMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
         loop {
             if let Some(conn) = &mut self.connection {
                 if let Some(msg) = conn.next().await {
-                    match msg? {
+                    let message = msg?;
+                    let metrics = WsMessageMetrics::record_receive();
+                    match message {
                         Message::Text(text) => {
                             if self.cfg.heartbeat_text.is_some() && text == "pong" {
                                 self.metrics.last_heartbeat = Some(Instant::now());
@@ -167,7 +169,6 @@ impl WsClient {
                             }
                             self.metrics.messages_received += 1;
                             trace!("接收到消息: {}", text);
-                            let metrics = WsFrameMetrics::record_receive();
                             return Ok(Some((text.to_string(), metrics)));
                         }
                         Message::Ping(payload) => {
@@ -190,7 +191,6 @@ impl WsClient {
                             match String::from_utf8(data.to_vec()) {
                                 Ok(text) => {
                                     self.metrics.messages_received += 1;
-                                    let metrics = WsFrameMetrics::record_receive();
                                     return Ok(Some((text, metrics)));
                                 }
                                 Err(_) => {
@@ -218,16 +218,18 @@ impl WsClient {
     /// 適合需要直接在原始字節上進行 JSON 解析的高性能場景。
     ///
     /// # 性能特性
-    /// - 零數據拷貝：直接返回 WebSocket 幀的底層緩衝區
+    /// - 零數據拷貝：直接返回 WebSocket message 的底層緩衝區
     /// - 延遲 UTF-8 驗證：由調用方決定何時進行字符串轉換
     /// - SIMD JSON 友好：可直接傳遞給 simd-json 進行解析
     pub async fn receive_message_bytes(
         &mut self,
-    ) -> Result<Option<(Bytes, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(Bytes, WsMessageMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
         loop {
             if let Some(conn) = &mut self.connection {
                 if let Some(msg) = conn.next().await {
-                    match msg? {
+                    let message = msg?;
+                    let metrics = WsMessageMetrics::record_receive();
+                    match message {
                         Message::Text(text) => {
                             if self.cfg.heartbeat_text.is_some() && text == "pong" {
                                 self.metrics.last_heartbeat = Some(Instant::now());
@@ -235,14 +237,12 @@ impl WsClient {
                             }
                             self.metrics.messages_received += 1;
                             trace!("接收到文本消息 (零拷貝)");
-                            let metrics = WsFrameMetrics::record_receive();
                             // Utf8Bytes and Bytes share the same backing storage in tungstenite.
                             return Ok(Some((Bytes::from(text), metrics)));
                         }
                         Message::Binary(data) => {
                             self.metrics.messages_received += 1;
                             trace!("接收到二進制消息 (零拷貝)");
-                            let metrics = WsFrameMetrics::record_receive();
                             // 直接包裝為 Bytes（零拷貝）
                             return Ok(Some((data, metrics)));
                         }
@@ -299,7 +299,7 @@ pub trait MessageHandler: Send + Sync {
     fn handle_message(
         &mut self,
         message: String,
-        metrics: WsFrameMetrics,
+        metrics: WsMessageMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -339,7 +339,7 @@ pub trait BytesMessageHandler: Send + Sync {
     fn handle_message_bytes(
         &mut self,
         message: Bytes,
-        metrics: WsFrameMetrics,
+        metrics: WsMessageMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

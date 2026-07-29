@@ -196,6 +196,7 @@ impl MarketStream for LighterMarketStream {
                                                 asks,
                                                 sequence: 0,
                                                 source_venue: Some(VenueId::LIGHTER),
+                                                timestamps: Default::default(),
                                             };
                                             let _ = tx.send(Ok(MarketEvent::Snapshot(snapshot)));
                                         }
@@ -229,6 +230,7 @@ impl MarketStream for LighterMarketStream {
                                             sequence: 0,
                                             is_snapshot: false,
                                             source_venue: Some(VenueId::LIGHTER),
+                                            timestamps: Default::default(),
                                         };
                                         let _ = tx.send(Ok(MarketEvent::Update(upd)));
                                     }

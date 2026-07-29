@@ -4,75 +4,41 @@ allowed-tools: Bash, Read, LS
 
 # Issue Status
 
-Check issue status (open/closed) and current state.
+Report concise live GitHub status for one or more issues.
 
 ## Usage
+
+```text
+/pm:issue-status <issue_number>[,<issue_number>...]
 ```
-/pm:issue-status <issue_number>
-```
 
-## Instructions
+GitHub is authoritative. Run this without requiring `.claude/epics`:
 
-You are checking the current status of a GitHub issue and providing a quick status report for: **Issue #$ARGUMENTS**
-
-### 1. Fetch Issue Status
-Use GitHub CLI to get current status:
 ```bash
-gh issue view #$ARGUMENTS --json state,title,labels,assignees,updatedAt
+IFS=',' read -r -a issue_numbers <<< "$ARGUMENTS"
+for issue_number in "${issue_numbers[@]}"; do
+  case "$issue_number" in
+    ''|*[!0-9]*) echo "❌ A numeric issue number is required" >&2; exit 1 ;;
+  esac
+
+  gh issue view "$issue_number" \
+    --json number,title,state,stateReason,body,labels,assignees,parent,subIssues,blockedBy,blocking,closedByPullRequestsReferences,comments,updatedAt,url || exit 1
+
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 1
+  closing_prs=$(gh issue view "$issue_number" --json closedByPullRequestsReferences \
+    --jq '.closedByPullRequestsReferences[].url') || exit 1
+  referencing_prs=$(gh api --paginate "repos/$repo/issues/$issue_number/timeline" \
+    --jq '.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null) | .source.issue.html_url') || exit 1
+  linked_prs=$(printf '%s\n%s\n' "$closing_prs" "$referencing_prs" | awk 'NF && !seen[$0]++')
+
+  while IFS= read -r pr_url; do
+    [ -n "$pr_url" ] || continue
+    gh pr view "$pr_url" --json number,title,state,isDraft,mergedAt,url || exit 1
+  done <<< "$linked_prs"
+done
 ```
 
-### 2. Status Display
-Show concise status information:
-```
-🎫 Issue #$ARGUMENTS: {Title}
-   
-📊 Status: {OPEN/CLOSED}
-   Last update: {timestamp}
-   Assignee: {assignee or "Unassigned"}
-   
-🏷️ Labels: {label1}, {label2}, {label3}
-```
-
-### 3. Epic Context
-If issue is part of an epic:
-```
-📚 Epic Context:
-   Epic: {epic_name}
-   Epic progress: {completed_tasks}/{total_tasks} tasks complete
-   This task: {task_position} of {total_tasks}
-```
-
-### 4. Local Sync Status
-Check if local files are in sync:
-```
-💾 Local Sync:
-   Local file: {exists/missing}
-   Last local update: {timestamp}
-   Sync status: {in_sync/needs_sync/local_ahead/remote_ahead}
-```
-
-### 5. Quick Status Indicators
-Use clear visual indicators:
-- 🟢 Open and ready
-- 🟡 Open with blockers  
-- 🔴 Open and overdue
-- ✅ Closed and complete
-- ❌ Closed without completion
-
-### 6. Actionable Next Steps
-Based on status, suggest actions:
-```
-🚀 Suggested Actions:
-   - Start work: /pm:issue-start $ARGUMENTS
-   - Sync updates: /pm:issue-sync $ARGUMENTS
-   - Close issue: gh issue close #$ARGUMENTS
-   - Reopen issue: gh issue reopen #$ARGUMENTS
-```
-
-### 7. Batch Status
-If checking multiple issues, support comma-separated list:
-```
-/pm:issue-status 123,124,125
-```
-
-Keep the output concise but informative, perfect for quick status checks during development of Issue #$ARGUMENTS.
+Report labels, assignees, native parent/sub-issues, blockers, blocking issues,
+and linked PR state. An open native blocker means `blocked`. Do not infer
+completion from local percentages; mention a local mirror only as optional
+enrichment.

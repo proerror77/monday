@@ -469,6 +469,8 @@ jobs:
               | tee binance-usdm-reference-artifact-verifier.sha256
           )
           control_assets=(
+            polymarket-raw-ops-gate-control.sh
+            polymarket-raw-ops-gate@.service
             polymarket-raw-ops-shadow-gate.sh
             polymarket-raw-ops-cutover.sh
             polymarket-shadow-gate-policy.jq

@@ -6,7 +6,8 @@
 
 use crate::message_types::*;
 use hft_core::{
-    now_micros, HftError, HftResult, Price, Quantity, Side, Symbol, Timestamp, VenueId,
+    now_micros, ExchangeEventTimestamp, ExchangeTradeTimestamp, HftError, HftResult,
+    MarketDataTimestamps, Price, Quantity, Side, Symbol, Timestamp, VenueId,
 };
 use integration::json::Value;
 use ports::events::*;
@@ -42,6 +43,12 @@ impl MessageConverter {
             .map_err(|error| HftError::Serialization(error.to_string()))
     }
 
+    fn millis_to_micros(value: u64, field: &str) -> HftResult<u64> {
+        value
+            .checked_mul(1_000)
+            .ok_or_else(|| HftError::Parse(format!("Binance {field} timestamp overflow")))
+    }
+
     /// 轉換深度快照
     pub fn convert_depth_snapshot(
         symbol: Symbol,
@@ -58,6 +65,7 @@ impl MessageConverter {
             asks,
             sequence: snapshot.last_update_id,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
         })
     }
 
@@ -66,17 +74,23 @@ impl MessageConverter {
         let symbol = Symbol::from(update.symbol);
         let bids = Self::convert_price_levels(&update.bids)?;
         let asks = Self::convert_price_levels(&update.asks)?;
+        let exchange_event_time_us = Self::millis_to_micros(update.event_time, "E")?;
 
         Ok(BookUpdate {
             symbol,
             source_venue: Some(VenueId::BINANCE),
             // Binance 提供毫秒時間戳，統一轉換為微秒
-            timestamp: update.event_time * 1000,
+            timestamp: exchange_event_time_us,
             bids,
             asks,
             first_sequence: Some(update.first_update_id),
             sequence: update.final_update_id,
             is_snapshot: false,
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
+                exchange_trade: None,
+                local_receive: None,
+            },
         })
     }
 
@@ -85,6 +99,8 @@ impl MessageConverter {
         let symbol = Symbol::from(trade.symbol);
         let price = Self::parse_price(&trade.price)?;
         let quantity = Self::parse_quantity(&trade.quantity)?;
+        let exchange_event_time_us = Self::millis_to_micros(trade.event_time, "E")?;
+        let exchange_trade_time_us = Self::millis_to_micros(trade.trade_time, "T")?;
 
         // Binance 用 is_buyer_maker 判斷方向
         // 如果買方是掛單方(maker)，則這筆交易是賣方吃單，方向為 Sell
@@ -98,18 +114,24 @@ impl MessageConverter {
         Ok(Trade {
             symbol,
             // 交易時間 (ms) → μs
-            timestamp: trade.trade_time * 1000,
+            timestamp: exchange_trade_time_us,
             price,
             quantity,
             side,
             trade_id: trade.trade_id.to_string(),
             source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
+                exchange_trade: Some(ExchangeTradeTimestamp::new(exchange_trade_time_us)),
+                local_receive: None,
+            },
         })
     }
 
     /// 轉換 K 線事件
     pub fn convert_kline_event(kline_event: KlineEvent) -> HftResult<AggregatedBar> {
         let symbol = Symbol::from(kline_event.symbol);
+        let exchange_event_time_us = Self::millis_to_micros(kline_event.event_time, "kline event")?;
         let kline = &kline_event.kline;
 
         let open = Self::parse_price(&kline.open_price)?;
@@ -125,8 +147,8 @@ impl MessageConverter {
             symbol,
             interval_ms,
             // K線起訖時間 (ms) → μs
-            open_time: kline.start_time * 1000,
-            close_time: kline.close_time * 1000,
+            open_time: Self::millis_to_micros(kline.start_time, "kline open")?,
+            close_time: Self::millis_to_micros(kline.close_time, "kline close")?,
             open,
             high,
             low,
@@ -134,6 +156,11 @@ impl MessageConverter {
             volume,
             trade_count: kline.trade_count,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps {
+                exchange_event: Some(ExchangeEventTimestamp::new(exchange_event_time_us)),
+                exchange_trade: None,
+                local_receive: None,
+            },
         })
     }
 
@@ -344,6 +371,7 @@ impl MessageConverter {
             bid,
             ask,
             source_venue: Some(VenueId::BINANCE),
+            timestamps: MarketDataTimestamps::default(),
         })
     }
 }
@@ -398,7 +426,7 @@ mod tests {
     fn test_convert_trade_event() {
         let trade = TradeEvent {
             _event_type: "trade".to_string(),
-            _event_time: 123456789,
+            event_time: 123456789,
             symbol: "BTCUSDT".to_string(),
             trade_id: 12345,
             price: "45000.00".to_string(),
@@ -416,6 +444,21 @@ mod tests {
         assert_eq!(trade_event.trade_id, "12345");
         // ms → μs 轉換
         assert_eq!(trade_event.timestamp, 123456789 * 1000);
+    }
+
+    #[test]
+    fn timestamp_conversion_rejects_millisecond_overflow() {
+        let update = DepthUpdate {
+            _event_type: "depthUpdate".to_string(),
+            event_time: u64::MAX,
+            symbol: "BTCUSDT".to_string(),
+            first_update_id: 100,
+            final_update_id: 101,
+            bids: vec![],
+            asks: vec![],
+        };
+
+        assert!(MessageConverter::convert_depth_update(update).is_err());
     }
 
     #[test]

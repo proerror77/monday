@@ -10,7 +10,7 @@ User=hftcollector
 Group=hftcollector
 WorkingDirectory=/opt/monday
 Environment=RUST_LOG=info
-ExecStart=/opt/monday/bin/new-ploy-runner \
+ExecStart=/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner \
     --config /etc/monday/polymarket-market-tape.toml \
     --deployment-id polymarket-market-data-ecs \
     --dry-run

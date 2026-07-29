@@ -13,12 +13,15 @@ pub mod unified_timestamp;
 pub use error::{HftError, HftResult};
 pub use fixed_point::{FixedBps, FixedPrice, FixedQuantity};
 pub use latency::{
-    monotonic_micros, now_micros, LatencyMeasurement, LatencyStage, LatencyStats, LatencyTracker,
-    MicrosTimestamp,
+    monotonic_micros, now_micros, LatencyCaptureBoundary, LatencyMeasurement, LatencyStage,
+    LatencyStats, LatencyTracker, MicrosTimestamp,
 };
 pub use topn_orderbook::{DualTopNJoiner, TopNOrderBook, DEFAULT_TOP_N, MAX_TOP_N};
 pub use types::*;
-pub use unified_timestamp::UnifiedTimestamp;
+pub use unified_timestamp::{
+    ExchangeEventTimestamp, ExchangeTradeTimestamp, LocalReceiveTimestamp, MarketDataTimestamps,
+    UnifiedTimestamp,
+};
 
 #[cfg(test)]
 mod tests {
@@ -68,8 +71,11 @@ mod tests {
         assert_eq!(unified.local_ts, local_ts);
         assert_eq!(unified.primary_ts(), exchange_ts); // 优先交易所时间
 
-        // 测试网络延迟计算
-        assert_eq!(unified.network_latency_us(), Some(1500)); // 1.5ms
+        assert_eq!(
+            LocalReceiveTimestamp::new(local_ts)
+                .latency_since_event(ExchangeEventTimestamp::new(exchange_ts)),
+            1500
+        );
     }
 
     #[test]
@@ -81,7 +87,10 @@ mod tests {
         assert_eq!(unified.exchange_ts, 0);
         assert_eq!(unified.local_ts, local_ts);
         assert_eq!(unified.primary_ts(), local_ts); // 降级到本地时间
-        assert_eq!(unified.network_latency_us(), None); // 无网络延迟
+        assert_eq!(
+            MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(local_ts)).exchange_event,
+            None
+        );
     }
 
     #[test]

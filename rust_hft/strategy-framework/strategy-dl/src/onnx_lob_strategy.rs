@@ -714,6 +714,7 @@ mod tests {
             ],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE_SPOT),
+            timestamps: Default::default(),
         }
     }
 

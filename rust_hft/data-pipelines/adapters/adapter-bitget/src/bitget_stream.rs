@@ -18,7 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 use infra_metrics::MetricsRegistry;
 
 use hft_core::*;
-use integration::latency::WsFrameMetrics;
+use integration::latency::WsMessageMetrics;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
@@ -258,6 +258,7 @@ fn orderbook_data_ref_to_snapshot(
         asks,
         sequence: 0,
         source_venue: Some(VenueId::BITGET),
+        timestamps: Default::default(),
     })
 }
 
@@ -313,6 +314,7 @@ fn trade_data_ref_to_trade(data: &BitgetTradeDataRef<'_>, fallback_inst: &str) -
         side,
         trade_id: data.trade_id.unwrap_or("").to_string(),
         source_venue: Some(VenueId::BITGET),
+        timestamps: Default::default(),
     })
 }
 
@@ -516,6 +518,7 @@ impl BitgetMarketStream {
             asks,
             sequence: 0, // Bitget 不提供序列號，使用時間戳
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 
@@ -560,6 +563,7 @@ impl BitgetMarketStream {
             side,
             trade_id: data.trade_id.clone(),
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 
@@ -778,7 +782,7 @@ impl MessageHandler for BitgetMessageHandler {
     fn handle_message(
         &mut self,
         message: String,
-        mut metrics: WsFrameMetrics,
+        mut metrics: WsMessageMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("收到 Bitget 消息: {}", message);
 
@@ -1310,6 +1314,7 @@ impl BitgetMessageHandler {
                 side,
                 trade_id,
                 source_venue: Some(VenueId::BITGET),
+                timestamps: Default::default(),
             };
             self.try_send_event(MarketEvent::Trade(trade));
         }
@@ -1365,6 +1370,7 @@ impl BitgetMessageHandler {
             asks,
             sequence: 0,
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 
@@ -1417,6 +1423,7 @@ impl BitgetMessageHandler {
             side,
             trade_id: data.trade_id.clone(),
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 }
@@ -1568,6 +1575,7 @@ impl OrderBookState {
             asks,
             sequence: 0,
             source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
         })
     }
 }

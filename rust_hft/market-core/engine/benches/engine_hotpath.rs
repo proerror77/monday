@@ -45,6 +45,7 @@ fn bench_topn_aggregation(c: &mut Criterion) {
         asks,
         sequence: 42,
         source_venue: None,
+        timestamps: Default::default(),
     };
 
     c.bench_function("TopN::update_from_snapshot+mid", |b| {
@@ -72,6 +73,7 @@ fn benchmark_snapshot(symbol: &Symbol) -> MarketSnapshot {
             .collect(),
         sequence: 1,
         source_venue: Some(VenueId::BINANCE),
+        timestamps: Default::default(),
     }
 }
 
@@ -103,6 +105,7 @@ fn bench_canonical_market_events(c: &mut Criterion) {
                         sequence,
                         is_snapshot: false,
                         source_venue: Some(VenueId::BINANCE),
+                        timestamps: Default::default(),
                     }),
                     &mut depth_output,
                 )
@@ -140,6 +143,7 @@ fn bench_canonical_market_events(c: &mut Criterion) {
                             quantity: Quantity::from_f64(2.0).expect("valid quantity"),
                         },
                         source_venue: Some(VenueId::BINANCE),
+                        timestamps: Default::default(),
                     }),
                     &mut quote_output,
                 )
