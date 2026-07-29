@@ -20,6 +20,13 @@ const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
 const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
 const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 
+#[cfg(feature = "metrics")]
+fn record_stale_metrics(metrics: &infra_metrics::MetricsRegistry, delay_us: u64) {
+    metrics.inc_events_stale();
+    metrics.record_staleness(delay_us as f64 / 1000.0);
+    metrics.record_ingestion_latency(delay_us as f64);
+}
+
 /// 事件攝取配置
 #[derive(Debug, Clone)]
 pub struct IngestionConfig {
@@ -269,11 +276,7 @@ impl EventIngester {
             if delay > self.config.stale_threshold_us {
                 self.metrics.events_stale += 1;
                 #[cfg(feature = "metrics")]
-                {
-                    infra_metrics::MetricsRegistry::global().inc_events_stale();
-                    infra_metrics::MetricsRegistry::global()
-                        .record_staleness(delay as f64 / 1000.0);
-                }
+                record_stale_metrics(infra_metrics::MetricsRegistry::global(), delay);
                 // Hot path: already throttled via record_stale_warn; trace only for deep diagnostics.
                 if let Some(suppressed) =
                     self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
@@ -756,6 +759,18 @@ mod tests {
             .ingest(MarketEvent::Snapshot(stale_snapshot))
             .is_ok());
         assert_eq!(ingester.metrics().events_stale, 1);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn stale_metrics_include_ingestion_tail_sample() {
+        let metrics = infra_metrics::MetricsRegistry::isolated();
+
+        record_stale_metrics(&metrics, 10_000);
+
+        assert_eq!(metrics.events_stale.get(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_count(), 1);
+        assert_eq!(metrics.latency_ingestion.get_sample_sum(), 10_000.0);
     }
 
     #[tokio::test]
