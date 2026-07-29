@@ -5,6 +5,7 @@ mode=${1:?expected create or verify}
 release=${2:?expected release directory}
 source_revision=${3:?expected source revision}
 image_digest=${4:?expected image digest}
+verify_user=${5:-}
 manifest="$release/polymarket-market-recorder-release.json"
 binary="$release/new-ploy-runner"
 
@@ -17,10 +18,18 @@ binary="$release/new-ploy-runner"
   exit 1
 }
 
+binary_version() {
+  if [[ -n $verify_user ]]; then
+    runuser -u "$verify_user" -- "$binary" --version
+  else
+    "$binary" --version
+  fi
+}
+
 verify_binary() {
   local expected_sha actual_sha
   [[ -f $binary && -x $binary && ! -L $binary ]]
-  "$binary" --version | grep -Fqx "new-ploy-runner $source_revision"
+  binary_version | grep -Fqx "new-ploy-runner $source_revision"
   expected_sha=$(awk 'NR == 1 && NF == 2 && $2 == "new-ploy-runner" {print $1}' \
     "$release/new-ploy-runner.sha256")
   [[ $expected_sha =~ ^[0-9a-f]{64}$ ]]
@@ -32,7 +41,7 @@ case "$mode" in
   create)
     [[ -d $release && ! -e $manifest ]]
     [[ -f $binary && -x $binary && ! -L $binary ]]
-    "$binary" --version | grep -Fqx "new-ploy-runner $source_revision"
+    binary_version | grep -Fqx "new-ploy-runner $source_revision"
     (
       cd "$release"
       sha256sum new-ploy-runner > new-ploy-runner.sha256
