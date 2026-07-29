@@ -80,6 +80,7 @@ fn demo_ultra_ingester() {
         asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
         sequence: 1,
         source_venue: None,
+        timestamps: Default::default(),
     };
 
     // 測量 ingest_fast 性能
@@ -137,6 +138,7 @@ fn demo_batch_operations() {
                 asks: vec![],
                 sequence: i as u64,
                 source_venue: None,
+                timestamps: Default::default(),
             })
         })
         .collect();

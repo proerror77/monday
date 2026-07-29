@@ -432,6 +432,7 @@ impl MarketStream for GrvtMarketStream {
                                 asks,
                                 sequence,
                                 source_venue: Some(VenueId::GRVT),
+                                timestamps: Default::default(),
                             };
                             let _ = tx.send(Ok(MarketEvent::Snapshot(snapshot)));
                         } else if stream_name.starts_with("v1.book.d") {
@@ -497,6 +498,7 @@ impl MarketStream for GrvtMarketStream {
                                 sequence,
                                 is_snapshot: false,
                                 source_venue: Some(VenueId::GRVT),
+                                timestamps: Default::default(),
                             };
                             let _ = tx.send(Ok(MarketEvent::Update(upd)));
                         } else if stream_name.starts_with("v1.ticker.") {
@@ -579,6 +581,7 @@ impl MarketStream for GrvtMarketStream {
                                 sequence,
                                 is_snapshot: false,
                                 source_venue: Some(VenueId::GRVT),
+                                timestamps: Default::default(),
                             };
                             let _ = tx.send(Ok(MarketEvent::Update(upd)));
                         } else if stream_name == "v1.trade" || stream_name.starts_with("v1.trade") {
@@ -687,6 +690,7 @@ fn parse_trade_obj(obj: &serde_json::Value, symbol: &Symbol) -> Option<MarketEve
         side,
         trade_id,
         source_venue: Some(VenueId::GRVT),
+        timestamps: Default::default(),
     };
     Some(MarketEvent::Trade(trade))
 }
