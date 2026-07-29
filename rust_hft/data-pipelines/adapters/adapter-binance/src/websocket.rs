@@ -220,7 +220,7 @@ impl BinanceWebSocket {
 
     pub async fn receive_message_bytes_with_metrics(
         &mut self,
-    ) -> HftResult<Option<(Bytes, integration::WsFrameMetrics)>> {
+    ) -> HftResult<Option<(Bytes, integration::WsMessageMetrics)>> {
         match self.client.receive_message_bytes().await {
             Ok(Some(message)) => Ok(Some(message)),
             Ok(None) => Ok(None),

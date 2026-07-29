@@ -25,8 +25,8 @@ pub trait MarketStream: Send + Sync {
     /// 訂閱指定品種，返回統一事件流
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>>;
 
-    /// Latency-aware stream. Adapters with frame timing override this; other adapters retain the
-    /// stable MarketEvent API and begin tracking at their publish boundary.
+    /// Latency-aware stream. Adapters with WS-library complete-message timing override this;
+    /// the default is explicitly tagged as adapter publish and excluded from receive cohorts.
     async fn subscribe_tracked(
         &self,
         symbols: Vec<Symbol>,

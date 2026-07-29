@@ -166,6 +166,7 @@ impl UltraEventIngester {
 
         // 3. 創建追蹤事件（零拷貝：移動所有權）
         let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -210,6 +211,7 @@ impl UltraEventIngester {
 
             // 創建追蹤事件（移動 event 所有權）
             let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+            tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
             tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
             tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
             tracker.record_stage(hft_core::LatencyStage::Ingestion);
@@ -256,6 +258,7 @@ impl UltraEventIngester {
 
         // 4. 創建追蹤事件
         let mut tracker = hft_core::LatencyTracker::from_time(tracker_origin_time(&event, now));
+        tracker.capture_boundary = hft_core::LatencyCaptureBoundary::AdapterPublish;
         tracker.record_stage_with_offset(hft_core::LatencyStage::WsReceive, 0);
         tracker.record_stage_with_offset(hft_core::LatencyStage::Parsing, 0);
         tracker.record_stage(hft_core::LatencyStage::Ingestion);

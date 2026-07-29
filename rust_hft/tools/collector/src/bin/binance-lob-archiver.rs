@@ -2036,9 +2036,10 @@ async fn receive_url(
                     return Ok(TaskExit::Stopped(None));
                 }
             };
+            // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
+            let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
                 watchdog.mark_data();
-                let received_at_ns = now_ns()?;
                 let frame: Value = serde_json::from_str(&text)?;
                 if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
                     let listed = validate_subscription_listing(&frame, &shard.streams)?;
@@ -2162,9 +2163,10 @@ async fn receive_url(
                     Err(_) => break format!("websocket shard stalled for {}s", stall_timeout.as_secs()),
                 }
             };
+            // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
+            let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
                 watchdog.mark_data();
-                let received_at_ns = now_ns()?;
                 let event = event_from_frame(serde_json::from_str(&text)?, received_at_ns)?;
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {}
@@ -2493,6 +2495,7 @@ async fn produce_snapshots(
                 }
             }
         }
+        // REST snapshot completion is a separate boundary and is excluded from WS latency cohorts.
         let received_at_ns = now_ns()?;
         let event = Event::Snapshot {
             received_at_ns,
