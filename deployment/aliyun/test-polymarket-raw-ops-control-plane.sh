@@ -13,6 +13,8 @@ readonly POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
 readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
+readonly GATE_CONTROL="$SCRIPT_DIR/polymarket-raw-ops-gate-control.sh"
+readonly GATE_UNIT="$SCRIPT_DIR/polymarket-raw-ops-gate@.service"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
@@ -25,15 +27,325 @@ if command -v gsha256sum >/dev/null 2>&1; then
   }
 fi
 
-for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum shellcheck sort \
-  sync wc zstd; do
+for command in cargo chmod cp grep jq ln mkdir mktemp mv python3 rm sed sha256sum \
+  shellcheck sort sync wc zstd; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
     exit 2
   }
 done
 
-shellcheck "$GATE" "$CUTOVER" "$0"
+[[ -x $GATE_CONTROL && -f $GATE_UNIT ]] || {
+  printf 'missing supervised Gate control-plane assets\n' >&2
+  exit 1
+}
+shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
+for unit_line in \
+  'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
+  'TimeoutStopSec=120' \
+  'ExecStartPre=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} prepare %i' \
+  'ExecStart=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} run %i' \
+  'ExecStopPost=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} finalize %i'; do
+  grep -Fxq "$unit_line" "$GATE_UNIT"
+done
+if grep -Eq '^\[(Install)\]$|^(Wants|Requires|Conflicts)=.*polymarket-reference' \
+  "$GATE_UNIT"; then
+  printf 'Gate supervisor must not install, start, or conflict with a collector\n' >&2
+  exit 1
+fi
+grep -Fq "trap 'exit 143' HUP INT TERM" "$GATE"
+grep -Fq 'run_id=$supervised_invocation_id' "$GATE"
+if ! awk '
+  /^verify_gate_supervisor "\$candidate_sha" "\$supervised_invocation_id"/ {guard=NR}
+  /^real_market_preflight_json=$/ {preflight=NR}
+  /^systemctl start "\$shadow_unit"$/ && !shadow {shadow=NR}
+  END {exit !(guard && guard < preflight && preflight < shadow)}
+' "$GATE"; then
+  printf 'unmanaged Gate can reach preflight or shadow startup\n' >&2
+  exit 1
+fi
+grep -Fq 'pass_ready_marker="$evidence_dir/.PASSED.sha256.ready"' "$GATE"
+if grep -Fq 'marker="$evidence_dir/PASSED.sha256"' "$GATE"; then
+  printf 'running Gate publishes the official pass marker before finalization\n' >&2
+  exit 1
+fi
+
+supervisor_tmp=$(mktemp -d)
+trap 'rm -rf "$supervisor_tmp"' EXIT
+supervisor_root="$supervisor_tmp/root"
+supervisor_fake_bin="$supervisor_tmp/bin"
+supervisor_control_dir="$supervisor_tmp/control"
+supervisor_control="$supervisor_control_dir/${GATE_CONTROL##*/}"
+supervisor_state="$supervisor_tmp/systemctl"
+supervisor_calls="$supervisor_tmp/systemctl.calls"
+supervisor_gate_calls="$supervisor_tmp/gate.calls"
+supervisor_candidate="$supervisor_tmp/polymarket-raw-ops"
+supervisor_source=$(printf 'b%.0s' {1..40})
+supervisor_invocation=$(printf '1%.0s' {1..32})
+mkdir -p "$supervisor_fake_bin" "$supervisor_control_dir" \
+  "$supervisor_root/etc/systemd/system" \
+  "$supervisor_root/run/monday" \
+  "$supervisor_root/data/monday/evidence"
+cp "$GATE_CONTROL" "$supervisor_control"
+cp "$GATE_UNIT" "$supervisor_control_dir/${GATE_UNIT##*/}"
+cat >"$supervisor_control_dir/${GATE##*/}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s|%s\n' "$*" "${INVOCATION_ID:-}" \
+  "${MONDAY_POLYMARKET_GATE_INVOCATION_ID:-}" >>"$FAKE_GATE_CALLS"
+exit "${FAKE_GATE_EXIT:-0}"
+EOF
+chmod 0755 "$supervisor_control" \
+  "$supervisor_control_dir/${GATE##*/}"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$supervisor_candidate"
+chmod 0755 "$supervisor_candidate"
+supervisor_candidate_sha=$(sha256sum "$supervisor_candidate" | awk '{print $1}')
+supervisor_unit="polymarket-raw-ops-gate@${supervisor_candidate_sha}.service"
+mkdir "$supervisor_state"
+printf 'inactive\n' >"$supervisor_state/active"
+printf '%s\n' "$supervisor_invocation" >"$supervisor_state/invocation"
+printf 'inactive\n' >"$supervisor_state/shadow"
+: >"$supervisor_calls"
+: >"$supervisor_gate_calls"
+
+cat >"$supervisor_fake_bin/systemctl" <<'EOF'
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+state_dir = Path(os.environ["FAKE_SYSTEMCTL_STATE"])
+argv = sys.argv[1:]
+Path(os.environ["FAKE_SYSTEMCTL_CALLS"]).open("a").write(" ".join(argv) + "\n")
+
+def read(name: str) -> str:
+    return (state_dir / name).read_text().strip()
+
+def write(name: str, value: str) -> None:
+    (state_dir / name).write_text(f"{value}\n")
+
+match argv:
+    case ["daemon-reload"]:
+        pass
+    case ["start", unit]:
+        candidate = unit.removeprefix("polymarket-raw-ops-gate@").removesuffix(".service")
+        invocation = read("invocation")
+        subprocess.run(
+            [os.environ["FAKE_GATE_CONTROL"], "prepare", candidate],
+            check=True,
+            env={**os.environ, "INVOCATION_ID": invocation},
+        )
+        write("active", "active")
+    case ["stop", *_, unit] if unit.startswith("polymarket-reference-collector-shadow@"):
+        if os.environ.get("FAKE_SHADOW_STOP_FAIL") == "1":
+            raise SystemExit(5)
+        write("shadow", "inactive")
+    case ["stop", *_, unit] if unit.startswith("polymarket-raw-ops-gate@"):
+        candidate = unit.removeprefix("polymarket-raw-ops-gate@").removesuffix(".service")
+        invocation = read("invocation")
+        write("active", "inactive")
+        subprocess.run(
+            [os.environ["FAKE_GATE_CONTROL"], "finalize", candidate],
+            check=True,
+            env={
+                **os.environ,
+                "INVOCATION_ID": invocation,
+                "SERVICE_RESULT": "signal",
+                "EXIT_CODE": "killed",
+                "EXIT_STATUS": "15",
+            },
+            stdout=subprocess.DEVNULL,
+        )
+    case ["show", unit, *rest]:
+        prop = next((item.split("=", 1)[1] for item in rest if item.startswith("--property=")), "")
+        if os.environ.get("FAKE_SHOW_FAIL") == prop:
+            raise SystemExit(9)
+        if prop == "ActiveState":
+            print(read("shadow" if unit.startswith("polymarket-reference-collector-shadow@") else "active"))
+        elif prop == "InvocationID":
+            print(read("invocation"))
+        elif prop == "MainPID":
+            if unit.startswith("polymarket-reference-collector-shadow@"):
+                print("5252" if read("shadow") == "active" else "0")
+            else:
+                print("4242" if read("active") == "active" else "0")
+        elif prop == "FragmentPath":
+            print("/etc/systemd/system/polymarket-raw-ops-gate@.service")
+        elif prop == "DropInPaths":
+            print("")
+        else:
+            raise SystemExit(2)
+    case _:
+        raise SystemExit(2)
+EOF
+chmod 0755 "$supervisor_fake_bin/systemctl"
+cat >"$supervisor_fake_bin/flock" <<'EOF'
+#!/usr/bin/env python3
+import fcntl
+import sys
+fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+EOF
+chmod 0755 "$supervisor_fake_bin/flock"
+
+gate_control_env=(
+  MONDAY_ALLOW_POLYMARKET_GATE_CONTROL_TEST_MODE=1
+  MONDAY_POLYMARKET_GATE_CONTROL_TEST_ROOT="$supervisor_root"
+  FAKE_SYSTEMCTL_STATE="$supervisor_state"
+  FAKE_SYSTEMCTL_CALLS="$supervisor_calls"
+  FAKE_GATE_CALLS="$supervisor_gate_calls"
+  FAKE_GATE_CONTROL="$supervisor_control"
+  PATH="$supervisor_fake_bin:$PATH"
+)
+gate_control() { env "${gate_control_env[@]}" "$supervisor_control" "$@"; }
+set_supervisor_state() { printf '%s\n' "$2" >"$supervisor_state/$1"; }
+reject() { if "$@" >/dev/null 2>&1; then return 1; fi; }
+start_supervisor() {
+  set_supervisor_state invocation "$1"
+  set_supervisor_state active inactive
+  gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
+    "$supervisor_source"
+}
+make_supervisor_ready() {
+  local invocation=$1 evidence
+  evidence="$supervisor_root/data/monday/evidence/polymarket-shadow-gates/$supervisor_candidate_sha/$invocation"
+  mkdir -p "$evidence"
+  jq -n --arg candidate "$supervisor_candidate_sha" \
+    --arg source "$supervisor_source" --arg invocation "$invocation" \
+    '{candidate_sha256:$candidate,deployment_source_revision:$source,
+      shadow_run_id:$invocation,production_eligible:true,passed:true}' \
+    >"$evidence/gate.json"
+  (cd "$evidence" && sha256sum gate.json >.PASSED.sha256.ready)
+  printf '%s\n' "$evidence"
+}
+assert_terminal() { jq -e --arg state "$2" '.phase == "terminal" and .terminal_state == $state' "$1" >/dev/null; }
+assert_running_status() {
+  gate_control status "$supervisor_candidate_sha" "$1" \
+    | jq -e '.phase == "running" and .terminal_state == null' >/dev/null
+}
+assert_terminal_status() {
+  gate_control status "$supervisor_candidate_sha" "$1" \
+    | jq -e --arg state "$2" '.phase == "terminal" and .terminal_state == $state' >/dev/null
+}
+finalize_supervisor() {
+  env "${gate_control_env[@]}" INVOCATION_ID="$1" SERVICE_RESULT="$2" \
+    EXIT_CODE="$3" EXIT_STATUS="$4" "$supervisor_control" finalize \
+    "$supervisor_candidate_sha"
+}
+installed_supervisor_unit="$supervisor_root/etc/systemd/system/${GATE_UNIT##*/}"
+gate_control install >"$supervisor_tmp/install.json"
+jq -e '.validated == true' "$supervisor_tmp/install.json" >/dev/null
+cmp -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'Gate unit install left a partial temporary file\n' >&2
+  exit 1
+fi
+printf 'mismatch\n' >"$installed_supervisor_unit"
+reject gate_control install
+rm "$installed_supervisor_unit"
+ln -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+reject gate_control install
+rm "$installed_supervisor_unit"
+gate_control install >/dev/null
+start_supervisor "$supervisor_invocation" >"$supervisor_tmp/start.json"
+jq -e --arg unit "$supervisor_unit" --arg invocation "$supervisor_invocation" '
+  .unit == $unit and .systemd_invocation_id == $invocation
+  and .phase == "running" and .terminal_state == null' \
+  "$supervisor_tmp/start.json" >/dev/null
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+assert_running_status "$supervisor_invocation"
+reject gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source"
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+if env "${gate_control_env[@]}" INVOCATION_ID="$supervisor_invocation" \
+  FAKE_GATE_EXIT=17 "$supervisor_control" run "$supervisor_candidate_sha" \
+  >/dev/null 2>&1; then
+  printf 'fake Gate unexpectedly passed\n' >&2
+  exit 1
+else
+  supervisor_run_status=$?
+fi
+[[ $supervisor_run_status == 17 ]]
+grep -Fqx \
+  "$supervisor_candidate $supervisor_candidate_sha $supervisor_source|$supervisor_invocation|$supervisor_invocation" \
+  "$supervisor_gate_calls"
+set_supervisor_state active inactive
+failed_evidence=$(make_supervisor_ready "$supervisor_invocation")
+FAKE_SHADOW_STOP_FAIL=1 finalize_supervisor "$supervisor_invocation" \
+  exit-code exited 17 \
+  >"$supervisor_tmp/failed.json"
+assert_terminal "$supervisor_tmp/failed.json" failed
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+[[ ! -e $failed_evidence/PASSED.sha256 \
+  && ! -e $failed_evidence/.PASSED.sha256.ready ]]
+assert_terminal_status "$supervisor_invocation" failed
+supervisor_start_query_invocation=$(printf '4%.0s' {1..32})
+set_supervisor_state invocation "$supervisor_start_query_invocation"
+set_supervisor_state active inactive
+reject env "${gate_control_env[@]}" FAKE_SHOW_FAIL=InvocationID \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source"
+[[ $(<"$supervisor_state/active") == inactive ]]
+start_query_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_start_query_invocation"
+assert_terminal "$start_query_dir/receipt.json" failed
+reject env "${gate_control_env[@]}" FAKE_SHOW_FAIL=ActiveState \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source"
+supervisor_finalize_query_invocation=$(printf '5%.0s' {1..32})
+start_supervisor "$supervisor_finalize_query_invocation" >/dev/null
+set_supervisor_state shadow active
+finalize_query_evidence=$(make_supervisor_ready \
+  "$supervisor_finalize_query_invocation")
+set_supervisor_state active inactive
+env "${gate_control_env[@]}" INVOCATION_ID="$supervisor_finalize_query_invocation" \
+  SERVICE_RESULT=success EXIT_CODE=exited EXIT_STATUS=0 \
+  FAKE_SHOW_FAIL=ActiveState "$supervisor_control" finalize \
+  "$supervisor_candidate_sha" >"$supervisor_tmp/finalize-query-failed.json"
+assert_terminal "$supervisor_tmp/finalize-query-failed.json" failed
+jq -e '
+  .shadow.stop_result == "success"
+  and .shadow.containment == "unverified"
+  and .shadow.active_state == "query-error"
+  and .shadow.main_pid == "0"
+' "$supervisor_tmp/finalize-query-failed.json" >/dev/null
+[[ ! -e $finalize_query_evidence/PASSED.sha256 \
+  && ! -e $finalize_query_evidence/.PASSED.sha256.ready ]]
+assert_terminal_status "$supervisor_finalize_query_invocation" failed
+supervisor_cancel_invocation=$(printf '2%.0s' {1..32})
+start_supervisor "$supervisor_cancel_invocation" >/dev/null
+set_supervisor_state shadow active
+cancel_evidence=$(make_supervisor_ready "$supervisor_cancel_invocation")
+gate_control cancel "$supervisor_candidate_sha" \
+  "$supervisor_cancel_invocation" >"$supervisor_tmp/cancelled.json"
+assert_terminal "$supervisor_tmp/cancelled.json" cancelled
+cancel_dir="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_cancel_invocation"
+[[ -f $cancel_dir/cancel.requested ]]
+[[ ! -e $cancel_evidence/PASSED.sha256 \
+  && ! -e $cancel_evidence/.PASSED.sha256.ready ]]
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+
+supervisor_pass_invocation=$(printf '3%.0s' {1..32})
+start_supervisor "$supervisor_pass_invocation" >/dev/null
+set_supervisor_state shadow active
+pass_evidence=$(make_supervisor_ready "$supervisor_pass_invocation")
+set_supervisor_state active inactive
+finalize_supervisor "$supervisor_pass_invocation" success exited 0 \
+  >"$supervisor_tmp/passed.json"
+assert_terminal "$supervisor_tmp/passed.json" passed
+(cd "$pass_evidence" && sha256sum --check --strict PASSED.sha256 >/dev/null)
+[[ $(<"$supervisor_state/shadow") == inactive ]]
+rm "$pass_evidence/PASSED.sha256"
+reject gate_control status "$supervisor_candidate_sha" \
+  "$supervisor_pass_invocation"
+if grep -Fq 'polymarket-reference-collector.service' "$supervisor_calls"; then
+  printf 'Gate supervisor mutated the Python baseline\n' >&2
+  exit 1
+fi
+
+rm -rf "$supervisor_tmp"
+trap - EXIT
 grep -Fxq 'export TZ=UTC' "$GATE" || {
   printf 'Gate does not force UTC for jq date builtins\n' >&2
   exit 1
@@ -3392,15 +3704,15 @@ grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GAT
 grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"
 gate_final_binding_line=$(grep -n '^  verify_release_binding "\$pinned_release_manifest"' "$GATE" \
   | tail -1 | cut -d: -f1)
-gate_marker_line=$(grep -n '^  marker="\$evidence_dir/PASSED.sha256"$' "$GATE" \
+gate_marker_line=$(grep -n '^  pass_ready_marker="\$evidence_dir/.PASSED.sha256.ready"$' "$GATE" \
   | cut -d: -f1)
-gate_marker_sync_line=$(grep -n '^  sync "\$marker"$' "$GATE" | cut -d: -f1)
+gate_marker_sync_line=$(grep -n '^  sync "\$pass_ready_marker"$' "$GATE" | cut -d: -f1)
 gate_marker_dir_sync_line=$(grep -n '^  sync -f "\$evidence_dir"$' "$GATE" \
   | tail -1 | cut -d: -f1)
 ((gate_final_binding_line < gate_marker_line \
   && gate_marker_line < gate_marker_sync_line \
   && gate_marker_sync_line < gate_marker_dir_sync_line)) || {
-  printf 'gate publishes success before revalidating the immutable release binding\n' >&2
+  printf 'gate stages success before revalidating the immutable release binding\n' >&2
   exit 1
 }
 cutover_binding_line=$(grep -n '^verify_release_binding "\$RELEASE_MANIFEST"' "$CUTOVER" \

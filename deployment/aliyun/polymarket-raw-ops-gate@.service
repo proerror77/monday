@@ -1,0 +1,31 @@
+[Unit]
+Description=Monday Polymarket raw-ops Gate job %i
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=exec
+User=root
+Group=root
+EnvironmentFile=/run/monday/polymarket-raw-ops-gates/%i.env
+ExecStartPre=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} prepare %i
+ExecStart=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} run %i
+ExecStopPost=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} finalize %i
+Restart=no
+RuntimeMaxSec=18000
+TimeoutStopSec=120
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday /opt/monday /etc/systemd/system /run/monday
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
