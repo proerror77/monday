@@ -3762,14 +3762,10 @@ extract_bundle_assets() {
 workflow_assets=$(sed -n \
   '/^[[:space:]]*control_assets=($/,/^[[:space:]]*)$/p' "$WORKFLOW" \
   | sed '1d;$d;s/^[[:space:]]*//')
-readme_assets=$(sed -n \
-  '/^control_assets=($/,/^)/p' "$README" \
-  | sed '1d;$d;s/^[[:space:]]*//')
 gate_assets=$(extract_bundle_assets "$GATE")
 cutover_assets=$(extract_bundle_assets "$CUTOVER")
 [[ -n $workflow_assets && $workflow_assets == "$gate_assets" \
-  && $workflow_assets == "$cutover_assets" \
-  && $workflow_assets == "$readme_assets" ]] || {
+  && $workflow_assets == "$cutover_assets" ]] || {
   printf 'ACR artifact and release-control bundle asset lists differ\n' >&2
   exit 1
 }
@@ -3793,22 +3789,23 @@ workflow_sidecar_line=$(grep -n '^              > source-revision.txt$' "$WORKFL
   printf 'workflow publishes release sidecars before the immutable manifest exists\n' >&2
   exit 1
 }
-grep -Fq 'actual_candidate_sha=$(sha256sum polymarket-raw-ops' "$README"
-grep -Fq 'release_manifest_sha=$(sha256sum polymarket-raw-ops-release.json' "$README"
-grep -Fq 'candidate_control_dir="/opt/monday/candidates/polymarket-raw-ops/$release_manifest_sha"' \
+grep -Fq 'stage_command="$source_tree/deployment/aliyun/polymarket-raw-ops-cutover.sh"' \
   "$README"
-grep -Fq 'actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz' \
+grep -Fq 'candidate_dir=$(sudo "$stage_command" stage "$artifact_dir" "$source_revision")' \
   "$README"
-grep -Fq 'sha256sum --check --strict' "$README"
-grep -Fq 'sha256sum polymarket-raw-ops-control-assets.sha256' "$README"
-grep -Fq 'sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"' "$README"
-grep -Fq '"${control_assets[@]}" | LC_ALL=C sort' "$README"
-grep -Fq 'tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort' "$README"
-grep -Fq '"$control_dir"/polymarket-reference-{collector,upload}.service' "$README"
-grep -Fq 'flock -n /run/monday/polymarket-raw-ops.lock' "$README"
-grep -Fq 'sync -f "$candidate_control_parent"' "$README"
+grep -Fq 'gate_control="$candidate_dir/polymarket-raw-ops-gate-control.sh"' "$README"
+grep -Fq 'sudo "$gate_control" install' "$README"
+grep -Fq 'gate_status=$(sudo "$gate_control" start' "$README"
+grep -Fq 'gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")' \
+  "$README"
+grep -Fq "jq -e '.terminal_state == \"passed\"'" "$README"
 grep -Fq 'pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"' \
   "$README"
+if grep -Fq 'polymarket-raw-ops-shadow-gate.sh" \
+  "$artifact_dir/polymarket-raw-ops"' "$README"; then
+  printf 'README bypasses the supervised Gate controller\n' >&2
+  exit 1
+fi
 if grep -Fq 'deployment/aliyun/polymarket-reference-collector.service' "$README"; then
   printf 'README installs the production unit from a mutable checkout\n' >&2
   exit 1

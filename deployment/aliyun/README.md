@@ -174,140 +174,43 @@ records are allowed, but a legacy-only record or any governed shared-value misma
 still fails closed. Field parity checks the governed record contract on both lanes
 rather than requiring every historical provider field to be identical.
 
-Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
-artifact. Verify the binary, source revision, control archive, control manifest,
-and deployment-bundle digest from the extracted artifact directory before
-installing anything:
+Obtain the immutable collector artifact on the ECS as a root-owned,
+non-group/world-writable directory. Run the staging command from the root-owned,
+exact source checkout used for that artifact; never execute a script extracted
+from an unverified artifact as root. The command requires its own bytes to match
+the candidate control release, then verifies and atomically publishes the complete
+release. It rejects mixed source identities, wrong sidecars, unexpected or
+symbolic control entries, and an existing manifest-addressed destination:
 
 ```bash
 set -euo pipefail
 artifact_dir=$(pwd -P)
+source_tree=/root/monday-release-source
+stage_command="$source_tree/deployment/aliyun/polymarket-raw-ops-cutover.sh"
+source_revision=$(sudo git -C "$source_tree" rev-parse HEAD)
+[[ -z $(sudo git -C "$source_tree" status --porcelain --untracked-files=no) ]]
+candidate_dir=$(sudo "$stage_command" stage "$artifact_dir" "$source_revision")
 
-release_manifest_sha=$(sha256sum polymarket-raw-ops-release.json | awk '{print $1}')
-[[ $(wc -l < polymarket-raw-ops-release.json.sha256) -eq 1 ]]
-[[ $(<polymarket-raw-ops-release.json.sha256) \
-  == "$release_manifest_sha  polymarket-raw-ops-release.json" ]]
-printf '%s  %s\n' "$release_manifest_sha" polymarket-raw-ops-release.json \
-  | sha256sum --check --strict
-jq -e -s '
-  length == 1 and (.[0] |
-    .schema == "monday.polymarket_raw_ops_release.v1"
-    and (keys | sort) == (["candidate","control_archive","control_manifest",
-      "schema","source_revision"] | sort)
-    and (.source_revision | test("^[0-9a-f]{40,64}$"))
-    and .candidate.file == "polymarket-raw-ops"
-    and (.candidate | keys | sort) == ["file","sha256"]
-    and (.candidate.sha256 | test("^[0-9a-f]{64}$"))
-    and .control_manifest.file == "polymarket-raw-ops-control-assets.sha256"
-    and (.control_manifest | keys | sort) == ["file","sha256"]
-    and (.control_manifest.sha256 | test("^[0-9a-f]{64}$"))
-    and .control_archive.file == "polymarket-raw-ops-control.tar.gz"
-    and (.control_archive | keys | sort) == ["file","sha256"]
-    and (.control_archive.sha256 | test("^[0-9a-f]{64}$"))
-  )
-' polymarket-raw-ops-release.json >/dev/null
-candidate_sha=$(jq -er -s '.[0].candidate.sha256' polymarket-raw-ops-release.json)
-source_revision=$(jq -er -s '.[0].source_revision' polymarket-raw-ops-release.json)
-deployment_bundle_sha=$(jq -er -s '.[0].control_manifest.sha256' \
-  polymarket-raw-ops-release.json)
-control_archive_sha=$(jq -er -s '.[0].control_archive.sha256' \
-  polymarket-raw-ops-release.json)
+candidate_sha=$(jq -er '.candidate.sha256' \
+  "$candidate_dir/polymarket-raw-ops-release.json")
+gate_control="$candidate_dir/polymarket-raw-ops-gate-control.sh"
+sudo "$gate_control" install
+gate_status=$(sudo "$gate_control" start \
+  "$candidate_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision")
+gate_invocation=$(jq -er '.systemd_invocation_id' <<<"$gate_status")
 
-actual_candidate_sha=$(sha256sum polymarket-raw-ops | awk '{print $1}')
-[[ $actual_candidate_sha == "$candidate_sha" ]]
-[[ $(wc -l < polymarket-raw-ops.sha256) -eq 1 ]]
-[[ $(<polymarket-raw-ops.sha256) == "$candidate_sha  polymarket-raw-ops" ]]
-printf '%s  %s\n' "$candidate_sha" polymarket-raw-ops \
-  | sha256sum --check --strict
-[[ $(wc -l < source-revision.txt) -eq 1 ]]
-grep -Eq '^[0-9a-f]{40,64}$' source-revision.txt
-[[ $(<source-revision.txt) == "$source_revision" ]]
-
-actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
-  | awk '{print $1}')
-[[ $actual_control_archive_sha == "$control_archive_sha" ]]
-[[ $(wc -l < polymarket-raw-ops-control.tar.gz.sha256) -eq 1 ]]
-[[ $(<polymarket-raw-ops-control.tar.gz.sha256) \
-  == "$control_archive_sha  polymarket-raw-ops-control.tar.gz" ]]
-printf '%s  %s\n' "$control_archive_sha" polymarket-raw-ops-control.tar.gz \
-  | sha256sum --check --strict
-[[ $(wc -l < deployment-bundle.sha256) -eq 1 ]]
-grep -Eq '^[0-9a-f]{64}$' deployment-bundle.sha256
-[[ $(<deployment-bundle.sha256) == "$deployment_bundle_sha" ]]
-manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 | awk '{print $1}')
-[[ $manifest_sha == "$deployment_bundle_sha" ]]
-
-control_assets=(
-  polymarket-raw-ops-shadow-gate.sh
-  polymarket-raw-ops-cutover.sh
-  polymarket-shadow-gate-policy.jq
-  polymarket-legacy-health-policy.jq
-  polymarket-rust-health-policy.jq
-  polymarket-reference-collector-shadow@.service
-  polymarket-reference-collector.service
-  polymarket-reference-upload.service
-  polymarket-reference-upload.timer
-  polymarket-market-tape-upload.service
-  polymarket-market-tape-upload.timer
-)
-control_dir=$(mktemp -d)
-trap 'rm -rf -- "$control_dir"' EXIT
-diff -u <(printf '%s\n' "${control_assets[@]}" | LC_ALL=C sort) \
-  <(tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort)
-tar --no-same-owner --no-same-permissions \
-  -xzf polymarket-raw-ops-control.tar.gz -C "$control_dir"
-(
-  cd "$control_dir"
-  sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"
-)
-```
-
-Stage the exact control bundle from the same reviewed revision without replacing
-the active global controls. The shadow gate pins that bundle under the candidate's
-immutable release; only cutover may install it globally. Never combine a candidate
-binary with control assets from another revision or replace a production unit
-manually:
-
-```bash
-candidate_control_dir="/opt/monday/candidates/polymarket-raw-ops/$release_manifest_sha"
-sudo install -d -o root -g root -m 0755 /run/monday
-sudo flock -n /run/monday/polymarket-raw-ops.lock \
-  bash -s -- "$control_dir" "$artifact_dir" "$candidate_control_dir" <<'ROOT_INSTALL'
-set -euo pipefail
-control_dir=$1
-artifact_dir=$2
-candidate_control_dir=$3
-candidate_control_parent=${candidate_control_dir%/*}
-[[ ! -e $candidate_control_dir && ! -L $candidate_control_dir ]]
-install -d -o root -g root -m 0755 "$candidate_control_parent"
-staging=$(mktemp -d "$candidate_control_parent/.new.XXXXXX")
-trap '[[ -z ${staging:-} ]] || rm -rf -- "$staging"' EXIT
-install -o root -g root -m 0644 \
-  "$control_dir"/polymarket-{legacy,rust}-health-policy.jq \
-  "$control_dir"/polymarket-shadow-gate-policy.jq \
-  "$control_dir"/polymarket-reference-collector-shadow@.service \
-  "$control_dir"/polymarket-reference-{collector,upload}.service \
-  "$control_dir"/polymarket-reference-upload.timer \
-  "$control_dir"/polymarket-market-tape-upload.{service,timer} \
-  "$staging"/
-install -o root -g root -m 0755 \
-  "$control_dir"/polymarket-raw-ops-{shadow-gate,cutover}.sh \
-  "$staging"/
-install -o root -g root -m 0444 \
-  "$artifact_dir/polymarket-raw-ops-release.json" \
-  "$staging/polymarket-raw-ops-release.json"
-chmod 0755 "$staging"
-mv "$staging" "$candidate_control_dir"
-staging=
-sync -f "$candidate_control_parent"
-ROOT_INSTALL
-
-gate_json=$(sudo "$candidate_control_dir/polymarket-raw-ops-shadow-gate.sh" \
-  "$artifact_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision")
+# Run this status command after the supervised systemd Gate becomes terminal.
+gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")
+jq -e '.terminal_state == "passed"' <<<"$gate_terminal" >/dev/null
+gate_json="/data/monday/evidence/polymarket-shadow-gates/$candidate_sha/$gate_invocation/gate.json"
 pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"
 sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
   cutover "$candidate_sha" "$gate_json"
 ```
+
+Staging does not replace active global controls or production units. The Gate pins
+the verified controls under the immutable candidate release; only a successful
+cutover may install them globally.
 
 The Rust shadow unit must complete its configured observation window and publish
 fresh fail-closed health before the reference collector is promoted. Evidence binds
