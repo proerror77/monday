@@ -266,9 +266,7 @@ pub struct Engine {
     /// Reused output buffer for one aggregation input event.
     aggregation_events_buf: Vec<ports::MarketEvent>,
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
-    intents_work_buf: Vec<ports::OrderIntent>,
-    /// Per-strategy observable intent handoff for the current event.
-    intent_emission_mono_by_strategy: FxHashMap<String, Option<u64>>,
+    intents_work_buf: Vec<ports::OrderIntentEnvelope>,
     /// 復用的執行事件緩衝，避免每 tick 分配
     execution_events_buf: Vec<ExecutionEvent>,
     /// 事件驱动唤醒通知器
@@ -362,7 +360,6 @@ impl Engine {
             pending_market_events: Vec::new(),
             aggregation_events_buf: Vec::with_capacity(4),
             intents_work_buf: Vec::new(),
-            intent_emission_mono_by_strategy: FxHashMap::default(),
             execution_events_buf: Vec::new(),
             wakeup_notify: Arc::new(Notify::new()),
             order_submit_ts: FxHashMap::default(),
@@ -1480,9 +1477,6 @@ impl Engine {
             // 復用策略意圖工作緩衝，避免熱路徑重分配
             let mut intents_work_buf = std::mem::take(&mut self.intents_work_buf);
             intents_work_buf.clear();
-            for emitted_at in self.intent_emission_mono_by_strategy.values_mut() {
-                *emitted_at = None;
-            }
             let expected_capacity = self.strategies.len().saturating_mul(4);
             if intents_work_buf.capacity() < expected_capacity {
                 intents_work_buf.reserve(expected_capacity - intents_work_buf.capacity());
@@ -1585,19 +1579,11 @@ impl Engine {
                 }
 
                 let emitted_at = monotonic_micros();
-                for intent in &intents {
-                    if let Some(timestamp) = self
-                        .intent_emission_mono_by_strategy
-                        .get_mut(&intent.strategy_id)
-                    {
-                        *timestamp = Some(emitted_at);
-                    } else {
-                        self.intent_emission_mono_by_strategy
-                            .insert(intent.strategy_id.clone(), Some(emitted_at));
-                    }
-                }
-
-                intents_work_buf.extend(intents);
+                intents_work_buf.extend(intents.into_iter().map(|intent| {
+                    let mut lifecycle = ports::OrderIntentLifecycle::default();
+                    lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
+                    ports::OrderIntentEnvelope::new(intent, lifecycle)
+                }));
             }
 
             // 記錄策略階段完成和延遲
@@ -1613,13 +1599,18 @@ impl Engine {
 
             // Risk must see an executable reference price for every market intent. Use the
             // event-sequenced book first; fail closed if no valid quote can be resolved.
-            if intents_work_buf.iter().any(|intent| {
-                matches!(intent.order_type, OrderType::Market) && intent.price.is_none()
+            if intents_work_buf.iter().any(|envelope| {
+                matches!(envelope.intent.order_type, OrderType::Market)
+                    && envelope.intent.price.is_none()
             }) {
                 let latest_market_view = self.get_market_view();
                 let before_pricing = intents_work_buf.len();
-                intents_work_buf.retain_mut(|intent| {
-                    Self::enrich_market_intent_price(intent, l2_book, &latest_market_view)
+                intents_work_buf.retain_mut(|envelope| {
+                    Self::enrich_market_intent_price(
+                        &mut envelope.intent,
+                        l2_book,
+                        &latest_market_view,
+                    )
                 });
                 let rejected = before_pricing.saturating_sub(intents_work_buf.len());
                 if rejected > 0 {
@@ -1637,7 +1628,7 @@ impl Engine {
             {
                 let risk_start = now_micros();
                 // 使用新的 venue-specific 風控方法
-                let reviewed = risk_manager.review_with_venue_specs(
+                let reviewed = risk_manager.review_envelopes_with_venue_specs(
                     intents_work_buf,
                     &account_view,
                     &self.venue_specs,
@@ -1689,36 +1680,27 @@ impl Engine {
             });
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
-                for intent in intents_to_send.drain(..) {
+                for mut envelope in intents_to_send.drain(..) {
                     let max_latency_us = self.config.intent_max_latency_us.max(1);
-                    let mut lifecycle = ports::OrderIntentLifecycle::new(
-                        received_at,
-                        received_at.saturating_add(max_latency_us),
-                    );
-                    lifecycle.max_latency_us = Some(max_latency_us);
-                    lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
-                    lifecycle.max_order_notional = self.intent_max_order_notional;
-                    lifecycle.max_order_quantity = self.intent_max_order_quantity;
-                    lifecycle.source_feature_ts = exchange_timestamp;
-                    lifecycle.source_book_seq = l2_book.map(|book| book.sequence).or(match event {
-                        ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
-                        ports::MarketEvent::Update(update) => Some(update.sequence),
-                        ports::MarketEvent::Quote(quote) => Some(quote.sequence),
-                        _ => None,
-                    });
-                    lifecycle.timing = ports::ExecutionTiming {
-                        intent_emitted_mono_us: self
-                            .intent_emission_mono_by_strategy
-                            .get(&intent.strategy_id)
-                            .copied()
-                            .flatten(),
-                        risk_completed_mono_us,
-                        source_market_receive_wall_us: capture_boundary
-                            .is_receive_latency_cohort()
-                            .then_some(received_at),
-                        source_market_capture_boundary: capture_boundary,
-                    };
-                    let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+                    envelope.lifecycle.created_ts = received_at;
+                    envelope.lifecycle.valid_until = received_at.saturating_add(max_latency_us);
+                    envelope.lifecycle.max_latency_us = Some(max_latency_us);
+                    envelope.lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
+                    envelope.lifecycle.max_order_notional = self.intent_max_order_notional;
+                    envelope.lifecycle.max_order_quantity = self.intent_max_order_quantity;
+                    envelope.lifecycle.source_feature_ts = exchange_timestamp;
+                    envelope.lifecycle.source_book_seq =
+                        l2_book.map(|book| book.sequence).or(match event {
+                            ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
+                            ports::MarketEvent::Update(update) => Some(update.sequence),
+                            ports::MarketEvent::Quote(quote) => Some(quote.sequence),
+                            _ => None,
+                        });
+                    envelope.lifecycle.timing.risk_completed_mono_us = risk_completed_mono_us;
+                    envelope.lifecycle.timing.source_market_receive_wall_us = capture_boundary
+                        .is_receive_latency_cohort()
+                        .then_some(received_at);
+                    envelope.lifecycle.timing.source_market_capture_boundary = capture_boundary;
                     if queues
                         .send_lifecycle_intent_with_book_seq(
                             envelope,
@@ -2428,6 +2410,7 @@ mod tests {
 
     struct EmittingStrategy {
         id: String,
+        emitted_strategy_id: Option<String>,
         delay: std::time::Duration,
     }
 
@@ -2439,7 +2422,10 @@ mod tests {
         ) -> Vec<ports::OrderIntent> {
             std::thread::sleep(self.delay);
             let mut intent = test_intent();
-            intent.strategy_id = self.id.clone();
+            intent.strategy_id = self
+                .emitted_strategy_id
+                .clone()
+                .unwrap_or_else(|| self.id.clone());
             vec![intent]
         }
 
@@ -2468,10 +2454,12 @@ mod tests {
         engine.set_execution_queues(engine_queues);
         engine.register_strategy(EmittingStrategy {
             id: "first".to_string(),
+            emitted_strategy_id: None,
             delay: std::time::Duration::ZERO,
         });
         engine.register_strategy(EmittingStrategy {
             id: "second".to_string(),
+            emitted_strategy_id: None,
             delay: std::time::Duration::from_millis(2),
         });
 
@@ -2511,6 +2499,66 @@ mod tests {
         assert!(
             first.timing.intent_emitted_mono_us.unwrap()
                 < second.timing.intent_emitted_mono_us.unwrap()
+        );
+    }
+
+    #[test]
+    fn duplicate_strategy_ids_keep_each_intent_emission_boundary() {
+        let mut engine = Engine::new(EngineConfig {
+            intent_max_latency_us: 100_000,
+            ..EngineConfig::default()
+        });
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        for (id, delay) in [
+            ("first", std::time::Duration::ZERO),
+            ("second", std::time::Duration::from_millis(2)),
+        ] {
+            engine.register_strategy(EmittingStrategy {
+                id: id.to_string(),
+                emitted_strategy_id: Some("shared".to_string()),
+                delay,
+            });
+        }
+
+        let received_at = now_micros();
+        engine.pending_market_events.push(PendingMarketEvent {
+            event: MarketEvent::Bar(AggregatedBar {
+                symbol: Symbol::new("BTCUSDT"),
+                interval_ms: 60_000,
+                open_time: received_at,
+                close_time: received_at,
+                open: Price::from_f64(100.0).unwrap(),
+                high: Price::from_f64(100.0).unwrap(),
+                low: Price::from_f64(100.0).unwrap(),
+                close: Price::from_f64(100.0).unwrap(),
+                volume: Quantity::from_f64(1.0).unwrap(),
+                trade_count: 1,
+                source_venue: Some(VenueId::MOCK),
+                timestamps: Default::default(),
+            }),
+            received_at,
+            capture_boundary: LatencyCaptureBoundary::AdapterPublish,
+            book: None,
+        });
+
+        engine
+            .run_strategies_sync(&mut EngineTickResult::default())
+            .unwrap();
+        let envelopes = worker_queues.receive_envelopes();
+        assert_eq!(envelopes.len(), 2);
+        assert!(
+            envelopes[0]
+                .lifecycle
+                .timing
+                .intent_emitted_mono_us
+                .unwrap()
+                < envelopes[1]
+                    .lifecycle
+                    .timing
+                    .intent_emitted_mono_us
+                    .unwrap()
         );
     }
 

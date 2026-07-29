@@ -339,78 +339,85 @@ fn publish_binance_execution_report(
         .get("X")
         .and_then(|entry| entry.as_str())
         .unwrap_or("");
+    let execution_type = value
+        .get("x")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("");
+    let publish_timing = |kind| {
+        let _ = tx.send(ExecutionEvent::PrivateOrderTiming {
+            order_id: order_id.clone(),
+            kind,
+            received_mono_us,
+        });
+    };
 
-    let _ = tx.send(ExecutionEvent::PrivateOrderTiming {
-        order_id: order_id.clone(),
-        kind: if status == "NEW" {
-            PrivateOrderEventKind::Ack
-        } else {
-            PrivateOrderEventKind::Report
-        },
-        received_mono_us,
-    });
-
-    match status {
-        "NEW" => {
+    match (execution_type, status) {
+        ("NEW", "NEW") => {
+            publish_timing(PrivateOrderEventKind::Ack);
             let _ = tx.send(ExecutionEvent::OrderAck {
                 order_id: order_id.clone(),
                 timestamp,
             });
         }
-        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
+        ("CANCELED", "CANCELED")
+        | ("EXPIRED", "EXPIRED")
+        | ("TRADE_PREVENTION", "EXPIRED_IN_MATCH") => {
+            publish_timing(PrivateOrderEventKind::Report);
             let _ = tx.send(ExecutionEvent::OrderCanceled {
                 order_id: order_id.clone(),
                 timestamp,
             });
         }
-        "REJECTED" => {
+        ("REJECTED", "REJECTED") => {
             let reason = value
                 .get("r")
                 .and_then(|entry| entry.as_str())
                 .filter(|reason| !reason.is_empty() && *reason != "NONE")
                 .unwrap_or("Exchange rejected")
                 .to_string();
+            publish_timing(PrivateOrderEventKind::Report);
             let _ = tx.send(ExecutionEvent::OrderReject {
                 order_id: order_id.clone(),
                 reason,
                 timestamp,
             });
         }
-        _ => {}
-    }
-
-    if value.get("x").and_then(|entry| entry.as_str()) != Some("TRADE") {
-        return;
-    }
-    let quantity = value
-        .get("l")
-        .and_then(|entry| entry.as_str())
-        .and_then(|value| Quantity::from_str(value).ok())
-        .filter(|quantity| *quantity > Quantity::zero());
-    let price = value
-        .get("L")
-        .and_then(|entry| entry.as_str())
-        .and_then(|value| Price::from_str(value).ok())
-        .filter(|price| *price > Price::zero());
-    let execution_id = value
-        .get("t")
-        .and_then(|entry| entry.as_i64())
-        .filter(|trade_id| *trade_id >= 0)
-        .map(|trade_id| trade_id.to_string())
-        .or_else(|| {
-            value
-                .get("I")
+        ("TRADE", "PARTIALLY_FILLED" | "FILLED") => {
+            let quantity = value
+                .get("l")
+                .and_then(|entry| entry.as_str())
+                .and_then(|value| Quantity::from_str(value).ok())
+                .filter(|quantity| *quantity > Quantity::zero());
+            let price = value
+                .get("L")
+                .and_then(|entry| entry.as_str())
+                .and_then(|value| Price::from_str(value).ok())
+                .filter(|price| *price > Price::zero());
+            let execution_id = value
+                .get("t")
                 .and_then(|entry| entry.as_i64())
-                .map(|execution_id| execution_id.to_string())
-        });
-    if let (Some(quantity), Some(price), Some(execution_id)) = (quantity, price, execution_id) {
-        let _ = tx.send(ExecutionEvent::Fill {
-            fill_id: format!("BNFILL-{}-{execution_id}", order_id.0),
-            order_id,
-            price,
-            quantity,
-            timestamp,
-        });
+                .filter(|trade_id| *trade_id >= 0)
+                .map(|trade_id| trade_id.to_string())
+                .or_else(|| {
+                    value
+                        .get("I")
+                        .and_then(|entry| entry.as_i64())
+                        .map(|execution_id| execution_id.to_string())
+                });
+            if let (Some(quantity), Some(price), Some(execution_id)) =
+                (quantity, price, execution_id)
+            {
+                publish_timing(PrivateOrderEventKind::Report);
+                let _ = tx.send(ExecutionEvent::Fill {
+                    fill_id: format!("BNFILL-{}-{execution_id}", order_id.0),
+                    order_id,
+                    price,
+                    quantity,
+                    timestamp,
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1505,6 +1512,53 @@ mod tests {
             rx.try_recv().expect("ack event"),
             ExecutionEvent::OrderAck { order_id, .. }
                 if order_id == OrderId("client-42".to_string())
+        ));
+    }
+
+    #[test]
+    fn malformed_private_reports_do_not_publish_authoritative_timing() {
+        let (tx, mut rx) = broadcast::channel(4);
+        for report in [
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "PARTIALLY_FILLED",
+                "i": 7,
+                "t": 41,
+                "l": "0",
+                "L": "100"
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "UNKNOWN",
+                "X": "UNKNOWN",
+                "i": 7
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "NEW",
+                "i": 7,
+                "t": 42,
+                "l": "0.1",
+                "L": "100"
+            }),
+            serde_json::json!({
+                "e": "executionReport",
+                "x": "TRADE",
+                "X": "CANCELED",
+                "i": 7,
+                "t": 43,
+                "l": "0.1",
+                "L": "100"
+            }),
+        ] {
+            publish_binance_execution_report(&tx, &report, 42);
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
     }
 
