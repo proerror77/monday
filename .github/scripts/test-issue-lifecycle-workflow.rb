@@ -19,7 +19,7 @@ raise "permissions are not minimal and read-only" unless workflow.fetch("permiss
 jobs = workflow.fetch("jobs")
 raise "expected one audit job" unless jobs.length == 1
 job = jobs.values.first
-raise "unstable check name" unless job.fetch("name") == "Issue Lifecycle"
+raise "unstable check name" unless job.fetch("name") == "Issue Lifecycle Audit"
 raise "GitHub token is not wired" unless job.fetch("env").fetch("GH_TOKEN") == "${{ github.token }}"
 
 steps = job.fetch("steps")

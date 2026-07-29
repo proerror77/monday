@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   issue-lifecycle:
-    name: Issue Lifecycle
+    name: Issue Lifecycle Audit
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
