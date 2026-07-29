@@ -948,6 +948,156 @@ if verify_gate_marker "$marker_dir"; then
   exit 1
 fi
 
+# Cutover must consume the supervisor's immutable terminal receipt, not a
+# caller-selected gate.json. The receipt fixes the candidate, source, systemd
+# invocation, terminal result, shadow containment, and exact Gate evidence path.
+terminal_receipt_verifier="$tmp_dir/verify-gate-terminal-receipt.sh"
+sed -n \
+  -e '/^verify_gate_marker() {$/,/^}$/p' \
+  -e '/^verify_gate_terminal_receipt() {$/,/^}$/p' \
+  "$CUTOVER" >"$terminal_receipt_verifier"
+grep -Fq 'verify_gate_terminal_receipt() {' "$terminal_receipt_verifier" || {
+  printf 'cutover does not expose its terminal-receipt admission contract\n' >&2
+  exit 1
+}
+(
+  candidate=$(printf 'a%.0s' {1..64})
+  source_revision=$(printf 'b%.0s' {1..40})
+  invocation=$(printf 'c%.0s' {1..32})
+  other_candidate=$(printf 'd%.0s' {1..64})
+  GATE_RECEIPT_ROOT="$tmp_dir/terminal-receipts"
+  GATE_EVIDENCE_ROOT="$tmp_dir/terminal-gates"
+  receipt_dir="$GATE_RECEIPT_ROOT/$candidate/$invocation"
+  gate_dir="$GATE_EVIDENCE_ROOT/$candidate/$invocation"
+  receipt="$receipt_dir/receipt.json"
+  gate_json="$gate_dir/gate.json"
+  mkdir -p "$receipt_dir" "$gate_dir"
+  secure_receipt=true
+  secure_regular_file() {
+    [[ $secure_receipt == true && -f $1 && ! -L $1 ]]
+  }
+  secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
+  write_receipt() {
+    jq -n --arg candidate "$candidate" --arg source "$source_revision" \
+      --arg invocation "$invocation" '
+      {schema:"monday.polymarket_gate_receipt.v1",
+        unit:("polymarket-raw-ops-gate@" + $candidate + ".service"),
+        candidate_sha256:$candidate,source_revision:$source,
+        systemd_invocation_id:$invocation,phase:"terminal",
+        terminal_state:"passed",systemd:{result:"success",exit_code:"exited",
+          exit_status:"0"},shadow:{
+          unit:("polymarket-reference-collector-shadow@" + $candidate + ".service"),
+          stop_result:"success",containment:"contained",active_state:"inactive",
+          main_pid:"0"}}' >"$receipt"
+  }
+  write_gate() {
+    jq -n --arg candidate "$candidate" --arg source "$source_revision" \
+      --arg invocation "$invocation" '
+      {candidate_sha256:$candidate,deployment_source_revision:$source,
+        shadow_run_id:$invocation,production_eligible:true,passed:true}' \
+      >"$gate_json"
+    (cd "$gate_dir" && sha256sum gate.json >PASSED.sha256)
+  }
+  # shellcheck source=/dev/null
+  source "$terminal_receipt_verifier"
+  write_receipt
+  write_gate
+  binding=$(verify_gate_terminal_receipt "$receipt" "$candidate") || {
+    printf 'cutover terminal-receipt verifier rejected valid evidence\n' >&2
+    exit 1
+  }
+  IFS='|' read -r bound_invocation bound_source bound_receipt_sha \
+    bound_gate_sha bound_gate_json bound_receipt extra <<<"$binding"
+  [[ $bound_invocation == "$invocation" \
+    && $bound_source == "$source_revision" \
+    && $bound_receipt_sha == "$(sha256sum "$receipt" | awk '{print $1}')" \
+    && $bound_gate_sha == "$(sha256sum "$gate_json" | awk '{print $1}')" \
+    && $bound_gate_json == "$gate_json" && $bound_receipt == "$receipt" \
+    && -z $extra ]] || {
+    printf 'cutover terminal-receipt verifier returned the wrong binding\n' >&2
+    exit 1
+  }
+  jq '.passed = false' "$gate_json" >"$gate_json.tmp"
+  mv "$gate_json.tmp" "$gate_json"
+  if [[ $(sha256sum "$gate_json" | awk '{print $1}') == "$bound_gate_sha" ]]; then
+    printf 'cutover Gate digest did not detect post-admission evidence drift\n' >&2
+    exit 1
+  fi
+  write_gate
+
+  rm "$receipt"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted standalone Gate evidence without a receipt\n' >&2
+    exit 1
+  fi
+  write_receipt
+  for mutation in \
+    '.terminal_state = "failed"' \
+    '.terminal_state = "cancelled"' \
+    '.systemd.result = "signal"' \
+    '.systemd.exit_code = "killed"' \
+    '.systemd.exit_status = "1"' \
+    '.shadow.containment = "active"' \
+    '.systemd.extra = true' \
+    '.shadow.extra = true' \
+    '.extra = true'; do
+    jq "$mutation" "$receipt" >"$receipt.tmp"
+    mv "$receipt.tmp" "$receipt"
+    if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+      printf 'cutover admitted invalid terminal receipt mutation: %s\n' \
+        "$mutation" >&2
+      exit 1
+    fi
+    write_receipt
+  done
+  jq --arg candidate "$other_candidate" '.candidate_sha256 = $candidate' \
+    "$receipt" >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted a receipt for another candidate\n' >&2
+    exit 1
+  fi
+  write_receipt
+  jq '.systemd_invocation_id = ("f" * 32)' "$receipt" >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted a receipt for another invocation\n' >&2
+    exit 1
+  fi
+  write_receipt
+  jq '.source_revision = ("e" * 40)' "$receipt" >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted a receipt whose source differs from gate evidence\n' >&2
+    exit 1
+  fi
+  write_receipt
+  cp "$receipt" "$tmp_dir/wrong-receipt.json"
+  if verify_gate_terminal_receipt "$tmp_dir/wrong-receipt.json" "$candidate" \
+    >/dev/null 2>&1; then
+    printf 'cutover admitted a receipt outside the fixed receipt root\n' >&2
+    exit 1
+  fi
+  printf 'tampered marker\n' >"$gate_dir/PASSED.sha256"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted a receipt bound to a tampered Gate marker\n' >&2
+    exit 1
+  fi
+  (cd "$gate_dir" && sha256sum gate.json >PASSED.sha256)
+  secure_receipt=false
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted an insecure terminal receipt\n' >&2
+    exit 1
+  fi
+  secure_receipt=true
+  mv "$receipt" "$receipt_dir/real.json"
+  ln -s real.json "$receipt"
+  if verify_gate_terminal_receipt "$receipt" "$candidate" >/dev/null 2>&1; then
+    printf 'cutover admitted an indirect terminal receipt\n' >&2
+    exit 1
+  fi
+)
+
 # Exercise the installed immutable release manifest parser. The manifest is the
 # sole binding for source, candidate, control-manifest, and control-archive IDs.
 (
@@ -3762,14 +3912,10 @@ extract_bundle_assets() {
 workflow_assets=$(sed -n \
   '/^[[:space:]]*control_assets=($/,/^[[:space:]]*)$/p' "$WORKFLOW" \
   | sed '1d;$d;s/^[[:space:]]*//')
-readme_assets=$(sed -n \
-  '/^control_assets=($/,/^)/p' "$README" \
-  | sed '1d;$d;s/^[[:space:]]*//')
 gate_assets=$(extract_bundle_assets "$GATE")
 cutover_assets=$(extract_bundle_assets "$CUTOVER")
 [[ -n $workflow_assets && $workflow_assets == "$gate_assets" \
-  && $workflow_assets == "$cutover_assets" \
-  && $workflow_assets == "$readme_assets" ]] || {
+  && $workflow_assets == "$cutover_assets" ]] || {
   printf 'ACR artifact and release-control bundle asset lists differ\n' >&2
   exit 1
 }
@@ -3793,22 +3939,23 @@ workflow_sidecar_line=$(grep -n '^              > source-revision.txt$' "$WORKFL
   printf 'workflow publishes release sidecars before the immutable manifest exists\n' >&2
   exit 1
 }
-grep -Fq 'actual_candidate_sha=$(sha256sum polymarket-raw-ops' "$README"
-grep -Fq 'release_manifest_sha=$(sha256sum polymarket-raw-ops-release.json' "$README"
-grep -Fq 'candidate_control_dir="/opt/monday/candidates/polymarket-raw-ops/$release_manifest_sha"' \
+grep -Fq 'stage_command="$source_tree/deployment/aliyun/polymarket-raw-ops-cutover.sh"' \
   "$README"
-grep -Fq 'actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz' \
+grep -Fq 'candidate_dir=$(sudo "$stage_command" stage "$artifact_dir" "$source_revision")' \
   "$README"
-grep -Fq 'sha256sum --check --strict' "$README"
-grep -Fq 'sha256sum polymarket-raw-ops-control-assets.sha256' "$README"
-grep -Fq 'sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"' "$README"
-grep -Fq '"${control_assets[@]}" | LC_ALL=C sort' "$README"
-grep -Fq 'tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort' "$README"
-grep -Fq '"$control_dir"/polymarket-reference-{collector,upload}.service' "$README"
-grep -Fq 'flock -n /run/monday/polymarket-raw-ops.lock' "$README"
-grep -Fq 'sync -f "$candidate_control_parent"' "$README"
+grep -Fq 'gate_control="$candidate_dir/polymarket-raw-ops-gate-control.sh"' "$README"
+grep -Fq 'sudo "$gate_control" install' "$README"
+grep -Fq 'gate_status=$(sudo "$gate_control" start' "$README"
+grep -Fq 'gate_terminal=$(sudo "$gate_control" status "$candidate_sha" "$gate_invocation")' \
+  "$README"
+grep -Fq "jq -e '.terminal_state == \"passed\"'" "$README"
 grep -Fq 'pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"' \
   "$README"
+if grep -Fq 'polymarket-raw-ops-shadow-gate.sh" \
+  "$artifact_dir/polymarket-raw-ops"' "$README"; then
+  printf 'README bypasses the supervised Gate controller\n' >&2
+  exit 1
+fi
 if grep -Fq 'deployment/aliyun/polymarket-reference-collector.service' "$README"; then
   printf 'README installs the production unit from a mutable checkout\n' >&2
   exit 1
