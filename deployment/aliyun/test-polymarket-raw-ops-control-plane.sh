@@ -4319,6 +4319,69 @@ grep -Fq 'market_upload_gate_verified:true' "$CUTOVER"
 grep -Fq 'market_upload_terminal_success_required:false' "$CUTOVER"
 grep -Fq 'market_backlog_deferred_to_timer:true' "$CUTOVER"
 
+deferred_upload_functions="$tmp_dir/deferred-upload-functions.sh"
+awk '
+  /^verify_oneshot_success\(\) \{$/ || /^verify_deferred_market_upload\(\) \{$/ {
+    copy=1
+  }
+  copy {print}
+  copy && /^}$/ {copy=0}
+' "$CUTOVER" >"$deferred_upload_functions"
+
+run_deferred_upload_case() (
+  local test_case=$1
+  local expected_binary=/opt/monday/releases/polymarket-raw-ops/candidate/polymarket-raw-ops
+  local previous_invocation=11111111111111111111111111111111
+  local new_invocation=22222222222222222222222222222222
+  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  systemctl() {
+    if [[ $1 == is-failed ]]; then
+      [[ $test_case == failed ]]
+      return
+    fi
+    case "$2" in
+      --property=InvocationID)
+        [[ $test_case == stale ]] \
+          && printf '%s\n' "$previous_invocation" \
+          || printf '%s\n' "$new_invocation"
+        ;;
+      --property=ActiveState)
+        [[ $test_case == inactive-failed ]] \
+          && printf '%s\n' inactive \
+          || printf '%s\n' activating
+        ;;
+      --property=MainPID) printf '%s\n' 42 ;;
+      --property=Result)
+        [[ $test_case == inactive-failed ]] \
+          && printf '%s\n' exit-code \
+          || printf '%s\n' success
+        ;;
+      --property=ExecMainStatus)
+        [[ $test_case == inactive-failed ]] \
+          && printf '%s\n' 1 \
+          || printf '%s\n' 0
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  readlink() {
+    [[ $test_case == mismatched-exe ]] \
+      && printf '%s\n' /opt/monday/releases/polymarket-raw-ops/wrong/polymarket-raw-ops \
+      || printf '%s\n' "$expected_binary"
+  }
+  sleep() { :; }
+  source "$deferred_upload_functions"
+  verify_deferred_market_upload "$expected_binary" "$previous_invocation"
+)
+
+for rejected_case in stale failed inactive-failed mismatched-exe; do
+  if run_deferred_upload_case "$rejected_case"; then
+    printf 'deferred market upload accepted counterexample: %s\n' "$rejected_case" >&2
+    exit 1
+  fi
+done
+run_deferred_upload_case success
+
 snapshot_manifest_line=$(grep -n \
   '^    sha256sum state.json systemd/\* bin/\* config/\* control/\* >manifest.sha256$' \
   "$CUTOVER" | cut -d: -f1)
