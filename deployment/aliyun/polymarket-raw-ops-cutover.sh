@@ -1027,8 +1027,7 @@ restore_legacy() (
           || die 'collector PID changed while rollback was being verified'
       fi
       if [[ $rollback_mode == legacy_python ]]; then
-        verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
-          "$rollback_invocation_id" "$rollback_health_policy" && break
+        verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" && break
       else
         if verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
           "$rollback_invocation_id" 0 "$rollback_health_policy"; then
@@ -1044,9 +1043,8 @@ restore_legacy() (
     || ( -n $current_health_sha && $current_health_sha != "$previous_health_sha" ) ]] \
     || die 'Rust collector health did not advance after rollback restart'
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
-    "$rollback_invocation_id" "$rollback_health_policy" \
-    || die 'Python collector identity or health did not recover during rollback'
+  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
+    || die 'Python collector identity did not recover during rollback'
   else
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
       "$rollback_invocation_id" 0 "$rollback_health_policy" \
@@ -1066,9 +1064,8 @@ restore_legacy() (
     fi
   done
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
-    "$rollback_invocation_id" "$rollback_health_policy" \
-    || die 'rollback did not preserve legacy runtime identity and health'
+  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
+    || die 'rollback did not preserve legacy runtime identity'
   else
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
       "$rollback_invocation_id" 0 "$rollback_health_policy" || die 'restored Rust runtime changed'
@@ -1076,8 +1073,7 @@ restore_legacy() (
   verify_saved_unit_state "$rollback_dir/state.json" \
     || die 'rollback did not restore the saved collector/timer state'
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
-    "$rollback_invocation_id" "$rollback_health_policy" \
+  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
     || die 'legacy runtime changed before rollback completion'
   else
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \

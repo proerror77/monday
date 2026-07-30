@@ -4163,12 +4163,16 @@ sed -n '/^restore_legacy() (/,/^\[\[ ${EUID}/p' "$CUTOVER" \
 cutover_legacy_rollback_joined="$tmp_dir/cutover-legacy-rollback-joined.sh"
 join_shell_continuations "$cutover_legacy_rollback" \
   >"$cutover_legacy_rollback_joined"
-grep -Fq \
-  'verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 "$rollback_invocation_id" "$rollback_health_policy"' \
-  "$cutover_legacy_rollback_joined" || {
-  printf 'rollback no longer requires a fresh restored legacy runtime\n' >&2
+[[ $(grep -Fc \
+  'verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id"' \
+  "$cutover_legacy_rollback_joined") -eq 4 ]] || {
+  printf 'rollback no longer verifies the restored legacy identity at every boundary\n' >&2
   exit 1
 }
+if grep -Fq 'verify_fresh_legacy_runtime' "$cutover_legacy_rollback"; then
+  printf 'legacy rollback still waits for a full-cycle health publication\n' >&2
+  exit 1
+fi
 legacy_drain_line=$(grep -n '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
   | head -1 | cut -d: -f1)
 legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
@@ -4218,7 +4222,7 @@ rollback_restart_line=$(grep -n '^  systemctl restart "$COLLECTOR_UNIT"$' "$CUTO
     exit 1
   }
 rollback_state_line=$(grep -n '^  verify_saved_unit_state' "$CUTOVER" | cut -d: -f1)
-rollback_final_runtime_line=$(grep -n '^  verify_fresh_legacy_runtime' "$CUTOVER" \
+rollback_final_runtime_line=$(grep -n '^  verify_legacy_runtime "$rollback_pid" 0' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 ((rollback_state_line < rollback_final_runtime_line)) || {
   printf 'rollback lacks a final runtime check after restoring unit state\n' >&2
