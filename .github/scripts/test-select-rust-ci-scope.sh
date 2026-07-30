@@ -325,4 +325,21 @@ if assert_docker_publish_triggers "$docker_publish_counterexample"; then
   exit 1
 fi
 
+listing_monitor_workflow="$script_dir/../workflows/deploy-listing-monitor.yml"
+expected_listing_monitor_triggers=$(printf '%s\n' 'on:' '  workflow_dispatch:')
+assert_listing_monitor_triggers() {
+  local trigger_block
+  trigger_block=$(sed -n '/^on:$/,/^env:$/p' "$1" | sed '$d')
+  [[ $trigger_block == "$expected_listing_monitor_triggers" ]]
+}
+assert_listing_monitor_triggers "$listing_monitor_workflow"
+
+listing_monitor_counterexample="$tmp_dir/listing-monitor-push.yml"
+awk '1; $0 == "on:" { print "  push:"; print "    branches: [main]" }' \
+  "$listing_monitor_workflow" >"$listing_monitor_counterexample"
+if assert_listing_monitor_triggers "$listing_monitor_counterexample"; then
+  echo 'Listing Monitor trigger contract accepted an automatic push' >&2
+  exit 1
+fi
+
 printf 'rust CI scope selector tests passed\n'
