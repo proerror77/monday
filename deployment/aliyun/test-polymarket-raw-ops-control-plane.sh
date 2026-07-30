@@ -39,6 +39,13 @@ done
   printf 'missing supervised Gate control-plane assets\n' >&2
   exit 1
 }
+
+gate_privilege_transition_contract() {
+  grep -Fq 'runuser -u hftcollector -- env HOME=/var/lib/hft-collector' "$1" &&
+    grep -Fxq 'RestrictSUIDSGID=false' "$2" &&
+    ! grep -Fxq 'RestrictSUIDSGID=true' "$2"
+}
+
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
 for unit_line in \
   'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
@@ -72,6 +79,14 @@ fi
 
 supervisor_tmp=$(mktemp -d)
 trap 'rm -rf "$supervisor_tmp"' EXIT
+blocked_gate_unit="$supervisor_tmp/blocked-gate.service"
+sed 's/^RestrictSUIDSGID=false$/RestrictSUIDSGID=true/' \
+  "$GATE_UNIT" >"$blocked_gate_unit"
+gate_privilege_transition_contract "$GATE" "$GATE_UNIT"
+if gate_privilege_transition_contract "$GATE" "$blocked_gate_unit"; then
+  printf 'Gate privilege contract accepted a unit that blocks runuser\n' >&2
+  exit 1
+fi
 supervisor_root="$supervisor_tmp/root"
 supervisor_fake_bin="$supervisor_tmp/bin"
 supervisor_control_dir="$supervisor_tmp/control"
