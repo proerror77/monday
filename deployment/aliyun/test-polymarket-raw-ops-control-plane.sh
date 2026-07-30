@@ -42,8 +42,10 @@ done
 
 gate_privilege_transition_contract() {
   grep -Fq 'runuser -u hftcollector -- env HOME=/var/lib/hft-collector' "$1" &&
-    grep -Fxq 'RestrictSUIDSGID=false' "$2" &&
-    ! grep -Fxq 'RestrictSUIDSGID=true' "$2"
+    grep -Fxq 'AmbientCapabilities=CAP_SETUID CAP_SETGID' "$2" &&
+    grep -Fxq 'NoNewPrivileges=true' "$2" &&
+    grep -Fxq 'RestrictSUIDSGID=true' "$2" &&
+    ! grep -Fxq 'RestrictSUIDSGID=false' "$2"
 }
 
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
@@ -80,11 +82,11 @@ fi
 supervisor_tmp=$(mktemp -d)
 trap 'rm -rf "$supervisor_tmp"' EXIT
 blocked_gate_unit="$supervisor_tmp/blocked-gate.service"
-sed 's/^RestrictSUIDSGID=false$/RestrictSUIDSGID=true/' \
+sed '/^AmbientCapabilities=CAP_SETUID CAP_SETGID$/d' \
   "$GATE_UNIT" >"$blocked_gate_unit"
 gate_privilege_transition_contract "$GATE" "$GATE_UNIT"
 if gate_privilege_transition_contract "$GATE" "$blocked_gate_unit"; then
-  printf 'Gate privilege contract accepted a unit that blocks runuser\n' >&2
+  printf 'Gate privilege contract accepted a unit without UID/GID capabilities\n' >&2
   exit 1
 fi
 supervisor_root="$supervisor_tmp/root"
