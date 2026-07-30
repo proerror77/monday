@@ -3635,40 +3635,42 @@ sed -n \
       printf 'Gate rejected a fresh completed legacy cycle with an old cycle-start timestamp\n' >&2
       exit 1
     }
-  fixed_now=$(date -u +%s)
-  date_bin=$(type -P gdate || type -P date)
-  date() {
-    if [[ $# -eq 2 && $1 == -u && $2 == +%s ]]; then
-      printf '%s\n' "$fixed_now"
-    else
-      command "$date_bin" "$@"
+  (
+    fixed_now=$(date -u +%s)
+    date_bin=$(type -P gdate || type -P date)
+    date() {
+      if [[ $# -eq 2 && $1 == -u && $2 == +%s ]]; then
+        printf '%s\n' "$fixed_now"
+      else
+        command "$date_bin" "$@"
+      fi
+    }
+    cp "$tmp_dir/legacy-health.json" "$tmp_dir/start-age-legacy-health.json"
+    TZ=UTC touch -t "$("$date_bin" -u -d \
+      "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS))" \
+      +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
+    fresh_legacy_health_observation \
+      "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+      true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null || {
+      printf 'Gate rejected a startup health publication exactly 2700 seconds old\n' >&2
+      exit 1
+    }
+    if fresh_legacy_health_observation \
+      "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+      false >/dev/null 2>&1; then
+      printf 'Gate applied startup health age to a strict freshness check\n' >&2
+      exit 1
     fi
-  }
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/start-age-legacy-health.json"
-  TZ=UTC touch -t "$("$date_bin" -u -d \
-    "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS))" \
-    +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
-  fresh_legacy_health_observation \
-    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
-    true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null || {
-    printf 'Gate rejected a startup health publication exactly 2700 seconds old\n' >&2
-    exit 1
-  }
-  if fresh_legacy_health_observation \
-    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
-    false >/dev/null 2>&1; then
-    printf 'Gate applied startup health age to a strict freshness check\n' >&2
-    exit 1
-  fi
-  TZ=UTC touch -t "$("$date_bin" -u -d \
-    "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS - 1))" \
-    +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
-  if fresh_legacy_health_observation \
-    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
-    true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null 2>&1; then
-    printf 'Gate accepted a startup health publication 2701 seconds old\n' >&2
-    exit 1
-  fi
+    TZ=UTC touch -t "$("$date_bin" -u -d \
+      "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS - 1))" \
+      +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
+    if fresh_legacy_health_observation \
+      "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+      true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null 2>&1; then
+      printf 'Gate accepted a startup health publication 2701 seconds old\n' >&2
+      exit 1
+    fi
+  )
   touch -d '1970-01-01T00:00:00Z' \
     "$tmp_dir/freshly-completed-legacy-health.json"
   if fresh_legacy_health_observation \
