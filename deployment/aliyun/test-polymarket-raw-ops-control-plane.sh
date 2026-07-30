@@ -42,6 +42,7 @@ done
 
 gate_privilege_transition_contract() {
   grep -Fq 'runuser -u hftcollector -- env HOME=/var/lib/hft-collector' "$1" &&
+    grep -Fxq 'Environment=HOME=/var/lib/hft-collector' "$2" &&
     grep -Fxq 'AmbientCapabilities=CAP_SETUID CAP_SETGID' "$2" &&
     grep -Fxq 'NoNewPrivileges=true' "$2" &&
     grep -Fxq 'RestrictSUIDSGID=true' "$2" &&
@@ -82,11 +83,18 @@ fi
 supervisor_tmp=$(mktemp -d)
 trap 'rm -rf "$supervisor_tmp"' EXIT
 blocked_gate_unit="$supervisor_tmp/blocked-gate.service"
+blocked_gate_home="$supervisor_tmp/blocked-gate-home.service"
 sed '/^AmbientCapabilities=CAP_SETUID CAP_SETGID$/d' \
   "$GATE_UNIT" >"$blocked_gate_unit"
+sed '/^Environment=HOME=\/var\/lib\/hft-collector$/d' \
+  "$GATE_UNIT" >"$blocked_gate_home"
 gate_privilege_transition_contract "$GATE" "$GATE_UNIT"
 if gate_privilege_transition_contract "$GATE" "$blocked_gate_unit"; then
   printf 'Gate privilege contract accepted a unit without UID/GID capabilities\n' >&2
+  exit 1
+fi
+if gate_privilege_transition_contract "$GATE" "$blocked_gate_home"; then
+  printf 'Gate privilege contract accepted a unit without an explicit HOME\n' >&2
   exit 1
 fi
 supervisor_root="$supervisor_tmp/root"
@@ -195,6 +203,11 @@ case "${1:-}" in
       *) exit 2 ;;
     esac
     ;;
+  list-units)
+    if [[ ${FAKE_GATE_UNITS_RUNNING:-0} == 1 ]]; then
+      printf 'polymarket-raw-ops-gate@active.service loaded active running\n'
+    fi
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -212,11 +225,16 @@ cat >"$supervisor_fake_bin/mv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 destination=${!#}
+source=${@: -2:1}
 [[ ${FAKE_MV_FAIL_RECEIPT_STAGE:-0} != 1 \
   || $destination != */.receipt.json.ready ]] \
   || exit 74
 [[ ${FAKE_MV_FAIL_RECEIPT:-0} != 1 || $destination != */receipt.json ]] \
   || exit 75
+[[ ${FAKE_MV_FAIL_GATE_INSTALL:-0} != 1 \
+  || $destination != */polymarket-raw-ops-gate@.service \
+  || $source == *.rollback.* ]] \
+  || exit 76
 exec /bin/mv "$@"
 EOF
 chmod 0755 "$supervisor_fake_bin/mv"
@@ -301,7 +319,35 @@ if compgen -G \
   exit 1
 fi
 printf 'mismatch\n' >"$installed_supervisor_unit"
-reject gate_control install
+if env "${gate_control_env[@]}" FAKE_MV_FAIL_GATE_INSTALL=1 \
+  "$supervisor_control" install >/dev/null 2>&1; then
+  printf 'Gate unit installer ignored an atomic replacement failure\n' >&2
+  exit 1
+fi
+[[ $(<"$installed_supervisor_unit") == mismatch ]]
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'failed Gate unit upgrade left a temporary or rollback file\n' >&2
+  exit 1
+fi
+if env "${gate_control_env[@]}" FAKE_GATE_UNITS_RUNNING=1 \
+  "$supervisor_control" install >/dev/null 2>&1; then
+  printf 'Gate unit installer replaced a unit while a Gate was running\n' >&2
+  exit 1
+fi
+[[ $(<"$installed_supervisor_unit") == mismatch ]]
+gate_control install >"$supervisor_tmp/upgrade.json"
+jq -e '.validated == true and .replaced == true
+  and (.previous_sha256 | test("^[a-f0-9]{64}$"))' \
+  "$supervisor_tmp/upgrade.json" >/dev/null
+cmp -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'Gate unit upgrade left a temporary or rollback file\n' >&2
+  exit 1
+fi
 rm "$installed_supervisor_unit"
 ln -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
 reject gate_control install
