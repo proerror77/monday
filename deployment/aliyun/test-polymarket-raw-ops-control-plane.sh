@@ -970,6 +970,10 @@ fi
   printf 'production gate appended settlement maturity after shadow start\n' >&2
   exit 1
 }
+[[ $(bounded_parity_window_start 3000 3840 false) == 3000 ]] || {
+  printf 'production gate moved parity start across an hour boundary\n' >&2
+  exit 1
+}
 
 # Exercise the production marker verifier itself. A marker is valid only when
 # it contains the one content-addressed gate.json entry; sha256sum otherwise
@@ -2932,6 +2936,11 @@ if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
   printf 'gate policy accepted a shadow shorter than 15 minutes total\n' >&2
   exit 1
 fi
+jq '.duration_seconds = 901' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
+if jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
+  printf 'gate policy accepted a shadow longer than exactly 15 minutes\n' >&2
+  exit 1
+fi
 jq '.started_at = "1970-01-01T00:01:41Z"' \
   "$tmp_dir/expedited-legacy-gate.json" >"$tmp_dir/pre-shadow-parity.json"
 if jq -e -f "$POLICY" "$tmp_dir/pre-shadow-parity.json" >/dev/null; then
@@ -3243,9 +3252,17 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     esac
   }
   monotonic_uptime_seconds() { printf '20906\n'; }
+  zstd_timeout_seconds=300
+  oss_copy_timeout_seconds=300
   required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
     + MINIMUM_GATE_SECONDS \
-    + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
+    + PARITY_CUTOFF_LAG_SECONDS \
+    + zstd_timeout_seconds + oss_copy_timeout_seconds \
+    + LEGACY_RUNTIME_RESERVE_SECONDS))
+  [[ $required -eq 1920 ]] || {
+    printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
+    exit 1
+  }
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
       "$required" >&2
@@ -3300,6 +3317,10 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate admitted a legacy identity that cannot survive the Gate\n' >&2
     exit 1
   fi
+  grep -Fq "remaining=695 required=$required" "$admission_error" || {
+    printf 'Gate admission omitted bounded post-gate work from its runtime budget\n' >&2
+    exit 1
+  }
   [[ ! -e $timeout_log && $identity_checks -eq 1 ]] || {
     printf 'Gate did not fail closed on an unstable legacy identity before preflight\n' >&2
     exit 1
@@ -3591,6 +3612,7 @@ done
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
 grep -Fq 'readonly MINIMUM_GATE_SECONDS=$REQUIRED_DURATION_SECONDS' "$GATE"
+grep -Fq 'production gate duration must be exactly 900 seconds' "$GATE"
 grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
 grep -Fq 'readonly LEGACY_HEALTH_START_REQUIRED=true' "$GATE"
 grep -Fq 'readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true' "$GATE"
@@ -3642,7 +3664,10 @@ if ((legacy_transition_line >= health_settle_line)); then
   exit 1
 fi
 grep -Fq 'if [[ $legacy_health_decision == advance ]]; then' "$GATE"
-grep -Fq '((elapsed < gate_seconds)) || break' "$GATE"
+grep -Fq 'observation_deadline=$gate_seconds' "$GATE"
+grep -Fq '&& ((observation_deadline < HEALTH_SETTLE_SECONDS)); then' "$GATE"
+grep -Fq 'observation_deadline=$HEALTH_SETTLE_SECONDS' "$GATE"
+grep -Fq '((elapsed < observation_deadline)) || break' "$GATE"
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2

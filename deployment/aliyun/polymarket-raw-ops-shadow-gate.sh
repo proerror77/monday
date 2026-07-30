@@ -82,8 +82,7 @@ valid_parity_window() {
 bounded_parity_window_start() {
   local gate_started_at=$1 common_cutoff=$2 allow_short=$3
   local parity_started_at
-  parity_started_at=$((common_cutoff - common_cutoff % 3600))
-  ((parity_started_at >= gate_started_at)) || parity_started_at=$gate_started_at
+  parity_started_at=$gate_started_at
   if [[ $allow_short == true ]] && ((parity_started_at >= common_cutoff)); then
     ((common_cutoff > 0)) || return 1
     parity_started_at=$((common_cutoff - 1))
@@ -921,7 +920,9 @@ run_budgeted_real_market_preflight() {
     }
     legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
       + gate_seconds \
-      + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
+      + PARITY_CUTOFF_LAG_SECONDS \
+      + zstd_timeout_seconds + oss_copy_timeout_seconds \
+      + LEGACY_RUNTIME_RESERVE_SECONDS))
     if observation=$(legacy_runtime_budget_observation \
       "$legacy_runtime_budget_required"); then
       :
@@ -1211,6 +1212,8 @@ verify_cutover_target_preflight "$baseline_mode" "$RUST_ACTIVE_BINARY" \
 
 gate_seconds=${MONDAY_POLYMARKET_GATE_SECONDS:-$MINIMUM_GATE_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'
+((gate_seconds <= MINIMUM_GATE_SECONDS)) \
+  || die 'production gate duration must be exactly 900 seconds'
 test_only=false
 if ((gate_seconds < MINIMUM_GATE_SECONDS)); then
   [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \
@@ -1423,6 +1426,11 @@ verify_baseline_identity \
 started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
+observation_deadline=$gate_seconds
+if [[ $test_only == true ]] \
+  && ((observation_deadline < HEALTH_SETTLE_SECONDS)); then
+  observation_deadline=$HEALTH_SETTLE_SECONDS
+fi
 
 last_health=
 last_health_change=$start_uptime
@@ -1585,11 +1593,11 @@ while :; do
     die 'legacy collector did not complete a clean post-start cycle during the gate'
   fi
 
-  ((elapsed < gate_seconds)) || break
+  ((elapsed < observation_deadline)) || break
 
   sleep_for=$SAMPLE_SECONDS
-  if ((elapsed < gate_seconds)); then
-    remaining=$((gate_seconds - elapsed))
+  if ((elapsed < observation_deadline)); then
+    remaining=$((observation_deadline - elapsed))
     ((remaining < sleep_for)) && sleep_for=$remaining
   fi
   sleep "$sleep_for"

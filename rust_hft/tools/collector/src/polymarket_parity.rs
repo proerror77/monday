@@ -956,7 +956,13 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         config.ended_at_unix,
         trade_event_window_end,
     )?;
-    let rust_self_mode = config.allow_empty_legacy && legacy_rows.is_empty();
+    let legacy_has_comparison_rows = legacy_rows.iter().any(|row| {
+        matches!(
+            row.update.get("kind").and_then(Value::as_str),
+            Some("polymarket_trade" | "market_settlement")
+        )
+    });
+    let rust_self_mode = config.allow_empty_legacy && !legacy_has_comparison_rows;
     let comparison_mode = if rust_self_mode {
         "rust_self"
     } else {
@@ -1467,6 +1473,33 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn metadata_only_legacy_window_uses_explicit_rust_self_mode() {
+        let (_root, mut config) = fixture();
+        let legacy_metadata = EXPECTED_SYMBOLS
+            .iter()
+            .map(|symbol| metadata(symbol))
+            .collect::<Vec<_>>();
+        write_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &legacy_metadata,
+            "1970-01-01T00:03:20Z",
+        );
+        config.allow_empty_legacy = true;
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["comparison_mode"], "rust_self");
+        assert!(
+            evidence["metrics"]["legacy_metadata_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(evidence["metrics"]["legacy_trade_count"], 0);
+        assert_eq!(evidence["metrics"]["legacy_settlement_count"], 0);
     }
 
     #[test]
