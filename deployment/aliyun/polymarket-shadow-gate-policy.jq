@@ -111,12 +111,17 @@ and ((.real_market_preflight.started_at | utc_iso8601_unix)
   <= (.real_market_preflight.completed_at | utc_iso8601_unix))
 and ((.real_market_preflight.completed_at | utc_iso8601_unix)
   <= (.started_at | utc_iso8601_unix))
-and (.duration_seconds | positive_integer and . >= 1501)
+and (.duration_seconds | positive_integer and . == 900)
 and (.started_at | utc_iso8601_unix | type == "number")
 and (.parity_window_started_at_unix | positive_integer)
 and (.parity_window_ended_at_unix | positive_integer)
 and (.parity_window_ended_at_unix - .parity_window_started_at_unix >= 601)
 and (.completed_at | utc_iso8601_unix | type == "number")
+and ((.completed_at | utc_iso8601_unix)
+  - (.started_at | utc_iso8601_unix) >= .duration_seconds)
+and (.parity_window_started_at_unix >= (.started_at | utc_iso8601_unix))
+and (.parity_window_ended_at_unix
+  <= ((.started_at | utc_iso8601_unix) + .duration_seconds))
 and .production_eligible == true
 and .passed == true
 and (
@@ -166,25 +171,6 @@ and (
         and .baseline_health_completion_file_identity == null
       end
     )
-    and (.legacy_runtime |
-      runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
-        "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
-      and ([has("release_path"),has("release_sha256"),has("proc_exe")] | any | not))
-  )
-  or
-  (
-    .baseline_mode == "legacy_python"
-    and .baseline_health_start_required == false
-    and .baseline_runtime_stability_required == false
-    and .baseline_health_completion_required == false
-    and .baseline_health_snapshot == null
-    and .baseline_health_completion_snapshot == null
-    and .baseline_health_start_success_unix == null
-    and .baseline_health_cutoff_unix == null
-    and .baseline_health_start_written_at_unix == null
-    and .baseline_health_completion_written_at_unix == null
-    and .baseline_health_start_file_identity == null
-    and .baseline_health_completion_file_identity == null
     and (.legacy_runtime |
       runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
         "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
@@ -262,7 +248,8 @@ and .checks.real_market_segment_preflight == true
 and (.comparison_mode == "legacy_overlap" or (
   .comparison_mode == "rust_self"
   and .baseline_mode == "legacy_python"
-  and .baseline_runtime_stability_required == false
+  and .baseline_health_start_required == true
+  and .baseline_runtime_stability_required == true
 ))
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)

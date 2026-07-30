@@ -946,8 +946,8 @@ jq -e '.status == "passed"
   "$good_case/evidence/real-market-preflight.json" >/dev/null
 export PATH=$original_path
 
-# A short test gate must not continue after the settlement-safe clamp places
-# the start at or beyond the common cutoff.
+# The live parity interval begins with the Rust shadow; settlement maturity is
+# proven inside the bounded observation rather than appended after it.
 parity_window_verifier="$tmp_dir/valid-parity-window.sh"
 sed -n '/^valid_parity_window() {$/,/^}$/p' "$GATE" >"$parity_window_verifier"
 sed -n '/^bounded_parity_window_start() {$/,/^}$/p' "$GATE" \
@@ -962,12 +962,16 @@ if valid_parity_window 1900 1800 || valid_parity_window 1800 1800; then
   printf 'parity-window verifier accepted a clamped start at/after cutoff\n' >&2
   exit 1
 fi
-[[ $(bounded_parity_window_start 100 1000 true 900) == 999 ]] || {
+[[ $(bounded_parity_window_start 1000 1000 true) == 999 ]] || {
   printf 'short test gate did not cap parity start below the cutoff\n' >&2
   exit 1
 }
-[[ $(bounded_parity_window_start 100 1900 false 900) == 1000 ]] || {
-  printf 'production gate did not preserve its settlement-safe start\n' >&2
+[[ $(bounded_parity_window_start 100 1000 false) == 100 ]] || {
+  printf 'production gate appended settlement maturity after shadow start\n' >&2
+  exit 1
+}
+[[ $(bounded_parity_window_start 3000 3840 false) == 3000 ]] || {
+  printf 'production gate moved parity start across an hour boundary\n' >&2
   exit 1
 }
 
@@ -2492,8 +2496,8 @@ jq \
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
     },
-    duration_seconds:1501,
-    started_at:"1970-01-01T00:02:00Z",
+    duration_seconds:900,
+    started_at:"1970-01-01T00:01:40Z",
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
     completed_at:"1970-01-01T01:12:01Z",
@@ -2518,7 +2522,7 @@ jq \
     },
     baseline_health_start_success_unix:100,
     baseline_health_cutoff_unix:1000,
-    baseline_health_start_written_at_unix:110,
+    baseline_health_start_written_at_unix:100,
     baseline_health_completion_written_at_unix:1301,
     baseline_health_start_file_identity:"1:10",
     baseline_health_completion_file_identity:"1:11",
@@ -2570,23 +2574,25 @@ jq '.baseline_health_start_required = false
   | .baseline_health_start_written_at_unix = null
   | .baseline_health_start_file_identity = null' \
   "$tmp_dir/expedited-legacy-gate.json" \
-  >"$tmp_dir/python-nonblocking-legacy-gate.json"
-jq -e -f "$POLICY" "$tmp_dir/python-nonblocking-legacy-gate.json" >/dev/null || {
-  printf 'gate policy rejected approved legacy-nonblocking evidence\n' >&2
+  >"$tmp_dir/forged-nonblocking-legacy-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/forged-nonblocking-legacy-gate.json" >/dev/null; then
+  printf 'gate policy accepted a legacy baseline without health or identity checks\n' >&2
   exit 1
-}
+fi
 jq '.comparison_mode = "rust_self"
   | .metrics.legacy_trade_count = 0
   | .metrics.legacy_metadata_count = 0
   | .metrics.legacy_settlement_count = 0' \
-  "$tmp_dir/python-nonblocking-legacy-gate.json" \
+  "$tmp_dir/expedited-legacy-gate.json" \
   >"$tmp_dir/rust-self-gate.json"
 jq -e -f "$POLICY" "$tmp_dir/rust-self-gate.json" >/dev/null || {
   printf 'gate policy rejected valid Rust-self parity evidence\n' >&2
   exit 1
 }
 for mutation in \
-  '.baseline_runtime_stability_required = true' \
+  '.baseline_health_start_required = false' \
+  '.baseline_runtime_stability_required = false' \
   '.metrics.legacy_trade_count = 1' \
   '.metrics.rust_settlement_count = 0' \
   '.checks.settlement_parity = false'; do
@@ -2597,33 +2603,20 @@ for mutation in \
     exit 1
   fi
 done
-for field in baseline_health_start_required baseline_runtime_stability_required; do
-  [[ $(jq -er --arg field "$field" \
-    '.[$field] | select(type == "boolean") | tostring' \
-    "$tmp_dir/python-nonblocking-legacy-gate.json") == false ]] || {
-    printf 'cutover boolean parser rejected a false gate contract\n' >&2
-    exit 1
-  }
-  grep -Fq ".$field | select(type == \"boolean\") | tostring" "$CUTOVER" || {
-    printf 'cutover does not preserve a false gate contract boolean\n' >&2
-    exit 1
-  }
-done
 for mutation in \
   'del(.baseline_health_start_required)' \
-  '.baseline_health_start_required = true' \
-  '.baseline_runtime_stability_required = true' \
+  '.baseline_health_start_required = false' \
+  '.baseline_runtime_stability_required = false' \
   '.checks.metadata_parity = false'; do
-  jq "$mutation" "$tmp_dir/python-nonblocking-legacy-gate.json" \
-    >"$tmp_dir/forged-python-nonblocking-legacy-gate.json"
+  jq "$mutation" "$tmp_dir/expedited-legacy-gate.json" \
+    >"$tmp_dir/forged-expedited-legacy-gate.json"
   if jq -e -f "$POLICY" \
-    "$tmp_dir/forged-python-nonblocking-legacy-gate.json" >/dev/null; then
-    printf 'gate policy accepted forged legacy-nonblocking evidence\n' >&2
+    "$tmp_dir/forged-expedited-legacy-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged legacy baseline evidence\n' >&2
     exit 1
   fi
 done
-if grep -Fq 'baseline_health_observation=$(wait_for_fresh_legacy_health_observation' \
-  "$GATE"; then
+if grep -Fq 'wait_for_fresh_legacy_health_observation' "$GATE"; then
   printf 'production Gate still waits for a legacy health publication\n' >&2
   exit 1
 fi
@@ -2698,15 +2691,6 @@ if jq -e -f "$POLICY" "$tmp_dir/error-market-preflight.json" >/dev/null; then
   printf 'gate policy accepted a preflight with a terminal error\n' >&2
   exit 1
 fi
-jq '.started_at = "1970-01-01T00:16:40Z"
-  | .baseline_health_start_written_at_unix = 900
-  | .baseline_health_completion_written_at_unix = 1000' \
-  "$tmp_dir/gate.json" >"$tmp_dir/same-second-baseline-health-write.json"
-jq -e -f "$POLICY" "$tmp_dir/same-second-baseline-health-write.json" \
-  >/dev/null || {
-  printf 'gate policy rejected a distinct atomic health write in the Gate start second\n' >&2
-  exit 1
-}
 jq '.baseline_health_completion_file_identity =
       .baseline_health_start_file_identity' "$tmp_dir/gate.json" \
   >"$tmp_dir/reused-baseline-health-file.json"
@@ -2947,9 +2931,26 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 1500' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 899' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than 15 minutes plus its maturity tail\n' >&2
+  printf 'gate policy accepted a shadow shorter than 15 minutes total\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 901' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
+if jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
+  printf 'gate policy accepted a shadow longer than exactly 15 minutes\n' >&2
+  exit 1
+fi
+jq '.started_at = "1970-01-01T00:01:41Z"' \
+  "$tmp_dir/expedited-legacy-gate.json" >"$tmp_dir/pre-shadow-parity.json"
+if jq -e -f "$POLICY" "$tmp_dir/pre-shadow-parity.json" >/dev/null; then
+  printf 'gate policy accepted parity beginning before the formal Gate\n' >&2
+  exit 1
+fi
+jq '.completed_at = "1970-01-01T00:16:39Z"' \
+  "$tmp_dir/expedited-legacy-gate.json" >"$tmp_dir/unelapsed-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/unelapsed-gate.json" >/dev/null; then
+  printf 'gate policy accepted 900 seconds without 900 elapsed wall-clock seconds\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -3204,7 +3205,6 @@ sed -n \
   -e '/^readonly REQUIRED_DURATION_SECONDS=/p' \
   -e '/^readonly PARITY_TAIL_SECONDS=/p' \
   -e '/^readonly MINIMUM_GATE_SECONDS=/p' \
-  -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_STABILITY_REQUIRED=/p' \
   -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
@@ -3236,8 +3236,8 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
 (
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
-  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
-    && $LEGACY_RUNTIME_STABILITY_REQUIRED == false \
+  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 300 \
+    && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
     && $PARITY_CUTOFF_LAG_SECONDS -eq 60 ]] || {
@@ -3252,9 +3252,17 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     esac
   }
   monotonic_uptime_seconds() { printf '20906\n'; }
+  zstd_timeout_seconds=300
+  oss_copy_timeout_seconds=300
   required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
-    + LEGACY_HEALTH_START_WAIT_SECONDS + MINIMUM_GATE_SECONDS \
-    + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
+    + MINIMUM_GATE_SECONDS \
+    + PARITY_CUTOFF_LAG_SECONDS \
+    + zstd_timeout_seconds + oss_copy_timeout_seconds \
+    + LEGACY_RUNTIME_RESERVE_SECONDS))
+  [[ $required -eq 1920 ]] || {
+    printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
+    exit 1
+  }
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
       "$required" >&2
@@ -3292,13 +3300,11 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   zstd_timeout_seconds=300 oss_copy_timeout_seconds=300 oss_config_sha=unused
   source_revision=unused deployment_bundle_sha=unused release_manifest_sha=unused
   control_archive_sha=unused
-  preflight_calls=0
   identity_checks=0
-  timeout_args=
+  timeout_log="$tmp_dir/runtime-budget-timeout.args"
   verify_baseline_identity() { identity_checks=$((identity_checks + 1)); }
   timeout() {
-    preflight_calls=$((preflight_calls + 1))
-    timeout_args=$*
+    printf '%s\n' "$*" >"$timeout_log"
     printf '{}\n'
   }
   legacy_runtime_budget_observation() {
@@ -3306,13 +3312,17 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     return 1
   }
   admission_error="$tmp_dir/runtime-budget-admission.err"
-  run_budgeted_real_market_preflight source spool download evidence \
-    2>"$admission_error" >/dev/null || {
-    printf 'Gate still blocks real preflight on legacy runtime budget\n' >&2
+  if run_budgeted_real_market_preflight source spool download evidence \
+    2>"$admission_error" >/dev/null; then
+    printf 'Gate admitted a legacy identity that cannot survive the Gate\n' >&2
+    exit 1
+  fi
+  grep -Fq "remaining=695 required=$required" "$admission_error" || {
+    printf 'Gate admission omitted bounded post-gate work from its runtime budget\n' >&2
     exit 1
   }
-  [[ $preflight_calls -eq 1 && $identity_checks -eq 0 ]] || {
-    printf 'Gate still consults legacy identity or runtime before real preflight\n' >&2
+  [[ ! -e $timeout_log && $identity_checks -eq 1 ]] || {
+    printf 'Gate did not fail closed on an unstable legacy identity before preflight\n' >&2
     exit 1
   }
   legacy_runtime_budget_observation() {
@@ -3322,11 +3332,11 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate rejected a sufficient runtime budget at the admission seam\n' >&2
     exit 1
   }
-  [[ $preflight_calls -eq 2 && $identity_checks -eq 0 ]] || {
-    printf 'Gate made legacy identity a real-preflight prerequisite\n' >&2
+  [[ -s $timeout_log && $identity_checks -eq 4 ]] || {
+    printf 'Gate did not bind legacy identity around real preflight\n' >&2
     exit 1
   }
-  [[ $timeout_args == '--signal=KILL 6300 env '* ]] || {
+  [[ $(<"$timeout_log") == '--signal=KILL 300 env '* ]] || {
     printf 'Gate real preflight does not have an exact hard deadline\n' >&2
     exit 1
   }
@@ -3380,17 +3390,11 @@ grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
-  -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
   -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \
-  -e '/^fresh_legacy_health_observation() {$/,/^}$/p' \
-  -e '/^wait_for_fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
+  -e '/^fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
   >"$legacy_health_observer"
 [[ -s $legacy_health_observer ]] || {
   printf 'Gate has no completed-write freshness verifier for legacy health\n' >&2
-  exit 1
-}
-grep -Fq 'wait_for_fresh_legacy_health_observation() {' "$GATE" || {
-  printf 'Gate has no bounded legacy health admission wait\n' >&2
   exit 1
 }
 (
@@ -3402,56 +3406,6 @@ grep -Fq 'wait_for_fresh_legacy_health_observation() {' "$GATE" || {
   fi
   # shellcheck source=/dev/null
   source "$legacy_health_observer"
-  [[ $LEGACY_HEALTH_START_WAIT_SECONDS -eq 3900 ]] || {
-    printf 'Gate legacy health admission wait is not bounded to 3900 seconds\n' >&2
-    exit 1
-  }
-  verify_baseline_identity() { return 0; }
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/waiting-legacy-health.json"
-  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/waiting-legacy-health.json"
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/pending-legacy-health.json"
-  printf '0\n' >"$tmp_dir/legacy-health-wait-sleeps"
-  sleep() {
-    local calls
-    calls=$(($(<"$tmp_dir/legacy-health-wait-sleeps") + 1))
-    printf '%s\n' "$calls" >"$tmp_dir/legacy-health-wait-sleeps"
-    if ((calls == 1)); then
-      mv "$tmp_dir/pending-legacy-health.json" "$tmp_dir/waiting-legacy-health.json"
-    fi
-  }
-  wait_observation=$(wait_for_fresh_legacy_health_observation \
-    "$tmp_dir/waiting-legacy-health.json" "$LEGACY_HEALTH_POLICY") || {
-    printf 'Gate did not wait for the next completed legacy health publication\n' >&2
-    exit 1
-  }
-  [[ $(<"$tmp_dir/legacy-health-wait-sleeps") -eq 1 ]] || {
-    printf 'Gate legacy health admission did not wait exactly once for completion\n' >&2
-    exit 1
-  }
-  jq -e '.health.last_success_at == "2026-07-15T00:00:01Z"' \
-    <<<"$wait_observation" >/dev/null
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/timed-out-legacy-health.json"
-  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/timed-out-legacy-health.json"
-  SECONDS=0
-  sleep() { SECONDS=$((SECONDS + LEGACY_HEALTH_START_WAIT_SECONDS)); }
-  if wait_for_fresh_legacy_health_observation \
-    "$tmp_dir/timed-out-legacy-health.json" "$LEGACY_HEALTH_POLICY" >/dev/null; then
-    printf 'Gate accepted legacy health after its bounded admission wait expired\n' >&2
-    exit 1
-  fi
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/late-legacy-health.json"
-  touch -d '1970-01-01T00:00:00Z' "$tmp_dir/late-legacy-health.json"
-  cp "$tmp_dir/legacy-health.json" "$tmp_dir/late-pending-legacy-health.json"
-  SECONDS=0
-  sleep() {
-    mv "$tmp_dir/late-pending-legacy-health.json" "$tmp_dir/late-legacy-health.json"
-    SECONDS=$LEGACY_HEALTH_START_WAIT_SECONDS
-  }
-  if wait_for_fresh_legacy_health_observation \
-    "$tmp_dir/late-legacy-health.json" "$LEGACY_HEALTH_POLICY" >/dev/null; then
-    printf 'Gate accepted legacy health published after its bounded admission wait expired\n' >&2
-    exit 1
-  fi
   legacy_health_publication_after_gate 120 start-file 120 completion-file || {
     printf 'Gate rejected a distinct atomic health write in the Gate start second\n' >&2
     exit 1
@@ -3517,15 +3471,31 @@ grep -Fq 'wait_for_fresh_legacy_health_observation() {' "$GATE" || {
   )
 )
 daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
+preflight_line=$(grep -nF \
+  'real_market_preflight_json=$(run_budgeted_real_market_preflight' \
+  "$GATE" | cut -d: -f1)
+start_snapshot_line=$(grep -nF \
+  'baseline_health_observation=$(fresh_legacy_health_observation' \
+  "$GATE" | cut -d: -f1)
+start_identity_before_line=$(grep -nF \
+  "baseline identity changed before legacy health admission" \
+  "$GATE" | cut -d: -f1)
+start_identity_after_line=$(grep -nF \
+  "baseline identity changed during legacy health admission" \
+  "$GATE" | cut -d: -f1)
 completion_snapshot_line=$(grep -nF \
   'baseline_health_completion_observation=$(fresh_legacy_health_observation' \
   "$GATE" | cut -d: -f1)
 gate_start_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "$shadow_unit"' "$GATE" | cut -d: -f1)
-if ! ((daemon_reload_line < gate_start_line \
-  && gate_start_line < shadow_start_line \
+if ! ((daemon_reload_line < preflight_line \
+  && preflight_line < start_identity_before_line \
+  && start_identity_before_line < start_snapshot_line \
+  && start_snapshot_line < start_identity_after_line \
+  && start_identity_after_line < shadow_start_line \
+  && shadow_start_line < gate_start_line \
   && shadow_start_line < completion_snapshot_line)); then
-  printf 'legacy health completion seam is not after shadow startup\n' >&2
+  printf 'legacy health admission or completion seam is ordered incorrectly\n' >&2
   exit 1
 fi
 [[ $(legacy_health_sample_state \
@@ -3641,8 +3611,11 @@ done
 
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
+grep -Fq 'readonly MINIMUM_GATE_SECONDS=$REQUIRED_DURATION_SECONDS' "$GATE"
+grep -Fq 'production gate duration must be exactly 900 seconds' "$GATE"
 grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
-grep -Fq 'readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900' "$GATE"
+grep -Fq 'readonly LEGACY_HEALTH_START_REQUIRED=true' "$GATE"
+grep -Fq 'readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true' "$GATE"
 grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$GATE"
@@ -3691,8 +3664,10 @@ if ((legacy_transition_line >= health_settle_line)); then
   exit 1
 fi
 grep -Fq 'if [[ $legacy_health_decision == advance ]]; then' "$GATE"
-grep -Fq '&& [[ $legacy_health_decision == advance ]]; then' \
-  "$GATE"
+grep -Fq 'observation_deadline=$gate_seconds' "$GATE"
+grep -Fq '&& ((observation_deadline < HEALTH_SETTLE_SECONDS)); then' "$GATE"
+grep -Fq 'observation_deadline=$HEALTH_SETTLE_SECONDS' "$GATE"
+grep -Fq '((elapsed < observation_deadline)) || break' "$GATE"
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2
@@ -3700,7 +3675,10 @@ if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]
 fi
 grep -Fq 'verify-shadow-parity' "$GATE"
 grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
-grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"
+if grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"; then
+  printf 'Gate retains a legacy identity bypass after parity or OSS readback\n' >&2
+  exit 1
+fi
 [[ ! -e "$SCRIPT_DIR/verify-polymarket-shadow-parity.py" ]]
 if grep -Fq 'python3 "$PARITY_VERIFIER"' "$GATE"; then
   printf 'shadow gate still invokes the retired legacy parity verifier\n' >&2
