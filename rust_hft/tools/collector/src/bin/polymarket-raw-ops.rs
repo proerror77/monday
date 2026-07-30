@@ -6,7 +6,7 @@ use hft_collector::polymarket_evidence_artifact::{
 };
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
-    run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
+    finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
 };
 use hft_collector::polymarket_research_import::{
@@ -73,6 +73,11 @@ enum Command {
         per_market_delay_ms: u64,
         #[arg(long)]
         once: bool,
+    },
+    /// Finalize one stopped active reference tape into a closed segment.
+    FinalizeReferenceTape {
+        #[arg(long, default_value = "/data/monday/spool/polymarket-reference")]
+        spool_dir: PathBuf,
     },
     /// Validate, compress, upload, and read back all closed tape segments.
     Upload {
@@ -200,7 +205,11 @@ fn reference_triplets(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
+    run(Cli::parse()).await
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
         Command::CollectReference {
             spool_dir,
             symbols,
@@ -235,6 +244,10 @@ async fn main() -> Result<()> {
                 per_market_delay: Duration::from_millis(per_market_delay_ms),
             };
             run_reference(config, once).await
+        }
+        Command::FinalizeReferenceTape { spool_dir } => {
+            println!("{}", finalize_reference_tape(&spool_dir)?.display());
+            Ok(())
         }
         Command::Upload {
             spool_dir,
@@ -408,6 +421,43 @@ mod tests {
             market_ids,
             vec!["2959141".to_owned(), "2959146".to_owned()]
         );
+    }
+
+    #[test]
+    fn finalize_reference_tape_cli_accepts_an_explicit_spool() {
+        let command = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "finalize-reference-tape",
+            "--spool-dir",
+            "/tmp/polymarket-reference",
+        ])
+        .expect("finalize reference tape CLI must parse")
+        .command;
+        let Command::FinalizeReferenceTape { spool_dir } = command else {
+            panic!("finalize-reference-tape must select the finalizer command");
+        };
+        assert_eq!(spool_dir, PathBuf::from("/tmp/polymarket-reference"));
+    }
+
+    #[test]
+    fn finalize_reference_tape_cli_fails_closed_for_an_empty_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = fs::canonicalize(root.path()).unwrap();
+        fs::write(spool.join("market-updates.ndjson"), b"").unwrap();
+        let cli = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "finalize-reference-tape",
+            "--spool-dir",
+            spool.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run(cli))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("active tape"));
     }
 
     #[test]
