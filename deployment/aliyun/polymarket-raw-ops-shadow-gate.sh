@@ -14,6 +14,7 @@ readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
+readonly LEGACY_START_HEALTH_MAX_AGE_SECONDS=2700
 readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
 readonly LEGACY_HEALTH_START_REQUIRED=true
 readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
@@ -481,8 +482,13 @@ legacy_start_health_policy_clean() {
     return 0
   fi
   jq -e '
-    .api_errors
-    | type == "array" and length <= 3
+    . as $snapshot
+    | ($snapshot.target_markets
+      | select(type == "number" and floor == . and . > 0)
+      | ((. + 99) / 100 | floor)
+      | if . < 3 then 3 elif . > 32 then 32 else . end) as $limit
+    | $snapshot.api_errors
+    | type == "array" and length <= $limit
     and all(.[];
       type == "string"
       and test("^trades 0x[0-9A-Fa-f]{64}: HTTP Error 429: Too Many Requests\\z"))
@@ -493,9 +499,11 @@ legacy_start_health_policy_clean() {
 
 fresh_legacy_health_observation() {
   local health=$1 policy=$2 allow_bounded_rate_limits=${3:-false}
+  local max_age_seconds=${4:-$MAX_HEALTH_SILENCE_SECONDS}
   local before after snapshot field timestamp epoch now
   local stable=false
   local _device _inode _size written_at_unix _changed_at_unix
+  [[ $max_age_seconds =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   [[ -f $health && ! -L $health ]] || return 1
   # Payload timestamps describe the cycle; mtime and identity prove its
   # completed atomic publication. Retry only snapshots that overlap rename.
@@ -525,7 +533,7 @@ fresh_legacy_health_observation() {
   [[ $written_at_unix =~ ^[0-9]+$ ]] || return 1
   now=$(date -u +%s) || return 1
   ((written_at_unix <= now \
-    && now - written_at_unix <= MAX_HEALTH_SILENCE_SECONDS)) || return 1
+    && now - written_at_unix <= max_age_seconds)) || return 1
   for field in updated_at last_success_at; do
     timestamp=$(jq -er --arg field "$field" \
       '.[$field] | select(type == "string" and length > 0)' <<<"$snapshot") \
@@ -1404,7 +1412,8 @@ if [[ $baseline_mode == legacy_python \
     || die 'baseline identity changed before legacy health admission'
   baseline_health_observation=$(fresh_legacy_health_observation \
     "$LEGACY_SPOOL/health.json" \
-    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true) \
+    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true \
+    "$LEGACY_START_HEALTH_MAX_AGE_SECONDS") \
     || die 'active legacy collector health is not fresh or Gate-admissible'
   baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
     || die 'admitted legacy collector health observation is invalid'
@@ -1451,6 +1460,11 @@ memory_events_end=$memory_events_start
 verify_baseline_identity \
   || die 'baseline identity changed while the Rust shadow was starting'
 started_at_unix=$(date -u +%s)
+if [[ $baseline_mode == legacy_python \
+  && $LEGACY_HEALTH_START_REQUIRED == true ]] \
+  && ((started_at_unix - baseline_health_start_written_at_unix > LEGACY_START_HEALTH_MAX_AGE_SECONDS)); then
+  die 'active legacy collector health aged past startup admission before observation'
+fi
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
 observation_deadline=$gate_seconds
