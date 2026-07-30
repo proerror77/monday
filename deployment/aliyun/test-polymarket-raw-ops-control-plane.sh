@@ -3040,6 +3040,7 @@ sed -n \
   -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
+  -e '/^readonly PARITY_CUTOFF_LAG_SECONDS=/p' \
   -e '/^readonly LEGACY_UNIT=/p' \
   -e '/^monotonic_uptime_seconds() {$/,/^}$/p' \
   -e '/^legacy_runtime_budget_observation() {$/,/^}$/p' \
@@ -3069,7 +3070,8 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
-    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 ]] || {
+    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
+    && $PARITY_CUTOFF_LAG_SECONDS -eq 60 ]] || {
     printf 'Gate runtime budget does not bind the reviewed preflight and unit limits\n' >&2
     exit 1
   }
@@ -3083,7 +3085,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   monotonic_uptime_seconds() { printf '20906\n'; }
   required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
     + LEGACY_HEALTH_START_WAIT_SECONDS + MINIMUM_GATE_SECONDS \
-    + LEGACY_RUNTIME_RESERVE_SECONDS))
+    + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
       "$required" >&2
@@ -3606,6 +3608,10 @@ final_thaw_line=$(grep -n '^systemctl thaw "$shadow_unit"' "$GATE" \
 thawed_state_line=$(grep -n '^shadow_thawed_state=.*FreezerState' "$GATE" \
   | cut -d: -f1 || true)
 final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
+finalize_line=$(grep -n '"$release_binary" finalize-reference-tape' "$GATE" \
+  | tail -1 | cut -d: -f1 || true)
+parity_line=$(grep -n '"$release_binary" verify-shadow-parity' "$GATE" \
+  | tail -1 | cut -d: -f1)
 [[ $freeze_line =~ ^[1-9][0-9]*$ \
   && $freezer_state_line =~ ^[1-9][0-9]*$ \
   && $final_memory_line =~ ^[1-9][0-9]*$ \
@@ -3613,17 +3619,43 @@ final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | 
   && $final_thaw_line =~ ^[1-9][0-9]*$ \
   && $thawed_state_line =~ ^[1-9][0-9]*$ \
   && $final_stop_line =~ ^[1-9][0-9]*$ \
+  && $finalize_line =~ ^[1-9][0-9]*$ \
+  && $parity_line =~ ^[1-9][0-9]*$ \
   && $freeze_line -lt $freezer_state_line \
   && $freezer_state_line -lt $final_memory_line \
   && $final_memory_line -lt $kill_line \
   && $kill_line -lt $final_thaw_line \
   && $final_thaw_line -lt $thawed_state_line \
   && $thawed_state_line -lt $final_stop_line \
-  && $kill_line -lt $final_stop_line ]] || {
-  printf 'shadow final freeze/snapshot/kill/thaw/stop sequence is unsafe\n' >&2
+  && $kill_line -lt $final_stop_line \
+  && $final_stop_line -lt $finalize_line \
+  && $finalize_line -lt $parity_line ]] || {
+  printf 'shadow final stop/finalize/parity sequence is unsafe\n' >&2
   exit 1
 }
 grep -Fq '[[ $shadow_thawed_state == running ]]' "$GATE"
+grep -Fq 'runuser -u hftcollector -- env HOME=/var/lib/hft-collector' "$GATE"
+finalizer_path_contract="$tmp_dir/finalizer-path-contract.sh"
+sed -n \
+  -e '/^valid_absolute_path() {$/,/^}$/p' \
+  -e '/^valid_finalized_reference_tape_path() {$/,/^}$/p' "$GATE" \
+  >"$finalizer_path_contract"
+# shellcheck disable=SC1090
+source "$finalizer_path_contract"
+finalizer_spool="$tmp_dir/finalizer-spool"
+mkdir -p "$finalizer_spool/market-updates.bad"
+direct_finalized="$finalizer_spool/market-updates.20260730T120000000000.ndjson"
+nested_finalized="$finalizer_spool/market-updates.bad/market-updates.20260730T120000000000.ndjson"
+: >"$direct_finalized"
+: >"$nested_finalized"
+valid_finalized_reference_tape_path "$direct_finalized" "$finalizer_spool" || {
+  printf 'Gate rejected a direct finalized reference tape\n' >&2
+  exit 1
+}
+if valid_finalized_reference_tape_path "$nested_finalized" "$finalizer_spool"; then
+  printf 'Gate accepted a nested finalized reference tape\n' >&2
+  exit 1
+fi
 
 validator_functions="$tmp_dir/control-group-validator.sh"
 sed -n '/^valid_absolute_path() {$/,/^}$/p' "$GATE" >"$validator_functions"

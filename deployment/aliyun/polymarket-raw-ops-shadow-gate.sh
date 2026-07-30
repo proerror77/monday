@@ -153,6 +153,15 @@ valid_absolute_path() {
     && $path != */. && $path != */.. ]]
 }
 
+valid_finalized_reference_tape_path() {
+  local path=$1 spool_dir=$2 name
+  valid_absolute_path "$path" || return 1
+  [[ ${path%/*} == "$spool_dir" ]] || return 1
+  name=${path##*/}
+  [[ $name =~ ^market-updates\.[0-9]{8}T[0-9]{12}\.ndjson$ \
+    && -f $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]
+}
+
 secure_root_chain() {
   local path=$1 remainder component current=
   valid_absolute_path "$path" || return 1
@@ -939,7 +948,7 @@ run_budgeted_real_market_preflight() {
     }
     legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
       + LEGACY_HEALTH_START_WAIT_SECONDS + gate_seconds \
-      + LEGACY_RUNTIME_RESERVE_SECONDS))
+      + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
     if observation=$(legacy_runtime_budget_observation \
       "$legacy_runtime_budget_required"); then
       :
@@ -1661,6 +1670,11 @@ verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_inv
 stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
 [[ $stopped_shadow_restarts == 0 ]] \
   || die 'Rust shadow restarted between final verification and stop'
+finalized_reference_tape=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
+  "$release_binary" finalize-reference-tape --spool-dir "$shadow_spool") \
+  || die 'could not finalize the stopped Rust shadow tape'
+valid_finalized_reference_tape_path "$finalized_reference_tape" "$shadow_spool" \
+  || die 'Rust shadow finalizer returned an invalid closed tape path'
 
 parity_json="$evidence_dir/parity.json"
 "$release_binary" verify-shadow-parity \
