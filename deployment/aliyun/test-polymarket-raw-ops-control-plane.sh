@@ -2400,6 +2400,8 @@ jq \
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    baseline_health_start_required:true,
+    baseline_runtime_stability_required:true,
     baseline_health_completion_required:true,
     baseline_health_snapshot:{
       updated_at:"1970-01-01T00:01:40.123456Z",
@@ -2462,6 +2464,36 @@ jq -e -f "$POLICY" "$tmp_dir/expedited-legacy-gate.json" >/dev/null || {
   printf 'gate policy rejected approved expedited legacy baseline evidence\n' >&2
   exit 1
 }
+jq '.baseline_health_start_required = false
+  | .baseline_runtime_stability_required = false
+  | .baseline_health_snapshot = null
+  | .baseline_health_start_success_unix = null
+  | .baseline_health_start_written_at_unix = null
+  | .baseline_health_start_file_identity = null' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/python-nonblocking-legacy-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/python-nonblocking-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected approved Python-nonblocking legacy evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  'del(.baseline_health_start_required)' \
+  '.baseline_health_start_required = true' \
+  '.baseline_runtime_stability_required = true' \
+  '.checks.metadata_parity = false'; do
+  jq "$mutation" "$tmp_dir/python-nonblocking-legacy-gate.json" \
+    >"$tmp_dir/forged-python-nonblocking-legacy-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-python-nonblocking-legacy-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged Python-nonblocking legacy evidence\n' >&2
+    exit 1
+  fi
+done
+if grep -Fq 'baseline_health_observation=$(wait_for_fresh_legacy_health_observation' \
+  "$GATE"; then
+  printf 'production Gate still waits for a Python health publication\n' >&2
+  exit 1
+fi
 for mutation in \
   'del(.baseline_health_snapshot)' \
   '.baseline_health_completion_snapshot = .baseline_health_snapshot' \
@@ -2942,6 +2974,8 @@ if jq -e -f "$POLICY" "$tmp_dir/shadow-once-cmdline.json" >/dev/null; then
 fi
 baseline_sha=$(printf '9%.0s' {1..64})
 jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
+  | .baseline_health_start_required = false
+  | .baseline_runtime_stability_required = true
   | .baseline_health_completion_required = false
   | .baseline_health_snapshot = null
   | .baseline_health_completion_snapshot = null
@@ -3038,6 +3072,7 @@ sed -n \
   -e '/^readonly PARITY_TAIL_SECONDS=/p' \
   -e '/^readonly MINIMUM_GATE_SECONDS=/p' \
   -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
+  -e '/^readonly LEGACY_RUNTIME_STABILITY_REQUIRED=/p' \
   -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
   -e '/^readonly PARITY_CUTOFF_LAG_SECONDS=/p' \
@@ -3047,7 +3082,7 @@ sed -n \
   -e '/^run_budgeted_real_market_preflight() {$/,/^}$/p' "$GATE" \
   >"$legacy_runtime_budget_contract"
 [[ -s $legacy_runtime_budget_contract ]] || {
-  printf 'Gate has no legacy RuntimeMaxSec budget verifier\n' >&2
+  printf 'Gate has no bounded real preflight contract\n' >&2
   exit 1
 }
 budgeted_preflight_line=$(grep -n '^real_market_preflight_json=$(run_budgeted_real_market_preflight' \
@@ -3057,7 +3092,7 @@ shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"' "$GATE" \
 [[ $budgeted_preflight_line =~ ^[1-9][0-9]*$ \
   && $shadow_start_line =~ ^[1-9][0-9]*$ \
   && $budgeted_preflight_line -lt $shadow_start_line ]] || {
-  printf 'Gate does not verify legacy runtime budget before real preflight\n' >&2
+  printf 'Gate does not run bounded real preflight before shadow startup\n' >&2
   exit 1
 }
 grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' \
@@ -3069,6 +3104,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
+    && $LEGACY_RUNTIME_STABILITY_REQUIRED == false \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
     && $PARITY_CUTOFF_LAG_SECONDS -eq 60 ]] || {
@@ -3137,17 +3173,13 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     return 1
   }
   admission_error="$tmp_dir/runtime-budget-admission.err"
-  if run_budgeted_real_market_preflight source spool download evidence \
-    2>"$admission_error"; then
-    printf 'Gate admitted an insufficient legacy runtime budget\n' >&2
-    exit 1
-  fi
-  [[ $preflight_calls -eq 0 && $identity_checks -eq 1 ]] || {
-    printf 'Gate attempted real preflight after runtime admission failed\n' >&2
+  run_budgeted_real_market_preflight source spool download evidence \
+    2>"$admission_error" >/dev/null || {
+    printf 'Gate still blocks real preflight on Python runtime budget\n' >&2
     exit 1
   }
-  grep -Fq "remaining=695 required=$required" "$admission_error" || {
-    printf 'Gate admission failure omitted exact runtime evidence\n' >&2
+  [[ $preflight_calls -eq 1 && $identity_checks -eq 0 ]] || {
+    printf 'Gate still consults Python identity or runtime before real preflight\n' >&2
     exit 1
   }
   legacy_runtime_budget_observation() {
@@ -3157,8 +3189,8 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate rejected a sufficient runtime budget at the admission seam\n' >&2
     exit 1
   }
-  [[ $preflight_calls -eq 1 && $identity_checks -eq 3 ]] || {
-    printf 'Gate did not bind preflight between two identity checks\n' >&2
+  [[ $preflight_calls -eq 2 && $identity_checks -eq 0 ]] || {
+    printf 'Gate made Python identity a real-preflight prerequisite\n' >&2
     exit 1
   }
   [[ $timeout_args == '--signal=KILL 6300 env '* ]] || {

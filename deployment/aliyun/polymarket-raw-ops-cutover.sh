@@ -1314,6 +1314,12 @@ for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER
 done
 baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release")' \
   "$gate_json") || die 'shadow gate has no valid baseline mode'
+baseline_health_start_required=$(jq -er \
+  '.baseline_health_start_required | select(type == "boolean")' "$gate_json") \
+  || die 'shadow gate has no valid baseline health admission contract'
+baseline_runtime_stability_required=$(jq -er \
+  '.baseline_runtime_stability_required | select(type == "boolean")' "$gate_json") \
+  || die 'shadow gate has no valid baseline runtime stability contract'
 legacy_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] \
   || die 'cutover requires a verifiable active legacy reference collector PID'
@@ -1325,15 +1331,27 @@ gate_legacy_restarts=$(jq -er \
 gate_legacy_invocation_id=$(jq -er \
   '.legacy_runtime.invocation_id | select(type == "string" and test("^[a-f0-9]{32}$"))' \
   "$gate_json") || die 'shadow gate has no valid legacy systemd invocation ID'
-[[ $legacy_pid == "$gate_legacy_pid" ]] \
-  || die 'legacy collector MainPID changed after the shadow gate'
 if [[ $baseline_mode == legacy_python ]]; then
-verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
-  || die 'legacy collector identity or restart counter changed after the shadow gate'
-legacy_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
-verify_legacy_health "$legacy_health_not_before" \
-  || die 'cutover requires current fail-closed legacy health'
+  if [[ $baseline_runtime_stability_required == true ]]; then
+    [[ $legacy_pid == "$gate_legacy_pid" ]] \
+      || die 'legacy collector MainPID changed after the shadow gate'
+  else
+    gate_legacy_pid=$legacy_pid
+    gate_legacy_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
+    gate_legacy_invocation_id=$(systemctl show \
+      --property=InvocationID --value "$COLLECTOR_UNIT")
+  fi
+  verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" \
+    "$gate_legacy_invocation_id" \
+    || die 'cutover requires an exact canonical Python rollback runtime'
+  if [[ $baseline_health_start_required == true ]]; then
+    legacy_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
+    verify_legacy_health "$legacy_health_not_before" \
+      || die 'cutover requires current fail-closed legacy health'
+  fi
 else
+  [[ $legacy_pid == "$gate_legacy_pid" ]] \
+    || die 'Rust baseline MainPID changed after the shadow gate'
   gate_baseline_release_path=$(jq -er '.legacy_runtime.release_path' "$gate_json")
   gate_baseline_release_sha=$(jq -er '.legacy_runtime.release_sha256' "$gate_json")
   gate_baseline_proc_exe=$(jq -er '.legacy_runtime.proc_exe' "$gate_json")
@@ -1435,7 +1453,8 @@ fi
 legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
   || die 'could not capture the legacy collector journal cursor before stop'
 pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
-if [[ $baseline_mode == legacy_python ]]; then
+if [[ $baseline_mode == legacy_python \
+  && $baseline_health_start_required == true ]]; then
 verify_legacy_health "$pre_stop_health_not_before" \
   || die 'legacy collector health is not current after uploader drain'
 fi

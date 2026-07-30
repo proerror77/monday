@@ -17,6 +17,8 @@ readonly MAX_HEALTH_SILENCE_SECONDS=240
 # Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
 readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
 readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
+readonly LEGACY_HEALTH_START_REQUIRED=false
+readonly LEGACY_RUNTIME_STABILITY_REQUIRED=false
 # One real-segment upload can spend one 300-second compression timeout, fifteen
 # candidate OSS operations, four independent Gate readbacks, and 300 seconds
 # of local processing reserve.
@@ -941,7 +943,8 @@ real_market_segment_preflight() {
 
 run_budgeted_real_market_preflight() {
   local legacy_runtime_budget_required observation
-  if [[ $baseline_mode == legacy_python ]]; then
+  if [[ $baseline_mode == legacy_python \
+    && $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
     verify_baseline_identity || {
       printf 'legacy baseline identity changed before real preflight\n' >&2
       return 1
@@ -1202,6 +1205,12 @@ case "$baseline_exec" in
     ;;
   *) die 'active reference collector ExecStart is not an approved baseline' ;;
 esac
+baseline_health_start_required=false
+baseline_runtime_stability_required=true
+if [[ $baseline_mode == legacy_python ]]; then
+  baseline_health_start_required=$LEGACY_HEALTH_START_REQUIRED
+  baseline_runtime_stability_required=$LEGACY_RUNTIME_STABILITY_REQUIRED
+fi
 legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
 legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
@@ -1381,31 +1390,6 @@ baseline_health_completion_written_at_unix=null
 baseline_health_completion_file_identity=null
 baseline_health_start_success_unix=null
 baseline_health_cutoff_unix=null
-if ! baseline_health_requires_continuous_freshness "$baseline_mode"; then
-  baseline_health_observation=$(wait_for_fresh_legacy_health_observation \
-    "$LEGACY_SPOOL/health.json" \
-    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
-    || die 'active legacy collector did not publish fresh health before shadow startup'
-  baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
-    || die 'frozen legacy collector health observation is invalid'
-  baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
-    <<<"$baseline_health_observation") \
-    || die 'frozen legacy collector health has no write time'
-  baseline_health_start_file_identity=$(jq -ce '.file_identity
-    | select(type == "string" and length > 0)' \
-    <<<"$baseline_health_observation") \
-    || die 'frozen legacy collector health has no file identity'
-  baseline_health_started_at=$(jq -er '.updated_at' <<<"$baseline_health_snapshot") \
-    || die 'frozen legacy collector health has no updated_at'
-  baseline_health_start_success_at=$(jq -er '.last_success_at' \
-    <<<"$baseline_health_snapshot") \
-    || die 'frozen legacy collector health has no last_success_at'
-  baseline_health_start_success_unix=$(date -u -d \
-    "$baseline_health_start_success_at" +%s) \
-    || die 'frozen legacy collector last_success_at is invalid'
-  ((baseline_health_start_success_unix <= baseline_health_start_written_at_unix)) \
-    || die 'frozen legacy collector success is after its completed write'
-fi
 started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
@@ -1442,8 +1426,11 @@ parity_window_started_at=
 while :; do
   now_uptime=$SECONDS
   elapsed=$((now_uptime - start_uptime))
-  verify_baseline_identity \
-    || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
+  if [[ $baseline_mode == rust_release \
+    || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
+    verify_baseline_identity \
+      || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
+  fi
   if baseline_health_requires_continuous_freshness "$baseline_mode"; then
     legacy_health="$LEGACY_SPOOL/health.json"
     [[ -f $legacy_health && ! -L $legacy_health ]] \
@@ -1628,8 +1615,11 @@ shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
   || die 'Rust shadow did not remain a single continuous process'
 verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
   || die 'final Rust shadow systemd identity differs from the gated candidate'
-verify_baseline_identity \
-  || die 'baseline collector identity changed before parity evidence was captured'
+if [[ $baseline_mode == rust_release \
+  || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
+  verify_baseline_identity \
+    || die 'baseline collector identity changed before parity evidence was captured'
+fi
 shadow_exec_argv=$(effective_exec_argv "$shadow_unit") \
   || die 'could not capture the effective Rust shadow ExecStart'
 shadow_cmdline=$(proc_cmdline "$initial_shadow_pid") \
@@ -1705,7 +1695,11 @@ canonical_uploaded_segments=$(jq -er \
   '.canonical_uploaded_segments | select(type == "number" and floor == . and . > 0)' \
   <<<"$upload_json") || die 'shadow uploader did not verify a canonical closed segment'
 
-if [[ $baseline_mode == legacy_python ]]; then
+if [[ $baseline_mode == legacy_python \
+  && $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then
+  legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
+  legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
+  legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
   verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
 else
   verify_baseline_identity
@@ -1762,6 +1756,9 @@ jq \
   --argjson parity_window_started_at_unix "$parity_window_started_at" \
   --argjson parity_window_ended_at_unix "$common_cutoff" \
   --argjson production_eligible "$production_eligible" \
+  --argjson baseline_health_start_required "$baseline_health_start_required" \
+  --argjson baseline_runtime_stability_required \
+    "$baseline_runtime_stability_required" \
   --argjson baseline_health_completion_required "$LEGACY_HEALTH_COMPLETION_REQUIRED" \
   --argjson baseline_health_snapshot "$baseline_health_snapshot" \
   --argjson baseline_health_completion_snapshot "$baseline_health_completion_snapshot" \
@@ -1796,6 +1793,8 @@ jq \
     parity_window_started_at_unix:$parity_window_started_at_unix,
     parity_window_ended_at_unix:$parity_window_ended_at_unix,
     production_eligible:$production_eligible,
+    baseline_health_start_required:$baseline_health_start_required,
+    baseline_runtime_stability_required:$baseline_runtime_stability_required,
     baseline_health_completion_required:$baseline_health_completion_required,
     baseline_health_snapshot:$baseline_health_snapshot,
     baseline_health_completion_snapshot:$baseline_health_completion_snapshot,
@@ -1847,8 +1846,11 @@ if [[ $production_eligible == true ]]; then
     "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
     "$control_archive_sha" "$release_binary" "$release_control_dir" \
     || die 'release manifest, candidate, or installed control bundle changed during gate'
-  verify_baseline_identity \
-    || die 'baseline collector identity changed before the gate marker was published'
+  if [[ $baseline_mode == rust_release \
+    || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
+    verify_baseline_identity \
+      || die 'baseline collector identity changed before the gate marker was published'
+  fi
   [[ $baseline_mode != rust_release ]] || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
     || die 'active Rust collector health became stale before marker publication'
   verify_current_oss_config
