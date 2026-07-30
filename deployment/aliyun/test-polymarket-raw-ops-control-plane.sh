@@ -4134,11 +4134,11 @@ sed -n '/^# Cutover depends on the current gate bundle/,/^systemctl stop "$COLLE
 grep -Fq 'jq -e -f "$POLICY" "$gate_json"' "$cutover_legacy_promotion"
 [[ $(grep -Fc 'verify_legacy_runtime "$legacy_pid"' \
   "$cutover_legacy_promotion") -eq 2 ]] || {
-  printf 'cutover no longer binds the gated Python identity before transition and stop\n' >&2
+  printf 'cutover no longer binds the gated legacy identity before transition and stop\n' >&2
   exit 1
 }
 if grep -Fq 'verify_legacy_health' "$cutover_legacy_promotion"; then
-  printf 'cutover re-admits Python health after the immutable Gate already passed\n' >&2
+  printf 'cutover re-admits legacy health after the immutable Gate already passed\n' >&2
   exit 1
 fi
 grep -Fq 'verify_fresh_legacy_runtime' "$CUTOVER" || {

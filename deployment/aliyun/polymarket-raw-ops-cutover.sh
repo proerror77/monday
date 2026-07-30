@@ -1342,7 +1342,7 @@ if [[ $baseline_mode == legacy_python ]]; then
   verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" \
     "$gate_legacy_invocation_id" \
     || die 'cutover requires an exact canonical legacy rollback runtime'
-  # The immutable Gate policy above already admitted the atomic Python health
+  # The immutable Gate policy above already admitted the atomic legacy health
   # snapshot. Promotion requires the same runtime identity, not a new cycle.
 else
   [[ $legacy_pid == "$gate_legacy_pid" ]] \
