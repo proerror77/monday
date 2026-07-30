@@ -1314,10 +1314,6 @@ for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER
 done
 baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release")' \
   "$gate_json") || die 'shadow gate has no valid baseline mode'
-baseline_health_start_required=$(jq -er \
-  '.baseline_health_start_required | select(type == "boolean") | tostring' \
-  "$gate_json") \
-  || die 'shadow gate has no valid baseline health admission contract'
 baseline_runtime_stability_required=$(jq -er \
   '.baseline_runtime_stability_required | select(type == "boolean") | tostring' \
   "$gate_json") \
@@ -1346,11 +1342,8 @@ if [[ $baseline_mode == legacy_python ]]; then
   verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" \
     "$gate_legacy_invocation_id" \
     || die 'cutover requires an exact canonical legacy rollback runtime'
-  if [[ $baseline_health_start_required == true ]]; then
-    legacy_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
-    verify_legacy_health "$legacy_health_not_before" \
-      || die 'cutover requires current fail-closed legacy health'
-  fi
+  # The immutable Gate policy above already admitted the atomic Python health
+  # snapshot. Promotion requires the same runtime identity, not a new cycle.
 else
   [[ $legacy_pid == "$gate_legacy_pid" ]] \
     || die 'Rust baseline MainPID changed after the shadow gate'
@@ -1454,12 +1447,6 @@ if [[ $baseline_mode == rust_release ]]; then
 fi
 legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
   || die 'could not capture the legacy collector journal cursor before stop'
-pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
-if [[ $baseline_mode == legacy_python \
-  && $baseline_health_start_required == true ]]; then
-verify_legacy_health "$pre_stop_health_not_before" \
-  || die 'legacy collector health is not current after uploader drain'
-fi
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed during the legacy uploader drain'
 [[ $baseline_mode == legacy_python \
@@ -1469,6 +1456,7 @@ if [[ $baseline_mode == legacy_python ]]; then
 verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
   || die 'legacy collector identity or restart counter changed during uploader drain'
 else
+  pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
   verify_rust_runtime "$gate_baseline_release_path" "$pre_stop_health_not_before" \
     "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
     "$LEGACY_HEALTH_POLICY" \

@@ -4128,6 +4128,23 @@ release_move_line=$(grep -n '^  mv "$staging" "$release_dir"$' "$GATE" \
 }
 
 cutover_stop_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' "$CUTOVER" | cut -d: -f1)
+cutover_legacy_promotion="$tmp_dir/cutover-legacy-promotion.sh"
+sed -n '/^# Cutover depends on the current gate bundle/,/^systemctl stop "$COLLECTOR_UNIT"$/p' \
+  "$CUTOVER" >"$cutover_legacy_promotion"
+grep -Fq 'jq -e -f "$POLICY" "$gate_json"' "$cutover_legacy_promotion"
+[[ $(grep -Fc 'verify_legacy_runtime "$legacy_pid"' \
+  "$cutover_legacy_promotion") -eq 2 ]] || {
+  printf 'cutover no longer binds the gated Python identity before transition and stop\n' >&2
+  exit 1
+}
+if grep -Fq 'verify_legacy_health' "$cutover_legacy_promotion"; then
+  printf 'cutover re-admits Python health after the immutable Gate already passed\n' >&2
+  exit 1
+fi
+grep -Fq 'verify_fresh_legacy_runtime' "$CUTOVER" || {
+  printf 'rollback no longer requires a fresh restored legacy runtime\n' >&2
+  exit 1
+}
 legacy_drain_line=$(grep -n '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
   | head -1 | cut -d: -f1)
 legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
@@ -4136,8 +4153,6 @@ legacy_final_runtime_line=$(grep -n \
   '^verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
   "$CUTOVER" \
   | tail -1 | cut -d: -f1)
-legacy_final_health_line=$(grep -n '^verify_legacy_health "$pre_stop_health_not_before"' \
-  "$CUTOVER" | cut -d: -f1)
 legacy_final_oss_line=$(grep -n \
   'OSS configuration changed during the legacy uploader drain' "$CUTOVER" \
   | cut -d: -f1)
@@ -4155,8 +4170,7 @@ cutover_reset_line=$(grep -n '^systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTO
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 ((legacy_drain_line < legacy_cursor_line \
-  && legacy_cursor_line < legacy_final_health_line \
-  && legacy_final_health_line < legacy_final_oss_line \
+  && legacy_cursor_line < legacy_final_oss_line \
   && legacy_final_oss_line < legacy_final_runtime_line \
   && legacy_final_runtime_line < cutover_stop_line \
   && cutover_stop_line < legacy_journal_guard_line \
