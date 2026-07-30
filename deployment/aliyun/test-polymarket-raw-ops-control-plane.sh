@@ -49,6 +49,18 @@ gate_privilege_transition_contract() {
     ! grep -Fxq 'RestrictSUIDSGID=false' "$2"
 }
 
+join_shell_continuations() {
+  awk '{
+    line=$0
+    while (sub(/[[:space:]]*\\$/, "", line)) {
+      if ((getline next_line) <= 0) break
+      sub(/^[[:space:]]*/, "", next_line)
+      line=line " " next_line
+    }
+    print line
+  }' "$1"
+}
+
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
 for unit_line in \
   'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
@@ -4131,9 +4143,13 @@ cutover_stop_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' "$CUTOVER" | cu
 cutover_legacy_promotion="$tmp_dir/cutover-legacy-promotion.sh"
 sed -n '/^# Cutover depends on the current gate bundle/,/^systemctl stop "$COLLECTOR_UNIT"$/p' \
   "$CUTOVER" >"$cutover_legacy_promotion"
+cutover_legacy_promotion_joined="$tmp_dir/cutover-legacy-promotion-joined.sh"
+join_shell_continuations "$cutover_legacy_promotion" \
+  >"$cutover_legacy_promotion_joined"
 grep -Fq 'jq -e -f "$POLICY" "$gate_json"' "$cutover_legacy_promotion"
-[[ $(grep -Fc 'verify_legacy_runtime "$legacy_pid"' \
-  "$cutover_legacy_promotion") -eq 2 ]] || {
+[[ $(grep -Fc \
+  'verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
+  "$cutover_legacy_promotion_joined") -eq 2 ]] || {
   printf 'cutover no longer binds the gated legacy identity before transition and stop\n' >&2
   exit 1
 }
@@ -4141,7 +4157,15 @@ if grep -Fq 'verify_legacy_health' "$cutover_legacy_promotion"; then
   printf 'cutover re-admits legacy health after the immutable Gate already passed\n' >&2
   exit 1
 fi
-grep -Fq 'verify_fresh_legacy_runtime' "$CUTOVER" || {
+cutover_legacy_rollback="$tmp_dir/cutover-legacy-rollback.sh"
+sed -n '/^restore_legacy() (/,/^\[\[ ${EUID}/p' "$CUTOVER" \
+  >"$cutover_legacy_rollback"
+cutover_legacy_rollback_joined="$tmp_dir/cutover-legacy-rollback-joined.sh"
+join_shell_continuations "$cutover_legacy_rollback" \
+  >"$cutover_legacy_rollback_joined"
+grep -Fq \
+  'verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 "$rollback_invocation_id" "$rollback_health_policy"' \
+  "$cutover_legacy_rollback_joined" || {
   printf 'rollback no longer requires a fresh restored legacy runtime\n' >&2
   exit 1
 }
