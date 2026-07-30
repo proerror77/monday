@@ -300,4 +300,29 @@ summary_upload_line=$(grep -nF '      - name: Upload summary' "$security_workflo
 security_gate_line=$(grep -nF '      - name: Require selected security jobs to pass' "$security_workflow" | cut -d: -f1)
 ((security_gate_line > summary_upload_line))
 
+docker_publish_workflow="$script_dir/../workflows/docker-publish.yml"
+expected_docker_publish_triggers=$(printf '%s\n' \
+  '  push:' \
+  '    branches: [main]' \
+  '    tags:' \
+  "      - 'v*'" \
+  '    paths:' \
+  '      - "rust_hft/**"' \
+  '      - ".github/workflows/docker-publish.yml"' \
+  '  workflow_dispatch:')
+assert_docker_publish_triggers() {
+  local trigger_block
+  trigger_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$1")
+  [[ $trigger_block == "$expected_docker_publish_triggers" ]]
+}
+assert_docker_publish_triggers "$docker_publish_workflow"
+
+docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
+awk '1; $0 == "      - \".github/workflows/docker-publish.yml\"" { print "      - \"docs/**\"" }' \
+  "$docker_publish_workflow" >"$docker_publish_counterexample"
+if assert_docker_publish_triggers "$docker_publish_counterexample"; then
+  echo 'Docker Publish trigger contract accepted an unrelated path' >&2
+  exit 1
+fi
+
 printf 'rust CI scope selector tests passed\n'
