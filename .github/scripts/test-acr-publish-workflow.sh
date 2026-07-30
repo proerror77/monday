@@ -19,6 +19,7 @@ source_command_block=$(sed -n \
 grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},' "$workflow"
 grep -Fqx '  workflow_run:' "$workflow"
 grep -Fqx '    workflows: ["Prediction Markets CI"]' "$workflow"
+grep -Fqx '    branches: [main]' "$workflow"
 grep -Fqx '  actions: read' "$workflow"
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
