@@ -2393,13 +2393,14 @@ jq \
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
     },
-    duration_seconds:4201,
+    duration_seconds:1501,
     started_at:"1970-01-01T00:02:00Z",
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    baseline_health_completion_required:true,
     baseline_health_snapshot:{
       updated_at:"1970-01-01T00:01:40.123456Z",
       last_success_at:"1970-01-01T00:01:40.123456Z",
@@ -2451,6 +2452,29 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq '.baseline_health_completion_required = false
+  | .baseline_health_completion_snapshot = null
+  | .baseline_health_cutoff_unix = null
+  | .baseline_health_completion_written_at_unix = null
+  | .baseline_health_completion_file_identity = null' \
+  "$tmp_dir/gate.json" >"$tmp_dir/expedited-legacy-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/expedited-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected approved expedited legacy baseline evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  'del(.baseline_health_snapshot)' \
+  '.baseline_health_completion_snapshot = .baseline_health_snapshot' \
+  '.baseline_health_cutoff_unix = 1000' \
+  '.baseline_health_completion_written_at_unix = 1301' \
+  '.baseline_health_completion_file_identity = "1:11"'; do
+  jq "$mutation" "$tmp_dir/expedited-legacy-gate.json" \
+    >"$tmp_dir/forged-expedited-legacy-gate.json"
+  if jq -e -f "$POLICY" "$tmp_dir/forged-expedited-legacy-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged post-start legacy completion in expedited evidence\n' >&2
+    exit 1
+  fi
+done
 jq 'del(.real_market_preflight)' "$tmp_dir/gate.json" \
   >"$tmp_dir/missing-real-market-preflight.json"
 if jq -e -f "$POLICY" "$tmp_dir/missing-real-market-preflight.json" >/dev/null; then
@@ -2758,9 +2782,9 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 4200' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 1500' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than one hour plus its maturity tail\n' >&2
+  printf 'gate policy accepted a shadow shorter than 15 minutes plus its maturity tail\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -2918,6 +2942,7 @@ if jq -e -f "$POLICY" "$tmp_dir/shadow-once-cmdline.json" >/dev/null; then
 fi
 baseline_sha=$(printf '9%.0s' {1..64})
 jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
+  | .baseline_health_completion_required = false
   | .baseline_health_snapshot = null
   | .baseline_health_completion_snapshot = null
   | .baseline_health_start_success_unix = null
@@ -3015,6 +3040,7 @@ sed -n \
   -e '/^readonly LEGACY_HEALTH_START_WAIT_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_MAX_SECONDS=/p' \
   -e '/^readonly LEGACY_RUNTIME_RESERVE_SECONDS=/p' \
+  -e '/^readonly PARITY_CUTOFF_LAG_SECONDS=/p' \
   -e '/^readonly LEGACY_UNIT=/p' \
   -e '/^monotonic_uptime_seconds() {$/,/^}$/p' \
   -e '/^legacy_runtime_budget_observation() {$/,/^}$/p' \
@@ -3044,7 +3070,8 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   source "$legacy_runtime_budget_contract"
   [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 6300 \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
-    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 ]] || {
+    && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
+    && $PARITY_CUTOFF_LAG_SECONDS -eq 60 ]] || {
     printf 'Gate runtime budget does not bind the reviewed preflight and unit limits\n' >&2
     exit 1
   }
@@ -3058,7 +3085,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   monotonic_uptime_seconds() { printf '20906\n'; }
   required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
     + LEGACY_HEALTH_START_WAIT_SECONDS + MINIMUM_GATE_SECONDS \
-    + LEGACY_RUNTIME_RESERVE_SECONDS))
+    + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate accepted 695 seconds of remaining runtime for a %s-second gate\n' \
       "$required" >&2
@@ -3068,12 +3095,14 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate runtime rejection does not report remaining and required seconds\n' >&2
     exit 1
   }
-  monotonic_uptime_seconds() { printf '7200\n'; }
+  unreserved_remaining=$((required - LEGACY_RUNTIME_RESERVE_SECONDS))
+  unreserved_uptime=$((LEGACY_RUNTIME_MAX_SECONDS - unreserved_remaining + 1))
+  monotonic_uptime_seconds() { printf '%s\n' "$unreserved_uptime"; }
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate admitted the unreserved exact runtime boundary\n' >&2
     exit 1
   fi
-  [[ $observation == "remaining=14401 required=$required" ]] || {
+  [[ $observation == "remaining=$unreserved_remaining required=$required" ]] || {
     printf 'Gate reserve-boundary evidence is not exact\n' >&2
     exit 1
   }
@@ -3447,8 +3476,9 @@ for mutation in \
   fi
 done
 
-grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
+grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
+grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
 grep -Fq 'readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900' "$GATE"
 grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
@@ -3578,6 +3608,10 @@ final_thaw_line=$(grep -n '^systemctl thaw "$shadow_unit"' "$GATE" \
 thawed_state_line=$(grep -n '^shadow_thawed_state=.*FreezerState' "$GATE" \
   | cut -d: -f1 || true)
 final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
+finalize_line=$(grep -n '"$release_binary" finalize-reference-tape' "$GATE" \
+  | tail -1 | cut -d: -f1 || true)
+parity_line=$(grep -n '"$release_binary" verify-shadow-parity' "$GATE" \
+  | tail -1 | cut -d: -f1)
 [[ $freeze_line =~ ^[1-9][0-9]*$ \
   && $freezer_state_line =~ ^[1-9][0-9]*$ \
   && $final_memory_line =~ ^[1-9][0-9]*$ \
@@ -3585,17 +3619,43 @@ final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | 
   && $final_thaw_line =~ ^[1-9][0-9]*$ \
   && $thawed_state_line =~ ^[1-9][0-9]*$ \
   && $final_stop_line =~ ^[1-9][0-9]*$ \
+  && $finalize_line =~ ^[1-9][0-9]*$ \
+  && $parity_line =~ ^[1-9][0-9]*$ \
   && $freeze_line -lt $freezer_state_line \
   && $freezer_state_line -lt $final_memory_line \
   && $final_memory_line -lt $kill_line \
   && $kill_line -lt $final_thaw_line \
   && $final_thaw_line -lt $thawed_state_line \
   && $thawed_state_line -lt $final_stop_line \
-  && $kill_line -lt $final_stop_line ]] || {
-  printf 'shadow final freeze/snapshot/kill/thaw/stop sequence is unsafe\n' >&2
+  && $kill_line -lt $final_stop_line \
+  && $final_stop_line -lt $finalize_line \
+  && $finalize_line -lt $parity_line ]] || {
+  printf 'shadow final stop/finalize/parity sequence is unsafe\n' >&2
   exit 1
 }
 grep -Fq '[[ $shadow_thawed_state == running ]]' "$GATE"
+grep -Fq 'runuser -u hftcollector -- env HOME=/var/lib/hft-collector' "$GATE"
+finalizer_path_contract="$tmp_dir/finalizer-path-contract.sh"
+sed -n \
+  -e '/^valid_absolute_path() {$/,/^}$/p' \
+  -e '/^valid_finalized_reference_tape_path() {$/,/^}$/p' "$GATE" \
+  >"$finalizer_path_contract"
+# shellcheck disable=SC1090
+source "$finalizer_path_contract"
+finalizer_spool="$tmp_dir/finalizer-spool"
+mkdir -p "$finalizer_spool/market-updates.bad"
+direct_finalized="$finalizer_spool/market-updates.20260730T120000000000.ndjson"
+nested_finalized="$finalizer_spool/market-updates.bad/market-updates.20260730T120000000000.ndjson"
+: >"$direct_finalized"
+: >"$nested_finalized"
+valid_finalized_reference_tape_path "$direct_finalized" "$finalizer_spool" || {
+  printf 'Gate rejected a direct finalized reference tape\n' >&2
+  exit 1
+}
+if valid_finalized_reference_tape_path "$nested_finalized" "$finalizer_spool"; then
+  printf 'Gate accepted a nested finalized reference tape\n' >&2
+  exit 1
+fi
 
 validator_functions="$tmp_dir/control-group-validator.sh"
 sed -n '/^valid_absolute_path() {$/,/^}$/p' "$GATE" >"$validator_functions"

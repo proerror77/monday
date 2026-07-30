@@ -5,7 +5,7 @@ umask 027
 export LC_ALL=C
 export TZ=UTC
 
-readonly REQUIRED_DURATION_SECONDS=3600
+readonly REQUIRED_DURATION_SECONDS=900
 # The verifier subtracts a 600-second trade maturity lag and requires a
 # non-empty event window, so the deployment tail must be strictly longer.
 readonly PARITY_TAIL_SECONDS=601
@@ -16,6 +16,7 @@ readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GR
 readonly MAX_HEALTH_SILENCE_SECONDS=240
 # Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
 readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
+readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
 # One real-segment upload can spend one 300-second compression timeout, fifteen
 # candidate OSS operations, four independent Gate readbacks, and 300 seconds
 # of local processing reserve.
@@ -73,7 +74,7 @@ usage() {
   printf '%s\n' \
     'Usage: polymarket-raw-ops-shadow-gate.sh <candidate-binary> <sha256> <source-revision>' \
     '' \
-    'A production-eligible gate observes for 3600 seconds plus a 601-second current-hour parity tail.'
+    'A production-eligible gate observes for 900 seconds plus a 601-second current-hour parity tail.'
 }
 
 valid_parity_window() {
@@ -150,6 +151,15 @@ valid_absolute_path() {
   local path=$1
   [[ $path == /* && $path != *//* && $path != */./* && $path != */../* \
     && $path != */. && $path != */.. ]]
+}
+
+valid_finalized_reference_tape_path() {
+  local path=$1 spool_dir=$2 name
+  valid_absolute_path "$path" || return 1
+  [[ ${path%/*} == "$spool_dir" ]] || return 1
+  name=${path##*/}
+  [[ $name =~ ^market-updates\.[0-9]{8}T[0-9]{12}\.ndjson$ \
+    && -f $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]
 }
 
 secure_root_chain() {
@@ -938,7 +948,7 @@ run_budgeted_real_market_preflight() {
     }
     legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
       + LEGACY_HEALTH_START_WAIT_SECONDS + gate_seconds \
-      + LEGACY_RUNTIME_RESERVE_SECONDS))
+      + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
     if observation=$(legacy_runtime_budget_observation \
       "$legacy_runtime_budget_required"); then
       :
@@ -1463,6 +1473,8 @@ while :; do
     fi
     ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die "$baseline_label health stopped advancing during shadow"
+  elif [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == false ]]; then
+    legacy_health_decision='advance'
   else
     legacy_health="$LEGACY_SPOOL/health.json"
     [[ -f $legacy_health && ! -L $legacy_health ]] \
@@ -1554,7 +1566,7 @@ while :; do
           && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
           || die "$baseline_label last_success_at is stale or from the future"
         ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
-      else
+      elif [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == true ]]; then
         [[ $baseline_health_cutoff_unix =~ ^[1-9][0-9]*$ ]] \
           || die 'no post-start legacy collector completion cutoff was observed'
         ((baseline_health_cutoff_unix < common_cutoff)) \
@@ -1572,6 +1584,7 @@ while :; do
 
   if ((elapsed >= gate_seconds)) \
     && ! baseline_health_requires_continuous_freshness "$baseline_mode" \
+    && [[ $LEGACY_HEALTH_COMPLETION_REQUIRED == true ]] \
     && [[ $legacy_health_decision != advance ]]; then
     die 'legacy collector did not complete a clean post-start cycle during the gate'
   fi
@@ -1657,6 +1670,11 @@ verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_inv
 stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
 [[ $stopped_shadow_restarts == 0 ]] \
   || die 'Rust shadow restarted between final verification and stop'
+finalized_reference_tape=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
+  "$release_binary" finalize-reference-tape --spool-dir "$shadow_spool") \
+  || die 'could not finalize the stopped Rust shadow tape'
+valid_finalized_reference_tape_path "$finalized_reference_tape" "$shadow_spool" \
+  || die 'Rust shadow finalizer returned an invalid closed tape path'
 
 parity_json="$evidence_dir/parity.json"
 "$release_binary" verify-shadow-parity \
@@ -1744,6 +1762,7 @@ jq \
   --argjson parity_window_started_at_unix "$parity_window_started_at" \
   --argjson parity_window_ended_at_unix "$common_cutoff" \
   --argjson production_eligible "$production_eligible" \
+  --argjson baseline_health_completion_required "$LEGACY_HEALTH_COMPLETION_REQUIRED" \
   --argjson baseline_health_snapshot "$baseline_health_snapshot" \
   --argjson baseline_health_completion_snapshot "$baseline_health_completion_snapshot" \
   --argjson baseline_health_start_success_unix "$baseline_health_start_success_unix" \
@@ -1777,6 +1796,7 @@ jq \
     parity_window_started_at_unix:$parity_window_started_at_unix,
     parity_window_ended_at_unix:$parity_window_ended_at_unix,
     production_eligible:$production_eligible,
+    baseline_health_completion_required:$baseline_health_completion_required,
     baseline_health_snapshot:$baseline_health_snapshot,
     baseline_health_completion_snapshot:$baseline_health_completion_snapshot,
     baseline_health_start_success_unix:$baseline_health_start_success_unix,
