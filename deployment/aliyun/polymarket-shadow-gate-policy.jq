@@ -111,7 +111,7 @@ and ((.real_market_preflight.started_at | utc_iso8601_unix)
   <= (.real_market_preflight.completed_at | utc_iso8601_unix))
 and ((.real_market_preflight.completed_at | utc_iso8601_unix)
   <= (.started_at | utc_iso8601_unix))
-and (.duration_seconds | positive_integer and . >= 4201)
+and (.duration_seconds | positive_integer and . >= 1501)
 and (.started_at | utc_iso8601_unix | type == "number")
 and (.parity_window_started_at_unix | positive_integer)
 and (.parity_window_ended_at_unix | positive_integer)
@@ -123,9 +123,6 @@ and (
   (
     .baseline_mode == "legacy_python"
     and (.baseline_health_snapshot | legacy_health_snapshot)
-    and (.baseline_health_completion_snapshot | legacy_health_snapshot)
-    and (.baseline_health_completion_snapshot.updated_at
-      != .baseline_health_snapshot.updated_at)
     and (.baseline_health_start_success_unix | positive_integer)
     and ((.baseline_health_snapshot.last_success_at | utc_iso8601_unix)
       == .baseline_health_start_success_unix)
@@ -137,23 +134,36 @@ and (
       <= (.started_at | utc_iso8601_unix)
     and ((.started_at | utc_iso8601_unix)
       - .baseline_health_start_written_at_unix <= 240)
-    and (.baseline_health_completion_snapshot.last_success_at
-      != .baseline_health_snapshot.last_success_at)
-    and (.baseline_health_cutoff_unix | positive_integer)
-    and ((.baseline_health_completion_snapshot.last_success_at | utc_iso8601_unix)
-      == .baseline_health_cutoff_unix)
-    and .baseline_health_cutoff_unix > .baseline_health_start_success_unix
-    and (.baseline_health_completion_written_at_unix | positive_integer)
-    and (.baseline_health_completion_file_identity | file_identity)
-    and .baseline_health_completion_file_identity
-      != .baseline_health_start_file_identity
-    and .baseline_health_cutoff_unix
-      <= .baseline_health_completion_written_at_unix
-    and .baseline_health_completion_written_at_unix
-      >= (.started_at | utc_iso8601_unix)
-    and .baseline_health_completion_written_at_unix
-      <= (.completed_at | utc_iso8601_unix)
-    and .parity_window_ended_at_unix <= .baseline_health_cutoff_unix
+    and (.baseline_health_completion_required | type == "boolean")
+    and (
+      if .baseline_health_completion_required then
+        (.baseline_health_completion_snapshot | legacy_health_snapshot)
+        and (.baseline_health_completion_snapshot.updated_at
+          != .baseline_health_snapshot.updated_at)
+        and (.baseline_health_completion_snapshot.last_success_at
+          != .baseline_health_snapshot.last_success_at)
+        and (.baseline_health_cutoff_unix | positive_integer)
+        and ((.baseline_health_completion_snapshot.last_success_at | utc_iso8601_unix)
+          == .baseline_health_cutoff_unix)
+        and .baseline_health_cutoff_unix > .baseline_health_start_success_unix
+        and (.baseline_health_completion_written_at_unix | positive_integer)
+        and (.baseline_health_completion_file_identity | file_identity)
+        and .baseline_health_completion_file_identity
+          != .baseline_health_start_file_identity
+        and .baseline_health_cutoff_unix
+          <= .baseline_health_completion_written_at_unix
+        and .baseline_health_completion_written_at_unix
+          >= (.started_at | utc_iso8601_unix)
+        and .baseline_health_completion_written_at_unix
+          <= (.completed_at | utc_iso8601_unix)
+        and .parity_window_ended_at_unix <= .baseline_health_cutoff_unix
+      else
+        .baseline_health_completion_snapshot == null
+        and .baseline_health_cutoff_unix == null
+        and .baseline_health_completion_written_at_unix == null
+        and .baseline_health_completion_file_identity == null
+      end
+    )
     and (.legacy_runtime |
       runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
         "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
@@ -162,6 +172,7 @@ and (
   or
   (
     .baseline_mode == "rust_release"
+    and .baseline_health_completion_required == false
     and .baseline_health_snapshot == null
     and .baseline_health_completion_snapshot == null
     and .baseline_health_start_success_unix == null

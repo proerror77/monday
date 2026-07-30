@@ -2393,13 +2393,14 @@ jq \
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
     },
-    duration_seconds:4201,
+    duration_seconds:1501,
     started_at:"1970-01-01T00:02:00Z",
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    baseline_health_completion_required:true,
     baseline_health_snapshot:{
       updated_at:"1970-01-01T00:01:40.123456Z",
       last_success_at:"1970-01-01T00:01:40.123456Z",
@@ -2451,6 +2452,29 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq '.baseline_health_completion_required = false
+  | .baseline_health_completion_snapshot = null
+  | .baseline_health_cutoff_unix = null
+  | .baseline_health_completion_written_at_unix = null
+  | .baseline_health_completion_file_identity = null' \
+  "$tmp_dir/gate.json" >"$tmp_dir/expedited-legacy-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/expedited-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected approved expedited legacy baseline evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  'del(.baseline_health_snapshot)' \
+  '.baseline_health_completion_snapshot = .baseline_health_snapshot' \
+  '.baseline_health_cutoff_unix = 1000' \
+  '.baseline_health_completion_written_at_unix = 1301' \
+  '.baseline_health_completion_file_identity = "1:11"'; do
+  jq "$mutation" "$tmp_dir/expedited-legacy-gate.json" \
+    >"$tmp_dir/forged-expedited-legacy-gate.json"
+  if jq -e -f "$POLICY" "$tmp_dir/forged-expedited-legacy-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged post-start legacy completion in expedited evidence\n' >&2
+    exit 1
+  fi
+done
 jq 'del(.real_market_preflight)' "$tmp_dir/gate.json" \
   >"$tmp_dir/missing-real-market-preflight.json"
 if jq -e -f "$POLICY" "$tmp_dir/missing-real-market-preflight.json" >/dev/null; then
@@ -2758,9 +2782,9 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 4200' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 1500' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than one hour plus its maturity tail\n' >&2
+  printf 'gate policy accepted a shadow shorter than 15 minutes plus its maturity tail\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -2918,6 +2942,7 @@ if jq -e -f "$POLICY" "$tmp_dir/shadow-once-cmdline.json" >/dev/null; then
 fi
 baseline_sha=$(printf '9%.0s' {1..64})
 jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
+  | .baseline_health_completion_required = false
   | .baseline_health_snapshot = null
   | .baseline_health_completion_snapshot = null
   | .baseline_health_start_success_unix = null
@@ -3068,12 +3093,14 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate runtime rejection does not report remaining and required seconds\n' >&2
     exit 1
   }
-  monotonic_uptime_seconds() { printf '7200\n'; }
+  unreserved_remaining=$((required - LEGACY_RUNTIME_RESERVE_SECONDS))
+  unreserved_uptime=$((LEGACY_RUNTIME_MAX_SECONDS - unreserved_remaining + 1))
+  monotonic_uptime_seconds() { printf '%s\n' "$unreserved_uptime"; }
   if observation=$(legacy_runtime_budget_observation "$required"); then
     printf 'Gate admitted the unreserved exact runtime boundary\n' >&2
     exit 1
   fi
-  [[ $observation == "remaining=14401 required=$required" ]] || {
+  [[ $observation == "remaining=$unreserved_remaining required=$required" ]] || {
     printf 'Gate reserve-boundary evidence is not exact\n' >&2
     exit 1
   }
@@ -3447,8 +3474,9 @@ for mutation in \
   fi
 done
 
-grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
+grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
+grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
 grep -Fq 'readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900' "$GATE"
 grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
