@@ -646,8 +646,14 @@ verify_deferred_market_upload() {
       fi
       if [[ $state == active || $state == activating ]]; then
         pid=$(systemctl show --property=MainPID --value "$MARKET_UPLOAD_UNIT")
-        [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
-        proc_exe=$(readlink -f -- "/proc/$pid/exe") || return 1
+        if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+          sleep 1
+          continue
+        fi
+        if ! proc_exe=$(readlink -f -- "/proc/$pid/exe"); then
+          sleep 1
+          continue
+        fi
         [[ $proc_exe == "$expected_binary" ]]
         return
       fi

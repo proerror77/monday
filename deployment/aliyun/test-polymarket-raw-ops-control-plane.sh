@@ -4337,6 +4337,8 @@ run_deferred_upload_case() (
   local expected_binary=/opt/monday/releases/polymarket-raw-ops/candidate/polymarket-raw-ops
   local previous_invocation=11111111111111111111111111111111
   local new_invocation=22222222222222222222222222222222
+  local pid_state="$tmp_dir/deferred-upload-pid-$test_case"
+  local exe_state="$tmp_dir/deferred-upload-exe-$test_case"
   MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
   systemctl() {
     if [[ $1 == is-failed ]]; then
@@ -4354,7 +4356,14 @@ run_deferred_upload_case() (
           && printf '%s\n' inactive \
           || printf '%s\n' activating
         ;;
-      --property=MainPID) printf '%s\n' 42 ;;
+      --property=MainPID)
+        if [[ $test_case == pid-delayed && ! -e $pid_state ]]; then
+          : >"$pid_state"
+          printf '%s\n' 0
+        else
+          printf '%s\n' 42
+        fi
+        ;;
       --property=Result)
         [[ $test_case == inactive-failed ]] \
           && printf '%s\n' exit-code \
@@ -4369,6 +4378,14 @@ run_deferred_upload_case() (
     esac
   }
   readlink() {
+    if [[ $test_case == pid-delayed && $3 == /proc/0/exe ]]; then
+      printf '%s\n' "${expected_binary}.wrong"
+      return
+    fi
+    if [[ $test_case == exe-delayed && ! -e $exe_state ]]; then
+      : >"$exe_state"
+      return 1
+    fi
     [[ $test_case == mismatched-exe ]] \
       && printf '%s\n' /opt/monday/releases/polymarket-raw-ops/wrong/polymarket-raw-ops \
       || printf '%s\n' "$expected_binary"
@@ -4385,6 +4402,13 @@ for rejected_case in stale failed inactive-failed mismatched-exe; do
   fi
 done
 run_deferred_upload_case success
+for retry_case in pid-delayed exe-delayed; do
+  if ! run_deferred_upload_case "$retry_case"; then
+    printf 'deferred market upload rejected transient visibility: %s\n' \
+      "$retry_case" >&2
+    exit 1
+  fi
+done
 
 snapshot_manifest_line=$(grep -n \
   '^    sha256sum state.json systemd/\* bin/\* config/\* control/\* >manifest.sha256$' \
