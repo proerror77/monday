@@ -2583,6 +2583,14 @@ jq -e --arg error "$legacy_rate_limit_error" \
   exit 1
 }
 jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_completion_snapshot.api_errors = [$error]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/rate-limited-legacy-completion-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/rate-limited-legacy-completion-gate.json" >/dev/null; then
+  printf 'gate policy accepted a rate limit in the post-start completion snapshot\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
   '.baseline_health_snapshot.api_errors = [$error, $error, $error, $error]' \
   "$tmp_dir/expedited-legacy-gate.json" \
   >"$tmp_dir/excessive-rate-limited-legacy-gate.json"
@@ -3221,6 +3229,15 @@ legacy_start_health_policy_clean \
   printf 'Gate startup policy rejected three trades rate limits\n' >&2
   exit 1
 }
+legacy_rate_limit_with_newline="${legacy_rate_limit_error}"$'\n'
+jq --arg error "$legacy_rate_limit_with_newline" '.api_errors = [$error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/newline-rate-limit-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/newline-rate-limit-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted a rate limit with a trailing newline\n' >&2
+  exit 1
+fi
 jq --arg error "$legacy_rate_limit_error" \
   '.api_errors = [$error, $error, $error, $error]' \
   "$tmp_dir/legacy-health.json" >"$tmp_dir/four-rate-limits-legacy-health.json"

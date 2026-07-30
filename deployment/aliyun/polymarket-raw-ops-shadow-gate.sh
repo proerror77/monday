@@ -485,7 +485,7 @@ legacy_start_health_policy_clean() {
     | type == "array" and length <= 3
     and all(.[];
       type == "string"
-      and test("^trades 0x[0-9A-Fa-f]{64}: HTTP Error 429: Too Many Requests$"))
+      and test("^trades 0x[0-9A-Fa-f]{64}: HTTP Error 429: Too Many Requests\\z"))
   ' <<<"$snapshot" >/dev/null \
     && jq '.api_errors = []' <<<"$snapshot" \
       | jq -e -f "$policy" >/dev/null
