@@ -3726,6 +3726,9 @@ completion_snapshot_line=$(grep -nF \
   'baseline_health_completion_observation=$(fresh_legacy_health_observation' \
   "$GATE" | cut -d: -f1)
 gate_start_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
+gate_start_health_recheck_line=$(grep -nF \
+  'active legacy collector health aged past startup admission before observation' \
+  "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "$shadow_unit"' "$GATE" | cut -d: -f1)
 if ! ((daemon_reload_line < preflight_line \
   && preflight_line < start_identity_before_line \
@@ -3733,10 +3736,18 @@ if ! ((daemon_reload_line < preflight_line \
   && start_snapshot_line < start_identity_after_line \
   && start_identity_after_line < shadow_start_line \
   && shadow_start_line < gate_start_line \
+  && gate_start_line < gate_start_health_recheck_line \
+  && gate_start_health_recheck_line < completion_snapshot_line \
   && shadow_start_line < completion_snapshot_line)); then
   printf 'legacy health admission or completion seam is ordered incorrectly\n' >&2
   exit 1
 fi
+grep -Fq \
+  'started_at_unix - baseline_health_start_written_at_unix > LEGACY_START_HEALTH_MAX_AGE_SECONDS' \
+  "$GATE" || {
+  printf 'Gate does not recheck startup health age at the exact observation start\n' >&2
+  exit 1
+}
 [[ $(legacy_health_sample_state \
   "$tmp_dir/legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == clean ]]
 jq '.api_errors = ["trades condition-1: The read operation timed out"]' \

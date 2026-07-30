@@ -1460,6 +1460,11 @@ memory_events_end=$memory_events_start
 verify_baseline_identity \
   || die 'baseline identity changed while the Rust shadow was starting'
 started_at_unix=$(date -u +%s)
+if [[ $baseline_mode == legacy_python \
+  && $LEGACY_HEALTH_START_REQUIRED == true ]] \
+  && ((started_at_unix - baseline_health_start_written_at_unix > LEGACY_START_HEALTH_MAX_AGE_SECONDS)); then
+  die 'active legacy collector health aged past startup admission before observation'
+fi
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
 observation_deadline=$gate_seconds
