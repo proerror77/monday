@@ -7,27 +7,21 @@ export TZ=UTC
 
 readonly REQUIRED_DURATION_SECONDS=900
 # The verifier subtracts a 600-second trade maturity lag and requires a
-# non-empty event window, so the deployment tail must be strictly longer.
+# non-empty event window, so 601 seconds of the observation are retained.
 readonly PARITY_TAIL_SECONDS=601
-readonly MINIMUM_GATE_SECONDS=$((REQUIRED_DURATION_SECONDS + PARITY_TAIL_SECONDS))
+readonly MINIMUM_GATE_SECONDS=$REQUIRED_DURATION_SECONDS
 readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
-# Legacy full-catalog cycles observed 35–58 minutes; bound admission at 65.
-readonly LEGACY_HEALTH_START_WAIT_SECONDS=3900
 readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
-readonly LEGACY_HEALTH_START_REQUIRED=false
-readonly LEGACY_RUNTIME_STABILITY_REQUIRED=false
-# One real-segment upload can spend one 300-second compression timeout, fifteen
-# candidate OSS operations, four independent Gate readbacks, and 300 seconds
-# of local processing reserve.
-readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=6300
+readonly LEGACY_HEALTH_START_REQUIRED=true
+readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
+readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=300
 readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
-readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
 readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
@@ -76,7 +70,7 @@ usage() {
   printf '%s\n' \
     'Usage: polymarket-raw-ops-shadow-gate.sh <candidate-binary> <sha256> <source-revision>' \
     '' \
-    'A production-eligible gate observes for 900 seconds plus a 601-second current-hour parity tail.'
+    'A production-eligible gate observes for 900 seconds total, including a 601-second parity interval.'
 }
 
 valid_parity_window() {
@@ -86,12 +80,10 @@ valid_parity_window() {
 }
 
 bounded_parity_window_start() {
-  local gate_started_at=$1 common_cutoff=$2 allow_short=$3 lookback_seconds=$4
-  local parity_started_at settlement_safe_started_at
+  local gate_started_at=$1 common_cutoff=$2 allow_short=$3
+  local parity_started_at
   parity_started_at=$((common_cutoff - common_cutoff % 3600))
-  settlement_safe_started_at=$((gate_started_at + lookback_seconds))
-  ((parity_started_at >= settlement_safe_started_at)) \
-    || parity_started_at=$settlement_safe_started_at
+  ((parity_started_at >= gate_started_at)) || parity_started_at=$gate_started_at
   if [[ $allow_short == true ]] && ((parity_started_at >= common_cutoff)); then
     ((common_cutoff > 0)) || return 1
     parity_started_at=$((common_cutoff - 1))
@@ -522,28 +514,6 @@ fresh_legacy_health_observation() {
       file_identity:$file_identity}'
 }
 
-wait_for_fresh_legacy_health_observation() {
-  local health=$1 policy=$2 observation deadline remaining
-  deadline=$((SECONDS + LEGACY_HEALTH_START_WAIT_SECONDS))
-  while true; do
-    ((SECONDS < deadline)) || return 1
-    verify_baseline_identity || return 1
-    if observation=$(fresh_legacy_health_observation "$health" "$policy"); then
-      ((SECONDS < deadline)) || return 1
-      verify_baseline_identity || return 1
-      ((SECONDS < deadline)) || return 1
-      printf '%s\n' "$observation"
-      return 0
-    fi
-    remaining=$((deadline - SECONDS))
-    ((remaining > 0)) || return 1
-    if ((remaining > 5)); then
-      remaining=5
-    fi
-    sleep "$remaining"
-  done
-}
-
 verify_fresh_baseline_health() {
   fresh_baseline_health_snapshot "$@" >/dev/null
 }
@@ -942,7 +912,7 @@ real_market_segment_preflight() {
 }
 
 run_budgeted_real_market_preflight() {
-  local legacy_runtime_budget_required observation
+  local legacy_runtime_budget_required observation preflight_output
   if [[ $baseline_mode == legacy_python \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
     verify_baseline_identity || {
@@ -950,7 +920,7 @@ run_budgeted_real_market_preflight() {
       return 1
     }
     legacy_runtime_budget_required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
-      + LEGACY_HEALTH_START_WAIT_SECONDS + gate_seconds \
+      + gate_seconds \
       + PARITY_CUTOFF_LAG_SECONDS + LEGACY_RUNTIME_RESERVE_SECONDS))
     if observation=$(legacy_runtime_budget_observation \
       "$legacy_runtime_budget_required"); then
@@ -968,7 +938,7 @@ run_budgeted_real_market_preflight() {
       return 1
     }
   fi
-  timeout --signal=KILL "$REAL_MARKET_PREFLIGHT_BUDGET_SECONDS" env \
+  preflight_output=$(timeout --signal=KILL "$REAL_MARKET_PREFLIGHT_BUDGET_SECONDS" env \
     "candidate_sha=$candidate_sha" "run_id=$run_id" \
     "release_binary=$release_binary" "oss_bucket=$oss_bucket" \
     "oss_endpoint=$oss_endpoint" "oss_region=$oss_region" \
@@ -979,7 +949,15 @@ run_budgeted_real_market_preflight() {
     "deployment_bundle_sha=$deployment_bundle_sha" \
     "release_manifest_sha=$release_manifest_sha" \
     "control_archive_sha=$control_archive_sha" \
-    "$0" --real-market-preflight-worker "$@"
+    "$0" --real-market-preflight-worker "$@") || return 1
+  if [[ $baseline_mode == legacy_python \
+    && $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
+    verify_baseline_identity || {
+      printf 'legacy baseline identity changed during real preflight\n' >&2
+      return 1
+    }
+  fi
+  printf '%s\n' "$preflight_output"
 }
 
 install_pinned_upload_env() {
@@ -1390,9 +1368,36 @@ baseline_health_completion_written_at_unix=null
 baseline_health_completion_file_identity=null
 baseline_health_start_success_unix=null
 baseline_health_cutoff_unix=null
-started_at_unix=$(date -u +%s)
-started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-start_uptime=$SECONDS
+if [[ $baseline_mode == legacy_python \
+  && $LEGACY_HEALTH_START_REQUIRED == true ]]; then
+  verify_baseline_identity \
+    || die 'baseline identity changed before legacy health admission'
+  baseline_health_observation=$(fresh_legacy_health_observation \
+    "$LEGACY_SPOOL/health.json" \
+    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
+    || die 'active legacy collector health is not fresh and fail-closed clean'
+  baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
+    || die 'admitted legacy collector health observation is invalid'
+  baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
+    <<<"$baseline_health_observation") \
+    || die 'admitted legacy collector health has no write time'
+  baseline_health_start_file_identity=$(jq -ce '.file_identity
+    | select(type == "string" and length > 0)' \
+    <<<"$baseline_health_observation") \
+    || die 'admitted legacy collector health has no file identity'
+  baseline_health_started_at=$(jq -er '.updated_at' <<<"$baseline_health_snapshot") \
+    || die 'admitted legacy collector health has no updated_at'
+  baseline_health_start_success_at=$(jq -er '.last_success_at' \
+    <<<"$baseline_health_snapshot") \
+    || die 'admitted legacy collector health has no last_success_at'
+  baseline_health_start_success_unix=$(date -u -d \
+    "$baseline_health_start_success_at" +%s) \
+    || die 'admitted legacy collector last_success_at is invalid'
+  ((baseline_health_start_success_unix <= baseline_health_start_written_at_unix)) \
+    || die 'admitted legacy collector success is after its completed write'
+  verify_baseline_identity \
+    || die 'baseline identity changed during legacy health admission'
+fi
 systemctl start "$shadow_unit"
 shadow_invocation_id=$(systemctl show --property=InvocationID --value "$shadow_unit")
 [[ $shadow_invocation_id =~ ^[a-f0-9]{32}$ ]] \
@@ -1413,6 +1418,11 @@ read -r memory_events_start_high memory_events_start_max memory_events_start_oom
   && $memory_events_start_oom_group_kill == 0 ]] \
   || die 'Rust shadow reached MemoryHigh, MemoryMax, or OOM before the gate baseline'
 memory_events_end=$memory_events_start
+verify_baseline_identity \
+  || die 'baseline identity changed while the Rust shadow was starting'
+started_at_unix=$(date -u +%s)
+started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+start_uptime=$SECONDS
 
 last_health=
 last_health_change=$start_uptime
@@ -1563,8 +1573,7 @@ while :; do
         common_cutoff=$((common_cutoff - PARITY_CUTOFF_LAG_SECONDS))
       fi
       parity_window_started_at=$(bounded_parity_window_start \
-        "$started_at_unix" "$common_cutoff" "$test_only" \
-        "$SETTLEMENT_EVENT_LOOKBACK_SECONDS") \
+        "$started_at_unix" "$common_cutoff" "$test_only") \
         || die 'could not derive a bounded parity window start'
     fi
   fi
@@ -1576,17 +1585,7 @@ while :; do
     die 'legacy collector did not complete a clean post-start cycle during the gate'
   fi
 
-  if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]] \
-    && [[ $legacy_health_decision == advance ]]; then
-    if valid_parity_window "$parity_window_started_at" "$common_cutoff"; then
-      if [[ $test_only == true ]] \
-        || ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)); then
-        break
-      fi
-    elif [[ $test_only == true ]]; then
-      die 'short test gate could not derive an ordered parity window'
-    fi
-  fi
+  ((elapsed < gate_seconds)) || break
 
   sleep_for=$SAMPLE_SECONDS
   if ((elapsed < gate_seconds)); then
@@ -1675,8 +1674,7 @@ parity_args=(
   --ended-at-unix "$common_cutoff"
   --output "$parity_json"
 )
-if [[ $baseline_mode == legacy_python \
-  && $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then
+if [[ $baseline_mode == legacy_python ]]; then
   parity_args+=(--allow-empty-legacy)
 fi
 "$release_binary" "${parity_args[@]}" \
@@ -1703,15 +1701,8 @@ canonical_uploaded_segments=$(jq -er \
   '.canonical_uploaded_segments | select(type == "number" and floor == . and . > 0)' \
   <<<"$upload_json") || die 'shadow uploader did not verify a canonical closed segment'
 
-if [[ $baseline_mode == legacy_python \
-  && $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then
-  legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
-  legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
-  legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
-  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
-else
-  verify_baseline_identity
-fi || die 'baseline collector identity changed while parity or OSS readback was running'
+verify_baseline_identity \
+  || die 'baseline collector identity changed while parity or OSS readback was running'
 baseline_proc_exe=''
 [[ $baseline_mode != rust_release ]] || baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") || die 'could not capture the production Rust executable identity'
 verify_current_oss_config
