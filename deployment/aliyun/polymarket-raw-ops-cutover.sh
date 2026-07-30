@@ -1315,10 +1315,12 @@ done
 baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release")' \
   "$gate_json") || die 'shadow gate has no valid baseline mode'
 baseline_health_start_required=$(jq -er \
-  '.baseline_health_start_required | select(type == "boolean")' "$gate_json") \
+  '.baseline_health_start_required | select(type == "boolean") | tostring' \
+  "$gate_json") \
   || die 'shadow gate has no valid baseline health admission contract'
 baseline_runtime_stability_required=$(jq -er \
-  '.baseline_runtime_stability_required | select(type == "boolean")' "$gate_json") \
+  '.baseline_runtime_stability_required | select(type == "boolean") | tostring' \
+  "$gate_json") \
   || die 'shadow gate has no valid baseline runtime stability contract'
 legacy_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] \

@@ -2476,6 +2476,18 @@ jq -e -f "$POLICY" "$tmp_dir/python-nonblocking-legacy-gate.json" >/dev/null || 
   printf 'gate policy rejected approved legacy-nonblocking evidence\n' >&2
   exit 1
 }
+for field in baseline_health_start_required baseline_runtime_stability_required; do
+  [[ $(jq -er --arg field "$field" \
+    '.[$field] | select(type == "boolean") | tostring' \
+    "$tmp_dir/python-nonblocking-legacy-gate.json") == false ]] || {
+    printf 'cutover boolean parser rejected a false gate contract\n' >&2
+    exit 1
+  }
+  grep -Fq ".$field | select(type == \"boolean\") | tostring" "$CUTOVER" || {
+    printf 'cutover does not preserve a false gate contract boolean\n' >&2
+    exit 1
+  }
+done
 for mutation in \
   'del(.baseline_health_start_required)' \
   '.baseline_health_start_required = true' \

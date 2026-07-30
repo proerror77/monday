@@ -219,12 +219,13 @@ and upload readback. Any stale health, missing symbol, sequence gap, or identity
 mismatch blocks promotion. Live execution remains disabled; this lane only collects
 and archives public market data.
 The gate detects either the legacy Python writer or the active immutable Rust
-release, then freezes its PID and current systemd restart counter. A nonzero
-historical counter from the
-unit's scheduled six-hour `RuntimeMaxSec` refresh is valid evidence; any increment
-during shadow or before cutover fails the upgrade. After the baseline writer is
-stopped, cutover explicitly resets the inherited counter and requires the new Rust
-process to remain at zero for post-start verification.
+release. A legacy-Python Gate does not wait for health publication or freeze the
+writer identity; the persistent legacy spool is the parity input and Python remains
+untouched for rollback. Cutover binds the current canonical Python identity only
+for its short transition. An active immutable Rust baseline still freezes its PID,
+systemd restart counter, and `InvocationID` throughout the Gate. After the baseline
+writer is stopped, cutover explicitly resets the inherited counter and requires the
+new Rust process to remain at zero for post-start verification.
 PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
 also freezes each unit's systemd `InvocationID`. Immediately before stopping the
 shadow or baseline writer, the control captures a synced journal cursor; after the
