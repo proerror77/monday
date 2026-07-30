@@ -4582,15 +4582,50 @@ mod tests {
             .write_updates(&[valid_metadata_update(now)], now)
             .unwrap();
         writer.close().unwrap();
+        let closed_count = || {
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+                .count()
+        };
+        assert_eq!(closed_count(), 0);
 
         let closed = finalize_reference_tape(root.path()).unwrap();
 
         assert!(closed.is_file());
         assert_eq!(fs::read_to_string(&closed).unwrap().lines().count(), 1);
+        assert_eq!(closed_count(), 1);
         assert_eq!(
             fs::metadata(root.path().join(ACTIVE_TAPE)).unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn finalized_reference_tape_passes_closed_segment_validation() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[valid_metadata_update(now)], now)
+            .unwrap();
+        writer.close().unwrap();
+
+        let closed = finalize_reference_tape_at(root.path(), now).unwrap();
+        let manifest =
+            crate::polymarket_upload::scan_tape(&closed, "crypto_expiry_reference", 0, 0)
+                .unwrap();
+
+        assert_eq!(manifest["event_types"]["market_metadata"], 1);
+        assert_eq!(manifest["start_sequence"], 0);
+        assert_eq!(manifest["end_sequence"], 0);
     }
 
     #[test]
