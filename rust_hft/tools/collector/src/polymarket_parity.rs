@@ -62,6 +62,7 @@ pub struct ShadowParityConfig {
     pub started_at_unix: i64,
     pub ended_at_unix: i64,
     pub output: PathBuf,
+    pub allow_empty_legacy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -955,6 +956,12 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         config.ended_at_unix,
         trade_event_window_end,
     )?;
+    let rust_self_mode = config.allow_empty_legacy && legacy_rows.is_empty();
+    let comparison_mode = if rust_self_mode {
+        "rust_self"
+    } else {
+        "legacy_overlap"
+    };
 
     let legacy_metadata = metadata_map(&legacy_rows, config.started_at_unix, config.ended_at_unix)?;
     let rust_metadata = metadata_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
@@ -967,9 +974,13 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
     let metadata_observed_value_mismatch_ids =
         shared_value_mismatch_ids(&legacy_metadata, &rust_metadata)?;
     let metadata_shared_values_match = metadata_shared_value_mismatch_ids.is_empty();
-    let metadata_parity = !legacy_metadata_ids.is_empty()
-        && legacy_metadata_ids.is_subset(&rust_metadata_ids)
-        && metadata_shared_values_match;
+    let metadata_parity = if rust_self_mode {
+        !rust_metadata_ids.is_empty()
+    } else {
+        !legacy_metadata_ids.is_empty()
+            && legacy_metadata_ids.is_subset(&rust_metadata_ids)
+            && metadata_shared_values_match
+    };
 
     let (legacy_trades, legacy_duplicates) = trade_map(
         &legacy_rows,
@@ -1013,8 +1024,13 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         legacy_trade_metadata_context_mismatch_market_ids.is_empty();
     let rust_trade_metadata_context_match =
         rust_trade_metadata_context_mismatch_market_ids.is_empty();
-    let dedupe_parity =
-        legacy_duplicates.is_empty() && rust_duplicates.is_empty() && !legacy_trade_ids.is_empty();
+    let dedupe_parity = legacy_duplicates.is_empty()
+        && rust_duplicates.is_empty()
+        && if rust_self_mode {
+            !rust_trade_ids.is_empty()
+        } else {
+            !legacy_trade_ids.is_empty()
+        };
     let trade_coverage_parity = legacy_trade_ids.is_subset(&rust_trade_ids);
     let trade_contract_parity = trade_metadata_shared_values_match
         && legacy_trade_metadata_context_match
@@ -1037,21 +1053,31 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         legacy_settlement_metadata_context_mismatch_market_ids.is_empty();
     let rust_settlement_metadata_context_match =
         rust_settlement_metadata_context_mismatch_market_ids.is_empty();
-    let settlement_parity = !legacy_settlement_ids.is_empty()
-        && legacy_settlement_ids.is_subset(&rust_settlement_ids)
-        && settlement_shared_values_match
-        && legacy_settlement_metadata_context_match
-        && rust_settlement_metadata_context_match;
-    let field_parity = [
-        required_fields_present("market_metadata", &legacy_metadata),
+    let settlement_parity = if rust_self_mode {
+        !rust_settlement_ids.is_empty() && rust_settlement_metadata_context_match
+    } else {
+        !legacy_settlement_ids.is_empty()
+            && legacy_settlement_ids.is_subset(&rust_settlement_ids)
+            && settlement_shared_values_match
+            && legacy_settlement_metadata_context_match
+            && rust_settlement_metadata_context_match
+    };
+    let rust_fields_present = [
         required_fields_present("market_metadata", &rust_metadata),
-        required_fields_present("polymarket_trade", &legacy_trades),
         required_fields_present("polymarket_trade", &rust_trades),
-        required_fields_present("market_settlement", &legacy_settlements),
         required_fields_present("market_settlement", &rust_settlements),
     ]
     .into_iter()
     .all(|present| present);
+    let field_parity = rust_fields_present
+        && (rust_self_mode
+            || [
+                required_fields_present("market_metadata", &legacy_metadata),
+                required_fields_present("polymarket_trade", &legacy_trades),
+                required_fields_present("market_settlement", &legacy_settlements),
+            ]
+            .into_iter()
+            .all(|present| present));
 
     let rust_symbols = rust_metadata
         .values()
@@ -1061,7 +1087,7 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
     let asset_parity = EXPECTED_SYMBOLS
         .iter()
         .all(|symbol| rust_symbols.contains(*symbol));
-    let rotation_parity = legacy_active && rust_active && rust_closed >= 1;
+    let rotation_parity = rust_active && rust_closed >= 1 && (rust_self_mode || legacy_active);
     let byte_parity = metadata_parity
         && dedupe_parity
         && trade_coverage_parity
@@ -1129,6 +1155,10 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
             "normalized_settlement_sha256": digest_values(rust_settlements.values())?,
         },
     });
+    evidence
+        .as_object_mut()
+        .expect("evidence is an object")
+        .insert("comparison_mode".to_owned(), json!(comparison_mode));
     let metrics = evidence["metrics"]
         .as_object_mut()
         .expect("evidence metrics is an object");
@@ -1411,8 +1441,71 @@ mod tests {
             started_at_unix: 100,
             ended_at_unix: 1000,
             output: root.path().join("parity.json"),
+            allow_empty_legacy: false,
         };
         (root, config)
+    }
+
+    #[test]
+    fn empty_legacy_window_requires_explicit_rust_self_mode() {
+        let (_root, mut config) = fixture();
+        fs::write(config.legacy_spool.join(ACTIVE_TAPE), b"").unwrap();
+
+        let strict = compare(&config).unwrap();
+        assert_eq!(strict["passed"], false);
+
+        config.allow_empty_legacy = true;
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["comparison_mode"], "rust_self");
+        assert_eq!(evidence["metrics"]["legacy_trade_count"], 0);
+        assert!(evidence["metrics"]["rust_trade_count"].as_u64().unwrap() > 0);
+        assert!(evidence["metrics"]["rust_metadata_count"].as_u64().unwrap() > 0);
+        assert!(
+            evidence["metrics"]["rust_settlement_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn rust_self_mode_rejects_missing_rust_settlement() {
+        let (_root, mut config) = fixture();
+        fs::write(config.legacy_spool.join(ACTIVE_TAPE), b"").unwrap();
+        let rust_rows = fixture_rows()
+            .into_iter()
+            .filter(|row| row["kind"] != "market_settlement")
+            .collect::<Vec<_>>();
+        write_tape(
+            &config
+                .rust_spool
+                .join("market-updates.19700101T000400000000.ndjson"),
+            &rust_rows,
+            "1970-01-01T00:03:20Z",
+        );
+        config.allow_empty_legacy = true;
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["comparison_mode"], "rust_self");
+        assert_eq!(evidence["checks"]["settlement_parity"], false);
+    }
+
+    #[test]
+    fn nonempty_legacy_window_stays_in_overlap_mode() {
+        let (_root, mut config) = fixture();
+        write_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &[trade("legacy-only")],
+            "1970-01-01T00:03:20Z",
+        );
+        config.allow_empty_legacy = true;
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["comparison_mode"], "legacy_overlap");
+        assert_eq!(evidence["checks"]["metadata_parity"], false);
     }
 
     #[test]

@@ -1667,12 +1667,20 @@ valid_finalized_reference_tape_path "$finalized_reference_tape" "$shadow_spool" 
   || die 'Rust shadow finalizer returned an invalid closed tape path'
 
 parity_json="$evidence_dir/parity.json"
-"$release_binary" verify-shadow-parity \
-  --legacy-spool "$LEGACY_SPOOL" \
-  --rust-spool "$shadow_spool" \
-  --started-at-unix "$parity_window_started_at" \
-  --ended-at-unix "$common_cutoff" \
-  --output "$parity_json" || die 'byte/field/dedupe/settlement/rotation parity failed'
+parity_args=(
+  verify-shadow-parity
+  --legacy-spool "$LEGACY_SPOOL"
+  --rust-spool "$shadow_spool"
+  --started-at-unix "$parity_window_started_at"
+  --ended-at-unix "$common_cutoff"
+  --output "$parity_json"
+)
+if [[ $baseline_mode == legacy_python \
+  && $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then
+  parity_args+=(--allow-empty-legacy)
+fi
+"$release_binary" "${parity_args[@]}" \
+  || die 'byte/field/dedupe/settlement/rotation parity failed'
 
 verify_current_oss_config
 upload_json=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
