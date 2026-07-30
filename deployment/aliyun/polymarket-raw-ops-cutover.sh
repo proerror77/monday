@@ -633,6 +633,30 @@ verify_oneshot_success() {
   [[ $result == success && $status == 0 ]]
 }
 
+verify_deferred_market_upload() {
+  local expected_binary=$1 previous_invocation=$2 state pid proc_exe invocation
+  for _ in $(seq 1 10); do
+    systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" && return 1
+    invocation=$(systemctl show --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
+    if [[ $invocation =~ ^[a-f0-9]{32}$ && $invocation != "$previous_invocation" ]]; then
+      state=$(systemctl show --property=ActiveState --value "$MARKET_UPLOAD_UNIT")
+      if [[ $state == inactive ]]; then
+        verify_oneshot_success "$MARKET_UPLOAD_UNIT"
+        return
+      fi
+      if [[ $state == active || $state == activating ]]; then
+        pid=$(systemctl show --property=MainPID --value "$MARKET_UPLOAD_UNIT")
+        [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+        proc_exe=$(readlink -f -- "/proc/$pid/exe") || return 1
+        [[ $proc_exe == "$expected_binary" ]]
+        return
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 verify_upload_units() {
   local pinned_upload_env=$1 unit_file
   verify_effective_unit "$REFERENCE_UPLOAD_UNIT" \
@@ -1536,7 +1560,8 @@ done
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector failed post-restart identity or health checks'
 
-# Both one-shot services must execute successfully before their timers are re-enabled.
+# The Gate's real-segment OSS readback proves market-uploader compatibility.
+# Start its historical backlog asynchronously so promotion remains bounded.
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed before Rust uploader verification'
 verify_upload_units "$pinned_upload_env" \
@@ -1544,15 +1569,22 @@ verify_upload_units "$pinned_upload_env" \
 systemctl start "$REFERENCE_UPLOAD_UNIT"
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed during reference upload'
-systemctl start "$MARKET_UPLOAD_UNIT"
-[[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
-  || die 'pinned OSS configuration changed during market upload'
 verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
   || die 'Rust reference uploader did not complete successfully'
-verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
-  || die 'Rust market uploader did not complete successfully'
+systemctl reset-failed "$MARKET_UPLOAD_UNIT"
+market_upload_invocation_before=$(systemctl show \
+  --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
+systemctl start --no-block "$MARKET_UPLOAD_UNIT"
+verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before" \
+  || die 'Rust market uploader did not start cleanly for deferred backlog processing'
+[[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
+  || die 'pinned OSS configuration changed during market upload startup'
 systemctl enable "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl start "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
+unit_active "$REFERENCE_UPLOAD_TIMER" \
+  || die 'Rust reference upload timer is not active'
+unit_active "$MARKET_UPLOAD_TIMER" \
+  || die 'Rust market upload timer is not active'
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while enabling upload timers'
 verify_upload_units "$pinned_upload_env" \
@@ -1570,6 +1602,8 @@ fi
 
 main_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $main_pid == "$rust_pid" ]] || die 'Rust collector PID changed before evidence publication'
+! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
+  || die 'Rust market uploader failed during deferred backlog startup'
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity or health changed before evidence publication'
 health_file="$evidence_dir/post-start-health.json"
@@ -1618,7 +1652,11 @@ jq -n \
       journal_sha256:$journal_sha256},
     rollback_manifest_sha256:$rollback_manifest_sha256,
     explicit_restart:true,post_start_identity_verified:true,
-    upload_services_verified:true,rollback_ready:true}' \
+    upload_services_verified:true,
+    market_upload_gate_verified:true,
+    market_upload_terminal_success_required:false,
+    market_backlog_deferred_to_timer:true,
+    upload_timers_verified:true,rollback_ready:true}' \
   >"$evidence_dir/cutover.json.tmp"
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while cutover evidence was being prepared'
@@ -1634,6 +1672,8 @@ verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invo
   || die 'Rust collector identity changed before cutover completion'
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit identity changed before cutover completion'
+! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
+  || die 'Rust market uploader failed before cutover completion'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed before cutover completion'
 verify_release_binding "$RELEASE_MANIFEST" "$gate_release_manifest_sha" \

@@ -4299,6 +4299,26 @@ cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -
   exit 1
 }
 
+[[ $(grep -c '^systemctl start "$MARKET_UPLOAD_UNIT"$' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still synchronously drains the complete market backlog\n' >&2
+  exit 1
+}
+[[ $(grep -c '^verify_oneshot_success "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -eq 0 ]] || {
+  printf 'cutover still requires terminal success for the complete market backlog\n' >&2
+  exit 1
+}
+grep -Fq 'systemctl start --no-block "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
+grep -Fq \
+  'verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before"' \
+  "$CUTOVER"
+grep -Fq 'systemctl reset-failed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
+[[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 3 ]]
+grep -Fq 'unit_active "$REFERENCE_UPLOAD_TIMER"' "$CUTOVER"
+grep -Fq 'unit_active "$MARKET_UPLOAD_TIMER"' "$CUTOVER"
+grep -Fq 'market_upload_gate_verified:true' "$CUTOVER"
+grep -Fq 'market_upload_terminal_success_required:false' "$CUTOVER"
+grep -Fq 'market_backlog_deferred_to_timer:true' "$CUTOVER"
+
 snapshot_manifest_line=$(grep -n \
   '^    sha256sum state.json systemd/\* bin/\* config/\* control/\* >manifest.sha256$' \
   "$CUTOVER" | cut -d: -f1)
