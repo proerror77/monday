@@ -54,7 +54,7 @@ SYSTEMD_UNIT_DIR=$(prefix_path /etc/systemd/system)
 readonly SYSTEMD_UNIT_DIR
 readonly CONTROL_LOCK="$RUN_ROOT/control.lock"
 
-for command in awk chmod cmp date flock install jq mkdir mv rm sha256sum stat \
+for command in awk chmod cmp date flock install jq ln mkdir mv rm sha256sum stat \
   sync systemctl tr; do
   command -v "$command" >/dev/null 2>&1 \
     || die "missing required command: $command"
@@ -96,7 +96,8 @@ sync_file() { [[ $test_mode == true ]] || sync "$1"; }
 sync_dir() { [[ $test_mode == true ]] || sync -f "$1"; }
 
 install_gate_unit() {
-  local temporary unit_sha
+  local backup previous_sha temporary unit_sha
+  local replaced=false
   for file in "$CONTROL" "$GATE" "$UNIT_ASSET"; do
     secure_control_file "$file"
   done
@@ -108,24 +109,55 @@ install_gate_unit() {
   flock -x 9
   if [[ -e $INSTALLED_UNIT || -L $INSTALLED_UNIT ]]; then
     secure_control_file "$INSTALLED_UNIT"
-    cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT" \
-      || die 'existing Gate unit differs from the controller bundle'
-  else
+    if ! cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT"; then
+      [[ -z $(systemctl list-units "${UNIT_PREFIX}@*.service" \
+        --state=running --no-legend --no-pager) ]] \
+        || die 'refusing to replace the Gate unit while a Gate is running'
+      previous_sha=$(sha256sum "$INSTALLED_UNIT" | awk '{print $1}')
+      replaced=true
+    fi
+  fi
+  if [[ ! -e $INSTALLED_UNIT || $replaced == true ]]; then
     temporary="$SYSTEMD_UNIT_DIR/.${UNIT_TEMPLATE}.$$"
+    backup="$SYSTEMD_UNIT_DIR/.${UNIT_TEMPLATE}.rollback.$$"
     (
-      trap 'rm -f -- "$temporary"' EXIT
+      # shellcheck disable=SC2329  # Invoked by the EXIT trap below.
+      rollback_gate_unit_install() {
+        local status=$?
+        rm -f -- "$temporary"
+        if [[ -f $backup && ! -L $backup ]]; then
+          if [[ ! -f $INSTALLED_UNIT || -L $INSTALLED_UNIT ]] \
+            || ! cmp -s "$backup" "$INSTALLED_UNIT"; then
+            mv -f "$backup" "$INSTALLED_UNIT"
+          else
+            rm -f -- "$backup"
+          fi
+          sync_file "$INSTALLED_UNIT"
+          sync_dir "$SYSTEMD_UNIT_DIR"
+        fi
+        exit "$status"
+      }
+      trap rollback_gate_unit_install EXIT
       install -m 0644 "$UNIT_ASSET" "$temporary"
       secure_control_file "$temporary"
       cmp -s "$UNIT_ASSET" "$temporary" || die 'staged Gate unit differs'
       sync_file "$temporary"
-      mv -n "$temporary" "$INSTALLED_UNIT"
-      [[ ! -e $temporary ]] \
-        || die 'Gate unit target appeared during atomic install'
+      if [[ $replaced == true ]]; then
+        [[ ! -e $backup && ! -L $backup ]] \
+          || die 'Gate unit rollback path already exists'
+        ln "$INSTALLED_UNIT" "$backup"
+        mv -f "$temporary" "$INSTALLED_UNIT"
+      else
+        mv -n "$temporary" "$INSTALLED_UNIT"
+        [[ ! -e $temporary ]] \
+          || die 'Gate unit target appeared during atomic install'
+      fi
       secure_control_file "$INSTALLED_UNIT"
       cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT" \
         || die 'installed Gate unit differs from the controller bundle'
       sync_file "$INSTALLED_UNIT"
       sync_dir "$SYSTEMD_UNIT_DIR"
+      rm -f -- "$backup"
       trap - EXIT
     )
   fi
@@ -133,9 +165,11 @@ install_gate_unit() {
   unit_sha=$(sha256sum "$INSTALLED_UNIT" | awk '{print $1}')
   jq -cn --arg template "$UNIT_TEMPLATE" \
     --arg fragment "/etc/systemd/system/$UNIT_TEMPLATE" \
-    --arg sha "$unit_sha" '
+    --arg sha "$unit_sha" --arg previous "${previous_sha:-}" \
+    --argjson replaced "$replaced" '
     {unit_template:$template,fragment_path:$fragment,sha256:$sha,
-      validated:true}
+      previous_sha256:(if $previous == "" then null else $previous end),
+      replaced:$replaced,validated:true}
   '
 }
 
@@ -592,8 +626,6 @@ start_gate() {
   for file in "$CONTROL" "$GATE" "$UNIT_ASSET" "$INSTALLED_UNIT"; do
     secure_control_file "$file"
   done
-  cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT" \
-    || die 'installed Gate unit differs from the controller bundle'
   [[ $CONTROL =~ ^/[A-Za-z0-9_./-]+$ ]] \
     || die 'Gate controller path is not safe for systemd EnvironmentFile'
   if [[ $test_mode == false ]]; then
@@ -606,6 +638,8 @@ start_gate() {
   secure_root_directory "$RECEIPT_ROOT" || die 'Gate receipt root is insecure'
   exec 9>"$CONTROL_LOCK"
   flock -x 9
+  cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT" \
+    || die 'installed Gate unit differs from the controller bundle'
   unit=$(unit_for "$candidate_sha")
   active_state=$(systemctl_value "$unit" ActiveState) \
     || die 'cannot read Gate state before start'

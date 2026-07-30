@@ -203,6 +203,11 @@ case "${1:-}" in
       *) exit 2 ;;
     esac
     ;;
+  list-units)
+    if [[ ${FAKE_GATE_UNITS_RUNNING:-0} == 1 ]]; then
+      printf 'polymarket-raw-ops-gate@active.service loaded active running\n'
+    fi
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -220,11 +225,16 @@ cat >"$supervisor_fake_bin/mv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 destination=${!#}
+source=${@: -2:1}
 [[ ${FAKE_MV_FAIL_RECEIPT_STAGE:-0} != 1 \
   || $destination != */.receipt.json.ready ]] \
   || exit 74
 [[ ${FAKE_MV_FAIL_RECEIPT:-0} != 1 || $destination != */receipt.json ]] \
   || exit 75
+[[ ${FAKE_MV_FAIL_GATE_INSTALL:-0} != 1 \
+  || $destination != */polymarket-raw-ops-gate@.service \
+  || $source == *.rollback.* ]] \
+  || exit 76
 exec /bin/mv "$@"
 EOF
 chmod 0755 "$supervisor_fake_bin/mv"
@@ -309,7 +319,35 @@ if compgen -G \
   exit 1
 fi
 printf 'mismatch\n' >"$installed_supervisor_unit"
-reject gate_control install
+if env "${gate_control_env[@]}" FAKE_MV_FAIL_GATE_INSTALL=1 \
+  "$supervisor_control" install >/dev/null 2>&1; then
+  printf 'Gate unit installer ignored an atomic replacement failure\n' >&2
+  exit 1
+fi
+[[ $(<"$installed_supervisor_unit") == mismatch ]]
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'failed Gate unit upgrade left a temporary or rollback file\n' >&2
+  exit 1
+fi
+if env "${gate_control_env[@]}" FAKE_GATE_UNITS_RUNNING=1 \
+  "$supervisor_control" install >/dev/null 2>&1; then
+  printf 'Gate unit installer replaced a unit while a Gate was running\n' >&2
+  exit 1
+fi
+[[ $(<"$installed_supervisor_unit") == mismatch ]]
+gate_control install >"$supervisor_tmp/upgrade.json"
+jq -e '.validated == true and .replaced == true
+  and (.previous_sha256 | test("^[a-f0-9]{64}$"))' \
+  "$supervisor_tmp/upgrade.json" >/dev/null
+cmp -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
+if compgen -G \
+  "$supervisor_root/etc/systemd/system/.polymarket-raw-ops-gate@.service.*" \
+  >/dev/null; then
+  printf 'Gate unit upgrade left a temporary or rollback file\n' >&2
+  exit 1
+fi
 rm "$installed_supervisor_unit"
 ln -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
 reject gate_control install
