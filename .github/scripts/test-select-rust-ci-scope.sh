@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -8,18 +9,26 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
 run_case() {
-  local name=$1 event=$2 changed=$3
+  local name=$1 event=$2 changed=$3 ref=
   local output="$tmp_dir/$name.out"
   local changed_file="$fixtures/$changed"
   [[ -f $changed_file ]] || changed_file="$tmp_dir/$changed"
-  "$selector" --event "$event" --changed-files "$changed_file" \
+  [[ $event == push ]] && ref=refs/heads/main
+  GITHUB_REF=$ref "$selector" --event "$event" --changed-files "$changed_file" \
     --metadata "$fixtures/metadata.fixture" --output "$output"
   printf '%s\n' "$output"
 }
 
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
+printf '%s\n' .github/workflows/issue-lifecycle.yml >"$tmp_dir/governance-workflow.txt"
+printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/issue-lifecycle-audit.rb >"$tmp_dir/governance-script.txt"
+printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
+printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
+printf '%s\n' config/risk.toml >"$tmp_dir/unknown-nested.txt"
+printf '%s\n' rust_hft/deployment/docker/Dockerfile.trading >"$tmp_dir/trading-dockerfile.txt"
 printf '%s\n' rust_hft/docs/README.md >"$tmp_dir/rust-docs.txt"
 printf '%s\n' rust_hft/research-core/README.md >"$tmp_dir/package-readme.txt"
 
@@ -48,6 +57,21 @@ assert_jobs() {
   }
 }
 
+assert_security_jobs() {
+  local output=$1 expected=$2 actual
+  actual=$(sed -n 's/^security_jobs=//p' "$output")
+  [[ $actual == ,*, ]] || {
+    printf '%s: security_jobs output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
+    exit 1
+  }
+  actual=${actual#,}
+  actual=${actual%,}
+  [[ $actual == "$expected" ]] || {
+    printf '%s: expected security_jobs=%s, got security_jobs=%s\n' "$output" "$expected" "$actual" >&2
+    exit 1
+  }
+}
+
 job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy'
@@ -57,8 +81,15 @@ job_cases=(
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'root-node|pull_request|root-node.txt|ci/node-install'
+  'governance-workflow|pull_request|governance-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
+  'governance-script|pull_request|governance-script.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
+  'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'unknown-root|pull_request|unknown-root.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
+  'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
   'docs|pull_request|docs.txt|'
@@ -67,6 +98,7 @@ job_cases=(
   'frontend|pull_request|frontend.txt|ploy/commit-hygiene,ploy/safety-scans,ploy/frontend'
   'backtest|pull_request|backtest.txt|ploy/research-image-binaries'
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
+  'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
   'acr-workflow-push|push|acr-workflow.txt|ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke'
@@ -77,6 +109,36 @@ for job_case in "${job_cases[@]}"; do
   assert_jobs "$output" "$expected"
   assert_flag "$output" selection_complete true
 done
+
+all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
+assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
+assert_security_jobs "$tmp_dir/governance-workflow.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
+assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/trading-dockerfile-push.out" 'security/sast-semgrep,security/secret-presence,security/container-scan,security/secret-detection'
+trading_develop="$tmp_dir/trading-dockerfile-develop.out"
+GITHUB_REF=refs/heads/develop "$selector" --event push \
+  --changed-files "$tmp_dir/trading-dockerfile.txt" \
+  --metadata "$fixtures/metadata.fixture" --output "$trading_develop"
+assert_jobs "$trading_develop" 'ci/deployment-artifacts'
+assert_security_jobs "$trading_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+security_workflow_develop="$tmp_dir/security-workflow-develop.out"
+GITHUB_REF=refs/heads/develop "$selector" --event push \
+  --changed-files "$tmp_dir/security-workflow.txt" \
+  --metadata "$fixtures/metadata.fixture" --output "$security_workflow_develop"
+assert_jobs "$security_workflow_develop" 'ploy/workflow-lint'
+assert_security_jobs "$security_workflow_develop" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/unknown-workflow.out" "$all_security_jobs"
+security_schedule="$tmp_dir/security-schedule.out"
+"$selector" --event schedule --output "$security_schedule"
+assert_jobs "$security_schedule" ''
+assert_security_jobs "$security_schedule" "$all_security_jobs"
+security_manual="$tmp_dir/security-manual.out"
+"$selector" --event workflow_dispatch --output "$security_manual"
+assert_security_jobs "$security_manual" "$all_security_jobs"
 
 collector="$tmp_dir/collector.out"
 for flag in loop collector control toolchain; do assert_flag "$collector" "$flag" true; done
@@ -106,23 +168,37 @@ always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
 grep -Fqx "$always_condition" "$ci_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ci_workflow"
-grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),\$ ]] &&" "$ci_workflow"
+grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
 grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
+[[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
 grep -Fqx "$always_condition" "$ploy_workflow"
 grep -Fqx '        working-directory: .' "$ploy_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ploy_workflow"
-grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),\$ ]]; then" "$ploy_workflow"
+grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]]; then" "$ploy_workflow"
 for invalid_jobs in '' ci/rust; do
-  [[ $invalid_jobs =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),$ ]] && exit 1
+  [[ $invalid_jobs =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] && exit 1
 done
 grep -Fq "'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,'" "$ploy_workflow"
 grep -Fq "contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,')" "$ploy_workflow"
+grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
+grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
+grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
+grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
+grep -Fqx '      - name: Test issue lifecycle workflow contract' "$ploy_workflow"
+grep -A1 -F '      - name: Test issue lifecycle workflow contract' "$ploy_workflow" | grep -Fqx '        working-directory: .'
+grep -Fqx '        run: ruby .github/scripts/test-issue-lifecycle-workflow.rb' "$ploy_workflow"
+grep -Fqx '      - name: Test issue lifecycle audit' "$ploy_workflow"
+grep -A1 -F '      - name: Test issue lifecycle audit' "$ploy_workflow" | grep -Fqx '        working-directory: .'
+grep -Fqx '        run: .github/scripts/test-issue-lifecycle-audit.sh' "$ploy_workflow"
+grep -Fqx '      - name: Test issue lifecycle templates' "$ploy_workflow"
+grep -A1 -F '      - name: Test issue lifecycle templates' "$ploy_workflow" | grep -Fqx '        working-directory: .'
+grep -Fqx '        run: .github/scripts/test-issue-lifecycle-contract.sh' "$ploy_workflow"
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
@@ -155,7 +231,42 @@ for flag in loop collector control toolchain; do assert_flag "$rename" "$flag" t
 
 gate="$script_dir/verify-ci-gate.sh"
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' | \
-  bash "$gate"
+  bash "$gate" --expected-jobs ',,'
+if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' | \
+  bash "$gate" --expected-jobs ',ci/rust,' >/dev/null 2>&1; then
+  echo 'CI gate accepted a skipped selected job' >&2
+  exit 1
+fi
+printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
+  bash "$gate" --expected-jobs ',ci/rust,'
+printf '%s' '{"selector":{"result":"success"},"scope":{"result":"success"}}' | \
+  bash "$gate" --job-prefix ci --expected-jobs ',ploy/workflow-lint,'
+release_expected=',ci/rust,ci/polymarket-evidence-compiler-image,ploy/rust-research-heavy,'
+release_needs='{"selector":{"result":"success"},"scope":{"result":"success"},"rust":{"result":"success"},"polymarket_evidence_compiler_image":{"result":"success"}}'
+printf '%s' "$release_needs" | bash "$gate" --job-prefix ci --expected-jobs "$release_expected"
+unrelated_needs='{"image-smoke-selector":{"result":"success"},"image-smoke-scope":{"result":"success"},"rust-research-heavy":{"result":"failure"}}'
+if printf '%s' "$unrelated_needs" | \
+  bash "$gate" --job-prefix ploy --expected-jobs "$release_expected" >/dev/null 2>&1; then
+  echo 'Prediction gate accepted an unrelated-lane failure' >&2
+  exit 1
+fi
+if printf '%s' '{"security-selector":{"result":"success"},"security-scope":{"result":"success"},"cargo-machete":{"result":"skipped"}}' | \
+  bash "$gate" --expected-jobs ',security/cargo-machete,' >/dev/null 2>&1; then
+  echo 'CI gate accepted a skipped selected security job' >&2
+  exit 1
+fi
+printf '%s' '{"security-selector":{"result":"success"},"security-scope":{"result":"success"},"cargo-machete":{"result":"success"}}' | \
+  bash "$gate" --expected-jobs ',security/cargo-machete,'
+if printf '%s' '{"selector":{"result":"skipped"},"rust":{"result":"skipped"}}' | \
+  bash "$gate" --expected-jobs ',,' >/dev/null 2>&1; then
+  echo 'CI gate accepted a skipped selector' >&2
+  exit 1
+fi
+if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
+  bash "$gate" --expected-jobs ',ci/missing-job,' >/dev/null 2>&1; then
+  echo 'CI gate accepted an unknown selected job' >&2
+  exit 1
+fi
 if printf '%s' '{"selector":{"result":"failure"}}' | bash "$gate" >/dev/null 2>&1; then
   echo 'CI gate accepted a failed selected job' >&2
   exit 1
@@ -168,10 +279,25 @@ fi
 grep -Fqx '  ci-gate:' "$ci_workflow"
 grep -Fqx '    name: Monorepo CI gate' "$ci_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ci_workflow"
-grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ci_workflow"
+grep -Fqx '          EXPECTED_JOBS: ${{ needs.scope.outputs.jobs }}' "$ci_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ci --expected-jobs \"\$EXPECTED_JOBS\"" "$ci_workflow"
 grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
 grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
-grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh" "$ploy_workflow"
+grep -Fqx '          EXPECTED_JOBS: ${{ needs.image-smoke-scope.outputs.jobs }}' "$ploy_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs \"\$EXPECTED_JOBS\"" "$ploy_workflow"
+
+security_workflow="$script_dir/../workflows/security-enabled.yml"
+grep -Fqx '  security-selector:' "$security_workflow"
+grep -Fqx '  security-scope:' "$security_workflow"
+grep -Fqx '      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6' "$security_workflow"
+grep -Fq "contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,')" "$security_workflow"
+grep -Fq "contains(needs.security-scope.outputs.jobs, ',security/container-scan,')" "$security_workflow"
+grep -Fqx '      - cargo-machete' "$security_workflow"
+grep -Fqx '          EXPECTED_JOBS: ${{ needs.security-scope.outputs.jobs }}' "$security_workflow"
+grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix security --expected-jobs \"\$EXPECTED_JOBS\"" "$security_workflow"
+summary_upload_line=$(grep -nF '      - name: Upload summary' "$security_workflow" | cut -d: -f1)
+security_gate_line=$(grep -nF '      - name: Require selected security jobs to pass' "$security_workflow" | cut -d: -f1)
+((security_gate_line > summary_upload_line))
 
 printf 'rust CI scope selector tests passed\n'

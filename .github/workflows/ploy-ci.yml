@@ -2,9 +2,9 @@ name: Prediction Markets CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "rust_hft/**"
       - ".cargo/**"
@@ -78,7 +78,7 @@ jobs:
           SELECTED_COMPLETE: ${{ needs.image-smoke-selector.outputs.selection_complete }}
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
-             [[ "$SELECTED_JOBS" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),$ ]]; then
+             [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]]; then
             printf 'jobs=%s\n' "$SELECTED_JOBS"
           else
             printf '%s\n' 'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,'
@@ -121,18 +121,49 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install actionlint
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Run actionlint
-        run: >-
-          "${HOME}/go/bin/actionlint" -color
-          ../../.github/workflows/ploy-ci.yml
-          ../../.github/workflows/acr-publish.yml
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          workflow_files=()
+          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null &&
+             git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            mapfile -d '' workflow_files < <(
+              git diff --no-renames --name-only --diff-filter=ACMR -z \
+                "${BASE_SHA}...${HEAD_SHA}" -- '.github/workflows/*.yml'
+            )
+          fi
+          if ((${#workflow_files[@]} == 0)); then
+            workflow_files=(
+              .github/workflows/ploy-ci.yml
+              .github/workflows/acr-publish.yml
+            )
+          fi
+          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"
 
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
+
+      - name: Test issue lifecycle workflow contract
+        working-directory: .
+        run: ruby .github/scripts/test-issue-lifecycle-workflow.rb
+
+      - name: Test issue lifecycle audit
+        working-directory: .
+        run: .github/scripts/test-issue-lifecycle-audit.sh
+
+      - name: Test issue lifecycle templates
+        working-directory: .
+        run: .github/scripts/test-issue-lifecycle-contract.sh
 
   research-image-binaries:
     name: Research image binaries
@@ -1090,4 +1121,5 @@ jobs:
         working-directory: .
         env:
           GATE_NEEDS: ${{ toJson(needs) }}
-        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh
+          EXPECTED_JOBS: ${{ needs.image-smoke-scope.outputs.jobs }}
+        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs "$EXPECTED_JOBS"

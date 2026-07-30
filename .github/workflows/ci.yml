@@ -81,7 +81,7 @@ jobs:
           SELECTED_COMPLETE: ${{ needs.selector.outputs.selection_complete }}
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
-             [[ "$SELECTED_JOBS" =~ ^,(|[a-z0-9/-]+(,[a-z0-9/-]+)*),$ ]] &&
+             [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
              [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
             printf '%s\n' \
               "jobs=$SELECTED_JOBS" \
@@ -577,4 +577,5 @@ jobs:
         working-directory: .
         env:
           GATE_NEEDS: ${{ toJson(needs) }}
-        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh
+          EXPECTED_JOBS: ${{ needs.scope.outputs.jobs }}
+        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh --job-prefix ci --expected-jobs "$EXPECTED_JOBS"
