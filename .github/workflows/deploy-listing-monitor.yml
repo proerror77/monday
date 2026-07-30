@@ -1,11 +1,6 @@
 name: Deploy Listing Monitor
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'rust_hft/tools/listing-monitor/**'
-      - '.github/workflows/deploy-listing-monitor.yml'
   workflow_dispatch:
 
 env:
@@ -37,11 +32,11 @@ jobs:
       - name: Build and push image
         working-directory: rust_hft
         run: |
-          docker build -f tools/listing-monitor/Dockerfile -t $IMAGE_NAME:latest .
-          docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:latest
-          docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
-          docker push $ECR_REGISTRY/$IMAGE_NAME:latest
-          docker push $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
+          docker build -f tools/listing-monitor/Dockerfile -t "$IMAGE_NAME:latest" .
+          docker tag "$IMAGE_NAME:latest" "$ECR_REGISTRY/$IMAGE_NAME:latest"
+          docker tag "$IMAGE_NAME:latest" "$ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+          docker push "$ECR_REGISTRY/$IMAGE_NAME:latest"
+          docker push "$ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}"
 
       - name: Register Task Definition
         id: task-def
@@ -97,7 +92,7 @@ jobs:
           }
           EOF
           TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region ${{ env.ECS_REGION }} --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to ECS
         run: |
