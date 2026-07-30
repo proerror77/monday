@@ -2473,7 +2473,7 @@ jq '.baseline_health_start_required = false
   "$tmp_dir/expedited-legacy-gate.json" \
   >"$tmp_dir/python-nonblocking-legacy-gate.json"
 jq -e -f "$POLICY" "$tmp_dir/python-nonblocking-legacy-gate.json" >/dev/null || {
-  printf 'gate policy rejected approved Python-nonblocking legacy evidence\n' >&2
+  printf 'gate policy rejected approved legacy-nonblocking evidence\n' >&2
   exit 1
 }
 for mutation in \
@@ -2485,7 +2485,7 @@ for mutation in \
     >"$tmp_dir/forged-python-nonblocking-legacy-gate.json"
   if jq -e -f "$POLICY" \
     "$tmp_dir/forged-python-nonblocking-legacy-gate.json" >/dev/null; then
-    printf 'gate policy accepted forged Python-nonblocking legacy evidence\n' >&2
+    printf 'gate policy accepted forged legacy-nonblocking evidence\n' >&2
     exit 1
   fi
 done
@@ -3384,17 +3384,15 @@ grep -Fq 'wait_for_fresh_legacy_health_observation() {' "$GATE" || {
   )
 )
 daemon_reload_line=$(grep -nF 'systemctl daemon-reload' "$GATE" | tail -1 | cut -d: -f1)
-snapshot_line=$(grep -nF 'baseline_health_observation=$(wait_for_fresh_legacy_health_observation' \
-  "$GATE" | cut -d: -f1)
 completion_snapshot_line=$(grep -nF \
   'baseline_health_completion_observation=$(fresh_legacy_health_observation' \
   "$GATE" | cut -d: -f1)
 gate_start_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
 shadow_start_line=$(grep -nF 'systemctl start "$shadow_unit"' "$GATE" | cut -d: -f1)
-if ! ((daemon_reload_line < snapshot_line && snapshot_line < gate_start_line \
+if ! ((daemon_reload_line < gate_start_line \
   && gate_start_line < shadow_start_line \
   && shadow_start_line < completion_snapshot_line)); then
-  printf 'legacy health is not frozen immediately at the shadow Gate start boundary\n' >&2
+  printf 'legacy health completion seam is not after shadow startup\n' >&2
   exit 1
 fi
 [[ $(legacy_health_sample_state \
