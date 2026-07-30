@@ -2583,6 +2583,41 @@ jq -e --arg error "$legacy_rate_limit_error" \
   exit 1
 }
 jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.target_markets = 2792
+    | .baseline_health_snapshot.api_errors = [range(0; 18) | $error]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/ratio-bounded-rate-limited-legacy-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/ratio-bounded-rate-limited-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected 18 trades rate limits for 2792 markets\n' >&2
+  exit 1
+}
+jq -e '.baseline_health_snapshot.api_errors | length == 18' \
+  "$tmp_dir/ratio-bounded-rate-limited-legacy-gate.json" >/dev/null || {
+  printf 'gate evidence did not preserve all admitted trades rate limits\n' >&2
+  exit 1
+}
+jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.target_markets = 2792
+    | .baseline_health_snapshot.api_errors = [range(0; 29) | $error]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/ratio-excessive-rate-limited-legacy-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/ratio-excessive-rate-limited-legacy-gate.json" >/dev/null; then
+  printf 'gate policy accepted 29 trades rate limits for 2792 markets\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.target_markets = 10000
+    | .baseline_health_snapshot.api_errors = [range(0; 33) | $error]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/absolute-cap-rate-limited-legacy-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/absolute-cap-rate-limited-legacy-gate.json" >/dev/null; then
+  printf 'gate policy accepted more than 32 trades rate limits\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
   '.baseline_health_completion_snapshot.api_errors = [$error]' \
   "$tmp_dir/gate.json" >"$tmp_dir/rate-limited-legacy-completion-gate.json"
 if jq -e -f "$POLICY" \
@@ -2607,6 +2642,34 @@ jq --arg rate_limit "$legacy_rate_limit_error" \
 if jq -e -f "$POLICY" \
   "$tmp_dir/mixed-rate-limited-legacy-gate.json" >/dev/null; then
   printf 'gate policy accepted a mixed legacy API error list\n' >&2
+  exit 1
+fi
+jq '.started_at = "1970-01-01T00:46:40Z"
+  | .completed_at = "1970-01-01T01:01:40Z"
+  | .parity_window_started_at_unix = 2800
+  | .parity_window_ended_at_unix = 3700
+  | .metrics.trade_event_window_started_at_unix = 2800
+  | .metrics.trade_event_window_ended_at_unix = 3100
+  | .metrics.settlement_event_window_started_at_unix = 1900
+  | .metrics.settlement_event_window_ended_at_unix = 3100' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/start-health-age-boundary-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/start-health-age-boundary-gate.json" >/dev/null || {
+  printf 'gate policy rejected a startup health publication exactly 2700 seconds old\n' >&2
+  exit 1
+}
+jq '.started_at = "1970-01-01T00:46:41Z"
+  | .completed_at = "1970-01-01T01:01:41Z"
+  | .parity_window_started_at_unix = 2801
+  | .parity_window_ended_at_unix = 3701
+  | .metrics.trade_event_window_started_at_unix = 2801
+  | .metrics.trade_event_window_ended_at_unix = 3101
+  | .metrics.settlement_event_window_started_at_unix = 1901
+  | .metrics.settlement_event_window_ended_at_unix = 3101' \
+  "$tmp_dir/start-health-age-boundary-gate.json" \
+  >"$tmp_dir/stale-start-health-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/stale-start-health-gate.json" >/dev/null; then
+  printf 'gate policy accepted a startup health publication 2701 seconds old\n' >&2
   exit 1
 fi
 jq '.baseline_health_start_required = false
@@ -3229,6 +3292,33 @@ legacy_start_health_policy_clean \
   printf 'Gate startup policy rejected three trades rate limits\n' >&2
   exit 1
 }
+jq --arg error "$legacy_rate_limit_error" \
+  '.target_markets = 2792 | .api_errors = [range(0; 18) | $error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/ratio-bounded-legacy-health.json"
+legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/ratio-bounded-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY" || {
+  printf 'Gate startup policy rejected 18 trades rate limits for 2792 markets\n' >&2
+  exit 1
+}
+jq --arg error "$legacy_rate_limit_error" \
+  '.target_markets = 2792 | .api_errors = [range(0; 29) | $error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/ratio-excessive-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/ratio-excessive-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted 29 trades rate limits for 2792 markets\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
+  '.target_markets = 10000 | .api_errors = [range(0; 33) | $error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/absolute-cap-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/absolute-cap-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted more than 32 trades rate limits\n' >&2
+  exit 1
+fi
 legacy_rate_limit_with_newline="${legacy_rate_limit_error}"$'\n'
 jq --arg error "$legacy_rate_limit_with_newline" '.api_errors = [$error]' \
   "$tmp_dir/legacy-health.json" >"$tmp_dir/newline-rate-limit-legacy-health.json"
@@ -3310,7 +3400,8 @@ if baseline_health_requires_continuous_freshness legacy_python; then
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
-grep -Fq '"$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true)' "$GATE"
+grep -Fq '"$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true \
+    "$LEGACY_START_HEALTH_MAX_AGE_SECONDS")' "$GATE"
 legacy_runtime_budget_contract="$tmp_dir/legacy-runtime-budget.sh"
 sed -n \
   -e '/^readonly REQUIRED_DURATION_SECONDS=/p' \
@@ -3501,6 +3592,7 @@ grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
+  -e '/^readonly LEGACY_START_HEALTH_MAX_AGE_SECONDS=/p' \
   -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \
   -e '/^fresh_legacy_health_observation() {$/,/^}$/p' "$GATE" \
   >"$legacy_health_observer"
@@ -3543,6 +3635,40 @@ sed -n \
       printf 'Gate rejected a fresh completed legacy cycle with an old cycle-start timestamp\n' >&2
       exit 1
     }
+  fixed_now=$(date -u +%s)
+  date_bin=$(type -P gdate || type -P date)
+  date() {
+    if [[ $# -eq 2 && $1 == -u && $2 == +%s ]]; then
+      printf '%s\n' "$fixed_now"
+    else
+      command "$date_bin" "$@"
+    fi
+  }
+  cp "$tmp_dir/legacy-health.json" "$tmp_dir/start-age-legacy-health.json"
+  TZ=UTC touch -t "$("$date_bin" -u -d \
+    "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS))" \
+    +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
+  fresh_legacy_health_observation \
+    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+    true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null || {
+    printf 'Gate rejected a startup health publication exactly 2700 seconds old\n' >&2
+    exit 1
+  }
+  if fresh_legacy_health_observation \
+    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+    false >/dev/null 2>&1; then
+    printf 'Gate applied startup health age to a strict freshness check\n' >&2
+    exit 1
+  fi
+  TZ=UTC touch -t "$("$date_bin" -u -d \
+    "@$((fixed_now - LEGACY_START_HEALTH_MAX_AGE_SECONDS - 1))" \
+    +%Y%m%d%H%M.%S)" "$tmp_dir/start-age-legacy-health.json"
+  if fresh_legacy_health_observation \
+    "$tmp_dir/start-age-legacy-health.json" "$LEGACY_HEALTH_POLICY" \
+    true "$LEGACY_START_HEALTH_MAX_AGE_SECONDS" >/dev/null 2>&1; then
+    printf 'Gate accepted a startup health publication 2701 seconds old\n' >&2
+    exit 1
+  fi
   touch -d '1970-01-01T00:00:00Z' \
     "$tmp_dir/freshly-completed-legacy-health.json"
   if fresh_legacy_health_observation \
