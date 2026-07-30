@@ -205,7 +205,11 @@ fn reference_triplets(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
+    run(Cli::parse()).await
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
         Command::CollectReference {
             spool_dir,
             symbols,
@@ -433,6 +437,27 @@ mod tests {
             panic!("finalize-reference-tape must select the finalizer command");
         };
         assert_eq!(spool_dir, PathBuf::from("/tmp/polymarket-reference"));
+    }
+
+    #[test]
+    fn finalize_reference_tape_cli_fails_closed_for_an_empty_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = fs::canonicalize(root.path()).unwrap();
+        fs::write(spool.join("market-updates.ndjson"), b"").unwrap();
+        let cli = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "finalize-reference-tape",
+            "--spool-dir",
+            spool.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run(cli))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("active tape"));
     }
 
     #[test]

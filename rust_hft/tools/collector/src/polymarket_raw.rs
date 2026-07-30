@@ -18,7 +18,7 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
@@ -1266,19 +1266,46 @@ impl TapeWriter {
     }
 }
 
-fn finalize_reference_tape_at(spool_dir: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
-    let _lock = ReferenceSpoolLock::acquire(spool_dir)?;
-    let active = spool_dir.join(ACTIVE_TAPE);
-    if !fs::symlink_metadata(&active)?.file_type().is_file() {
+fn active_reference_tape_metadata(active: &Path, effective_uid: u32) -> Result<fs::Metadata> {
+    let active_metadata = fs::symlink_metadata(active)?;
+    if !active_metadata.file_type().is_file() {
         bail!("Polymarket reference active tape is not a regular file");
     }
-    let mut writer = TapeWriter::new_with_recovery(spool_dir, |_| Ok(()))?;
-    if writer.sequence == 0 {
+    if active_metadata.uid() != effective_uid {
+        bail!(
+            "Polymarket reference finalizer must run as active tape owner uid={} effective_uid={effective_uid}",
+            active_metadata.uid()
+        );
+    }
+    Ok(active_metadata)
+}
+
+fn finalize_reference_tape_at_as(
+    spool_dir: &Path,
+    now: DateTime<Utc>,
+    effective_uid: u32,
+) -> Result<PathBuf> {
+    let active = spool_dir.join(ACTIVE_TAPE);
+    let active_before_lock = active_reference_tape_metadata(&active, effective_uid)?;
+    let _lock = ReferenceSpoolLock::acquire(spool_dir)?;
+    let active_metadata = active_reference_tape_metadata(&active, effective_uid)?;
+    if active_metadata.dev() != active_before_lock.dev()
+        || active_metadata.ino() != active_before_lock.ino()
+    {
+        bail!("Polymarket reference active tape changed while acquiring spool lock");
+    }
+    if active_metadata.len() == 0 {
         bail!("Polymarket reference active tape is empty");
     }
-    validate_reference_tape_for_recovery(&writer.active, now)
+    validate_reference_tape_for_recovery(&active, now)
         .context("active reference tape failed uploader validation")?;
+    let mut writer = TapeWriter::new_with_recovery(spool_dir, |_| Ok(()))?;
     writer.rotate(now)
+}
+
+fn finalize_reference_tape_at(spool_dir: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    finalize_reference_tape_at_as(spool_dir, now, unsafe { libc::geteuid() })
 }
 
 pub fn finalize_reference_tape(spool_dir: &Path) -> Result<PathBuf> {
@@ -2734,12 +2761,9 @@ impl ReferenceCollector {
     }
 }
 
-fn initialize_reference_collector_with_watchdog<F>(
-    timeout: Duration,
-    initialize: F,
-) -> Result<ReferenceCollector>
+fn initialize_reference_collector_with_watchdog<F, T>(timeout: Duration, initialize: F) -> Result<T>
 where
-    F: FnOnce() -> Result<ReferenceCollector>,
+    F: FnOnce() -> Result<T>,
 {
     let _hard_watchdog = CycleWatchdog::arm(timeout).map_err(|error| {
         completeness_error(format!("could not arm the hard startup watchdog: {error}"))
@@ -2748,12 +2772,13 @@ where
 }
 
 pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
-    let _spool_lock = ReferenceSpoolLock::acquire(&config.spool_dir)?;
     let poll_interval = config.poll_interval;
     let stale_after = config.stale_after;
-    let mut collector = initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
-        ReferenceCollector::new(config)
-    })?;
+    let (_spool_lock, mut collector) =
+        initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
+            let spool_lock = ReferenceSpoolLock::acquire(&config.spool_dir)?;
+            Ok((spool_lock, ReferenceCollector::new(config)?))
+        })?;
     if once {
         println!(
             "{}",
@@ -4631,9 +4656,15 @@ mod tests {
     #[test]
     fn finalization_fails_while_the_reference_spool_is_locked() {
         let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[valid_metadata_update(now)], now)
+            .unwrap();
+        writer.close().unwrap();
         let _lock = ReferenceSpoolLock::acquire(root.path()).unwrap();
 
-        let error = finalize_reference_tape(root.path()).unwrap_err();
+        let error = finalize_reference_tape_at(root.path(), now).unwrap_err();
 
         assert!(error.to_string().contains("already locked"));
     }
@@ -4667,6 +4698,27 @@ mod tests {
     }
 
     #[test]
+    fn finalization_rejects_an_effective_user_that_does_not_own_the_active_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[valid_metadata_update(now)], now)
+            .unwrap();
+        writer.close().unwrap();
+        let active = root.path().join(ACTIVE_TAPE);
+        let before = fs::read(&active).unwrap();
+        let owner = fs::metadata(&active).unwrap().uid();
+        let other_uid = owner.checked_add(1).unwrap_or(owner.saturating_sub(1));
+
+        let error = finalize_reference_tape_at_as(root.path(), now, other_uid).unwrap_err();
+
+        assert!(error.to_string().contains("must run as active tape owner"));
+        assert_eq!(fs::read(active).unwrap(), before);
+        assert!(!root.path().join(REFERENCE_SPOOL_LOCK).exists());
+    }
+
+    #[test]
     fn finalization_rejects_a_semantically_invalid_active_tape() {
         let root = TestDir::new();
         let now = fixed_time("2026-07-15T01:00:00Z");
@@ -4689,6 +4741,44 @@ mod tests {
 
         assert!(format!("{error:#}").contains("polymarket_trade.trade must be an object"));
         assert_eq!(fs::read(active).unwrap(), before);
+    }
+
+    #[test]
+    fn finalization_rejects_a_partial_tail_without_modifying_the_active_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[valid_metadata_update(now)], now)
+            .unwrap();
+        writer.close().unwrap();
+        let active = root.path().join(ACTIVE_TAPE);
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(br#"{"sequence":1"#)
+            .unwrap();
+        let before = fs::read(&active).unwrap();
+
+        let error = finalize_reference_tape_at(root.path(), now).unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed uploader validation"));
+        assert_eq!(fs::read(&active).unwrap(), before);
+        assert_eq!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+                .count(),
+            0
+        );
     }
 
     #[test]
