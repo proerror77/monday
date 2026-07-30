@@ -49,6 +49,18 @@ gate_privilege_transition_contract() {
     ! grep -Fxq 'RestrictSUIDSGID=false' "$2"
 }
 
+join_shell_continuations() {
+  awk '{
+    line=$0
+    while (sub(/[[:space:]]*\\$/, "", line)) {
+      if ((getline next_line) <= 0) break
+      sub(/^[[:space:]]*/, "", next_line)
+      line=line " " next_line
+    }
+    print line
+  }' "$1"
+}
+
 shellcheck "$GATE" "$GATE_CONTROL" "$CUTOVER" "$0"
 for unit_line in \
   'Type=exec' 'Restart=no' 'KillMode=control-group' 'RuntimeMaxSec=18000' \
@@ -4128,6 +4140,35 @@ release_move_line=$(grep -n '^  mv "$staging" "$release_dir"$' "$GATE" \
 }
 
 cutover_stop_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' "$CUTOVER" | cut -d: -f1)
+cutover_legacy_promotion="$tmp_dir/cutover-legacy-promotion.sh"
+sed -n '/^# Cutover depends on the current gate bundle/,/^systemctl stop "$COLLECTOR_UNIT"$/p' \
+  "$CUTOVER" >"$cutover_legacy_promotion"
+cutover_legacy_promotion_joined="$tmp_dir/cutover-legacy-promotion-joined.sh"
+join_shell_continuations "$cutover_legacy_promotion" \
+  >"$cutover_legacy_promotion_joined"
+grep -Fq 'jq -e -f "$POLICY" "$gate_json"' "$cutover_legacy_promotion"
+[[ $(grep -Fc \
+  'verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
+  "$cutover_legacy_promotion_joined") -eq 2 ]] || {
+  printf 'cutover no longer binds the gated legacy identity before transition and stop\n' >&2
+  exit 1
+}
+if grep -Fq 'verify_legacy_health' "$cutover_legacy_promotion"; then
+  printf 'cutover re-admits legacy health after the immutable Gate already passed\n' >&2
+  exit 1
+fi
+cutover_legacy_rollback="$tmp_dir/cutover-legacy-rollback.sh"
+sed -n '/^restore_legacy() (/,/^\[\[ ${EUID}/p' "$CUTOVER" \
+  >"$cutover_legacy_rollback"
+cutover_legacy_rollback_joined="$tmp_dir/cutover-legacy-rollback-joined.sh"
+join_shell_continuations "$cutover_legacy_rollback" \
+  >"$cutover_legacy_rollback_joined"
+grep -Fq \
+  'verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 "$rollback_invocation_id" "$rollback_health_policy"' \
+  "$cutover_legacy_rollback_joined" || {
+  printf 'rollback no longer requires a fresh restored legacy runtime\n' >&2
+  exit 1
+}
 legacy_drain_line=$(grep -n '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
   | head -1 | cut -d: -f1)
 legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
@@ -4136,8 +4177,6 @@ legacy_final_runtime_line=$(grep -n \
   '^verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
   "$CUTOVER" \
   | tail -1 | cut -d: -f1)
-legacy_final_health_line=$(grep -n '^verify_legacy_health "$pre_stop_health_not_before"' \
-  "$CUTOVER" | cut -d: -f1)
 legacy_final_oss_line=$(grep -n \
   'OSS configuration changed during the legacy uploader drain' "$CUTOVER" \
   | cut -d: -f1)
@@ -4155,8 +4194,7 @@ cutover_reset_line=$(grep -n '^systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTO
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 ((legacy_drain_line < legacy_cursor_line \
-  && legacy_cursor_line < legacy_final_health_line \
-  && legacy_final_health_line < legacy_final_oss_line \
+  && legacy_cursor_line < legacy_final_oss_line \
   && legacy_final_oss_line < legacy_final_runtime_line \
   && legacy_final_runtime_line < cutover_stop_line \
   && cutover_stop_line < legacy_journal_guard_line \
