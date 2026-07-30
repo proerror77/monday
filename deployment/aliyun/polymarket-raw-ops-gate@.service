@@ -9,6 +9,7 @@ ConditionPathIsMountPoint=/data
 Type=exec
 User=root
 Group=root
+Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/run/monday/polymarket-raw-ops-gates/%i.env
 ExecStartPre=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} prepare %i
 ExecStart=/usr/bin/env -- ${MONDAY_POLYMARKET_GATE_CONTROL} run %i
