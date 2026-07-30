@@ -1343,7 +1343,7 @@ if [[ $baseline_mode == legacy_python ]]; then
   fi
   verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" \
     "$gate_legacy_invocation_id" \
-    || die 'cutover requires an exact canonical Python rollback runtime'
+    || die 'cutover requires an exact canonical legacy rollback runtime'
   if [[ $baseline_health_start_required == true ]]; then
     legacy_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
     verify_legacy_health "$legacy_health_not_before" \

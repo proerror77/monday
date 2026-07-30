@@ -2491,7 +2491,7 @@ for mutation in \
 done
 if grep -Fq 'baseline_health_observation=$(wait_for_fresh_legacy_health_observation' \
   "$GATE"; then
-  printf 'production Gate still waits for a Python health publication\n' >&2
+  printf 'production Gate still waits for a legacy health publication\n' >&2
   exit 1
 fi
 for mutation in \
@@ -3175,11 +3175,11 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   admission_error="$tmp_dir/runtime-budget-admission.err"
   run_budgeted_real_market_preflight source spool download evidence \
     2>"$admission_error" >/dev/null || {
-    printf 'Gate still blocks real preflight on Python runtime budget\n' >&2
+    printf 'Gate still blocks real preflight on legacy runtime budget\n' >&2
     exit 1
   }
   [[ $preflight_calls -eq 1 && $identity_checks -eq 0 ]] || {
-    printf 'Gate still consults Python identity or runtime before real preflight\n' >&2
+    printf 'Gate still consults legacy identity or runtime before real preflight\n' >&2
     exit 1
   }
   legacy_runtime_budget_observation() {
@@ -3190,7 +3190,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     exit 1
   }
   [[ $preflight_calls -eq 2 && $identity_checks -eq 0 ]] || {
-    printf 'Gate made Python identity a real-preflight prerequisite\n' >&2
+    printf 'Gate made legacy identity a real-preflight prerequisite\n' >&2
     exit 1
   }
   [[ $timeout_args == '--signal=KILL 6300 env '* ]] || {
