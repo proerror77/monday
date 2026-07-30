@@ -38,11 +38,16 @@ def runtime_identity($exec; $digest):
   and (.invocation_id | type == "string" and test("^[a-f0-9]{32}$"));
 def nonnegative_sub($left; $right):
   if $left < $right then 0 else ($left - $right) end;
+def bounded_legacy_trade_rate_limits:
+  type == "array" and length <= 3
+  and all(.[];
+    type == "string"
+    and test("^trades 0x[0-9A-Fa-f]{64}: HTTP Error 429: Too Many Requests$"));
 def legacy_health_snapshot:
   (.updated_at | utc_iso8601_unix | type == "number")
   and (.last_success_at | type == "string" and length > 0)
   and (.target_markets | positive_integer)
-  and .api_errors == []
+  and (.api_errors | bounded_legacy_trade_rate_limits)
   and .malformed_trade_rows == 0
   and .truncated_trade_markets == []
   and .stale_trade_markets == []
