@@ -29,11 +29,70 @@ control=false
 focused=false
 toolchain=false
 jobs=
+security_jobs=
 research_image_relevant=false
 
 select_job() {
   local job=$1
   [[ ,$jobs, == *,$job,* ]] || jobs=${jobs:+$jobs,}$job
+}
+
+select_security_job() {
+  local job=$1
+  [[ ,$security_jobs, == *,$job,* ]] || security_jobs=${security_jobs:+$security_jobs,}$job
+}
+
+select_all_security_jobs() {
+  select_security_job security/sast-semgrep
+  select_security_job security/cargo-audit
+  select_security_job security/secret-presence
+  select_security_job security/license-check
+  select_security_job security/clippy-strict
+  select_security_job security/cargo-machete
+  select_security_job security/secret-detection
+}
+
+select_security_scope() {
+  local scan_repository=false rust_relevant=false container_relevant=false
+
+  if [[ $event == schedule || $event == workflow_dispatch ]]; then
+    select_all_security_jobs
+    return
+  fi
+
+  for path in "${paths[@]}"; do
+    case "$path" in
+      docs/*|*.md|LICENSE*|rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*) ;;
+      *) scan_repository=true ;;
+    esac
+    case "$path" in
+      .github/workflows/security-enabled.yml|rust_hft/docker/Dockerfile|\
+      rust_hft/deployment/docker/Dockerfile.trading|rust_hft/.dockerignore)
+        container_relevant=true
+        ;;
+    esac
+  done
+
+  case ",$jobs," in
+    *",ci/rust,"*|*",ci/polymarket-evidence-compiler-image,"*|*",ci/rust-hft-engine-fast-lane,"*|\
+    *",ploy/research-image-"*|*",ploy/rust-"*|*",ploy/audit,"*|*",ploy/integration-regressions,"*)
+      rust_relevant=true
+      ;;
+  esac
+
+  [[ $scan_repository == true ]] && select_security_job security/sast-semgrep
+  [[ $rust_relevant == true ]] && select_security_job security/cargo-audit
+  [[ $scan_repository == true ]] && select_security_job security/secret-presence
+  if [[ $rust_relevant == true ]]; then
+    select_security_job security/license-check
+    select_security_job security/clippy-strict
+    select_security_job security/cargo-machete
+  fi
+  if [[ $event == push && ${GITHUB_REF:-} == refs/heads/main && \
+        ($rust_relevant == true || $container_relevant == true) ]]; then
+    select_security_job security/container-scan
+  fi
+  select_security_job security/secret-detection
 }
 
 select_all_ci_jobs() {
@@ -96,12 +155,15 @@ select_all() {
 
 emit() {
   local value
+  select_security_scope
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
   done
-  [[ $jobs =~ ^([a-z0-9/-]+(,[a-z0-9/-]+)*)?$ ]] || { printf 'invalid job selector output: %s\n' "$jobs" >&2; exit 1; }
+  [[ $jobs =~ ^((ci|ploy)/[a-z0-9/-]+(,(ci|ploy)/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid job selector output: %s\n' "$jobs" >&2; exit 1; }
+  [[ $security_jobs =~ ^(security/[a-z0-9/-]+(,security/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid security job selector output: %s\n' "$security_jobs" >&2; exit 1; }
   printf '%s\n' \
     "jobs=,$jobs," \
+    "security_jobs=,$security_jobs," \
     "loop=$loop" \
     "handoff=$handoff" \
     "json=$json" \
@@ -119,6 +181,13 @@ if [[ $event == workflow_dispatch ]]; then
   select_all_ci_jobs
   select_job ploy/workflow-lint
   select_all_ploy_jobs
+  emit
+  exit 0
+fi
+
+# Scheduled security audits retain the complete security contract without
+# selecting unrelated build or publication jobs.
+if [[ $event == schedule ]]; then
   emit
   exit 0
 fi
@@ -208,6 +277,21 @@ for path in "${paths[@]}"; do
     .github/workflows/ci.yml)
       select_all
       select_all_ci_jobs
+      continue
+      ;;
+    .github/workflows/security-enabled.yml)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/workflow-lint
+      select_all_security_jobs
+      continue
+      ;;
+    .github/workflows/issue-lifecycle.yml|\
+    .github/workflows/claude.yml|.github/workflows/claude-code-review.yml|\
+    .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|\
+    docs/agents/issue-tracker.md|docs/agents/triage-labels.md|\
+    .github/scripts/issue-lifecycle-*|.github/scripts/test-issue-lifecycle-*)
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/workflow-lint
       continue
       ;;
     .github/scripts/select-rust-ci-scope.sh|.github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*)

@@ -17,11 +17,60 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  security-selector:
+    name: Security job selector
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      jobs: ${{ steps.scope.outputs.security_jobs }}
+      selection_complete: ${{ steps.scope.outputs.selection_complete }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Test CI job selector
+        run: .github/scripts/test-select-rust-ci-scope.sh
+      - name: Select security jobs
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          .github/scripts/select-rust-ci-scope.sh
+          --event "${GITHUB_EVENT_NAME}"
+          --base "${BASE_SHA}"
+          --head "${HEAD_SHA}"
+
+  security-scope:
+    name: Security job scope
+    needs: security-selector
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      jobs: ${{ steps.scope.outputs.jobs }}
+    steps:
+      - name: Resolve selector result
+        id: scope
+        env:
+          SELECTOR_RESULT: ${{ needs.security-selector.result }}
+          SELECTED_SECURITY_JOBS: ${{ needs.security-selector.outputs.jobs }}
+          SELECTED_COMPLETE: ${{ needs.security-selector.outputs.selection_complete }}
+        run: |
+          if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
+             [[ "$SELECTED_SECURITY_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]]; then
+            printf 'jobs=%s\n' "$SELECTED_SECURITY_JOBS"
+          else
+            printf '%s\n' 'jobs=,security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection,'
+          fi >> "$GITHUB_OUTPUT"
+
   # ============================================================================
   # SAST - Static Application Security Testing
   # ============================================================================
   sast-semgrep:
     name: SAST - Semgrep
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/sast-semgrep,') }}
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep:1.164.0
@@ -56,6 +105,8 @@ jobs:
   # ============================================================================
   cargo-audit:
     name: Dependency Security - Cargo Audit
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -88,6 +139,8 @@ jobs:
 
   secret-presence:
     name: Security - Repository Secret Presence
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/secret-presence,') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +159,8 @@ jobs:
   # ============================================================================
   license-check:
     name: License Compliance
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/license-check,') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -143,6 +198,8 @@ jobs:
   # ============================================================================
   clippy-strict:
     name: Code Quality - Clippy (STRICT)
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/clippy-strict,') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -193,6 +250,8 @@ jobs:
   # ============================================================================
   cargo-machete:
     name: Code Quality - Unused Dependencies
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/cargo-machete,') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -224,8 +283,9 @@ jobs:
   # ============================================================================
   container-scan:
     name: Container Security - Image Scan
+    needs: security-scope
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/container-scan,')
     permissions:
       contents: read
       security-events: write
@@ -290,6 +350,8 @@ jobs:
   # ============================================================================
   secret-detection:
     name: Security - Secret Detection
+    needs: security-scope
+    if: ${{ contains(needs.security-scope.outputs.jobs, ',security/secret-detection,') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -309,10 +371,11 @@ jobs:
   # ============================================================================
   sbom:
     name: Security - SBOM Generation
+    needs: security-scope
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,')
     steps:
       - uses: actions/checkout@v4
 
@@ -335,36 +398,49 @@ jobs:
     name: Security Summary Report
     runs-on: ubuntu-latest
     needs:
+      - security-selector
+      - security-scope
       - sast-semgrep
       - cargo-audit
       - secret-presence
       - license-check
       - clippy-strict
+      - cargo-machete
       - container-scan
       - secret-detection
       - sbom
     if: always()
     steps:
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
       - name: Download cargo audit results
+        if: ${{ always() && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,') }}
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: cargo-audit-results
           path: cargo-audit-results
 
       - name: Download license report
+        if: ${{ always() && contains(needs.security-scope.outputs.jobs, ',security/license-check,') }}
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: license-report
           path: license-report
 
       - name: Download SBOM
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,') }}
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: sbom
           path: sbom
 
       - name: Generate summary
+        if: ${{ always() }}
+        env:
+          CARGO_AUDIT_RESULT: ${{ needs.cargo-audit.result }}
+          LICENSE_CHECK_RESULT: ${{ needs.license-check.result }}
         run: |
           {
             echo "# 🔒 HFT System Security Report"
@@ -379,17 +455,25 @@ jobs:
               CRITICAL=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="critical") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
               HIGH=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="high") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
               echo "- **Cargo Audit**: Critical=$CRITICAL, High=$HIGH"
+            else
+              echo "- **Cargo Audit**: $CARGO_AUDIT_RESULT"
             fi
 
             if [ -f license-report/licenses.json ]; then
               LICENSE_COUNT=$(jq length license-report/licenses.json)
               echo "- **License Check**: $LICENSE_COUNT dependencies"
+            else
+              echo "- **License Check**: $LICENSE_CHECK_RESULT"
             fi
 
             echo ""
             echo "## Artifacts"
-            echo "- Audit results: cargo-audit-results/audit-results.json"
-            echo "- License report: license-report/licenses.json"
+            if [ -f cargo-audit-results/audit-results.json ]; then
+              echo "- Audit results: cargo-audit-results/audit-results.json"
+            fi
+            if [ -f license-report/licenses.json ]; then
+              echo "- License report: license-report/licenses.json"
+            fi
             if [ -f sbom/sbom.json ]; then
               echo "- SBOM: sbom/sbom.json"
             fi
@@ -398,13 +482,15 @@ jobs:
           cat security-summary.md
 
       - name: Upload summary
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: security-summary.md
 
-      - name: Fail if critical findings
-        if: failure()
-        run: |
-          echo "::error::Security checks failed - review artifacts"
-          exit 1
+      - name: Require selected security jobs to pass
+        if: ${{ always() }}
+        env:
+          GATE_NEEDS: ${{ toJson(needs) }}
+          EXPECTED_JOBS: ${{ needs.security-scope.outputs.jobs }}
+        run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh --job-prefix security --expected-jobs "$EXPECTED_JOBS"
