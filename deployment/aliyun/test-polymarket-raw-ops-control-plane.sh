@@ -2567,6 +2567,48 @@ jq -e -f "$POLICY" "$tmp_dir/expedited-legacy-gate.json" >/dev/null || {
   printf 'gate policy rejected approved expedited legacy baseline evidence\n' >&2
   exit 1
 }
+legacy_rate_limit_error='trades 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: HTTP Error 429: Too Many Requests'
+jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.api_errors = [$error]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/rate-limited-legacy-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/rate-limited-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected a bounded legacy trades rate limit\n' >&2
+  exit 1
+}
+jq -e --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.api_errors == [$error]' \
+  "$tmp_dir/rate-limited-legacy-gate.json" >/dev/null || {
+  printf 'gate evidence did not preserve the accepted legacy rate limit\n' >&2
+  exit 1
+}
+jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_completion_snapshot.api_errors = [$error]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/rate-limited-legacy-completion-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/rate-limited-legacy-completion-gate.json" >/dev/null; then
+  printf 'gate policy accepted a rate limit in the post-start completion snapshot\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.api_errors = [$error, $error, $error, $error]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/excessive-rate-limited-legacy-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/excessive-rate-limited-legacy-gate.json" >/dev/null; then
+  printf 'gate policy accepted more than three legacy trades rate limits\n' >&2
+  exit 1
+fi
+jq --arg rate_limit "$legacy_rate_limit_error" \
+  '.baseline_health_snapshot.api_errors = [$rate_limit,
+    "trades 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb: The read operation timed out"]' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/mixed-rate-limited-legacy-gate.json"
+if jq -e -f "$POLICY" \
+  "$tmp_dir/mixed-rate-limited-legacy-gate.json" >/dev/null; then
+  printf 'gate policy accepted a mixed legacy API error list\n' >&2
+  exit 1
+fi
 jq '.baseline_health_start_required = false
   | .baseline_runtime_stability_required = false
   | .baseline_health_snapshot = null
@@ -3160,6 +3202,64 @@ jq -n '{
   overdue_unresolved_markets:[]
 }' >"$tmp_dir/legacy-health.json"
 jq -e -f "$LEGACY_HEALTH_POLICY" "$tmp_dir/legacy-health.json" >/dev/null
+jq --arg error "$legacy_rate_limit_error" '.api_errors = [$error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/rate-limited-legacy-health.json"
+if jq -e -f "$LEGACY_HEALTH_POLICY" \
+  "$tmp_dir/rate-limited-legacy-health.json" >/dev/null; then
+  printf 'shared legacy health policy accepted a trades rate limit\n' >&2
+  exit 1
+fi
+legacy_start_health_contract="$tmp_dir/legacy-start-health-contract.sh"
+sed -n '/^legacy_start_health_policy_clean()/,/^}/p' "$GATE" \
+  >"$legacy_start_health_contract"
+# shellcheck source=/dev/null
+source "$legacy_start_health_contract"
+legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/rate-limited-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY" || {
+  printf 'Gate startup policy rejected a bounded trades rate limit\n' >&2
+  exit 1
+}
+jq --arg error "$legacy_rate_limit_error" \
+  '.api_errors = [$error, $error, $error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/three-rate-limits-legacy-health.json"
+legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/three-rate-limits-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY" || {
+  printf 'Gate startup policy rejected three trades rate limits\n' >&2
+  exit 1
+}
+legacy_rate_limit_with_newline="${legacy_rate_limit_error}"$'\n'
+jq --arg error "$legacy_rate_limit_with_newline" '.api_errors = [$error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/newline-rate-limit-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/newline-rate-limit-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted a rate limit with a trailing newline\n' >&2
+  exit 1
+fi
+jq --arg error "$legacy_rate_limit_error" \
+  '.api_errors = [$error, $error, $error, $error]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/four-rate-limits-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/four-rate-limits-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted more than three trades rate limits\n' >&2
+  exit 1
+fi
+for error in \
+  'Gamma 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: HTTP Error 429: Too Many Requests' \
+  'trades 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: HTTP Error 500: Internal Server Error' \
+  'trades 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: The read operation timed out'; do
+  jq --arg error "$error" '.api_errors = [$error]' \
+    "$tmp_dir/legacy-health.json" >"$tmp_dir/non-rate-limit-legacy-health.json"
+  if legacy_start_health_policy_clean \
+    "$(jq -cS . "$tmp_dir/non-rate-limit-legacy-health.json")" \
+    "$LEGACY_HEALTH_POLICY"; then
+    printf 'Gate startup policy accepted non-rate-limit API error: %s\n' "$error" >&2
+    exit 1
+  fi
+done
 for mutation in \
   '.api_errors = ["Gamma unavailable"]' \
   '.malformed_trade_rows = 1' \
@@ -3172,6 +3272,16 @@ for mutation in \
     exit 1
   fi
 done
+jq --arg rate_limit "$legacy_rate_limit_error" \
+  '.api_errors = [$rate_limit,
+    "trades 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb: The read operation timed out"]' \
+  "$tmp_dir/legacy-health.json" >"$tmp_dir/mixed-legacy-health.json"
+if legacy_start_health_policy_clean \
+  "$(jq -cS . "$tmp_dir/mixed-legacy-health.json")" \
+  "$LEGACY_HEALTH_POLICY"; then
+  printf 'Gate startup policy accepted a mixed API error list\n' >&2
+  exit 1
+fi
 jq '.overdue_unresolved_markets = ["historical-market"]' \
   "$tmp_dir/legacy-health.json" >"$tmp_dir/historical-overdue-legacy-health.json"
 jq -e -f "$LEGACY_HEALTH_POLICY" \
@@ -3200,6 +3310,7 @@ if baseline_health_requires_continuous_freshness legacy_python; then
   exit 1
 fi
 baseline_health_requires_continuous_freshness rust_release
+grep -Fq '"$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true)' "$GATE"
 legacy_runtime_budget_contract="$tmp_dir/legacy-runtime-budget.sh"
 sed -n \
   -e '/^readonly REQUIRED_DURATION_SECONDS=/p' \
@@ -3541,6 +3652,13 @@ jq -n '{
   overdue_unresolved_markets:[]
 }' >"$tmp_dir/rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/rust-health.json" >/dev/null
+jq --arg error "$legacy_rate_limit_error" '.api_errors = [$error]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/rate-limited-rust-health.json"
+if jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/rate-limited-rust-health.json" >/dev/null; then
+  printf 'Rust health policy accepted a legacy trades rate limit\n' >&2
+  exit 1
+fi
 jq '.overdue_unresolved_markets = ["historical-market"]' \
   "$tmp_dir/rust-health.json" >"$tmp_dir/historical-overdue-rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" \

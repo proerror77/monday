@@ -475,8 +475,25 @@ legacy_health_publication_after_gate() {
   ((written_at >= gate_started_at)) && [[ $completion_identity != "$start_identity" ]]
 }
 
+legacy_start_health_policy_clean() {
+  local snapshot=$1 policy=$2
+  if jq -e -f "$policy" <<<"$snapshot" >/dev/null; then
+    return 0
+  fi
+  jq -e '
+    .api_errors
+    | type == "array" and length <= 3
+    and all(.[];
+      type == "string"
+      and test("^trades 0x[0-9A-Fa-f]{64}: HTTP Error 429: Too Many Requests\\z"))
+  ' <<<"$snapshot" >/dev/null \
+    && jq '.api_errors = []' <<<"$snapshot" \
+      | jq -e -f "$policy" >/dev/null
+}
+
 fresh_legacy_health_observation() {
-  local health=$1 policy=$2 before after snapshot field timestamp epoch now
+  local health=$1 policy=$2 allow_bounded_rate_limits=${3:-false}
+  local before after snapshot field timestamp epoch now
   local stable=false
   local _device _inode _size written_at_unix _changed_at_unix
   [[ -f $health && ! -L $health ]] || return 1
@@ -492,7 +509,17 @@ fresh_legacy_health_observation() {
     fi
   done
   [[ $stable == true ]] || return 1
-  jq -e -f "$policy" <<<"$snapshot" >/dev/null || return 1
+  case "$allow_bounded_rate_limits" in
+    true)
+      legacy_start_health_policy_clean "$snapshot" "$policy" || return 1
+      ;;
+    false)
+      jq -e -f "$policy" <<<"$snapshot" >/dev/null || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
   IFS=: read -r _device _inode _size written_at_unix _changed_at_unix \
     <<<"$before"
   [[ $written_at_unix =~ ^[0-9]+$ ]] || return 1
@@ -1377,8 +1404,8 @@ if [[ $baseline_mode == legacy_python \
     || die 'baseline identity changed before legacy health admission'
   baseline_health_observation=$(fresh_legacy_health_observation \
     "$LEGACY_SPOOL/health.json" \
-    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}") \
-    || die 'active legacy collector health is not fresh and fail-closed clean'
+    "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" true) \
+    || die 'active legacy collector health is not fresh or Gate-admissible'
   baseline_health_snapshot=$(jq -c '.health' <<<"$baseline_health_observation") \
     || die 'admitted legacy collector health observation is invalid'
   baseline_health_start_written_at_unix=$(jq -er '.written_at_unix' \
