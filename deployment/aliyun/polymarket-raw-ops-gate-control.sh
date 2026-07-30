@@ -121,7 +121,7 @@ install_gate_unit() {
     temporary="$SYSTEMD_UNIT_DIR/.${UNIT_TEMPLATE}.$$"
     backup="$SYSTEMD_UNIT_DIR/.${UNIT_TEMPLATE}.rollback.$$"
     (
-      # shellcheck disable=SC2329  # Invoked by the EXIT trap below.
+      # shellcheck disable=SC2317,SC2329  # Invoked by the EXIT trap below.
       rollback_gate_unit_install() {
         local status=$?
         rm -f -- "$temporary"
