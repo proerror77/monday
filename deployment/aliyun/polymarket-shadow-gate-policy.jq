@@ -259,7 +259,11 @@ and .checks.memory_events_stable == true
 and .checks.oss_readback_parity == true
 and .checks.market_oss_readback_parity == true
 and .checks.real_market_segment_preflight == true
-and (.comparison_mode == "legacy_overlap" or .comparison_mode == "rust_self")
+and (.comparison_mode == "legacy_overlap" or (
+  .comparison_mode == "rust_self"
+  and .baseline_mode == "legacy_python"
+  and .baseline_runtime_stability_required == false
+))
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.market_oss_uploaded_segments | positive_integer)

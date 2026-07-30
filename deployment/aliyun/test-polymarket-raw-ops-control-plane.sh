@@ -2586,6 +2586,7 @@ jq -e -f "$POLICY" "$tmp_dir/rust-self-gate.json" >/dev/null || {
   exit 1
 }
 for mutation in \
+  '.baseline_runtime_stability_required = true' \
   '.metrics.legacy_trade_count = 1' \
   '.metrics.rust_settlement_count = 0' \
   '.checks.settlement_parity = false'; do
