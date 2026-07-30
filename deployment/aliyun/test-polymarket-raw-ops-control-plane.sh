@@ -2352,6 +2352,7 @@ parity="$tmp_dir/parity.json"
   --ended-at-unix 1000 \
   --output "$parity"
 jq -e '.passed == true and .checks.metadata_parity == true
+  and .comparison_mode == "legacy_overlap"
   and ([.checks[]] | all)
   and .metrics.legacy_trade_count == 2
   and .metrics.rust_trade_count == 2
@@ -2360,6 +2361,41 @@ jq -e '.passed == true and .checks.metadata_parity == true
   and (.metrics.normalized_metadata_sha256 | test("^[a-f0-9]{64}$"))
   and (.metrics.normalized_settlement_sha256 | test("^[a-f0-9]{64}$"))' \
   "$parity" >/dev/null
+
+legacy_empty="$tmp_dir/legacy-empty"
+mkdir "$legacy_empty"
+: >"$legacy_empty/market-updates.ndjson"
+rust_self_parity="$tmp_dir/rust-self-parity.json"
+"$VERIFY" verify-shadow-parity \
+  --legacy-spool "$legacy_empty" --rust-spool "$rust" \
+  --started-at-unix 100 --ended-at-unix 1000 \
+  --output "$rust_self_parity" --allow-empty-legacy
+jq -e '.passed == true and .comparison_mode == "rust_self"
+  and ([.checks[]] | all)
+  and .metrics.legacy_trade_count == 0
+  and .metrics.legacy_metadata_count == 0
+  and .metrics.legacy_settlement_count == 0
+  and .metrics.rust_trade_count > 0
+  and .metrics.rust_metadata_count > 0
+  and .metrics.rust_settlement_count > 0' "$rust_self_parity" >/dev/null
+
+rust_self_missing_settlement="$tmp_dir/rust-self-missing-settlement"
+cp -R "$rust" "$rust_self_missing_settlement"
+jq -c 'select(.update.kind != "market_settlement")' \
+  "$rust_self_missing_settlement/market-updates.19700101T000400000000.ndjson" \
+  >"$rust_self_missing_settlement/market-updates.rewritten"
+mv "$rust_self_missing_settlement/market-updates.rewritten" \
+  "$rust_self_missing_settlement/market-updates.19700101T000400000000.ndjson"
+if "$VERIFY" verify-shadow-parity --legacy-spool "$legacy_empty" \
+  --rust-spool "$rust_self_missing_settlement" --started-at-unix 100 \
+  --ended-at-unix 1000 --output "$tmp_dir/bad-rust-self-parity.json" \
+  --allow-empty-legacy 2>/dev/null; then
+  printf 'Rust-self parity accepted a window without settlements\n' >&2
+  exit 1
+fi
+jq -e '.passed == false and .comparison_mode == "rust_self"
+  and .checks.settlement_parity == false' \
+  "$tmp_dir/bad-rust-self-parity.json" >/dev/null
 jq -e 'select(.update.transaction_hash == "0xlate")
   | .update.trade_ts_unix == 319
     and .update.trade.timestamp == 319
@@ -2539,6 +2575,28 @@ jq -e -f "$POLICY" "$tmp_dir/python-nonblocking-legacy-gate.json" >/dev/null || 
   printf 'gate policy rejected approved legacy-nonblocking evidence\n' >&2
   exit 1
 }
+jq '.comparison_mode = "rust_self"
+  | .metrics.legacy_trade_count = 0
+  | .metrics.legacy_metadata_count = 0
+  | .metrics.legacy_settlement_count = 0' \
+  "$tmp_dir/python-nonblocking-legacy-gate.json" \
+  >"$tmp_dir/rust-self-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/rust-self-gate.json" >/dev/null || {
+  printf 'gate policy rejected valid Rust-self parity evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  '.baseline_runtime_stability_required = true' \
+  '.metrics.legacy_trade_count = 1' \
+  '.metrics.rust_settlement_count = 0' \
+  '.checks.settlement_parity = false'; do
+  jq "$mutation" "$tmp_dir/rust-self-gate.json" \
+    >"$tmp_dir/forged-rust-self-gate.json"
+  if jq -e -f "$POLICY" "$tmp_dir/forged-rust-self-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged Rust-self parity evidence\n' >&2
+    exit 1
+  fi
+done
 for field in baseline_health_start_required baseline_runtime_stability_required; do
   [[ $(jq -er --arg field "$field" \
     '.[$field] | select(type == "boolean") | tostring' \
@@ -3641,6 +3699,8 @@ if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]
   exit 1
 fi
 grep -Fq 'verify-shadow-parity' "$GATE"
+grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
+grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"
 [[ ! -e "$SCRIPT_DIR/verify-polymarket-shadow-parity.py" ]]
 if grep -Fq 'python3 "$PARITY_VERIFIER"' "$GATE"; then
   printf 'shadow gate still invokes the retired legacy parity verifier\n' >&2
@@ -3715,7 +3775,7 @@ thawed_state_line=$(grep -n '^shadow_thawed_state=.*FreezerState' "$GATE" \
 final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
 finalize_line=$(grep -n '"$release_binary" finalize-reference-tape' "$GATE" \
   | tail -1 | cut -d: -f1 || true)
-parity_line=$(grep -n '"$release_binary" verify-shadow-parity' "$GATE" \
+parity_line=$(grep -n '"$release_binary" "${parity_args\[@\]}"' "$GATE" \
   | tail -1 | cut -d: -f1)
 [[ $freeze_line =~ ^[1-9][0-9]*$ \
   && $freezer_state_line =~ ^[1-9][0-9]*$ \

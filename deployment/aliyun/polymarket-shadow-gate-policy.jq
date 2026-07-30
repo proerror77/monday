@@ -259,6 +259,11 @@ and .checks.memory_events_stable == true
 and .checks.oss_readback_parity == true
 and .checks.market_oss_readback_parity == true
 and .checks.real_market_segment_preflight == true
+and (.comparison_mode == "legacy_overlap" or (
+  .comparison_mode == "rust_self"
+  and .baseline_mode == "legacy_python"
+  and .baseline_runtime_stability_required == false
+))
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.market_oss_uploaded_segments | positive_integer)
@@ -268,20 +273,26 @@ and (.metrics.market_oss_uploaded_segments
 and (.metrics.market_oss_canonical_uploaded_segments
   == .real_market_preflight.upload_summary.canonical_uploaded_segments)
 and (.metrics.rust_closed_tape_count | positive_integer)
-and (.metrics.legacy_trade_count | positive_integer)
 and (.metrics.rust_trade_count | positive_integer)
 and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
 and (.metrics.rust_only_trade_ids | type == "array")
-and (.metrics.legacy_metadata_count | positive_integer)
 and (.metrics.rust_metadata_count | positive_integer)
 and (.metrics.legacy_only_metadata_ids | type == "array" and length == 0)
 and (.metrics.rust_only_metadata_ids | type == "array")
 and .metrics.metadata_shared_values_match == true
 and (.metrics.metadata_shared_value_mismatch_ids | type == "array" and length == 0)
-and (.metrics.legacy_settlement_count | positive_integer)
 and (.metrics.rust_settlement_count | positive_integer)
 and (.metrics.legacy_only_settlement_ids | type == "array" and length == 0)
 and (.metrics.rust_only_settlement_ids | type == "array")
+and (if .comparison_mode == "legacy_overlap" then
+  (.metrics.legacy_trade_count | positive_integer)
+  and (.metrics.legacy_metadata_count | positive_integer)
+  and (.metrics.legacy_settlement_count | positive_integer)
+else
+  .metrics.legacy_trade_count == 0
+  and .metrics.legacy_metadata_count == 0
+  and .metrics.legacy_settlement_count == 0
+end)
 and .metrics.settlement_shared_values_match == true
 and (.metrics.settlement_shared_value_mismatch_ids | type == "array" and length == 0)
 and .metrics.trade_shared_values_match == true

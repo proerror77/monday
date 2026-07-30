@@ -114,6 +114,8 @@ enum Command {
         ended_at_unix: i64,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        allow_empty_legacy: bool,
     },
     /// Fail closed unless staged market/reference segments are research-safe.
     ValidateResearchSegments {
@@ -288,6 +290,7 @@ async fn run(cli: Cli) -> Result<()> {
             started_at_unix,
             ended_at_unix,
             output,
+            allow_empty_legacy,
         } => {
             let config = ShadowParityConfig {
                 legacy_spool,
@@ -295,6 +298,7 @@ async fn run(cli: Cli) -> Result<()> {
                 started_at_unix,
                 ended_at_unix,
                 output,
+                allow_empty_legacy,
             };
             if !verify_shadow_parity(&config)? {
                 bail!("byte/field/dedupe/settlement/rotation parity failed");
