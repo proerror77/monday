@@ -122,6 +122,8 @@ and .passed == true
 and (
   (
     .baseline_mode == "legacy_python"
+    and .baseline_health_start_required == true
+    and .baseline_runtime_stability_required == true
     and (.baseline_health_snapshot | legacy_health_snapshot)
     and (.baseline_health_start_success_unix | positive_integer)
     and ((.baseline_health_snapshot.last_success_at | utc_iso8601_unix)
@@ -171,7 +173,28 @@ and (
   )
   or
   (
+    .baseline_mode == "legacy_python"
+    and .baseline_health_start_required == false
+    and .baseline_runtime_stability_required == false
+    and .baseline_health_completion_required == false
+    and .baseline_health_snapshot == null
+    and .baseline_health_completion_snapshot == null
+    and .baseline_health_start_success_unix == null
+    and .baseline_health_cutoff_unix == null
+    and .baseline_health_start_written_at_unix == null
+    and .baseline_health_completion_written_at_unix == null
+    and .baseline_health_start_file_identity == null
+    and .baseline_health_completion_file_identity == null
+    and (.legacy_runtime |
+      runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
+        "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
+      and ([has("release_path"),has("release_sha256"),has("proc_exe")] | any | not))
+  )
+  or
+  (
     .baseline_mode == "rust_release"
+    and .baseline_health_start_required == false
+    and .baseline_runtime_stability_required == true
     and .baseline_health_completion_required == false
     and .baseline_health_snapshot == null
     and .baseline_health_completion_snapshot == null
