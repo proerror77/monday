@@ -137,10 +137,10 @@ struct UploadedSegment {
     canonical_complete: bool,
 }
 
-struct ExclusiveTempDir(PathBuf);
+pub(crate) struct ExclusiveTempDir(PathBuf);
 
 impl ExclusiveTempDir {
-    fn create(parent: &Path, prefix: &str) -> Result<Self> {
+    pub(crate) fn create(parent: &Path, prefix: &str) -> Result<Self> {
         ensure_canonical_directory(parent)?;
         for _ in 0..32 {
             let path = parent.join(format!("{prefix}.{:016x}", random::<u64>()));
@@ -153,7 +153,7 @@ impl ExclusiveTempDir {
         bail!("could not allocate an exclusive temporary directory")
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -164,7 +164,7 @@ impl Drop for ExclusiveTempDir {
     }
 }
 
-fn utc_now() -> String {
+pub(crate) fn utc_now() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
@@ -1720,7 +1720,7 @@ fn exclusive_sibling(path: &Path, suffix: &str) -> Result<(PathBuf, File)> {
     bail!("could not allocate an exclusive temporary file")
 }
 
-fn atomic_json(path: &Path, payload: &Value) -> Result<()> {
+pub(crate) fn atomic_json(path: &Path, payload: &Value) -> Result<()> {
     let (temporary, mut file) = exclusive_sibling(path, ".tmp")?;
     let result = (|| -> Result<()> {
         serde_json::to_writer(&mut file, payload)?;
@@ -2111,7 +2111,7 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     Ok(uploaded)
 }
 
-fn read_status(path: &Path) -> Result<Map<String, Value>> {
+pub(crate) fn read_status(path: &Path) -> Result<Map<String, Value>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {

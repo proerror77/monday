@@ -127,4 +127,35 @@ if grep -Fq 'polymarket-raw-ops-control' <<<"$reference_release"; then
   exit 1
 fi
 
+reference_production_assets=$(sed -n \
+  '/^          reference_production_assets=(/,/^          )/p' "$workflow")
+[[ $(grep -cE '^            binance-usdm-reference-' <<<"$reference_assets") == 3 ]] || {
+  printf '%s\n' 'Reference shadow bundle must keep exactly three assets' >&2
+  exit 1
+}
+for asset in \
+  binance-usdm-reference-collector.service \
+  binance-usdm-reference-upload.service \
+  binance-usdm-reference-upload.timer \
+  binance-usdm-reference-upload.env \
+  binance-usdm-reference-cutover.sh; do
+  grep -Fq "$asset" <<<"$reference_production_assets"
+  [[ -f $script_dir/$asset ]] || {
+    printf 'reference production asset is missing: %s\n' "$asset" >&2
+    exit 1
+  }
+  if grep -Fq "$asset" <<<"$reference_assets" || grep -Fq "$asset" <<<"$shared_assets"; then
+    printf '%s\n' \
+      'Reference production assets must stay out of the shadow and Polymarket bundles' >&2
+    exit 1
+  fi
+done
+[[ $(grep -cE '^            binance-usdm-reference-' <<<"$reference_production_assets") == 5 ]] \
+  || {
+    printf '%s\n' 'Reference production bundle must contain exactly five assets' >&2
+    exit 1
+  }
+grep -Fq 'binance-usdm-reference-production-control-assets.sha256' "$workflow"
+grep -Fq 'binance-usdm-reference-production-control.tar.gz' "$workflow"
+
 printf '%s\n' 'Binance USD-M reference shadow gate tests passed'
