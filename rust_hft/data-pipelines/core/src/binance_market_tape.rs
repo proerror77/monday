@@ -848,7 +848,9 @@ impl RawTradeSequenceValidator {
 }
 
 /// Best bid/ask ticker; carries an update id but no sequence guarantee, so only
-/// source/receive clock bounds and payload sanity are enforced.
+/// source/receive clock bounds and payload sanity are enforced. Spot frames
+/// carry no event identity or source clocks (`e`/`E`/`T` are USD-M only), so
+/// for them `event_time_ms` falls back to the receive clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookTicker {
     pub symbol: String,
@@ -872,25 +874,39 @@ impl BookTicker {
 
     pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
         let data = frame.get("data").unwrap_or(frame);
-        if data.get("e").and_then(Value::as_str) != Some("bookTicker") {
-            anyhow::bail!("book ticker frame has the wrong event identity");
-        }
-        let symbol = required_string(data, "s", "book ticker")?.to_ascii_uppercase();
+        // The frame shape decides the market: USD-M frames carry an explicit
+        // event identity and source clocks, spot frames carry neither.
+        let usdm = match data.get("e").and_then(Value::as_str) {
+            Some("bookTicker") => true,
+            Some(_) => anyhow::bail!("book ticker frame has the wrong event identity"),
+            None => false,
+        };
+        let symbol = if usdm {
+            required_string(data, "s", "book ticker")?.to_ascii_uppercase()
+        } else {
+            spot_symbol(frame, data, "book ticker")?
+        };
         validate_stream_identity(frame, &symbol, "bookTicker")?;
         let update_id = required_u64(data, "u", "book ticker")?;
         let best_bid_price = positive_decimal(data, "b", "book ticker")?;
         let best_bid_quantity = positive_decimal(data, "B", "book ticker")?;
         let best_ask_price = positive_decimal(data, "a", "book ticker")?;
         let best_ask_quantity = positive_decimal(data, "A", "book ticker")?;
-        let event_time_ms = required_u64(data, "E", "book ticker")?;
-        let transaction_time_ms = optional_u64(data, "T", "book ticker")?;
-        if transaction_time_ms.is_some_and(|transaction| transaction > event_time_ms) {
-            anyhow::bail!("book ticker source clocks are reversed");
-        }
-        validate_receive_clock(event_time_ms, received_at_ns, "book ticker")?;
-        if let Some(transaction_time_ms) = transaction_time_ms {
-            validate_receive_clock(transaction_time_ms, received_at_ns, "book ticker")?;
-        }
+        let event_time_ms = if usdm {
+            let event_time_ms = required_u64(data, "E", "book ticker")?;
+            let transaction_time_ms = optional_u64(data, "T", "book ticker")?;
+            if transaction_time_ms.is_some_and(|transaction| transaction > event_time_ms) {
+                anyhow::bail!("book ticker source clocks are reversed");
+            }
+            validate_receive_clock(event_time_ms, received_at_ns, "book ticker")?;
+            if let Some(transaction_time_ms) = transaction_time_ms {
+                validate_receive_clock(transaction_time_ms, received_at_ns, "book ticker")?;
+            }
+            event_time_ms
+        } else {
+            // Spot frames carry no source clock; only the receive clock bounds.
+            received_at_ns / 1_000_000
+        };
         Ok(Self {
             symbol,
             update_id,
@@ -974,6 +990,21 @@ fn validate_stream_identity(frame: &Value, symbol: &str, channel: &str) -> Resul
         anyhow::bail!("{channel} frame has the wrong stream identity");
     }
     Ok(())
+}
+
+/// Spot payloads carry no event identity, so `s` is the only symbol field;
+/// fall back to the combined-stream name when it is absent.
+fn spot_symbol(frame: &Value, data: &Value, kind: &str) -> Result<String> {
+    if let Ok(symbol) = required_string(data, "s", kind) {
+        return Ok(symbol.to_ascii_uppercase());
+    }
+    let symbol = frame
+        .get("stream")
+        .and_then(Value::as_str)
+        .and_then(|stream| stream.split('@').next())
+        .filter(|symbol| !symbol.is_empty())
+        .with_context(|| format!("{kind} field s is missing"))?;
+    Ok(symbol.to_ascii_uppercase())
 }
 
 fn validate_receive_clock(event_time_ms: u64, received_at_ns: u64, kind: &str) -> Result<()> {
@@ -1405,6 +1436,21 @@ mod tests {
     }
 
     #[rustfmt::skip]
+    fn spot_book_ticker_frame() -> Value {
+        json!({
+            "stream": "btcusdt@bookTicker",
+            "data": {
+                "u": 400900217,
+                "s": "BTCUSDT",
+                "b": "100.5",
+                "B": "31.21",
+                "a": "100.6",
+                "A": "40.66"
+            }
+        })
+    }
+
+    #[rustfmt::skip]
     fn force_order_frame(event_time_ms: u64, trade_time_ms: u64) -> Value {
         json!({
             "stream": "btcusdt@forceOrder",
@@ -1546,6 +1592,49 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("positive"));
+    }
+
+    #[test]
+    fn spot_book_ticker_frame_parses_without_source_clocks() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        // Spot bookTicker frames carry no e/E/T fields; the receive clock is
+        // the only time anchor.
+        let ticker = BookTicker::from_frame(&spot_book_ticker_frame(), received_at_ns).unwrap();
+        assert_eq!(ticker.symbol, "BTCUSDT");
+        assert_eq!(ticker.update_id, 400900217);
+        assert_eq!(ticker.event_time_ms, received_at_ns / 1_000_000);
+
+        // Without an `s` field the combined-stream name is the only symbol source.
+        let mut stream_only = spot_book_ticker_frame();
+        stream_only["data"].as_object_mut().unwrap().remove("s");
+        let ticker = BookTicker::from_frame(&stream_only, received_at_ns).unwrap();
+        assert_eq!(ticker.symbol, "BTCUSDT");
+    }
+
+    #[test]
+    fn spot_book_ticker_frame_fails_closed_on_bad_payload() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        let mut non_positive = spot_book_ticker_frame();
+        non_positive["data"]["a"] = json!("0");
+        assert!(BookTicker::from_frame(&non_positive, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("positive"));
+
+        // No `s` field and no stream name to derive it from.
+        let bare = json!({"data": {"u": 400900217, "b": "100.5", "B": "31.21", "a": "100.6", "A": "40.66"}});
+        assert!(BookTicker::from_frame(&bare, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
+
+        // USD-M frames keep their strict source-clock validation.
+        let mut no_event_time = book_ticker_frame(1_700_000_000_000);
+        no_event_time["data"].as_object_mut().unwrap().remove("E");
+        assert!(BookTicker::from_frame(&no_event_time, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
     }
 
     #[test]

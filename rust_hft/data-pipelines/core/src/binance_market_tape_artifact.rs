@@ -1377,6 +1377,11 @@ mod tests {
     }
 
     #[rustfmt::skip]
+    fn spot_book_ticker_row(received_at_ns: u64) -> Value {
+        json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"book_ticker","session_id":"session-1","frame":{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"100.5","B":"31.21","a":"100.6","A":"40.66"}}})
+    }
+
+    #[rustfmt::skip]
     fn force_order_row(received_at_ns: u64) -> Value {
         json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"force_order","session_id":"session-1","frame":{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":received_at_ns/1_000_000,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910","ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":received_at_ns/1_000_000}}}})
     }
@@ -2341,6 +2346,34 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("USD-M"));
+    }
+
+    #[test]
+    fn v2_spot_book_ticker_rows_verify_for_spot_market() {
+        const SPOT_STREAM_TYPES: [&str; 4] = ["depth@100ms", "aggTrade", "trade", "bookTicker"];
+        let root = tempdir();
+        let rows = with_stream_coverage_v2(
+            vec![
+                json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":START_NS,"type":"session_start","session_id":"session-1","market":"spot","symbols":1,"websocket_shards":1,"websocket_streams":SPOT_STREAM_TYPES.len(),"stream_types":SPOT_STREAM_TYPES}),
+                v2_schema(valid_rows()[1].clone()),
+                v2_schema(depth_row(START_NS + 200_000_000, 101, 100)),
+                v2_schema(trade_row(START_NS + 300_000_000, 10)),
+                raw_trade_row(START_NS + 320_000_000, 10),
+                spot_book_ticker_row(START_NS + 340_000_000),
+                v2_schema(checkpoint_row(START_NS + 400_000_000, 101)),
+            ],
+            &["BTCUSDT"],
+            &SPOT_STREAM_TYPES,
+        );
+        let event_count = rows.len() as u64;
+        let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &SPOT_STREAM_TYPES);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["market"] = json!("spot");
+        });
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified = verify_binance_market_tape(vec![sealed]).unwrap();
+        assert_eq!(verified.segments()[0].events, event_count);
     }
 
     #[test]
