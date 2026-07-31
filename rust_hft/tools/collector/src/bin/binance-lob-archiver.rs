@@ -1,8 +1,8 @@
 use anyhow::{bail, Context};
 use clap::Parser;
 use data::binance_market_tape::{
-    AggregateTrade, AggregateTradeSequenceValidator, DepthSourceClock,
-    DepthSourceClockSequenceValidator,
+    AggregateTrade, AggregateTradeSequenceValidator, BookTicker, DepthSourceClock,
+    DepthSourceClockSequenceValidator, ForceOrder, RawTrade, RawTradeSequenceValidator,
 };
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet, verify_binance_market_tape_for_strict_gate,
@@ -116,11 +116,39 @@ const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
 const SUBSCRIPTION_PROOF_ID: u64 = 1;
 const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RECONNECT_PROOF_BUFFERED_EVENTS: usize = 16_384;
+/// Raw trade and bookTicker shards sustain a much higher message rate than
+/// depth@100ms, aggTrade, or forceOrder shards (hot symbols burst into the
+/// 10^2-10^3 msgs/s range), so their reconnect subscription-proof window needs
+/// a larger per-shard buffer: 4x the low-rate budget covers the 20s proof
+/// timeout at ~3.2k msgs/s while still failing closed on a runaway shard.
+const MAX_RECONNECT_PROOF_BUFFERED_HIGH_RATE_EVENTS: usize = 65_536;
+/// Extra archive-queue backlog per high-rate shard. The rotation barrier
+/// gather can stall the consumer for up to the stall timeout while producers
+/// keep capturing, so each high-rate shard adds its own burst load on top of
+/// MAX_BUFFERED_DIFFS; sized equal to its reconnect-proof budget so one full
+/// proof window of burst cannot overflow the queue by itself.
+const HIGH_RATE_SHARD_QUEUE_BACKLOG: usize = 65_536;
 
 #[derive(Debug, Clone)]
 struct StreamShard {
     url: String,
     streams: BTreeSet<String>,
+}
+
+impl StreamShard {
+    fn is_high_rate(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|stream| stream.ends_with("@trade") || stream.ends_with("@bookTicker"))
+    }
+
+    fn reconnect_proof_buffer_budget(&self) -> usize {
+        if self.is_high_rate() {
+            MAX_RECONNECT_PROOF_BUFFERED_HIGH_RATE_EVENTS
+        } else {
+            MAX_RECONNECT_PROOF_BUFFERED_EVENTS
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -243,6 +271,22 @@ impl Config {
         })
     }
 
+    /// Declared per-symbol stream-type list carried by the v2 tape manifest
+    /// and repeated by every session_start row. Liquidation orders are USD-M
+    /// only, so spot tapes declare one fewer stream type.
+    fn stream_types(&self) -> Vec<String> {
+        let mut stream_types = vec![
+            "depth@100ms".to_owned(),
+            "aggTrade".to_owned(),
+            "trade".to_owned(),
+            "bookTicker".to_owned(),
+        ];
+        if self.market == Market::Usdm {
+            stream_types.push("forceOrder".to_owned());
+        }
+        stream_types
+    }
+
     fn segment_config(&self) -> SegmentConfig {
         SegmentConfig {
             spool_dir: self.spool_dir.clone(),
@@ -254,6 +298,7 @@ impl Config {
             excluded_symbols: self.excluded_symbols(),
             snapshot_limit: self.snapshot_limit,
             zstd_timeout: self.zstd_timeout,
+            stream_types: self.stream_types(),
         }
     }
 
@@ -269,8 +314,22 @@ impl Config {
                     .iter()
                     .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
                     .collect::<BTreeSet<_>>();
+                let trade_streams = symbols
+                    .iter()
+                    .map(|symbol| format!("{}@trade", symbol.to_ascii_lowercase()))
+                    .collect::<BTreeSet<_>>();
+                let book_ticker_streams = symbols
+                    .iter()
+                    .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
+                    .collect::<BTreeSet<_>>();
                 let depth = depth_streams.iter().cloned().collect::<Vec<_>>().join("/");
                 let aggregate_trades = aggregate_trade_streams
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let trades = trade_streams.iter().cloned().collect::<Vec<_>>().join("/");
+                let book_tickers = book_ticker_streams
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>()
@@ -287,19 +346,58 @@ impl Config {
                             ),
                             streams: aggregate_trade_streams,
                         },
-                    ],
-                    Market::Usdm => vec![
                         StreamShard {
-                            url: format!("wss://fstream.binance.com/public/stream?streams={depth}"),
-                            streams: depth_streams,
+                            url: format!("wss://data-stream.binance.vision/stream?streams={trades}"),
+                            streams: trade_streams,
                         },
                         StreamShard {
                             url: format!(
-                                "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                                "wss://data-stream.binance.vision/stream?streams={book_tickers}"
                             ),
-                            streams: aggregate_trade_streams,
+                            streams: book_ticker_streams,
                         },
                     ],
+                    Market::Usdm => {
+                        let force_order_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@forceOrder", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let force_orders = force_order_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        vec![
+                            StreamShard {
+                                url: format!("wss://fstream.binance.com/public/stream?streams={depth}"),
+                                streams: depth_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                                ),
+                                streams: aggregate_trade_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={trades}"
+                                ),
+                                streams: trade_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={book_tickers}"
+                                ),
+                                streams: book_ticker_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={force_orders}"
+                                ),
+                                streams: force_order_streams,
+                            },
+                        ]
+                    }
                 }
             })
             .collect()
@@ -360,6 +458,18 @@ enum Event {
     },
     AggregateTrade {
         trade: AggregateTrade,
+        frame: Value,
+    },
+    RawTrade {
+        trade: RawTrade,
+        frame: Value,
+    },
+    BookTicker {
+        ticker: BookTicker,
+        frame: Value,
+    },
+    ForceOrder {
+        order: ForceOrder,
         frame: Value,
     },
     Snapshot {
@@ -425,6 +535,7 @@ struct ProcessState {
     sequence_gaps: u64,
     depth_source_clocks: DepthSourceClockSequenceValidator,
     aggregate_trades: AggregateTradeSequenceValidator,
+    raw_trades: RawTradeSequenceValidator,
     stream_coverage_trusted: bool,
     stream_coverage_shards: Vec<Vec<String>>,
     reconnecting_shards: Vec<BTreeSet<String>>,
@@ -819,13 +930,20 @@ async fn run_session(
     if active_symbols.is_empty() {
         anyhow::bail!("no active symbols remain after runtime exclusions");
     }
-    let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
+    let stream_shards = config.stream_shards();
+    let high_rate_shards = stream_shards
+        .iter()
+        .filter(|shard| shard.is_high_rate())
+        .count();
+    let queue_capacity = config
+        .max_buffered_diffs
+        .saturating_add(high_rate_shards.saturating_mul(HIGH_RATE_SHARD_QUEUE_BACKLOG));
+    let (sender, mut receiver) = mpsc::channel(queue_capacity);
     let (rotation_pause_tx, rotation_pause_rx) = watch::channel(0_u64);
     let (rotation_resume_tx, rotation_resume_rx) = watch::channel(0_u64);
     let mut rotation_epoch = 0_u64;
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    let stream_shards = config.stream_shards();
     let expected_shards = stream_shards.len();
     let expected_rotation_producers = expected_shards
         .checked_add(1)
@@ -874,6 +992,7 @@ async fn run_session(
             "symbols": active_symbols.len(),
             "websocket_shards": expected_shards,
             "websocket_streams": expected_streams,
+            "stream_types": config.stream_types(),
         }),
         now_ns()?,
     )?;
@@ -1215,6 +1334,83 @@ fn process_event(
                 return Ok(ProcessAction::RestartSession);
             }
         }
+        Event::RawTrade { trade, frame } => {
+            if config.is_excluded(&trade.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&trade.symbol) {
+                anyhow::bail!("unconfigured symbol {}", trade.symbol);
+            }
+            if let Err(error) = process_state.raw_trades.observe(&trade) {
+                segment.mark_replay_unsafe();
+                process_state.sequence_gaps += 1;
+                segment.write(
+                    "sequence_gap",
+                    json!({
+                        "session_id":session_id,
+                        "kind":"raw_trade_sequence",
+                        "symbol":trade.symbol,
+                        "error":error.to_string(),
+                        "frame":frame,
+                    }),
+                    trade.received_at_ns,
+                )?;
+                return Err(error);
+            }
+            segment.write(
+                "raw_trade",
+                json!({"session_id":session_id,"frame":frame}),
+                trade.received_at_ns,
+            )?;
+            let stream_name = format!("{}@trade", trade.symbol.to_ascii_lowercase());
+            let reconnecting_before = !process_state.streams_healthy();
+            process_state.mark_stream_observed(&stream_name);
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
+        }
+        Event::BookTicker { ticker, frame } => {
+            if config.is_excluded(&ticker.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&ticker.symbol) {
+                anyhow::bail!("unconfigured symbol {}", ticker.symbol);
+            }
+            segment.write(
+                "book_ticker",
+                json!({"session_id":session_id,"frame":frame}),
+                ticker.received_at_ns,
+            )?;
+            let stream_name = format!("{}@bookTicker", ticker.symbol.to_ascii_lowercase());
+            let reconnecting_before = !process_state.streams_healthy();
+            process_state.mark_stream_observed(&stream_name);
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
+        }
+        Event::ForceOrder { order, frame } => {
+            anyhow::ensure!(
+                config.market == Market::Usdm,
+                "forceOrder liquidation streams are USD-M only"
+            );
+            if config.is_excluded(&order.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&order.symbol) {
+                anyhow::bail!("unconfigured symbol {}", order.symbol);
+            }
+            segment.write(
+                "force_order",
+                json!({"session_id":session_id,"frame":frame}),
+                order.received_at_ns,
+            )?;
+            let stream_name = format!("{}@forceOrder", order.symbol.to_ascii_lowercase());
+            let reconnecting_before = !process_state.streams_healthy();
+            process_state.mark_stream_observed(&stream_name);
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
+        }
         Event::Snapshot {
             received_at_ns,
             symbol,
@@ -1265,7 +1461,7 @@ fn process_event(
             return Ok(ProcessAction::InitialSnapshotsComplete);
         }
         Event::StreamCoverageVerified { shards } => {
-            let stream_count = validate_stream_coverage_shards(&shards, states)?;
+            let stream_count = validate_stream_coverage_shards(&shards, states, &config.stream_types())?;
             let shard_count = shards.len();
             info!(
                 shard_count,
@@ -1435,6 +1631,21 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
             trade.received_at_ns,
         ),
+        Event::RawTrade { trade, frame } => segment.write(
+            "raw_trade",
+            json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+            trade.received_at_ns,
+        ),
+        Event::BookTicker { ticker, frame } => segment.write(
+            "book_ticker",
+            json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+            ticker.received_at_ns,
+        ),
+        Event::ForceOrder { order, frame } => segment.write(
+            "force_order",
+            json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+            order.received_at_ns,
+        ),
         Event::Snapshot {
             received_at_ns,
             symbol,
@@ -1476,6 +1687,7 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
 fn validate_stream_coverage_shards(
     shards: &[Vec<String>],
     states: &HashMap<String, OrderBookState>,
+    stream_types: &[String],
 ) -> anyhow::Result<usize> {
     anyhow::ensure!(
         !shards.is_empty() && shards.iter().all(|shard| !shard.is_empty()),
@@ -1491,10 +1703,9 @@ fn validate_stream_coverage_shards(
         .keys()
         .flat_map(|symbol| {
             let symbol = symbol.to_ascii_lowercase();
-            [
-                format!("{symbol}@depth@100ms"),
-                format!("{symbol}@aggTrade"),
-            ]
+            stream_types
+                .iter()
+                .map(move |stream_type| format!("{symbol}@{stream_type}"))
         })
         .collect::<BTreeSet<_>>();
     anyhow::ensure!(
@@ -1849,6 +2060,7 @@ async fn receive_url(
     mut rotation_resume: watch::Receiver<u64>,
 ) -> anyhow::Result<TaskExit> {
     let streams = shard.streams.iter().cloned().collect::<Vec<_>>();
+    let proof_buffer_budget = shard.reconnect_proof_buffer_budget();
     let mut coverage_announced = false;
     let mut reconnect_backoff = 1_u64;
     let mut last_pause_epoch = 0_u64;
@@ -2075,10 +2287,9 @@ async fn receive_url(
                 }
                 let event = event_from_frame(frame, received_at_ns)?;
                 if coverage_announced {
-                    if proof_events.len() >= MAX_RECONNECT_PROOF_BUFFERED_EVENTS {
+                    if proof_events.len() >= proof_buffer_budget {
                         anyhow::bail!(
-                            "websocket reconnect proof buffer exceeded {} events",
-                            MAX_RECONNECT_PROOF_BUFFERED_EVENTS
+                            "websocket reconnect proof buffer exceeded {proof_buffer_budget} events"
                         );
                     }
                     proof_events.push(event);
@@ -2336,14 +2547,27 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
             depth: Box::new(ValidatedDepth { diff, source_clock }),
         });
     }
-    if !stream
+    let channel = stream
         .rsplit_once('@')
-        .is_some_and(|(_, channel)| channel.eq_ignore_ascii_case("aggTrade"))
-    {
-        anyhow::bail!("unsupported Binance research stream {stream}");
+        .map(|(_, channel)| channel)
+        .unwrap_or_default();
+    if channel.eq_ignore_ascii_case("aggTrade") {
+        let trade = AggregateTrade::from_frame(&frame, received_at_ns)?;
+        return Ok(Event::AggregateTrade { trade, frame });
     }
-    let trade = AggregateTrade::from_frame(&frame, received_at_ns)?;
-    Ok(Event::AggregateTrade { trade, frame })
+    if channel.eq_ignore_ascii_case("trade") {
+        let trade = RawTrade::from_frame(&frame, received_at_ns)?;
+        return Ok(Event::RawTrade { trade, frame });
+    }
+    if channel.eq_ignore_ascii_case("bookTicker") {
+        let ticker = BookTicker::from_frame(&frame, received_at_ns)?;
+        return Ok(Event::BookTicker { ticker, frame });
+    }
+    if channel.eq_ignore_ascii_case("forceOrder") {
+        let order = ForceOrder::from_frame(&frame, received_at_ns)?;
+        return Ok(Event::ForceOrder { order, frame });
+    }
+    anyhow::bail!("unsupported Binance research stream {stream}");
 }
 
 async fn produce_snapshots(
@@ -3180,6 +3404,12 @@ fn self_test() -> anyhow::Result<()> {
             excluded_symbols: vec![],
             snapshot_limit: 100,
             zstd_timeout: Duration::from_secs(30),
+            stream_types: vec![
+                "depth@100ms".into(),
+                "aggTrade".into(),
+                "trade".into(),
+                "bookTicker".into(),
+            ],
         },
         1_700_000_000_000_000_000,
     )?;
@@ -3778,6 +4008,8 @@ mod tests {
                 [
                     format!("{symbol}@depth@100ms"),
                     format!("{symbol}@aggTrade"),
+                    format!("{symbol}@trade"),
+                    format!("{symbol}@bookTicker"),
                 ]
             })
             .collect()];
@@ -3785,38 +4017,96 @@ mod tests {
     }
 
     #[test]
-    fn market_tape_subscribes_depth_and_aggregate_trades_separately() {
+    fn market_tape_v2_subscribes_research_streams_as_separate_shards_per_market() {
         let spot = test_config("http://unused".into()).stream_shards();
-        assert_eq!(spot.len(), 2);
-        assert!(spot.iter().any(|shard| {
-            shard.streams.contains("btcusdt@depth@100ms")
-                && !shard.streams.contains("btcusdt@aggTrade")
-        }));
-        assert!(spot.iter().any(|shard| {
-            shard.streams.contains("btcusdt@aggTrade")
-                && !shard.streams.contains("btcusdt@depth@100ms")
-        }));
+        assert_eq!(spot.len(), 4);
+        for (stream, url_prefix) in [
+            ("btcusdt@depth@100ms", "wss://data-stream.binance.vision/stream"),
+            ("btcusdt@aggTrade", "wss://data-stream.binance.vision/stream"),
+            ("btcusdt@trade", "wss://data-stream.binance.vision/stream"),
+            ("btcusdt@bookTicker", "wss://data-stream.binance.vision/stream"),
+        ] {
+            assert!(spot.iter().any(|shard| {
+                shard.url.starts_with(url_prefix)
+                    && shard.streams.contains(stream)
+                    && shard.streams.len() == 1
+            }), "spot shard for {stream}");
+        }
 
         let mut usdm_config = test_config("http://unused".into());
         usdm_config.market = Market::Usdm;
         usdm_config.dataset = "usdm_all".into();
         let usdm = usdm_config.stream_shards();
+        assert_eq!(usdm.len(), 5);
         assert!(usdm.iter().any(|shard| {
             shard
                 .url
                 .starts_with("wss://fstream.binance.com/public/stream")
                 && shard.streams.contains("btcusdt@depth@100ms")
+                && shard.streams.len() == 1
         }));
-        assert!(usdm.iter().any(|shard| {
-            shard
-                .url
-                .starts_with("wss://fstream.binance.com/market/stream")
-                && shard.streams.contains("btcusdt@aggTrade")
-        }));
+        for stream in [
+            "btcusdt@aggTrade",
+            "btcusdt@trade",
+            "btcusdt@bookTicker",
+            "btcusdt@forceOrder",
+        ] {
+            assert!(usdm.iter().any(|shard| {
+                shard
+                    .url
+                    .starts_with("wss://fstream.binance.com/market/stream")
+                    && shard.streams.contains(stream)
+                    && shard.streams.len() == 1
+            }), "usdm shard for {stream}");
+        }
+        // Liquidation orders are USD-M only: spot never subscribes forceOrder.
         assert!(spot
             .iter()
-            .chain(&usdm)
-            .all(|shard| !shard.streams.contains("btcusdt@trade")));
+            .all(|shard| !shard.streams.contains("btcusdt@forceOrder")));
+        assert_eq!(
+            test_config("http://unused".into()).stream_types(),
+            ["depth@100ms", "aggTrade", "trade", "bookTicker"]
+        );
+        assert_eq!(
+            usdm_config.stream_types(),
+            ["depth@100ms", "aggTrade", "trade", "bookTicker", "forceOrder"]
+        );
+    }
+
+    #[test]
+    fn high_rate_shard_classification_scales_reconnect_proof_budget() {
+        let low_rate = StreamShard {
+            url: String::new(),
+            streams: BTreeSet::from([
+                "btcusdt@depth@100ms".to_owned(),
+                "ethusdt@depth@100ms".to_owned(),
+            ]),
+        };
+        assert!(!low_rate.is_high_rate());
+        assert_eq!(
+            low_rate.reconnect_proof_buffer_budget(),
+            MAX_RECONNECT_PROOF_BUFFERED_EVENTS
+        );
+        for stream in ["btcusdt@trade", "btcusdt@bookTicker"] {
+            let shard = StreamShard {
+                url: String::new(),
+                streams: BTreeSet::from([stream.to_owned()]),
+            };
+            assert!(shard.is_high_rate(), "{stream}");
+            assert_eq!(
+                shard.reconnect_proof_buffer_budget(),
+                MAX_RECONNECT_PROOF_BUFFERED_HIGH_RATE_EVENTS
+            );
+        }
+        // aggTrade and forceOrder stay in the low-rate class: aggregate trades
+        // are one message per aggregate and liquidations are sparse.
+        for stream in ["btcusdt@aggTrade", "btcusdt@forceOrder"] {
+            let shard = StreamShard {
+                url: String::new(),
+                streams: BTreeSet::from([stream.to_owned()]),
+            };
+            assert!(!shard.is_high_rate(), "{stream}");
+        }
     }
 
     #[test]
@@ -4465,6 +4755,240 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("id range is reversed"));
+    }
+
+    #[rustfmt::skip]
+    fn raw_trade_frame(id: u64, received_at_ns: u64) -> Value {
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        json!({
+            "stream": "btcusdt@trade",
+            "data": {"e":"trade","E":event_time_ms,"s":"BTCUSDT","t":id,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+        })
+    }
+
+    #[rustfmt::skip]
+    fn book_ticker_frame(received_at_ns: u64) -> Value {
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        json!({
+            "stream": "btcusdt@bookTicker",
+            "data": {"e":"bookTicker","u":400900217,"E":event_time_ms,"T":event_time_ms,"s":"BTCUSDT","b":"100.5","B":"31.21","a":"100.6","A":"40.66"}
+        })
+    }
+
+    #[rustfmt::skip]
+    fn force_order_frame(received_at_ns: u64) -> Value {
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        json!({
+            "stream": "btcusdt@forceOrder",
+            "data": {"e":"forceOrder","E":event_time_ms,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910","ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":event_time_ms}}
+        })
+    }
+
+    #[test]
+    fn event_from_frame_dispatches_v2_research_streams() {
+        let received_at_ns = now_ns().unwrap();
+        let event = event_from_frame(raw_trade_frame(9, received_at_ns), received_at_ns).unwrap();
+        assert!(matches!(event, Event::RawTrade { .. }));
+        let event =
+            event_from_frame(book_ticker_frame(received_at_ns), received_at_ns).unwrap();
+        assert!(matches!(event, Event::BookTicker { .. }));
+        let event =
+            event_from_frame(force_order_frame(received_at_ns), received_at_ns).unwrap();
+        assert!(matches!(event, Event::ForceOrder { .. }));
+        let unsupported = json!({
+            "stream": "btcusdt@miniTicker",
+            "data": {"e":"24hrMiniTicker","s":"BTCUSDT"}
+        });
+        assert!(event_from_frame(unsupported, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported Binance research stream"));
+    }
+
+    #[test]
+    fn raw_trade_is_sequence_validated_and_archived_without_mutating_lob_state() {
+        let root = env::temp_dir().join(format!(
+            "monday-binance-raw-trades-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+
+        for id in [9, 10] {
+            let received_at_ns = now_ns().unwrap();
+            let event = event_from_frame(raw_trade_frame(id, received_at_ns), received_at_ns)
+                .unwrap();
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                event,
+                &mut process_state,
+            )
+            .unwrap();
+        }
+        assert_eq!(segment.event_count("raw_trade"), 2);
+        assert!(!states["BTCUSDT"].synced);
+
+        let received_at_ns = now_ns().unwrap();
+        let gap = event_from_frame(raw_trade_frame(12, received_at_ns), received_at_ns).unwrap();
+        let error = process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            gap,
+            &mut process_state,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("raw trade gap"));
+        assert_eq!(segment.event_count("sequence_gap"), 1);
+        assert!(!segment.is_replay_safe());
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn book_ticker_and_force_order_are_archived_without_sequence_state() {
+        let root = env::temp_dir().join(format!(
+            "monday-binance-book-ticker-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.spool_dir = root.clone();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+
+        for frame in [book_ticker_frame, force_order_frame] {
+            let received_at_ns = now_ns().unwrap();
+            let event = event_from_frame(frame(received_at_ns), received_at_ns).unwrap();
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                event,
+                &mut process_state,
+            )
+            .unwrap();
+        }
+        assert_eq!(segment.event_count("book_ticker"), 1);
+        assert_eq!(segment.event_count("force_order"), 1);
+        assert_eq!(process_state.sequence_gaps, 0);
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_order_is_usdm_only() {
+        let root = env::temp_dir().join(format!(
+            "monday-binance-force-order-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        let received_at_ns = now_ns().unwrap();
+        let event = event_from_frame(force_order_frame(received_at_ns), received_at_ns).unwrap();
+        assert!(process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            event,
+            &mut process_state,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("USD-M"));
+        assert_eq!(segment.event_count("force_order"), 0);
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_coverage_requires_the_v2_stream_types() {
+        let states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Usdm),
+        )]);
+        let stream_types = [
+            "depth@100ms".to_owned(),
+            "aggTrade".to_owned(),
+            "trade".to_owned(),
+            "bookTicker".to_owned(),
+            "forceOrder".to_owned(),
+        ];
+        let shards = stream_types
+            .iter()
+            .map(|stream_type| vec![format!("btcusdt@{stream_type}")])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_stream_coverage_shards(&shards, &states, &stream_types).unwrap(),
+            5
+        );
+        let legacy_shards = vec![
+            vec!["btcusdt@depth@100ms".to_owned()],
+            vec!["btcusdt@aggTrade".to_owned()],
+        ];
+        assert!(validate_stream_coverage_shards(&legacy_shards, &states, &stream_types)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match the active catalog"));
+        let duplicate_shards = vec![
+            vec!["btcusdt@depth@100ms".to_owned()],
+            vec!["btcusdt@depth@100ms".to_owned()],
+        ];
+        assert!(validate_stream_coverage_shards(&duplicate_shards, &states, &stream_types)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn non_depth_shards_do_not_gate_depth_health() {
+        let mut process_state = ProcessState::new(true);
+        process_state.mark_shard_disconnected(vec![
+            "btcusdt@trade".into(),
+            "btcusdt@bookTicker".into(),
+        ]);
+        assert!(!process_state.streams_healthy());
+        // Raw trade and bookTicker shards carry no LOB state, so they must
+        // not hold back depth-only checkpoint gating.
+        assert!(process_state.depth_streams_healthy());
+        process_state.mark_stream_observed("btcusdt@trade");
+        assert!(!process_state.streams_healthy());
+        process_state.mark_stream_observed("btcusdt@bookTicker");
+        assert!(process_state.streams_healthy());
+        assert!(process_state.depth_streams_healthy());
+
+        process_state.mark_shard_disconnected(vec!["btcusdt@forceOrder".into()]);
+        assert!(process_state.depth_streams_healthy());
     }
 
     #[test]
