@@ -4776,6 +4776,14 @@ mod tests {
     }
 
     #[rustfmt::skip]
+    fn spot_book_ticker_frame() -> Value {
+        json!({
+            "stream": "btcusdt@bookTicker",
+            "data": {"u":400900217,"s":"BTCUSDT","b":"100.5","B":"31.21","a":"100.6","A":"40.66"}
+        })
+    }
+
+    #[rustfmt::skip]
     fn force_order_frame(received_at_ns: u64) -> Value {
         let event_time_ms = received_at_ns / 1_000_000 - 1;
         json!({
@@ -4803,6 +4811,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported Binance research stream"));
+    }
+
+    #[test]
+    fn event_from_frame_dispatches_spot_shaped_book_ticker() {
+        // Spot bookTicker payloads carry no e/E/T fields; the frame must still
+        // flow through dispatch instead of killing the producer.
+        let received_at_ns = now_ns().unwrap();
+        let event = event_from_frame(spot_book_ticker_frame(), received_at_ns).unwrap();
+        let Event::BookTicker { ticker, .. } = event else {
+            panic!("spot bookTicker frame must dispatch as a book ticker");
+        };
+        assert_eq!(ticker.symbol, "BTCUSDT");
+        assert_eq!(ticker.received_at_ns, received_at_ns);
     }
 
     #[test]
