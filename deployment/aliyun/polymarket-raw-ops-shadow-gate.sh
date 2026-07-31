@@ -31,6 +31,7 @@ readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
+readonly LEGACY_STATE="$LEGACY_SPOOL/collector-state.json"
 readonly MARKET_SPOOL=/data/monday/spool/polymarket
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
@@ -201,6 +202,28 @@ secure_collector_directory() {
   [[ $owner == hftcollector && $group == hftcollector && $mode == 750 ]] || return 1
   parent=${path%/*}
   secure_root_chain "$parent"
+}
+
+verify_legacy_state_handoff_preflight() {
+  local baseline_mode=$1 state_path=$2 parent owner group mode
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python ]] || return 0
+  parent=${state_path%/*}
+  secure_collector_directory "$parent" || return 1
+  [[ -f $state_path && ! -L $state_path ]] || return 1
+  owner=$(stat -c %U -- "$state_path") || return 1
+  group=$(stat -c %G -- "$state_path") || return 1
+  mode=$(stat -c %a -- "$state_path") || return 1
+  [[ $owner == hftcollector && $group == hftcollector && $mode == 640 ]] || return 1
+  jq -e '
+    type == "object"
+    and (.markets | type == "object")
+    and all(.markets[]; type == "object")
+    and (.trade_seen | type == "object")
+    and all(.trade_seen[];
+      type == "object"
+      and all(.[]; type == "number" and floor == .))
+  ' "$state_path" >/dev/null 2>&1
 }
 
 secure_release_directory() {
@@ -1241,6 +1264,8 @@ verify_baseline_identity \
 verify_cutover_target_preflight "$baseline_mode" "$RUST_ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_control_file \
   || die 'production cutover target state would reject promotion'
+verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE" \
+  || die 'production collector state cannot be handed from Python to Rust'
 [[ $baseline_mode != rust_release ]] \
   || verify_control_release "$CONTROL_DIR" "$baseline_release_sha" "$baseline_release_path" \
   || die 'global controls do not bind the active Rust baseline'
