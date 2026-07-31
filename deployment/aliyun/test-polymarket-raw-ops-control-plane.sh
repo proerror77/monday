@@ -3054,8 +3054,13 @@ if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
   exit 1
 fi
 jq '.duration_seconds = 901' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
-if jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
-  printf 'gate policy accepted a shadow longer than exactly 15 minutes\n' >&2
+if ! jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
+  printf 'gate policy rejected one second of elapsed-time rounding\n' >&2
+  exit 1
+fi
+jq '.duration_seconds = 902' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
+  printf 'gate policy accepted more than one second of elapsed-time rounding\n' >&2
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:01:41Z"' \
