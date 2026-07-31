@@ -43,8 +43,9 @@ until this lane is stable and explicitly expanded.
 The service records normalized `MarketUpdate` NDJSON under
 `/data/monday/spool/polymarket/`. It has no credential environment file and cannot
 emit trading intents. The primary tape stores Polymarket quotes/lifecycle events plus
-reference prices, records one full visible CLOB book per token per second, retains
-every bid and ask level in each snapshot, and drops orphaned or post-expiry quotes.
+reference prices, records every quote update with the full visible CLOB book
+per token, retains every bid and ask level in each snapshot, and drops
+orphaned or post-expiry quotes.
 The manifest separates `venue_depth_complete` from `temporal_updates_complete` so a
 full-depth sampled snapshot cannot be mistaken for a raw exchange-diff tape.
 Quotes timestamped after
@@ -93,7 +94,7 @@ requires three additional stable polls before a market is marked complete. Malfo
 trade rows are isolated and counted by reason in `health.json` instead of blocking
 valid rows.
 The collector discovers the full 24-hour settlement lane on every cycle, but bounds
-Data API trade requests to 112 markets per cycle. Markets in the active/finalization
+Data API trade requests to 200 markets per cycle. Markets in the active/finalization
 window and failed retries are always selected first; the remaining historical lane
 rotates by oldest successful poll so cold-start backfill cannot prevent health from
 advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
@@ -108,9 +109,13 @@ A separate OS-thread watchdog enforces the same wall-clock deadline across synch
 tape fsync and atomic state publication, where a cooperative Tokio timeout cannot
 preempt non-yielding work. Health evidence over that duration is rejected by the
 shadow gate.
-The 112-request budget and the collector units' 672MiB/768MiB memory high/max
-limits are a measured pair. A Tokyo cold-start probe covered all 112 priority
-markets in 31.425 seconds with zero priority backlog. The retired 384MiB high
+The 200-request budget and the collector units' 672MiB/768MiB memory high/max
+limits are a measured pair. The budget was raised from 112 to speed historical
+trade backfill without raising concurrency: at most four requests remain in
+flight and each chunk retains at most four market responses, so the measured
+memory calibration below still bounds the same working set. A Tokyo cold-start
+probe covered all 112 priority markets in 31.425 seconds with zero priority
+backlog. The retired 384MiB high
 watermark prevented health publication, while a later formal shadow reached a
 538,951,680-byte peak and continued incrementing `memory.events high` under the
 512MiB watermark. July 17 formal gates then measured 586.1MiB, 605.8MiB, and
