@@ -30,8 +30,8 @@ RestrictSUIDSGID=true
 StateDirectory=hft-collector
 ReadWritePaths=/data/monday/spool/binance-lob
 CPUQuota=80%
-MemoryHigh=2500M
-MemoryMax=3200M
+MemoryHigh=3072M
+MemoryMax=3584M
 
 [Install]
 WantedBy=multi-user.target

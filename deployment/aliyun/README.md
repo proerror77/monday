@@ -285,7 +285,7 @@ Current coverage:
 
 The July 13 full-market probe measured about 1,450 events/s and 0.46MiB/s on the
 wire. With both production services synchronized, the host used about 1.2 CPU
-cores and less than 1GiB of service memory. The 80% CPU quota and 3.2GiB memory
+cores and less than 1GiB of service memory. The 80% CPU quota and 3.5GiB memory
 limit on each service preserve host headroom during bursts.
 
 ## Binance USD-M reference collector lane
@@ -340,6 +340,28 @@ bytes before deleting the local batch. An existing remote triplet must match
 byte for byte; a conflicting object fails closed and the local batch is
 retained. A bad batch never blocks later batches, and failures surface in
 `/data/monday/spool/binance-usdm-reference/upload-status.json`.
+
+The 3072MiB high and 3584MiB max watermarks are a measured pair, calibrated the
+same way as the Polymarket reference collector limits above. On 2026-07-28 the
+USD-M production archiver stopped writing data while its cgroup sat at the
+former 2500MiB high watermark: `/proc` showed `__mem_cgroup_handle_over_high`,
+so memory-high reclaim throttling stalled the process in D state at about
+2.75GiB RSS without ever reaching `MemoryMax=3200M` or recording an OOM. That
+throttled footprint understates real demand because the initial full-catalog
+snapshot sync allocates above the steady-state working set. The 3072MiB
+watermark restores measured headroom above the 2.75GiB footprint, and the
+3584MiB hard limit covers initial-sync and catalog-growth overshoot. Host
+budget: the 7.5GiB host reserves about 1GiB for the OS and journald, the
+Polymarket tape and reference collector cap at 512MiB and 768MiB, and the
+short-lived upload units are transient, leaving about 5.25GiB of steady-state
+budget for both archivers. Both instances share this template, so the new caps
+formally oversubscribe that budget at the hard limit; this is accepted because
+the watermarks are caps rather than reservations, the Spot instance currently
+measures healthy below the former watermark, and `MemoryMax` remains the OOM
+backstop protecting the OS. If the Spot working set later grows to the USD-M
+level, the host needs a resize rather than a further raise. It is calibration,
+not promotion evidence: the production gate still requires CPU accounting and
+peak memory to stay inside the systemd limits.
 
 ## Backtesting storage boundary
 
