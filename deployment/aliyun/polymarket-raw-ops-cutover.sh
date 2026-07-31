@@ -1066,6 +1066,9 @@ restore_legacy() (
   for asset in "${BUNDLE_ASSETS[@]}" "${RELEASE_MANIFEST##*/}"; do
     rm -f -- "$CONTROL_DIR/$asset"
   done
+  if [[ $control_dir_present == false && ( -e $CONTROL_DIR || -L $CONTROL_DIR ) ]]; then
+    rmdir -- "$CONTROL_DIR" || die 'could not restore absent global control directory'
+  fi
   if [[ $rollback_mode == legacy_python ]]; then
     if [[ $control_dir_present == true ]]; then
       while IFS= read -r asset; do

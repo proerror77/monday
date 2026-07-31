@@ -2371,6 +2371,79 @@ sed -n '/^restore_legacy() (/,/^)/p' "$CUTOVER" >"$restore_legacy_contract"
   printf 'restore_legacy contract is missing\n' >&2
   exit 1
 }
+exercise_absent_control_dir_restore() (
+  set +e
+  evidence_dir=$1
+  extra_control=${2:-false}
+  rollback_dir=$evidence_dir/rollback
+  CONTROL_DIR=$evidence_dir/global-control
+  HEALTH=$evidence_dir/health.json
+  UPLOAD_ENV=$evidence_dir/upload.env
+  ACTIVE_BINARY=$evidence_dir/active-binary
+  LEGACY_COLLECTOR=$evidence_dir/legacy-collector.py
+  LEGACY_UPLOADER=$evidence_dir/legacy-uploader.py
+  RELEASE_ROOT=$evidence_dir/releases
+  RELEASE_MANIFEST=$evidence_dir/polymarket-raw-ops-release.json
+  COLLECTOR_UNIT=collector.service
+  REFERENCE_UPLOAD_UNIT=reference-upload.service
+  REFERENCE_UPLOAD_TIMER=reference-upload.timer
+  MARKET_UPLOAD_UNIT=market-upload.service
+  MARKET_UPLOAD_TIMER=market-upload.timer
+  UNIT_ASSETS=("$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER"
+    "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER")
+  BUNDLE_ASSETS=(candidate-control)
+  PYTHON_ASSETS=(legacy-collector.py legacy-uploader.py)
+  mkdir -p "$rollback_dir/control" "$CONTROL_DIR"
+  printf 'legacy health policy\n' \
+    >"$rollback_dir/control/polymarket-legacy-health-policy.jq"
+  printf 'candidate control\n' >"$CONTROL_DIR/candidate-control"
+  printf 'candidate manifest\n' \
+    >"$CONTROL_DIR/${RELEASE_MANIFEST##*/}"
+  [[ $extra_control == false ]] || printf 'unexpected\n' >"$CONTROL_DIR/unexpected"
+  jq -n --argjson units "$(printf '%s\n' "${UNIT_ASSETS[@]}" \
+      | jq -Rn '[inputs] | map({key:.,value:"0644"}) | from_entries')" '
+      {baseline_mode:"legacy_python",control_dir_present:false,
+       unit_modes:$units,upload_env_mode:"0640"}' \
+    >"$rollback_dir/state.json"
+  (
+    cd "$rollback_dir"
+    sha256sum state.json control/polymarket-legacy-health-policy.jq >manifest.sha256
+  )
+  secure_root_chain() { [[ -e $1 && ! -L $1 ]]; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  clear_health_before_restart() { :; }
+  systemctl() { return 0; }
+  rm() { command rm "$@"; }
+  atomic_install() {
+    [[ $3 != "$LEGACY_COLLECTOR" ]] || exit 77
+  }
+  die() { exit 66; }
+  # shellcheck source=/dev/null
+  source "$restore_legacy_contract"
+  restore_legacy "$evidence_dir" >/dev/null 2>&1
+)
+absent_control_restore_dir="$tmp_dir/restore-absent-control-dir"
+mkdir "$absent_control_restore_dir"
+set +e
+exercise_absent_control_dir_restore "$absent_control_restore_dir"
+absent_control_restore_status=$?
+set -e
+[[ $absent_control_restore_status -ne 0 \
+  && ! -e $absent_control_restore_dir/global-control ]] || {
+  printf 'legacy rollback retained an absent control-directory snapshot\n' >&2
+  exit 1
+}
+unexpected_control_restore_dir="$tmp_dir/restore-unexpected-control-dir"
+mkdir "$unexpected_control_restore_dir"
+set +e
+exercise_absent_control_dir_restore "$unexpected_control_restore_dir" true
+unexpected_control_restore_status=$?
+set -e
+[[ $unexpected_control_restore_status -eq 66 \
+  && -f $unexpected_control_restore_dir/global-control/unexpected ]] || {
+  printf 'legacy rollback removed or accepted an unexpected control entry\n' >&2
+  exit 1
+}
 exercise_restore_manifest_guard() (
   set +e
   evidence_dir=$1
