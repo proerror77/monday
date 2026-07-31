@@ -2812,9 +2812,11 @@ jq \
     },
     shadow_runtime:{
       exec_start:("/opt/monday/releases/polymarket-raw-ops/" + $candidate
-        + "/polymarket-raw-ops collect-reference --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"),
+        + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+        + " --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"),
       cmdline:("/opt/monday/releases/polymarket-raw-ops/" + $candidate
-        + "/polymarket-raw-ops collect-reference --spool-dir "
+        + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+        + " --spool-dir "
         + "/data/monday/spool/polymarket-reference-rust-shadow/" + $candidate + "/run-1"),
       fragment_path:"/etc/systemd/system/polymarket-reference-collector-shadow@.service",
       drop_in_paths:[],main_pid:11,restarts:0,

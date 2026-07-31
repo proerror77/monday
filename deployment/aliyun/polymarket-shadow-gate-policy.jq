@@ -215,13 +215,15 @@ and (
 and (
   .shadow_runtime.exec_start == (
     "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
-    + "/polymarket-raw-ops collect-reference --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"
+    + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+    + " --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"
   )
   or .shadow_runtime.exec_start == .shadow_runtime.cmdline
 )
 and .shadow_runtime.cmdline == (
   "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
-  + "/polymarket-raw-ops collect-reference --spool-dir "
+  + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+  + " --spool-dir "
   + "/data/monday/spool/polymarket-reference-rust-shadow/"
   + .candidate_sha256 + "/" + .shadow_run_id
 )

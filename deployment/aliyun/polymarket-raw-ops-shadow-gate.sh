@@ -1056,8 +1056,8 @@ verify_shadow_identity() {
   [[ $fragment == "$SHADOW_FRAGMENT" ]] || return 1
   drop_ins=$(systemctl show --property=DropInPaths --value "$shadow_unit") || return 1
   [[ -z $drop_ins ]] || return 1
-  expected_exec_raw="$release_binary collect-reference --spool-dir \${MONDAY_POLYMARKET_SHADOW_SPOOL}"
-  expected_exec_expanded="$release_binary collect-reference --spool-dir $shadow_spool"
+  expected_exec_raw="$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir \${MONDAY_POLYMARKET_SHADOW_SPOOL}"
+  expected_exec_expanded="$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir $shadow_spool"
   exec_argv=$(effective_exec_argv "$shadow_unit") || return 1
   [[ $exec_argv == "$expected_exec_raw" || $exec_argv == "$expected_exec_expanded" ]] \
     || return 1
@@ -1069,7 +1069,7 @@ verify_shadow_identity() {
   [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   [[ $(readlink -f "/proc/$pid/exe") == "$release_binary" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
-  [[ $cmdline == "$release_binary collect-reference --spool-dir $shadow_spool " ]]
+  [[ $cmdline == "$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir $shadow_spool " ]]
 }
 
 valid_shadow_control_group() {
