@@ -993,6 +993,12 @@ pub fn write_health(
             "snapshot_only_symbols": readiness.snapshot_only_symbols,
             "all_symbols_bridged": readiness.all_symbols_bridged,
             "all_stream_coverage_verified": readiness.all_stream_coverage_verified,
+            // The collector only verifies stream coverage after the connected
+            // shards match the full declared per-symbol stream-type list, so
+            // verified coverage is always full-family coverage; the explicit
+            // field lets deploy policies pin that semantics without weakening
+            // the depth-only readiness fields above.
+            "full_stream_coverage_verified": readiness.all_stream_coverage_verified,
             "session_id": session_id,
             "sequence_gaps": sequence_gaps,
             "pending_upload_segments": pending_upload_segments,
@@ -1480,6 +1486,8 @@ mod tests {
         assert_eq!(health["bridged_count"], 0);
         assert_eq!(health["snapshot_only_symbols"], json!([]));
         assert_eq!(health["all_symbols_bridged"], false);
+        assert_eq!(health["all_stream_coverage_verified"], false);
+        assert_eq!(health["full_stream_coverage_verified"], false);
         fs::remove_dir_all(root).unwrap();
     }
 

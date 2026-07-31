@@ -143,6 +143,7 @@ setup_fixture() {
       upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
+      tape_schema:"binance.market_tape.v1",
       agg_trade_segments:2,agg_trade_count:2,
       strict_trade_summary_readback:true,strict_lob_continuity_readback:true,
       lob_reconnect_boundaries:0,
