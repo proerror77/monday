@@ -2485,6 +2485,169 @@ mod tests {
     }
 
     #[test]
+    fn quote_collection_failure_does_not_count_as_quote_in_quality_fields() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            sample_rows()[1].clone(),
+            record(
+                2,
+                "2026-07-15T01:00:02Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "down-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:01.900Z",
+                    "http_status": 503, "error_kind": "http_status",
+                    "ts": "2026-07-15T01:00:02Z"
+                }),
+            ),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["event_types"]["quote"], 1);
+        assert_eq!(manifest["event_types"]["quote_collection_failure"], 1);
+        assert_eq!(manifest["quality"]["request_attempts"], 2);
+        assert_eq!(manifest["quality"]["request_successes"], 1);
+        assert_eq!(manifest["quality"]["request_failures"], 1);
+        assert_eq!(manifest["quality"]["executable_quotes"], 1);
+        assert_eq!(manifest["quality"]["one_sided_quotes"], 0);
+        assert_eq!(manifest["quality"]["empty_quotes"], 0);
+        assert_eq!(manifest["quality"]["non_executable_quotes"], 0);
+        assert_eq!(manifest["quality"]["incomplete_quotes"], 0);
+        assert_eq!(manifest["missing_quote_tokens"], json!(["down-1"]));
+        assert_eq!(manifest["missing_quote_attempt_tokens"], json!([]));
+        assert_eq!(manifest["quote_coverage_complete"], false);
+    }
+
+    #[test]
+    fn rejects_quote_collection_failure_without_explicit_status() {
+        let root = TestDir::new();
+        let mut failure = sample_rows()[0].clone();
+        failure["sequence"] = json!(0);
+        failure["recorded_at"] = json!("2026-07-15T01:00:01Z");
+        failure["update"] = json!({
+            "kind": "quote_collection_failure", "token_id": "up-1",
+            "collection_result": "api_failure",
+            "request_started_at": "2026-07-15T01:00:00.900Z",
+            "http_status": null, "error_kind": "websocket_receive",
+            "ts": "2026-07-15T01:00:01Z"
+        });
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[failure],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("quote collection failure requires explicit status"));
+    }
+
+    #[test]
+    fn rejects_quote_collection_failure_with_unknown_error_kind() {
+        let root = TestDir::new();
+        let mut failure = sample_rows()[0].clone();
+        failure["sequence"] = json!(0);
+        failure["recorded_at"] = json!("2026-07-15T01:00:01Z");
+        failure["update"] = json!({
+            "kind": "quote_collection_failure", "token_id": "up-1",
+            "request_status": "failure", "collection_result": "api_failure",
+            "request_started_at": "2026-07-15T01:00:00.900Z",
+            "http_status": null, "error_kind": "dns_failure",
+            "ts": "2026-07-15T01:00:01Z"
+        });
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[failure],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported quote collection error_kind"));
+    }
+
+    #[test]
+    fn rejects_quote_collection_failure_with_invalid_http_status_pairing() {
+        let root = TestDir::new();
+        let mut failure = sample_rows()[0].clone();
+        failure["sequence"] = json!(0);
+        failure["recorded_at"] = json!("2026-07-15T01:00:01Z");
+        failure["update"] = json!({
+            "kind": "quote_collection_failure", "token_id": "up-1",
+            "request_status": "failure", "collection_result": "api_failure",
+            "request_started_at": "2026-07-15T01:00:00.900Z",
+            "http_status": null, "error_kind": "http_status",
+            "ts": "2026-07-15T01:00:01Z"
+        });
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[failure],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("invalid quote collection http_status"));
+    }
+
+    #[test]
+    fn rejects_quote_collection_failure_with_inverted_request_timing() {
+        let root = TestDir::new();
+        let mut failure = sample_rows()[0].clone();
+        failure["sequence"] = json!(0);
+        failure["recorded_at"] = json!("2026-07-15T01:00:01Z");
+        failure["update"] = json!({
+            "kind": "quote_collection_failure", "token_id": "up-1",
+            "request_status": "failure", "collection_result": "api_failure",
+            "request_started_at": "2026-07-15T01:00:01.100Z",
+            "http_status": null, "error_kind": "websocket_receive",
+            "ts": "2026-07-15T01:00:01Z"
+        });
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[failure],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error.to_string().contains("invalid quote request timing"));
+    }
+
+    #[test]
+    fn rejects_quote_collection_failure_without_token_id() {
+        let root = TestDir::new();
+        let mut failure = sample_rows()[0].clone();
+        failure["sequence"] = json!(0);
+        failure["recorded_at"] = json!("2026-07-15T01:00:01Z");
+        failure["update"] = json!({
+            "kind": "quote_collection_failure",
+            "request_status": "failure", "collection_result": "api_failure",
+            "request_started_at": "2026-07-15T01:00:00.900Z",
+            "http_status": null, "error_kind": "websocket_receive",
+            "ts": "2026-07-15T01:00:01Z"
+        });
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[failure],
+        );
+
+        let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+
+        assert!(error.to_string().contains("token_id"));
+    }
+
+    #[test]
     fn rejects_quote_source_time_regression_per_token() {
         let root = TestDir::new();
         let mut first = sample_rows()[1].clone();
