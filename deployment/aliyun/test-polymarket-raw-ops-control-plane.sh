@@ -1713,6 +1713,8 @@ cutover_start_rust_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' \
 [[ $gate_state_handoff_line =~ ^[1-9][0-9]*$ \
   && $cutover_state_handoff_line =~ ^[1-9][0-9]*$ \
   && $cutover_apply_handoff_line =~ ^[1-9][0-9]*$ \
+  && $cutover_stop_collector_line =~ ^[1-9][0-9]*$ \
+  && $cutover_start_rust_line =~ ^[1-9][0-9]*$ \
   && $gate_state_handoff_line -lt $gate_shadow_start_line \
   && $cutover_state_handoff_line -lt $cutover_transition_line \
   && $cutover_stop_collector_line -lt $cutover_apply_handoff_line \
