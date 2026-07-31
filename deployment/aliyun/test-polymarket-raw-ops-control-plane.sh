@@ -4535,6 +4535,7 @@ run_deferred_upload_case() (
   local new_invocation=22222222222222222222222222222222
   local pid_state="$tmp_dir/deferred-upload-pid-$test_case"
   local exe_state="$tmp_dir/deferred-upload-exe-$test_case"
+  local preexec_state="$tmp_dir/deferred-upload-preexec-$test_case"
   MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
   systemctl() {
     if [[ $1 == is-failed ]]; then
@@ -4548,9 +4549,13 @@ run_deferred_upload_case() (
           || printf '%s\n' "$new_invocation"
         ;;
       --property=ActiveState)
-        [[ $test_case == inactive-failed ]] \
-          && printf '%s\n' inactive \
-          || printf '%s\n' activating
+        if [[ $test_case == inactive-failed ]]; then
+          printf '%s\n' inactive
+        elif [[ $test_case == active-mismatched-exe ]]; then
+          printf '%s\n' active
+        else
+          printf '%s\n' activating
+        fi
         ;;
       --property=MainPID)
         if [[ $test_case == pid-delayed && ! -e $pid_state ]]; then
@@ -4582,23 +4587,32 @@ run_deferred_upload_case() (
       : >"$exe_state"
       return 1
     fi
-    [[ $test_case == mismatched-exe ]] \
+    if [[ $test_case == preexec-delayed && ! -e $preexec_state ]]; then
+      : >"$preexec_state"
+      printf '%s\n' /usr/lib/systemd/systemd-executor
+      return
+    fi
+    [[ $test_case == mismatched-exe || $test_case == active-mismatched-exe ]] \
       && printf '%s\n' /opt/monday/releases/polymarket-raw-ops/wrong/polymarket-raw-ops \
       || printf '%s\n' "$expected_binary"
   }
-  sleep() { :; }
+  sleep() { : >"$tmp_dir/deferred-upload-slept-$test_case"; }
   source "$deferred_upload_functions"
   verify_deferred_market_upload "$expected_binary" "$previous_invocation"
 )
 
-for rejected_case in stale failed inactive-failed mismatched-exe; do
+for rejected_case in stale failed inactive-failed mismatched-exe active-mismatched-exe; do
   if run_deferred_upload_case "$rejected_case"; then
     printf 'deferred market upload accepted counterexample: %s\n' "$rejected_case" >&2
     exit 1
   fi
 done
+[[ ! -e $tmp_dir/deferred-upload-slept-active-mismatched-exe ]] || {
+  printf 'deferred market upload retried an active wrong executable\n' >&2
+  exit 1
+}
 run_deferred_upload_case success
-for retry_case in pid-delayed exe-delayed; do
+for retry_case in pid-delayed exe-delayed preexec-delayed; do
   if ! run_deferred_upload_case "$retry_case"; then
     printf 'deferred market upload rejected transient visibility: %s\n' \
       "$retry_case" >&2

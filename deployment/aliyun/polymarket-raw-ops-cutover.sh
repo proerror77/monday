@@ -748,8 +748,12 @@ verify_deferred_market_upload() {
           sleep 1
           continue
         fi
-        [[ $proc_exe == "$expected_binary" ]]
-        return
+        if [[ $proc_exe != "$expected_binary" ]]; then
+          [[ $state == activating ]] || return 1
+          sleep 1
+          continue
+        fi
+        return 0
       fi
     fi
     sleep 1
