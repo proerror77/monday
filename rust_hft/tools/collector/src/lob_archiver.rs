@@ -3,9 +3,10 @@ pub use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use data::binance_market_tape::{
-    event_type_allowed, supported_schema, AggregateTrade, AggregateTradeSequenceValidator,
-    AggregateTradeSummary, AggregateTradeSummaryBuilder, LobContinuitySummary,
-    LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT, LEGACY_LOB_TAPE_SCHEMA,
+    event_type_allowed, market_tape_schema, supported_schema, AggregateTrade,
+    AggregateTradeSequenceValidator, AggregateTradeSummary, AggregateTradeSummaryBuilder,
+    LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
+    LEGACY_LOB_TAPE_SCHEMA,
 };
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
@@ -617,10 +618,12 @@ fn finalize_segment(
 ) -> anyhow::Result<SegmentArtifacts> {
     let replay_scope = match schema {
         LEGACY_LOB_TAPE_SCHEMA => "captured_snapshot_seed_plus_sequence_checked_diffs",
-        RAW_SCHEMA => "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+        schema if market_tape_schema(schema) => {
+            "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs"
+        }
         _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
     };
-    let lob_continuity = if schema == RAW_SCHEMA {
+    let lob_continuity = if market_tape_schema(schema) {
         Some(summarize_lob_continuity(path, config.symbols.clone())?)
     } else {
         None
@@ -674,7 +677,7 @@ fn finalize_segment(
         "bytes": data.metadata()?.len(),
         "sha256": digest,
     });
-    if schema == RAW_SCHEMA {
+    if market_tape_schema(schema) {
         let metadata = metadata.as_object_mut().expect("manifest is an object");
         metadata.insert(
             "trade_representation".to_owned(),

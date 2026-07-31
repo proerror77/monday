@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 pub const LEGACY_LOB_TAPE_SCHEMA: &str = "binance.lob_tape.v2";
 pub const MARKET_TAPE_SCHEMA: &str = "binance.market_tape.v1";
+pub const MARKET_TAPE_SCHEMA_V2: &str = "binance.market_tape.v2";
 pub const AGGREGATE_TRADE_SUMMARY_CONTRACT: &str = "binance.aggregate_trade_summary.v1";
 pub const LOB_CONTINUITY_SUMMARY_CONTRACT: &str = "binance.lob_continuity.v1";
 pub const MAX_SOURCE_LEAD_MS: u64 = 1_000;
@@ -182,6 +183,9 @@ impl LobContinuitySummaryBuilder {
                         .context("LOB source-time rollback count overflow")?;
                 }
             }
+            // Trade, ticker, and liquidation families carry no LOB continuity
+            // state; they are validated by their own sequence/clock contracts.
+            "stream_coverage" | "agg_trade" | "raw_trade" | "book_ticker" | "force_order" => {}
             _ => {}
         }
         Ok(())
@@ -297,7 +301,14 @@ fn venue_to_userspace_ws_message_latency_ms(
 }
 
 pub fn supported_schema(schema: &str) -> bool {
-    matches!(schema, LEGACY_LOB_TAPE_SCHEMA | MARKET_TAPE_SCHEMA)
+    matches!(
+        schema,
+        LEGACY_LOB_TAPE_SCHEMA | MARKET_TAPE_SCHEMA | MARKET_TAPE_SCHEMA_V2
+    )
+}
+
+pub fn market_tape_schema(schema: &str) -> bool {
+    matches!(schema, MARKET_TAPE_SCHEMA | MARKET_TAPE_SCHEMA_V2)
 }
 
 pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
@@ -311,6 +322,7 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
                 | "sequence_gap"
                 | "symbol_excluded"
         ),
+        // "kline" is a reserved event type name only; it has no implementation yet.
         MARKET_TAPE_SCHEMA => matches!(
             event_type,
             "session_start"
@@ -322,6 +334,21 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
                 | "symbol_excluded"
                 | "agg_trade"
                 | "aggregate_trade_gap"
+        ),
+        MARKET_TAPE_SCHEMA_V2 => matches!(
+            event_type,
+            "session_start"
+                | "stream_coverage"
+                | "snapshot"
+                | "diff"
+                | "checkpoint"
+                | "sequence_gap"
+                | "symbol_excluded"
+                | "agg_trade"
+                | "aggregate_trade_gap"
+                | "raw_trade"
+                | "book_ticker"
+                | "force_order"
         ),
         _ => false,
     }
@@ -663,8 +690,8 @@ impl AggregateTrade {
         if first_trade_id > last_trade_id {
             anyhow::bail!("aggregate trade id range is reversed");
         }
-        let price = positive_decimal(data, "p")?;
-        let quantity = positive_decimal(data, "q")?;
+        let price = positive_decimal(data, "p", "aggregate trade")?;
+        let quantity = positive_decimal(data, "q", "aggregate trade")?;
         let event_time_ms = required_u64(data, "E", "aggregate trade")?;
         let trade_time_ms = required_u64(data, "T", "aggregate trade")?;
         let is_buyer_maker = data
@@ -730,6 +757,211 @@ impl AggregateTradeSequenceValidator {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTrade {
+    pub symbol: String,
+    pub trade_id: u64,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub event_time_ms: u64,
+    pub trade_time_ms: u64,
+    pub is_buyer_maker: bool,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
+    pub received_at_ns: u64,
+}
+
+impl RawTrade {
+    pub fn from_archived_event(raw: &Map<String, Value>, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame(
+            raw.get("frame").context("raw trade event has no frame")?,
+            received_at_ns,
+        )
+    }
+
+    pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        let data = frame.get("data").unwrap_or(frame);
+        if data.get("e").and_then(Value::as_str) != Some("trade") {
+            anyhow::bail!("raw trade frame has the wrong event identity");
+        }
+        let symbol = required_string(data, "s", "raw trade")?.to_ascii_uppercase();
+        validate_stream_identity(frame, &symbol, "trade")?;
+        let trade_id = required_u64(data, "t", "raw trade")?;
+        let price = positive_decimal(data, "p", "raw trade")?;
+        let quantity = positive_decimal(data, "q", "raw trade")?;
+        let event_time_ms = required_u64(data, "E", "raw trade")?;
+        let trade_time_ms = required_u64(data, "T", "raw trade")?;
+        let is_buyer_maker = data
+            .get("m")
+            .and_then(Value::as_bool)
+            .context("raw trade maker side is missing")?;
+        if trade_time_ms > event_time_ms {
+            anyhow::bail!("raw trade source clocks are reversed");
+        }
+        validate_receive_clock(event_time_ms, received_at_ns, "raw trade")?;
+        validate_receive_clock(trade_time_ms, received_at_ns, "raw trade")?;
+        Ok(Self {
+            symbol,
+            trade_id,
+            price,
+            quantity,
+            event_time_ms,
+            trade_time_ms,
+            is_buyer_maker,
+            received_at_ns,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RawTradeSequenceValidator {
+    last: HashMap<String, (u64, u64, u64)>,
+}
+
+impl RawTradeSequenceValidator {
+    pub fn observe(&mut self, trade: &RawTrade) -> Result<()> {
+        if let Some((previous_id, previous_event_time, previous_trade_time)) =
+            self.last.get(&trade.symbol).copied()
+        {
+            let expected = previous_id
+                .checked_add(1)
+                .context("raw trade id overflow")?;
+            if trade.trade_id != expected {
+                anyhow::bail!(
+                    "{} raw trade gap expected={} received={}",
+                    trade.symbol,
+                    expected,
+                    trade.trade_id
+                );
+            }
+            if trade.event_time_ms < previous_event_time
+                || trade.trade_time_ms < previous_trade_time
+            {
+                anyhow::bail!("{} raw trade source-time rollback", trade.symbol);
+            }
+        }
+        self.last.insert(
+            trade.symbol.clone(),
+            (trade.trade_id, trade.event_time_ms, trade.trade_time_ms),
+        );
+        Ok(())
+    }
+}
+
+/// Best bid/ask ticker; carries an update id but no sequence guarantee, so only
+/// source/receive clock bounds and payload sanity are enforced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookTicker {
+    pub symbol: String,
+    pub update_id: u64,
+    pub best_bid_price: Decimal,
+    pub best_bid_quantity: Decimal,
+    pub best_ask_price: Decimal,
+    pub best_ask_quantity: Decimal,
+    pub event_time_ms: u64,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
+    pub received_at_ns: u64,
+}
+
+impl BookTicker {
+    pub fn from_archived_event(raw: &Map<String, Value>, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame(
+            raw.get("frame").context("book ticker event has no frame")?,
+            received_at_ns,
+        )
+    }
+
+    pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        let data = frame.get("data").unwrap_or(frame);
+        if data.get("e").and_then(Value::as_str) != Some("bookTicker") {
+            anyhow::bail!("book ticker frame has the wrong event identity");
+        }
+        let symbol = required_string(data, "s", "book ticker")?.to_ascii_uppercase();
+        validate_stream_identity(frame, &symbol, "bookTicker")?;
+        let update_id = required_u64(data, "u", "book ticker")?;
+        let best_bid_price = positive_decimal(data, "b", "book ticker")?;
+        let best_bid_quantity = positive_decimal(data, "B", "book ticker")?;
+        let best_ask_price = positive_decimal(data, "a", "book ticker")?;
+        let best_ask_quantity = positive_decimal(data, "A", "book ticker")?;
+        let event_time_ms = required_u64(data, "E", "book ticker")?;
+        let transaction_time_ms = optional_u64(data, "T", "book ticker")?;
+        if transaction_time_ms.is_some_and(|transaction| transaction > event_time_ms) {
+            anyhow::bail!("book ticker source clocks are reversed");
+        }
+        validate_receive_clock(event_time_ms, received_at_ns, "book ticker")?;
+        if let Some(transaction_time_ms) = transaction_time_ms {
+            validate_receive_clock(transaction_time_ms, received_at_ns, "book ticker")?;
+        }
+        Ok(Self {
+            symbol,
+            update_id,
+            best_bid_price,
+            best_bid_quantity,
+            best_ask_price,
+            best_ask_quantity,
+            event_time_ms,
+            received_at_ns,
+        })
+    }
+}
+
+/// USD-M liquidation order; carries no sequence guarantee, so only
+/// source/receive clock bounds and payload sanity are enforced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceOrder {
+    pub symbol: String,
+    pub side: String,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub event_time_ms: u64,
+    pub trade_time_ms: u64,
+    /// WS-library complete-message delivery timestamp in userspace; not kernel or NIC RX.
+    pub received_at_ns: u64,
+}
+
+impl ForceOrder {
+    pub fn from_archived_event(raw: &Map<String, Value>, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame(
+            raw.get("frame").context("force order event has no frame")?,
+            received_at_ns,
+        )
+    }
+
+    pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        let data = frame.get("data").unwrap_or(frame);
+        if data.get("e").and_then(Value::as_str) != Some("forceOrder") {
+            anyhow::bail!("force order frame has the wrong event identity");
+        }
+        let order = data
+            .get("o")
+            .filter(|order| order.is_object())
+            .context("force order has no order payload")?;
+        let symbol = required_string(order, "s", "force order")?.to_ascii_uppercase();
+        validate_stream_identity(frame, &symbol, "forceOrder")?;
+        let side = required_string(order, "S", "force order")?;
+        if !matches!(side, "BUY" | "SELL") {
+            anyhow::bail!("force order side is invalid");
+        }
+        let price = positive_decimal(order, "p", "force order")?;
+        let quantity = positive_decimal(order, "q", "force order")?;
+        let event_time_ms = required_u64(data, "E", "force order")?;
+        let trade_time_ms = required_u64(order, "T", "force order")?;
+        if trade_time_ms > event_time_ms {
+            anyhow::bail!("force order source clocks are reversed");
+        }
+        validate_receive_clock(event_time_ms, received_at_ns, "force order")?;
+        validate_receive_clock(trade_time_ms, received_at_ns, "force order")?;
+        Ok(Self {
+            symbol,
+            side: side.to_owned(),
+            price,
+            quantity,
+            event_time_ms,
+            trade_time_ms,
+            received_at_ns,
+        })
+    }
+}
+
 fn validate_stream_identity(frame: &Value, symbol: &str, channel: &str) -> Result<()> {
     let Some(stream) = frame.get("stream").and_then(Value::as_str) else {
         return Ok(());
@@ -781,12 +1013,12 @@ fn optional_u64(value: &Value, field: &str, kind: &str) -> Result<Option<u64>> {
         .transpose()
 }
 
-fn positive_decimal(value: &Value, field: &str) -> Result<Decimal> {
-    let decimal = required_string(value, field, "aggregate trade")?
+fn positive_decimal(value: &Value, field: &str, kind: &str) -> Result<Decimal> {
+    let decimal = required_string(value, field, kind)?
         .parse::<Decimal>()
-        .with_context(|| format!("aggregate trade field {field} is not decimal"))?;
+        .with_context(|| format!("{kind} field {field} is not decimal"))?;
     if decimal <= Decimal::ZERO {
-        anyhow::bail!("aggregate trade field {field} is not positive");
+        anyhow::bail!("{kind} field {field} is not positive");
     }
     Ok(decimal)
 }
@@ -1135,6 +1367,215 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("lead exceeds"));
+    }
+
+    #[rustfmt::skip]
+    fn raw_trade_frame(id: u64, event_time_ms: u64, trade_time_ms: u64) -> Value {
+        json!({
+            "stream": "btcusdt@trade",
+            "data": {
+                "e": "trade",
+                "E": event_time_ms,
+                "s": "BTCUSDT",
+                "t": id,
+                "p": "100.5",
+                "q": "0.25",
+                "T": trade_time_ms,
+                "m": false
+            }
+        })
+    }
+
+    #[rustfmt::skip]
+    fn book_ticker_frame(event_time_ms: u64) -> Value {
+        json!({
+            "stream": "btcusdt@bookTicker",
+            "data": {
+                "e": "bookTicker",
+                "u": 400900217,
+                "E": event_time_ms,
+                "T": event_time_ms,
+                "s": "BTCUSDT",
+                "b": "100.5",
+                "B": "31.21",
+                "a": "100.6",
+                "A": "40.66"
+            }
+        })
+    }
+
+    #[rustfmt::skip]
+    fn force_order_frame(event_time_ms: u64, trade_time_ms: u64) -> Value {
+        json!({
+            "stream": "btcusdt@forceOrder",
+            "data": {
+                "e": "forceOrder",
+                "E": event_time_ms,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "SELL",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "0.014",
+                    "p": "9910",
+                    "ap": "9910",
+                    "X": "FILLED",
+                    "l": "0.014",
+                    "z": "0.014",
+                    "T": trade_time_ms
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn market_tape_v2_supports_new_event_families() {
+        assert!(supported_schema(MARKET_TAPE_SCHEMA_V2));
+        assert!(market_tape_schema(MARKET_TAPE_SCHEMA));
+        assert!(market_tape_schema(MARKET_TAPE_SCHEMA_V2));
+        assert!(!market_tape_schema(LEGACY_LOB_TAPE_SCHEMA));
+        for event_type in ["raw_trade", "book_ticker", "force_order"] {
+            assert!(event_type_allowed(MARKET_TAPE_SCHEMA_V2, event_type));
+            assert!(!event_type_allowed(MARKET_TAPE_SCHEMA, event_type));
+        }
+        for schema in [MARKET_TAPE_SCHEMA, MARKET_TAPE_SCHEMA_V2] {
+            for event_type in [
+                "session_start",
+                "snapshot",
+                "diff",
+                "checkpoint",
+                "agg_trade",
+            ] {
+                assert!(event_type_allowed(schema, event_type));
+            }
+            // kline is a reserved event type name only; it has no implementation.
+            assert!(!event_type_allowed(schema, "kline"));
+        }
+    }
+
+    #[test]
+    fn raw_trade_enforces_dual_clocks_and_delay() {
+        assert!(RawTrade::from_frame(
+            &raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000),
+            1_700_000_000_100_000_000,
+        )
+        .is_ok());
+        assert!(RawTrade::from_frame(
+            &raw_trade_frame(1, 1_700_000_000_001, 1_700_000_000_002),
+            1_700_000_000_100_000_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reversed"));
+        assert!(RawTrade::from_frame(
+            &raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000),
+            1_700_000_031_000_000_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("delay"));
+        let mut wrong_identity = raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
+        wrong_identity["data"]["e"] = json!("aggTrade");
+        assert!(
+            RawTrade::from_frame(&wrong_identity, 1_700_000_000_100_000_000)
+                .unwrap_err()
+                .to_string()
+                .contains("identity")
+        );
+    }
+
+    #[test]
+    fn raw_trade_sequence_rejects_gap_and_source_time_rollback() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        let first = RawTrade::from_frame(
+            &raw_trade_frame(10, 1_700_000_000_000, 1_700_000_000_000),
+            received_at_ns,
+        )
+        .unwrap();
+        let next = RawTrade::from_frame(
+            &raw_trade_frame(11, 1_700_000_000_001, 1_700_000_000_001),
+            received_at_ns,
+        )
+        .unwrap();
+        let gap = RawTrade::from_frame(
+            &raw_trade_frame(13, 1_700_000_000_002, 1_700_000_000_002),
+            received_at_ns,
+        )
+        .unwrap();
+        let rollback = RawTrade::from_frame(
+            &raw_trade_frame(12, 1_699_999_999_999, 1_699_999_999_999),
+            received_at_ns,
+        )
+        .unwrap();
+
+        let mut sequence = RawTradeSequenceValidator::default();
+        sequence.observe(&first).unwrap();
+        sequence.observe(&next).unwrap();
+        assert!(sequence
+            .observe(&gap)
+            .unwrap_err()
+            .to_string()
+            .contains("gap"));
+        assert!(sequence
+            .observe(&rollback)
+            .unwrap_err()
+            .to_string()
+            .contains("rollback"));
+    }
+
+    #[test]
+    fn book_ticker_enforces_clock_bounds_without_a_sequence_guarantee() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        let first =
+            BookTicker::from_frame(&book_ticker_frame(1_700_000_000_000), received_at_ns).unwrap();
+        assert_eq!(first.symbol, "BTCUSDT");
+        // Non-consecutive update ids are valid: book tickers carry no sequence guarantee.
+        let mut later = book_ticker_frame(1_700_000_000_001);
+        later["data"]["u"] = json!(400900999);
+        BookTicker::from_frame(&later, received_at_ns).unwrap();
+        assert!(BookTicker::from_frame(
+            &book_ticker_frame(1_700_000_000_000),
+            1_700_000_031_000_000_000
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("delay"));
+        let mut non_positive = book_ticker_frame(1_700_000_000_000);
+        non_positive["data"]["b"] = json!("0");
+        assert!(BookTicker::from_frame(&non_positive, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("positive"));
+    }
+
+    #[test]
+    fn force_order_enforces_dual_clocks_and_delay() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        assert!(ForceOrder::from_frame(
+            &force_order_frame(1_700_000_000_000, 1_700_000_000_000),
+            received_at_ns,
+        )
+        .is_ok());
+        assert!(ForceOrder::from_frame(
+            &force_order_frame(1_700_000_000_001, 1_700_000_000_002),
+            received_at_ns,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reversed"));
+        assert!(ForceOrder::from_frame(
+            &force_order_frame(1_700_000_000_000, 1_700_000_000_000),
+            1_700_000_031_000_000_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("delay"));
+        let mut bad_side = force_order_frame(1_700_000_000_000, 1_700_000_000_000);
+        bad_side["data"]["o"]["S"] = json!("HOLD");
+        assert!(ForceOrder::from_frame(&bad_side, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("side"));
     }
 
     #[test]

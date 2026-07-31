@@ -18,10 +18,12 @@ use crate::binance_lob_replay::{
     Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use crate::binance_market_tape::{
-    event_type_allowed, AggregateTrade, AggregateTradeSequenceValidator, AggregateTradeSummary,
-    AggregateTradeSummaryBuilder, DepthSourceClock, DepthSourceClockSequenceValidator,
-    LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
-    LOB_CONTINUITY_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
+    event_type_allowed, market_tape_schema, AggregateTrade, AggregateTradeSequenceValidator,
+    AggregateTradeSummary, AggregateTradeSummaryBuilder, BookTicker, DepthSourceClock,
+    DepthSourceClockSequenceValidator, ForceOrder, LobContinuitySummary,
+    LobContinuitySummaryBuilder, RawTrade, RawTradeSequenceValidator,
+    AGGREGATE_TRADE_SUMMARY_CONTRACT, LOB_CONTINUITY_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
+    MARKET_TAPE_SCHEMA_V2,
 };
 
 const REPLAY_SCOPE: &str =
@@ -160,6 +162,97 @@ impl BinanceAggregateTradeContinuityVerifier {
         }
         if aggregate_trade_count == 0 {
             bail!("market-tape segment is missing aggregate trades");
+        }
+        self.previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BinanceRawTradeContinuityVerifier {
+    symbols: Option<BTreeSet<String>>,
+    market: Option<String>,
+    dataset: Option<String>,
+    shard_id: Option<String>,
+    session_id: Option<String>,
+    trade_receive_clocks: BTreeMap<String, Option<u64>>,
+    raw_trade_sequence: RawTradeSequenceValidator,
+    previous_segment_end_received_at_ns: Option<u64>,
+}
+
+impl BinanceRawTradeContinuityVerifier {
+    pub fn observe_segment(&mut self, segment: SealedBinanceMarketTapeTriplet) -> Result<()> {
+        if segment.manifest.schema != MARKET_TAPE_SCHEMA_V2 {
+            bail!("raw-trade continuity requires binance.market_tape.v2 segments");
+        }
+        let symbols = segment
+            .manifest
+            .symbols
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if symbols.is_empty() {
+            bail!("raw-trade continuity segment has no declared symbols");
+        }
+        if self
+            .previous_segment_end_received_at_ns
+            .is_some_and(|last| segment.manifest.start_received_at_ns < last)
+        {
+            bail!("raw-trade receive time moved backwards across segments");
+        }
+        if self.symbols.is_none() {
+            self.trade_receive_clocks = symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), None))
+                .collect();
+            self.symbols = Some(symbols.clone());
+            self.market = Some(segment.manifest.market.clone());
+            self.dataset = Some(segment.manifest.dataset.clone());
+            self.shard_id = Some(segment.manifest.shard_id.clone());
+        } else if self.symbols.as_ref() != Some(&symbols)
+            || self.market.as_deref() != Some(segment.manifest.market.as_str())
+            || self.dataset.as_deref() != Some(segment.manifest.dataset.as_str())
+            || self.shard_id.as_deref() != Some(segment.manifest.shard_id.as_str())
+        {
+            bail!("raw-trade continuity segments do not share one scope");
+        }
+
+        let mut raw_trade_count = 0_u64;
+        for (index, range) in segment.rows.iter().enumerate() {
+            let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
+                .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
+            let raw = raw
+                .as_object()
+                .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
+            let (event_type, row_session_id, received_at_ns) =
+                validate_row(raw, &segment.manifest)?;
+            if self
+                .session_id
+                .get_or_insert_with(|| row_session_id.to_owned())
+                != row_session_id
+            {
+                bail!("raw-trade rows do not share one session_id");
+            }
+            if event_type != "raw_trade" {
+                continue;
+            }
+            let trade = RawTrade::from_archived_event(raw, received_at_ns)?;
+            require_symbol(
+                self.symbols.as_ref().expect("initialized above"),
+                &trade.symbol,
+            )?;
+            observe_receive_clock(
+                &mut self.trade_receive_clocks,
+                &trade.symbol,
+                received_at_ns,
+            )?;
+            self.raw_trade_sequence.observe(&trade)?;
+            raw_trade_count = raw_trade_count
+                .checked_add(1)
+                .context("raw-trade count overflow")?;
+        }
+        if raw_trade_count == 0 {
+            bail!("market-tape segment is missing raw trades");
         }
         self.previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
         Ok(())
@@ -336,6 +429,7 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut aggregate_sequence = AggregateTradeSequenceValidator::default();
+    let mut raw_trade_sequence = RawTradeSequenceValidator::default();
     let mut depth_sequence = DepthSourceClockSequenceValidator::default();
     let mut replay = symbols
         .iter()
@@ -363,6 +457,9 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
         .map(|symbol| (symbol.clone(), None))
         .collect::<BTreeMap<_, _>>();
     let mut trade_receive_clocks = depth_receive_clocks.clone();
+    let mut raw_trade_receive_clocks = depth_receive_clocks.clone();
+    let mut book_ticker_receive_clocks = depth_receive_clocks.clone();
+    let mut force_order_receive_clocks = depth_receive_clocks.clone();
     let mut highest_received_at_ns = None;
     let mut previous_segment_end_received_at_ns = None;
 
@@ -513,30 +610,100 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                         aggregate_trades.push(trade);
                     }
                 }
+                "raw_trade" => {
+                    let trade = RawTrade::from_archived_event(raw, received_at_ns)?;
+                    require_symbol(&symbols, &trade.symbol)?;
+                    observe_receive_clock(
+                        &mut raw_trade_receive_clocks,
+                        &trade.symbol,
+                        received_at_ns,
+                    )?;
+                    raw_trade_sequence.observe(&trade)?;
+                }
+                "book_ticker" => {
+                    let ticker = BookTicker::from_archived_event(raw, received_at_ns)?;
+                    require_symbol(&symbols, &ticker.symbol)?;
+                    observe_receive_clock(
+                        &mut book_ticker_receive_clocks,
+                        &ticker.symbol,
+                        received_at_ns,
+                    )?;
+                }
+                "force_order" => {
+                    if market != Market::Usdm {
+                        bail!("market-tape force orders are USD-M only");
+                    }
+                    let order = ForceOrder::from_archived_event(raw, received_at_ns)?;
+                    require_symbol(&symbols, &order.symbol)?;
+                    observe_receive_clock(
+                        &mut force_order_receive_clocks,
+                        &order.symbol,
+                        received_at_ns,
+                    )?;
+                }
                 "session_start" => {
                     if required_string(raw, "market")? != market.as_str() {
                         bail!("market-tape session market does not match its manifest");
                     }
                     let declared_count = u64::try_from(symbols.len())?;
+                    let expected_streams = match segment.manifest.schema.as_str() {
+                        MARKET_TAPE_SCHEMA_V2 => {
+                            let declared_types = segment
+                                .manifest
+                                .stream_types
+                                .as_ref()
+                                .expect("v2 manifest declares stream types");
+                            let row_types =
+                                raw.get("stream_types")
+                                    .and_then(Value::as_array)
+                                    .map(|types| {
+                                        types.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
+                                    });
+                            let row_types = match row_types {
+                                Some(Some(row_types))
+                                    if row_types.len() == declared_types.len()
+                                        && row_types.iter().all(|value| !value.is_empty()) =>
+                                {
+                                    row_types
+                                }
+                                _ => bail!(
+                                    "market-tape session stream types do not match its manifest"
+                                ),
+                            };
+                            if row_types.iter().copied().collect::<BTreeSet<_>>()
+                                != declared_types
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<BTreeSet<_>>()
+                            {
+                                bail!("market-tape session stream types do not match its manifest");
+                            }
+                            Some(declared_count * u64::try_from(declared_types.len())?)
+                        }
+                        _ if require_lob_continuity => Some(declared_count.saturating_mul(2)),
+                        _ => None,
+                    };
                     if raw.get("symbols").and_then(Value::as_u64) != Some(declared_count)
                         || raw.get("websocket_shards").and_then(Value::as_u64) == Some(0)
                         || raw
                             .get("websocket_shards")
                             .and_then(Value::as_u64)
                             .is_none()
-                        || (require_lob_continuity
-                            && raw.get("websocket_streams").and_then(Value::as_u64)
-                                != Some(declared_count.saturating_mul(2)))
-                        || raw
-                            .get("websocket_streams")
-                            .is_some_and(|value| value.as_u64() != Some(declared_count * 2))
+                        || expected_streams.is_some_and(|expected| {
+                            raw.get("websocket_streams").and_then(Value::as_u64) != Some(expected)
+                        })
+                        || (expected_streams.is_none()
+                            && raw
+                                .get("websocket_streams")
+                                .is_some_and(|value| value.as_u64() != Some(declared_count * 2)))
                     {
                         bail!("market-tape session stream counts do not match its manifest");
                     }
                     session_shard_count = raw.get("websocket_shards").and_then(Value::as_u64);
                 }
                 "stream_coverage" => {
-                    let shard_count = validate_stream_coverage_row(raw, &symbols)?;
+                    let shard_count =
+                        validate_stream_coverage_row(raw, &symbols, &segment.manifest)?;
                     if coverage_shard_count.replace(shard_count).is_some() {
                         bail!("market-tape segment has duplicate stream coverage evidence");
                     }
@@ -703,6 +870,8 @@ struct TapeManifest {
     trade_summaries: Option<BTreeMap<String, AggregateTradeSummary>>,
     #[serde(default)]
     lob_continuity: Option<LobContinuitySummary>,
+    #[serde(default)]
+    stream_types: Option<Vec<String>>,
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<TapeManifest> {
@@ -737,7 +906,7 @@ fn validate_manifest_identity(
         bail!("market-tape triplet names do not share one segment identity");
     }
     let content_sha256 = hex::encode(trust.expected_content_sha256);
-    if manifest.schema != MARKET_TAPE_SCHEMA
+    if !market_tape_schema(&manifest.schema)
         || manifest.venue != "binance"
         || manifest.mode != "diff"
         || manifest.replay_scope != REPLAY_SCOPE
@@ -764,6 +933,20 @@ fn validate_manifest_identity(
         || manifest.hour.is_empty()
     {
         bail!("market-tape manifest identity is inconsistent");
+    }
+    // The v2 manifest declares its per-symbol stream-type list; v1 must not
+    // carry the field, keeping v1 verification byte-identical.
+    let stream_types_declared = match manifest.schema.as_str() {
+        MARKET_TAPE_SCHEMA => manifest.stream_types.is_none(),
+        MARKET_TAPE_SCHEMA_V2 => manifest.stream_types.as_ref().is_some_and(|types| {
+            !types.is_empty()
+                && types.iter().all(|value| !value.is_empty())
+                && types.iter().collect::<BTreeSet<_>>().len() == types.len()
+        }),
+        _ => false,
+    };
+    if !stream_types_declared {
+        bail!("market-tape manifest stream types are inconsistent with its schema");
     }
     parse_digest(&manifest.sha256)?;
     Market::from_str(&manifest.market).map_err(anyhow::Error::msg)?;
@@ -810,15 +993,15 @@ fn validate_manifest_quality(manifest: &TapeManifest, require_stream_coverage: b
         bail!("market-tape manifest event count mismatch");
     }
     for event_type in manifest.event_types.keys() {
-        if !complete_event_type(event_type) {
+        if !complete_event_type(&manifest.schema, event_type) {
             bail!("incomplete market-tape event {event_type}");
         }
     }
     Ok(())
 }
 
-fn complete_event_type(event_type: &str) -> bool {
-    event_type_allowed(MARKET_TAPE_SCHEMA, event_type)
+fn complete_event_type(schema: &str, event_type: &str) -> bool {
+    event_type_allowed(schema, event_type)
         && !matches!(
             event_type,
             "sequence_gap" | "aggregate_trade_gap" | "symbol_excluded"
@@ -826,12 +1009,13 @@ fn complete_event_type(event_type: &str) -> bool {
 }
 
 #[rustfmt::skip]
-fn allowed_fields(event_type: &str) -> &'static [&'static str] {
+fn allowed_fields(event_type: &str, schema: &str) -> &'static [&'static str] {
     match event_type {
+        "session_start" if schema == MARKET_TAPE_SCHEMA_V2 => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards", "websocket_streams", "stream_types"],
         "session_start" => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards", "websocket_streams"],
         "stream_coverage" => &["schema", "received_at_ns", "type", "session_id", "shards"],
         "snapshot" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "symbol", "request_started_at_ns", "snapshot"],
-        "diff" | "agg_trade" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
+        "diff" | "agg_trade" | "raw_trade" | "book_ticker" | "force_order" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
         "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "continuity_complete", "stream_coverage_verified", "bids", "asks", "reason", "replay_safe"],
         _ => unreachable!("event type checked above"),
     }
@@ -840,6 +1024,7 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
 fn validate_stream_coverage_row(
     raw: &Map<String, Value>,
     symbols: &BTreeSet<String>,
+    manifest: &TapeManifest,
 ) -> Result<u64> {
     let shards = raw
         .get("shards")
@@ -873,16 +1058,33 @@ fn validate_stream_coverage_row(
     if actual.len() != stream_count {
         bail!("market-tape stream coverage contains duplicate streams");
     }
-    let expected = symbols
-        .iter()
-        .flat_map(|symbol| {
-            let symbol = symbol.to_ascii_lowercase();
-            [
-                format!("{symbol}@depth@100ms"),
-                format!("{symbol}@aggTrade"),
-            ]
-        })
-        .collect::<BTreeSet<_>>();
+    let expected = match manifest.schema.as_str() {
+        MARKET_TAPE_SCHEMA_V2 => {
+            let stream_types = manifest
+                .stream_types
+                .as_ref()
+                .expect("v2 manifest declares stream types");
+            symbols
+                .iter()
+                .flat_map(|symbol| {
+                    let symbol = symbol.to_ascii_lowercase();
+                    stream_types
+                        .iter()
+                        .map(move |stream_type| format!("{symbol}@{stream_type}"))
+                })
+                .collect::<BTreeSet<_>>()
+        }
+        _ => symbols
+            .iter()
+            .flat_map(|symbol| {
+                let symbol = symbol.to_ascii_lowercase();
+                [
+                    format!("{symbol}@depth@100ms"),
+                    format!("{symbol}@aggTrade"),
+                ]
+            })
+            .collect::<BTreeSet<_>>(),
+    };
     if actual != expected {
         bail!("market-tape stream coverage does not match declared symbols");
     }
@@ -893,11 +1095,11 @@ fn validate_row<'a>(
     raw: &'a Map<String, Value>,
     manifest: &TapeManifest,
 ) -> Result<(&'a str, &'a str, u64)> {
-    if required_string(raw, "schema")? != MARKET_TAPE_SCHEMA {
+    if required_string(raw, "schema")? != manifest.schema {
         bail!("market-tape row schema mismatch");
     }
     let event_type = required_string(raw, "type")?;
-    if !complete_event_type(event_type) {
+    if !complete_event_type(&manifest.schema, event_type) {
         bail!("incomplete market-tape event {event_type}");
     }
     if raw
@@ -906,7 +1108,7 @@ fn validate_row<'a>(
     {
         bail!("market-tape contains archived_only data");
     }
-    let allowed = allowed_fields(event_type);
+    let allowed = allowed_fields(event_type, &manifest.schema);
     if raw.keys().any(|key| !allowed.contains(&key.as_str())) {
         bail!("market-tape row contains an unknown field");
     }
@@ -1137,6 +1339,84 @@ mod tests {
         rows
     }
 
+    const V2_STREAM_TYPES: [&str; 5] = [
+        "depth@100ms",
+        "aggTrade",
+        "trade",
+        "bookTicker",
+        "forceOrder",
+    ];
+
+    fn v2_schema(mut row: Value) -> Value {
+        row["schema"] = json!(MARKET_TAPE_SCHEMA_V2);
+        row
+    }
+
+    #[rustfmt::skip]
+    fn valid_v2_rows() -> Vec<Value> {
+        vec![
+            json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":START_NS,"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":1,"websocket_streams":5,"stream_types":V2_STREAM_TYPES}),
+            v2_schema(valid_rows()[1].clone()),
+            v2_schema(depth_row(START_NS + 200_000_000, 101, 100)),
+            v2_schema(trade_row(START_NS + 300_000_000, 10)),
+            raw_trade_row(START_NS + 320_000_000, 10),
+            book_ticker_row(START_NS + 340_000_000),
+            force_order_row(START_NS + 360_000_000),
+            v2_schema(checkpoint_row(START_NS + 400_000_000, 101)),
+        ]
+    }
+
+    #[rustfmt::skip]
+    fn raw_trade_row(received_at_ns: u64, id: u64) -> Value {
+        json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"raw_trade","session_id":"session-1","frame":{"stream":"btcusdt@trade","data":{"e":"trade","E":received_at_ns/1_000_000,"s":"BTCUSDT","t":id,"p":"100.5","q":"2","T":received_at_ns/1_000_000,"m":false}}})
+    }
+
+    #[rustfmt::skip]
+    fn book_ticker_row(received_at_ns: u64) -> Value {
+        json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"book_ticker","session_id":"session-1","frame":{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","u":400900217,"E":received_at_ns/1_000_000,"T":received_at_ns/1_000_000,"s":"BTCUSDT","b":"100.5","B":"31.21","a":"100.6","A":"40.66"}}})
+    }
+
+    #[rustfmt::skip]
+    fn force_order_row(received_at_ns: u64) -> Value {
+        json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"force_order","session_id":"session-1","frame":{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":received_at_ns/1_000_000,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.014","p":"9910","ap":"9910","X":"FILLED","l":"0.014","z":"0.014","T":received_at_ns/1_000_000}}}})
+    }
+
+    fn with_stream_coverage_v2(
+        mut rows: Vec<Value>,
+        symbols: &[&str],
+        stream_types: &[&str],
+    ) -> Vec<Value> {
+        let received_at_ns = rows
+            .iter()
+            .find(|row| row["type"] == "session_start")
+            .map_or_else(
+                || {
+                    rows.iter()
+                        .map(|row| row["received_at_ns"].as_u64().unwrap())
+                        .min()
+                        .unwrap()
+                },
+                |row| row["received_at_ns"].as_u64().unwrap() + 1,
+            );
+        if let Some(session) = rows.iter_mut().find(|row| row["type"] == "session_start") {
+            session["websocket_shards"] = json!(2);
+            session["websocket_streams"] = json!(symbols.len() * stream_types.len());
+        }
+        let mut streams = symbols
+            .iter()
+            .flat_map(|symbol| {
+                let symbol = symbol.to_ascii_lowercase();
+                stream_types
+                    .iter()
+                    .map(move |stream_type| format!("{symbol}@{stream_type}"))
+            })
+            .collect::<Vec<_>>();
+        let second_shard = streams.split_off(streams.len() / 2);
+        rows.push(json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"stream_coverage","session_id":"session-1","shards":[streams, second_shard]}));
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        rows
+    }
+
     fn write_triplet(
         root: &Path,
         rows: &[Value],
@@ -1216,6 +1496,26 @@ mod tests {
 
     #[rustfmt::skip]
     fn write_triplet_for_symbols(root: &Path, rows: &[Value], symbols: &[&str]) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
+        write_triplet_with_schema(root, rows, symbols, MARKET_TAPE_SCHEMA, None)
+    }
+
+    fn write_triplet_v2(
+        root: &Path,
+        rows: &[Value],
+        symbols: &[&str],
+        stream_types: &[&str],
+    ) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
+        write_triplet_with_schema(
+            root,
+            rows,
+            symbols,
+            MARKET_TAPE_SCHEMA_V2,
+            Some(stream_types),
+        )
+    }
+
+    #[rustfmt::skip]
+    fn write_triplet_with_schema(root: &Path, rows: &[Value], symbols: &[&str], schema: &str, stream_types: Option<&[&str]>) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
         let root = fs::canonicalize(root).unwrap();
         let start = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).min().unwrap();
         let end = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).max().unwrap();
@@ -1238,8 +1538,8 @@ mod tests {
         let snapshot_only_symbols = declared_symbols.difference(&checkpointed_symbols).cloned().collect::<Vec<_>>();
         let has_checkpoint = counts.get("checkpoint").copied().unwrap_or(0) > 0;
         let data_sha = format!("{:x}", Sha256::digest(&compressed));
-        let manifest = json!({
-            "schema":"binance.market_tape.v1","venue":"binance","market":"usdm","dataset":"usdm_all","shard_id":"all","mode":"diff",
+        let mut manifest = json!({
+            "schema":schema,"venue":"binance","market":"usdm","dataset":"usdm_all","shard_id":"all","mode":"diff",
             "symbols":symbols,"security_token_symbols":[],"excluded_symbols":[],"snapshot_limit":1000,
             "replay_scope":"captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs","venue_depth_complete":false,
             "events":rows.len(),"event_types":counts,"has_replay_safe_checkpoint":has_checkpoint,
@@ -1250,6 +1550,9 @@ mod tests {
             "start_received_at_ns":start,"end_received_at_ns":end,"date":"2023-11-14","hour":"22","file":name,"bytes":compressed.len(),"sha256":data_sha,
             "trade_representation":"aggregate_trade_only","price_surface_derivation":"latest aggregate trade price"
         });
+        if let Some(stream_types) = stream_types {
+            manifest["stream_types"] = json!(stream_types);
+        }
         let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         manifest_bytes.push(b'\n');
         let manifest_path = root.join(format!("{name}.manifest.json"));
@@ -1855,5 +2158,247 @@ mod tests {
         assert!(error
             .to_string()
             .contains("surface-free market-tape verification requires LOB continuity mode"));
+    }
+
+    #[test]
+    fn complete_v2_with_new_event_families_verifies() {
+        let root = tempdir();
+        let rows = with_stream_coverage_v2(valid_v2_rows(), &["BTCUSDT"], &V2_STREAM_TYPES);
+        let event_count = rows.len() as u64;
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified = verify_binance_market_tape(vec![sealed]).unwrap();
+        assert_eq!(verified.segments()[0].events, event_count);
+        assert_eq!(verified.aggregate_trades().len(), 1);
+        assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
+    }
+
+    #[test]
+    fn v2_rejects_unknown_fields_and_v1_rejects_new_event_types() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows[4]["surprise"] = json!(true);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.push(v2_schema(raw_trade_row(START_NS + 320_000_000, 10)));
+        rows[5]["schema"] = json!(MARKET_TAPE_SCHEMA);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete market-tape event raw_trade"));
+    }
+
+    #[test]
+    fn v2_session_stream_counts_must_match_declared_stream_types() {
+        // websocket_streams no longer equals symbols x declared stream types.
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows[0]["websocket_streams"] = json!(4);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("stream counts"));
+
+        // session_start does not declare its stream-type list.
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows[0].as_object_mut().unwrap().remove("stream_types");
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("stream"));
+
+        // session_start stream-type list disagrees with the manifest declaration.
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows[0]["stream_types"] =
+            json!(["depth@100ms", "aggTrade", "trade", "bookTicker", "kline"]);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("stream"));
+
+        // A v1 manifest must not carry the v2 stream-type declaration.
+        let root = tempdir();
+        let (triplet, _) = write_triplet(root.path(), &valid_rows());
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["stream_types"] = json!(["depth@100ms", "aggTrade"]);
+        });
+        assert!(seal_binance_market_tape_triplet(&triplet, &anchor)
+            .unwrap_err()
+            .to_string()
+            .contains("stream"));
+
+        // A v2 manifest must declare its stream-type list.
+        let root = tempdir();
+        let rows = valid_v2_rows();
+        let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest.as_object_mut().unwrap().remove("stream_types");
+        });
+        assert!(seal_binance_market_tape_triplet(&triplet, &anchor)
+            .unwrap_err()
+            .to_string()
+            .contains("stream"));
+    }
+
+    #[test]
+    fn v2_stream_coverage_must_cover_declared_stream_types() {
+        let root = tempdir();
+        let mut rows = with_stream_coverage_v2(valid_v2_rows(), &["BTCUSDT"], &V2_STREAM_TYPES);
+        let coverage = rows
+            .iter_mut()
+            .find(|row| row["type"] == "stream_coverage")
+            .unwrap();
+        coverage["shards"][1]
+            .as_array_mut()
+            .unwrap()
+            .retain(|stream| stream != "btcusdt@forceOrder");
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("does not match declared symbols"));
+    }
+
+    #[test]
+    fn v2_raw_trade_gap_is_rejected_within_and_across_segments() {
+        // Within one segment.
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.insert(6, raw_trade_row(START_NS + 330_000_000, 12));
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("BTCUSDT raw trade gap"));
+
+        // Across segments, with book and aggregate-trade continuity intact.
+        let root = tempdir();
+        let (first, first_anchor) = write_triplet_v2(
+            root.path(),
+            &valid_v2_rows(),
+            &["BTCUSDT"],
+            &V2_STREAM_TYPES,
+        );
+        let second_rows = vec![
+            v2_schema(depth_row(START_NS + 1_000_000_000, 102, 101)),
+            v2_schema(trade_row(START_NS + 1_100_000_000, 11)),
+            raw_trade_row(START_NS + 1_150_000_000, 12),
+            v2_schema(checkpoint_row(START_NS + 1_200_000_000, 102)),
+        ];
+        let (second, second_anchor) =
+            write_triplet_v2(root.path(), &second_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ];
+        assert!(verify_binance_market_tape(sealed)
+            .unwrap_err()
+            .to_string()
+            .contains("BTCUSDT raw trade gap"));
+    }
+
+    #[test]
+    fn v2_force_order_is_usdm_only() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows[0]["market"] = json!("spot");
+        let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["market"] = json!("spot");
+        });
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("USD-M"));
+    }
+
+    #[test]
+    fn v2_kline_is_a_reserved_name_without_implementation() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.push(
+            json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":START_NS + 380_000_000,"type":"kline","session_id":"session-1","frame":{}}),
+        );
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        assert!(verify_binance_market_tape(vec![sealed])
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete market-tape event kline"));
+    }
+
+    #[test]
+    fn raw_trade_continuity_verifier_tracks_v2_segments() {
+        let root = tempdir();
+        let (first, first_anchor) = write_triplet_v2(
+            root.path(),
+            &valid_v2_rows(),
+            &["BTCUSDT"],
+            &V2_STREAM_TYPES,
+        );
+        let second_rows = vec![
+            raw_trade_row(START_NS + 1_000_000_000, 11),
+            raw_trade_row(START_NS + 1_100_000_000, 12),
+        ];
+        let (second, second_anchor) =
+            write_triplet_v2(root.path(), &second_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let gap_rows = vec![raw_trade_row(START_NS + 2_000_000_000, 14)];
+        let (gap, gap_anchor) =
+            write_triplet_v2(root.path(), &gap_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+
+        let mut verifier = BinanceRawTradeContinuityVerifier::default();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&first, &first_anchor).unwrap())
+            .unwrap();
+        verifier
+            .observe_segment(seal_binance_market_tape_triplet(&second, &second_anchor).unwrap())
+            .unwrap();
+        let error = verifier
+            .observe_segment(seal_binance_market_tape_triplet(&gap, &gap_anchor).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("BTCUSDT raw trade gap"));
+
+        // The raw-trade verifier fails closed on v1 tapes.
+        let root = tempdir();
+        let (v1, v1_anchor) = write_triplet(root.path(), &valid_rows());
+        let mut verifier = BinanceRawTradeContinuityVerifier::default();
+        assert!(verifier
+            .observe_segment(seal_binance_market_tape_triplet(&v1, &v1_anchor).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("market_tape.v2"));
     }
 }
