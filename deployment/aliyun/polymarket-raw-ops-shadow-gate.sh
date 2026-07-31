@@ -1265,7 +1265,7 @@ verify_cutover_target_preflight "$baseline_mode" "$RUST_ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_control_file \
   || die 'production cutover target state would reject promotion'
 verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE" \
-  || die 'production collector state cannot be handed from Python to Rust'
+  || die 'production collector state cannot be handed from the legacy runtime to Rust'
 [[ $baseline_mode != rust_release ]] \
   || verify_control_release "$CONTROL_DIR" "$baseline_release_sha" "$baseline_release_path" \
   || die 'global controls do not bind the active Rust baseline'

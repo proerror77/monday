@@ -1496,7 +1496,7 @@ verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
   || die 'production cutover target state would reject promotion'
 verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE" \
-  || die 'production collector state cannot be handed from Python to Rust'
+  || die 'production collector state cannot be handed from the legacy runtime to Rust'
 
 install -d -m 0755 /data/monday /data/monday/evidence "$EVIDENCE_ROOT"
 secure_root_chain "$EVIDENCE_ROOT" || die 'cutover evidence root is not trusted'
