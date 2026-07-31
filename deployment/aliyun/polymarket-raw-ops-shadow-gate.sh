@@ -25,7 +25,7 @@ readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
-readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
+readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
 readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
@@ -838,7 +838,7 @@ real_market_segment_preflight() {
   if run_before_deadline "$preflight_deadline" runuser \
     -u hftcollector -- env HOME=/var/lib/hft-collector \
     "$release_binary" upload --spool-dir "$spool" \
-    --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 1000 \
+    --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 0 \
     --bucket "$oss_bucket" --endpoint "$oss_endpoint" --region "$oss_region" \
     --profile "$aliyun_profile" --zstd-timeout "$zstd_timeout_seconds" \
     --oss-timeout "$oss_copy_timeout_seconds" \
