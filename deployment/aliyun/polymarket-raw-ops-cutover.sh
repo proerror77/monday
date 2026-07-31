@@ -26,6 +26,7 @@ readonly REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
 readonly MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
 readonly MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
 readonly HEALTH=/data/monday/spool/polymarket-reference/health.json
+readonly LEGACY_STATE=/data/monday/spool/polymarket-reference/collector-state.json
 readonly LEGACY_COLLECTOR=/opt/monday/bin/polymarket_reference_collector.py
 readonly LEGACY_UPLOADER=/opt/monday/bin/polymarket_market_tape_upload.py
 readonly LEGACY_EXEC="/usr/bin/python3 $LEGACY_COLLECTOR"
@@ -188,6 +189,99 @@ secure_collector_directory() {
   [[ $owner == hftcollector && $group == hftcollector && $mode == 750 ]] || return 1
   parent=${path%/*}
   secure_root_chain "$parent"
+}
+
+verify_legacy_state_handoff_preflight() {
+  local baseline_mode=$1 state_path=$2 parent owner group mode
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python ]] || return 0
+  parent=${state_path%/*}
+  secure_collector_directory "$parent" || return 1
+  [[ -f $state_path && ! -L $state_path ]] || return 1
+  owner=$(stat -c %U -- "$state_path") || return 1
+  group=$(stat -c %G -- "$state_path") || return 1
+  mode=$(stat -c %a -- "$state_path") || return 1
+  [[ $owner == hftcollector && $group == hftcollector && $mode == 640 ]] || return 1
+  jq -e '
+    type == "object"
+    and (.markets | type == "object")
+    and all(.markets[]; type == "object")
+    and (.trade_seen | type == "object")
+    and all(.trade_seen[];
+      type == "object"
+      and all(.[]; type == "number" and floor == .))
+  ' "$state_path" >/dev/null 2>&1
+}
+
+apply_legacy_state_handoff() {
+  (
+    set -e
+    local state_path=$1 evidence_dir=$2 state_dir snapshot handoff
+    local temporary='' handoff_tmp='' before_sha after_sha snapshot_sha
+    local cleared_fields durable_state after_durable
+    state_dir=${state_path%/*}
+    snapshot="$evidence_dir/pre-handoff-collector-state.json"
+    handoff="$evidence_dir/legacy-state-handoff.json"
+    [[ ! -e $snapshot && ! -L $snapshot && ! -e $handoff && ! -L $handoff ]]
+    verify_legacy_state_handoff_preflight legacy_python "$state_path"
+    trap 'rm -f -- "${temporary:-}" "${handoff_tmp:-}"' EXIT
+
+    before_sha=$(sha256sum "$state_path" | awk '{print $1}')
+    cleared_fields=$(jq -ce '{
+      trade_failure_since:([.markets[] | select(has("trade_failure_since"))] | length),
+      trade_last_error:([.markets[] | select(has("trade_last_error"))] | length),
+      settlement_failure_since:([.markets[] | select(has("settlement_failure_since"))] | length),
+      settlement_last_error:([.markets[] | select(has("settlement_last_error"))] | length)
+    }' "$state_path")
+    durable_state=$(jq -ce '{
+      markets:(.markets | length),
+      trade_seen_conditions:(.trade_seen | length),
+      retained_trade_ids:([.trade_seen[] | length] | add // 0)
+    }' "$state_path")
+    install -m 0640 "$state_path" "$snapshot"
+    snapshot_sha=$(sha256sum "$snapshot" | awk '{print $1}')
+    [[ $snapshot_sha == "$before_sha" ]]
+
+    temporary=$(mktemp "$state_dir/.collector-state.handoff.XXXXXX")
+    jq -e '(.markets[] | objects) |= del(
+        .trade_failure_since,.trade_last_error,
+        .settlement_failure_since,.settlement_last_error)' \
+      "$state_path" >"$temporary"
+    chown --reference="$state_path" "$temporary"
+    chmod --reference="$state_path" "$temporary"
+    after_durable=$(jq -ce '{
+      markets:(.markets | length),
+      trade_seen_conditions:(.trade_seen | length),
+      retained_trade_ids:([.trade_seen[] | length] | add // 0)
+    }' "$temporary")
+    [[ $after_durable == "$durable_state" ]]
+    after_sha=$(sha256sum "$temporary" | awk '{print $1}')
+
+    handoff_tmp=$(mktemp "$evidence_dir/.legacy-state-handoff.XXXXXX")
+    jq -n --arg schema monday.polymarket_legacy_state_handoff.v1 \
+      --arg status applied --arg applied_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg state_path "$state_path" --arg before_sha256 "$before_sha" \
+      --arg after_sha256 "$after_sha" --arg snapshot_path "$snapshot" \
+      --arg snapshot_sha256 "$snapshot_sha" \
+      --argjson cleared_fields "$cleared_fields" \
+      --argjson durable_state "$durable_state" '
+      {schema:$schema,status:$status,applied_at:$applied_at,
+       state_path:$state_path,before_sha256:$before_sha256,
+       after_sha256:$after_sha256,
+       snapshot:{path:$snapshot_path,sha256:$snapshot_sha256},
+       cleared_fields:$cleared_fields,durable_state:$durable_state}
+    ' >"$handoff_tmp"
+    sync "$snapshot" "$temporary" "$handoff_tmp"
+    mv -Tf "$temporary" "$state_path"
+    temporary=
+    [[ $(sha256sum "$state_path" | awk '{print $1}') == "$after_sha" ]]
+    mv -Tf "$handoff_tmp" "$handoff"
+    handoff_tmp=
+    sync "$state_path" "$handoff"
+    sync -f -- "$state_dir"
+    sync -f -- "$evidence_dir"
+    trap - EXIT
+  )
 }
 
 secure_release_directory() {
@@ -1089,7 +1183,7 @@ restore_legacy() (
 )
 
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
-for command in awk cmp date dirname flock grep install journalctl jq ln mkdir mktemp mountpoint \
+for command in awk chmod chown cmp date dirname flock grep install journalctl jq ln mkdir mktemp mountpoint \
   mv readlink rm sed seq sha256sum sleep sort stat sync systemctl tar tr wc; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -1401,6 +1495,8 @@ fi
 verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
   || die 'production cutover target state would reject promotion'
+verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE" \
+  || die 'production collector state cannot be handed from the legacy runtime to Rust'
 
 install -d -m 0755 /data/monday /data/monday/evidence "$EVIDENCE_ROOT"
 secure_root_chain "$EVIDENCE_ROOT" || die 'cutover evidence root is not trusted'
@@ -1496,8 +1592,13 @@ verify_no_restart_after_cursor \
 stopped_legacy_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
 [[ $stopped_legacy_restarts == "$gate_legacy_restarts" ]] \
   || die 'legacy collector restarted between final verification and stop'
+legacy_state_handoff_json=null
 if [[ $baseline_mode == legacy_python ]]; then
 clear_health_before_restart "$evidence_dir" pre-cutover
+apply_legacy_state_handoff "$LEGACY_STATE" "$evidence_dir" \
+  || die 'legacy collector state handoff failed'
+legacy_state_handoff_json=$(jq -cS . "$evidence_dir/legacy-state-handoff.json") \
+  || die 'legacy collector state handoff evidence is invalid'
 fi
 install -d -m 0755 /opt/monday/bin
 temporary_link="${ACTIVE_BINARY}.new.$$"
@@ -1638,6 +1739,7 @@ jq -n \
   --arg journal_sha256 "$journal_sha" \
   --arg rollback_manifest_sha256 "$rollback_sha" \
   --arg rust_invocation_id "$rust_invocation_id" \
+  --argjson legacy_state_handoff "$legacy_state_handoff_json" \
   --argjson main_pid "$main_pid" \
   '{schema:$schema,baseline_mode:$baseline_mode,candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
@@ -1648,6 +1750,7 @@ jq -n \
     gate_json_sha256:$gate_json_sha256,
     gate_terminal_receipt_sha256:$gate_terminal_receipt_sha256,
     gate_systemd_invocation_id:$gate_systemd_invocation_id,
+    legacy_state_handoff:$legacy_state_handoff,
     completed_at:$completed_at,
     collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,
       health_sha256:$health_sha256,

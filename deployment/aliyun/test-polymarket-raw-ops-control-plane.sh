@@ -1538,6 +1538,197 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" \
   }
 )
 
+# A Python-to-Rust cutover must not import Python's long-cycle transient
+# failure clocks into Rust's 180-second stale window. The read-only admission
+# contract is shared by Gate and cutover; only the stopped legacy transition
+# may apply the atomic transform.
+gate_state_handoff_contract=$(sed -n \
+  '/^verify_legacy_state_handoff_preflight() {$/,/^}$/p' "$GATE")
+cutover_state_handoff_contract=$(sed -n \
+  '/^verify_legacy_state_handoff_preflight() {$/,/^}$/p' "$CUTOVER")
+[[ -n $gate_state_handoff_contract \
+  && $gate_state_handoff_contract == "$cutover_state_handoff_contract" ]] || {
+  printf 'Gate and cutover legacy-state handoff preflight contracts differ\n' >&2
+  exit 1
+}
+state_handoff_contract_file="$tmp_dir/legacy-state-handoff.sh"
+printf '%s\n' "$cutover_state_handoff_contract" >"$state_handoff_contract_file"
+sed -n '/^apply_legacy_state_handoff() {$/,/^}$/p' "$CUTOVER" \
+  >>"$state_handoff_contract_file"
+grep -Fq 'apply_legacy_state_handoff() {' "$state_handoff_contract_file" || {
+  printf 'cutover has no atomic legacy-state handoff implementation\n' >&2
+  exit 1
+}
+(
+  state_dir="$tmp_dir/legacy-state-spool"
+  state="$state_dir/collector-state.json"
+  evidence="$tmp_dir/legacy-state-evidence"
+  mkdir "$state_dir" "$evidence"
+  cat >"$state" <<'EOF'
+{
+  "trade_id_version": "v2",
+  "trade_completion_version": "v1",
+  "top_extra": {"preserve": true},
+  "markets": {
+    "market-a": {
+      "condition_id": "condition-a",
+      "trade_failure_since": "2026-07-30T23:55:44Z",
+      "trade_last_error": "HTTP Error 429: Too Many Requests",
+      "settlement_failure_since": "2026-07-30T23:55:44Z",
+      "settlement_last_error": "temporary gamma error",
+      "trade_complete": false,
+      "market_extra": [1, 2, 3]
+    },
+    "market-b": {
+      "condition_id": "condition-b",
+      "trade_failure_since": "2026-07-30T23:55:44Z",
+      "trade_complete": true
+    }
+  },
+  "trade_seen": {"condition-a": {"id-a": 1, "id-b": 2}}
+}
+EOF
+  state_owner=hftcollector
+  state_group=hftcollector
+  state_mode=640
+  secure_collector_directory() { [[ $1 == "$state_dir" ]]; }
+  chown() { :; }
+  chmod() { :; }
+  mv() {
+    if [[ ${1:-} == -Tf ]]; then
+      /bin/mv -f "$2" "$3"
+    else
+      /bin/mv "$@"
+    fi
+  }
+  sync() { :; }
+  stat() {
+    [[ $1 == -c && $3 == -- && $4 == "$state" ]] || return 64
+    case "$2" in
+      %U) printf '%s\n' "$state_owner" ;;
+      %G) printf '%s\n' "$state_group" ;;
+      %a) printf '%s\n' "$state_mode" ;;
+      *) return 64 ;;
+    esac
+  }
+  # shellcheck source=/dev/null
+  source "$state_handoff_contract_file"
+
+  verify_legacy_state_handoff_preflight legacy_python "$state" || {
+    printf 'legacy-state handoff rejected a valid direct state file\n' >&2
+    exit 1
+  }
+  expected="$tmp_dir/legacy-state-expected.json"
+  jq '(.markets[] | objects) |= del(
+      .trade_failure_since,.trade_last_error,
+      .settlement_failure_since,.settlement_last_error)' \
+    "$state" >"$expected"
+  apply_legacy_state_handoff "$state" "$evidence" || {
+    printf 'legacy-state handoff failed to transform a valid state\n' >&2
+    exit 1
+  }
+  jq -S . "$state" >"$state.normalized"
+  jq -S . "$expected" >"$expected.normalized"
+  cmp -s "$state.normalized" "$expected.normalized" || {
+    printf 'legacy-state handoff changed durable collector state\n' >&2
+    exit 1
+  }
+  jq -e '
+    .schema == "monday.polymarket_legacy_state_handoff.v1"
+    and .status == "applied"
+    and .cleared_fields == {
+      trade_failure_since:2,trade_last_error:1,
+      settlement_failure_since:1,settlement_last_error:1}
+    and .durable_state == {
+      markets:2,trade_seen_conditions:1,retained_trade_ids:2}
+    and (.before_sha256 | test("^[a-f0-9]{64}$"))
+    and (.after_sha256 | test("^[a-f0-9]{64}$"))
+    and .before_sha256 != .after_sha256
+    and .snapshot.sha256 == .before_sha256
+  ' "$evidence/legacy-state-handoff.json" >/dev/null || {
+    printf 'legacy-state handoff evidence is incomplete\n' >&2
+    exit 1
+  }
+  [[ $(sha256sum "$state" | awk '{print $1}') \
+      == "$(jq -r .after_sha256 "$evidence/legacy-state-handoff.json")" ]] || {
+    printf 'legacy-state handoff evidence does not bind the transformed state\n' >&2
+    exit 1
+  }
+  jq -e '.markets["market-a"].trade_failure_since
+      == "2026-07-30T23:55:44Z"' \
+    "$evidence/pre-handoff-collector-state.json" >/dev/null || {
+    printf 'legacy-state handoff did not preserve the original snapshot\n' >&2
+    exit 1
+  }
+
+  printf 'not-json\n' >"$state"
+  if verify_legacy_state_handoff_preflight legacy_python "$state"; then
+    printf 'legacy-state handoff admitted malformed JSON\n' >&2
+    exit 1
+  fi
+  printf '{"markets":{"bad":[]},"trade_seen":{}}\n' >"$state"
+  if verify_legacy_state_handoff_preflight legacy_python "$state"; then
+    printf 'legacy-state handoff admitted a non-object market state\n' >&2
+    exit 1
+  fi
+  printf '{"markets":{},"trade_seen":{}}\n' >"$state"
+  state_mode=660
+  if verify_legacy_state_handoff_preflight legacy_python "$state"; then
+    printf 'legacy-state handoff admitted a writable state file\n' >&2
+    exit 1
+  fi
+  state_mode=640
+  state_owner=root
+  if verify_legacy_state_handoff_preflight legacy_python "$state"; then
+    printf 'legacy-state handoff admitted a root-owned state file\n' >&2
+    exit 1
+  fi
+  state_owner=hftcollector
+  rm "$state"
+  ln -s state-target.json "$state"
+  printf '{"markets":{},"trade_seen":{}}\n' >"$state_dir/state-target.json"
+  if verify_legacy_state_handoff_preflight legacy_python "$state"; then
+    printf 'legacy-state handoff admitted an indirect state file\n' >&2
+    exit 1
+  fi
+  verify_legacy_state_handoff_preflight rust_release "$state_dir/absent.json" || {
+    printf 'Rust-to-Rust promotion incorrectly required legacy-state handoff\n' >&2
+    exit 1
+  }
+)
+
+gate_state_handoff_line=$(grep -n \
+  '^verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE"' \
+  "$GATE" | cut -d: -f1)
+cutover_state_handoff_line=$(grep -n \
+  '^verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE"' \
+  "$CUTOVER" | cut -d: -f1)
+cutover_apply_handoff_line=$(grep -n \
+  '^apply_legacy_state_handoff "$LEGACY_STATE" "$evidence_dir"' \
+  "$CUTOVER" | cut -d: -f1)
+cutover_stop_collector_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
+cutover_start_rust_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
+[[ $gate_state_handoff_line =~ ^[1-9][0-9]*$ \
+  && $cutover_state_handoff_line =~ ^[1-9][0-9]*$ \
+  && $cutover_apply_handoff_line =~ ^[1-9][0-9]*$ \
+  && $cutover_stop_collector_line =~ ^[1-9][0-9]*$ \
+  && $cutover_start_rust_line =~ ^[1-9][0-9]*$ \
+  && $gate_state_handoff_line -lt $gate_shadow_start_line \
+  && $cutover_state_handoff_line -lt $cutover_transition_line \
+  && $cutover_stop_collector_line -lt $cutover_apply_handoff_line \
+  && $cutover_apply_handoff_line -lt $cutover_start_rust_line ]] || {
+  printf 'legacy-state handoff runs outside the fail-closed transition order\n' >&2
+  exit 1
+}
+if ! grep -Fq -- '--argjson legacy_state_handoff "$legacy_state_handoff_json"' \
+    "$CUTOVER" \
+  || ! grep -Fq 'legacy_state_handoff:$legacy_state_handoff' "$CUTOVER"; then
+  printf 'cutover evidence does not bind the legacy-state handoff\n' >&2
+  exit 1
+fi
+
 # Rollback must preserve the baseline release's own control membership rather
 # than substituting the candidate script's BUNDLE_ASSETS.
 rollback_control_contract="$tmp_dir/rollback-control-files.sh"
