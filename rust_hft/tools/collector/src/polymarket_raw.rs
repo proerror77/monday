@@ -40,7 +40,12 @@ const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
-const MAX_RETAINED_TRADE_IDS: usize = 1_000_000;
+// Default cap on retained trade IDs for dedupe state. Raised from 1M to 4M
+// after the 2026-08-01 shadow gate failure: at the current catalog (2765+
+// markets) a full backfill at poll budget 200 accumulates ~42k IDs/min, so 1M
+// is reached in ~15 minutes and the collector bails. At ~150-200B/ID in
+// memory, 4M IDs cost well under the units' 1536M/2048M watermarks.
+pub const DEFAULT_MAX_RETAINED_TRADE_IDS: usize = 4_000_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -182,6 +187,7 @@ pub struct ReferenceConfig {
     pub market_lookback_secs: i64,
     pub settlement_lookback_secs: i64,
     pub max_markets: usize,
+    pub max_retained_trade_ids: usize,
     pub max_trade_polls_per_cycle: usize,
     pub max_concurrent_trade_polls: usize,
     pub http_timeout: Duration,
@@ -204,6 +210,7 @@ impl Default for ReferenceConfig {
             market_lookback_secs: 7_200,
             settlement_lookback_secs: 86_400,
             max_markets: DEFAULT_MAX_MARKETS_PER_LANE,
+            max_retained_trade_ids: DEFAULT_MAX_RETAINED_TRADE_IDS,
             max_trade_polls_per_cycle: DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
             max_concurrent_trade_polls: DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
             http_timeout: Duration::from_secs(20),
@@ -2109,7 +2116,7 @@ impl ReferenceCollector {
             cache_release?;
         }
         let state_scoped = retain_requested_market_state(&mut state, &config.market_ids);
-        validate_state_bounds(&state, config.max_markets, MAX_RETAINED_TRADE_IDS)?;
+        validate_state_bounds(&state, config.max_markets, config.max_retained_trade_ids)?;
         if state_compacted || recovered_active || state_scoped {
             // The state checkpoint must be durable before the recovered segment
             // stops being the active crash-recovery source.
@@ -2686,7 +2693,7 @@ impl ReferenceCollector {
         validate_state_bounds(
             &next_state,
             self.config.max_markets,
-            MAX_RETAINED_TRADE_IDS,
+            self.config.max_retained_trade_ids,
         )?;
         updates.replay(&mut self.writer, recorded_at)?;
         if missing_target_symbols.is_empty() {
