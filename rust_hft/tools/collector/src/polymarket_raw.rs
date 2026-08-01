@@ -2019,6 +2019,61 @@ fn compact_trade_dedupe(state: &mut CollectorState, cutoff: i64) -> bool {
     changed
 }
 
+/// Incomplete markets retain every trade ID until their completion proof is
+/// emitted, so at high trade volume the retained-ID cap becomes a guaranteed
+/// fail-closed crash once completion falls behind. Keep a headroom margin
+/// below the cap instead: evict the oldest incomplete-market IDs (the least
+/// re-fetchable) before the cap is reached. `validate_state_bounds` stays the
+/// fail-closed boundary for accumulation eviction cannot cover.
+const TRADE_ID_BUDGET_DIVISOR: usize = 4;
+
+fn trade_id_budget(max_retained_trade_ids: usize) -> usize {
+    max_retained_trade_ids - max_retained_trade_ids / TRADE_ID_BUDGET_DIVISOR
+}
+
+fn retained_trade_id_count(state: &CollectorState) -> usize {
+    state.trade_seen.values().map(BTreeMap::len).sum()
+}
+
+fn evict_oldest_incomplete_trade_ids(state: &mut CollectorState, budget: usize) -> usize {
+    let excess = retained_trade_id_count(state).saturating_sub(budget);
+    if excess == 0 {
+        return 0;
+    }
+    let incomplete = state
+        .markets
+        .values()
+        .filter(|market| !market.trade_complete)
+        .filter_map(|market| market.condition_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut by_age: Vec<(i64, String, String)> = Vec::new();
+    for (condition_id, seen) in &state.trade_seen {
+        if !incomplete.contains(condition_id) {
+            continue;
+        }
+        for (trade_id, timestamp) in seen {
+            by_age.push((*timestamp, condition_id.clone(), trade_id.clone()));
+        }
+    }
+    by_age.sort_unstable_by_key(|(timestamp, _, _)| *timestamp);
+    let mut evicted = 0_usize;
+    let mut emptied = Vec::new();
+    for (_, condition_id, trade_id) in by_age.into_iter().take(excess) {
+        if let Some(seen) = state.trade_seen.get_mut(&condition_id) {
+            if seen.remove(&trade_id).is_some() {
+                evicted += 1;
+                if seen.is_empty() {
+                    emptied.push(condition_id);
+                }
+            }
+        }
+    }
+    for condition_id in emptied {
+        state.trade_seen.remove(&condition_id);
+    }
+    evicted
+}
+
 fn validate_state_bounds(
     state: &CollectorState,
     max_markets: usize,
@@ -2117,8 +2172,12 @@ impl ReferenceCollector {
             cache_release?;
         }
         let state_scoped = retain_requested_market_state(&mut state, &config.market_ids);
+        let startup_evicted = evict_oldest_incomplete_trade_ids(
+            &mut state,
+            trade_id_budget(config.max_retained_trade_ids),
+        );
         validate_state_bounds(&state, config.max_markets, config.max_retained_trade_ids)?;
-        if state_compacted || recovered_active || state_scoped {
+        if state_compacted || startup_evicted > 0 || recovered_active || state_scoped {
             // The state checkpoint must be durable before the recovered segment
             // stops being the active crash-recovery source.
             atomic_write_json(&state_path, &state)?;
@@ -2691,6 +2750,10 @@ impl ReferenceCollector {
         let record_types = updates.record_types();
         let recorded_at = self.now();
         validate_cycle_hour(&target_hour, recorded_at)?;
+        let trade_ids_evicted = evict_oldest_incomplete_trade_ids(
+            &mut next_state,
+            trade_id_budget(self.config.max_retained_trade_ids),
+        );
         validate_state_bounds(
             &next_state,
             self.config.max_markets,
@@ -2731,6 +2794,7 @@ impl ReferenceCollector {
             "market_detail_priority_deferred": market_detail_plan.priority_deferred,
             "records_written": records_written,
             "record_types": record_types,
+            "trade_ids_evicted": trade_ids_evicted,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
             "priority_trade_markets_before_market_details": priority_trade_markets_before_market_details,
@@ -4057,6 +4121,81 @@ mod tests {
         );
         assert!(validate_state_bounds(&state, 1, 1).is_err());
         assert!(validate_state_bounds(&state, 1, 2).is_ok());
+    }
+
+    #[test]
+    fn eviction_drops_oldest_incomplete_ids_before_the_cap() {
+        let tracked = |condition_id: &str, trade_complete: bool| TrackedMarket {
+            condition_id: Some(condition_id.to_owned()),
+            trade_complete,
+            ..TrackedMarket::default()
+        };
+        let mut state = CollectorState::default();
+        state.markets.insert("m-inc".to_owned(), tracked("c-inc", false));
+        state.markets.insert("m-done".to_owned(), tracked("c-done", true));
+        state.trade_seen.insert(
+            "c-inc".to_owned(),
+            BTreeMap::from([
+                ("old-1".to_owned(), 1),
+                ("old-2".to_owned(), 2),
+                ("new-1".to_owned(), 100),
+            ]),
+        );
+        state.trade_seen.insert(
+            "c-done".to_owned(),
+            BTreeMap::from([("done-1".to_owned(), 3), ("done-2".to_owned(), 4)]),
+        );
+
+        let evicted = evict_oldest_incomplete_trade_ids(&mut state, 3);
+
+        assert_eq!(evicted, 2);
+        let remaining: Vec<&str> = state.trade_seen["c-inc"].keys().map(String::as_str).collect();
+        assert_eq!(remaining, ["new-1"]);
+        assert_eq!(state.trade_seen["c-done"].len(), 2);
+        assert!(validate_state_bounds(&state, 10, 3).is_ok());
+    }
+
+    #[test]
+    fn eviction_removes_emptied_conditions_and_is_noop_under_budget() {
+        let mut state = CollectorState::default();
+        state.markets.insert(
+            "m-inc".to_owned(),
+            TrackedMarket {
+                condition_id: Some("c-inc".to_owned()),
+                ..TrackedMarket::default()
+            },
+        );
+        state.trade_seen.insert(
+            "c-inc".to_owned(),
+            BTreeMap::from([("only".to_owned(), 1)]),
+        );
+
+        assert_eq!(evict_oldest_incomplete_trade_ids(&mut state, 10), 0);
+        assert!(state.trade_seen.contains_key("c-inc"));
+        assert_eq!(evict_oldest_incomplete_trade_ids(&mut state, 0), 1);
+        assert!(!state.trade_seen.contains_key("c-inc"));
+    }
+
+    #[test]
+    fn eviction_cannot_hide_a_complete_market_overflow() {
+        let mut state = CollectorState::default();
+        state.markets.insert(
+            "m-done".to_owned(),
+            TrackedMarket {
+                condition_id: Some("c-done".to_owned()),
+                trade_complete: true,
+                ..TrackedMarket::default()
+            },
+        );
+        state.trade_seen.insert(
+            "c-done".to_owned(),
+            BTreeMap::from([("t-1".to_owned(), 1), ("t-2".to_owned(), 2)]),
+        );
+
+        // Complete-market IDs are never evicted, so the fail-closed bound
+        // still fires for accumulation eviction cannot cover.
+        assert_eq!(evict_oldest_incomplete_trade_ids(&mut state, 1), 0);
+        assert!(validate_state_bounds(&state, 10, 1).is_err());
     }
 
     #[test]
