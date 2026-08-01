@@ -688,21 +688,22 @@ run_before_deadline() {
 # after (observed in production twice: 2026-08-01T07:47:39+08 where the
 # object committed one second after a single-attempt readback, and
 # 2026-08-01T11:01:41+08 where it committed one second after the sixth
-# retry). Retry with a generous bounded window so a publication race cannot
-# fail the gate.
+# retry, and 2026-08-01T20:31:07+08 where a 117MiB multipart object became
+# visible 168s after publication began, exactly at the fifteenth retry).
+# Retry 30x with 20s backoff (~600s) so a publication race cannot fail the gate.
 oss_download_with_retry() {
   local deadline=$1 src=$2 dst=$3 attempt remaining
-  for attempt in $(seq 1 15); do
+  for attempt in $(seq 1 30); do
     if run_before_deadline "$deadline" aliyun ossutil cp "$src" "$dst" \
       --profile "$aliyun_profile" \
       --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null; then
       return 0
     fi
-    [[ $attempt -lt 15 ]] || return 1
+    [[ $attempt -lt 30 ]] || return 1
     # Never let the backoff itself run past the caller's deadline.
     remaining=$(remaining_seconds_before_deadline "$deadline") || return 1
-    (( remaining > 13 )) || return 1
-    sleep 12
+    (( remaining > 21 )) || return 1
+    sleep 20
   done
 }
 
