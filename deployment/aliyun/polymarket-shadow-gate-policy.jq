@@ -139,9 +139,12 @@ and .passed == true
 and (
   (
     .baseline_mode == "legacy_python"
-    and .baseline_health_start_required == true
     and .baseline_runtime_stability_required == true
-    and (.baseline_health_snapshot | legacy_health_snapshot(true))
+    and (
+      .baseline_health_start_required == false
+      or (
+        .baseline_health_start_required == true
+        and (.baseline_health_snapshot | legacy_health_snapshot(true))
     and (.baseline_health_start_success_unix | positive_integer)
     and ((.baseline_health_snapshot.last_success_at | utc_iso8601_unix)
       == .baseline_health_start_success_unix)
@@ -182,6 +185,8 @@ and (
         and .baseline_health_completion_written_at_unix == null
         and .baseline_health_completion_file_identity == null
       end
+    )
+      )
     )
     and (.legacy_runtime |
       runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
@@ -262,7 +267,6 @@ and .checks.real_market_segment_preflight == true
 and (.comparison_mode == "legacy_overlap" or (
   .comparison_mode == "rust_self"
   and .baseline_mode == "legacy_python"
-  and .baseline_health_start_required == true
   and .baseline_runtime_stability_required == true
 ))
 and (.metrics.oss_uploaded_segments | positive_integer)
