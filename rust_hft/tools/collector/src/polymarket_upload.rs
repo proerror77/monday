@@ -1858,6 +1858,7 @@ fn run_checked(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
 fn download_remote_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
+    budget_remaining: Duration,
     runner: &mut F,
 ) -> Result<(ExclusiveTempDir, BTreeMap<String, PathBuf>)>
 where
@@ -1883,7 +1884,13 @@ where
                 .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
             config,
         );
-        runner(&mut command, config.oss_timeout.min(OSS_READBACK_FILE_TIMEOUT))?;
+        runner(
+            &mut command,
+            config
+                .oss_timeout
+                .min(OSS_READBACK_FILE_TIMEOUT)
+                .min(budget_remaining),
+        )?;
         regular_identity(&destination)?;
         downloaded.insert(name.to_owned(), destination);
     }
@@ -1943,10 +1950,12 @@ where
     let mut last_error = None;
     let started = std::time::Instant::now();
     for attempt in 0..OSS_READBACK_ATTEMPTS {
-        if started.elapsed() > OSS_READBACK_MAX_WALL_CLOCK {
+        let elapsed = started.elapsed();
+        if elapsed > OSS_READBACK_MAX_WALL_CLOCK {
             break;
         }
-        match download_remote_artifacts_with(artifacts, config, runner) {
+        let budget_remaining = OSS_READBACK_MAX_WALL_CLOCK - elapsed;
+        match download_remote_artifacts_with(artifacts, config, budget_remaining, runner) {
             Ok((_verify_dir, downloaded)) => {
                 return verify_downloaded_artifacts(artifacts, &downloaded);
             }
@@ -1969,7 +1978,8 @@ fn remote_artifacts_exist_and_match_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let Ok((_verify_dir, downloaded)) = download_remote_artifacts_with(artifacts, config, runner)
+    let Ok((_verify_dir, downloaded)) =
+        download_remote_artifacts_with(artifacts, config, Duration::MAX, runner)
     else {
         return Ok(false);
     };
