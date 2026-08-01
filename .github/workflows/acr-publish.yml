@@ -121,6 +121,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -136,29 +137,38 @@ jobs:
             jq \
             mold \
             pkg-config \
-            protobuf-compiler \
-            sccache
+            protobuf-compiler
           rm -rf /var/lib/apt/lists/*
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
-          key: research-image-bookworm-${{ hashFiles('rust_hft/**/Cargo.lock') }}
+          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/**/Cargo.lock') }}
           cache-all-crates: true
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-
 
       - name: Build research runner binaries
         run: |
           set -euo pipefail
-          sccache --zero-stats
           cargo build --release --locked -p hft-backtest -p alpha-harness
           cargo build --release --locked -p hft-collector --bin lob-pit-materializer
           CARGO_TARGET_DIR=target/prediction-markets \
@@ -180,7 +190,10 @@ jobs:
           ../.github/scripts/research-image-release-artifact.sh create research-release \
             "${{ needs.selector.outputs.source_sha }}" \
             "${{ needs.selector.outputs.artifact_run_id }}" .
-          sccache --show-stats
+
+      - name: Show sccache stats
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats || true
 
       - name: Upload manual research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
