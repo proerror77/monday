@@ -366,17 +366,29 @@ isolated spools below, and isolated OSS datasets:
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
 | USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
 
-Each session proves the exact expected depth and `aggTrade` subscription set on
-every WebSocket shard with `LIST_SUBSCRIPTIONS` before it requests snapshots.
+Each session proves the exact expected subscription set on every WebSocket
+shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. A
+`binance.market_tape.v2` candidate declares its per-symbol stream-type list
+(`depth@100ms`, `aggTrade`, `trade`, `bookTicker`, plus USD-M-only
+`forceOrder`) in the manifest and every `session_start` row, and coverage is
+verified against that declared list. A `binance.market_tape.v1` candidate
+keeps the legacy depth-plus-`aggTrade` pair and never carries the new
+families, so the same gate can still gate a v1 binary during the transition.
 Every segment also retains the sorted stream list returned for each shard in a
 SHA-bound `stream_coverage` row, so canonical readback can recompute the exact
-depth-plus-`aggTrade` catalog instead of trusting a boolean alone. The resulting
-`binance.market_tape.v1` checkpoints, health, and manifests carry the derived
-coverage summary. A symbol that receives no depth or trade event during
+catalog (symbols x declared stream types for v2, symbols x 2 for v1) instead
+of trusting a boolean alone. The resulting checkpoints, health, and manifests
+carry the derived coverage summary; health also publishes an explicit
+`full_stream_coverage_verified` decision so deploy policies can pin
+full-family coverage without weakening the depth-only readiness fields (a v1
+collector never publishes the field, and its absence stays acceptable so a
+rollback to a v1 binary remains possible during the transition). A
+symbol that receives no depth or trade event during
 a segment is complete only when it has an unchanged two-sided snapshot-backed
 checkpoint and verified stream coverage; the collector never invents a diff or
 trade for a static symbol. Every segment must still contain at least one real
-`agg_trade` for its market dataset.
+`agg_trade` for its market dataset, and a v2 segment must additionally carry
+`raw_trade` and `book_ticker` events for the same scope.
 
 ### 2. Run the one-hour full-catalog gate
 

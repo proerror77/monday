@@ -145,7 +145,7 @@ env_value() {
 
 readonly -a markets=(spot usdm)
 declare -A env_file spool_dir dataset shard_id oss_bucket oss_endpoint oss_region
-declare -A aliyun_profile oss_copy_timeout min_symbols unit
+declare -A aliyun_profile oss_copy_timeout min_symbols unit expected_stream_types
 for market in "${markets[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
@@ -207,6 +207,13 @@ done
   || die 'USD-M shadow dataset is not isolated'
 min_symbols[spot]=1000
 min_symbols[usdm]=400
+# A v2 tape candidate declares this exact per-symbol stream-type list in its
+# manifest and every session_start row (sorted); forceOrder is USD-M only. A
+# v1 candidate keeps the legacy depth@100ms+aggTrade pair and must not carry
+# the new families, so both schema generations remain gateable during the
+# transition.
+expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
+expected_stream_types[usdm]='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
@@ -398,6 +405,26 @@ verify_aggregate_trade_continuity() {
     || die 'strict aggregate-trade continuity readback failed'
 }
 
+verify_raw_trade_continuity() {
+  local -a verifier_args=(--verify-raw-trade-continuity)
+  local path content_sha256 manifest_sha256
+  (( $# > 0 && $# % 3 == 0 )) \
+    || die 'raw-trade verifier requires one or more complete segment trust anchors'
+  while (($#)); do
+    path=$1
+    content_sha256=$2
+    manifest_sha256=$3
+    shift 3
+    verifier_args+=(
+      --verify-segment "$path"
+      --segment-content-sha256 "$content_sha256"
+      --segment-manifest-sha256 "$manifest_sha256"
+    )
+  done
+  run_strict_verifier "${verifier_args[@]}" \
+    || die 'strict raw-trade continuity readback failed'
+}
+
 systemctl stop "${unit[spot]}" "${unit[usdm]}"
 for market in "${markets[@]}"; do
   run_candidate_drain "$market"
@@ -520,6 +547,8 @@ health_passes() {
       and .snapshot_only_symbols == []
       and .all_symbols_bridged == true
       and .all_stream_coverage_verified == true
+      and ((.full_stream_coverage_verified == null)
+        or (.full_stream_coverage_verified == true))
       and .queue_saturated == false
       and .disk_warning == false
       and .upload_warning == false
@@ -631,6 +660,7 @@ fi
 
 declare -A observed_runtime_seconds cpu_usage_ns memory_peak_bytes health_sha256
 declare -A symbol_count snapshot_ready_count stream_coverage_verified_count sequence_gaps
+declare -A full_stream_coverage_verified
 now_monotonic_us=$(awk '{printf "%.0f\n", $1 * 1000000}' /proc/uptime)
 for market in "${markets[@]}"; do
   assert_candidate
@@ -671,6 +701,7 @@ for market in "${markets[@]}"; do
   snapshot_ready_count[$market]=$(jq -er '.snapshot_ready_count' "$health")
   stream_coverage_verified_count[$market]=$(jq -er '.stream_coverage_verified_count' "$health")
   sequence_gaps[$market]=$(jq -er '.sequence_gaps' "$health")
+  full_stream_coverage_verified[$market]=$(jq -c '.full_stream_coverage_verified' "$health")
 done
 
 systemctl stop "${unit[spot]}" "${unit[usdm]}"
@@ -726,6 +757,10 @@ verify_oss_round_trips() {
   local manifest_replay_safe
   local segment_dir manifest_path manifest_digest actual_manifest_digest
   local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
+  local tape_schema='' candidate_schema stream_type_count
+  local family_counts raw_trade_count book_ticker_count force_order_count
+  local manifest_symbol_count manifest_raw_trade_count manifest_book_ticker_count
+  local manifest_force_order_count
   local previous_end_ns=0
   local round_trips='[]'
   local -a strict_verifier_segments=()
@@ -759,7 +794,31 @@ verify_oss_round_trips() {
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
     ((start_ns < observation_started_ns)) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
-      '.schema == "binance.market_tape.v1"
+      --arg market "$market" \
+      --argjson expected_stream_types "${expected_stream_types[$market]}" \
+      '(.schema == "binance.market_tape.v1" or .schema == "binance.market_tape.v2")
+        and (if .schema == "binance.market_tape.v1" then
+          (has("stream_types") | not)
+          and (.event_types | has("raw_trade") | not)
+          and (.event_types | has("book_ticker") | not)
+          and (.event_types | has("force_order") | not)
+        else
+          (.stream_types | type) == "array"
+          and (.stream_types | sort) == $expected_stream_types
+          and (.event_types.raw_trade | type) == "number"
+          and .event_types.raw_trade == (.event_types.raw_trade | floor)
+          and .event_types.raw_trade > 0
+          and (.event_types.book_ticker | type) == "number"
+          and .event_types.book_ticker == (.event_types.book_ticker | floor)
+          and .event_types.book_ticker > 0
+          and (if $market == "usdm" then
+            ((.event_types.force_order // 0) | type) == "number"
+            and (.event_types.force_order // 0) == ((.event_types.force_order // 0) | floor)
+            and (.event_types.force_order // 0) >= 0
+          else
+            (.event_types | has("force_order") | not)
+          end)
+        end)
         and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
         and (.trade_summaries | type) == "object"
         and (.trade_summaries | length) > 0
@@ -814,6 +873,13 @@ verify_oss_round_trips() {
         and .event_types.agg_trade > 0' \
       "$manifest" >/dev/null \
       || die "$market has an incomplete market-tape manifest after gate start: $uri"
+    candidate_schema=$(jq -er '.schema' "$manifest")
+    if [[ -z $tape_schema ]]; then
+      tape_schema=$candidate_schema
+    else
+      [[ $candidate_schema == "$tape_schema" ]] \
+        || die "$market mixes market-tape schema versions at $uri"
+    fi
     jq -e '.has_replay_safe_checkpoint | type == "boolean"' "$manifest" >/dev/null \
       || die "$market manifest has no replay-safety decision: $uri"
     manifest_replay_safe=$(jq -r '.has_replay_safe_checkpoint' "$manifest")
@@ -837,6 +903,12 @@ verify_oss_round_trips() {
   candidate_count=$(wc -l <"$candidates" | tr -d ' ')
   ((candidate_count >= 2)) \
     || die "$market has fewer than two replay-safe complete OSS manifests after gate start"
+
+  if [[ $tape_schema == binance.market_tape.v2 ]]; then
+    stream_type_count=$(jq -er 'length' <<<"${expected_stream_types[$market]}")
+  else
+    stream_type_count=2
+  fi
 
   index=0
   while IFS=$'\t' read -r start_ns end_ns uri file digest manifest_digest manifest \
@@ -869,10 +941,15 @@ verify_oss_round_trips() {
     run_oss "$market" cp "$success_uri" "$success_path" --force --no-progress >/dev/null
     printf '%s\n' "$digest" | cmp -s - "$success_path" \
       || die "$market OSS success marker does not match segment SHA-256: $success_uri"
-    agg_trade_count=$(zstd -q -d -c "$zst_path" | jq -er -n '
+    manifest_symbol_count=$(jq -er '.symbols | length' "$manifest")
+    family_counts=$(zstd -q -d -c "$zst_path" | jq -ec -n \
+      --arg schema "$tape_schema" \
+      --argjson symbol_count "$manifest_symbol_count" \
+      --argjson stream_type_count "$stream_type_count" \
+      --argjson expected_stream_types "${expected_stream_types[$market]}" \
+      '
       def valid_agg_trade:
-        .schema == "binance.market_tape.v1"
-        and (.received_at_ns | type) == "number"
+        (.received_at_ns | type) == "number"
         and .received_at_ns >= 0
         and (.frame.data.e == "aggTrade")
         and (.frame.data.s | type) == "string"
@@ -887,15 +964,104 @@ verify_oss_round_trips() {
         and (.frame.data.E | type) == "number"
         and (.frame.data.T | type) == "number"
         and (.frame.data.m | type) == "boolean";
+      def valid_raw_trade:
+        (.received_at_ns | type) == "number"
+        and .received_at_ns >= 0
+        and (.frame.data.e == "trade")
+        and (.frame.data.s | type) == "string"
+        and (.frame.data.s | length) > 0
+        and (.frame.data.t | type) == "number"
+        and .frame.data.t >= 0
+        and (.frame.data.t | floor) == .frame.data.t
+        and (.frame.data.p | type) == "string"
+        and (.frame.data.p | length) > 0
+        and (.frame.data.q | type) == "string"
+        and (.frame.data.q | length) > 0
+        and (.frame.data.E | type) == "number"
+        and (.frame.data.T | type) == "number"
+        and .frame.data.T <= .frame.data.E
+        and (.frame.data.m | type) == "boolean";
+      def valid_book_ticker:
+        (.received_at_ns | type) == "number"
+        and .received_at_ns >= 0
+        and (.frame.data.e == "bookTicker")
+        and (.frame.data.s | type) == "string"
+        and (.frame.data.s | length) > 0
+        and (.frame.data.u | type) == "number"
+        and .frame.data.u >= 0
+        and (.frame.data.u | floor) == .frame.data.u
+        and (.frame.data.b | type) == "string"
+        and (.frame.data.b | length) > 0
+        and (.frame.data.B | type) == "string"
+        and (.frame.data.B | length) > 0
+        and (.frame.data.a | type) == "string"
+        and (.frame.data.a | length) > 0
+        and (.frame.data.A | type) == "string"
+        and (.frame.data.A | length) > 0
+        and (.frame.data.E | type) == "number"
+        and ((.frame.data.T == null)
+          or ((.frame.data.T | type) == "number" and .frame.data.T <= .frame.data.E));
+      def valid_force_order:
+        (.received_at_ns | type) == "number"
+        and .received_at_ns >= 0
+        and (.frame.data.e == "forceOrder")
+        and (.frame.data.o | type) == "object"
+        and (.frame.data.o.s | type) == "string"
+        and (.frame.data.o.s | length) > 0
+        and (.frame.data.o.S == "BUY" or .frame.data.o.S == "SELL")
+        and (.frame.data.o.p | type) == "string"
+        and (.frame.data.o.p | length) > 0
+        and (.frame.data.o.q | type) == "string"
+        and (.frame.data.o.q | length) > 0
+        and (.frame.data.E | type) == "number"
+        and (.frame.data.o.T | type) == "number"
+        and .frame.data.o.T <= .frame.data.E;
+      def valid_session_start:
+        .websocket_streams == ($symbol_count * $stream_type_count)
+        and (if $schema == "binance.market_tape.v2" then
+          (.stream_types | sort) == $expected_stream_types
+        else
+          (has("stream_types") | not)
+        end);
       reduce inputs as $row
-        ({count:0,invalid:false};
-          if $row.type == "agg_trade" then
-            .count += 1 | .invalid = (.invalid or (($row | valid_agg_trade) | not))
+        ({agg_trade:0,raw_trade:0,book_ticker:0,force_order:0,invalid:false};
+          if $row.schema != $schema then
+            .invalid = true
+          elif $row.type == "agg_trade" then
+            .agg_trade += 1 | .invalid = (.invalid or (($row | valid_agg_trade) | not))
+          elif $row.type == "raw_trade" then
+            .raw_trade += 1 | .invalid = (.invalid or (($row | valid_raw_trade) | not))
+          elif $row.type == "book_ticker" then
+            .book_ticker += 1 | .invalid = (.invalid or (($row | valid_book_ticker) | not))
+          elif $row.type == "force_order" then
+            .force_order += 1 | .invalid = (.invalid or (($row | valid_force_order) | not))
+          elif $row.type == "session_start" then
+            .invalid = (.invalid or (($row | valid_session_start) | not))
           else . end)
-      | if .count == 0 or .invalid then error("missing or malformed agg_trade") else .count end') \
-      || die "$market segment has no valid aggregate trades: $zst_uri"
+      | if .invalid then error("malformed market-tape row")
+        elif .agg_trade == 0 then error("missing agg_trade")
+        elif $schema == "binance.market_tape.v2" and (.raw_trade == 0 or .book_ticker == 0)
+          then error("missing v2 stream family")
+        elif $schema == "binance.market_tape.v1"
+          and (.raw_trade > 0 or .book_ticker > 0 or .force_order > 0)
+          then error("v1 tape carries v2 stream families")
+        else {agg_trade,raw_trade,book_ticker,force_order} end') \
+      || die "$market segment has missing or malformed stream-family events: $zst_uri"
+    agg_trade_count=$(jq -er '.agg_trade' <<<"$family_counts")
+    raw_trade_count=$(jq -er '.raw_trade' <<<"$family_counts")
+    book_ticker_count=$(jq -er '.book_ticker' <<<"$family_counts")
+    force_order_count=$(jq -er '.force_order' <<<"$family_counts")
+    manifest_raw_trade_count=$(jq -er '.event_types.raw_trade // 0' "$manifest")
+    manifest_book_ticker_count=$(jq -er '.event_types.book_ticker // 0' "$manifest")
+    manifest_force_order_count=$(jq -er '.event_types.force_order // 0' "$manifest")
     [[ $agg_trade_count == "$manifest_agg_trade_count" ]] \
       || die "$market manifest aggregate-trade count does not match segment: $uri"
+    [[ $raw_trade_count == "$manifest_raw_trade_count" ]] \
+      || die "$market manifest raw-trade count does not match segment: $uri"
+    [[ $book_ticker_count == "$manifest_book_ticker_count" ]] \
+      || die "$market manifest book-ticker count does not match segment: $uri"
+    [[ $force_order_count == "$manifest_force_order_count" ]] \
+      || die "$market manifest force-order count does not match segment: $uri"
     strict_verifier_segments+=("$zst_path" "$digest" "$manifest_digest")
     bytes=$(stat -c '%s' "$zst_path")
     install -m 0640 "$manifest" "$evidence_dir/${market}-manifest-${index}.json"
@@ -928,12 +1094,25 @@ verify_oss_round_trips() {
         lob_max_source_latency_ms:([$lob_continuity.symbols[].max_source_latency_ms | select(type == "number")] | max),
         lob_min_bid_levels:([$lob_continuity.symbols[].min_bid_levels] | min),
         lob_min_ask_levels:([$lob_continuity.symbols[].min_ask_levels] | min)}')
+    if [[ $tape_schema == binance.market_tape.v2 ]]; then
+      round_trip=$(jq -cn \
+        --argjson value "$round_trip" \
+        --argjson raw_trade_count "$raw_trade_count" \
+        --argjson book_ticker_count "$book_ticker_count" \
+        --argjson force_order_count "$force_order_count" \
+        --arg market "$market" \
+        '$value + {raw_trade_count:$raw_trade_count,book_ticker_count:$book_ticker_count}
+          + (if $market == "usdm" then {force_order_count:$force_order_count} else {} end)')
+    fi
     round_trips=$(jq -cn --argjson values "$round_trips" --argjson value "$round_trip" \
       '$values + [$value]')
   done < <(sort -n -k1,1 "$candidates")
 
   verify_adjacent_segments "${strict_verifier_segments[@]}"
   verify_aggregate_trade_continuity "${strict_verifier_segments[@]}"
+  if [[ $tape_schema == binance.market_tape.v2 ]]; then
+    verify_raw_trade_continuity "${strict_verifier_segments[@]}"
+  fi
 
   jq -e --arg session_id "${observed_session[$market]}" '
     all(.[].lob_reconnect_boundary; . == false)
@@ -941,7 +1120,8 @@ verify_oss_round_trips() {
     <<<"$round_trips" >/dev/null \
     || die "$market LOB evidence crosses a capture-session or observation boundary"
 
-  printf '%s\n' "$round_trips"
+  jq -cn --arg tape_schema "$tape_schema" --argjson round_trips "$round_trips" \
+    '{tape_schema:$tape_schema,round_trips:$round_trips}'
 }
 
 duration_seconds=${observed_runtime_seconds[spot]}
@@ -953,18 +1133,21 @@ markets_json='{}'
 for market in "${markets[@]}"; do
   round_trips_path="$tmp_dir/${market}-round-trips.json"
   verify_oss_round_trips "$market" >"$round_trips_path"
-  round_trips=$(<"$round_trips_path")
+  tape_schema=$(jq -er '.tape_schema' "$round_trips_path")
+  round_trips=$(jq -c '.round_trips' "$round_trips_path")
   market_json=$(jq -cn \
     --arg market "$market" \
     --arg unit "${unit[$market]}" \
     --arg dataset "${dataset[$market]}" \
     --arg session_id "${observed_session[$market]}" \
+    --arg tape_schema "$tape_schema" \
     --arg catalog_sha256 "${frozen_catalog_sha256[$market]}" \
     --arg health_sha256 "${health_sha256[$market]}" \
     --argjson symbol_count "${symbol_count[$market]}" \
     --argjson snapshot_ready_count "${snapshot_ready_count[$market]}" \
     --argjson stream_coverage_verified_count "${stream_coverage_verified_count[$market]}" \
     --argjson sequence_gaps "${sequence_gaps[$market]}" \
+    --argjson full_stream_coverage_verified "${full_stream_coverage_verified[$market]}" \
     --argjson upload_failure_count "${initial_upload_failure_count[$market]}" \
     --argjson health_samples "${health_samples[$market]}" \
     --argjson max_health_silence_seconds "${max_health_silence_seconds[$market]}" \
@@ -976,10 +1159,12 @@ for market in "${markets[@]}"; do
     --argjson memory_max_bytes "${memory_max_bytes[$market]}" \
     --argjson oss_round_trips "$round_trips" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session_id,
+      tape_schema:$tape_schema,
       symbols_config:"ALL",catalog_sha256:$catalog_sha256,
       symbol_count:$symbol_count,snapshot_ready_count:$snapshot_ready_count,
       stream_coverage_verified_count:$stream_coverage_verified_count,
       all_stream_coverage_verified:($stream_coverage_verified_count == $symbol_count),
+      full_stream_coverage_verified:$full_stream_coverage_verified,
       sequence_gaps:$sequence_gaps,upload_failure_count:$upload_failure_count,
       health_samples:$health_samples,
       max_health_silence_seconds:$max_health_silence_seconds,
@@ -1000,6 +1185,22 @@ for market in "${markets[@]}"; do
       agg_trade_segments:($oss_round_trips | length),
       agg_trade_count:([$oss_round_trips[].agg_trade_count] | add),
       oss_roundtrip_evidence:$oss_round_trips}')
+  if [[ $tape_schema == binance.market_tape.v2 ]]; then
+    market_json=$(jq -cn \
+      --argjson value "$market_json" \
+      --arg market "$market" \
+      --argjson stream_types "${expected_stream_types[$market]}" \
+      '$value + {
+        stream_types:$stream_types,
+        raw_trade_segments:([$value.oss_roundtrip_evidence[].raw_trade_count
+          | select(. > 0)] | length),
+        raw_trade_count:([$value.oss_roundtrip_evidence[].raw_trade_count] | add),
+        book_ticker_count:([$value.oss_roundtrip_evidence[].book_ticker_count] | add),
+        strict_raw_trade_continuity_readback:true}
+        + (if $market == "usdm" then
+          {force_order_count:([$value.oss_roundtrip_evidence[].force_order_count] | add)}
+        else {} end)')
+  fi
   markets_json=$(jq -cn \
     --argjson values "$markets_json" \
     --arg market "$market" \

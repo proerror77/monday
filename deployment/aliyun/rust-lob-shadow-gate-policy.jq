@@ -203,3 +203,94 @@ and (.markets.usdm.oss_roundtrip_evidence as $round_trips
       $round_trips[.].start_received_at_ns >= $round_trips[. - 1].end_received_at_ns
       and $round_trips[.].gap_from_previous_ns
         == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
+and .markets.spot.tape_schema == .markets.usdm.tape_schema
+and (.markets.spot.tape_schema == "binance.market_tape.v1"
+  or .markets.spot.tape_schema == "binance.market_tape.v2")
+and (if .markets.spot.tape_schema == "binance.market_tape.v1" then
+  (.markets.spot | has("stream_types") | not)
+  and (.markets.spot | has("raw_trade_segments") | not)
+  and (.markets.spot | has("raw_trade_count") | not)
+  and (.markets.spot | has("book_ticker_count") | not)
+  and (.markets.spot | has("force_order_count") | not)
+  and (.markets.spot | has("strict_raw_trade_continuity_readback") | not)
+  and (.markets.spot.full_stream_coverage_verified == null
+    or .markets.spot.full_stream_coverage_verified == true)
+  and all(.markets.spot.oss_roundtrip_evidence[];
+    (has("raw_trade_count") | not)
+    and (has("book_ticker_count") | not)
+    and (has("force_order_count") | not))
+else
+  .markets.spot.stream_types == ["aggTrade","bookTicker","depth@100ms","trade"]
+  and (.markets.spot.raw_trade_segments | type) == "number"
+  and .markets.spot.raw_trade_segments == (.markets.spot.raw_trade_segments | floor)
+  and .markets.spot.raw_trade_segments >= 2
+  and .markets.spot.raw_trade_segments == .markets.spot.oss_roundtrips
+  and (.markets.spot.raw_trade_count | type) == "number"
+  and .markets.spot.raw_trade_count == (.markets.spot.raw_trade_count | floor)
+  and .markets.spot.raw_trade_count > 0
+  and .markets.spot.raw_trade_count
+    == ([.markets.spot.oss_roundtrip_evidence[].raw_trade_count] | add)
+  and (.markets.spot.book_ticker_count | type) == "number"
+  and .markets.spot.book_ticker_count == (.markets.spot.book_ticker_count | floor)
+  and .markets.spot.book_ticker_count > 0
+  and .markets.spot.book_ticker_count
+    == ([.markets.spot.oss_roundtrip_evidence[].book_ticker_count] | add)
+  and (.markets.spot | has("force_order_count") | not)
+  and .markets.spot.strict_raw_trade_continuity_readback == true
+  and .markets.spot.full_stream_coverage_verified == true
+  and all(.markets.spot.oss_roundtrip_evidence[];
+    (.raw_trade_count | type) == "number"
+    and .raw_trade_count == (.raw_trade_count | floor)
+    and .raw_trade_count > 0
+    and (.book_ticker_count | type) == "number"
+    and .book_ticker_count == (.book_ticker_count | floor)
+    and .book_ticker_count > 0
+    and (has("force_order_count") | not))
+end)
+and (if .markets.usdm.tape_schema == "binance.market_tape.v1" then
+  (.markets.usdm | has("stream_types") | not)
+  and (.markets.usdm | has("raw_trade_segments") | not)
+  and (.markets.usdm | has("raw_trade_count") | not)
+  and (.markets.usdm | has("book_ticker_count") | not)
+  and (.markets.usdm | has("force_order_count") | not)
+  and (.markets.usdm | has("strict_raw_trade_continuity_readback") | not)
+  and (.markets.usdm.full_stream_coverage_verified == null
+    or .markets.usdm.full_stream_coverage_verified == true)
+  and all(.markets.usdm.oss_roundtrip_evidence[];
+    (has("raw_trade_count") | not)
+    and (has("book_ticker_count") | not)
+    and (has("force_order_count") | not))
+else
+  .markets.usdm.stream_types == ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]
+  and (.markets.usdm.raw_trade_segments | type) == "number"
+  and .markets.usdm.raw_trade_segments == (.markets.usdm.raw_trade_segments | floor)
+  and .markets.usdm.raw_trade_segments >= 2
+  and .markets.usdm.raw_trade_segments == .markets.usdm.oss_roundtrips
+  and (.markets.usdm.raw_trade_count | type) == "number"
+  and .markets.usdm.raw_trade_count == (.markets.usdm.raw_trade_count | floor)
+  and .markets.usdm.raw_trade_count > 0
+  and .markets.usdm.raw_trade_count
+    == ([.markets.usdm.oss_roundtrip_evidence[].raw_trade_count] | add)
+  and (.markets.usdm.book_ticker_count | type) == "number"
+  and .markets.usdm.book_ticker_count == (.markets.usdm.book_ticker_count | floor)
+  and .markets.usdm.book_ticker_count > 0
+  and .markets.usdm.book_ticker_count
+    == ([.markets.usdm.oss_roundtrip_evidence[].book_ticker_count] | add)
+  and (.markets.usdm.force_order_count | type) == "number"
+  and .markets.usdm.force_order_count == (.markets.usdm.force_order_count | floor)
+  and .markets.usdm.force_order_count >= 0
+  and .markets.usdm.force_order_count
+    == ([.markets.usdm.oss_roundtrip_evidence[].force_order_count] | add)
+  and .markets.usdm.strict_raw_trade_continuity_readback == true
+  and .markets.usdm.full_stream_coverage_verified == true
+  and all(.markets.usdm.oss_roundtrip_evidence[];
+    (.raw_trade_count | type) == "number"
+    and .raw_trade_count == (.raw_trade_count | floor)
+    and .raw_trade_count > 0
+    and (.book_ticker_count | type) == "number"
+    and .book_ticker_count == (.book_ticker_count | floor)
+    and .book_ticker_count > 0
+    and (.force_order_count | type) == "number"
+    and .force_order_count == (.force_order_count | floor)
+    and .force_order_count >= 0)
+end)

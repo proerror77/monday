@@ -13,6 +13,8 @@ and .stream_coverage_verified_count == .symbol_count
 and .snapshot_only_symbols == []
 and .all_symbols_bridged == true
 and .all_stream_coverage_verified == true
+and ((.full_stream_coverage_verified == null)
+  or (.full_stream_coverage_verified == true))
 and .pending_upload_segments == 0
 and .queue_saturated == false
 and .disk_warning == false

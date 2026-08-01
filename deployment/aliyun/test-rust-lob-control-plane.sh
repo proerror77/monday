@@ -11,6 +11,7 @@ INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
 ARTIFACT_VERIFIER="$SCRIPT_DIR/../../rust_hft/data-pipelines/core/src/binance_market_tape_artifact.rs"
 COLLECTOR="$SCRIPT_DIR/../../rust_hft/tools/collector/src/bin/binance-lob-archiver.rs"
+LOB_ARCHIVER="$SCRIPT_DIR/../../rust_hft/tools/collector/src/lob_archiver.rs"
 ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
@@ -35,6 +36,18 @@ grep -Fq -- '--segment-content-sha256' "$GATE"
 grep -Fq -- '--segment-manifest-sha256' "$GATE"
 grep -Fq -- '--require-lob-continuity' "$GATE"
 grep -Fq -- '--verify-aggregate-trade-continuity' "$GATE"
+grep -Fq 'verify_raw_trade_continuity' "$GATE"
+grep -Fq -- '--verify-raw-trade-continuity' "$GATE"
+grep -Fq 'BinanceRawTradeContinuityVerifier' "$COLLECTOR"
+grep -Fq 'verify_raw_trade_continuity "${strict_verifier_segments[@]}"' "$GATE"
+grep -Fq 'strict_raw_trade_continuity_readback' "$GATE"
+grep -Fq 'raw_trade_segments' "$GATE"
+grep -Fq 'book_ticker_count' "$GATE"
+grep -Fq 'force_order_count' "$GATE"
+grep -Fq 'tape_schema' "$GATE"
+grep -Fq 'full_stream_coverage_verified' "$GATE"
+grep -Fq 'or (.full_stream_coverage_verified == true))' "$RUNTIME_POLICY"
+grep -Fq '"full_stream_coverage_verified"' "$LOB_ARCHIVER"
 grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
 grep -Fq -- '--property=KillMode=control-group' "$GATE"
 grep -Fq 'MemoryHigh=5000M' "$GATE"
@@ -137,7 +150,7 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
 strict_verifier_body="$tmp_dir/strict-verifier.sh"
-sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p' \
+sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p;/^verify_raw_trade_continuity()/,/^}/p' \
   "$GATE" >"$strict_verifier_body"
 run_strict_verifier_fixture() (
   local -a verifier_units=()
@@ -170,8 +183,12 @@ run_strict_verifier_fixture() (
     first.zst first-content first-manifest \
     second.zst second-content second-manifest \
     third.zst third-content third-manifest
-  [[ ${#verifier_invocations[@]} -eq 3 ]] || {
-    printf 'strict verifier did not run adjacent pairs plus one aggregate continuity pass\n' >&2
+  verify_raw_trade_continuity \
+    first.zst first-content first-manifest \
+    second.zst second-content second-manifest \
+    third.zst third-content third-manifest
+  [[ ${#verifier_invocations[@]} -eq 4 ]] || {
+    printf 'strict verifier did not run adjacent pairs plus one continuity pass per trade family\n' >&2
     exit 1
   }
   [[ ${verifier_invocations[0]} == \
@@ -183,7 +200,12 @@ run_strict_verifier_fixture() (
     printf 'aggregate continuity verifier lost segment trust-anchor flags\n' >&2
     exit 1
   }
-  [[ ${#verifier_units[@]} -eq 3 ]] || {
+  [[ ${verifier_invocations[3]} == \
+    '--verify-raw-trade-continuity --verify-segment first.zst --segment-content-sha256 first-content --segment-manifest-sha256 first-manifest --verify-segment second.zst --segment-content-sha256 second-content --segment-manifest-sha256 second-manifest --verify-segment third.zst --segment-content-sha256 third-content --segment-manifest-sha256 third-manifest' ]] || {
+    printf 'raw-trade continuity verifier lost segment trust-anchor flags\n' >&2
+    exit 1
+  }
+  [[ ${#verifier_units[@]} -eq 4 ]] || {
     printf 'strict verifier did not isolate every verification pass\n' >&2
     exit 1
   }
@@ -347,15 +369,22 @@ market_json=$(jq -cn \
     upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
     catalog_sha256:$catalog,
     session_id:"session-1",oss_roundtrips:2,
+    tape_schema:"binance.market_tape.v2",
+    stream_types:["aggTrade","bookTicker","depth@100ms","trade"],
     agg_trade_segments:2,agg_trade_count:2,
+    raw_trade_segments:2,raw_trade_count:2,book_ticker_count:2,
     strict_trade_summary_readback:true,
-    strict_lob_continuity_readback:true,lob_reconnect_boundaries:0,
+    strict_lob_continuity_readback:true,
+    strict_raw_trade_continuity_readback:true,
+    full_stream_coverage_verified:true,
+    lob_reconnect_boundaries:0,
     min_lob_source_latency_ms:0,max_lob_source_latency_ms:0,
     min_lob_bid_levels:1,min_lob_ask_levels:1,
     max_segment_gap_ns:0,
     oss_roundtrip_evidence:[
       {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
        gap_from_previous_ns:0,start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1,
+       raw_trade_count:1,book_ticker_count:1,
        lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
        lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
        stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
@@ -363,6 +392,7 @@ market_json=$(jq -cn \
        lob_min_bid_levels:1,lob_min_ask_levels:1},
       {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",sha256:$catalog,manifest_sha256:$catalog,
        gap_from_previous_ns:0,start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1,
+       raw_trade_count:1,book_ticker_count:1,
        lob_capture_session_id:"session-1",lob_reconnect_boundary:false,lob_sequence_gaps:0,
        lob_source_time_rollbacks:0,lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
        stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
@@ -374,9 +404,12 @@ usdm_market=$(jq -c '
   | .snapshot_ready_count = 500
   | .bridged_count = 500
   | .stream_coverage_verified_count = 500
+  | .stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]
+  | .force_order_count = 2
   | .oss_roundtrip_evidence |= map(
       .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-      | .stream_coverage_verified_count = 500)' \
+      | .stream_coverage_verified_count = 500
+      | .force_order_count = 1)' \
   <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
@@ -395,6 +428,153 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+v1_market=$(jq -c '
+  del(.stream_types, .raw_trade_segments, .raw_trade_count, .book_ticker_count,
+      .force_order_count, .strict_raw_trade_continuity_readback)
+  | .tape_schema = "binance.market_tape.v1"
+  | .full_stream_coverage_verified = null
+  | .oss_roundtrip_evidence |= map(
+      del(.raw_trade_count, .book_ticker_count, .force_order_count))' \
+  <<<"$market_json")
+v1_usdm_market=$(jq -c '
+  .symbol_count = 500
+  | .snapshot_ready_count = 500
+  | .bridged_count = 500
+  | .stream_coverage_verified_count = 500
+  | .oss_roundtrip_evidence |= map(
+      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
+      | .stream_coverage_verified_count = 500)' \
+  <<<"$v1_market")
+jq -n \
+  --arg artifact "$artifact" \
+  --arg bundle "$bundle" \
+  --arg source "$source_revision" \
+  --argjson market "$v1_market" \
+  --argjson usdm_market "$v1_usdm_market" \
+  '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
+    deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
+    passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
+    markets:{spot:$market,usdm:$usdm_market}}' \
+  >"$tmp_dir/gate-v1.json"
+jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/gate-v1.json" >/dev/null || {
+  printf 'gate policy rejected a v1 tape candidate during the transition\n' >&2
+  exit 1
+}
+
+jq '.markets.spot.raw_trade_count = 1' \
+  "$tmp_dir/gate-v1.json" >"$tmp_dir/v1-with-raw-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/v1-with-raw-trades.json" >/dev/null; then
+  printf 'gate policy accepted v2 family evidence on a v1 tape candidate\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.spot.tape_schema)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-tape-schema.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-tape-schema.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a tape schema\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.stream_types = ["aggTrade","depth@100ms"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/legacy-stream-types.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/legacy-stream-types.json" >/dev/null; then
+  printf 'gate policy accepted a v2 candidate declaring legacy stream types\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.raw_trade_segments = 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/non-continuous-raw-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/non-continuous-raw-trades.json" >/dev/null; then
+  printf 'gate policy accepted raw trades from fewer than two segments\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.raw_trade_count = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/zero-raw-trades.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/zero-raw-trades.json" >/dev/null; then
+  printf 'gate policy accepted zero raw trades\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.book_ticker_count = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/zero-book-tickers.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/zero-book-tickers.json" >/dev/null; then
+  printf 'gate policy accepted zero book tickers\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.spot.strict_raw_trade_continuity_readback)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-strict-raw-trade-readback.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-strict-raw-trade-readback.json" >/dev/null; then
+  printf 'gate policy accepted evidence without strict raw-trade continuity readback\n' >&2
+  exit 1
+fi
+
+jq 'del(.markets.usdm.force_order_count)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-force-order-count.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-force-order-count.json" >/dev/null; then
+  printf 'gate policy accepted USD-M evidence without a force-order count\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.force_order_count = 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/spot-force-orders.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/spot-force-orders.json" >/dev/null; then
+  printf 'gate policy accepted force-order evidence on a spot candidate\n' >&2
+  exit 1
+fi
+
+jq '.markets.spot.full_stream_coverage_verified = false' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unverified-full-stream-coverage.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/unverified-full-stream-coverage.json" >/dev/null; then
+  printf 'gate policy accepted unverified full stream coverage\n' >&2
+  exit 1
+fi
 
 jq '.markets.spot.all_stream_coverage_verified = false' \
   "$tmp_dir/gate.json" >"$tmp_dir/unverified-stream-coverage.json"
@@ -591,6 +771,7 @@ fi
 jq -n '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_count:1200,
   snapshot_ready_count:1200,bridged_count:1200,stream_coverage_verified_count:1200,
   snapshot_only_symbols:[],all_symbols_bridged:true,all_stream_coverage_verified:true,
+  full_stream_coverage_verified:true,
   pending_upload_segments:0,queue_saturated:false,
   disk_warning:false,upload_warning:false,updated_at_ns:200,session_id:"new-session"}' \
   >"$tmp_dir/runtime-health.json"
@@ -626,6 +807,18 @@ if runtime_policy_accepts "$tmp_dir/incomplete-runtime-stream-coverage.json" old
   printf 'runtime policy accepted incomplete stream coverage\n' >&2
   exit 1
 fi
+jq '.full_stream_coverage_verified = false' \
+  "$tmp_dir/runtime-health.json" >"$tmp_dir/unverified-full-runtime-coverage.json"
+if runtime_policy_accepts "$tmp_dir/unverified-full-runtime-coverage.json" old-session 100; then
+  printf 'runtime policy accepted unverified full stream coverage\n' >&2
+  exit 1
+fi
+jq 'del(.full_stream_coverage_verified)' \
+  "$tmp_dir/runtime-health.json" >"$tmp_dir/v1-runtime-coverage.json"
+runtime_policy_accepts "$tmp_dir/v1-runtime-coverage.json" old-session 100 || {
+  printf 'runtime policy rejected a v1 collector without the full coverage field\n' >&2
+  exit 1
+}
 for field in symbol_count snapshot_ready_count bridged_count stream_coverage_verified_count; do
   jq --arg field "$field" '.[$field] = "1200"' \
     "$tmp_dir/runtime-health.json" >"$tmp_dir/quoted-count.json"

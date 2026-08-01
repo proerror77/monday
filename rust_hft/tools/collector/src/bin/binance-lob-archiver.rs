@@ -8,7 +8,7 @@ use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet, verify_binance_market_tape_for_strict_gate,
     verify_binance_market_tape_with_required_trade_summaries,
     BinanceAggregateTradeContinuityVerifier, BinanceMarketTapeTriplet,
-    BinanceMarketTapeTrustAnchor,
+    BinanceMarketTapeTrustAnchor, BinanceRawTradeContinuityVerifier,
 };
 use futures::{SinkExt, StreamExt};
 use hft_collector::lob_archiver::{
@@ -69,6 +69,13 @@ struct Args {
         conflicts_with = "require_lob_continuity"
     )]
     verify_aggregate_trade_continuity: bool,
+
+    #[arg(
+        long,
+        requires = "verify_segment",
+        conflicts_with_all = ["require_lob_continuity", "verify_aggregate_trade_continuity"]
+    )]
+    verify_raw_trade_continuity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -891,6 +898,24 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
             "aggregate-trade continuity verification: ok ({} segments)",
             count
         );
+        return Ok(());
+    }
+
+    if args.verify_raw_trade_continuity {
+        let mut verifier = BinanceRawTradeContinuityVerifier::default();
+        for (path, trust) in trusted_segments {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("market-tape segment path has no UTF-8 file name")?;
+            let triplet = BinanceMarketTapeTriplet {
+                data: path.clone(),
+                manifest: path.with_file_name(format!("{file_name}.manifest.json")),
+                success: path.with_file_name(format!("{file_name}._SUCCESS")),
+            };
+            verifier.observe_segment(seal_binance_market_tape_triplet(&triplet, &trust)?)?;
+        }
+        println!("raw-trade continuity verification: ok ({} segments)", count);
         return Ok(());
     }
 
@@ -3555,6 +3580,50 @@ mod tests {
             &"b".repeat(64),
             "--verify-aggregate-trade-continuity",
             "--require-lob-continuity",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn raw_trade_continuity_is_an_explicit_segment_verifier_mode() {
+        let args = Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-raw-trade-continuity",
+        ])
+        .unwrap();
+        assert!(args.verify_raw_trade_continuity);
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--verify-raw-trade-continuity",])
+                .is_err()
+        );
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-raw-trade-continuity",
+            "--require-lob-continuity",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+            "--verify-raw-trade-continuity",
+            "--verify-aggregate-trade-continuity",
         ])
         .is_err());
     }
