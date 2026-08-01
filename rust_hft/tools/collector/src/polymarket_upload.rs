@@ -54,7 +54,7 @@ const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
 // endpoint: in production (2026-08-01, three gate invocations) a just-PUT
 // object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
 // retry window before becoming HEAD-able, failing every shadow gate.
-const OSS_READBACK_ATTEMPTS: usize = 60;
+const OSS_READBACK_ATTEMPTS: usize = 120;
 #[cfg(not(test))]
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -1871,6 +1871,7 @@ where
         .parent()
         .ok_or_else(|| anyhow!("artifact has no parent"))?;
     let verify_dir = ExclusiveTempDir::create(parent, ".oss-verify")?;
+    let download_started = std::time::Instant::now();
     let mut downloaded = BTreeMap::new();
     for source in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
         let name = source
@@ -1886,12 +1887,15 @@ where
                 .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
             config,
         );
+        let file_budget = budget_remaining
+            .checked_sub(download_started.elapsed())
+            .unwrap_or(Duration::ZERO);
         runner(
             &mut command,
             config
                 .oss_timeout
                 .min(OSS_READBACK_FILE_TIMEOUT)
-                .min(budget_remaining),
+                .min(file_budget),
         )?;
         regular_identity(&destination)?;
         downloaded.insert(name.to_owned(), destination);

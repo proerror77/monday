@@ -22,7 +22,10 @@ readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
 # evidence requirements are unchanged.
 readonly LEGACY_HEALTH_START_REQUIRED=false
 readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
-readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=300
+# Must exceed the uploader's worst-case readback window (600s deadline
+# budget plus 120 attempts) AND the upload time of the largest observed
+# segment (~150s for a 109MiB multipart object on this endpoint).
+readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
 readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
