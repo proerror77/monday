@@ -757,7 +757,7 @@ verify_oss_round_trips() {
   local manifest_replay_safe
   local segment_dir manifest_path manifest_digest actual_manifest_digest
   local actual_digest bytes agg_trade_count manifest_agg_trade_count gap_ns
-  local tape_schema= candidate_schema stream_type_count
+  local tape_schema='' candidate_schema stream_type_count
   local family_counts raw_trade_count book_ticker_count force_order_count
   local manifest_symbol_count manifest_raw_trade_count manifest_book_ticker_count
   local manifest_force_order_count
