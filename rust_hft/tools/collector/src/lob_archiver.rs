@@ -6,7 +6,7 @@ use data::binance_market_tape::{
     event_type_allowed, market_tape_schema, supported_schema, AggregateTrade,
     AggregateTradeSequenceValidator, AggregateTradeSummary, AggregateTradeSummaryBuilder,
     LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
-    LEGACY_LOB_TAPE_SCHEMA,
+    LEGACY_LOB_TAPE_SCHEMA, MARKET_TAPE_SCHEMA_V2,
 };
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
-pub use data::binance_market_tape::MARKET_TAPE_SCHEMA as RAW_SCHEMA;
+pub use data::binance_market_tape::MARKET_TAPE_SCHEMA_V2 as RAW_SCHEMA;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepthDiff {
@@ -402,6 +402,7 @@ pub struct SegmentConfig {
     pub excluded_symbols: Vec<String>,
     pub snapshot_limit: u64,
     pub zstd_timeout: Duration,
+    pub stream_types: Vec<String>,
 }
 
 pub struct Segment {
@@ -699,6 +700,21 @@ fn finalize_segment(
             "lob_continuity".to_owned(),
             serde_json::to_value(lob_continuity.context("market tape has no LOB summary")?)?,
         );
+        // The v2 manifest declares its per-symbol stream-type list; v1 tapes
+        // never carry the field so old segments verify byte-identically.
+        if schema == MARKET_TAPE_SCHEMA_V2 {
+            anyhow::ensure!(
+                !config.stream_types.is_empty()
+                    && config.stream_types.iter().all(|value| !value.is_empty())
+                    && config.stream_types.iter().collect::<BTreeSet<_>>().len()
+                        == config.stream_types.len(),
+                "v2 market tape requires a declared stream type set"
+            );
+            metadata.insert(
+                "stream_types".to_owned(),
+                config.stream_types.clone().into(),
+            );
+        }
     }
     let manifest = data.with_file_name(format!(
         "{}.manifest.json",
@@ -1215,6 +1231,12 @@ mod tests {
             excluded_symbols: vec![],
             snapshot_limit: 100,
             zstd_timeout: Duration::from_secs(30),
+            stream_types: vec![
+                "depth@100ms".into(),
+                "aggTrade".into(),
+                "trade".into(),
+                "bookTicker".into(),
+            ],
         }
     }
 
@@ -1530,6 +1552,12 @@ mod tests {
             excluded_symbols: vec![],
             snapshot_limit: 100,
             zstd_timeout: Duration::from_secs(30),
+            stream_types: vec![
+                "depth@100ms".into(),
+                "aggTrade".into(),
+                "trade".into(),
+                "bookTicker".into(),
+            ],
         };
         let start_ns = 1_700_000_000_000_000_000;
         let mut segment = Segment::create(config, start_ns).unwrap();
@@ -1656,7 +1684,11 @@ mod tests {
             serde_json::from_reader(File::open(&artifacts.manifest).unwrap()).unwrap();
         assert_eq!(
             manifest["schema"],
-            data::binance_market_tape::MARKET_TAPE_SCHEMA
+            data::binance_market_tape::MARKET_TAPE_SCHEMA_V2
+        );
+        assert_eq!(
+            manifest["stream_types"],
+            json!(["depth@100ms", "aggTrade", "trade", "bookTicker"])
         );
         assert_eq!(manifest["start_received_at_ns"], json!(start_ns));
         assert_eq!(
@@ -1806,6 +1838,32 @@ mod tests {
                 RAW_SCHEMA,
                 "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
             ),
+            (
+                "v1",
+                json!({
+                    "schema":data::binance_market_tape::MARKET_TAPE_SCHEMA,
+                    "received_at_ns":start_ns,
+                    "type":"agg_trade",
+                    "session_id":"session-1",
+                    "frame":{
+                        "stream":"btcusdt@aggTrade",
+                        "data":{
+                            "e":"aggTrade",
+                            "E":start_ns / 1_000_000,
+                            "s":"BTCUSDT",
+                            "a":10,
+                            "p":"100.5",
+                            "q":"2",
+                            "f":10,
+                            "l":10,
+                            "T":start_ns / 1_000_000,
+                            "m":false
+                        }
+                    }
+                }),
+                data::binance_market_tape::MARKET_TAPE_SCHEMA,
+                "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+            ),
         ] {
             let root = tempfile::Builder::new()
                 .prefix(&format!("monday-recovery-{name}-"))
@@ -1819,7 +1877,7 @@ mod tests {
                 serde_json::from_reader(File::open(&artifacts[0].manifest).unwrap()).unwrap();
             assert_eq!(manifest["schema"], schema, "case={name}");
             assert_eq!(manifest["replay_scope"], replay_scope, "case={name}");
-            if schema == RAW_SCHEMA {
+            if market_tape_schema(schema) {
                 assert_eq!(manifest["trade_representation"], "aggregate_trade_only");
                 assert_eq!(
                     manifest["price_surface_derivation"],
@@ -1832,6 +1890,15 @@ mod tests {
             } else {
                 assert!(manifest.get("trade_representation").is_none());
                 assert!(manifest.get("price_surface_derivation").is_none());
+            }
+            if schema == RAW_SCHEMA {
+                assert_eq!(
+                    manifest["stream_types"],
+                    json!(["depth@100ms", "aggTrade", "trade", "bookTicker"]),
+                    "case={name}"
+                );
+            } else {
+                assert!(manifest.get("stream_types").is_none(), "case={name}");
             }
         }
     }
