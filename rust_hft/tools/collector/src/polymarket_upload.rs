@@ -54,7 +54,7 @@ const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
 // endpoint: in production (2026-08-01, three gate invocations) a just-PUT
 // object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
 // retry window before becoming HEAD-able, failing every shadow gate.
-const OSS_READBACK_ATTEMPTS: usize = 12;
+const OSS_READBACK_ATTEMPTS: usize = 60;
 #[cfg(not(test))]
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -65,8 +65,10 @@ const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_millis(5);
 // loop at hours).
 const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 // Wall-clock budget for the entire retry loop, covering command time AND
-// backoff sleeps (a backoff-only cap cannot trigger: 11 x 5s sleeps = 55s).
-const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
+// backoff sleeps. Must exceed the worst observed object-visibility lag on
+// this endpoint: a 109MiB multipart upload took ~150s to become HEAD-able
+// (2026-08-01T18:23 CST), failing a 12x5s loop at ~90s.
+const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1962,7 +1964,13 @@ where
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < OSS_READBACK_ATTEMPTS {
-            std::thread::sleep(OSS_READBACK_RETRY_DELAY);
+            let remaining = OSS_READBACK_MAX_WALL_CLOCK
+                .saturating_sub(started.elapsed())
+                .min(OSS_READBACK_RETRY_DELAY);
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining);
         }
     }
     Err(last_error
