@@ -59,10 +59,14 @@ const OSS_READBACK_ATTEMPTS: usize = 12;
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_millis(5);
-// Hard ceiling on total sleep time across attempts; a hung readback command
-// is bounded by config.oss_timeout per attempt, but the aggregate backoff
-// must not stretch the upload far beyond the visibility lag we observed.
-const OSS_READBACK_MAX_BACKOFF: Duration = Duration::from_secs(120);
+// Per-file readback timeout: verified objects are tens of MB on an internal
+// endpoint, so a hung download must fail fast instead of inheriting the
+// 300s upload timeout (36 downloads x 300s would otherwise cap the retry
+// loop at hours).
+const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
+// Wall-clock budget for the entire retry loop, covering command time AND
+// backoff sleeps (a backoff-only cap cannot trigger: 11 x 5s sleeps = 55s).
+const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1879,7 +1883,7 @@ where
                 .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
             config,
         );
-        runner(&mut command, config.oss_timeout)?;
+        runner(&mut command, config.oss_timeout.min(OSS_READBACK_FILE_TIMEOUT))?;
         regular_identity(&destination)?;
         downloaded.insert(name.to_owned(), destination);
     }
@@ -1937,8 +1941,11 @@ where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
     let mut last_error = None;
-    let mut backoff_spent = Duration::ZERO;
+    let started = std::time::Instant::now();
     for attempt in 0..OSS_READBACK_ATTEMPTS {
+        if started.elapsed() > OSS_READBACK_MAX_WALL_CLOCK {
+            break;
+        }
         match download_remote_artifacts_with(artifacts, config, runner) {
             Ok((_verify_dir, downloaded)) => {
                 return verify_downloaded_artifacts(artifacts, &downloaded);
@@ -1946,10 +1953,6 @@ where
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < OSS_READBACK_ATTEMPTS {
-            backoff_spent += OSS_READBACK_RETRY_DELAY;
-            if backoff_spent > OSS_READBACK_MAX_BACKOFF {
-                break;
-            }
             std::thread::sleep(OSS_READBACK_RETRY_DELAY);
         }
     }
