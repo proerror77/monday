@@ -242,4 +242,47 @@ setup_fixture verifier
 printf 'drift\n' >>"$release/binance-usdm-reference-artifact-verifier"
 expect_failure verifier-sha-drift
 
+production_collector="$script_dir/binance-usdm-reference-collector.service"
+production_upload_service="$script_dir/binance-usdm-reference-upload.service"
+production_upload_timer="$script_dir/binance-usdm-reference-upload.timer"
+production_upload_env="$script_dir/binance-usdm-reference-upload.env"
+cutover="$script_dir/binance-usdm-reference-cutover.sh"
+
+[[ -x $cutover ]] || {
+  printf '%s\n' 'missing executable Binance USD-M reference cutover' >&2
+  exit 1
+}
+grep -Fq 'must run as root' "$cutover"
+grep -Fq 'flock -n 9' "$cutover"
+grep -Fq 'mountpoint -q /data' "$cutover"
+grep -Fq 'secure_regular_file' "$cutover"
+grep -Fq 'PASSED.sha256' "$cutover"
+grep -Fq 'binance-usdm-reference-shadow-gates' "$cutover"
+grep -Fq '/opt/monday/bin/binance-usdm-reference-collector' "$cutover"
+grep -Fq '/opt/monday/bin/binance-usdm-reference-upload' "$cutover"
+grep -Fq 'monday.binance_usdm_reference_cutover.v1' "$cutover"
+grep -Fq 'new-host' "$cutover"
+
+grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
+grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
+  "$production_collector"
+grep -Fxq 'ReadWritePaths=/data/monday/spool/binance-usdm-reference' "$production_collector"
+grep -Fxq 'WantedBy=multi-user.target' "$production_collector"
+grep -Fxq 'Type=oneshot' "$production_upload_service"
+grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_upload_service"
+grep -Fxq 'EnvironmentFile=/etc/monday/binance-usdm-reference-upload.env' \
+  "$production_upload_service"
+grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-upload --output-root /data/monday/spool/binance-usdm-reference' \
+  "$production_upload_service"
+grep -Fxq 'ReadWritePaths=/data/monday/spool/binance-usdm-reference' \
+  "$production_upload_service"
+grep -Fxq 'Unit=binance-usdm-reference-upload.service' "$production_upload_timer"
+grep -Fxq 'OnUnitActiveSec=5min' "$production_upload_timer"
+grep -Fxq 'WantedBy=timers.target' "$production_upload_timer"
+grep -Fxq 'OSS_BUCKET=monday-lob-apne1-1045353359' "$production_upload_env"
+grep -Fxq 'OSS_ENDPOINT=oss-ap-northeast-1-internal.aliyuncs.com' "$production_upload_env"
+grep -Fxq 'OSS_REGION=ap-northeast-1' "$production_upload_env"
+grep -Fxq 'ALIYUN_PROFILE=ecs-role' "$production_upload_env"
+grep -Fxq 'OSS_COPY_TIMEOUT_SECONDS=300' "$production_upload_env"
+
 printf '%s\n' 'Binance USD-M reference host gate tests passed'

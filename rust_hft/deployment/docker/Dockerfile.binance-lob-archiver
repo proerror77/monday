@@ -23,6 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin binance-lob-archiver \
     --bin binance-usdm-reference-collector \
     --bin binance-usdm-reference-artifact-verifier \
+    --bin binance-usdm-reference-upload \
     --bin polymarket-raw-ops \
     && install -D -m 0755 /work/target/release/binance-lob-archiver \
        /out/bin/binance-lob-archiver \
@@ -31,7 +32,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/release/binance-usdm-reference-collector \
        /out/bin/binance-usdm-reference-collector \
     && install -D -m 0755 /work/target/release/binance-usdm-reference-artifact-verifier \
-       /out/bin/binance-usdm-reference-artifact-verifier
+       /out/bin/binance-usdm-reference-artifact-verifier \
+    && install -D -m 0755 /work/target/release/binance-usdm-reference-upload \
+       /out/bin/binance-usdm-reference-upload
 
 FROM debian:bookworm-slim AS aliyun-cli
 
@@ -68,6 +71,7 @@ COPY --from=builder /out/bin/binance-lob-archiver /usr/local/bin/binance-lob-arc
 COPY --from=builder /out/bin/polymarket-raw-ops /usr/local/bin/polymarket-raw-ops
 COPY --from=builder /out/bin/binance-usdm-reference-collector /usr/local/bin/binance-usdm-reference-collector
 COPY --from=builder /out/bin/binance-usdm-reference-artifact-verifier /usr/local/bin/binance-usdm-reference-artifact-verifier
+COPY --from=builder /out/bin/binance-usdm-reference-upload /usr/local/bin/binance-usdm-reference-upload
 COPY --from=aliyun-cli /usr/local/bin/aliyun /usr/local/bin/aliyun
 
 USER hftcollector

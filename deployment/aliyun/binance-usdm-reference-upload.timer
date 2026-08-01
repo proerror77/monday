@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry verified Monday Binance USD-M reference batch uploads every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=binance-usdm-reference-upload.service
+
+[Install]
+WantedBy=timers.target

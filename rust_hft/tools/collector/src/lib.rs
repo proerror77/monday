@@ -2,6 +2,7 @@
 
 pub mod binance_usdm_reference_artifact;
 pub mod binance_usdm_reference_collector;
+pub mod binance_usdm_reference_upload;
 pub mod feature_matrix;
 pub mod lob_archiver;
 pub mod polymarket_evidence_artifact;

@@ -288,6 +288,59 @@ wire. With both production services synchronized, the host used about 1.2 CPU
 cores and less than 1GiB of service memory. The 80% CPU quota and 3.2GiB memory
 limit on each service preserve host headroom during bursts.
 
+## Binance USD-M reference collector lane
+
+The `binance-usdm-reference-collector` publishes a complete snapshot of every
+active Binance USD-M perpetual contract every 30 seconds: exchange metadata,
+mark/index/funding observations, and open interest, all anchored to the
+official `https://fapi.binance.com` server clock. Each poll is published as an
+atomic no-clobber batch triplet (`reference.ndjson`,
+`reference.ndjson.manifest.json`, `reference.ndjson._SUCCESS`) under
+`/data/monday/spool/binance-usdm-reference/lake/raw/venue=binance_usdm/dataset=reference/date=.../hour=.../batch=<observed-at-ns>/`
+and is verified by canonical readback before the batch is visible. The lane
+has no credentials and no execution path; it is public market data only.
+
+Promotion follows the same three-operation contract as the LOB archiver:
+install a digest-addressed release under
+`/opt/monday/releases/binance-usdm-reference-collector/<candidate-sha256>/`,
+pass the one-hour isolated shadow gate
+(`binance-usdm-reference-collector-shadow@<candidate-sha256>.service` observed
+by `binance-usdm-reference-shadow-gate.sh`), then promote with
+`binance-usdm-reference-cutover.sh <candidate-sha256>`. The shadow bundle
+(`binance-usdm-reference-control.tar.gz`) keeps exactly the three gate assets;
+the production units ship in the separate
+`binance-usdm-reference-production-control.tar.gz` bundle, so production
+assets can never invalidate a completed shadow gate.
+
+The cutover is green-field only: it refuses any existing production unit,
+symlink, or canonical lake artifact. It revalidates the release identity, the
+uploader sidecar digest, the production bundle manifest, and exactly one
+immutable `PASSED.sha256` shadow gate before touching systemd. It then
+installs the production units, points
+`/opt/monday/bin/binance-usdm-reference-collector` and
+`/opt/monday/bin/binance-usdm-reference-upload` at the digest-addressed
+release, starts the collector without enabling it, requires fresh verifier-
+checked health, proves one OSS round trip by draining the spool with the
+candidate uploader, requires fresh post-drain health, and only then enables
+`binance-usdm-reference-collector.service` and
+`binance-usdm-reference-upload.timer`. Failure after the transition starts
+disables and runtime-masks every lane unit and removes candidate symlinks.
+Evidence is append-only under
+`/data/monday/evidence/binance-usdm-reference-cutovers/` and is valid only as
+the `cutover.json` plus single-line `PASSED.sha256` pair verified with
+`sha256sum --check --strict`.
+
+The production uploader runs every five minutes from
+`binance-usdm-reference-upload.timer`. It re-verifies each local batch with
+the canonical artifact verifier, uploads the triplet to
+`oss://monday-lob-apne1-1045353359/lake/raw/venue=binance_usdm/dataset=reference/...`
+with `aliyun ossutil cp --ignore-existing` under the `ecs-role` profile,
+downloads all three objects back, and re-runs the verifier on the remote
+bytes before deleting the local batch. An existing remote triplet must match
+byte for byte; a conflicting object fails closed and the local batch is
+retained. A bad batch never blocks later batches, and failures surface in
+`/data/monday/spool/binance-usdm-reference/upload-status.json`.
+
 ## Backtesting storage boundary
 
 Use OSS raw segments as the immutable source of truth, not as the repeated query
