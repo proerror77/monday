@@ -175,8 +175,6 @@ grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
 grep -Fqx '      - rust_fast_gates' "$ci_workflow"
-ci_gate_block=$(job_block ci-gate)
-grep -Fqx '      - market_recorder_contract' <<<"$ci_gate_block"
 grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
 grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$ci_workflow"
 grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
@@ -220,6 +218,8 @@ grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 
 # The market-recorder release contract runs as its own parallel job (#568).
+ci_gate_block=$(job_block ci-gate)
+grep -Fqx '      - market_recorder_contract' <<<"$ci_gate_block"
 recorder_block=$(job_block market_recorder_contract)
 [ -n "$recorder_block" ]
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
