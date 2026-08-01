@@ -589,6 +589,50 @@ mod tests {
     }
 
     #[test]
+    fn replay_ignores_market_tape_v2_event_types_without_state_drift() {
+        let mut replay = ReplaySequenceValidator::new(Market::Usdm, "BTCUSDT").unwrap();
+        for event_type in ["raw_trade", "book_ticker", "force_order"] {
+            let row = json!({
+                "session_id": "session-1",
+                "frame": {"stream": "btcusdt@trade", "data": {"s": "BTCUSDT"}}
+            });
+            assert!(replay
+                .observe(event_type, row.as_object().unwrap(), 100)
+                .unwrap()
+                .is_empty());
+        }
+        let snapshot = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "snapshot": {
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]]
+            }
+        });
+        replay
+            .observe("snapshot", snapshot.as_object().unwrap(), 101)
+            .unwrap();
+        let diff = json!({
+            "session_id": "session-1",
+            "frame": {
+                "data": {
+                    "s": "BTCUSDT",
+                    "U": 101,
+                    "u": 101,
+                    "pu": 100,
+                    "b": [["100", "2"]],
+                    "a": []
+                }
+            }
+        });
+        replay
+            .observe("diff", diff.as_object().unwrap(), 102)
+            .unwrap();
+        replay.finish().unwrap();
+    }
+
+    #[test]
     fn replay_book_snapshot_is_full_and_price_sorted() {
         let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
         let snapshot = json!({
