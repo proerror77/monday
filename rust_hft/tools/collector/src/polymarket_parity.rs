@@ -20,7 +20,12 @@ const ACTIVE_TAPE: &str = "market-updates.ndjson";
 const EXPECTED_SYMBOLS: [&str; 7] = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "HYPEUSDT", "BNBUSDT",
 ];
-const KINDS: [&str; 3] = ["market_metadata", "polymarket_trade", "market_settlement"];
+const KINDS: [&str; 4] = [
+    "market_metadata",
+    "polymarket_trade",
+    "market_settlement",
+    "polymarket_trade_collection_complete",
+];
 // Settlement polling is eventually consistent across implementations. Compare
 // events that ended far enough before the common cutoff, not the collectors'
 // independently scheduled retrieval timestamps.
@@ -329,6 +334,10 @@ fn retain_primary_row(
             let event_window_end = nonnegative_epoch_sub(ended_at, SETTLEMENT_MATURITY_LAG_SECONDS);
             Ok((event_window_start..=event_window_end).contains(&end_epoch))
         }
+        // Trade completion proofs are per-lane polling bookkeeping emitted on
+        // independent schedules, not shared market evidence; admit them in the
+        // tape but exclude them from the comparison window.
+        Some("polymarket_trade_collection_complete") => Ok(false),
         _ => unreachable!("stream_stable_rows validates update kinds"),
     }
 }
@@ -1655,6 +1664,36 @@ mod tests {
 
         let error = compare(&config).unwrap_err();
         assert!(error.to_string().contains("sequence gap"));
+    }
+
+    #[test]
+    fn trade_completion_rows_are_admitted_and_excluded_from_parity() {
+        let (_root, config) = fixture();
+        let completion = |condition_id: &str| {
+            json!({
+                "kind": "polymarket_trade_collection_complete",
+                "condition_id": condition_id,
+                "market_id": "market-1",
+                "completeness_basis": "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1",
+                "malformed_trade_rows": 0,
+                "finalization_lag_secs": 1800,
+                "market_window_secs": 900
+            })
+        };
+        append_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &completion("0xlegacy"),
+            "1970-01-01T00:03:21Z",
+        );
+        append_tape(
+            &config.rust_spool.join(ACTIVE_TAPE),
+            &completion("0xrust"),
+            "1970-01-01T00:03:21Z",
+        );
+
+        let evidence = compare(&config).unwrap();
+
+        assert_eq!(evidence["passed"], true);
     }
 
     #[test]
