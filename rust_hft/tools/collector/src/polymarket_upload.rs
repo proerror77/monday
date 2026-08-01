@@ -50,8 +50,23 @@ const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
-const OSS_READBACK_ATTEMPTS: usize = 3;
-const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
+// Readback-after-upload must tolerate OSS object-visibility lag on this
+// endpoint: in production (2026-08-01, three gate invocations) a just-PUT
+// object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
+// retry window before becoming HEAD-able, failing every shadow gate.
+const OSS_READBACK_ATTEMPTS: usize = 12;
+#[cfg(not(test))]
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_millis(5);
+// Per-file readback timeout: verified objects are tens of MB on an internal
+// endpoint, so a hung download must fail fast instead of inheriting the
+// 300s upload timeout (36 downloads x 300s would otherwise cap the retry
+// loop at hours).
+const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
+// Wall-clock budget for the entire retry loop, covering command time AND
+// backoff sleeps (a backoff-only cap cannot trigger: 11 x 5s sleeps = 55s).
+const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1843,6 +1858,7 @@ fn run_checked(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
 fn download_remote_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
+    budget_remaining: Duration,
     runner: &mut F,
 ) -> Result<(ExclusiveTempDir, BTreeMap<String, PathBuf>)>
 where
@@ -1868,7 +1884,13 @@ where
                 .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
             config,
         );
-        runner(&mut command, config.oss_timeout)?;
+        runner(
+            &mut command,
+            config
+                .oss_timeout
+                .min(OSS_READBACK_FILE_TIMEOUT)
+                .min(budget_remaining),
+        )?;
         regular_identity(&destination)?;
         downloaded.insert(name.to_owned(), destination);
     }
@@ -1926,8 +1948,14 @@ where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
     let mut last_error = None;
+    let started = std::time::Instant::now();
     for attempt in 0..OSS_READBACK_ATTEMPTS {
-        match download_remote_artifacts_with(artifacts, config, runner) {
+        let elapsed = started.elapsed();
+        if elapsed > OSS_READBACK_MAX_WALL_CLOCK {
+            break;
+        }
+        let budget_remaining = OSS_READBACK_MAX_WALL_CLOCK - elapsed;
+        match download_remote_artifacts_with(artifacts, config, budget_remaining, runner) {
             Ok((_verify_dir, downloaded)) => {
                 return verify_downloaded_artifacts(artifacts, &downloaded);
             }
@@ -1950,7 +1978,8 @@ fn remote_artifacts_exist_and_match_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let Ok((_verify_dir, downloaded)) = download_remote_artifacts_with(artifacts, config, runner)
+    let Ok((_verify_dir, downloaded)) =
+        download_remote_artifacts_with(artifacts, config, Duration::MAX, runner)
     else {
         return Ok(false);
     };
