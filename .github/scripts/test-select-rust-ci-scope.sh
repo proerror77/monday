@@ -245,6 +245,36 @@ grep -Fqx '      - name: Test issue lifecycle templates' "$ploy_workflow"
 grep -A1 -F '      - name: Test issue lifecycle templates' "$ploy_workflow" | grep -Fqx '        working-directory: .'
 grep -Fqx '        run: .github/scripts/test-issue-lifecycle-contract.sh' "$ploy_workflow"
 
+# sccache must use the #559/#566 pattern (sccache-action + GHA backend,
+# rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
+# EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
+# actions/cache sccache block must stay removed.
+! grep -Fq 'sccache --zero-stats' "$ploy_workflow"
+! grep -Fq 'cargo install sccache' "$ploy_workflow"
+! grep -Fq 'path: ~/.cache/sccache' "$ploy_workflow"
+ploy_job_block() {
+  awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
+}
+for ploy_rust_job in \
+  research-image-binaries \
+  rust-control-plane \
+  rust-runner-lean \
+  rust-runner-full \
+  rust-market-data \
+  rust-research-heavy \
+  integration-regressions; do
+  ploy_block=$(ploy_job_block "$ploy_rust_job")
+  [ -n "$ploy_block" ]
+  grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$ploy_block"
+  grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$ploy_block"
+  grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' <<<"$ploy_block"
+  grep -Fqx '        continue-on-error: true' <<<"$ploy_block"
+  grep -Fq "if: steps.sccache.outcome == 'failure'" <<<"$ploy_block"
+  grep -Fq 'steps.cache-info.outputs.rust' <<<"$ploy_block"
+  grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
+  ! grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"
+done
+
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
 git -C "$deletion_repo" init -q

@@ -179,6 +179,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -192,29 +193,38 @@ jobs:
             jq \
             mold \
             pkg-config \
-            protobuf-compiler \
-            sccache
+            protobuf-compiler
           rm -rf /var/lib/apt/lists/*
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
-          key: research-image-bookworm-${{ hashFiles('rust_hft/**/Cargo.lock') }}
+          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/**/Cargo.lock') }}
           cache-all-crates: true
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-research-image-${{ hashFiles('rust_hft/**/Cargo.lock') }}-
 
       - name: Build research image binaries
         run: |
           set -euo pipefail
-          sccache --zero-stats
           cargo build \
             --release \
             --locked \
@@ -249,7 +259,7 @@ jobs:
 
       - name: Show sccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ${SCCACHE_PATH:-sccache} --show-stats || true
 
       - name: Upload research image release
         uses: actions/upload-artifact@v4
@@ -523,6 +533,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-control-plane,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:15
@@ -551,22 +564,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-control-plane-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-control-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-control-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-control-plane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Install SQLx CLI
         run: |
@@ -584,7 +606,6 @@ jobs:
       - name: Build and test control-plane/core lane
         env:
           DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -619,7 +640,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-control-plane"
             echo '```'
@@ -633,6 +654,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-runner-lean,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 18
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -646,26 +670,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-runner-lean-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-runner-lean-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-runner-lean-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-runner-lean-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Check lean runner lane
-        env:
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -679,7 +710,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-runner-lean"
             echo '```'
@@ -693,6 +724,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-runner-full,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -706,26 +740,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-runner-full-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-runner-full-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-runner-full-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-runner-full-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Check runner slim/default and full non-executing contracts
-        env:
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -757,7 +798,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-runner-full"
             echo '```'
@@ -771,6 +812,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-market-data,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 18
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -784,26 +828,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-market-data-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-market-data-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-market-data-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Check market-data ops lane
-        env:
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -814,7 +865,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-market-data"
             echo '```'
@@ -828,6 +879,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:15
@@ -856,26 +910,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-research-heavy-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-research-heavy-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-research-heavy-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-research-heavy-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Test research core lane
-        env:
-          RUSTC_WRAPPER: sccache
         run: |
           cargo test --locked -p ploy-feed-loaders --lib
           cargo test --locked -p ploy-research --lib
@@ -904,7 +965,6 @@ jobs:
         env:
           DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
           PLOY_TEST_DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -928,7 +988,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-research-heavy"
             echo '```'
@@ -1014,6 +1074,9 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/integration-regressions,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     services:
       postgres:
         image: postgres:15
@@ -1041,22 +1104,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
-          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Setup sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Disable sccache on setup failure
+        if: steps.sccache.outcome == 'failure'
+        run: |
+          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft/prediction-markets
-          shared-key: rust-integration-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-
-      - name: Cache sccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-integration-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sccache-integration-
-            ${{ runner.os }}-sccache-
+          shared-key: rust-integration-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Install SQLx CLI
         run: |
@@ -1074,7 +1146,6 @@ jobs:
       - name: Run integration regressions
         env:
           DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
-          RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
@@ -1086,7 +1157,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: |
-          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          ${SCCACHE_PATH:-sccache} --show-stats | tee /tmp/sccache-stats.txt || true
           {
             echo "### sccache: rust-integration"
             echo '```'

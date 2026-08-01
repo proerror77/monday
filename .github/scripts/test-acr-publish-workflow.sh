@@ -49,6 +49,17 @@ grep -Fqx '            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft'
 grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$workflow"
 grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
 
+# research-runner-binaries compiles on the runner and must use the #559/#566
+# sccache-action pattern; the publish matrix compiles inside docker, where a
+# host-side wrapper does not apply.
+grep -Fqx '      RUSTC_WRAPPER: sccache' "$workflow"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$workflow"
+grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$workflow"
+grep -Fqx '        continue-on-error: true' "$workflow"
+! grep -Fq 'sccache --zero-stats' "$workflow"
+! grep -Fq 'path: ~/.cache/sccache' "$workflow"
+! grep -Fq -- '}}-${{ github.sha }}' "$workflow"
+
 grep -Fqx '          name: research-image-release-${{ github.sha }}' "$ploy_workflow"
 grep -Fqx '          retention-days: 1' "$ploy_workflow"
 test "$(grep -Fxc '            jq \' "$workflow")" -eq 1
