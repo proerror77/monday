@@ -449,9 +449,27 @@ impl FullConfig {
         self.runtime.feed_broadcast_capacity.unwrap_or(8192)
     }
 
+    /// Validated broadcast capacity; rejects zero before the channel is built
+    /// so a malformed config fails fast instead of panicking in tokio.
+    pub fn validated_feed_broadcast_capacity(&self) -> Result<usize, String> {
+        let capacity = self.feed_broadcast_capacity();
+        if capacity == 0 {
+            return Err("feed_broadcast_capacity must be greater than zero".to_string());
+        }
+        Ok(capacity)
+    }
+
     /// Lag policy for the live feed.
     pub fn feed_lag_policy(&self) -> LagPolicy {
         self.runtime.feed_lag_policy
+    }
+
+    /// Trading runtimes must remain fail-closed on feed lag; only a pure noop
+    /// dry-run recorder may skip lagged updates, because there a restart loses
+    /// more tape than a bounded, warn-logged gap.
+    pub fn feed_lag_policy_allowed(&self, mode: RuntimeMode) -> bool {
+        self.runtime.feed_lag_policy != LagPolicy::SkipAndContinue
+            || (mode == RuntimeMode::DryRun && self.runtime.strategy_variant == "noop")
     }
 
     /// Build SimulatedExecutorConfig from the parsed config.
@@ -859,6 +877,60 @@ replay_market_updates_from = "captures/dryrun.ndjson"
         let sec = config.sim_executor_config();
         assert!(!sec.use_spread);
         assert!(sec.enable_market_impact);
+    }
+
+    #[test]
+    fn feed_lag_policy_defaults_to_fail_closed_with_default_capacity() {
+        let minimal = r#"
+[runtime]
+mode = "dryrun"
+
+[strategy]
+"#;
+        let config = FullConfig::from_toml(minimal).unwrap();
+        assert_eq!(config.feed_lag_policy(), LagPolicy::FailClosed);
+        assert_eq!(config.feed_broadcast_capacity(), 8192);
+        assert!(config.feed_lag_policy_allowed(RuntimeMode::Live));
+        assert!(config.feed_lag_policy_allowed(RuntimeMode::DryRun));
+    }
+
+    #[test]
+    fn skip_and_continue_is_only_allowed_for_noop_dry_run_recorders() {
+        let recorder = r#"
+[runtime]
+mode = "dryrun"
+strategy_variant = "noop"
+feed_lag_policy = "skip_and_continue"
+
+[strategy]
+"#;
+        let config = FullConfig::from_toml(recorder).unwrap();
+        assert_eq!(config.feed_lag_policy(), LagPolicy::SkipAndContinue);
+        assert!(config.feed_lag_policy_allowed(RuntimeMode::DryRun));
+        assert!(!config.feed_lag_policy_allowed(RuntimeMode::Live));
+        assert!(!config.feed_lag_policy_allowed(RuntimeMode::Backtest));
+
+        let trading = recorder.replace("strategy_variant = \"noop\"", "strategy_variant = \"delta_neutral\"");
+        let config = FullConfig::from_toml(&trading).unwrap();
+        assert!(!config.feed_lag_policy_allowed(RuntimeMode::DryRun));
+    }
+
+    #[test]
+    fn feed_broadcast_capacity_passes_through_configured_value() {
+        let toml = r#"
+[runtime]
+mode = "dryrun"
+feed_broadcast_capacity = 65536
+
+[strategy]
+"#;
+        let config = FullConfig::from_toml(toml).unwrap();
+        assert_eq!(config.feed_broadcast_capacity(), 65536);
+        assert_eq!(config.validated_feed_broadcast_capacity(), Ok(65536));
+
+        let zero = toml.replace("65536", "0");
+        let config = FullConfig::from_toml(&zero).unwrap();
+        assert!(config.validated_feed_broadcast_capacity().is_err());
     }
 
     #[test]

@@ -572,7 +572,19 @@ async fn run_live_or_dry_run(
         }
     };
 
-    let (tx, rx) = broadcast::channel(config.feed_broadcast_capacity());
+    let feed_capacity = config
+        .validated_feed_broadcast_capacity()
+        .unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(1);
+        });
+    if !config.feed_lag_policy_allowed(runtime_config.mode) {
+        eprintln!(
+            "feed_lag_policy = \"skip_and_continue\" is only allowed for a pure noop dry-run recorder"
+        );
+        std::process::exit(1);
+    }
+    let (tx, rx) = broadcast::channel(feed_capacity);
     let tx = Arc::new(tx);
     let reference_prices = new_reference_price_registry();
     let market_data_source = config.runtime.market_data_source;
