@@ -50,6 +50,10 @@ const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
+// Tick-level tapes mix WS hot-path and REST poll quotes for the same token;
+// the slower family legitimately regresses per-token source time by a few
+// seconds. Tolerate bounded jitter while still rejecting true reordering.
+const MAX_QUOTE_SOURCE_REGRESSION_MS: i64 = 30_000;
 // Readback-after-upload must tolerate OSS object-visibility lag on this
 // endpoint: in production (2026-08-01, three gate invocations) a just-PUT
 // object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
@@ -1001,6 +1005,7 @@ fn scan_tape_with_identity_at(
     let mut missing_ask_size = 0_u64;
     let mut incomplete_quotes = 0_u64;
     let mut max_quote_latency_ms = 0_i64;
+    let mut tolerated_quote_source_regressions = 0_u64;
     let mut request_attempts = 0_u64;
     let mut request_failures = 0_u64;
     let mut max_request_latency_ms = 0_i64;
@@ -1286,11 +1291,23 @@ fn scan_tape_with_identity_at(
             }
             max_quote_latency_ms = max_quote_latency_ms.max(quote_latency_ms);
             let token = required_text(update, "token_id", line_number)?;
-            if last_quote_source_at
-                .insert(token.to_owned(), source_at)
-                .is_some_and(|previous| source_at < previous)
-            {
-                bail!("line {line_number}: quote source time moved backwards");
+            match last_quote_source_at.get_mut(token) {
+                Some(previous) => {
+                    if source_at < *previous {
+                        let regression_ms = (*previous - source_at).num_milliseconds();
+                        if regression_ms > MAX_QUOTE_SOURCE_REGRESSION_MS {
+                            bail!(
+                                "line {line_number}: quote source time moved backwards by {regression_ms}ms"
+                            );
+                        }
+                        tolerated_quote_source_regressions += 1;
+                    } else {
+                        *previous = source_at;
+                    }
+                }
+                None => {
+                    last_quote_source_at.insert(token.to_owned(), source_at);
+                }
             }
             quoted_token_ids.insert(token.to_owned());
             let bid = decimal_or_none(update.get("bid"), "bid", line_number)?;
@@ -1550,6 +1567,7 @@ fn scan_tape_with_identity_at(
         "missing_ask_size": missing_ask_size,
         "incomplete_quotes": incomplete_quotes,
         "max_quote_latency_ms": max_quote_latency_ms,
+        "tolerated_quote_source_regressions": tolerated_quote_source_regressions,
         "request_attempts": request_attempts,
         "request_successes": quote_count,
         "request_failures": request_failures,
@@ -2793,12 +2811,12 @@ mod tests {
         let root = TestDir::new();
         let mut first = sample_rows()[1].clone();
         first["sequence"] = json!(0);
-        first["recorded_at"] = json!("2026-07-15T01:00:02Z");
-        first["update"]["ts"] = json!("2026-07-15T01:00:02Z");
+        first["recorded_at"] = json!("2026-07-15T01:01:00Z");
+        first["update"]["ts"] = json!("2026-07-15T01:01:00Z");
         let mut second = first.clone();
         second["sequence"] = json!(1);
-        second["recorded_at"] = json!("2026-07-15T01:00:03Z");
-        second["update"]["ts"] = json!("2026-07-15T01:00:01Z");
+        second["recorded_at"] = json!("2026-07-15T01:01:30Z");
+        second["update"]["ts"] = json!("2026-07-15T01:00:00Z");
         let tape = write_tape(
             root.path(),
             "market-updates.20260715T010000.ndjson",
@@ -2809,7 +2827,36 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("quote source time moved backwards"));
+            .contains("quote source time moved backwards by 60000ms"));
+    }
+
+    #[test]
+    fn tolerates_bounded_quote_source_time_jitter_per_token() {
+        let root = TestDir::new();
+        let mut first = sample_rows()[1].clone();
+        first["sequence"] = json!(0);
+        first["recorded_at"] = json!("2026-07-15T01:00:02Z");
+        first["update"]["ts"] = json!("2026-07-15T01:00:02Z");
+        let mut second = first.clone();
+        second["sequence"] = json!(1);
+        second["recorded_at"] = json!("2026-07-15T01:00:03Z");
+        second["update"]["ts"] = json!("2026-07-15T01:00:01Z");
+        let mut third = first.clone();
+        third["sequence"] = json!(2);
+        third["recorded_at"] = json!("2026-07-15T01:00:04Z");
+        third["update"]["ts"] = json!("2026-07-15T01:00:03Z");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[first, second, third],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(
+            manifest["quality"]["tolerated_quote_source_regressions"],
+            json!(1)
+        );
     }
 
     #[test]
