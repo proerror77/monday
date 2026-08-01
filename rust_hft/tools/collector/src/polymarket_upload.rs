@@ -55,7 +55,14 @@ const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
 // object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
 // retry window before becoming HEAD-able, failing every shadow gate.
 const OSS_READBACK_ATTEMPTS: usize = 12;
+#[cfg(not(test))]
 const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_millis(5);
+// Hard ceiling on total sleep time across attempts; a hung readback command
+// is bounded by config.oss_timeout per attempt, but the aggregate backoff
+// must not stretch the upload far beyond the visibility lag we observed.
+const OSS_READBACK_MAX_BACKOFF: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1930,6 +1937,7 @@ where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
     let mut last_error = None;
+    let mut backoff_spent = Duration::ZERO;
     for attempt in 0..OSS_READBACK_ATTEMPTS {
         match download_remote_artifacts_with(artifacts, config, runner) {
             Ok((_verify_dir, downloaded)) => {
@@ -1938,6 +1946,10 @@ where
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < OSS_READBACK_ATTEMPTS {
+            backoff_spent += OSS_READBACK_RETRY_DELAY;
+            if backoff_spent > OSS_READBACK_MAX_BACKOFF {
+                break;
+            }
             std::thread::sleep(OSS_READBACK_RETRY_DELAY);
         }
     }
