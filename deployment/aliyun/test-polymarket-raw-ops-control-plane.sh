@@ -3722,7 +3722,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
 (
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
-  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 300 \
+  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 1200 \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
