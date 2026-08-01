@@ -16,7 +16,11 @@ readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GR
 readonly MAX_HEALTH_SILENCE_SECONDS=240
 readonly LEGACY_START_HEALTH_MAX_AGE_SECONDS=2700
 readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false
-readonly LEGACY_HEALTH_START_REQUIRED=true
+# Legacy-Python health admission is disabled: the legacy lane is being retired
+# for the same degradation that blocked it (chronic HTTP 429 storms and frozen
+# health writes on 2026-07-31..08-01, see issue #553). Candidate-side parity
+# evidence requirements are unchanged.
+readonly LEGACY_HEALTH_START_REQUIRED=false
 readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=300
 readonly LEGACY_RUNTIME_MAX_SECONDS=21600
