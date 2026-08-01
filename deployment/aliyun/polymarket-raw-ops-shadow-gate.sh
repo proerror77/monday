@@ -688,7 +688,7 @@ run_before_deadline() {
 # retry). Retry with a generous bounded window so a publication race cannot
 # fail the gate.
 oss_download_with_retry() {
-  local deadline=$1 src=$2 dst=$3 attempt
+  local deadline=$1 src=$2 dst=$3 attempt remaining
   for attempt in $(seq 1 15); do
     if run_before_deadline "$deadline" aliyun ossutil cp "$src" "$dst" \
       --profile "$aliyun_profile" \
@@ -696,6 +696,9 @@ oss_download_with_retry() {
       return 0
     fi
     [[ $attempt -lt 15 ]] || return 1
+    # Never let the backoff itself run past the caller's deadline.
+    remaining=$(remaining_seconds_before_deadline "$deadline") || return 1
+    (( remaining > 13 )) || return 1
     sleep 12
   done
 }
