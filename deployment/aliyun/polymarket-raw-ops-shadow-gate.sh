@@ -702,7 +702,7 @@ oss_download_with_retry() {
     [[ $attempt -lt 30 ]] || return 1
     # Never let the backoff itself run past the caller's deadline.
     remaining=$(remaining_seconds_before_deadline "$deadline") || return 1
-    (( remaining > 13 )) || return 1
+    (( remaining > 21 )) || return 1
     sleep 20
   done
 }
