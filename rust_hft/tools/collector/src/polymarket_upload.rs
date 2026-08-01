@@ -50,8 +50,12 @@ const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
-const OSS_READBACK_ATTEMPTS: usize = 3;
-const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
+// Readback-after-upload must tolerate OSS object-visibility lag on this
+// endpoint: in production (2026-08-01, three gate invocations) a just-PUT
+// object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
+// retry window before becoming HEAD-able, failing every shadow gate.
+const OSS_READBACK_ATTEMPTS: usize = 12;
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
