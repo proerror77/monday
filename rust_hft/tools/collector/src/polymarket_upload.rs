@@ -1294,8 +1294,9 @@ fn scan_tape_with_identity_at(
             match last_quote_source_at.get_mut(token) {
                 Some(previous) => {
                     if source_at < *previous {
-                        let regression_ms = (*previous - source_at).num_milliseconds();
-                        if regression_ms > MAX_QUOTE_SOURCE_REGRESSION_MS {
+                        let regression = *previous - source_at;
+                        if regression > TimeDelta::milliseconds(MAX_QUOTE_SOURCE_REGRESSION_MS) {
+                            let regression_ms = regression.num_milliseconds();
                             bail!(
                                 "line {line_number}: quote source time moved backwards by {regression_ms}ms"
                             );
