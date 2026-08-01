@@ -25,9 +25,9 @@ ProtectHome=true
 ReadWritePaths=/data/monday/spool/polymarket
 RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
-CPUQuota=30%
-MemoryHigh=384M
-MemoryMax=512M
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=1536M
 
 [Install]
 WantedBy=multi-user.target
