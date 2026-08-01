@@ -681,19 +681,22 @@ run_before_deadline() {
 
 # The shadow uploader publishes the data object, its manifest, and _SUCCESS
 # in sequence; a readback that starts while publication is still landing can
-# transiently observe a 404 NoSuchKey for an object that commits a second
-# later (observed in production 2026-08-01T07:47:39+08). Retry bounded times
-# before failing so a transient publication race cannot fail the gate.
+# transiently observe a 404 NoSuchKey for an object that commits shortly
+# after (observed in production twice: 2026-08-01T07:47:39+08 where the
+# object committed one second after a single-attempt readback, and
+# 2026-08-01T11:01:41+08 where it committed one second after the sixth
+# retry). Retry with a generous bounded window so a publication race cannot
+# fail the gate.
 oss_download_with_retry() {
   local deadline=$1 src=$2 dst=$3 attempt
-  for attempt in 1 2 3 4 5 6; do
+  for attempt in $(seq 1 15); do
     if run_before_deadline "$deadline" aliyun ossutil cp "$src" "$dst" \
       --profile "$aliyun_profile" \
       --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null; then
       return 0
     fi
-    [[ $attempt -lt 6 ]] || return 1
-    sleep 10
+    [[ $attempt -lt 15 ]] || return 1
+    sleep 12
   done
 }
 
