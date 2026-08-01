@@ -2975,7 +2975,6 @@ jq -e -f "$POLICY" "$tmp_dir/rust-self-gate.json" >/dev/null || {
   exit 1
 }
 for mutation in \
-  '.baseline_health_start_required = false' \
   '.baseline_runtime_stability_required = false' \
   '.metrics.legacy_trade_count = 1' \
   '.metrics.rust_settlement_count = 0' \
@@ -2987,9 +2986,14 @@ for mutation in \
     exit 1
   fi
 done
+jq '.baseline_health_start_required = false' "$tmp_dir/rust-self-gate.json" \
+  >"$tmp_dir/health-optional-rust-self-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/health-optional-rust-self-gate.json" >/dev/null || {
+  printf 'gate policy rejected a Rust-self gate with legacy health admission disabled\n' >&2
+  exit 1
+}
 for mutation in \
   'del(.baseline_health_start_required)' \
-  '.baseline_health_start_required = false' \
   '.baseline_runtime_stability_required = false' \
   '.checks.metadata_parity = false'; do
   jq "$mutation" "$tmp_dir/expedited-legacy-gate.json" \
@@ -3000,6 +3004,17 @@ for mutation in \
     exit 1
   fi
 done
+jq '.baseline_health_start_required = false
+  | .baseline_health_snapshot = false
+  | del(.legacy_runtime.release_sha256,
+      .legacy_runtime.release_path,
+      .legacy_runtime.proc_exe)' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/health-optional-legacy-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/health-optional-legacy-gate.json" >/dev/null || {
+  printf 'gate policy rejected a legacy gate with health admission disabled\n' >&2
+  exit 1
+}
 if grep -Fq 'wait_for_fresh_legacy_health_observation' "$GATE"; then
   printf 'production Gate still waits for a legacy health publication\n' >&2
   exit 1
