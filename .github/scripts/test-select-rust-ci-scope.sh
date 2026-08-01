@@ -215,8 +215,15 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
 grep -Fq 'shellcheck' <<<"$fast_gates_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
-grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
+
+# The market-recorder release contract runs as its own parallel job (#568).
+ci_gate_block=$(job_block ci-gate)
+grep -Fqx '      - market_recorder_contract' <<<"$ci_gate_block"
+recorder_block=$(job_block market_recorder_contract)
+[ -n "$recorder_block" ]
+grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
+! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"

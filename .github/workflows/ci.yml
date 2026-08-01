@@ -14,7 +14,9 @@ permissions:
 
 concurrency:
   group: monorepo-${{ github.ref }}
-  cancel-in-progress: true
+  # PR runs may be superseded; main runs must finish so sccache/rust-cache
+  # keep producing for everyone else.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   selector:
@@ -156,7 +158,7 @@ jobs:
         shell: bash
         run: |
           echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         if: needs.scope.outputs.toolchain == 'true'
@@ -209,12 +211,6 @@ jobs:
         run: |
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
-
-      - name: Verify market recorder release contract
-        if: needs.scope.outputs.control == 'true'
-        run: |
-          MONDAY_TEST_RECORDER_IMAGE=1 SOURCE_REVISION="$GITHUB_SHA" \
-            ../deployment/aliyun/test-polymarket-market-recorder-release.sh
 
       - name: Build focused packages
         if: needs.scope.outputs.focused == 'true'
@@ -442,6 +438,24 @@ jobs:
           ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh
 
+  market_recorder_contract:
+    name: Market Recorder Release Contract
+    needs: scope
+    if: needs.scope.outputs.control == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify market recorder release contract
+        working-directory: rust_hft
+        run: |
+          MONDAY_TEST_RECORDER_IMAGE=1 SOURCE_REVISION="$GITHUB_SHA" \
+            ../deployment/aliyun/test-polymarket-market-recorder-release.sh
+
   deployment_artifacts:
     name: Production Image And Kubernetes Contract
     needs: scope
@@ -549,7 +563,7 @@ jobs:
         shell: bash
         run: |
           echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -638,6 +652,7 @@ jobs:
       - scope
       - rust
       - rust_fast_gates
+      - market_recorder_contract
       - deployment_artifacts
       - polymarket_evidence_compiler_image
       - rust_hft_engine_fast_lane
