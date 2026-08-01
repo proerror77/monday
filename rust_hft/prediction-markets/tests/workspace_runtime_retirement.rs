@@ -1676,8 +1676,8 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
         "strategy_variant = \"noop\"",
         "market_data_source = \"external_direct\"",
         "record_market_updates_to = \"/data/monday/spool/polymarket/market-updates.ndjson\"",
-        "record_market_updates_include_kinds = [\"quote\", \"event_discovered\", \"event_expired\", \"reference_price\"]",
-        "record_market_updates_quote_sample_ms = 1000",
+        "record_market_updates_include_kinds = [\"quote\", \"event_discovered\", \"event_expired\", \"reference_price\", \"spot_price\", \"agg_trade\", \"l2\"]",
+        "record_market_updates_quote_sample_ms = 0",
         "record_market_updates_event_scoped_quotes = true",
         "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\", \"DOGEUSDT\", \"HYPEUSDT\", \"BNBUSDT\"]",
     ] {
