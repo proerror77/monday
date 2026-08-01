@@ -679,6 +679,24 @@ run_before_deadline() {
   timeout --signal=KILL "$remaining" "$@"
 }
 
+# The shadow uploader publishes the data object, its manifest, and _SUCCESS
+# in sequence; a readback that starts while publication is still landing can
+# transiently observe a 404 NoSuchKey for an object that commits a second
+# later (observed in production 2026-08-01T07:47:39+08). Retry bounded times
+# before failing so a transient publication race cannot fail the gate.
+oss_download_with_retry() {
+  local deadline=$1 src=$2 dst=$3 attempt
+  for attempt in 1 2 3 4 5 6; do
+    if run_before_deadline "$deadline" aliyun ossutil cp "$src" "$dst" \
+      --profile "$aliyun_profile" \
+      --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null; then
+      return 0
+    fi
+    [[ $attempt -lt 6 ]] || return 1
+    sleep 10
+  done
+}
+
 download_and_verify_oss_triplet() {
   local uri=$1 expected_dataset=$2 target=$3 deadline=$4
   local prefix relative path_sha data_name
@@ -705,18 +723,10 @@ download_and_verify_oss_triplet() {
   if grep -Fq "$superseded_uri" <<<"$superseded_listing"; then
     return 1
   fi
-  run_before_deadline "$deadline" aliyun ossutil cp "$uri" "$data" \
-    --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
+  oss_download_with_retry "$deadline" "$uri" "$data" || return 1
+  oss_download_with_retry "$deadline" "$uri.manifest.json" "$manifest" \
     || return 1
-  run_before_deadline "$deadline" aliyun ossutil cp \
-    "$uri.manifest.json" "$manifest" --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
-    || return 1
-  run_before_deadline "$deadline" aliyun ossutil cp \
-    "$uri._SUCCESS" "$success" --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
-    || return 1
+  oss_download_with_retry "$deadline" "$uri._SUCCESS" "$success" || return 1
   verify_current_oss_config
   [[ -f $data && ! -L $data && -f $manifest && ! -L $manifest \
     && -f $success && ! -L $success ]] || return 1

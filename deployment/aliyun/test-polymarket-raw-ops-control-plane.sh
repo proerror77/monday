@@ -573,7 +573,8 @@ preflight_verifier="$tmp_dir/real-market-preflight.sh"
 sed -n \
   -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
   -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
-  -e '/^run_before_deadline() {$/,/^}$/p' "$GATE" \
+  -e '/^run_before_deadline() {$/,/^}$/p' \
+  -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE" \
   >"$preflight_verifier"
 sed -n '/^download_and_verify_oss_triplet() {$/,/^}$/p' "$GATE" \
   >>"$preflight_verifier"
@@ -3844,8 +3845,12 @@ grep -Fq 'run_before_deadline "$preflight_deadline" runuser' "$GATE" || {
   printf 'Gate candidate preflight uploader is not deadline bounded\n' >&2
   exit 1
 }
-[[ $(grep -Fc 'run_before_deadline "$deadline" aliyun ossutil' "$GATE") -eq 4 ]] || {
-  printf 'Gate OSS triplet readback is not fully deadline bounded\n' >&2
+grep -Fq 'oss_download_with_retry() {' "$GATE" || {
+  printf 'Gate OSS triplet readback has no retry wrapper\n' >&2
+  exit 1
+}
+[[ $(grep -Fc 'oss_download_with_retry "$deadline"' "$GATE") -eq 3 ]] || {
+  printf 'Gate OSS triplet readback is not fully retry wrapped\n' >&2
   exit 1
 }
 (
