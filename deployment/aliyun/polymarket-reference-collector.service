@@ -9,7 +9,14 @@ ConditionPathIsMountPoint=/data
 Type=simple
 User=hftcollector
 Group=hftcollector
-ExecStart=/opt/monday/bin/polymarket-raw-ops collect-reference
+# --max-trade-polls-per-cycle 200: the 180-second cycle watchdog and the
+# 100ms minimum Data API request spacing bound one cycle to 1800 request
+# starts; 200 polls need at least 20 seconds of pacing, leaving ~160 seconds
+# of headroom for metadata and settlement work inside the watchdog. Poll
+# concurrency stays at the default 4, so the 672MiB/768MiB memory calibration
+# is unchanged while historical trade backfill throughput rises from the
+# default 112 markets per cycle to 200.
+ExecStart=/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200
 Restart=always
 RestartSec=5
 RuntimeMaxSec=21600
