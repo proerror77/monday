@@ -679,6 +679,30 @@ run_before_deadline() {
   timeout --signal=KILL "$remaining" "$@"
 }
 
+# The shadow uploader publishes the data object, its manifest, and _SUCCESS
+# in sequence; a readback that starts while publication is still landing can
+# transiently observe a 404 NoSuchKey for an object that commits shortly
+# after (observed in production twice: 2026-08-01T07:47:39+08 where the
+# object committed one second after a single-attempt readback, and
+# 2026-08-01T11:01:41+08 where it committed one second after the sixth
+# retry). Retry with a generous bounded window so a publication race cannot
+# fail the gate.
+oss_download_with_retry() {
+  local deadline=$1 src=$2 dst=$3 attempt remaining
+  for attempt in $(seq 1 15); do
+    if run_before_deadline "$deadline" aliyun ossutil cp "$src" "$dst" \
+      --profile "$aliyun_profile" \
+      --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null; then
+      return 0
+    fi
+    [[ $attempt -lt 15 ]] || return 1
+    # Never let the backoff itself run past the caller's deadline.
+    remaining=$(remaining_seconds_before_deadline "$deadline") || return 1
+    (( remaining > 13 )) || return 1
+    sleep 12
+  done
+}
+
 download_and_verify_oss_triplet() {
   local uri=$1 expected_dataset=$2 target=$3 deadline=$4
   local prefix relative path_sha data_name
@@ -705,18 +729,10 @@ download_and_verify_oss_triplet() {
   if grep -Fq "$superseded_uri" <<<"$superseded_listing"; then
     return 1
   fi
-  run_before_deadline "$deadline" aliyun ossutil cp "$uri" "$data" \
-    --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
+  oss_download_with_retry "$deadline" "$uri" "$data" || return 1
+  oss_download_with_retry "$deadline" "$uri.manifest.json" "$manifest" \
     || return 1
-  run_before_deadline "$deadline" aliyun ossutil cp \
-    "$uri.manifest.json" "$manifest" --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
-    || return 1
-  run_before_deadline "$deadline" aliyun ossutil cp \
-    "$uri._SUCCESS" "$success" --profile "$aliyun_profile" \
-    --endpoint "$oss_endpoint" --region "$oss_region" --force >/dev/null \
-    || return 1
+  oss_download_with_retry "$deadline" "$uri._SUCCESS" "$success" || return 1
   verify_current_oss_config
   [[ -f $data && ! -L $data && -f $manifest && ! -L $manifest \
     && -f $success && ! -L $success ]] || return 1
