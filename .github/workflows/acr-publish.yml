@@ -157,7 +157,7 @@ jobs:
         shell: bash
         run: |
           echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
