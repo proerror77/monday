@@ -572,7 +572,19 @@ async fn run_live_or_dry_run(
         }
     };
 
-    let (tx, rx) = broadcast::channel(8192);
+    let feed_capacity = config
+        .validated_feed_broadcast_capacity()
+        .unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(1);
+        });
+    if !config.feed_lag_policy_allowed(runtime_config.mode) {
+        eprintln!(
+            "feed_lag_policy = \"skip_and_continue\" is only allowed for a pure noop dry-run recorder"
+        );
+        std::process::exit(1);
+    }
+    let (tx, rx) = broadcast::channel(feed_capacity);
     let tx = Arc::new(tx);
     let reference_prices = new_reference_price_registry();
     let market_data_source = config.runtime.market_data_source;
@@ -644,7 +656,7 @@ async fn run_live_or_dry_run(
     let feed: Box<dyn Feed> = if let Some(record_path) = config.record_market_updates_path() {
         Box::new(
             RecordingFeed::with_policy(
-                LiveFeed::new(rx),
+                LiveFeed::with_lag_policy(rx, config.feed_lag_policy()),
                 record_path,
                 config.record_market_updates_policy(),
             )
@@ -657,7 +669,7 @@ async fn run_live_or_dry_run(
             }),
         )
     } else {
-        Box::new(LiveFeed::new(rx))
+        Box::new(LiveFeed::with_lag_policy(rx, config.feed_lag_policy()))
     };
 
     let recorder = build_signal_recorder(db_pool.clone(), runtime_config.mode);
