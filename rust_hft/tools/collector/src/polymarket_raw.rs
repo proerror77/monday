@@ -229,6 +229,7 @@ impl ReferenceConfig {
             || self.market_lookback_secs <= 0
             || self.settlement_lookback_secs <= 0
             || self.max_markets == 0
+            || self.max_retained_trade_ids == 0
             || self.max_trade_polls_per_cycle == 0
             || self.max_concurrent_trade_polls == 0
             || self.http_timeout.is_zero()

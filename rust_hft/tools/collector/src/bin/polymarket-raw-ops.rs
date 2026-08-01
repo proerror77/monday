@@ -393,6 +393,7 @@ mod tests {
             .command;
         let Command::CollectReference {
             max_markets,
+            max_retained_trade_ids,
             max_trade_polls_per_cycle,
             max_concurrent_trade_polls,
             ..
@@ -401,6 +402,10 @@ mod tests {
             panic!("collect-reference must select the collector command");
         };
         assert_eq!(max_markets, ReferenceConfig::default().max_markets);
+        assert_eq!(
+            max_retained_trade_ids,
+            ReferenceConfig::default().max_retained_trade_ids
+        );
         assert_eq!(
             max_trade_polls_per_cycle,
             ReferenceConfig::default().max_trade_polls_per_cycle
