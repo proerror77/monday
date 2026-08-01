@@ -178,6 +178,45 @@ grep -Fqx '      - rust_fast_gates' "$ci_workflow"
 grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
 grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$ci_workflow"
 grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
+
+# Job-block extraction: lines from '^  <name>:' up to (excluding) the next
+# two-space top-level job key.
+job_block() {
+  awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z_]+:/ {found=0} found' "$ci_workflow"
+}
+rust_job_block=$(job_block rust)
+fast_gates_block=$(job_block rust_fast_gates)
+[ -n "$rust_job_block" ]
+[ -n "$fast_gates_block" ]
+
+# rust_fast_gates must carry the same scope condition as the heavy rust job,
+# checked inside its own block (a file-wide substring match would pass even
+# if the condition were deleted from the fast job and gate enforcement
+# silently bypassed).
+grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$fast_gates_block"
+grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust_job_block"
+
+# sccache must be wired into EACH of the two heavy jobs (per-job presence,
+# not a file-wide count).
+grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$rust_job_block"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$rust_job_block"
+grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$rust_job_block"
+fast_lane_block=$(job_block rust_hft_engine_fast_lane)
+grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$fast_lane_block"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$fast_lane_block"
+grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
+
+# Suite placement is pinned both ways: fast-only work stays out of the heavy
+# job, and each suite's required home is asserted positively.
+! grep -Fq 'cargo fmt --check' <<<"$rust_job_block"
+! grep -Fq 'shellcheck' <<<"$rust_job_block"
+! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"
+! grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"
+grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"
+grep -Fq 'shellcheck' <<<"$fast_gates_block"
+grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
+grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"
+grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
