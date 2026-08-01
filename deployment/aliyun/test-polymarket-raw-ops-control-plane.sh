@@ -3722,7 +3722,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
 (
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
-  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 300 \
+  [[ $REAL_MARKET_PREFLIGHT_BUDGET_SECONDS -eq 1200 \
     && $LEGACY_RUNTIME_STABILITY_REQUIRED == true \
     && $LEGACY_RUNTIME_MAX_SECONDS -eq 21600 \
     && $LEGACY_RUNTIME_RESERVE_SECONDS -eq 60 \
@@ -3745,7 +3745,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 1920 ]] || {
+  [[ $required -eq 2820 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -3822,7 +3822,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     printf 'Gate did not bind legacy identity around real preflight\n' >&2
     exit 1
   }
-  [[ $(<"$timeout_log") == '--signal=KILL 300 env '* ]] || {
+  [[ $(<"$timeout_log") == '--signal=KILL 1200 env '* ]] || {
     printf 'Gate real preflight does not have an exact hard deadline\n' >&2
     exit 1
   }
