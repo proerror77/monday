@@ -178,6 +178,21 @@ grep -Fqx '      - rust_fast_gates' "$ci_workflow"
 grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
 grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$ci_workflow"
 grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
+
+# rust_fast_gates must carry the same scope condition as the heavy rust job;
+# a bare substring grep would pass if the condition were deleted from the
+# fast job, so scope the check to the job block.
+awk '/^  rust_fast_gates:/{found=1} found && /contains\(needs.scope.outputs.jobs, '"'"',ci\/rust,'"'"'\)/{ok=1} found && /^  [a-z_]+:/ && !/rust_fast_gates:/{if(seen)exit; seen=1} END{exit !ok}' "$ci_workflow"
+
+# sccache must be wired into BOTH heavy jobs; dropping one must fail.
+[[ $(grep -Fxc '      RUSTC_WRAPPER: sccache' "$ci_workflow") -eq 2 ]]
+[[ $(grep -Fxc '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow") -eq 2 ]]
+
+# Negative pins: work moved to rust_fast_gates must not reappear in the heavy rust job.
+rust_job_block=$(awk '/^  rust:/{found=1;next} /^  [a-z_]+:/{found=0} found' "$ci_workflow")
+! grep -Fq 'cargo fmt --check' <<<"$rust_job_block"
+! grep -Fq 'shellcheck' <<<"$rust_job_block"
+! grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
