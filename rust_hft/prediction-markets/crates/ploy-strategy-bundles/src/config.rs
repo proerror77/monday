@@ -910,7 +910,10 @@ feed_lag_policy = "skip_and_continue"
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::Live));
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::Backtest));
 
-        let trading = recorder.replace("strategy_variant = \"noop\"", "strategy_variant = \"delta_neutral\"");
+        let trading = recorder.replace(
+            "strategy_variant = \"noop\"",
+            "strategy_variant = \"delta_neutral\"",
+        );
         let config = FullConfig::from_toml(&trading).unwrap();
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::DryRun));
     }
