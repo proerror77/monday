@@ -957,6 +957,10 @@ struct ClobBookState {
     ask_timestamps: BTreeMap<Decimal, i64>,
     snapshot_timestamp: Option<i64>,
     initialized: bool,
+    // Set when the cached depth proved stale against a provider-reported BBA.
+    // A dirty token stays failed closed until a full book snapshot clears it,
+    // unlike a merely uninitialized new token which may quote entry BBA.
+    dirty: bool,
 }
 
 impl ClobBookState {
@@ -980,6 +984,7 @@ impl ClobBookState {
         self.ask_timestamps.clear();
         self.snapshot_timestamp = Some(book.timestamp);
         self.initialized = true;
+        self.dirty = false;
         Ok(())
     }
 
@@ -1215,32 +1220,31 @@ fn market_updates_from_price_change(
     }
 
     // A reported BBA level missing from cached depth proves only that token's
-    // cache is stale. Mark just that token dirty (uninitialized) so the next
-    // book snapshot reinitializes it, and fail it closed in-band instead of
-    // rejecting the whole batch and reconnecting every subscribed token.
-    let dirty_tokens = updated_tokens
-        .iter()
-        .filter(|token_id| {
-            let state = &books[*token_id];
-            let entry = last_entries[*token_id];
-            state.initialized
-                && (entry.best_bid.is_some_and(|price| {
-                    pm_tradeable_price(price) && !state.bids.contains_key(&price)
-                }) || entry.best_ask.is_some_and(|price| {
-                    pm_tradeable_price(price) && !state.asks.contains_key(&price)
-                }))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for token_id in &dirty_tokens {
-        books.insert(token_id.clone(), ClobBookState::default());
+    // cache is stale. Mark just that token dirty so it stays failed closed
+    // until the next book snapshot reinitializes it, and fail it closed
+    // in-band instead of rejecting the whole batch and reconnecting every
+    // subscribed token.
+    for token_id in &updated_tokens {
+        let state = &books[token_id];
+        let entry = last_entries[token_id];
+        let missing_bba = state.initialized
+            && (entry.best_bid.is_some_and(|price| {
+                pm_tradeable_price(price) && !state.bids.contains_key(&price)
+            }) || entry.best_ask.is_some_and(|price| {
+                pm_tradeable_price(price) && !state.asks.contains_key(&price)
+            }));
+        if missing_bba {
+            let state = books.get_mut(token_id).expect("token state was applied");
+            *state = ClobBookState::default();
+            state.dirty = true;
+        }
     }
 
     let failed_at = Utc::now();
     let updates = updated_tokens
         .into_iter()
         .flat_map(|token_id| {
-            if dirty_tokens.contains(&token_id) {
+            if books[&token_id].dirty {
                 let token_id: Arc<str> = Arc::from(token_id);
                 vec![
                     MarketUpdate::QuoteCollectionFailure {
@@ -1366,12 +1370,12 @@ fn forward_clob_ws_payload(
         match message {
             WsMessage::Book(book) => {
                 let token_id = book.asset_id.to_string();
-                // A dirty (uninitialized) token has no valid state to protect:
-                // accept even an older snapshot so it can self-heal.
-                let dirty = books_by_token
+                // A dirty or never-initialized token has no valid state to
+                // protect: accept even an older snapshot so it can self-heal.
+                let healable = books_by_token
                     .get(&token_id)
-                    .is_none_or(|state| !state.initialized);
-                if !dirty
+                    .is_none_or(|state| state.dirty || !state.initialized);
+                if !healable
                     && last_timestamp
                         .get(&token_id)
                         .is_some_and(|last| book.timestamp < *last)
@@ -2688,6 +2692,7 @@ mod tests {
                 && ask_levels.is_empty()
         ));
         assert!(!books["7"].initialized);
+        assert!(books["7"].dirty);
 
         let fresh_book = serde_json::from_value(json!({
             "asset_id": "7",
@@ -2701,9 +2706,111 @@ mod tests {
         market_update_from_clob_book(&fresh_book, books.get_mut("7").expect("dirty token state"))
             .expect("fresh snapshot reinitializes the dirty token");
         assert!(books["7"].initialized);
+        assert!(!books["7"].dirty);
         let healed_change = serde_json::from_value(json!({
             "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "timestamp": "1712205600400",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.41", "size": "3", "side": "BUY",
+                "hash": null, "best_bid": "0.42", "best_ask": "0.43"
+            }]
+        }))
+        .expect("valid post-heal price change");
+        let healed = market_updates_from_price_change(&healed_change, &mut books, &mut timestamps)
+            .expect("post-heal price change publishes normally");
+        assert!(matches!(
+            healed.as_slice(),
+            [MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                ..
+            }] if token_id.as_ref() == "7" && *bid == dec!(0.42) && *ask == dec!(0.43)
+        ));
+    }
+
+    #[test]
+    fn clob_dirty_token_stays_failed_closed_until_fresh_snapshot() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}, {"price": "0.38", "size": "5"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let dirtying_change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.41", "size": "10", "side": "SELL",
+                "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+            }]
+        }))
+        .expect("valid price change whose reported bid is missing locally");
+        let follow_up = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600300",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.45", "size": "5", "side": "BUY",
+                "hash": null, "best_bid": "0.45", "best_ask": "0.46"
+            }]
+        }))
+        .expect("valid follow-up price change before any healing snapshot");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
+        let mut timestamps = std::collections::HashMap::new();
+
+        market_updates_from_price_change(&dirtying_change, &mut books, &mut timestamps)
+            .expect("missing authoritative BBA must not reject the whole batch");
+        assert!(!books["7"].initialized);
+        assert!(books["7"].dirty);
+
+        let updates = market_updates_from_price_change(&follow_up, &mut books, &mut timestamps)
+            .expect("a dirty token must stay failed closed, not reject the batch");
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::QuoteCollectionFailure {
+                    token_id,
+                    error_kind,
+                    ..
+                }, MarketUpdate::Quote {
+                    token_id: quote_token_id,
+                    bid: None,
+                    ask: None,
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels,
+                    ask_levels,
+                    ..
+                }] if token_id.as_ref() == "7"
+                    && error_kind.as_ref() == "websocket_payload"
+                    && quote_token_id.as_ref() == "7"
+                    && bid_levels.is_empty()
+                    && ask_levels.is_empty()
+            ),
+            "a dirty token must not silently reopen on unverified entry-reported BBA"
+        );
+
+        let fresh_book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600400",
+            "bids": [{"price": "0.42", "size": "6"}],
+            "asks": [{"price": "0.43", "size": "8"}],
+            "hash": null
+        }))
+        .expect("valid healing CLOB book update");
+        market_update_from_clob_book(&fresh_book, books.get_mut("7").expect("dirty token state"))
+            .expect("fresh snapshot reinitializes the dirty token");
+        assert!(books["7"].initialized);
+        assert!(!books["7"].dirty);
+        let healed_change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600500",
             "price_changes": [{
                 "asset_id": "7", "price": "0.41", "size": "3", "side": "BUY",
                 "hash": null, "best_bid": "0.42", "best_ask": "0.43"
@@ -2795,7 +2902,9 @@ mod tests {
                 && *bid_size == dec!(8)
         ));
         assert!(!books["7"].initialized);
+        assert!(books["7"].dirty);
         assert!(books["8"].initialized);
+        assert!(!books["8"].dirty);
     }
 
     #[test]
@@ -2813,6 +2922,10 @@ mod tests {
                 .expect("delta arriving before any snapshot is tolerated")
         );
         assert!(!books["7"].initialized);
+        assert!(
+            !books["7"].dirty,
+            "a new token without any snapshot is uninitialized but not dirty"
+        );
         assert!(matches!(
             rx.try_recv().unwrap(),
             MarketUpdate::Quote { token_id, .. } if token_id.as_ref() == "7"
@@ -2824,6 +2937,7 @@ mod tests {
             )
         );
         assert!(books["7"].initialized);
+        assert!(!books["7"].dirty);
         assert!(matches!(
             rx.try_recv().unwrap(),
             MarketUpdate::Quote {
@@ -2887,6 +3001,7 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         assert!(!books["7"].initialized);
+        assert!(books["7"].dirty);
     }
 
     #[test]
