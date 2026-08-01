@@ -21,7 +21,7 @@ pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_comp
 pub(crate) const TRADE_COMPLETION_BASIS: &str =
     "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1";
 
-const ALLOWED_KINDS: [&str; 9] = [
+const ALLOWED_KINDS: [&str; 12] = [
     "quote",
     "quote_collection_failure",
     "event_discovered",
@@ -31,6 +31,11 @@ const ALLOWED_KINDS: [&str; 9] = [
     "polymarket_trade",
     "market_settlement",
     TRADE_COMPLETION_KIND,
+    // Binance reference kinds recorded by the strategy-runtime tape recorder
+    // when its include_kinds policy enables them.
+    "spot_price",
+    "agg_trade",
+    "l2",
 ];
 const SUPPORTED_SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
     ("BTCUSDT", &["BITCOIN", "BTC"]),
@@ -726,6 +731,75 @@ pub(crate) fn validate_market_settlement(
     Ok(())
 }
 
+fn required_decimal(
+    update: &Map<String, Value>,
+    field: &str,
+    kind: &str,
+    line_number: usize,
+) -> Result<Decimal> {
+    decimal_or_none(update.get(field), field, line_number)?
+        .ok_or_else(|| anyhow!("line {line_number}: {kind} requires {field}"))
+}
+
+/// Binance reference kinds are fail-closed on malformed records but otherwise
+/// validated only for shape: coverage and quality manifest flags stay
+/// Polymarket-scoped and never create obligations for these updates.
+///
+/// `spot_price` accepts a zero price: the direct Binance tick feed emits a
+/// zero-price sentinel per symbol while its websocket is reconnecting
+/// (`send_unavailable_spot_ticks`), and the recorder persists it. Negative
+/// prices, missing fields, and wrong types are malformed.
+fn validate_spot_price(update: &Map<String, Value>, line_number: usize) -> Result<()> {
+    required_text(update, "symbol", line_number)
+        .map_err(|_| anyhow!("line {line_number}: spot_price requires symbol"))?;
+    let price = required_decimal(update, "price", "spot_price", line_number)?;
+    if price < Decimal::ZERO {
+        bail!("line {line_number}: spot_price price must be non-negative");
+    }
+    parse_timestamp(update.get("ts"), "ts", line_number)?;
+    Ok(())
+}
+
+/// The Binance feed parser only emits agg trades with positive price and
+/// quantity, so a recorded `agg_trade` must preserve those invariants.
+fn validate_agg_trade(update: &Map<String, Value>, line_number: usize) -> Result<()> {
+    required_text(update, "symbol", line_number)
+        .map_err(|_| anyhow!("line {line_number}: agg_trade requires symbol"))?;
+    if update.get("agg_trade_id").and_then(Value::as_u64).is_none() {
+        bail!("line {line_number}: agg_trade requires agg_trade_id");
+    }
+    if required_decimal(update, "price", "agg_trade", line_number)? <= Decimal::ZERO {
+        bail!("line {line_number}: agg_trade price must be positive");
+    }
+    if required_decimal(update, "quantity", "agg_trade", line_number)? <= Decimal::ZERO {
+        bail!("line {line_number}: agg_trade quantity must be positive");
+    }
+    if !update.get("is_buyer_maker").is_some_and(Value::is_boolean) {
+        bail!("line {line_number}: agg_trade is_buyer_maker must be a boolean");
+    }
+    parse_timestamp(update.get("ts"), "ts", line_number)?;
+    Ok(())
+}
+
+/// `obi` is a ratio of near-mid depth totals and therefore bounded by [-1, 1].
+fn validate_l2(update: &Map<String, Value>, line_number: usize) -> Result<()> {
+    required_text(update, "symbol", line_number)
+        .map_err(|_| anyhow!("line {line_number}: l2 requires symbol"))?;
+    let obi = update
+        .get("obi")
+        .and_then(Value::as_f64)
+        .filter(|obi| obi.is_finite())
+        .ok_or_else(|| anyhow!("line {line_number}: l2 requires a finite obi"))?;
+    if !(-1.0..=1.0).contains(&obi) {
+        bail!("line {line_number}: l2 obi must be within [-1, 1]");
+    }
+    if update.get("spread_bps").and_then(Value::as_u64).is_none() {
+        bail!("line {line_number}: l2 requires spread_bps");
+    }
+    parse_timestamp(update.get("ts"), "ts", line_number)?;
+    Ok(())
+}
+
 fn required_text<'a>(
     update: &'a Map<String, Value>,
     field: &str,
@@ -835,6 +909,9 @@ pub(crate) fn validate_reference_tape_for_recovery(
             scan.manifest["start_sequence"]
         );
     }
+    // Deliberately narrower than ALLOWED_KINDS: the recovered active tape
+    // belongs to the PM reference collector, which never records Binance
+    // reference kinds, so their presence here remains a hard failure.
     for kind in scan.manifest["event_types"]
         .as_object()
         .expect("scan manifest has event types")
@@ -1162,6 +1239,9 @@ fn scan_tape_with_identity_at(
                 }
                 dependent_reference_contexts.insert(context);
             }
+            "spot_price" => validate_spot_price(update, line_number)?,
+            "agg_trade" => validate_agg_trade(update, line_number)?,
+            "l2" => validate_l2(update, line_number)?,
             _ => {}
         }
 
@@ -1527,6 +1607,26 @@ fn scan_tape_with_identity_at(
         .insert(
             "reference_context_complete".to_owned(),
             json!(reference_context_complete),
+        );
+    // Binance reference kinds are counted separately: quote coverage, event
+    // context, and quality flags stay Polymarket-scoped, so `canonical` keeps
+    // its PM-only meaning on mixed tapes and Binance presence is reported
+    // only here and in `event_types`.
+    let binance_reference_counts = ["spot_price", "agg_trade", "l2"]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind.to_owned(),
+                json!(event_types.get(kind).copied().unwrap_or_default()),
+            )
+        })
+        .collect::<Map<String, Value>>();
+    manifest
+        .as_object_mut()
+        .expect("manifest is an object")
+        .insert(
+            "binance_reference_counts".to_owned(),
+            Value::Object(binance_reference_counts),
         );
     Ok(ScanResult { manifest, identity })
 }
@@ -4040,6 +4140,196 @@ mod tests {
             serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
                 .unwrap();
         assert_eq!(status["canonical_uploaded_segments"], 1);
+    }
+
+    fn binance_spot_price_update(ts: &str) -> Value {
+        json!({
+            "kind": "spot_price", "symbol": "BTCUSDT", "price": "65000.25", "ts": ts,
+        })
+    }
+
+    fn binance_agg_trade_update(ts: &str) -> Value {
+        json!({
+            "kind": "agg_trade", "symbol": "ETHUSDT", "agg_trade_id": 987,
+            "price": "3500.75", "quantity": "1.25", "is_buyer_maker": true, "ts": ts,
+        })
+    }
+
+    fn binance_l2_update(ts: &str) -> Value {
+        json!({
+            "kind": "l2", "symbol": "BTCUSDT", "obi": 0.142857, "spread_bps": 10, "ts": ts,
+        })
+    }
+
+    #[test]
+    fn validates_mixed_tape_with_binance_reference_kinds() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            sample_rows()[1].clone(),
+            record(
+                2,
+                "2026-07-15T01:00:02.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "down-1", "bid": "0.49", "ask": "0.51",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.49", "size": "10"}],
+                    "ask_levels": [{"price": "0.51", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
+                    "ts": "2026-07-15T01:00:02Z",
+                }),
+            ),
+            record(
+                3,
+                "2026-07-15T01:00:03.000000000Z",
+                binance_spot_price_update("2026-07-15T01:00:03Z"),
+            ),
+            record(
+                4,
+                "2026-07-15T01:00:04.000000000Z",
+                binance_agg_trade_update("2026-07-15T01:00:04Z"),
+            ),
+            record(
+                5,
+                "2026-07-15T01:00:05.000000000Z",
+                binance_l2_update("2026-07-15T01:00:05Z"),
+            ),
+        ];
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &rows,
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["event_types"]["spot_price"], 1);
+        assert_eq!(manifest["event_types"]["agg_trade"], 1);
+        assert_eq!(manifest["event_types"]["l2"], 1);
+        assert_eq!(manifest["binance_reference_counts"]["spot_price"], 1);
+        assert_eq!(manifest["binance_reference_counts"]["agg_trade"], 1);
+        assert_eq!(manifest["binance_reference_counts"]["l2"], 1);
+        assert_eq!(manifest["field_non_null"]["spot_price"]["price"], 1);
+        assert_eq!(manifest["quote_coverage_complete"], true);
+        assert_eq!(manifest["event_context_complete"], true);
+        assert_eq!(manifest["canonical"], true);
+        assert_eq!(manifest["segment_complete"], true);
+    }
+
+    #[test]
+    fn accepts_zero_price_binance_unavailable_sentinel() {
+        let root = TestDir::new();
+        let mut sentinel = binance_spot_price_update("2026-07-15T01:00:01Z");
+        sentinel["price"] = json!("0");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[record(0, "2026-07-15T01:00:01.000000000Z", sentinel)],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["binance_reference_counts"]["spot_price"], 1);
+    }
+
+    #[test]
+    fn rejects_malformed_binance_reference_kinds() {
+        let root = TestDir::new();
+        let cases: Vec<(&str, Value)> = vec![
+            {
+                let mut update = binance_spot_price_update("2026-07-15T01:00:01Z");
+                update["symbol"] = json!("");
+                ("spot_price requires symbol", update)
+            },
+            {
+                let mut update = binance_spot_price_update("2026-07-15T01:00:01Z");
+                update["price"] = json!("-1");
+                ("spot_price price must be non-negative", update)
+            },
+            {
+                let mut update = binance_spot_price_update("2026-07-15T01:00:01Z");
+                update.as_object_mut().unwrap().remove("ts");
+                ("ts must be a string", update)
+            },
+            {
+                let mut update = binance_agg_trade_update("2026-07-15T01:00:01Z");
+                update.as_object_mut().unwrap().remove("agg_trade_id");
+                ("agg_trade requires agg_trade_id", update)
+            },
+            {
+                let mut update = binance_agg_trade_update("2026-07-15T01:00:01Z");
+                update["price"] = json!("0");
+                ("agg_trade price must be positive", update)
+            },
+            {
+                let mut update = binance_agg_trade_update("2026-07-15T01:00:01Z");
+                update["quantity"] = json!("0");
+                ("agg_trade quantity must be positive", update)
+            },
+            {
+                let mut update = binance_agg_trade_update("2026-07-15T01:00:01Z");
+                update["is_buyer_maker"] = json!("yes");
+                ("agg_trade is_buyer_maker must be a boolean", update)
+            },
+            {
+                let mut update = binance_l2_update("2026-07-15T01:00:01Z");
+                update["obi"] = json!(1.5);
+                ("l2 obi must be within [-1, 1]", update)
+            },
+            {
+                let mut update = binance_l2_update("2026-07-15T01:00:01Z");
+                update.as_object_mut().unwrap().remove("spread_bps");
+                ("l2 requires spread_bps", update)
+            },
+        ];
+        for (index, (message, update)) in cases.into_iter().enumerate() {
+            let tape = write_tape(
+                root.path(),
+                &format!("market-updates.20260715T01{index:02}00.ndjson"),
+                &[record(0, "2026-07-15T01:00:01.000000000Z", update)],
+            );
+            let error = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap_err();
+            assert!(
+                error.to_string().contains(message),
+                "case {message:?} failed with: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn binance_kinds_do_not_mask_polymarket_coverage_gaps() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            sample_rows()[1].clone(),
+            record(
+                2,
+                "2026-07-15T01:00:02.000000000Z",
+                binance_spot_price_update("2026-07-15T01:00:02Z"),
+            ),
+            record(
+                3,
+                "2026-07-15T01:00:03.000000000Z",
+                binance_agg_trade_update("2026-07-15T01:00:03Z"),
+            ),
+            record(
+                4,
+                "2026-07-15T01:00:04.000000000Z",
+                binance_l2_update("2026-07-15T01:00:04Z"),
+            ),
+        ];
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &rows,
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["missing_quote_tokens"], json!(["down-1"]));
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["binance_reference_counts"]["spot_price"], 1);
     }
 
     #[cfg(unix)]
