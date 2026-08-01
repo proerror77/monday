@@ -109,7 +109,7 @@ A separate OS-thread watchdog enforces the same wall-clock deadline across synch
 tape fsync and atomic state publication, where a cooperative Tokio timeout cannot
 preempt non-yielding work. Health evidence over that duration is rejected by the
 shadow gate.
-The 200-request budget and the collector units' 672MiB/768MiB memory high/max
+The 200-request budget and the collector units' 1536MiB/2048MiB memory high/max
 limits are a measured pair. The budget was raised from 112 to speed historical
 trade backfill without raising concurrency: at most four requests remain in
 flight and each chunk retains at most four market responses, so the measured
@@ -121,7 +121,12 @@ watermark prevented health publication, while a later formal shadow reached a
 512MiB watermark. July 17 formal gates then measured 586.1MiB, 605.8MiB, and
 601.9MiB cold-start peaks under the former 576MiB watermark without reaching
 `MemoryMax=768M` or recording an OOM. The 672MiB watermark restores measured
-headroom without changing that hard limit. It is calibration, not promotion
+headroom without changing that hard limit. On 2026-08-01 the tracked catalog
+(6509 markets, 316k retained trade ids) outgrew the 672MiB high watermark: a
+production shadow gate (`329edad2`) failed with `memory.events high` growth
+during cold-start backfill. The 1536MiB/2048MiB pair doubles the former
+watermark within the Tokyo host budget and is the new calibration for the
+enlarged catalog. It is calibration, not promotion
 evidence: the formal gate still requires zero high/max/OOM events. The health policy
 pins the budget so a later default drift cannot silently invalidate that evidence.
 Both reference units reserve up to 80% of one CPU so observed collector work can
