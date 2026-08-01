@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use crate::engine::{RuntimeConfig, RuntimeMode};
 use crate::executor::SimulatedExecutorConfig;
-use crate::feed::{RecordingKind, RecordingLimits, RecordingPolicy};
+use crate::feed::{LagPolicy, RecordingKind, RecordingLimits, RecordingPolicy};
 use crate::strategies::directional::DirectionalConfig;
 
 /// Top-level config deserialized from a TOML file.
@@ -94,6 +94,13 @@ pub struct RuntimeSection {
     /// Restrict persisted quotes to tokens belonging to an active discovered event.
     #[serde(default)]
     pub record_market_updates_event_scoped_quotes: bool,
+    /// Broadcast channel capacity between feed producers and the runtime
+    /// consumer. Defaults to 8192 when unset.
+    pub feed_broadcast_capacity: Option<usize>,
+    /// How the live feed reacts to broadcast lag. Defaults to `fail_closed`
+    /// for trading runtimes; pure recorders may opt into `skip_and_continue`.
+    #[serde(default)]
+    pub feed_lag_policy: LagPolicy,
     /// Source boundary for live/dry-run market data.
     ///
     /// Defaults to `local_db`, where strategy runners consume collector-persisted
@@ -435,6 +442,16 @@ impl FullConfig {
 
     pub fn replay_market_updates_path(&self) -> Option<&Path> {
         self.runtime.replay_market_updates_from.as_deref()
+    }
+
+    /// Broadcast channel capacity between feed producers and the runtime consumer.
+    pub fn feed_broadcast_capacity(&self) -> usize {
+        self.runtime.feed_broadcast_capacity.unwrap_or(8192)
+    }
+
+    /// Lag policy for the live feed.
+    pub fn feed_lag_policy(&self) -> LagPolicy {
+        self.runtime.feed_lag_policy
     }
 
     /// Build SimulatedExecutorConfig from the parsed config.

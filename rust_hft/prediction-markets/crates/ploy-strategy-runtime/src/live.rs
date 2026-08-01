@@ -572,7 +572,7 @@ async fn run_live_or_dry_run(
         }
     };
 
-    let (tx, rx) = broadcast::channel(8192);
+    let (tx, rx) = broadcast::channel(config.feed_broadcast_capacity());
     let tx = Arc::new(tx);
     let reference_prices = new_reference_price_registry();
     let market_data_source = config.runtime.market_data_source;
@@ -644,7 +644,7 @@ async fn run_live_or_dry_run(
     let feed: Box<dyn Feed> = if let Some(record_path) = config.record_market_updates_path() {
         Box::new(
             RecordingFeed::with_policy(
-                LiveFeed::new(rx),
+                LiveFeed::with_lag_policy(rx, config.feed_lag_policy()),
                 record_path,
                 config.record_market_updates_policy(),
             )
@@ -657,7 +657,7 @@ async fn run_live_or_dry_run(
             }),
         )
     } else {
-        Box::new(LiveFeed::new(rx))
+        Box::new(LiveFeed::with_lag_policy(rx, config.feed_lag_policy()))
     };
 
     let recorder = build_signal_recorder(db_pool.clone(), runtime_config.mode);

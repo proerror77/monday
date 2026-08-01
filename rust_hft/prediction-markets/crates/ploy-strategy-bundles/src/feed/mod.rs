@@ -10,7 +10,7 @@ pub mod parquet_stream;
 mod recorded;
 
 pub use historical::HistoricalFeed;
-pub use live::LiveFeed;
+pub use live::{LagPolicy, LiveFeed};
 pub use options::HistoricalLoadOptions;
 #[cfg(feature = "parquet-feed")]
 pub use parquet_stream::StreamingParquetFeed;

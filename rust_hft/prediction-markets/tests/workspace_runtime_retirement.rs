@@ -1679,6 +1679,8 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
         "record_market_updates_include_kinds = [\"quote\", \"event_discovered\", \"event_expired\", \"reference_price\", \"spot_price\", \"agg_trade\", \"l2\"]",
         "record_market_updates_quote_sample_ms = 0",
         "record_market_updates_event_scoped_quotes = true",
+        "feed_broadcast_capacity = 65536",
+        "feed_lag_policy = \"skip_and_continue\"",
         "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\", \"DOGEUSDT\", \"HYPEUSDT\", \"BNBUSDT\"]",
     ] {
         assert!(config.contains(required), "config missing {required}");
@@ -1689,6 +1691,9 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
         "NoNewPrivileges=true",
         "ProtectSystem=strict",
         "ReadWritePaths=/data/monday/spool/polymarket",
+        "CPUQuota=100%",
+        "MemoryHigh=768M",
+        "MemoryMax=1G",
     ] {
         assert!(service.contains(required), "service missing {required}");
     }
