@@ -203,8 +203,8 @@ and (
     and .baseline_health_start_file_identity == null
     and .baseline_health_completion_file_identity == null
     and (.legacy_runtime |
-      runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference";
-        "7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94"))
+      runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200";
+        "6d942117a378a42f06376acb78dbc312c85e1146fc05ff17d1699b8a6007edec"))
     and (.legacy_runtime.release_sha256 | sha256)
     and .candidate_sha256 != .legacy_runtime.release_sha256
     and .legacy_runtime.release_path == ("/opt/monday/releases/polymarket-raw-ops/"
@@ -215,13 +215,15 @@ and (
 and (
   .shadow_runtime.exec_start == (
     "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
-    + "/polymarket-raw-ops collect-reference --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"
+    + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+    + " --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"
   )
   or .shadow_runtime.exec_start == .shadow_runtime.cmdline
 )
 and .shadow_runtime.cmdline == (
   "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
-  + "/polymarket-raw-ops collect-reference --spool-dir "
+  + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+  + " --spool-dir "
   + "/data/monday/spool/polymarket-reference-rust-shadow/"
   + .candidate_sha256 + "/" + .shadow_run_id
 )

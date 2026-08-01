@@ -1323,7 +1323,7 @@ sed -n '/^verify_baseline_identity() {$/,/^}$/p' "$GATE" >"$baseline_identity_co
 exercise_rust_baseline_identity() (
   set -euo pipefail
   RUST_ACTIVE_BINARY="$tmp_dir/active" baseline_mode=rust_release legacy_pid=42
-  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
   legacy_restarts=1 legacy_invocation_id=$(printf '1%.0s' {1..32})
   baseline_release_sha=$(printf '9%.0s' {1..64})
   baseline_release_path="$tmp_dir/$baseline_release_sha/polymarket-raw-ops"
@@ -2812,9 +2812,11 @@ jq \
     },
     shadow_runtime:{
       exec_start:("/opt/monday/releases/polymarket-raw-ops/" + $candidate
-        + "/polymarket-raw-ops collect-reference --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"),
+        + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+        + " --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}"),
       cmdline:("/opt/monday/releases/polymarket-raw-ops/" + $candidate
-        + "/polymarket-raw-ops collect-reference --spool-dir "
+        + "/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+        + " --spool-dir "
         + "/data/monday/spool/polymarket-reference-rust-shadow/" + $candidate + "/run-1"),
       fragment_path:"/etc/systemd/system/polymarket-reference-collector-shadow@.service",
       drop_in_paths:[],main_pid:11,restarts:0,
@@ -3506,9 +3508,9 @@ jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
   | .baseline_health_start_file_identity = null
   | .baseline_health_completion_file_identity = null
   | .legacy_runtime += {
-      exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
-      cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
-      cmdline_sha256:"7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94",
+      exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
+      cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
+      cmdline_sha256:"6d942117a378a42f06376acb78dbc312c85e1146fc05ff17d1699b8a6007edec",
       fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
       drop_in_paths:[],
       main_pid:12,restarts:0,invocation_id:("1" * 32),
@@ -4059,14 +4061,14 @@ jq -n '{
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:120,
   missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
-  trade_poll_budget:112,trade_poll_concurrency:4,trade_request_spacing_ms:100,
+  trade_poll_budget:200,trade_poll_concurrency:4,trade_request_spacing_ms:100,
   priority_trade_markets_before_market_details:108,
-  market_detail_budget:2,market_detail_eligible:3,market_detail_priority:2,
-  market_detail_selected:2,market_detail_deferred:1,market_detail_priority_deferred:0,
-  trade_poll_budget_after_market_details:110,
-  eligible_trade_markets:112,priority_trade_markets:110,
-  selected_trade_markets:110,deferred_trade_markets:2,priority_trade_backlog:0,
-  trade_polls:110,successful_trade_polls:110,
+  market_detail_budget:4,market_detail_eligible:3,market_detail_priority:2,
+  market_detail_selected:3,market_detail_deferred:0,market_detail_priority_deferred:0,
+  trade_poll_budget_after_market_details:197,
+  eligible_trade_markets:200,priority_trade_markets:110,
+  selected_trade_markets:197,deferred_trade_markets:3,priority_trade_backlog:0,
+  trade_polls:197,successful_trade_polls:197,
   truncated_trade_markets:[],non_object_trade_markets:[],invalid_settlement_markets:[],
   invalid_end_time_markets:[],stale_trade_markets:[],stale_settlement_markets:[],
   overdue_unresolved_markets:[]
@@ -4095,17 +4097,18 @@ for mutation in \
   fi
 done
 jq '
-  .priority_trade_markets_before_market_details = 112
-  | .market_detail_budget = 0
+  .priority_trade_markets_before_market_details = 120
+  | .market_detail_eligible = 0
+  | .market_detail_priority = 0
   | .market_detail_selected = 0
-  | .market_detail_deferred = 3
-  | .market_detail_priority_deferred = 2
-  | .trade_poll_budget_after_market_details = 112
-  | .priority_trade_markets = 112
-  | .selected_trade_markets = 112
+  | .market_detail_deferred = 0
+  | .market_detail_priority_deferred = 0
+  | .trade_poll_budget_after_market_details = 200
+  | .priority_trade_markets = 120
+  | .selected_trade_markets = 200
   | .deferred_trade_markets = 0
-  | .trade_polls = 112
-  | .successful_trade_polls = 112
+  | .trade_polls = 200
+  | .successful_trade_polls = 200
 ' "$tmp_dir/rust-health.json" >"$tmp_dir/saturated-rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/saturated-rust-health.json" >/dev/null
 for mutation in \
@@ -4113,8 +4116,8 @@ for mutation in \
   'del(.cycle_started_at)' \
   '.cycle_duration_ms = -1' \
   '.cycle_duration_ms = 180001' \
-  '.trade_poll_budget = 111' \
-  '.trade_poll_budget = 113' \
+  '.trade_poll_budget = 199' \
+  '.trade_poll_budget = 201' \
   '.trade_poll_concurrency = 0' \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \
@@ -4125,12 +4128,12 @@ for mutation in \
   '.market_detail_selected = 1' \
   '.market_detail_deferred = 2' \
   '.market_detail_priority_deferred = 1' \
-  '.trade_poll_budget_after_market_details = 109' \
+  '.trade_poll_budget_after_market_details = 196' \
   'del(.trade_request_spacing_ms)' \
   '.trade_request_spacing_ms = 99' \
   '.priority_trade_markets = 107' \
   '.priority_trade_backlog = 1' \
-  '.selected_trade_markets = 109' \
+  '.selected_trade_markets = 196' \
   '.deferred_trade_markets = 1' \
   '.eligible_trade_markets = 111' \
   '.successful_trade_polls = 0' \

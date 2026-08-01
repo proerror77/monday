@@ -25,7 +25,7 @@ readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
-readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
+readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
 readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly CONTROL_DIR=/opt/monday/control/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
@@ -838,7 +838,7 @@ real_market_segment_preflight() {
   if run_before_deadline "$preflight_deadline" runuser \
     -u hftcollector -- env HOME=/var/lib/hft-collector \
     "$release_binary" upload --spool-dir "$spool" \
-    --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 1000 \
+    --dataset "$preflight_dataset" --quote-depth-levels 0 --quote-sample-ms 0 \
     --bucket "$oss_bucket" --endpoint "$oss_endpoint" --region "$oss_region" \
     --profile "$aliyun_profile" --zstd-timeout "$zstd_timeout_seconds" \
     --oss-timeout "$oss_copy_timeout_seconds" \
@@ -1056,8 +1056,8 @@ verify_shadow_identity() {
   [[ $fragment == "$SHADOW_FRAGMENT" ]] || return 1
   drop_ins=$(systemctl show --property=DropInPaths --value "$shadow_unit") || return 1
   [[ -z $drop_ins ]] || return 1
-  expected_exec_raw="$release_binary collect-reference --spool-dir \${MONDAY_POLYMARKET_SHADOW_SPOOL}"
-  expected_exec_expanded="$release_binary collect-reference --spool-dir $shadow_spool"
+  expected_exec_raw="$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir \${MONDAY_POLYMARKET_SHADOW_SPOOL}"
+  expected_exec_expanded="$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir $shadow_spool"
   exec_argv=$(effective_exec_argv "$shadow_unit") || return 1
   [[ $exec_argv == "$expected_exec_raw" || $exec_argv == "$expected_exec_expanded" ]] \
     || return 1
@@ -1069,7 +1069,7 @@ verify_shadow_identity() {
   [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   [[ $(readlink -f "/proc/$pid/exe") == "$release_binary" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
-  [[ $cmdline == "$release_binary collect-reference --spool-dir $shadow_spool " ]]
+  [[ $cmdline == "$release_binary collect-reference --max-trade-polls-per-cycle 200 --spool-dir $shadow_spool " ]]
 }
 
 valid_shadow_control_group() {
