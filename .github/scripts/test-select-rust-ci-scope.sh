@@ -173,6 +173,12 @@ grep -Fq "'jobs=,ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
+grep -Fqx '  rust_fast_gates:' "$ci_workflow"
+grep -Fqx '      - rust_fast_gates' "$ci_workflow"
+grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$ci_workflow"
+grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
+grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
