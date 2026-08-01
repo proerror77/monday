@@ -2046,25 +2046,62 @@ fn evict_oldest_incomplete_trade_ids(state: &mut CollectorState, budget: usize) 
         .filter(|market| !market.trade_complete)
         .filter_map(|market| market.condition_id.clone())
         .collect::<BTreeSet<_>>();
-    let mut by_age: Vec<(i64, String, String)> = Vec::new();
+    // Pass 1: find the timestamp of the excess-th oldest incomplete ID. Only
+    // i64 timestamps are collected (~8 bytes each) so a 4M-entry state does
+    // not duplicate every condition/trade ID string during recovery.
+    let mut timestamps: Vec<i64> = Vec::new();
     for (condition_id, seen) in &state.trade_seen {
         if !incomplete.contains(condition_id) {
             continue;
         }
-        for (trade_id, timestamp) in seen {
-            by_age.push((*timestamp, condition_id.clone(), trade_id.clone()));
-        }
+        timestamps.extend(seen.values().copied());
     }
-    by_age.sort_unstable_by_key(|(timestamp, _, _)| *timestamp);
+    timestamps.sort_unstable();
+    let Some(&cutoff_ts) = timestamps.get(
+        excess
+            .saturating_sub(1)
+            .min(timestamps.len().saturating_sub(1)),
+    ) else {
+        // Every retained ID belongs to a completed market; eviction never
+        // covers those, and validate_state_bounds stays fail-closed for them.
+        return 0;
+    };
+    // Pass 2: evict strictly older IDs, then ties in deterministic BTreeMap order.
     let mut evicted = 0_usize;
     let mut emptied = Vec::new();
-    for (_, condition_id, trade_id) in by_age.into_iter().take(excess) {
-        if let Some(seen) = state.trade_seen.get_mut(&condition_id) {
-            if seen.remove(&trade_id).is_some() {
+    for (condition_id, seen) in state.trade_seen.iter_mut() {
+        if !incomplete.contains(condition_id) {
+            continue;
+        }
+        let before = seen.len();
+        seen.retain(|_, timestamp| *timestamp >= cutoff_ts);
+        evicted += before - seen.len();
+        if seen.is_empty() {
+            emptied.push(condition_id.clone());
+        }
+    }
+    if evicted < excess {
+        'outer: for (condition_id, seen) in state.trade_seen.iter_mut() {
+            if !incomplete.contains(condition_id) {
+                continue;
+            }
+            let ties: Vec<String> = seen
+                .iter()
+                .filter(|(_, timestamp)| **timestamp == cutoff_ts)
+                .map(|(trade_id, _)| trade_id.clone())
+                .collect();
+            for trade_id in ties {
+                seen.remove(&trade_id);
                 evicted += 1;
-                if seen.is_empty() {
-                    emptied.push(condition_id);
+                if evicted >= excess {
+                    if seen.is_empty() {
+                        emptied.push(condition_id.clone());
+                    }
+                    break 'outer;
                 }
+            }
+            if seen.is_empty() {
+                emptied.push(condition_id.clone());
             }
         }
     }
