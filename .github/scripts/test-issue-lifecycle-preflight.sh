@@ -93,7 +93,7 @@ case "$path" in
   repos/example/repo/issues/comments*)
     call="$(bump comments)"
     comments='[{"id":1001,"issue_url":"https://api.github.test/repos/example/repo/issues/1","body":"evidence"},{"id":1002,"issue_url":"https://api.github.test/repos/example/repo/issues/2","body":"review context"}]'
-    if [[ "${FIXTURE_MODE:-normal}" == capture-race && "$call" -gt 1 ]]; then
+    if [[ "${FIXTURE_MODE:-normal}" == live-drift || "${FIXTURE_MODE:-normal}" == capture-race && "$call" -gt 1 ]]; then
       comments='[{"id":1001,"issue_url":"https://api.github.test/repos/example/repo/issues/1","body":"evidence changed concurrently"},{"id":1002,"issue_url":"https://api.github.test/repos/example/repo/issues/2","body":"review context"}]'
     fi
     etag=fixture
@@ -160,9 +160,87 @@ capture() {
     --repo example/repo --controller "Codex /root" --output "$output"
 }
 
+verify() {
+  local bundle="$1"
+  shift
+  PATH="$fake_bin:$PATH" ruby "$preflight" verify \
+    --repo example/repo --controller "Codex /root" --bundle "$bundle" "$@"
+}
+
+verify_live() {
+  local mode="$1" bundle="$2"
+  rm -f "$TEST_FAKE_STATE"/*
+  FIXTURE_MODE="$mode" PATH="$fake_bin:$PATH" ruby "$preflight" verify \
+    --repo example/repo --controller "Codex /root" --bundle "$bundle" --live
+}
+
+copy_bundle() {
+  cp -R "$tmp_dir/bundle-a" "$tmp_dir/$1"
+}
+
+rehash() {
+  local bundle="$1" filename="$2"
+  (cd "$bundle" && sha256sum "$filename" >"$filename.sha256")
+}
+
+resign_preflight() {
+  local bundle="$1"
+  rehash "$bundle" preflight.json
+  ruby -rdigest -rjson -e '
+    bundle = ARGV.fetch(0)
+    path = File.join(bundle, "manifest.json")
+    object = JSON.parse(File.binread(path))
+    object.fetch("preflight")["sha256"] = Digest::SHA256.file(File.join(bundle, "preflight.json")).hexdigest
+    File.binwrite(path, JSON.generate(object) + "\n")
+  ' "$bundle"
+  rehash "$bundle" manifest.json
+}
+
+set_json_field() {
+  local path="$1" key="$2" value="$3"
+  ruby -rjson -e '
+    path, key, value = ARGV
+    object = JSON.parse(File.binread(path))
+    object[key] = JSON.parse(value)
+    File.binwrite(path, JSON.generate(object) + "\n")
+  ' "$path" "$key" "$value"
+}
+
+verify_fails() {
+  local name="$1" bundle="$2"
+  shift 2
+  set +e
+  output="$(verify "$bundle" "$@" 2>&1)"
+  exit_code=$?
+  set -e
+  test "$exit_code" -eq 2
+  grep -Fq "ERROR issue lifecycle preflight:" <<<"$output" || {
+    echo "$name did not report a verifier error" >&2
+    exit 1
+  }
+}
+
+verify_live_fails() {
+  local mode="$1" bundle="$2"
+  local before output exit_code
+  before="$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
+  set +e
+  output="$(verify_live "$mode" "$bundle" 2>&1)"
+  exit_code=$?
+  set -e
+  test "$exit_code" -eq 2
+  grep -Fq "ERROR issue lifecycle preflight:" <<<"$output"
+  test "$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)" = "$before"
+}
+
 : >"$api_log"
 capture normal "$tmp_dir/bundle-a"
 capture reordered "$tmp_dir/bundle-b"
+bundle_before="$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
+api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
+verify "$tmp_dir/bundle-a"
+test "$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)" = "$bundle_before"
+test "$(wc -l <"$api_log" | tr -d ' ')" = "$api_calls_before"
 expected_files=$'manifest.json\nmanifest.json.sha256\npreflight.json\npreflight.json.sha256'
 actual_files="$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -print | sed 's|.*/||' | sort)"
 test "$actual_files" = "$expected_files"
@@ -195,6 +273,112 @@ abort "wrong main" unless manifest["default_branch_sha"] == "a" * 40
 abort "missing conditional stability pages" unless manifest.fetch("pages").any? { |page| page["phase"] == "stability_check" && page["protocol"] == "rest" } && manifest.fetch("pages").select { |page| page["phase"] == "stability_check" && page["protocol"] == "rest" }.all? { |page| page["status"] == 304 }
 abort "wrong counts" unless manifest.fetch("counts") == {"issues" => 2, "pull_requests" => 1, "labels" => 2, "issue_comments" => 2, "issue_events" => 2}
 RUBY
+
+local_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
+
+copy_bundle verify-missing
+rm "$tmp_dir/verify-missing/manifest.json.sha256"
+verify_fails missing "$tmp_dir/verify-missing"
+
+copy_bundle verify-extra
+touch "$tmp_dir/verify-extra/unexpected"
+verify_fails extra "$tmp_dir/verify-extra"
+
+copy_bundle verify-symlink
+rm "$tmp_dir/verify-symlink/preflight.json"
+ln -s "$tmp_dir/bundle-a/preflight.json" "$tmp_dir/verify-symlink/preflight.json"
+verify_fails symlink "$tmp_dir/verify-symlink"
+
+copy_bundle verify-tampered
+printf ' ' >>"$tmp_dir/verify-tampered/preflight.json"
+verify_fails tampered "$tmp_dir/verify-tampered"
+
+copy_bundle verify-digest
+printf '%064d  preflight.json\n' 0 >"$tmp_dir/verify-digest/preflight.json.sha256"
+verify_fails digest "$tmp_dir/verify-digest"
+
+copy_bundle verify-noncanonical
+ruby -rjson -e 'path = ARGV.fetch(0); File.binwrite(path, JSON.pretty_generate(JSON.parse(File.binread(path))) + "\n")' "$tmp_dir/verify-noncanonical/preflight.json"
+rehash "$tmp_dir/verify-noncanonical" preflight.json
+verify_fails noncanonical "$tmp_dir/verify-noncanonical"
+
+copy_bundle verify-schema
+set_json_field "$tmp_dir/verify-schema/manifest.json" schema '"monday.issue_lifecycle_manifest.v2"'
+rehash "$tmp_dir/verify-schema" manifest.json
+verify_fails schema "$tmp_dir/verify-schema"
+
+verify_fails scope "$tmp_dir/bundle-a" --repo other/repo
+
+copy_bundle verify-api
+set_json_field "$tmp_dir/verify-api/manifest.json" api '{"rest_version":"wrong"}'
+rehash "$tmp_dir/verify-api" manifest.json
+verify_fails api "$tmp_dir/verify-api"
+
+copy_bundle verify-pages
+set_json_field "$tmp_dir/verify-pages/manifest.json" pages '[]'
+rehash "$tmp_dir/verify-pages" manifest.json
+verify_fails pages "$tmp_dir/verify-pages"
+
+copy_bundle verify-counts
+set_json_field "$tmp_dir/verify-counts/manifest.json" counts '{"issues":999}'
+rehash "$tmp_dir/verify-counts" manifest.json
+verify_fails counts "$tmp_dir/verify-counts"
+
+copy_bundle verify-branch
+set_json_field "$tmp_dir/verify-branch/manifest.json" default_branch_sha '"cccccccccccccccccccccccccccccccccccccccc"'
+rehash "$tmp_dir/verify-branch" manifest.json
+verify_fails branch "$tmp_dir/verify-branch"
+
+copy_bundle verify-item-schema
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("items").first["unexpected"] = true
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-item-schema/preflight.json"
+resign_preflight "$tmp_dir/verify-item-schema"
+verify_fails item-schema "$tmp_dir/verify-item-schema"
+
+copy_bundle verify-pr-schema
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("items").find { |item| item["kind"] == "pull_request" }.fetch("pull_request").delete("commits")
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-pr-schema/preflight.json"
+resign_preflight "$tmp_dir/verify-pr-schema"
+verify_fails pr-schema "$tmp_dir/verify-pr-schema"
+
+copy_bundle verify-relationship-schema
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("items").find { |item| item["kind"] == "issue" }.fetch("relationships").delete("blocked_by")
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-relationship-schema/preflight.json"
+resign_preflight "$tmp_dir/verify-relationship-schema"
+verify_fails relationship-schema "$tmp_dir/verify-relationship-schema"
+
+copy_bundle verify-rest-etag
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("pages").select { |page| page["protocol"] == "rest" }.each { |page| page["etag"] = nil }
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-rest-etag/manifest.json"
+rehash "$tmp_dir/verify-rest-etag" manifest.json
+verify_fails rest-etag "$tmp_dir/verify-rest-etag"
+
+test "$(wc -l <"$api_log" | tr -d ' ')" = "$local_api_calls_before"
+
+live_bundle_before="$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
+live_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
+verify_live normal "$tmp_dir/bundle-a"
+test "$(wc -l <"$api_log" | tr -d ' ')" -gt "$live_api_calls_before"
+test "$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)" = "$live_bundle_before"
+for mode in live-drift incomplete missing-link capture-race header-race issue-detail-race closed-pr-race graphql-media-race graphql-media-missing; do
+  verify_live_fails "$mode" "$tmp_dir/bundle-a"
+done
 
 for mode in incomplete missing-link missing-relationship capture-race header-race issue-detail-race closed-pr-race graphql-media-race graphql-media-missing; do
   set +e

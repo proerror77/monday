@@ -11,6 +11,10 @@ require "tmpdir"
 require "uri"
 
 EVIDENCE_EXCLUSIONS = ["GitHub metadata mutation", "branch protection and required checks", "deployment and runtime resources", "source code and Agent-led research PRD scope"].freeze
+PREFLIGHT_SCHEMA = "monday.issue_lifecycle_preflight.v1"
+MANIFEST_SCHEMA = "monday.issue_lifecycle_manifest.v1"
+BUNDLE_FILES = %w[manifest.json manifest.json.sha256 preflight.json preflight.json.sha256].freeze
+PAGE_KEYS = %w[api_version body_sha256 etag last_modified media_type phase protocol request status].freeze
 
 module Canonical
   PRESERVE_ARRAY_ORDER = %w[comments commits events].freeze
@@ -393,7 +397,7 @@ def read_graph(github, repo)
   end
 
   graph = {
-    "schema" => "monday.issue_lifecycle_preflight.v1",
+    "schema" => PREFLIGHT_SCHEMA,
     "repository" => repository,
     "label_catalog" => labels,
     "items" => items
@@ -481,6 +485,218 @@ def write_bundle(output, graph, manifest)
   end
 end
 
+def read_canonical_json(path)
+  contents = File.binread(path)
+  object = JSON.parse(contents)
+  raise "#{File.basename(path)} is not canonical JSON" unless contents == Canonical.dump(object)
+
+  object
+rescue JSON::ParserError => error
+  raise "#{File.basename(path)} is invalid JSON: #{error.message}"
+end
+
+def verify_sidecar(bundle, filename)
+  sidecar = "#{filename}.sha256"
+  contents = File.binread(File.join(bundle, sidecar))
+  match = contents.match(/\A([0-9a-f]{64})  #{Regexp.escape(filename)}\n\z/)
+  raise "#{sidecar} is invalid" unless match
+
+  actual = Digest::SHA256.file(File.join(bundle, filename)).hexdigest
+  raise "#{filename} digest mismatch" unless actual == match[1]
+
+  actual
+end
+
+def verify_page_inventory!(pages, graphql_media_type)
+  raise "manifest page inventory is empty" unless pages.is_a?(Array) && !pages.empty?
+
+  pages.each do |page|
+    unless page.is_a?(Hash) && page.keys.sort == PAGE_KEYS &&
+           %w[capture stability_check].include?(page["phase"]) &&
+           %w[graphql rest].include?(page["protocol"]) &&
+           !page["request"].to_s.empty? && page["body_sha256"].to_s.match?(/\A[0-9a-f]{64}\z/)
+      raise "manifest page inventory entry is invalid"
+    end
+    expected_status = page["phase"] == "stability_check" && page["protocol"] == "rest" ? 304 : 200..299
+    raise "manifest page status is invalid" unless expected_status === page["status"]
+  end
+
+  endpoint_set = lambda do |phase|
+    pages.select { |page| page["phase"] == phase }.map { |page| [page["protocol"], page["request"]] }
+  end
+  captured = endpoint_set.call("capture")
+  stable = endpoint_set.call("stability_check")
+  unless captured.any? && captured.uniq.length == captured.length && stable.uniq.length == stable.length && captured.sort == stable.sort
+    raise "manifest page inventory phases do not match"
+  end
+  captured_pages = pages.select { |page| page["phase"] == "capture" }.to_h { |page| [[page["protocol"], page["request"]], page] }
+  pages.select { |page| page["phase"] == "stability_check" }.each do |page|
+    original = captured_pages.fetch([page["protocol"], page["request"]])
+    raise "manifest page body identity changed" unless page["body_sha256"] == original["body_sha256"]
+    next unless page["protocol"] == "rest"
+
+    if original["etag"].to_s.empty? || page["etag"] != original["etag"]
+      raise "manifest REST ETag provenance is invalid"
+    end
+  end
+
+  graphql_media_types = pages.select { |page| page["protocol"] == "graphql" }.map { |page| page["media_type"] }
+  unless graphql_media_types.any? && graphql_media_types.all? { |media_type| !media_type.to_s.empty? } && graphql_media_types.uniq == [graphql_media_type]
+    raise "manifest GraphQL media type does not match page inventory"
+  end
+  rest_pages = pages.select { |page| page["phase"] == "capture" && page["protocol"] == "rest" }
+  unless rest_pages.any? && rest_pages.all? { |page| page["api_version"] == GitHubReadOnly::API_VERSION && !page["media_type"].to_s.empty? }
+    raise "manifest REST provenance is incomplete"
+  end
+end
+
+def relationship_reference?(reference)
+  reference.is_a?(Hash) && reference.keys.sort == %w[number repository url] &&
+    reference["number"].is_a?(Integer) && reference["number"].positive? && !reference["url"].to_s.empty? &&
+    reference["repository"].is_a?(Hash) && reference["repository"].keys == ["nameWithOwner"] &&
+    !reference.dig("repository", "nameWithOwner").to_s.empty?
+end
+
+def graph_counts(graph, repo)
+  unless graph.is_a?(Hash) && graph.keys.sort == %w[items label_catalog repository schema] && graph["schema"] == PREFLIGHT_SCHEMA
+    raise "preflight schema is invalid"
+  end
+  repository = graph.fetch("repository")
+  unless repository.is_a?(Hash) && repository.keys.sort == %w[default_branch default_branch_sha full_name id] &&
+         repository["full_name"] == repo && !repository["id"].to_s.empty? &&
+         !repository["default_branch"].to_s.empty? && repository["default_branch_sha"].to_s.match?(/\A[0-9a-f]{40}\z/i)
+    raise "preflight repository identity is invalid"
+  end
+
+  labels = graph.fetch("label_catalog")
+  items = graph.fetch("items")
+  raise "preflight collections are invalid" unless labels.is_a?(Array) && items.is_a?(Array)
+  unless labels.all? { |label| label.is_a?(Hash) && label["id"].is_a?(Integer) && !label["name"].to_s.empty? } &&
+         labels.map { |label| label["id"] }.uniq.length == labels.length &&
+         labels.map { |label| label["name"] }.uniq.length == labels.length
+    raise "preflight label catalog is invalid"
+  end
+
+  numbers = []
+  issue_count = 0
+  pull_request_count = 0
+  comment_count = 0
+  event_count = 0
+  items.each do |item|
+    raise "preflight item is invalid" unless item.is_a?(Hash) && item["number"].is_a?(Integer) && item["number"].positive?
+
+    number = item["number"]
+    metadata = item["issue"]
+    comments = item["comments"]
+    events = item["events"]
+    unless metadata.is_a?(Hash) && metadata["number"] == number && metadata.key?("body") &&
+           %w[open closed].include?(metadata["state"]) && metadata["labels"].is_a?(Array) &&
+           metadata["assignees"].is_a?(Array) && metadata["comments"] == comments&.length &&
+           comments.is_a?(Array) && comments.all? { |comment| comment.is_a?(Hash) } &&
+           events.is_a?(Array) && events.all? { |event| event.is_a?(Hash) }
+      raise "preflight item ##{number} metadata is invalid"
+    end
+    case item["kind"]
+    when "issue"
+      relationships = item["relationships"]
+      relationship_lists = %w[blocked_by blocking closed_by_pull_requests sub_issues]
+      unless item.keys.sort == %w[comments events issue kind number relationships] &&
+             relationships.is_a?(Hash) &&
+             relationships.keys.sort == %w[blocked_by blocking closed_by_pull_requests number parent sub_issues] &&
+             relationships["number"] == number &&
+             (!relationships["parent"] || relationship_reference?(relationships["parent"])) &&
+             relationship_lists.all? do |key|
+               relationships[key].is_a?(Array) && relationships[key].all? { |reference| relationship_reference?(reference) }
+             end
+        raise "preflight Issue ##{number} schema is invalid"
+      end
+
+      issue_count += 1
+    when "pull_request"
+      pull_request = item["pull_request"]
+      unless item.keys.sort == %w[comments events issue kind number pull_request] && pull_request.is_a?(Hash) &&
+             pull_request.keys.sort == %w[check_runs commits files metadata review_comments reviews statuses] &&
+             pull_request["metadata"].is_a?(Hash) && pull_request.dig("metadata", "number") == number &&
+             pull_request.dig("metadata", "head", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
+             pull_request.dig("metadata", "base", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
+             %w[commits files review_comments reviews statuses].all? { |key| pull_request[key].is_a?(Array) } &&
+             pull_request["commits"].length == pull_request.dig("metadata", "commits") &&
+             pull_request["files"].length == pull_request.dig("metadata", "changed_files") &&
+             pull_request["review_comments"].length == pull_request.dig("metadata", "review_comments") &&
+             pull_request["check_runs"].is_a?(Hash) && pull_request["check_runs"].keys.sort == %w[check_runs total_count] &&
+             pull_request.dig("check_runs", "check_runs").is_a?(Array) &&
+             pull_request.dig("check_runs", "total_count") == pull_request.dig("check_runs", "check_runs").length
+        raise "preflight PR ##{number} schema is invalid"
+      end
+
+      pull_request_count += 1
+    else
+      raise "preflight item ##{number} kind is invalid"
+    end
+    numbers << number
+    comment_count += comments.length
+    event_count += events.length
+  end
+  raise "preflight contains duplicate item numbers" unless numbers.uniq.length == numbers.length
+
+  {
+    "issues" => issue_count,
+    "pull_requests" => pull_request_count,
+    "labels" => labels.length,
+    "issue_comments" => comment_count,
+    "issue_events" => event_count
+  }
+end
+
+def verify_bundle(bundle, repo, controller)
+  unless File.directory?(bundle) && !File.symlink?(bundle) && Dir.children(bundle).sort == BUNDLE_FILES
+    raise "bundle file set is invalid"
+  end
+  BUNDLE_FILES.each do |filename|
+    path = File.join(bundle, filename)
+    raise "bundle entry #{filename} is not a regular file" unless File.file?(path) && !File.symlink?(path)
+  end
+
+  preflight_sha = verify_sidecar(bundle, "preflight.json")
+  verify_sidecar(bundle, "manifest.json")
+  graph = read_canonical_json(File.join(bundle, "preflight.json"))
+  manifest = read_canonical_json(File.join(bundle, "manifest.json"))
+  expected_manifest_keys = %w[api captured_at controller counts default_branch default_branch_sha exclusions pages preflight repository schema target]
+  unless manifest.is_a?(Hash) && manifest.keys.sort == expected_manifest_keys && manifest["schema"] == MANIFEST_SCHEMA
+    raise "manifest schema is invalid"
+  end
+  unless manifest["repository"] == repo && manifest["controller"] == controller &&
+         manifest["target"] == "GitHub Issue and pull request metadata in #{repo}" && manifest["exclusions"] == EVIDENCE_EXCLUSIONS
+    raise "manifest scope is invalid"
+  end
+  begin
+    captured_at = manifest.fetch("captured_at")
+    raise ArgumentError unless captured_at.is_a?(String) && captured_at.end_with?("Z") && Time.iso8601(captured_at).utc_offset.zero?
+  rescue ArgumentError
+    raise "manifest capture time is not UTC"
+  end
+
+  api = manifest.fetch("api")
+  unless api.is_a?(Hash) && api.keys.sort == %w[graphql_media_type rest_accept rest_version] &&
+         api["rest_version"] == GitHubReadOnly::API_VERSION && api["rest_accept"] == GitHubReadOnly::REST_ACCEPT &&
+         !api["graphql_media_type"].to_s.empty?
+    raise "manifest API provenance is invalid"
+  end
+  verify_page_inventory!(manifest.fetch("pages"), api.fetch("graphql_media_type"))
+  counts = graph_counts(graph, repo)
+  raise "manifest counts do not match preflight" unless manifest["counts"] == counts
+
+  repository = graph.fetch("repository")
+  unless manifest["default_branch"] == repository["default_branch"] &&
+         manifest["default_branch_sha"] == repository["default_branch_sha"] &&
+         manifest["preflight"] == { "file" => "preflight.json", "sha256" => preflight_sha }
+    raise "manifest preflight identity is invalid"
+  end
+  [graph, manifest]
+rescue Errno::EACCES, Errno::ENOENT => error
+  raise "bundle read failed: #{error.message}"
+end
+
 def capture(options)
   repo, controller, output = options.values_at(:repo, :controller, :output)
   raise "--repo OWNER/REPO is required" if repo.to_s.empty?
@@ -493,7 +709,7 @@ def capture(options)
     raise "capture stability drift: GraphQL media type missing or inconsistent: #{graphql_media_types.uniq.inspect}"
   end
   manifest = {
-    "schema" => "monday.issue_lifecycle_manifest.v1",
+    "schema" => MANIFEST_SCHEMA,
     "repository" => repo,
     "captured_at" => Time.now.utc.iso8601(6),
     "controller" => controller,
@@ -513,21 +729,55 @@ def capture(options)
   puts "captured #{repo} at #{default_branch_sha} -> #{output}"
 end
 
+def verify(options)
+  repo, controller, bundle = options.values_at(:repo, :controller, :bundle)
+  raise "--repo OWNER/REPO is required" if repo.to_s.empty?
+  raise "--controller NAME is required" if controller.to_s.strip.empty?
+  raise "--bundle DIR is required" if bundle.to_s.empty?
+
+  graph, manifest = verify_bundle(bundle, repo, controller)
+  if options[:live]
+    live_graph, live_counts, live_branch, live_branch_sha, live_pages = capture_graph(repo)
+    raise "live verification drift: Issue/PR graph changed" unless Canonical.value(live_graph) == Canonical.value(graph)
+    raise "live verification drift: counts changed" unless live_counts == manifest["counts"]
+    unless live_branch == manifest["default_branch"] && live_branch_sha == manifest["default_branch_sha"]
+      raise "live verification drift: default branch changed"
+    end
+    unless Canonical.value(live_pages) == Canonical.value(manifest["pages"])
+      raise "live verification drift: page/header inventory changed"
+    end
+  end
+  suffix = options[:live] ? " with live readback" : ""
+  puts "verified #{repo} at #{manifest.fetch("default_branch_sha")}#{suffix} <- #{bundle}"
+end
+
 command = ARGV.shift
 options = {}
 parser = OptionParser.new do |flags|
-  flags.banner = "Usage: issue-lifecycle-preflight.rb capture --repo OWNER/REPO --controller NAME --output DIR"
+  flags.banner = "Usage: issue-lifecycle-preflight.rb (capture|verify) --repo OWNER/REPO --controller NAME (--output|--bundle) DIR"
   flags.on("--repo OWNER/REPO", "Repository to read") { |value| options[:repo] = value }
   flags.on("--controller NAME", "Named evidence controller") { |value| options[:controller] = value }
   flags.on("--output DIR", "New evidence bundle directory") { |value| options[:output] = value }
+  flags.on("--bundle DIR", "Existing evidence bundle directory") { |value| options[:bundle] = value }
+  flags.on("--live", "Independently compare the bundle with live GitHub reads") { options[:live] = true }
 end
 
 begin
   parser.parse!
   raise "unexpected arguments: #{ARGV.join(" ")}" unless ARGV.empty?
-  raise "unsupported operation #{command.inspect}; expected capture" unless command == "capture"
+  case command
+  when "capture"
+    raise "--bundle is only valid for verify" if options[:bundle]
+    raise "--live is only valid for verify" if options[:live]
 
-  capture(options)
+    capture(options)
+  when "verify"
+    raise "--output is only valid for capture" if options[:output]
+
+    verify(options)
+  else
+    raise "unsupported operation #{command.inspect}; expected capture or verify"
+  end
 rescue StandardError => error
   warn "ERROR issue lifecycle preflight: #{error.message}"
   exit 2
