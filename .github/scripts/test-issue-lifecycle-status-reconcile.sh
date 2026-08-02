@@ -62,10 +62,13 @@ sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 sha_c=cccccccccccccccccccccccccccccccccccccccc
 sha_d=dddddddddddddddddddddddddddddddddddddddd
+sha_shared=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 
 case "$path" in
   repos/example/repo/pulls\?state=open\&per_page=100)
-    if [[ "$FIXTURE_MODE" == mapping ]]; then
+    if [[ "$FIXTURE_MODE" == shared ]]; then
+      echo "[[{\"number\":201,\"head\":{\"sha\":\"$sha_shared\"}},{\"number\":202,\"head\":{\"sha\":\"$sha_shared\"}}]]"
+    elif [[ "$FIXTURE_MODE" == mapping ]]; then
       echo "[[{\"number\":101,\"head\":{\"sha\":\"$sha_a\"}}],[{\"number\":102,\"head\":{\"sha\":\"$sha_b\"}},{\"number\":103,\"head\":{\"sha\":\"$sha_c\"}}]]"
     else
       echo "[[{\"number\":101,\"head\":{\"sha\":\"$sha_d\"}}]]"
@@ -75,7 +78,9 @@ case "$path" in
     echo '{"default_branch":"main"}'
     ;;
   repos/example/repo/issues\?state=open\&per_page=100\&page=1)
-    if [[ "$FIXTURE_MODE" == mapping ]]; then
+    if [[ "$FIXTURE_MODE" == shared ]]; then
+      echo '[{"number":10,"body":"## Parent\n\nNone\n\n## Blocked by\n\nNone\n","labels":[{"name":"ready-for-agent"}],"assignees":[{"login":"agent"}],"issue_dependencies_summary":{"total_blocked_by":0}},{"number":201,"pull_request":{}},{"number":202,"pull_request":{}}]'
+    elif [[ "$FIXTURE_MODE" == mapping ]]; then
       echo '[{"number":10,"body":"## Parent\n\nNone\n\n## Blocked by\n\nNone\n","labels":[{"name":"enhancement"},{"name":"ready-for-agent"}],"assignees":[{"login":"agent"}],"issue_dependencies_summary":{"total_blocked_by":0}},{"number":20,"body":"## Parent\n\nNone\n\n## Blocked by\n\nNone\n","labels":[{"name":"ready-for-agent"}],"assignees":[{"login":"agent"}],"issue_dependencies_summary":{"total_blocked_by":0}},{"number":30,"body":"## Parent\n\nNone\n\n## Blocked by\n\nNone\n","labels":[{"name":"enhancement"},{"name":"ready-for-agent"}],"assignees":[{"login":"agent"}],"issue_dependencies_summary":{"total_blocked_by":0}},{"number":101,"pull_request":{}},{"number":102,"pull_request":{}},{"number":103,"pull_request":{}}]'
     elif [[ "$(command cat "$TEST_METADATA_STATE")" == valid ]]; then
       echo '[{"number":10,"body":"## Parent\n\nNone\n\n## Blocked by\n\nNone\n","labels":[{"name":"enhancement"},{"name":"ready-for-agent"}],"assignees":[{"login":"agent"}],"issue_dependencies_summary":{"total_blocked_by":0}},{"number":101,"pull_request":{}}]'
@@ -86,6 +91,13 @@ case "$path" in
   repos/example/repo/pulls/101)
     echo '{"number":101,"base":{"ref":"main"},"title":"Fixture PR 101","body":"## Issue relationship\n\nRefs #10\n\n## Focused validation\n\nFixture proof.\n","commits":1}'
     ;;
+  repos/example/repo/pulls/201)
+    echo '{"number":201,"base":{"ref":"main"},"title":"Fixture PR 201","body":"## Issue relationship\n\nRefs #10\n\n## Focused validation\n\nFixture proof.\n","commits":1}'
+    ;;
+  repos/example/repo/pulls/202)
+    echo 'fixture auditor error' >&2
+    exit 1
+    ;;
   repos/example/repo/pulls/102)
     echo '{"number":102,"base":{"ref":"main"},"title":"Fixture PR 102","body":"## Issue relationship\n\nRefs #20\n\n## Focused validation\n\nFixture proof.\n","commits":1}'
     ;;
@@ -93,7 +105,7 @@ case "$path" in
     echo 'fixture auditor error' >&2
     exit 1
     ;;
-  repos/example/repo/pulls/101/commits\?per_page=100\&page=1|repos/example/repo/pulls/102/commits\?per_page=100\&page=1)
+  repos/example/repo/pulls/101/commits\?per_page=100\&page=1|repos/example/repo/pulls/102/commits\?per_page=100\&page=1|repos/example/repo/pulls/201/commits\?per_page=100\&page=1)
     echo '[{"sha":"safe","commit":{"message":"Safe commit"}}]'
     ;;
   repos/example/repo/commits/*/statuses\?per_page=100)
@@ -180,17 +192,45 @@ grep -Fq "| #102 | \`bbbbbbbbbbbb\` | failure | published |" "$tmp_dir/mapping-s
 grep -Fq "| #103 | \`cccccccccccc\` | error | published |" "$tmp_dir/mapping-summary.md"
 
 : > "$api_log"
+run_reconciler shared "$tmp_dir/shared.out" "$tmp_dir/shared-summary.md"
+if [[ "$RUN_EXIT" -ne 2 ]]; then
+  echo "expected shared-head run to exit 2, got $RUN_EXIT" >&2
+  command cat "$tmp_dir/shared.out" >&2
+  exit 1
+fi
+grep -Fq "Issue #10: expected exactly one category label" "$tmp_dir/shared.out"
+grep -Fq "ERROR issue lifecycle audit" "$tmp_dir/shared.out"
+if grep -q $'^GET\trepos/example/repo/commits/' "$api_log"; then
+  echo "status lookup GET was issued before publishing" >&2
+  exit 1
+fi
+test "$(grep -c $'^POST\trepos/example/repo/statuses/' "$api_log")" -eq 1
+ruby -rjson - "$api_log" <<'RUBY'
+posts = File.readlines(ARGV.fetch(0), chomp: true).map do |line|
+  method, path, _paginate, _slurp, payload = line.split("\t", 5)
+  [path.split("/").last, JSON.parse(payload)] if method == "POST"
+end.compact
+abort "expected one aggregate status, got #{posts.inspect}" unless posts.length == 1
+sha, payload = posts.fetch(0)
+abort "unexpected aggregate head #{sha.inspect}" unless sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+abort "shared-head status was not worst-case error: #{payload.inspect}" unless payload == {
+  "context" => "Issue Lifecycle", "state" => "error", "description" => "Issue lifecycle audit errored"
+}
+RUBY
+
+: > "$api_log"
 run_reconciler dedupe "$tmp_dir/dedupe.out" "$tmp_dir/dedupe-summary.md"
 if [[ "$RUN_EXIT" -ne 0 ]]; then
   echo "expected dedupe run to exit 0, got $RUN_EXIT" >&2
   command cat "$tmp_dir/dedupe.out" >&2
   exit 1
 fi
-if grep -q $'^POST\t' "$api_log"; then
-  echo "duplicate status was published" >&2
+test "$(grep -c $'^POST\trepos/example/repo/statuses/' "$api_log")" -eq 1
+if grep -q $'^GET\trepos/example/repo/commits/' "$api_log"; then
+  echo "status lookup GET was issued before publishing" >&2
   exit 1
 fi
-grep -Fq "| #101 | \`dddddddddddd\` | success | unchanged |" "$tmp_dir/dedupe-summary.md"
+grep -Fq "| #101 | \`dddddddddddd\` | success | published |" "$tmp_dir/dedupe-summary.md"
 
 : > "$api_log"
 printf 'invalid' > "$metadata_state"

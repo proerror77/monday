@@ -26,12 +26,6 @@ class GitHubStatuses
     paginate("repos/#{@repo}/pulls?state=open&per_page=100")
   end
 
-  def latest_status(sha, context)
-    paginate("repos/#{@repo}/commits/#{sha}/statuses?per_page=100").find do |status|
-      status["context"] == context
-    end
-  end
-
   def create_status(sha, payload)
     run(
       "gh", "api", "--method", "POST", *headers,
@@ -109,21 +103,28 @@ begin
 
   github = GitHubStatuses.new(repo)
   rows = []
+  audits_by_sha = {}
   result = 0
+  # ponytail: #480 intentionally keeps a per-PR merged-auditor call; add a shared snapshot only after measured API/runtime limits justify the protocol change.
   github.open_pull_requests.each do |pull_request|
     number = Integer(pull_request.fetch("number"))
     sha = pull_request.dig("head", "sha").to_s
     raise "PR ##{number} has invalid head SHA #{sha.inspect}" unless sha.match?(/\A[0-9a-f]{40}\z/i)
 
     audit_exit = audit(repo, number, options[:summary])
-    state, description = STATUS_BY_EXIT.fetch(audit_exit)
-    payload = { "context" => CONTEXT, "state" => state, "description" => description }
-    latest = github.latest_status(sha, CONTEXT)
-    duplicate = latest && payload.all? { |key, value| latest[key] == value }
-    github.create_status(sha, payload) unless duplicate
-    rows << [number, sha, state, duplicate ? "unchanged" : "published"]
+    state = STATUS_BY_EXIT.fetch(audit_exit).first
+    aggregate = audits_by_sha[sha] ||= { exit: 0 }
+    aggregate[:exit] = [aggregate[:exit], audit_exit].max
+    rows << [number, sha, state, "pending"]
     result = [result, audit_exit].max
   end
+
+  audits_by_sha.each do |sha, aggregate|
+    state, description = STATUS_BY_EXIT.fetch(aggregate[:exit])
+    payload = { "context" => CONTEXT, "state" => state, "description" => description }
+    github.create_status(sha, payload)
+  end
+  rows.each { |row| row[3] = "published" }
 
   append_summary(options[:summary], rows)
   exit result
