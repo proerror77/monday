@@ -217,7 +217,7 @@ set_json_field() {
     File.binwrite(path, JSON.generate(object) + "\n")
   ' "$path" "$key" "$value"
 }
-
+remove_link_provenance() { ruby -rjson -e 'path = ARGV.fetch(0); object = JSON.parse(File.binread(path)); object.fetch("pages").each { |page| page.delete("link") }; File.binwrite(path, JSON.generate(object) + "\n")' "$1"; }
 verify_fails() {
   local name="$1" bundle="$2" expected="$3"
   shift 3
@@ -303,11 +303,11 @@ RUBY
 local_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
 
 copy_bundle verify-v1-pages
-ruby -rjson -e 'path = ARGV.fetch(0); object = JSON.parse(File.binread(path)); object.fetch("pages").each { |page| page.delete("link") }; File.binwrite(path, JSON.generate(object) + "\n")' "$tmp_dir/verify-v1-pages/manifest.json"
+remove_link_provenance "$tmp_dir/verify-v1-pages/manifest.json"
 rehash "$tmp_dir/verify-v1-pages" manifest.json
 verify "$tmp_dir/verify-v1-pages"
 cp -R "$tmp_dir/bundle-canonical-link" "$tmp_dir/verify-v1-multipage"
-ruby -rjson -e 'path = ARGV.fetch(0); object = JSON.parse(File.binread(path)); object.fetch("pages").each { |page| page.delete("link") }; File.binwrite(path, JSON.generate(object) + "\n")' "$tmp_dir/verify-v1-multipage/manifest.json"
+remove_link_provenance "$tmp_dir/verify-v1-multipage/manifest.json"
 rehash "$tmp_dir/verify-v1-multipage" manifest.json
 verify_fails v1-multipage "$tmp_dir/verify-v1-multipage" "legacy manifest cannot verify multi-page REST provenance"
 
