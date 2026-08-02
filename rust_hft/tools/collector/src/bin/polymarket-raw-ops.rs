@@ -14,7 +14,9 @@ use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
 };
 use hft_collector::polymarket_research_normalize::PolymarketEvidenceConfig;
-use hft_collector::polymarket_upload::{run_upload, UploadConfig};
+use hft_collector::polymarket_upload::{
+    run_upload_async, UploadConfig, DEFAULT_MAX_CONCURRENT_UPLOADS,
+};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -104,6 +106,8 @@ enum Command {
         zstd_timeout: Option<u64>,
         #[arg(long)]
         oss_timeout: Option<u64>,
+        #[arg(long)]
+        upload_concurrency: Option<usize>,
     },
     /// Compare a bounded legacy reference lane with an isolated Rust shadow.
     VerifyShadowParity {
@@ -267,9 +271,12 @@ async fn run(cli: Cli) -> Result<()> {
             profile,
             zstd_timeout,
             oss_timeout,
+            upload_concurrency,
         } => {
             let zstd_timeout = env_u64(zstd_timeout, "ZSTD_TIMEOUT_SECONDS", 300)?;
             let oss_timeout = env_u64(oss_timeout, "OSS_COPY_TIMEOUT_SECONDS", 300)?;
+            let max_concurrent_uploads =
+                upload_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS);
             let config = UploadConfig {
                 spool_dir,
                 dataset,
@@ -285,8 +292,12 @@ async fn run(cli: Cli) -> Result<()> {
                 profile: env_or(profile, "ALIYUN_PROFILE", "ecs-role"),
                 zstd_timeout: Duration::from_secs(zstd_timeout),
                 oss_timeout: Duration::from_secs(oss_timeout),
+                max_concurrent_uploads,
             };
-            println!("{}", serde_json::to_string(&run_upload(&config)?)?);
+            println!(
+                "{}",
+                serde_json::to_string(&run_upload_async(config).await?)?
+            );
             Ok(())
         }
         Command::VerifyShadowParity {

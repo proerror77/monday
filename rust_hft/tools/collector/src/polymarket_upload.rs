@@ -15,7 +15,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_complete";
 pub(crate) const TRADE_COMPLETION_BASIS: &str =
@@ -72,6 +74,8 @@ const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(600);
 // minutes on this endpoint (2026-08-02 production uploads), so each artifact
 // gets a bounded retry budget aligned with the gate script's 30x20s curve.
 const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 30;
+pub const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 2;
+const MAX_CONCURRENT_UPLOADS: usize = 4;
 #[cfg(not(test))]
 const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(20);
 #[cfg(test)]
@@ -89,6 +93,7 @@ pub struct UploadConfig {
     pub profile: String,
     pub zstd_timeout: Duration,
     pub oss_timeout: Duration,
+    pub max_concurrent_uploads: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -114,6 +119,9 @@ impl UploadConfig {
             || self.oss_timeout.is_zero()
         {
             bail!("upload destination and timeouts must be non-empty");
+        }
+        if !(1..=MAX_CONCURRENT_UPLOADS).contains(&self.max_concurrent_uploads) {
+            bail!("max concurrent uploads must be between 1 and {MAX_CONCURRENT_UPLOADS}");
         }
         Ok(())
     }
@@ -2214,6 +2222,20 @@ fn canonical_complete_manifest(manifest: &Value) -> bool {
         .all(|field| manifest["quality"][field].as_u64().is_some())
 }
 
+fn ensure_upload_staging_root(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("upload staging root must be a plain directory"),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
     let source_scan = scan_tape_with_identity(
         source,
@@ -2231,14 +2253,7 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
         .parent()
         .ok_or_else(|| anyhow!("source has no parent"))?;
     let staging_root = spool_dir.join(".upload-staging");
-    match fs::symlink_metadata(&staging_root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&staging_root)?;
-        }
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => bail!("upload staging root must be a plain directory"),
-        Err(error) => return Err(error.into()),
-    }
+    ensure_upload_staging_root(&staging_root)?;
     let staging = ExclusiveTempDir::create(&staging_root, "session")?;
     let chunks = split_tape_by_utc_hour(source, staging.path())?;
     ensure_identity(source, source_scan.identity)?;
@@ -2280,49 +2295,109 @@ pub fn run_upload(config: &UploadConfig) -> Result<UploadSummary> {
     upload_pending(config)
 }
 
-fn upload_pending_with<F>(config: &UploadConfig, mut archive: F) -> Result<UploadSummary>
+pub async fn run_upload_async(config: UploadConfig) -> Result<UploadSummary> {
+    upload_pending_async_with(&config, archive_source).await
+}
+
+async fn upload_pending_async_with<F>(config: &UploadConfig, archive: F) -> Result<UploadSummary>
 where
-    F: FnMut(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>>,
+    F: Fn(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>> + Send + Sync + 'static,
 {
     config.validate()?;
     ensure_canonical_directory(&config.spool_dir)?;
-    let status_path = config.spool_dir.join("upload-status.json");
-    let mut status = read_status(&status_path)?;
+    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
+    let archive = Arc::new(archive);
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
+    let sources = discover_rotated_tapes(&config.spool_dir)?;
+    let mut tasks = Vec::with_capacity(sources.len());
+    for source in sources {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let archive = archive.clone();
+        let config = config.clone();
+        let task_source = source.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = archive(&task_source, &config);
+            drop(permit);
+            result
+        });
+        tasks.push((source, task));
+    }
+
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
-    for source in discover_rotated_tapes(&config.spool_dir)? {
-        match archive(&source, config) {
-            Ok(uploaded) if !uploaded.is_empty() => {
-                uploaded_segments += uploaded.len();
-                canonical_uploaded_segments += uploaded
-                    .iter()
-                    .filter(|segment| segment.canonical_complete)
-                    .count();
-                status.insert("last_success_at".to_owned(), json!(utc_now()));
-                status.insert(
-                    "last_uploaded_object".to_owned(),
-                    json!(&uploaded.last().expect("non-empty upload result").object),
-                );
-            }
-            Ok(_) => failures.push(json!({
+    for (source, task) in tasks {
+        match task.await {
+            Ok(result) => record_upload_result(
+                &source,
+                result,
+                &mut status,
+                &mut failures,
+                &mut uploaded_segments,
+                &mut canonical_uploaded_segments,
+            ),
+            Err(error) => failures.push(json!({
                 "source": source.file_name().and_then(|name| name.to_str()),
-                "error": "closed tape produced no upload artifacts",
+                "error": format!("async upload task failed: {error}"),
             })),
-            Err(error) => {
-                eprintln!(
-                    "Polymarket tape upload failed for {}: {error}",
-                    source.display()
-                );
-                failures.push(json!({
-                    "source": source.file_name().and_then(|name| name.to_str()),
-                    "error": error.to_string(),
-                }));
-            }
         }
     }
+    finalize_upload_status(
+        &config.spool_dir,
+        status,
+        failures,
+        uploaded_segments,
+        canonical_uploaded_segments,
+    )
+}
+
+fn record_upload_result(
+    source: &Path,
+    result: Result<Vec<UploadedSegment>>,
+    status: &mut Map<String, Value>,
+    failures: &mut Vec<Value>,
+    uploaded_segments: &mut usize,
+    canonical_uploaded_segments: &mut usize,
+) {
+    match result {
+        Ok(uploaded) if !uploaded.is_empty() => {
+            *uploaded_segments += uploaded.len();
+            *canonical_uploaded_segments += uploaded
+                .iter()
+                .filter(|segment| segment.canonical_complete)
+                .count();
+            status.insert("last_success_at".to_owned(), json!(utc_now()));
+            status.insert(
+                "last_uploaded_object".to_owned(),
+                json!(&uploaded.last().expect("non-empty upload result").object),
+            );
+        }
+        Ok(_) => failures.push(json!({
+            "source": source.file_name().and_then(|name| name.to_str()),
+            "error": "closed tape produced no upload artifacts",
+        })),
+        Err(error) => {
+            eprintln!(
+                "Polymarket tape upload failed for {}: {error}",
+                source.display()
+            );
+            failures.push(json!({
+                "source": source.file_name().and_then(|name| name.to_str()),
+                "error": error.to_string(),
+            }));
+        }
+    }
+}
+
+fn finalize_upload_status(
+    spool_dir: &Path,
+    mut status: Map<String, Value>,
+    failures: Vec<Value>,
+    uploaded_segments: usize,
+    canonical_uploaded_segments: usize,
+) -> Result<UploadSummary> {
     let now = utc_now();
-    let pending = discover_rotated_tapes(&config.spool_dir)?.len();
+    let pending = discover_rotated_tapes(spool_dir)?.len();
     status.insert("updated_at".to_owned(), json!(now));
     status.insert("uploaded_segments".to_owned(), json!(uploaded_segments));
     status.insert(
@@ -2347,7 +2422,10 @@ where
             .cloned()
             .unwrap_or(Value::Null),
     );
-    atomic_json(&status_path, &Value::Object(status))?;
+    atomic_json(
+        &spool_dir.join("upload-status.json"),
+        &Value::Object(status),
+    )?;
     if failures.is_empty() {
         Ok(UploadSummary {
             uploaded_segments,
@@ -2359,6 +2437,35 @@ where
             failures.len()
         )
     }
+}
+
+fn upload_pending_with<F>(config: &UploadConfig, mut archive: F) -> Result<UploadSummary>
+where
+    F: FnMut(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>>,
+{
+    config.validate()?;
+    ensure_canonical_directory(&config.spool_dir)?;
+    let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
+    let mut failures = Vec::new();
+    let mut uploaded_segments = 0_usize;
+    let mut canonical_uploaded_segments = 0_usize;
+    for source in discover_rotated_tapes(&config.spool_dir)? {
+        record_upload_result(
+            &source,
+            archive(&source, config),
+            &mut status,
+            &mut failures,
+            &mut uploaded_segments,
+            &mut canonical_uploaded_segments,
+        );
+    }
+    finalize_upload_status(
+        &config.spool_dir,
+        status,
+        failures,
+        uploaded_segments,
+        canonical_uploaded_segments,
+    )
 }
 
 #[cfg(test)]
@@ -2578,7 +2685,39 @@ mod tests {
             profile: "profile".to_owned(),
             zstd_timeout: Duration::from_secs(30),
             oss_timeout: Duration::from_secs(30),
+            max_concurrent_uploads: 2,
         }
+    }
+
+    #[test]
+    fn rejects_out_of_range_upload_concurrency() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.max_concurrent_uploads = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max concurrent uploads must be between 1 and 4"));
+        config.max_concurrent_uploads = MAX_CONCURRENT_UPLOADS + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max concurrent uploads must be between 1 and 4"));
+    }
+
+    #[test]
+    fn staging_root_creation_is_idempotent_under_concurrency() {
+        let root = TestDir::new();
+        let staging_root = root.path().join(".upload-staging");
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| ensure_upload_staging_root(&staging_root));
+            let second = scope.spawn(|| ensure_upload_staging_root(&staging_root));
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+        assert!(staging_root.is_dir());
     }
 
     #[test]
@@ -4586,6 +4725,45 @@ mod tests {
             status["failed_segments"][0]["source"],
             first.file_name().unwrap().to_str().unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_uploads_closed_sources_concurrently_with_bound() {
+        let root = TestDir::new();
+        for name in [
+            "market-updates.20260715T010000.ndjson",
+            "market-updates.20260715T020000.ndjson",
+        ] {
+            fs::write(root.path().join(name), b"closed").unwrap();
+        }
+        let config = config(root.path());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let archive = {
+            let active = active.clone();
+            let max_active = max_active.clone();
+            move |source: &Path, _config: &UploadConfig| -> Result<Vec<UploadedSegment>> {
+                let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(25));
+                fs::remove_file(source)?;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![UploadedSegment {
+                    object: format!("oss://bucket/{}", source.display()),
+                    canonical_complete: true,
+                }])
+            }
+        };
+
+        let summary = upload_pending_async_with(&config, archive).await.unwrap();
+
+        assert_eq!(summary.uploaded_segments, 2);
+        assert_eq!(summary.canonical_uploaded_segments, 2);
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["pending_segments"], 0);
     }
 
     #[test]
