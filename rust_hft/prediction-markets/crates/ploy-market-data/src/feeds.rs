@@ -1176,12 +1176,13 @@ fn market_update_from_clob_book(
     let pending = std::mem::take(&mut state.pending);
     state.replace(book)?;
     // Replay deltas buffered since (re)subscription in arrival order, keeping
-    // only those newer than the snapshot, and rebuild the timestamp watermark
+    // those at or newer than the snapshot millisecond (the live path likewise
+    // only skips strictly older batches), and rebuild the timestamp watermark
     // from what was actually applied.
     let mut watermark = book.timestamp;
     let mut last_replayed = None;
     for (timestamp, entry) in &pending {
-        if *timestamp <= book.timestamp {
+        if *timestamp < book.timestamp {
             continue;
         }
         state.apply(entry, *timestamp);
@@ -3204,6 +3205,63 @@ mod tests {
                 ..
             }] if *bid == dec!(0.50) && *ask == dec!(0.60)
         ));
+        assert!(!books["7"].bids.contains_key(&dec!(0.70)));
+        assert!(books["7"].pending.is_empty());
+    }
+
+    #[test]
+    fn clob_replay_applies_same_millisecond_deltas_like_the_live_path() {
+        let stale_change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600050",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.70", "size": "1", "side": "BUY",
+                "hash": null, "best_bid": "0.70", "best_ask": "0.75"
+            }]
+        }))
+        .expect("valid older pre-snapshot price change");
+        let same_millisecond = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.55", "size": "3", "side": "BUY",
+                "hash": null, "best_bid": "0.55", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid same-millisecond pre-snapshot price change");
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+
+        market_updates_from_price_change(&stale_change, &mut books, &mut timestamps)
+            .expect("older delta is buffered");
+        market_updates_from_price_change(&same_millisecond, &mut books, &mut timestamps)
+            .expect("same-millisecond delta is buffered");
+
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let (updates, watermark) =
+            market_update_from_clob_book(&book, books.get_mut("7").expect("syncing token state"))
+                .expect("snapshot applies");
+        assert_eq!(watermark, 1_712_205_600_100);
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::Quote {
+                    bid: Some(bid),
+                    ask: Some(ask),
+                    ..
+                }] if *bid == dec!(0.55) && *ask == dec!(0.60)
+            ),
+            "a delta sharing the snapshot millisecond must replay like the live path"
+        );
+        assert!(books["7"].bids.contains_key(&dec!(0.55)));
         assert!(!books["7"].bids.contains_key(&dec!(0.70)));
         assert!(books["7"].pending.is_empty());
     }
