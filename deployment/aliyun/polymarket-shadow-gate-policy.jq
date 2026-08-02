@@ -318,8 +318,14 @@ and (if .comparison_mode == "legacy_overlap" then
   and (.metrics.legacy_settlement_count | positive_integer)
 else
   .metrics.legacy_trade_count == 0
-  and .metrics.legacy_metadata_count == 0
   and .metrics.legacy_settlement_count == 0
+  and (
+    .metrics.legacy_metadata_count == 0
+    or (
+      .baseline_mode == "rust_bootstrap"
+      and (.metrics.legacy_metadata_count | positive_integer)
+    )
+  )
 end)
 and .metrics.settlement_shared_values_match == true
 and (.metrics.settlement_shared_value_mismatch_ids | type == "array" and length == 0)

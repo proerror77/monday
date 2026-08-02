@@ -1026,6 +1026,9 @@ snapshot_legacy() {
   elif [[ $baseline_mode == rust_bootstrap ]]; then
     mode=$(stat -c %a -- "$ACTIVE_BINARY")
     install -m "$mode" "$ACTIVE_BINARY" "$rollback_dir/bin/polymarket-raw-ops"
+    printf '%s  %s\n' "$baseline_release_sha" "$rollback_dir/bin/polymarket-raw-ops" \
+      | sha256sum --check --strict >/dev/null \
+      || die 'snapshotted Rust bootstrap binary digest changed before rollback manifest'
     jq --arg path "$baseline_release_path" --arg sha "$baseline_release_sha" --arg mode "$mode" \
       '.active_direct={path:$path,sha256:$sha,mode:$mode}' "$state_json" >"$state_json.tmp"
     mv "$state_json.tmp" "$state_json"
@@ -1044,6 +1047,7 @@ snapshot_legacy() {
   done
   (
     cd "$rollback_dir"
+    shopt -s nullglob
     sha256sum state.json systemd/* bin/* config/* control/* >manifest.sha256
   )
   sync -f "$rollback_dir"
@@ -1055,7 +1059,7 @@ restore_legacy() (
   local rollback_dir=$evidence_dir/rollback active_target actual_manifest_sha asset mode
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts rollback_mode
   local rollback_sha temporary_link previous_health_sha current_health_sha
-  local bootstrap_path bootstrap_sha bootstrap_mode bootstrap_restored
+  local bootstrap_path bootstrap_sha bootstrap_mode bootstrap_restored bootstrap_active_mode
   local control_dir_present control_files=
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
   secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
@@ -1166,6 +1170,13 @@ restore_legacy() (
       rm -f "$ACTIVE_BINARY"
     elif [[ -e $ACTIVE_BINARY ]]; then
       secure_regular_file "$ACTIVE_BINARY"
+      [[ -x $ACTIVE_BINARY ]] \
+        || die 'active direct Rust binary is not executable'
+      bootstrap_active_mode=$(stat -c %a -- "$ACTIVE_BINARY")
+      [[ $bootstrap_active_mode =~ ^[0-7]{3,4}$ ]] \
+        || die 'active direct Rust binary mode is invalid'
+      (( 8#$bootstrap_active_mode == 8#$bootstrap_mode )) \
+        || die 'active direct Rust binary mode differs from rollback snapshot'
       if printf '%s  %s\n' "$bootstrap_sha" "$ACTIVE_BINARY" \
         | sha256sum --check --strict >/dev/null; then
         bootstrap_restored=true
@@ -1412,6 +1423,7 @@ if [[ $mode == rollback ]]; then
   rollback_saved_path=
   rollback_saved_sha=
   rollback_saved_mode=
+  rollback_active_mode=
   if [[ $rollback_mode == rust_release ]]; then
     rollback_saved_path=$(jq -er '.active_symlink.target' "$rollback_dir/state.json")
     rollback_saved_sha=$(jq -er '.active_symlink.sha256' "$rollback_dir/state.json")
@@ -1443,6 +1455,13 @@ if [[ $mode == rollback ]]; then
     rollback_active_path=$(readlink -f -- "$ACTIVE_BINARY")
   elif [[ $rollback_mode == rust_bootstrap && -f $ACTIVE_BINARY ]]; then
     secure_regular_file "$ACTIVE_BINARY"
+    [[ -x $ACTIVE_BINARY ]] \
+      || die 'active direct Rust binary is not executable'
+    rollback_active_mode=$(stat -c %a -- "$ACTIVE_BINARY")
+    [[ $rollback_active_mode =~ ^[0-7]{3,4}$ ]] \
+      || die 'active direct Rust binary mode is invalid'
+    (( 8#$rollback_active_mode == 8#$rollback_saved_mode )) \
+      || die 'active direct Rust binary mode differs from the saved bootstrap baseline'
     printf '%s  %s\n' "$rollback_saved_sha" "$ACTIVE_BINARY" \
       | sha256sum --check --strict >/dev/null \
       || die 'active direct Rust binary differs from the saved bootstrap baseline'
