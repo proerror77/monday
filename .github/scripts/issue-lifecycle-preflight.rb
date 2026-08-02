@@ -13,8 +13,13 @@ require "uri"
 EVIDENCE_EXCLUSIONS = ["GitHub metadata mutation", "branch protection and required checks", "deployment and runtime resources", "source code and Agent-led research PRD scope"].freeze
 PREFLIGHT_SCHEMA = "monday.issue_lifecycle_preflight.v1"
 MANIFEST_SCHEMA = "monday.issue_lifecycle_manifest.v1"
+FORWARD_PLAN_SCHEMA = "monday.issue_lifecycle_forward_plan.v1"
+REVERSE_PLAN_SCHEMA = "monday.issue_lifecycle_reverse_plan.v1"
+RECEIPT_SCHEMA = "monday.issue_lifecycle_receipt.v1"
 BUNDLE_FILES = %w[manifest.json manifest.json.sha256 preflight.json preflight.json.sha256].freeze
 PAGE_KEYS = %w[api_version body_sha256 etag last_modified link media_type phase protocol request status].freeze
+PLAN_STATE_KEYS = %w[assignees blocked_by body labels parent state].freeze
+DERIVED_ISSUE_METADATA_KEYS = %w[assignee assignees body closed_at closed_by comments issue_dependencies_summary labels parent_issue_url state state_reason sub_issues_summary updated_at].freeze
 
 module Canonical
   PRESERVE_ARRAY_ORDER = %w[comments commits events].freeze
@@ -491,26 +496,31 @@ def write_bundle(output, graph, manifest)
   end
 end
 
-def read_canonical_json(path)
-  contents = File.binread(path)
+def parse_canonical_json(contents, name)
   object = JSON.parse(contents)
-  raise "#{File.basename(path)} is not canonical JSON" unless contents.b == Canonical.dump(object).b
+  raise "#{name} is not canonical JSON" unless contents.b == Canonical.dump(object).b
 
   object
 rescue JSON::ParserError => error
-  raise "#{File.basename(path)} is invalid JSON: #{error.message}"
+  raise "#{name} is invalid JSON: #{error.message}"
+end
+
+def read_canonical_document(path)
+  contents = File.binread(path)
+  [parse_canonical_json(contents, File.basename(path)), contents, Digest::SHA256.hexdigest(contents)]
 end
 
 def verify_sidecar(bundle, filename)
   sidecar = "#{filename}.sha256"
-  contents = File.binread(File.join(bundle, sidecar))
-  match = contents.match(/\A([0-9a-f]{64})  #{Regexp.escape(filename)}\n\z/)
+  sidecar_contents = File.binread(File.join(bundle, sidecar))
+  match = sidecar_contents.match(/\A([0-9a-f]{64})  #{Regexp.escape(filename)}\n\z/)
   raise "#{sidecar} is invalid" unless match
 
-  actual = Digest::SHA256.file(File.join(bundle, filename)).hexdigest
+  contents = File.binread(File.join(bundle, filename))
+  actual = Digest::SHA256.hexdigest(contents)
   raise "#{filename} digest mismatch" unless actual == match[1]
 
-  actual
+  [contents, actual]
 end
 
 def collection_scope(request, repo)
@@ -795,10 +805,10 @@ def verify_bundle(bundle, repo, controller)
     raise "bundle entry #{filename} is not a regular file" unless File.file?(path) && !File.symlink?(path)
   end
 
-  preflight_sha = verify_sidecar(bundle, "preflight.json")
-  verify_sidecar(bundle, "manifest.json")
-  graph = read_canonical_json(File.join(bundle, "preflight.json"))
-  manifest = read_canonical_json(File.join(bundle, "manifest.json"))
+  preflight_contents, preflight_sha = verify_sidecar(bundle, "preflight.json")
+  manifest_contents, manifest_sha = verify_sidecar(bundle, "manifest.json")
+  graph = parse_canonical_json(preflight_contents, "preflight.json")
+  manifest = parse_canonical_json(manifest_contents, "manifest.json")
   expected_manifest_keys = %w[api captured_at controller counts default_branch default_branch_sha exclusions pages preflight repository schema target]
   unless manifest.is_a?(Hash) && manifest.keys.sort == expected_manifest_keys && manifest["schema"] == MANIFEST_SCHEMA
     raise "manifest schema is invalid"
@@ -838,9 +848,344 @@ def verify_bundle(bundle, repo, controller)
          manifest["preflight"] == { "file" => "preflight.json", "sha256" => preflight_sha }
     raise "manifest preflight identity is invalid"
   end
-  [graph, manifest, link_provenance]
+  [graph, manifest, link_provenance, { "manifest_sha256" => manifest_sha, "preflight_sha256" => preflight_sha }]
 rescue Errno::EACCES, Errno::ENOENT => error
   raise "bundle read failed: #{error.message}"
+end
+
+def issue_plan_state(item)
+  metadata = item.fetch("issue")
+  relationships = item.fetch("relationships")
+  Canonical.value(
+    "assignees" => metadata.fetch("assignees").map { |assignee| assignee.fetch("login") },
+    "blocked_by" => relationships.fetch("blocked_by").map { |reference| reference.fetch("number") },
+    "body" => metadata["body"],
+    "labels" => metadata.fetch("labels").map { |label| label.fetch("name") },
+    "parent" => relationships["parent"] && relationships.dig("parent", "number"),
+    "state" => { "reason" => metadata["state_reason"], "value" => metadata.fetch("state") }
+  )
+end
+
+def github_login?(login)
+  login.is_a?(String) && login.match?(/\A(?=.{1,39}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\z/)
+end
+
+def valid_utc_timestamp?(value)
+  value.is_a?(String) && value.end_with?("Z") && Time.iso8601(value).utc_offset.zero?
+rescue ArgumentError
+  false
+end
+
+def validate_plan_relationship_scope!(items, repo, prefix)
+  items.each do |number, item|
+    relationships = item.fetch("relationships")
+    references = [relationships["parent"], *relationships.fetch("sub_issues"),
+                  *relationships.fetch("blocked_by"), *relationships.fetch("blocking")].compact
+    unless references.all? { |reference| reference.dig("repository", "nameWithOwner") == repo }
+      raise "#{prefix} Issue ##{number} relationship scope is unsupported"
+    end
+  end
+end
+
+def validate_issue_metadata_derivations!(item, states, repo, prefix)
+  number = item.fetch("number")
+  metadata = item.fetch("issue")
+  relationships = item.fetch("relationships")
+  state = states.fetch(number).dig("state", "value")
+
+  if metadata.key?("assignee")
+    assignee = metadata["assignee"]
+    valid_assignee = assignee.nil? ? metadata.fetch("assignees").empty? :
+      assignee.is_a?(Hash) && metadata.fetch("assignees").any? { |entry| Canonical.value(entry) == Canonical.value(assignee) }
+    raise "#{prefix} Issue ##{number} assignee summary is inconsistent" unless valid_assignee
+  end
+
+  if metadata.key?("parent_issue_url")
+    parent = states.fetch(number)["parent"]
+    expected_parent_url = parent && "https://api.github.com/repos/#{repo}/issues/#{parent}"
+    raise "#{prefix} Issue ##{number} parent summary is inconsistent" unless metadata["parent_issue_url"] == expected_parent_url
+  end
+
+  if metadata.key?("sub_issues_summary")
+    sub_issues = relationships.fetch("sub_issues").map { |reference| reference.fetch("number") }
+    completed = sub_issues.count { |related| states.fetch(related).dig("state", "value") == "closed" }
+    expected = {
+      "completed" => completed,
+      "percent_completed" => sub_issues.empty? ? 0 : completed * 100 / sub_issues.length,
+      "total" => sub_issues.length
+    }
+    raise "#{prefix} Issue ##{number} sub-issues summary is inconsistent" unless metadata["sub_issues_summary"] == expected
+  end
+
+  if metadata.key?("issue_dependencies_summary")
+    blocked_by = relationships.fetch("blocked_by").map { |reference| reference.fetch("number") }
+    blocking = relationships.fetch("blocking").map { |reference| reference.fetch("number") }
+    expected = {
+      "blocked_by" => blocked_by.count { |related| states.fetch(related).dig("state", "value") == "open" },
+      "blocking" => blocking.count { |related| states.fetch(related).dig("state", "value") == "open" },
+      "total_blocked_by" => blocked_by.length,
+      "total_blocking" => blocking.length
+    }
+    raise "#{prefix} Issue ##{number} dependency summary is inconsistent" unless metadata["issue_dependencies_summary"] == expected
+  end
+
+  if metadata.key?("closed_at")
+    valid_closed_at = state == "open" ? metadata["closed_at"].nil? : valid_utc_timestamp?(metadata["closed_at"])
+    raise "#{prefix} Issue ##{number} closed_at is inconsistent" unless valid_closed_at
+  end
+  if metadata.key?("closed_by")
+    closed_by = metadata["closed_by"]
+    valid_closed_by = state == "open" ? closed_by.nil? : closed_by.nil? || closed_by.is_a?(Hash) && !closed_by["login"].to_s.empty?
+    raise "#{prefix} Issue ##{number} closed_by is inconsistent" unless valid_closed_by
+  end
+  if metadata.key?("updated_at") && !valid_utc_timestamp?(metadata["updated_at"])
+    raise "#{prefix} Issue ##{number} updated_at is invalid"
+  end
+end
+
+def validate_plan_state!(state, number, issue_numbers, label_names, target:)
+  unless state.is_a?(Hash) && state.keys.sort == PLAN_STATE_KEYS && (state["body"].nil? || state["body"].is_a?(String))
+    raise "forward plan Issue ##{number} state schema is invalid"
+  end
+
+  labels = state["labels"]
+  assignees = state["assignees"]
+  blockers = state["blocked_by"]
+  parent = state["parent"]
+  issue_state = state["state"]
+  unless labels.is_a?(Array) && labels.all? { |label| label.is_a?(String) && !label.empty? } &&
+         labels.uniq.length == labels.length && (labels - label_names).empty? &&
+         assignees.is_a?(Array) && assignees.all? { |login| github_login?(login) } &&
+         assignees.uniq.length == assignees.length && blockers.is_a?(Array) &&
+         blockers.all? { |blocker| issue_numbers.include?(blocker) && blocker != number } && blockers.uniq.length == blockers.length &&
+         (parent.nil? || issue_numbers.include?(parent) && parent != number) &&
+         issue_state.is_a?(Hash) && issue_state.keys.sort == %w[reason value]
+    raise "forward plan Issue ##{number} state identity is invalid"
+  end
+
+  value = issue_state["value"]
+  reason = issue_state["reason"]
+  valid_reason = value == "open" ? [nil, "reopened"].include?(reason) :
+    value == "closed" && [nil, "completed", "duplicate", "not_planned"].include?(reason)
+  valid_reason &&= !target || value != "closed" || !reason.nil?
+  raise "forward plan Issue ##{number} state transition is invalid" unless valid_reason
+end
+
+def validate_plan_edges!(states)
+  edges = {
+    "parent" => states.transform_values { |state| [state["parent"]].compact },
+    "blocked_by" => states.transform_values { |state| state.fetch("blocked_by") }
+  }
+  edges.each do |field, graph|
+    visited = {}
+    visiting = {}
+    visit = lambda do |number|
+      raise "forward plan #{field} relationships contain a cycle" if visiting[number]
+      return if visited[number]
+
+      visiting[number] = true
+      graph.fetch(number).each { |related| visit.call(related) }
+      visiting.delete(number)
+      visited[number] = true
+    end
+    graph.each_key { |number| visit.call(number) }
+  end
+end
+
+def expected_derived_relationships(states)
+  sub_issues = Hash.new { |hash, key| hash[key] = [] }
+  blocking = Hash.new { |hash, key| hash[key] = [] }
+  states.each do |number, state|
+    sub_issues[state["parent"]] << number if state["parent"]
+    state.fetch("blocked_by").each { |blocker| blocking[blocker] << number }
+  end
+  [sub_issues, blocking]
+end
+
+def validate_derived_relationships!(items, states, prefix)
+  expected_sub_issues, expected_blocking = expected_derived_relationships(states)
+  items.each do |number, item|
+    actual_sub_issues = item.dig("relationships", "sub_issues").map { |reference| reference.fetch("number") }
+    actual_blocking = item.dig("relationships", "blocking").map { |reference| reference.fetch("number") }
+    unless actual_sub_issues.sort == expected_sub_issues[number].sort && actual_blocking.sort == expected_blocking[number].sort
+      raise "#{prefix} Issue ##{number} derived relationship drift"
+    end
+  end
+end
+
+def reverse_plan(graph, manifest, manifest_sha, forward_path, repo, controller)
+  forward, _, forward_sha = read_canonical_document(forward_path)
+  expected_keys = %w[controller default_branch default_branch_sha operations preflight_manifest_sha256 preflight_sha256 repository schema target]
+  unless forward.is_a?(Hash) && forward.keys.sort == expected_keys && forward["schema"] == FORWARD_PLAN_SCHEMA &&
+         forward["repository"] == repo && forward["controller"] == controller && forward["target"] == manifest["target"] &&
+         forward["preflight_manifest_sha256"] == manifest_sha &&
+         forward["preflight_sha256"] == manifest.dig("preflight", "sha256") &&
+         forward["default_branch"] == manifest["default_branch"] && forward["default_branch_sha"] == manifest["default_branch_sha"]
+    raise "forward plan identity is invalid"
+  end
+
+  issues = graph.fetch("items").select { |item| item["kind"] == "issue" }.to_h { |item| [item.fetch("number"), item] }
+  issue_numbers = issues.keys
+  label_names = graph.fetch("label_catalog").map { |label| label.fetch("name") }
+  validate_plan_relationship_scope!(issues, repo, "preflight")
+  states = issues.transform_values { |item| issue_plan_state(item) }
+  validate_plan_edges!(states)
+  validate_derived_relationships!(issues, states, "preflight")
+  issues.each_value { |item| validate_issue_metadata_derivations!(item, states, repo, "preflight") }
+  targets = states.dup
+  operations = forward["operations"]
+  raise "forward plan operations are invalid" unless operations.is_a?(Array) && !operations.empty?
+
+  seen = {}
+  reverse_operations = operations.map do |operation|
+    unless operation.is_a?(Hash) && operation.keys.sort == %w[number precondition target] && operation["number"].is_a?(Integer)
+      raise "forward plan operation schema is invalid"
+    end
+    number = operation["number"]
+    raise "forward plan references unknown Issue ##{number}" unless issues.key?(number)
+    raise "forward plan contains duplicate Issue ##{number}" if seen[number]
+
+    seen[number] = true
+    validate_plan_state!(operation["precondition"], number, issue_numbers, label_names, target: false)
+    validate_plan_state!(operation["target"], number, issue_numbers, label_names, target: true)
+    unless Canonical.value(operation["precondition"]) == states.fetch(number)
+      raise "forward plan Issue ##{number} precondition does not match preflight"
+    end
+    if Canonical.value(operation["target"]) == states.fetch(number)
+      raise "forward plan Issue ##{number} operation is a no-op"
+    end
+
+    targets[number] = Canonical.value(operation["target"])
+    { "number" => number, "precondition" => operation["target"], "target" => operation["precondition"] }
+  end
+  validate_plan_edges!(targets)
+
+  reverse = {
+    "controller" => controller,
+    "default_branch" => manifest.fetch("default_branch"),
+    "default_branch_sha" => manifest.fetch("default_branch_sha"),
+    "forward_plan_sha256" => forward_sha,
+    "operations" => reverse_operations,
+    "preflight_manifest_sha256" => manifest_sha,
+    "preflight_sha256" => manifest.dig("preflight", "sha256"),
+    "repository" => repo,
+    "schema" => REVERSE_PLAN_SCHEMA,
+    "target" => manifest.fetch("target")
+  }
+  [reverse, forward, forward_sha]
+end
+
+def appended_provenance_ids(before, after, field, number)
+  unless after.length >= before.length && Canonical.value(after.first(before.length), field) == Canonical.value(before, field)
+    raise "post-state Issue ##{number} #{field} provenance is not append-only"
+  end
+  after.drop(before.length).map { |entry| entry.fetch("id") }
+end
+
+def verify_post_state!(before_graph, after_graph, forward)
+  unless after_graph.fetch("repository") == before_graph.fetch("repository") &&
+         Canonical.value(after_graph.fetch("label_catalog")) == Canonical.value(before_graph.fetch("label_catalog"))
+    raise "post-state repository or label catalog drift"
+  end
+
+  before_items = before_graph.fetch("items").to_h { |item| [item.fetch("number"), item] }
+  after_items = after_graph.fetch("items").to_h { |item| [item.fetch("number"), item] }
+  raise "post-state Issue/PR inventory drift" unless after_items.keys.sort == before_items.keys.sort
+
+  operations = forward.fetch("operations").to_h { |operation| [operation.fetch("number"), operation] }
+  expected_states = before_items.select { |_, item| item["kind"] == "issue" }.transform_values { |item| issue_plan_state(item) }
+  operations.each { |number, operation| expected_states[number] = Canonical.value(operation.fetch("target")) }
+  after_issues = after_items.select { |_, item| item["kind"] == "issue" }
+  repo = before_graph.dig("repository", "full_name")
+  validate_plan_relationship_scope!(after_issues, repo, "post-state")
+  validate_derived_relationships!(after_issues, expected_states, "post-state")
+  after_issues.each_value { |item| validate_issue_metadata_derivations!(item, expected_states, repo, "post-state") }
+
+  operation_receipts = []
+  before_items.each do |number, before|
+    after = after_items.fetch(number)
+    raise "post-state item ##{number} kind drift" unless after["kind"] == before["kind"]
+    if before["kind"] == "pull_request"
+      raise "post-state PR ##{number} metadata drift" unless Canonical.value(after) == Canonical.value(before)
+      next
+    end
+
+    unless issue_plan_state(after) == expected_states.fetch(number)
+      raise "post-state Issue ##{number} does not match the forward plan"
+    end
+    before_metadata = before.fetch("issue").reject { |key, _| DERIVED_ISSUE_METADATA_KEYS.include?(key) }
+    after_metadata = after.fetch("issue").reject { |key, _| DERIVED_ISSUE_METADATA_KEYS.include?(key) }
+    unless Canonical.value(after_metadata) == Canonical.value(before_metadata)
+      raise "post-state Issue ##{number} unsupported metadata drift"
+    end
+    before_issue = before.fetch("issue")
+    after_issue = after.fetch("issue")
+    unless DERIVED_ISSUE_METADATA_KEYS.all? { |key| before_issue.key?(key) == after_issue.key?(key) }
+      raise "post-state Issue ##{number} derived metadata schema drift"
+    end
+    if before_issue["state"] == after_issue["state"] &&
+       Canonical.value(before_issue.values_at("closed_at", "closed_by")) != Canonical.value(after_issue.values_at("closed_at", "closed_by"))
+      raise "post-state Issue ##{number} closure metadata drift"
+    end
+    before_without_updated_at = before.merge("issue" => before_issue.reject { |key, _| key == "updated_at" })
+    after_without_updated_at = after.merge("issue" => after_issue.reject { |key, _| key == "updated_at" })
+    if before_issue["updated_at"] != after_issue["updated_at"]
+      observable_change = Canonical.value(before_without_updated_at) != Canonical.value(after_without_updated_at)
+      timestamps_advance = valid_utc_timestamp?(before_issue["updated_at"]) && valid_utc_timestamp?(after_issue["updated_at"]) &&
+        Time.iso8601(after_issue["updated_at"]) >= Time.iso8601(before_issue["updated_at"])
+      raise "post-state Issue ##{number} updated_at drift" unless observable_change && timestamps_advance
+    end
+    unless Canonical.value(after.dig("relationships", "closed_by_pull_requests")) ==
+           Canonical.value(before.dig("relationships", "closed_by_pull_requests"))
+      raise "post-state Issue ##{number} closing-reference drift"
+    end
+    comment_ids = appended_provenance_ids(before.fetch("comments"), after.fetch("comments"), "comments", number)
+    event_ids = appended_provenance_ids(before.fetch("events"), after.fetch("events"), "events", number)
+    operation = operations[number]
+    if operation.nil?
+      raise "post-state Issue ##{number} has unplanned provenance" unless comment_ids.empty? && event_ids.empty?
+      next
+    end
+    operation_receipts << {
+      "comment_ids" => comment_ids,
+      "event_ids" => event_ids,
+      "number" => number,
+      "precondition_sha256" => Digest::SHA256.hexdigest(Canonical.dump(operation.fetch("precondition"))),
+      "result" => "passed",
+      "target_sha256" => Digest::SHA256.hexdigest(Canonical.dump(operation.fetch("target")))
+    }
+  end
+  operation_receipts
+end
+
+def verify_receipt!(receipt, before_identity, after_identity, before_manifest, after_manifest, forward_sha, reverse_sha, operation_receipts, repo, controller)
+  expected_keys = %w[api controller counts default_branch default_branch_sha forward_plan_sha256 operations pages postflight_manifest_sha256 postflight_sha256 preflight_manifest_sha256 preflight_sha256 repository reverse_plan_sha256 schema target]
+  unless receipt.is_a?(Hash) && receipt.keys.sort == expected_keys && receipt["schema"] == RECEIPT_SCHEMA &&
+         receipt["repository"] == repo && receipt["controller"] == controller && receipt["target"] == before_manifest["target"] &&
+         receipt["preflight_sha256"] == before_manifest.dig("preflight", "sha256") &&
+         receipt["postflight_sha256"] == after_manifest.dig("preflight", "sha256") &&
+         receipt["preflight_manifest_sha256"] == before_identity["manifest_sha256"] &&
+         receipt["postflight_manifest_sha256"] == after_identity["manifest_sha256"] &&
+         receipt["forward_plan_sha256"] == forward_sha && receipt["reverse_plan_sha256"] == reverse_sha &&
+         receipt["default_branch"] == after_manifest["default_branch"] && receipt["default_branch_sha"] == after_manifest["default_branch_sha"] &&
+         receipt["api"] == after_manifest["api"] && receipt["pages"] == after_manifest["pages"] &&
+         receipt["counts"] == after_manifest["counts"] && receipt["operations"] == Canonical.value(operation_receipts)
+    raise "restoration receipt identity is invalid"
+  end
+end
+
+def verify_live_bundle!(graph, manifest, repo, link_provenance, prefix)
+  live_graph, live_counts, live_branch, live_branch_sha, live_pages = capture_graph(repo)
+  verify_page_inventory!(live_pages, manifest.dig("api", "graphql_media_type"), live_graph, repo, link_provenance: true)
+  raise "#{prefix}: Issue/PR graph changed" unless Canonical.value(live_graph) == Canonical.value(graph)
+  raise "#{prefix}: counts changed" unless live_counts == manifest["counts"]
+  unless live_branch == manifest["default_branch"] && live_branch_sha == manifest["default_branch_sha"]
+    raise "#{prefix}: default branch changed"
+  end
+  comparison_pages = link_provenance ? live_pages : live_pages.map { |page| page.merge("link" => nil) }
+  unless Canonical.value(comparison_pages) == Canonical.value(manifest["pages"])
+    raise "#{prefix}: page/header inventory changed"
+  end
 end
 
 def capture(options)
@@ -882,31 +1227,58 @@ def verify(options)
   raise "--bundle DIR is required" if bundle.to_s.empty?
 
   graph, manifest, link_provenance = verify_bundle(bundle, repo, controller)
-  if options[:live]
-    live_graph, live_counts, live_branch, live_branch_sha, live_pages = capture_graph(repo)
-    verify_page_inventory!(live_pages, manifest.dig("api", "graphql_media_type"), live_graph, repo, link_provenance: true)
-    raise "live verification drift: Issue/PR graph changed" unless Canonical.value(live_graph) == Canonical.value(graph)
-    raise "live verification drift: counts changed" unless live_counts == manifest["counts"]
-    unless live_branch == manifest["default_branch"] && live_branch_sha == manifest["default_branch_sha"]
-      raise "live verification drift: default branch changed"
-    end
-    comparison_pages = link_provenance ? live_pages : live_pages.map { |page| page.merge("link" => nil) }
-    unless Canonical.value(comparison_pages) == Canonical.value(manifest["pages"])
-      raise "live verification drift: page/header inventory changed"
-    end
-  end
+  verify_live_bundle!(graph, manifest, repo, link_provenance, "live verification drift") if options[:live]
   suffix = options[:live] ? " with live readback" : ""
   puts "verified #{repo} at #{manifest.fetch("default_branch_sha")}#{suffix} <- #{bundle}"
+end
+
+def plan_restore(options)
+  repo, controller, bundle, forward_path = options.values_at(:repo, :controller, :bundle, :forward_plan)
+  raise "--repo OWNER/REPO is required" if repo.to_s.empty?
+  raise "--controller NAME is required" if controller.to_s.strip.empty?
+  raise "--bundle DIR is required" if bundle.to_s.empty?
+  raise "--forward-plan FILE is required" if forward_path.to_s.empty?
+
+  post_paths = options.values_at(:reverse_plan, :receipt, :post_bundle)
+  if post_paths.any? && !post_paths.all? { |path| !path.to_s.empty? }
+    raise "--reverse-plan, --receipt, and --post-bundle are required together"
+  end
+
+  graph, manifest, link_provenance, identity = verify_bundle(bundle, repo, controller)
+  plan, forward, forward_sha = reverse_plan(graph, manifest, identity.fetch("manifest_sha256"), forward_path, repo, controller)
+  unless post_paths.any?
+    verify_live_bundle!(graph, manifest, repo, link_provenance, "pre-mutation live drift")
+    print Canonical.dump(plan)
+    return
+  end
+
+  reverse_path, receipt_path, post_bundle = post_paths
+  saved_plan, reverse_contents, reverse_sha = read_canonical_document(reverse_path)
+  raise "saved reverse plan does not match the exact derived inverse" unless reverse_contents.b == Canonical.dump(plan).b && saved_plan == plan
+
+  post_graph, post_manifest, post_link_provenance, post_identity = verify_bundle(post_bundle, repo, controller)
+  unless post_manifest["default_branch"] == manifest["default_branch"] && post_manifest["default_branch_sha"] == manifest["default_branch_sha"]
+    raise "post-state default branch drift"
+  end
+  operation_receipts = verify_post_state!(graph, post_graph, forward)
+  receipt, = read_canonical_document(receipt_path)
+  verify_receipt!(receipt, identity, post_identity, manifest, post_manifest, forward_sha, reverse_sha, operation_receipts, repo, controller)
+  verify_live_bundle!(post_graph, post_manifest, repo, post_link_provenance, "restoration live drift")
+  print reverse_contents
 end
 
 command = ARGV.shift
 options = {}
 parser = OptionParser.new do |flags|
-  flags.banner = "Usage: issue-lifecycle-preflight.rb (capture|verify) --repo OWNER/REPO --controller NAME (--output|--bundle) DIR"
+  flags.banner = "Usage: issue-lifecycle-preflight.rb (capture|verify|plan-restore) --repo OWNER/REPO --controller NAME"
   flags.on("--repo OWNER/REPO", "Repository to read") { |value| options[:repo] = value }
   flags.on("--controller NAME", "Named evidence controller") { |value| options[:controller] = value }
   flags.on("--output DIR", "New evidence bundle directory") { |value| options[:output] = value }
   flags.on("--bundle DIR", "Existing evidence bundle directory") { |value| options[:bundle] = value }
+  flags.on("--forward-plan FILE", "Canonical approved forward plan") { |value| options[:forward_plan] = value }
+  flags.on("--reverse-plan FILE", "Exact saved reverse plan") { |value| options[:reverse_plan] = value }
+  flags.on("--receipt FILE", "Canonical post-state receipt") { |value| options[:receipt] = value }
+  flags.on("--post-bundle DIR", "Verified post-state evidence bundle") { |value| options[:post_bundle] = value }
   flags.on("--live", "Independently compare the bundle with live GitHub reads") { options[:live] = true }
 end
 
@@ -916,15 +1288,24 @@ begin
   case command
   when "capture"
     raise "--bundle is only valid for verify" if options[:bundle]
+    raise "--forward-plan is only valid for plan-restore" if options[:forward_plan]
+    raise "restoration inputs are only valid for plan-restore" if options.values_at(:reverse_plan, :receipt, :post_bundle).any?
     raise "--live is only valid for verify" if options[:live]
 
     capture(options)
   when "verify"
     raise "--output is only valid for capture" if options[:output]
+    raise "--forward-plan is only valid for plan-restore" if options[:forward_plan]
+    raise "restoration inputs are only valid for plan-restore" if options.values_at(:reverse_plan, :receipt, :post_bundle).any?
 
     verify(options)
+  when "plan-restore"
+    raise "--output is only valid for capture" if options[:output]
+    raise "--live is implicit for plan-restore" if options[:live]
+
+    plan_restore(options)
   else
-    raise "unsupported operation #{command.inspect}; expected capture or verify"
+    raise "unsupported operation #{command.inspect}; expected capture, verify, or plan-restore"
   end
 rescue StandardError => error
   warn "ERROR issue lifecycle preflight: #{error.message}"
