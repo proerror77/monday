@@ -41,7 +41,7 @@ bump() {
 }
 
 respond() {
-  local body="$1" etag="${2:-fixture}"
+  local body="$1" etag="${2:-fixture}" media_type="${3:-github.v3; format=json}"
   if [[ -n "$if_none_match" && "$if_none_match" == "W/\"$etag\"" ]]; then
     printf 'HTTP/2.0 304 Not Modified\r\nEtag: W/"%s"\r\n\r\n' "$etag"; exit 1
   fi
@@ -50,7 +50,9 @@ respond() {
     body="${body//\{\"number\":1\}/\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
     body="${body//\"number\":3,\"parent\":null/\"number\":3,\"parent\":\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
   fi
-  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nEtag: W/"%s"\r\nLast-Modified: Sat, 02 Aug 2026 00:00:00 GMT\r\nX-GitHub-Api-Version-Selected: 2026-03-10\r\nX-GitHub-Media-Type: github.v3; format=json\r\n\r\n%s\n' "$etag" "$body"
+  local media_header=
+  [[ -z "$media_type" ]] || media_header="X-GitHub-Media-Type: ${media_type}"$'\r\n'
+  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nEtag: W/"%s"\r\nLast-Modified: Sat, 02 Aug 2026 00:00:00 GMT\r\nX-GitHub-Api-Version-Selected: 2026-03-10\r\n%s\r\n%s\n' "$etag" "$media_header" "$body"
 }
 
 respond_with_next() {
@@ -134,10 +136,14 @@ case "$path" in
     ;;
   graphql)
     test "$(grep -o 'number url repository { nameWithOwner }' <<<"$query" | wc -l | tr -d ' ')" -eq 5
+    call="$(bump graphql)"
+    media_type='github.v4; format=json'
+    [[ "${FIXTURE_MODE:-normal}" != graphql-media-race || "$call" -le 1 ]] || media_type='github.v4; format=json; drift=1'
+    [[ "${FIXTURE_MODE:-normal}" != graphql-media-missing || "$call" -le 1 ]] || media_type=
     if [[ "${FIXTURE_MODE:-normal}" == reordered ]]; then
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.test/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.test/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' fixture "$media_type"
     else
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.test/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}'
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.test/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
     fi
     ;;
   *) echo "unexpected GitHub API path: $path" >&2; exit 1 ;;
@@ -183,13 +189,14 @@ abort "missing close ref" unless issue.dig("relationships", "closed_by_pull_requ
 abort "missing PR evidence" unless pull.dig("pull_request", "metadata", "head", "sha") == "b" * 40 && pull.dig("pull_request", "metadata", "base", "sha") == "a" * 40 && %w[commits files reviews review_comments statuses].all? { |key| pull.dig("pull_request", key).is_a?(Array) } && pull.dig("pull_request", "check_runs", "total_count") == 1
 abort "missing same-blob files" unless pull.dig("pull_request", "files").map { |file| file["filename"] } == %w[safe-copy.txt safe.txt]
 abort "wrong manifest" unless manifest.fetch("schema") == "monday.issue_lifecycle_manifest.v1" && manifest.dig("api", "rest_version") == "2026-03-10" && manifest.fetch("target").include?("example/repo") && manifest.fetch("exclusions").include?("GitHub metadata mutation")
+abort "wrong GraphQL media type" unless manifest.dig("api", "graphql_media_type") == "github.v4; format=json"
 abort "wrong controller" unless manifest["controller"] == "Codex /root"
 abort "wrong main" unless manifest["default_branch_sha"] == "a" * 40
 abort "missing conditional stability pages" unless manifest.fetch("pages").any? { |page| page["phase"] == "stability_check" && page["protocol"] == "rest" } && manifest.fetch("pages").select { |page| page["phase"] == "stability_check" && page["protocol"] == "rest" }.all? { |page| page["status"] == 304 }
 abort "wrong counts" unless manifest.fetch("counts") == {"issues" => 2, "pull_requests" => 1, "labels" => 2, "issue_comments" => 2, "issue_events" => 2}
 RUBY
 
-for mode in incomplete missing-link missing-relationship capture-race header-race issue-detail-race closed-pr-race; do
+for mode in incomplete missing-link missing-relationship capture-race header-race issue-detail-race closed-pr-race graphql-media-race graphql-media-missing; do
   set +e
   output="$(capture "$mode" "$tmp_dir/$mode" 2>&1)"
   exit_code=$?

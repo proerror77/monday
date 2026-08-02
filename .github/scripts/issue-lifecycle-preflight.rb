@@ -488,6 +488,10 @@ def capture(options)
   raise "--output DIR is required" if output.to_s.empty?
 
   graph, counts, default_branch, default_branch_sha, pages = capture_graph(repo)
+  graphql_media_types = pages.select { |page| page["protocol"] == "graphql" }.map { |page| page["media_type"] }
+  unless graphql_media_types.any? && graphql_media_types.all? { |media_type| !media_type.to_s.empty? } && graphql_media_types.uniq.length == 1
+    raise "capture stability drift: GraphQL media type missing or inconsistent: #{graphql_media_types.uniq.inspect}"
+  end
   manifest = {
     "schema" => "monday.issue_lifecycle_manifest.v1",
     "repository" => repo,
@@ -500,7 +504,7 @@ def capture(options)
     "api" => {
       "rest_version" => GitHubReadOnly::API_VERSION,
       "rest_accept" => GitHubReadOnly::REST_ACCEPT,
-      "graphql_media_type" => "github.v4"
+      "graphql_media_type" => graphql_media_types.first
     },
     "pages" => pages,
     "counts" => counts
@@ -524,7 +528,7 @@ begin
   raise "unsupported operation #{command.inspect}; expected capture" unless command == "capture"
 
   capture(options)
-rescue OptionParser::ParseError, StandardError => error
+rescue StandardError => error
   warn "ERROR issue lifecycle preflight: #{error.message}"
   exit 2
 end
