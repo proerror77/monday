@@ -1,21 +1,19 @@
 use crate::{
     cli::{
-        print_json, DatasetArgs, EngineChoice, EvaluateArgs, ExecuteMissionArgs, RunMissionArgs,
-        ValidationArgs,
+        print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
     },
     data_mission, governance, mission,
 };
 use alpha_domain::{
-    canonical_json_hash, CandidateEvaluation, CexMctsResearchReceiptV1, EngineKind,
-    EvaluationCostsV1, EvaluationLabelSpecV1, IterationVerdict, MissionCompletionPolicy,
-    MissionStatus, ResearchMission, SearchBudget, ValidatorMode,
+    canonical_json_hash, CexResearchMissionArtifactV1, EvaluationCostsV1, MissionCompletionPolicy,
+    MissionStatus, ResearchMission, ValidatorMode,
 };
-use alpha_engine::engines::{CexMctsSearchIdentityV1, MCTS_CHECKPOINT_VERSION};
-use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, RunCheckpoint, StoreError};
+use alpha_store::{AlphaStore, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_research_manifest::{
-    CexReplaySnapshotV1, ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    CexReplayDatasetManifestV1, CexReplaySnapshotV1, ManifestId,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
 };
 use reqwest::{
     blocking::Client,
@@ -25,13 +23,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{BufWriter, Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
+const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
@@ -40,6 +39,7 @@ const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 struct Materialization {
     dataset_kind: String,
     schema_version: String,
+    mission_id: String,
     symbol: String,
     market: String,
     source_revision: String,
@@ -69,19 +69,6 @@ struct ExecutionReport<'a> {
     engine: &'static str,
     bundle_bytes: u64,
     bundle_sha256: String,
-    research_receipt_hash: Option<String>,
-}
-
-struct PreparedMctsResearchReceipt {
-    mission_id: String,
-    dataset_manifest_id: ManifestId,
-    search_identity_hash: String,
-    checkpoint_hash: String,
-    selected_candidate_id: String,
-    selected_candidate_content_hash: String,
-    training_evaluation_id: String,
-    training_evaluation_hash: String,
-    evaluation_protocol_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +126,15 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
+    let bundle = args.work_dir.join("results.zip");
+    for path in [&input_dir, &artifact_dir, &results_dir, &bundle] {
+        if path.try_exists()? {
+            bail!(
+                "Mission execution requires a fresh work directory; existing path: {}",
+                path.display()
+            );
+        }
+    }
     std::fs::create_dir_all(&input_dir)?;
     std::fs::create_dir_all(&artifact_dir)?;
     std::fs::create_dir_all(&results_dir)?;
@@ -146,8 +142,23 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
+    let mission_path = input_dir.join("mission.json");
     let feature_path = input_dir.join("features.jsonl");
     let materialization_path = input_dir.join("materialization.json");
+    let (_, mission_sha256) =
+        fetch_to_file(&client, &args.mission_url, &mission_path, MAX_MISSION_BYTES)?;
+    if mission_sha256 != normalized_sha256("Mission", &args.mission_sha256)? {
+        bail!("Mission artifact SHA256 mismatch");
+    }
+    let control_mission: CexResearchMissionArtifactV1 =
+        serde_json::from_slice(&std::fs::read(&mission_path)?)
+            .context("CEX Research Mission artifact is invalid JSON or schema")?;
+    control_mission.validate()?;
+    mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
+    let mission_id = control_mission.semantic_id()?;
+    let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
+    let engine = EngineChoice::Mcts;
+
     let (_, feature_sha256) =
         fetch_to_file(&client, &args.feature_url, &feature_path, MAX_FEATURE_BYTES)?;
     let (_, materialization_sha256) = fetch_to_file(
@@ -156,20 +167,17 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &materialization_path,
         MAX_MATERIALIZATION_BYTES,
     )?;
-    if materialization_sha256 != normalized_sha256("materialization", &args.materialization_sha256)?
-    {
-        bail!("materialization manifest SHA256 mismatch");
-    }
     let materialization: Materialization =
         serde_json::from_slice(&std::fs::read(&materialization_path)?)
             .context("materialization manifest is invalid JSON")?;
-    validate_materialization(&materialization, &feature_sha256, &args.validation)?;
-    let evaluation_protocol = args
-        .validation
-        .evaluation_protocol(&EvaluationLabelSpecV1 {
-            horizon_buckets: materialization.label_horizon_buckets,
-            observation_frequency_millis: materialization.bucket_ms,
-        })?;
+    validate_materialization(&materialization, &feature_sha256, &validation)?;
+    validate_mission_materialization_binding(
+        &control_mission,
+        &materialization,
+        &materialization_sha256,
+        &feature_sha256,
+    )?;
+    let evaluation_protocol = control_mission.spec.evaluation_protocol.clone();
 
     let db = results_dir.join("alpha.duckdb");
     let feature_manifest_path = results_dir.join("feature-manifest.json");
@@ -177,7 +185,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&db)?;
     let feature_manifest = data_mission::import_and_register_features(
         &mut store,
-        &args.data_mission_id,
+        &control_mission.spec.data_mission_id,
         &feature_path,
         &artifact_dir,
     )?;
@@ -196,6 +204,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &feature_manifest,
         &materialization.snapshot,
     )?;
+    validate_mission_dataset_binding(&control_mission, &feature_manifest, &dataset_manifest)?;
     data_mission::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
     data_mission::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
     data_mission::write_json_atomic(
@@ -217,24 +226,52 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     )?;
 
     let now = Utc::now();
+    let semantic_mission = serde_json::json!({
+        "schema_version": &control_mission.schema_version,
+        "spec": &control_mission.spec,
+    });
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: mission_id.clone(),
+        registry_kind: "cex_research_mission".to_string(),
+        asset_id: control_mission.spec.instrument.symbol.clone(),
+        parent_revision_id: Some(dataset_manifest.manifest_id.clone()),
+        payload: semantic_mission,
+        created_at: now,
+    })?;
+    data_mission::write_json_atomic(
+        &results_dir.join("control-plane-mission.json"),
+        &control_mission,
+    )?;
+    data_mission::write_json_atomic(
+        &results_dir.join("mission-admission.json"),
+        &serde_json::json!({
+            "schema_version": &control_mission.schema_version,
+            "mission_id": &mission_id,
+            "mission_artifact_sha256": &mission_sha256,
+            "dataset_manifest_id": &dataset_manifest.manifest_id,
+        }),
+    )?;
     let research_mission = ResearchMission {
-        mission_id: args.mission_id.clone(),
-        objective: args.objective.clone(),
-        hypothesis_scope: args.hypothesis_scope.clone(),
+        mission_id: mission_id.clone(),
+        objective: control_mission.spec.objective.clone(),
+        hypothesis_scope: control_mission
+            .spec
+            .hypotheses
+            .iter()
+            .map(|hypothesis| hypothesis.hypothesis_id.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         mutable_scope: vec!["factor_ast".to_string()],
         dataset_manifest_id: ManifestId::new(dataset_manifest.manifest_id.clone())?,
         baseline_artifact_id: None,
         validation_mode: ValidatorMode::MissionValidator,
-        validator_spec: serde_json::json!({"multiple_testing_trials": args.max_candidates}),
-        search_budget: SearchBudget {
-            max_candidates: args.max_candidates,
-            max_expansions: args.max_expansions,
-            max_tokens: 0,
-            max_seconds: args.max_seconds,
-        },
+        validator_spec: serde_json::json!({
+            "multiple_testing_trials": control_mission.spec.search.budget.max_candidates
+        }),
+        search_budget: control_mission.spec.search.budget.clone(),
         completion_policy: MissionCompletionPolicy::default(),
         prompt_snapshot_id: None,
-        search_policy_snapshot_id: format!("{}-lob-pit-v1", engine_name(args.engine)),
+        search_policy_snapshot_id: control_mission.spec.policies.subset_search.id.clone(),
         status: MissionStatus::Pending,
         terminal_reason: None,
         created_at: now,
@@ -247,16 +284,16 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 
     let dataset = DatasetArgs {
         dataset_manifest: dataset_manifest_path,
-        validation: args.validation.clone(),
+        validation,
     };
     let run_args = RunMissionArgs {
         db: db.clone(),
-        mission_id: args.mission_id.clone(),
-        engine: args.engine,
-        seed: args.seed,
-        feature_fields: args.feature_fields.clone(),
+        mission_id: mission_id.clone(),
+        engine,
+        seed: control_mission.spec.search.seed,
+        feature_fields: control_mission.spec.feature_fields.clone(),
         offline_trace: None,
-        max_new_iterations: Some(args.max_new_iterations),
+        max_new_iterations: Some(control_mission.spec.search.max_new_iterations),
         dataset: dataset.clone(),
     };
     let mut run_report = mission::execute_mission(&run_args, false)?;
@@ -272,8 +309,8 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     data_mission::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
 
     let store = AlphaStore::open(&db)?;
-    let lineage = store.mission_lineage(&args.mission_id)?;
-    let checkpoint = match store.get_checkpoint(&args.mission_id) {
+    let lineage = store.mission_lineage(&mission_id)?;
+    let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
         Err(error) => return Err(error.into()),
@@ -291,12 +328,12 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     data_mission::write_json_atomic(
         &results_dir.join("candidates.json"),
         &serde_json::json!({
-            "mission_id": &args.mission_id,
+            "mission_id": &mission_id,
             "candidates": lineage.candidates,
             "evaluations": lineage.evaluations,
         }),
     )?;
-    let selected = governance::selected_walk_forward_candidate(&store, &args.mission_id)?;
+    let selected = governance::selected_walk_forward_candidate(&store, &mission_id)?;
     drop(store);
     std::fs::write(
         results_dir.join("kept-candidates.txt"),
@@ -305,231 +342,83 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             .map(|candidate| format!("{candidate}\n"))
             .collect::<String>(),
     )?;
-    let mut sealed = BufWriter::new(File::create(results_dir.join("sealed-evaluations.jsonl"))?);
-    let receipt_path = results_dir.join("mcts-research-receipt.json");
-    if let Err(error) = std::fs::remove_file(&receipt_path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error).context("remove stale MCTS research receipt");
-        }
-    }
-    let mut research_receipt_hash = None;
-    if let Some(candidate_id) = selected {
-        let prepared_receipt = prepare_mcts_research_receipt(
-            &lineage,
-            checkpoint
-                .as_ref()
-                .context("selected candidate has no durable MCTS checkpoint")?,
-            &candidate_id,
-            args.max_new_iterations,
-        )?;
-        let revision = governance::execute_evaluate(EvaluateArgs {
-            db: db.clone(),
-            mission_id: args.mission_id.clone(),
-            candidate_id: candidate_id.clone(),
-            model_root: None,
-            dataset: dataset.clone(),
-        })?;
-        serde_json::to_writer(&mut sealed, &revision)?;
-        sealed.write_all(b"\n")?;
-        let receipt = finish_mcts_research_receipt(prepared_receipt, &revision)?;
-        data_mission::write_json_atomic(&receipt_path, &receipt)?;
-        research_receipt_hash = Some(receipt.receipt_hash);
-    }
-    sealed.flush()?;
-
-    let bundle = args.work_dir.join("results.zip");
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
     print_json(&ExecutionReport {
-        mission_id: &args.mission_id,
-        engine: engine_name(args.engine),
+        mission_id: &mission_id,
+        engine: engine_name(engine),
         bundle_bytes,
         bundle_sha256,
-        research_receipt_hash,
     })
-}
-
-fn prepare_mcts_research_receipt(
-    lineage: &MissionLineage,
-    checkpoint: &RunCheckpoint,
-    selected_candidate_id: &str,
-    max_new_iterations: usize,
-) -> anyhow::Result<PreparedMctsResearchReceipt> {
-    if checkpoint.mission_id != lineage.mission.mission_id
-        || checkpoint.engine_kind != EngineKind::Mcts
-        || checkpoint.engine_version != MCTS_CHECKPOINT_VERSION
-    {
-        bail!("durable checkpoint is not the selected mission's current MCTS checkpoint");
-    }
-    let checkpoint_protocol_hash = checkpoint
-        .evaluation_protocol_hash
-        .as_deref()
-        .context("durable checkpoint has no evaluation protocol binding")?;
-    let checkpoint_config = checkpoint
-        .engine_state
-        .get("config")
-        .context("durable MCTS checkpoint has no configuration")?;
-    let search_identity: CexMctsSearchIdentityV1 = serde_json::from_value(
-        checkpoint_config
-            .get("research_identity")
-            .cloned()
-            .context("durable MCTS checkpoint has no research identity")?,
-    )
-    .context("durable MCTS checkpoint research identity is malformed")?;
-    search_identity.validate().map_err(anyhow::Error::msg)?;
-    if search_identity.mission_id != lineage.mission.mission_id
-        || search_identity.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
-        || search_identity.search_policy_snapshot_id != lineage.mission.search_policy_snapshot_id
-        || search_identity.search_budget != lineage.mission.search_budget
-        || search_identity.completion_policy != lineage.mission.completion_policy
-        || search_identity.max_new_iterations != Some(max_new_iterations)
-        || search_identity.evaluation_protocol_hash != checkpoint_protocol_hash
-    {
-        bail!("durable MCTS checkpoint research identity does not match the mission");
-    }
-
-    let candidate = lineage
-        .candidates
-        .iter()
-        .find(|candidate| candidate.candidate_id == selected_candidate_id)
-        .context("selected candidate is missing from mission lineage")?;
-    let iteration = lineage
-        .iterations
-        .iter()
-        .find(|iteration| iteration.candidate_artifact_id.as_deref() == Some(selected_candidate_id))
-        .context("selected candidate iteration is missing")?;
-    if iteration.engine != EngineKind::Mcts || iteration.verdict != IterationVerdict::Keep {
-        bail!("selected candidate was not kept by the MCTS training search");
-    }
-    let training_evaluation_id = iteration
-        .evaluation_artifact_id
-        .as_deref()
-        .context("selected candidate has no training evaluation")?;
-    let training = lineage
-        .evaluations
-        .iter()
-        .find(|stored| {
-            stored.record.evaluation_id == training_evaluation_id
-                && stored.record.candidate_id == selected_candidate_id
-        })
-        .context("selected candidate training evaluation is missing")?;
-    let training_evaluation: CandidateEvaluation =
-        serde_json::from_value(training.record.payload.clone())
-            .context("selected candidate training evaluation is malformed")?;
-    training_evaluation.validate()?;
-    if !training_evaluation.passed
-        || training.record.mission_id != lineage.mission.mission_id
-        || training.record.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
-        || training.record.evaluation_protocol_hash != checkpoint_protocol_hash
-        || training_evaluation.evaluation_protocol_hash.as_deref() != Some(checkpoint_protocol_hash)
-        || training_evaluation.evaluator_version != search_identity.evaluator_version
-        || canonical_json_hash(&training_evaluation.evaluator_config)?
-            != search_identity.evaluator_config_hash
-    {
-        bail!("selected candidate training evidence does not match the MCTS research identity");
-    }
-
-    Ok(PreparedMctsResearchReceipt {
-        mission_id: lineage.mission.mission_id.clone(),
-        dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
-        search_identity_hash: canonical_json_hash(checkpoint_config)?,
-        checkpoint_hash: canonical_json_hash(checkpoint)?,
-        selected_candidate_id: selected_candidate_id.to_string(),
-        selected_candidate_content_hash: candidate.content_hash.clone(),
-        training_evaluation_id: training.record.evaluation_id.clone(),
-        training_evaluation_hash: training.content_hash.clone(),
-        evaluation_protocol_hash: checkpoint_protocol_hash.to_string(),
-    })
-}
-
-fn finish_mcts_research_receipt(
-    prepared: PreparedMctsResearchReceipt,
-    sealed_revision: &RegistryRevision,
-) -> anyhow::Result<CexMctsResearchReceiptV1> {
-    let sealed_evaluation: CandidateEvaluation = serde_json::from_value(
-        sealed_revision
-            .payload
-            .get("evaluation")
-            .cloned()
-            .context("sealed evaluation payload is incomplete")?,
-    )
-    .context("sealed evaluation is malformed")?;
-    sealed_evaluation.validate()?;
-    if sealed_revision.registry_kind != "sealed_evaluation"
-        || sealed_revision.asset_id != prepared.selected_candidate_id
-        || sealed_revision
-            .payload
-            .get("mission_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(prepared.mission_id.as_str())
-        || sealed_revision
-            .payload
-            .get("candidate_content_hash")
-            .and_then(serde_json::Value::as_str)
-            != Some(prepared.selected_candidate_content_hash.as_str())
-        || sealed_revision
-            .payload
-            .get("dataset_manifest_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(prepared.dataset_manifest_id.as_str())
-        || sealed_revision
-            .payload
-            .get("evaluation_protocol_hash")
-            .and_then(serde_json::Value::as_str)
-            != Some(prepared.evaluation_protocol_hash.as_str())
-        || sealed_evaluation.evaluation_protocol_hash.as_deref()
-            != Some(prepared.evaluation_protocol_hash.as_str())
-    {
-        bail!("sealed evaluation does not match the selected MCTS research evidence");
-    }
-
-    let receipt = CexMctsResearchReceiptV1::new(
-        prepared.mission_id,
-        prepared.dataset_manifest_id,
-        prepared.search_identity_hash,
-        prepared.checkpoint_hash,
-        prepared.selected_candidate_id,
-        prepared.selected_candidate_content_hash,
-        prepared.training_evaluation_id,
-        prepared.training_evaluation_hash,
-        prepared.evaluation_protocol_hash,
-        sealed_revision.revision_id.clone(),
-        canonical_json_hash(sealed_revision)?,
-    )?;
-    receipt.validate()?;
-    Ok(receipt)
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
-    mission::validate_live_formula_engine(args.engine)?;
-    if !matches!(args.engine, EngineChoice::Mcts) {
-        bail!(
-            "unsupported durable Mission engine: {}",
-            engine_name(args.engine)
-        );
-    }
     if args.work_dir.as_os_str().is_empty()
         || [
+            args.mission_url.as_str(),
             args.feature_url.as_str(),
             args.materialization_url.as_str(),
             args.result_put_url.as_str(),
-            args.data_mission_id.as_str(),
-            args.mission_id.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
-        || args.feature_fields.is_empty()
-        || args.max_new_iterations == 0
-        || args
-            .feature_fields
-            .iter()
-            .any(|field| field.trim().is_empty())
     {
-        bail!("Mission execution paths, ids, URLs, and feature fields are required");
+        bail!("Mission execution paths and URLs are required");
     }
-    mission::validate_live_feature_fields(&args.feature_fields)?;
+    normalized_sha256("Mission", &args.mission_sha256)?;
+    Ok(())
+}
+
+fn validate_mission_materialization_binding(
+    mission: &CexResearchMissionArtifactV1,
+    materialization: &Materialization,
+    materialization_sha256: &str,
+    feature_sha256: &str,
+) -> anyhow::Result<()> {
+    let spec = &mission.spec;
+    let snapshot_sha256 = materialization.snapshot.sha256();
+    let partition_sha256 = canonical_json_hash(&materialization.snapshot.source_segments)?;
+    if spec.instrument.venue.as_str() != materialization.snapshot.venue
+        || spec.instrument.market.as_str() != materialization.market
+        || spec.instrument.market.as_str() != materialization.snapshot.instrument_type
+        || spec.instrument.symbol != materialization.symbol
+        || spec.instrument.symbol != materialization.snapshot.symbol
+        || spec.instrument.horizon.horizon_buckets != materialization.label_horizon_buckets
+        || spec.instrument.horizon.observation_frequency_millis != materialization.bucket_ms
+    {
+        bail!("CEX Research Mission instrument or horizon does not match materialization");
+    }
+    if spec.data_mission_id != materialization.mission_id
+        || spec.inputs.materialization.id != materialization.mission_id
+        || spec.inputs.materialization.content_sha256 != materialization_sha256
+        || spec.inputs.snapshot.id != format!("cex-replay-snapshot-{snapshot_sha256}")
+        || spec.inputs.snapshot.content_sha256 != snapshot_sha256
+        || spec.inputs.partition.id != format!("cex-replay-partition-{partition_sha256}")
+        || spec.inputs.partition.content_sha256 != partition_sha256
+        || spec.inputs.source.id != materialization.source_revision
+        || spec.inputs.source.content_sha256 != materialization.source_revision
+        || spec.inputs.feature.id != format!("dataset-{feature_sha256}")
+        || spec.inputs.feature.content_sha256 != feature_sha256
+    {
+        bail!("CEX Research Mission input identities do not match materialization");
+    }
+    Ok(())
+}
+
+fn validate_mission_dataset_binding(
+    mission: &CexResearchMissionArtifactV1,
+    features: &hft_collector::FeatureDatasetManifest,
+    dataset: &CexReplayDatasetManifestV1,
+) -> anyhow::Result<()> {
+    if mission.spec.inputs.feature.id != features.manifest_id
+        || mission.spec.inputs.feature.content_sha256 != features.artifact_sha256
+        || mission.spec.inputs.dataset.id != dataset.manifest_id
+        || mission.spec.inputs.dataset.content_sha256 != canonical_json_hash(dataset)?
+    {
+        bail!("CEX Research Mission dataset identities do not match admitted manifests");
+    }
     Ok(())
 }
 
@@ -552,7 +441,8 @@ fn validate_materialization(
     {
         bail!("materialization kind or schema is unsupported");
     }
-    if materialization.symbol.trim().is_empty()
+    if materialization.mission_id.trim().is_empty()
+        || materialization.symbol.trim().is_empty()
         || !matches!(materialization.market.as_str(), "spot" | "usdm")
         || materialization.source_revision.trim().is_empty()
         || materialization.source_segments.is_empty()
@@ -763,6 +653,14 @@ fn engine_name(engine: EngineChoice) -> &'static str {
 mod tests {
     use super::*;
     use crate::cli::ValidationArgs;
+    use alpha_domain::{
+        CexResearchContentRefV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
+        CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
+        CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
+        CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionSpecV1,
+        CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
+        CexResearchVenueV1, EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use hft_collector::{DataModality, PointInTimeFeatureRow};
     use std::{
@@ -776,9 +674,10 @@ mod tests {
     #[test]
     fn execute_rejects_features_that_have_no_live_formula_semantics() {
         let mut fixture = fixture("unsupported-live-fields");
-        fixture.args.feature_fields = vec!["book_imbalance_top5".to_string()];
+        fixture.mission.spec.feature_fields = vec!["book_imbalance_top5".to_string()];
+        resign_mission(&mut fixture);
 
-        let error = validate_args(&fixture.args).unwrap_err();
+        let error = execute(fixture.args.clone()).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -788,37 +687,125 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_bayesian_window_search_before_materialization() {
-        let mut fixture = fixture("bayesian-window-search");
-        fixture.args.engine = EngineChoice::Bayesian;
+    fn execute_rejects_unknown_mission_schema_before_materialization() {
+        let mut fixture = fixture("unknown-mission-schema");
+        fixture.mission.schema_version = "cex-research-mission-v999".to_string();
+        write_mission(&mut fixture);
 
-        let error = validate_args(&fixture.args).unwrap_err();
+        let error = execute(fixture.args.clone()).unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "Bayesian window search is research-only and cannot produce live-executable formulas"
-        );
+        assert!(error.to_string().contains("schema version is unsupported"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_tampered_mission_artifact_before_admission() {
+        let fixture = fixture("tampered-mission-artifact");
+        let mut bytes = std::fs::read(&fixture.mission_path).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&fixture.mission_path, bytes).unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Mission artifact SHA256 mismatch"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_cross_instrument_mission_before_admission() {
+        let mut fixture = fixture("cross-instrument-mission");
+        fixture.mission.spec.instrument.symbol = "ETHUSDT".to_string();
+        write_mission(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("instrument or horizon does not match materialization"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_prediction_market_fields_before_admission() {
+        let mut fixture = fixture("cross-lane-mission");
+        let mut value = serde_json::to_value(&fixture.mission).unwrap();
+        value["task_capability"] = serde_json::json!("btc_5m_backtest");
+        value["cohort_manifest_id"] = serde_json::json!("prediction-cohort-1");
+        value["settlement"] = serde_json::json!({"token_id": "yes-token"});
+        std::fs::write(
+            &fixture.mission_path,
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        fixture.args.mission_sha256 = sha256_file(&fixture.mission_path).unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_agent_action_fields_before_admission() {
+        let mut fixture = fixture("agent-action-mission");
+        let mut value = serde_json::to_value(&fixture.mission).unwrap();
+        value["spec"]["actions"] = serde_json::json!([
+            "evaluate",
+            "open_holdout",
+            "create_deployment_envelope",
+            "submit_order",
+            "start_live_small"
+        ]);
+        std::fs::write(
+            &fixture.mission_path,
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        fixture.args.mission_sha256 = sha256_file(&fixture.mission_path).unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_exposed_holdout_from_resumed_search() {
+        let mut fixture = fixture("resumed-search-holdout-evidence");
+        fixture.mission.spec.evidence[0].kind = CexResearchEvidenceKindV1::ExposedHoldout;
+        fixture.mission.spec.evidence[0].source_search_lineage_id =
+            fixture.mission.spec.search_lineage_id.clone();
+        fixture.mission.spec.evidence[0].holdout_id = Some("earlier-holdout-1".to_string());
+        write_mission(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("exposed holdout evidence cannot feed the same search"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[test]
     fn execute_rejects_feature_hash_mismatch() {
-        let fixture = fixture("hash-mismatch");
-        let mut materialization = fixture.materialization;
-        materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
-        materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!("0".repeat(64));
+        let mut fixture = fixture("hash-mismatch");
+        fixture.materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
+        fixture.materialization["snapshot"]["feature_artifact_sha256"] =
+            serde_json::json!("0".repeat(64));
         let snapshot: CexReplaySnapshotV1 =
-            serde_json::from_value(materialization["snapshot"].clone()).unwrap();
-        materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
-        std::fs::write(
-            &fixture.materialization_path,
-            serde_json::to_vec_pretty(&materialization).unwrap(),
-        )
-        .unwrap();
-        let mut args = fixture.args;
-        args.materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
+            serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
+        fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+        resign_materialization_outer(&mut fixture);
 
-        let error = execute(args).unwrap_err();
+        let error = execute(fixture.args.clone()).unwrap_err();
 
         assert!(error
             .to_string()
@@ -828,9 +815,8 @@ mod tests {
 
     #[test]
     fn execute_rejects_snapshot_missing_aggregate_trade_modality() {
-        let fixture = fixture("missing-aggregate-trade-modality");
-        let mut materialization = fixture.materialization;
-        materialization["snapshot"] = serde_json::json!({
+        let mut fixture = fixture("missing-aggregate-trade-modality");
+        fixture.materialization["snapshot"] = serde_json::json!({
             "schema_version": "cex-replay-snapshot-v1",
             "venue": "binance",
             "instrument_type": "usdm",
@@ -844,24 +830,18 @@ mod tests {
                 "end_received_at_ns": 2,
                 "events": 1
             }],
-            "first_event_time": materialization["first_event_time"].clone(),
-            "last_event_time": materialization["last_event_time"].clone(),
-            "feature_artifact_sha256": materialization["artifact_sha256"].clone(),
+            "first_event_time": fixture.materialization["first_event_time"].clone(),
+            "last_event_time": fixture.materialization["last_event_time"].clone(),
+            "feature_artifact_sha256": fixture.materialization["artifact_sha256"].clone(),
             "feature_availability_policy": "feature_available_time_equals_event_time",
             "bucket_ms": 1_000,
             "label_horizon_buckets": 5,
             "top_depth": 5
         });
-        materialization["snapshot_sha256"] = serde_json::json!("0".repeat(64));
-        std::fs::write(
-            &fixture.materialization_path,
-            serde_json::to_vec_pretty(&materialization).unwrap(),
-        )
-        .unwrap();
-        let mut args = fixture.args;
-        args.materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
+        fixture.materialization["snapshot_sha256"] = serde_json::json!("0".repeat(64));
+        resign_materialization_outer(&mut fixture);
 
-        let error = execute(args).unwrap_err();
+        let error = execute(fixture.args.clone()).unwrap_err();
 
         assert!(error.to_string().contains("required modalities"));
         std::fs::remove_dir_all(fixture.root).unwrap();
@@ -882,6 +862,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mission.dataset_manifest_id.as_str(), expected);
+        assert_eq!(mission.mission_id, fixture.mission.semantic_id().unwrap());
+        let admission: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/mission-admission.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(admission["mission_id"], mission.mission_id);
+        assert_eq!(
+            admission["mission_artifact_sha256"],
+            fixture.args.mission_sha256
+        );
+        assert_eq!(admission["dataset_manifest_id"], expected);
+        let store = AlphaStore::open(fixture.args.work_dir.join("results/alpha.duckdb")).unwrap();
+        let revision = store.get_registry_revision(&mission.mission_id).unwrap();
+        assert_eq!(revision.revision_id, mission.mission_id);
+        assert_eq!(revision.registry_kind, "cex_research_mission");
+        assert_eq!(revision.asset_id, "BTCUSDT");
+        assert_eq!(
+            revision.parent_revision_id.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            revision.payload,
+            serde_json::json!({
+                "schema_version": &fixture.mission.schema_version,
+                "spec": &fixture.mission.spec,
+            })
+        );
+        drop(store);
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -903,13 +911,12 @@ mod tests {
     #[test]
     fn execute_rejects_feature_source_revision_not_bound_to_snapshot_segments() {
         let mut fixture = fixture("forged-feature-source-revision");
+        let forged_revision = "9".repeat(64);
         rewrite_features(&mut fixture, |row| {
-            row.source_revisions.insert(
-                "binance-usdm-lob".to_string(),
-                "forged-revision".to_string(),
-            );
+            row.source_revisions
+                .insert("binance-usdm-lob".to_string(), forged_revision.clone());
         });
-        fixture.materialization["source_revision"] = serde_json::json!("forged-revision");
+        fixture.materialization["source_revision"] = serde_json::json!(forged_revision);
         resign_materialization(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
@@ -980,8 +987,6 @@ mod tests {
 
         let mut second_args = fixture.args;
         second_args.work_dir = fixture.root.join("work-2");
-        second_args.data_mission_id = "data-2".to_string();
-        second_args.mission_id = "mission-2".to_string();
         let error = execute(second_args).unwrap_err();
 
         assert!(error
@@ -993,21 +998,29 @@ mod tests {
     #[test]
     fn execute_records_explicit_taker_costs_in_evidence() {
         let mut fixture = fixture("explicit-taker-costs");
-        fixture.args.validation.rebate_bps = 0.25;
-        fixture.args.validation.slippage_bps = 0.75;
-        fixture.args.validation.cross_spread = true;
-        fixture.args.validation.position_notional_usd = 10_000.0;
-        fixture.args.validation.capacity_depth_levels = 5;
-        fixture.args.validation.max_book_depth_fraction = 0.1;
-        let stale_receipt = fixture
-            .args
-            .work_dir
-            .join("results/mcts-research-receipt.json");
-        std::fs::create_dir_all(stale_receipt.parent().unwrap()).unwrap();
-        std::fs::write(&stale_receipt, b"stale\n").unwrap();
-
+        fixture.mission.spec.evaluation_protocol.costs.rebate_bps = 0.25;
+        fixture.mission.spec.evaluation_protocol.costs.slippage_bps = 0.75;
+        fixture.mission.spec.evaluation_protocol.costs.cross_spread = true;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .position_notional_usd = 10_000.0;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .capacity_depth_levels = 5;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .max_book_depth_fraction = 0.1;
+        resign_mission(&mut fixture);
         execute(fixture.args.clone()).unwrap();
-        assert!(!stale_receipt.exists());
 
         let evidence: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.args.work_dir.join("results/candidates.json")).unwrap(),
@@ -1052,105 +1065,49 @@ mod tests {
             execution_model["capacity_gate_model"],
             "same_side_top_n_depth_fraction"
         );
-        assert!(
-            std::fs::read_to_string(
-                fixture
-                    .args
-                    .work_dir
-                    .join("results/sealed-evaluations.jsonl")
-            )
-            .unwrap()
-            .lines()
-            .count()
-                <= 1
-        );
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/sealed-evaluations.jsonl")
+            .exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[test]
-    fn execute_emits_a_bound_mcts_research_receipt() {
-        let mut fixture = fixture("bound-mcts-research-receipt");
-        fixture.args.max_candidates = 2;
-        fixture.args.max_expansions = 2;
-        fixture.args.max_new_iterations = 1;
-        rewrite_features(&mut fixture, |row| {
-            row.features.insert("book_imbalance".to_string(), -1.5);
-            row.features.insert(
-                "spread_bps".to_string(),
-                if row.label > 0.0 { 1.0 } else { 0.0 },
-            );
-        });
+    fn execute_stops_before_sealed_holdout() {
+        let fixture = fixture("sealed-holdout-remains-closed");
 
         execute(fixture.args.clone()).unwrap();
 
-        let receipt: alpha_domain::CexMctsResearchReceiptV1 = serde_json::from_slice(
-            &std::fs::read(
-                fixture
-                    .args
-                    .work_dir
-                    .join("results/mcts-research-receipt.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        receipt.validate().unwrap();
-        let candidates: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(fixture.args.work_dir.join("results/candidates.json")).unwrap(),
-        )
-        .unwrap();
-        let status: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(fixture.args.work_dir.join("results/mission-status.json")).unwrap(),
-        )
-        .unwrap();
-        let checkpoint: RunCheckpoint =
-            serde_json::from_value(status["checkpoint"].clone()).unwrap();
-        let run: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(fixture.args.work_dir.join("results/mission-run.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(run["total_iterations"], 2);
-        assert_eq!(receipt.selected_candidate_id, "mission-1-mcts-2");
-        assert_eq!(receipt.mission_id, fixture.args.mission_id);
-        assert_eq!(
-            receipt.dataset_manifest_id.as_str(),
-            candidates["evaluations"][0]["record"]["dataset_manifest_id"]
-                .as_str()
-                .unwrap()
-        );
-        assert_eq!(
-            receipt.search_identity_hash,
-            canonical_json_hash(&checkpoint.engine_state["config"]).unwrap()
-        );
-        assert_eq!(
-            receipt.checkpoint_hash,
-            canonical_json_hash(&checkpoint).unwrap()
-        );
-        assert_eq!(
-            std::fs::read_to_string(
-                fixture
-                    .args
-                    .work_dir
-                    .join("results/sealed-evaluations.jsonl")
-            )
-            .unwrap()
-            .lines()
-            .count(),
-            1
-        );
+        let results = fixture.args.work_dir.join("results");
+        assert!(results.join("mission-admission.json").exists());
+        assert!(!results.join("sealed-evaluations.jsonl").exists());
+        assert!(!results.join("mcts-research-receipt.json").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_preserves_prior_holdout_evidence_in_reused_work_dir() {
+        let fixture = fixture("preserve-prior-holdout");
+        let results = fixture.args.work_dir.join("results");
+        let sealed = results.join("sealed-evaluations.jsonl");
+        let receipt = results.join("mcts-research-receipt.json");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::write(&sealed, b"sealed-evidence\n").unwrap();
+        std::fs::write(&receipt, b"sealed-receipt\n").unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error.to_string().contains("fresh work directory"));
+        assert_eq!(std::fs::read(&sealed).unwrap(), b"sealed-evidence\n");
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"sealed-receipt\n");
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[test]
     fn baseline_execution_model_discloses_zero_slippage_and_unmodeled_microstructure() {
         let fixture = fixture("baseline-execution-model");
-        let protocol = fixture
-            .args
-            .validation
-            .evaluation_protocol(&EvaluationLabelSpecV1 {
-                horizon_buckets: fixture.args.validation.label_horizon_buckets,
-                observation_frequency_millis: fixture.args.validation.observation_frequency_millis,
-            })
-            .unwrap();
+        let protocol = &fixture.mission.spec.evaluation_protocol;
         let evidence = serde_json::to_value(ExecutionModelEvidence::from(&protocol.costs)).unwrap();
 
         assert_eq!(evidence["fee_bps"], 2.0);
@@ -1170,7 +1127,13 @@ mod tests {
     #[test]
     fn incomplete_capacity_inputs_fail_before_execution_evidence_is_written() {
         let mut fixture = fixture("incomplete-capacity-evidence");
-        fixture.args.validation.position_notional_usd = 10_000.0;
+        fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .costs
+            .position_notional_usd = 10_000.0;
+        write_mission(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
@@ -1269,8 +1232,10 @@ mod tests {
     struct Fixture {
         root: PathBuf,
         feature_path: PathBuf,
+        mission_path: PathBuf,
         materialization_path: PathBuf,
         result_path: PathBuf,
+        mission: CexResearchMissionArtifactV1,
         materialization: serde_json::Value,
         args: ExecuteMissionArgs,
     }
@@ -1358,7 +1323,7 @@ mod tests {
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
             "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
-            "mission_id": "materialize-1",
+            "mission_id": "data-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
             "bucket_ms": 1000,
@@ -1391,49 +1356,159 @@ mod tests {
             serde_json::to_vec_pretty(&materialization).unwrap(),
         )
         .unwrap();
+        let validation = ValidationArgs {
+            initial_train_rows: 40,
+            validation_rows: 30,
+            fold_count: 2,
+            purge_rows: 5,
+            embargo_rows: 1,
+            sealed_holdout_rows: 30,
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+            label_horizon_buckets: 5,
+            observation_frequency_millis: 1_000,
+        };
+        let evaluation_protocol = validation
+            .evaluation_protocol(&EvaluationLabelSpecV1 {
+                horizon_buckets: 5,
+                observation_frequency_millis: 1_000,
+            })
+            .unwrap();
+        let search = CexResearchSearchPlanV1 {
+            seed: 7,
+            budget: SearchBudget {
+                max_candidates: 1,
+                max_expansions: 1,
+                max_tokens: 0,
+                max_seconds: 5,
+            },
+            max_new_iterations: 1,
+        };
+        let reference = |id: &str, byte: char| CexResearchContentRefV1 {
+            id: id.to_string(),
+            content_sha256: byte.to_string().repeat(64),
+        };
+        let materialization_sha256 = sha256_file(&materialization_path).unwrap();
+        let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
+        let dataset =
+            CexReplayDatasetManifestV1::new(format!("dataset-{feature_sha256}"), snapshot.clone())
+                .unwrap();
+        let mission = CexResearchMissionArtifactV1 {
+            schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
+            spec: CexResearchMissionSpecV1 {
+                objective: "test objective".to_string(),
+                search_lineage_id: "search-lineage-1".to_string(),
+                data_mission_id: "data-1".to_string(),
+                instrument: CexResearchInstrumentV1 {
+                    venue: CexResearchVenueV1::Binance,
+                    market: CexResearchMarketV1::Usdm,
+                    symbol: "BTCUSDT".to_string(),
+                    horizon: evaluation_protocol.labels.clone(),
+                },
+                hypotheses: vec![CexResearchHypothesisV1 {
+                    hypothesis_id: "hypothesis-1".to_string(),
+                    statement: "LOB imbalance predicts the next five buckets".to_string(),
+                    target: CexResearchHypothesisTargetV1 {
+                        name: "forward_mid_return".to_string(),
+                        horizon: evaluation_protocol.labels.clone(),
+                    },
+                    required_feature_families: vec!["book_imbalance".to_string()],
+                    required_template_families: vec!["signed_rolling_imbalance".to_string()],
+                    falsification_tests: vec![CexResearchFalsificationTestV1 {
+                        test_id: "rank-ic-positive".to_string(),
+                        reject_when: "purged validation rank IC is non-positive".to_string(),
+                    }],
+                    source_evidence_ids: vec!["evidence-training-1".to_string()],
+                }],
+                inputs: CexResearchInputBindingsV1 {
+                    dataset: CexResearchContentRefV1 {
+                        id: dataset.manifest_id.clone(),
+                        content_sha256: canonical_json_hash(&dataset).unwrap(),
+                    },
+                    snapshot: CexResearchContentRefV1 {
+                        id: format!("cex-replay-snapshot-{snapshot_sha256}"),
+                        content_sha256: snapshot_sha256.clone(),
+                    },
+                    partition: CexResearchContentRefV1 {
+                        id: format!("cex-replay-partition-{partition_sha256}"),
+                        content_sha256: partition_sha256,
+                    },
+                    source: CexResearchContentRefV1 {
+                        id: source_revision.clone(),
+                        content_sha256: source_revision.clone(),
+                    },
+                    feature: CexResearchContentRefV1 {
+                        id: format!("dataset-{feature_sha256}"),
+                        content_sha256: feature_sha256.clone(),
+                    },
+                    materialization: CexResearchContentRefV1 {
+                        id: "data-1".to_string(),
+                        content_sha256: materialization_sha256,
+                    },
+                },
+                policies: CexResearchPolicyBindingsV1 {
+                    gp: reference("gp-policy-1", '1'),
+                    screening: reference("screening-policy-1", '2'),
+                    baseline: reference("baseline-policy-1", '3'),
+                    subset_search: CexResearchContentRefV1 {
+                        id: "subset-search-policy-1".to_string(),
+                        content_sha256: canonical_json_hash(&search).unwrap(),
+                    },
+                    weight: reference("weight-policy-1", '4'),
+                    evaluation: CexResearchContentRefV1 {
+                        id: "evaluation-policy-1".to_string(),
+                        content_sha256: evaluation_protocol.content_hash().unwrap(),
+                    },
+                    replay: reference("replay-policy-1", '5'),
+                    holdout: reference("holdout-policy-1", '6'),
+                },
+                evidence: vec![CexResearchEvidenceRefV1 {
+                    evidence_id: "evidence-training-1".to_string(),
+                    kind: CexResearchEvidenceKindV1::TrainingValidation,
+                    source_mission_id: "earlier-mission-1".to_string(),
+                    source_search_lineage_id: "earlier-search-lineage-1".to_string(),
+                    artifact_sha256: "7".repeat(64),
+                    signature: None,
+                    holdout_id: None,
+                }],
+                feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+                search,
+                evaluation_protocol,
+                holdout: CexResearchHoldoutV1 {
+                    holdout_id: "holdout-fresh-1".to_string(),
+                    state: CexResearchHoldoutStateV1::Unopened,
+                },
+            },
+            operational: CexResearchOperationalMetadataV1 {
+                submitted_at: Some(Utc::now()),
+            },
+        };
+        mission.validate().unwrap();
+        let mission_path = root.join("mission.json");
+        std::fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
         let result_path = root.join("result.zip");
         let args = ExecuteMissionArgs {
             work_dir: root.join("work-1"),
+            mission_url: mission_path.to_string_lossy().into_owned(),
+            mission_sha256: sha256_file(&mission_path).unwrap(),
             feature_url: feature_path.to_string_lossy().into_owned(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),
-            materialization_sha256: sha256_file(&materialization_path).unwrap(),
             result_put_url: result_path.to_string_lossy().into_owned(),
-            data_mission_id: "data-1".to_string(),
-            mission_id: "mission-1".to_string(),
-            engine: EngineChoice::Mcts,
-            feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
-            seed: 7,
-            max_candidates: 1,
-            max_expansions: 1,
-            max_seconds: 5,
-            max_new_iterations: 1,
-            objective: "test objective".to_string(),
-            hypothesis_scope: "test scope".to_string(),
-            validation: ValidationArgs {
-                initial_train_rows: 40,
-                validation_rows: 30,
-                fold_count: 2,
-                purge_rows: 5,
-                embargo_rows: 1,
-                sealed_holdout_rows: 30,
-                fee_bps: 2.0,
-                rebate_bps: 0.0,
-                funding_bps: 0.0,
-                latency_bps: 0.5,
-                slippage_bps: 0.0,
-                cross_spread: false,
-                position_notional_usd: 0.0,
-                capacity_depth_levels: 0,
-                max_book_depth_fraction: 0.0,
-                label_horizon_buckets: 5,
-                observation_frequency_millis: 1_000,
-            },
         };
         Fixture {
             root,
             feature_path,
+            mission_path,
             materialization_path,
             result_path,
+            mission,
             materialization,
             args,
         }
@@ -1458,6 +1533,84 @@ mod tests {
         resign_materialization(fixture);
     }
 
+    fn write_mission(fixture: &mut Fixture) {
+        std::fs::write(
+            &fixture.mission_path,
+            serde_json::to_vec_pretty(&fixture.mission).unwrap(),
+        )
+        .unwrap();
+        fixture.args.mission_sha256 = sha256_file(&fixture.mission_path).unwrap();
+    }
+
+    fn resign_mission(fixture: &mut Fixture) {
+        fixture.mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&fixture.mission.spec.search).unwrap();
+        fixture.mission.spec.policies.evaluation.content_sha256 = fixture
+            .mission
+            .spec
+            .evaluation_protocol
+            .content_hash()
+            .unwrap();
+        write_mission(fixture);
+    }
+
+    fn rebind_mission_inputs(fixture: &mut Fixture) {
+        let snapshot: CexReplaySnapshotV1 =
+            serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
+        let snapshot_sha256 = snapshot.sha256();
+        let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
+        let feature_sha256 = sha256_file(&fixture.feature_path).unwrap();
+        let source_revision = fixture.materialization["source_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let data_mission_id = fixture.materialization["mission_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dataset =
+            CexReplayDatasetManifestV1::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
+        fixture.mission.spec.data_mission_id = data_mission_id.clone();
+        fixture.mission.spec.inputs = CexResearchInputBindingsV1 {
+            dataset: CexResearchContentRefV1 {
+                id: dataset.manifest_id.clone(),
+                content_sha256: canonical_json_hash(&dataset).unwrap(),
+            },
+            snapshot: CexResearchContentRefV1 {
+                id: format!("cex-replay-snapshot-{snapshot_sha256}"),
+                content_sha256: snapshot_sha256,
+            },
+            partition: CexResearchContentRefV1 {
+                id: format!("cex-replay-partition-{partition_sha256}"),
+                content_sha256: partition_sha256,
+            },
+            source: CexResearchContentRefV1 {
+                id: source_revision.clone(),
+                content_sha256: source_revision,
+            },
+            feature: CexResearchContentRefV1 {
+                id: format!("dataset-{feature_sha256}"),
+                content_sha256: feature_sha256,
+            },
+            materialization: CexResearchContentRefV1 {
+                id: data_mission_id,
+                content_sha256: sha256_file(&fixture.materialization_path).unwrap(),
+            },
+        };
+        resign_mission(fixture);
+    }
+
+    fn resign_materialization_outer(fixture: &mut Fixture) {
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&fixture.materialization).unwrap(),
+        )
+        .unwrap();
+        fixture.mission.spec.inputs.materialization.content_sha256 =
+            sha256_file(&fixture.materialization_path).unwrap();
+        write_mission(fixture);
+    }
+
     fn resign_materialization(fixture: &mut Fixture) {
         let snapshot: CexReplaySnapshotV1 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
@@ -1467,6 +1620,6 @@ mod tests {
             serde_json::to_vec_pretty(&fixture.materialization).unwrap(),
         )
         .unwrap();
-        fixture.args.materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
+        rebind_mission_inputs(fixture);
     }
 }

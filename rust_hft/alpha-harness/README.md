@@ -48,7 +48,33 @@ cargo run -p alpha-harness -- candidate list \
   --db var/alpha.duckdb --mission-id mission-1
 ```
 
-`--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
+The bounded CEX entrypoint consumes a separate Agent-produced,
+content-addressed `cex-research-mission-v1` artifact:
+
+```bash
+cargo run -p alpha-harness -- mission execute \
+  --work-dir var/runs/cex-mission-1 \
+  --mission-url var/missions/cex-mission.json \
+  --mission-sha256 "$MISSION_SHA256" \
+  --feature-url var/materializations/features.jsonl \
+  --materialization-url var/materializations/materialization.json \
+  --result-put-url var/results/cex-mission-1.zip
+```
+
+The artifact binds one Binance Spot or USD-M instrument and horizon, typed
+hypotheses and falsifiers, immutable data/policy identities, the search and
+evaluation protocol, and typed prior-evidence references. The command derives
+research fields, budgets, and costs from that artifact; they are not accepted
+as alternate execute flags. Unknown fields, Prediction Market fields, action
+requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
+feedback fail before Mission admission. `operational.submitted_at` is retained
+for audit but does not alter the semantic Mission identity. Execution stops
+after research candidate selection; sealed-holdout evaluation requires the
+separate governed precommit boundary. This schema binds prior-evidence
+identities; later holdout and Paper/Shadow gates own receipt and signature
+verification.
+
+For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT

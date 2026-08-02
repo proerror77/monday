@@ -298,6 +298,28 @@ pub struct ValidationArgs {
 }
 
 impl ValidationArgs {
+    pub fn from_protocol(protocol: &EvaluationProtocolV1) -> Self {
+        Self {
+            initial_train_rows: protocol.walk_forward.initial_train_rows,
+            validation_rows: protocol.walk_forward.validation_rows,
+            fold_count: protocol.walk_forward.fold_count,
+            purge_rows: protocol.walk_forward.purge_rows,
+            embargo_rows: protocol.walk_forward.embargo_rows,
+            sealed_holdout_rows: protocol.walk_forward.sealed_holdout_rows,
+            fee_bps: protocol.costs.fee_bps,
+            rebate_bps: protocol.costs.rebate_bps,
+            funding_bps: protocol.costs.funding_bps,
+            latency_bps: protocol.costs.latency_bps,
+            slippage_bps: protocol.costs.slippage_bps,
+            cross_spread: protocol.costs.cross_spread,
+            position_notional_usd: protocol.costs.position_notional_usd,
+            capacity_depth_levels: protocol.costs.capacity_depth_levels,
+            max_book_depth_fraction: protocol.costs.max_book_depth_fraction,
+            label_horizon_buckets: protocol.labels.horizon_buckets,
+            observation_frequency_millis: protocol.labels.observation_frequency_millis,
+        }
+    }
+
     pub fn evaluation_protocol(
         &self,
         labels: &EvaluationLabelSpecV1,
@@ -337,37 +359,15 @@ pub struct ExecuteMissionArgs {
     #[arg(long)]
     pub work_dir: PathBuf,
     #[arg(long)]
+    pub mission_url: String,
+    #[arg(long)]
+    pub mission_sha256: String,
+    #[arg(long)]
     pub feature_url: String,
     #[arg(long)]
     pub materialization_url: String,
     #[arg(long)]
-    pub materialization_sha256: String,
-    #[arg(long)]
     pub result_put_url: String,
-    #[arg(long)]
-    pub data_mission_id: String,
-    #[arg(long)]
-    pub mission_id: String,
-    #[arg(long, value_enum)]
-    pub engine: EngineChoice,
-    #[arg(long, value_delimiter = ',')]
-    pub feature_fields: Vec<String>,
-    #[arg(long, default_value_t = 7)]
-    pub seed: u64,
-    #[arg(long, default_value_t = 8)]
-    pub max_candidates: usize,
-    #[arg(long, default_value_t = 40)]
-    pub max_expansions: u64,
-    #[arg(long, default_value_t = 300)]
-    pub max_seconds: u64,
-    #[arg(long, default_value_t = 8)]
-    pub max_new_iterations: usize,
-    #[arg(long, default_value = "Find a cost-aware, out-of-sample LOB factor")]
-    pub objective: String,
-    #[arg(long, default_value = "LOB imbalance and order-flow dynamics")]
-    pub hypothesis_scope: String,
-    #[command(flatten)]
-    pub validation: ValidationArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -750,6 +750,11 @@ mod tests {
     async fn mission_execute_runs_blocking_pipeline_outside_async_runtime() {
         let root = tempfile::tempdir().unwrap();
         let work_dir = root.path().join("work").display().to_string();
+        let missing_mission = root
+            .path()
+            .join("missing-mission.json")
+            .display()
+            .to_string();
         let missing_features = root
             .path()
             .join("missing-features.jsonl")
@@ -767,26 +772,16 @@ mod tests {
             "execute".to_owned(),
             "--work-dir".to_owned(),
             work_dir,
+            "--mission-url".to_owned(),
+            missing_mission.clone(),
+            "--mission-sha256".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "--feature-url".to_owned(),
-            missing_features.clone(),
+            missing_features,
             "--materialization-url".to_owned(),
             missing_materialization,
-            "--materialization-sha256".to_owned(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "--result-put-url".to_owned(),
             result,
-            "--data-mission-id".to_owned(),
-            "data-1".to_owned(),
-            "--mission-id".to_owned(),
-            "mission-1".to_owned(),
-            "--engine".to_owned(),
-            "mcts".to_owned(),
-            "--feature-fields".to_owned(),
-            "book_imbalance".to_owned(),
-            "--label-horizon-buckets".to_owned(),
-            "5".to_owned(),
-            "--observation-frequency-millis".to_owned(),
-            "1000".to_owned(),
         ])
         .unwrap();
 
@@ -794,7 +789,7 @@ mod tests {
 
         assert!(
             format!("{error:#}")
-                .contains(&format!("failed to open local source {missing_features}")),
+                .contains(&format!("failed to open local source {missing_mission}")),
             "unexpected error: {error:#}"
         );
     }
@@ -1049,26 +1044,16 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-url",
+            "mission.json",
+            "--mission-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--feature-url",
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
-            "--materialization-sha256",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--result-put-url",
             "results.zip",
-            "--data-mission-id",
-            "data-1",
-            "--mission-id",
-            "mission-1",
-            "--engine",
-            "mcts",
-            "--feature-fields",
-            "book_imbalance_top5,ofi_top5",
-            "--label-horizon-buckets",
-            "5",
-            "--observation-frequency-millis",
-            "1000",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -1086,46 +1071,25 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
     }
 
     #[test]
-    fn parses_explicit_taker_execution_costs() {
+    fn mission_execute_accepts_only_content_bound_mission_transport() {
         let cli = Cli::try_parse_from([
             "alpha-harness",
             "mission",
             "execute",
             "--work-dir",
             "work",
+            "--mission-url",
+            "mission.json",
+            "--mission-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--feature-url",
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
-            "--materialization-sha256",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--result-put-url",
             "results.zip",
-            "--data-mission-id",
-            "data-1",
-            "--mission-id",
-            "mission-1",
-            "--engine",
-            "mcts",
-            "--feature-fields",
-            "book_imbalance",
-            "--latency-bps",
-            "0.5",
-            "--slippage-bps",
-            "0.75",
-            "--cross-spread",
-            "--position-notional-usd",
-            "10000",
-            "--capacity-depth-levels",
-            "5",
-            "--max-book-depth-fraction",
-            "0.1",
-            "--label-horizon-buckets",
-            "5",
-            "--observation-frequency-millis",
-            "1000",
         ])
-        .expect("explicit taker execution costs must be accepted");
+        .expect("content-bound Mission transport must be accepted");
 
         let Command::Mission {
             command: MissionCommand::Execute(args),
@@ -1133,11 +1097,29 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
         else {
             panic!("expected mission execute command")
         };
-        assert_eq!(args.validation.slippage_bps, 0.75);
-        assert!(args.validation.cross_spread);
-        assert_eq!(args.validation.position_notional_usd, 10_000.0);
-        assert_eq!(args.validation.capacity_depth_levels, 5);
-        assert_eq!(args.validation.max_book_depth_fraction, 0.1);
+        assert_eq!(args.mission_url, "mission.json");
+        assert_eq!(args.mission_sha256, "b".repeat(64));
+
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "execute",
+            "--work-dir",
+            "work",
+            "--mission-url",
+            "mission.json",
+            "--mission-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--feature-url",
+            "features.jsonl",
+            "--materialization-url",
+            "materialization.json",
+            "--result-put-url",
+            "results.zip",
+            "--objective",
+            "alternate authority",
+        ])
+        .is_err());
     }
 
     #[test]
