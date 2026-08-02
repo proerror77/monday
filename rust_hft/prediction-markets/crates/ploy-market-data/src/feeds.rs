@@ -1175,31 +1175,35 @@ fn market_update_from_clob_book(
 ) -> Result<(Vec<MarketUpdate>, i64), String> {
     let pending = std::mem::take(&mut state.pending);
     state.replace(book)?;
-    // Replay deltas buffered since (re)subscription in arrival order, keeping
-    // those at or newer than the snapshot millisecond (the live path likewise
-    // only skips strictly older batches), and rebuild the timestamp watermark
-    // from what was actually applied.
+    // Replay buffered messages in arrival order. Messages strictly older than
+    // an already-applied timestamp are skipped (the live path likewise rejects
+    // regressing source time), each replayed message's final entry faces the
+    // same BBA reconciliation as a live batch, and the timestamp watermark is
+    // rebuilt from what was actually applied.
     let mut watermark = book.timestamp;
-    let mut last_replayed = None;
-    for (timestamp, entry) in &pending {
-        if *timestamp < book.timestamp {
+    let mut replay_dirty = false;
+    for (index, (timestamp, entry)) in pending.iter().enumerate() {
+        if *timestamp < watermark {
             continue;
         }
         state.apply(entry, *timestamp);
-        watermark = watermark.max(*timestamp);
-        last_replayed = Some(entry);
+        watermark = *timestamp;
+        let message_ends = pending
+            .get(index + 1)
+            .is_none_or(|(next_timestamp, _)| next_timestamp != timestamp);
+        if message_ends
+            && (entry
+                .best_bid
+                .is_some_and(|price| pm_tradeable_price(price) && !state.bids.contains_key(&price))
+                || entry.best_ask.is_some_and(|price| {
+                    pm_tradeable_price(price) && !state.asks.contains_key(&price)
+                }))
+        {
+            replay_dirty = true;
+            break;
+        }
     }
-    // Replayed deltas face the same BBA reconciliation as a live batch: if a
-    // reported level is still missing, isolate the token instead of
-    // publishing an unverified quote.
-    if last_replayed.is_some_and(|entry| {
-        entry
-            .best_bid
-            .is_some_and(|price| pm_tradeable_price(price) && !state.bids.contains_key(&price))
-            || entry
-                .best_ask
-                .is_some_and(|price| pm_tradeable_price(price) && !state.asks.contains_key(&price))
-    }) {
+    if replay_dirty {
         *state = ClobBookState::default();
         state.dirty = true;
         return Ok((
@@ -1207,12 +1211,28 @@ fn market_update_from_clob_book(
             watermark,
         ));
     }
-    let ts = DateTime::from_timestamp_millis(book.timestamp)
+    let ts = DateTime::from_timestamp_millis(watermark)
         .ok_or_else(|| "Polymarket book timestamp is out of range".to_string())?;
-    Ok((
-        vec![state.quote(book.asset_id.to_string(), ts, None)],
-        watermark,
-    ))
+    let quote = state.quote(book.asset_id.to_string(), ts, None);
+    // A replayed book can cross when buffered entries lack BBA fields, so the
+    // final quote faces the same crossed-book check as a live batch, with the
+    // same in-band isolation as the reconciliation above.
+    if let MarketUpdate::Quote {
+        bid: Some(bid),
+        ask: Some(ask),
+        ..
+    } = quote
+    {
+        if bid > ask {
+            *state = ClobBookState::default();
+            state.dirty = true;
+            return Ok((
+                clob_failed_closed_updates(&book.asset_id.to_string(), Utc::now()),
+                watermark,
+            ));
+        }
+    }
+    Ok((vec![quote], watermark))
 }
 
 fn market_updates_from_price_change(
@@ -3264,6 +3284,201 @@ mod tests {
         assert!(books["7"].bids.contains_key(&dec!(0.55)));
         assert!(!books["7"].bids.contains_key(&dec!(0.70)));
         assert!(books["7"].pending.is_empty());
+    }
+
+    #[test]
+    fn clob_replay_crossed_book_isolates_token_instead_of_publishing() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        // Without BBA fields apply() cannot prune the opposite side, so the
+        // replayed level crosses the snapshot ask.
+        let crossing = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600150",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.65", "size": "3", "side": "BUY", "hash": null
+            }]
+        }))
+        .expect("valid crossing pre-snapshot price change");
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        market_updates_from_price_change(&crossing, &mut books, &mut timestamps)
+            .expect("crossing delta is buffered");
+
+        let (updates, _) =
+            market_update_from_clob_book(&book, books.get_mut("7").expect("syncing token state"))
+                .expect("a crossed replay must isolate the token, not error the batch");
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::QuoteCollectionFailure {
+                    token_id,
+                    error_kind,
+                    ..
+                }, MarketUpdate::Quote {
+                    token_id: quote_token_id,
+                    bid: None,
+                    ask: None,
+                    ..
+                }] if token_id.as_ref() == "7"
+                    && error_kind.as_ref() == "websocket_payload"
+                    && quote_token_id.as_ref() == "7"
+            ),
+            "a crossed replayed book must fail closed instead of publishing"
+        );
+        assert!(books["7"].dirty);
+    }
+
+    #[test]
+    fn clob_replayed_quote_carries_the_replay_watermark_timestamp() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600150",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.55", "size": "3", "side": "BUY",
+                "hash": null, "best_bid": "0.55", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid pre-snapshot price change");
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        market_updates_from_price_change(&change, &mut books, &mut timestamps)
+            .expect("pre-snapshot delta is buffered");
+
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let (updates, _) =
+            market_update_from_clob_book(&book, books.get_mut("7").expect("syncing token state"))
+                .expect("snapshot replays the buffered delta");
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::Quote { ts, .. }] if ts.timestamp_millis() == 1_712_205_600_150
+            ),
+            "a quote built from replayed deltas must carry the replay watermark, \
+             not the older snapshot timestamp"
+        );
+    }
+
+    #[test]
+    fn clob_replay_reconciles_every_buffered_message_not_just_the_last() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let missing_bba = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600150",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.41", "size": "10", "side": "SELL",
+                "hash": null, "best_bid": "0.40", "best_ask": "0.41"
+            }]
+        }))
+        .expect("valid earlier message whose reported bid is missing locally");
+        let no_bba = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.55", "size": "3", "side": "SELL", "hash": null
+            }]
+        }))
+        .expect("valid later message without BBA fields");
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        market_updates_from_price_change(&missing_bba, &mut books, &mut timestamps)
+            .expect("earlier message is buffered");
+        market_updates_from_price_change(&no_bba, &mut books, &mut timestamps)
+            .expect("later message is buffered");
+
+        let (updates, _) =
+            market_update_from_clob_book(&book, books.get_mut("7").expect("syncing token state"))
+                .expect("reconciliation isolates the token in-band");
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::QuoteCollectionFailure { token_id, .. }, MarketUpdate::Quote {
+                    token_id: quote_token_id,
+                    bid: None,
+                    ask: None,
+                    ..
+                }] if token_id.as_ref() == "7" && quote_token_id.as_ref() == "7"
+            ),
+            "an earlier message's missing-BBA evidence must not be drowned by a later message"
+        );
+        assert!(books["7"].dirty);
+    }
+
+    #[test]
+    fn clob_replay_skips_regressing_messages_and_keeps_watermark() {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.50", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let newer = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600300",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.55", "size": "3", "side": "BUY",
+                "hash": null, "best_bid": "0.55", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid newer buffered message");
+        let regressing = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.55", "size": "99", "side": "BUY",
+                "hash": null, "best_bid": "0.55", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid regressing buffered message");
+        let mut books = std::collections::HashMap::new();
+        let mut timestamps = std::collections::HashMap::new();
+        market_updates_from_price_change(&newer, &mut books, &mut timestamps)
+            .expect("newer message is buffered");
+        market_updates_from_price_change(&regressing, &mut books, &mut timestamps)
+            .expect("regressing message is buffered");
+
+        let (updates, watermark) =
+            market_update_from_clob_book(&book, books.get_mut("7").expect("syncing token state"))
+                .expect("snapshot replays non-regressing messages");
+        assert_eq!(watermark, 1_712_205_600_300);
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [MarketUpdate::Quote {
+                    bid: Some(bid),
+                    bid_size: Some(size),
+                    ..
+                }] if *bid == dec!(0.55) && *size == dec!(3)
+            ),
+            "a regressing buffered message must not overwrite newer replayed state"
+        );
+        assert_eq!(books["7"].bids[&dec!(0.55)], dec!(3));
     }
 
     #[test]
