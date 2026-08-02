@@ -1008,6 +1008,10 @@ fn scan_tape_with_identity_at(
     let mut tolerated_quote_source_regressions = 0_u64;
     let mut request_attempts = 0_u64;
     let mut request_failures = 0_u64;
+    let mut transport_reconnects = 0_u64;
+    // Transport-kind failure rows whose token has not yet proven a later
+    // successful quote in tape order; leftovers still count as failures.
+    let mut pending_transport_reconnects: BTreeMap<String, u64> = BTreeMap::new();
     let mut max_request_latency_ms = 0_i64;
     let mut out_of_range_prices = 0_u64;
     let mut negative_sizes = 0_u64;
@@ -1311,6 +1315,9 @@ fn scan_tape_with_identity_at(
                 }
             }
             quoted_token_ids.insert(token.to_owned());
+            // A successful quote proves the token recovered from any earlier
+            // transport reconnect, excusing those rows from request_failures.
+            pending_transport_reconnects.remove(token);
             let bid = decimal_or_none(update.get("bid"), "bid", line_number)?;
             let ask = decimal_or_none(update.get("ask"), "ask", line_number)?;
             let bid_size = decimal_or_none(update.get("bid_size"), "bid_size", line_number)?;
@@ -1431,6 +1438,7 @@ fn scan_tape_with_identity_at(
             if !matches!(
                 error_kind,
                 "transport"
+                    | "transport_reconnect"
                     | "http_status"
                     | "invalid_response"
                     | "websocket_connect"
@@ -1455,7 +1463,19 @@ fn scan_tape_with_identity_at(
                             .is_some_and(|status| (100..=599).contains(&status)) => {}
                 _ => bail!("line {line_number}: invalid quote collection http_status"),
             }
-            request_failures += 1;
+            // Bare transport resets are reconnection lifecycle evidence, not
+            // integrity failures, but only once the token proves a later
+            // successful quote in tape order; without that recovery the row
+            // stays pending and still counts as a request failure below.
+            if matches!(error_kind, "websocket_receive" | "transport_reconnect") {
+                transport_reconnects += 1;
+                let token = required_text(update, "token_id", line_number)?;
+                *pending_transport_reconnects
+                    .entry(token.to_owned())
+                    .or_default() += 1;
+            } else {
+                request_failures += 1;
+            }
         }
 
         let recorded_at_text = record
@@ -1473,6 +1493,10 @@ fn scan_tape_with_identity_at(
         }
         previous_recorded_at = Some(recorded_at);
     }
+
+    // A transport reconnect whose token never quoted again inside this tape
+    // never proved a clean resync, so it still counts as a request failure.
+    request_failures += pending_transport_reconnects.values().sum::<u64>();
 
     let after = FileIdentity::from_metadata(&reader.get_ref().metadata()?);
     if after != identity {
@@ -1572,6 +1596,7 @@ fn scan_tape_with_identity_at(
         "request_attempts": request_attempts,
         "request_successes": quote_count,
         "request_failures": request_failures,
+        "transport_reconnects": transport_reconnects,
         "max_request_latency_ms": max_request_latency_ms,
         "one_sided_quotes": one_sided_quotes,
         "empty_quotes": empty_quotes,
@@ -2638,10 +2663,133 @@ mod tests {
         let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
 
         assert_eq!(manifest["quality"]["request_attempts"], 2);
+        // The websocket_connect row is integrity-domain, and the
+        // websocket_receive row never proves a recovery inside this tape, so
+        // both count as request failures.
         assert_eq!(manifest["quality"]["request_failures"], 2);
+        assert_eq!(manifest["quality"]["transport_reconnects"], 1);
         assert_eq!(manifest["quality"]["max_request_latency_ms"], 100);
         assert_eq!(manifest["quote_coverage_complete"], false);
         assert_eq!(manifest["segment_complete"], false);
+    }
+
+    #[test]
+    fn transport_reconnects_with_recovery_do_not_block_complete_segment() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            sample_rows()[1].clone(),
+            record(
+                2,
+                "2026-07-15T01:00:02.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "down-1", "bid": "0.49", "ask": "0.51",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.49", "size": "10"}],
+                    "ask_levels": [{"price": "0.51", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
+                    "ts": "2026-07-15T01:00:02Z",
+                }),
+            ),
+            record(
+                3,
+                "2026-07-15T01:00:03.000000000Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "up-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:02.900Z",
+                    "http_status": null, "error_kind": "websocket_receive",
+                    "ts": "2026-07-15T01:00:03Z"
+                }),
+            ),
+            record(
+                4,
+                "2026-07-15T01:00:04.000000000Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "down-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:03.900Z",
+                    "http_status": null, "error_kind": "transport_reconnect",
+                    "ts": "2026-07-15T01:00:04Z"
+                }),
+            ),
+            record(
+                5,
+                "2026-07-15T01:00:05.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "up-1", "bid": "0.50", "ask": "0.52",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.50", "size": "10"}],
+                    "ask_levels": [{"price": "0.52", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
+                    "ts": "2026-07-15T01:00:05Z",
+                }),
+            ),
+            record(
+                6,
+                "2026-07-15T01:00:06.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "down-1", "bid": "0.48", "ask": "0.50",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.48", "size": "10"}],
+                    "ask_levels": [{"price": "0.50", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
+                    "ts": "2026-07-15T01:00:06Z",
+                }),
+            ),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["quality"]["request_attempts"], 6);
+        assert_eq!(manifest["quality"]["request_failures"], 0);
+        assert_eq!(manifest["quality"]["transport_reconnects"], 2);
+        assert_eq!(manifest["quote_coverage_complete"], true);
+        assert_eq!(manifest["segment_complete"], true);
+        assert_eq!(manifest["canonical"], true);
+    }
+
+    #[test]
+    fn transport_reconnect_without_recovery_counts_as_request_failure() {
+        let root = TestDir::new();
+        let rows = vec![
+            sample_rows()[0].clone(),
+            sample_rows()[1].clone(),
+            record(
+                2,
+                "2026-07-15T01:00:02.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "down-1", "bid": "0.49", "ask": "0.51",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.49", "size": "10"}],
+                    "ask_levels": [{"price": "0.51", "size": "11"}],
+                    "request_status": "success", "collection_result": "executable",
+                    "ts": "2026-07-15T01:00:02Z",
+                }),
+            ),
+            record(
+                3,
+                "2026-07-15T01:00:03.000000000Z",
+                json!({
+                    "kind": "quote_collection_failure", "token_id": "down-1",
+                    "request_status": "failure", "collection_result": "api_failure",
+                    "request_started_at": "2026-07-15T01:00:02.900Z",
+                    "http_status": null, "error_kind": "websocket_receive",
+                    "ts": "2026-07-15T01:00:03Z"
+                }),
+            ),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+
+        assert_eq!(manifest["quality"]["request_attempts"], 3);
+        assert_eq!(manifest["quality"]["request_failures"], 1);
+        assert_eq!(manifest["quality"]["transport_reconnects"], 1);
+        assert_eq!(manifest["quote_coverage_complete"], false);
+        assert_eq!(manifest["segment_complete"], false);
+        assert_eq!(manifest["canonical"], false);
     }
 
     #[test]
@@ -2671,6 +2819,7 @@ mod tests {
         assert_eq!(manifest["quality"]["request_attempts"], 2);
         assert_eq!(manifest["quality"]["request_successes"], 1);
         assert_eq!(manifest["quality"]["request_failures"], 1);
+        assert_eq!(manifest["quality"]["transport_reconnects"], 0);
         assert_eq!(manifest["quality"]["executable_quotes"], 1);
         assert_eq!(manifest["quality"]["one_sided_quotes"], 0);
         assert_eq!(manifest["quality"]["empty_quotes"], 0);
@@ -4284,11 +4433,7 @@ mod tests {
                 binance_l2_update("2026-07-15T01:00:05Z"),
             ),
         ];
-        let tape = write_tape(
-            root.path(),
-            "market-updates.20260715T010000.ndjson",
-            &rows,
-        );
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
 
         let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
 
@@ -4407,11 +4552,7 @@ mod tests {
                 binance_l2_update("2026-07-15T01:00:04Z"),
             ),
         ];
-        let tape = write_tape(
-            root.path(),
-            "market-updates.20260715T010000.ndjson",
-            &rows,
-        );
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
 
         let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
 

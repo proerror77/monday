@@ -1532,6 +1532,31 @@ async fn capture_crossed_clob_failure_and_empty(
     true
 }
 
+/// Classify a hot-path receive error into a failure kind: bare transport
+/// drops (including TCP resets, which tungstenite surfaces as
+/// `ProtocolError::ResetWithoutClosingHandshake`) are reconnection lifecycle
+/// evidence, while genuine protocol violations are payload-integrity errors.
+fn classify_clob_ws_receive_error(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            "transport_reconnect"
+        }
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => "transport_reconnect",
+        _ => "websocket_payload",
+    }
+}
+
 /// Publish Polymarket CLOB book and BBA ticks directly to the strategy runtime.
 ///
 /// Disconnects publish empty quotes so the strategy fails closed until a fresh
@@ -1695,7 +1720,7 @@ pub fn spawn_clob_ws_quote_feed_until(
                         Some(Ok(_)) => {}
                         Some(Err(error)) => {
                             warn!(%error, "Polymarket hot-path WebSocket receive failed");
-                            break "websocket_receive";
+                            break classify_clob_ws_receive_error(&error);
                         }
                         None => break "websocket_eof",
                     },
@@ -2314,12 +2339,13 @@ fn parse_agg_trade_msg(v: &serde_json::Value) -> Option<AggTradeMsg> {
 #[cfg(test)]
 mod tests {
     use super::{
-        book_quote_from_rest, capture_crossed_clob_failure_and_empty, db_polymarket_poll_intervals,
-        equity_price_subscription, forward_clob_ws_payload, l2_updates_from_book,
-        mark_db_event_expired_if_resolved, market_update_from_clob_book,
-        market_updates_from_price_change, parse_agg_trade_msg, parse_equity_price_payload,
-        rtds_market_data_ws_config, send_quote_collection_failure_and_empty, ClobBookState,
-        RestBook, MAX_POLYMARKET_CLOB_PENDING_CHANGES, POLYMARKET_CLOB_CROSSED_BOOK_ERROR, U256,
+        book_quote_from_rest, capture_crossed_clob_failure_and_empty,
+        classify_clob_ws_receive_error, db_polymarket_poll_intervals, equity_price_subscription,
+        forward_clob_ws_payload, l2_updates_from_book, mark_db_event_expired_if_resolved,
+        market_update_from_clob_book, market_updates_from_price_change, parse_agg_trade_msg,
+        parse_equity_price_payload, rtds_market_data_ws_config,
+        send_quote_collection_failure_and_empty, ClobBookState, RestBook,
+        MAX_POLYMARKET_CLOB_PENDING_CHANGES, POLYMARKET_CLOB_CROSSED_BOOK_ERROR, U256,
     };
     use chrono::Utc;
     use ploy_market_contracts::MarketUpdate;
@@ -3608,6 +3634,47 @@ mod tests {
             .expect("a dirty token stays failed closed");
         assert_eq!(updates.len(), 2);
         assert!(books["7"].pending.is_empty());
+    }
+
+    #[test]
+    fn clob_ws_receive_error_classification_splits_transport_from_protocol() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+        use tokio_tungstenite::tungstenite::Error;
+
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert_eq!(
+                classify_clob_ws_receive_error(&Error::Io(std::io::Error::new(kind, "io"))),
+                "transport_reconnect"
+            );
+        }
+        assert_eq!(
+            classify_clob_ws_receive_error(&Error::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake
+            )),
+            "transport_reconnect",
+            "a TCP reset surfaces through the protocol layer but stays transport evidence"
+        );
+        assert_eq!(
+            classify_clob_ws_receive_error(&Error::Protocol(ProtocolError::InvalidOpcode(9))),
+            "websocket_payload"
+        );
+        assert_eq!(
+            classify_clob_ws_receive_error(&Error::Utf8("bad utf8".to_string())),
+            "websocket_payload"
+        );
+        assert_eq!(
+            classify_clob_ws_receive_error(&Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timeout"
+            ))),
+            "websocket_payload"
+        );
     }
 
     #[test]
