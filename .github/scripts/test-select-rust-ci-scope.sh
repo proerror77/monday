@@ -251,6 +251,12 @@ grep -Fqx '        run: .github/scripts/test-issue-lifecycle-audit.sh' "$ploy_wo
 grep -Fqx '      - name: Test issue lifecycle templates' "$ploy_workflow"
 grep -A1 -F '      - name: Test issue lifecycle templates' "$ploy_workflow" | grep -Fqx '        working-directory: .'
 grep -Fqx '        run: .github/scripts/test-issue-lifecycle-contract.sh' "$ploy_workflow"
+grep -Fqx '      - name: Test issue lifecycle reconciliation workflow contract' "$ploy_workflow"
+grep -A1 -F '      - name: Test issue lifecycle reconciliation workflow contract' "$ploy_workflow" | grep -Fqx '        working-directory: .'
+grep -Fqx '        run: ruby .github/scripts/test-issue-lifecycle-reconcile-workflow.rb' "$ploy_workflow"
+grep -Fqx '      - name: Test issue lifecycle status reconciliation' "$ploy_workflow"
+grep -A1 -F '      - name: Test issue lifecycle status reconciliation' "$ploy_workflow" | grep -Fqx '        working-directory: .'
+grep -Fqx '        run: .github/scripts/test-issue-lifecycle-status-reconcile.sh' "$ploy_workflow"
 
 # sccache must use the #559/#566 pattern (sccache-action + GHA backend,
 # rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in

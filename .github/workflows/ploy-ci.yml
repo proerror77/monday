@@ -165,6 +165,14 @@ jobs:
         working-directory: .
         run: .github/scripts/test-issue-lifecycle-contract.sh
 
+      - name: Test issue lifecycle reconciliation workflow contract
+        working-directory: .
+        run: ruby .github/scripts/test-issue-lifecycle-reconcile-workflow.rb
+
+      - name: Test issue lifecycle status reconciliation
+        working-directory: .
+        run: .github/scripts/test-issue-lifecycle-status-reconcile.sh
+
   research-image-binaries:
     name: Research image binaries
     needs: image-smoke-scope
