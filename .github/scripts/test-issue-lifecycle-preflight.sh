@@ -66,10 +66,13 @@ respond_with_next() {
 }
 
 labels='[{"id":10,"node_id":"LA_enhancement","name":"enhancement","color":"a2eeef"},{"id":11,"node_id":"LA_ready","name":"ready-for-agent","color":"0e8a16"}]'
+alice='{"id":19,"node_id":"U_alice","login":"alice"}'
 assignees='[{"id":20,"node_id":"U_bob","login":"bob"},{"id":19,"node_id":"U_alice","login":"alice"}]'
 if [[ "${FIXTURE_MODE:-normal}" == reordered ]]; then
   labels='[{"color":"0e8a16","name":"ready-for-agent","node_id":"LA_ready","id":11},{"name":"enhancement","id":10,"color":"a2eeef","node_id":"LA_enhancement"}]'
   assignees='[{"login":"alice","node_id":"U_alice","id":19},{"node_id":"U_bob","id":20,"login":"bob"}]'
+elif [[ "${FIXTURE_MODE:-normal}" == post-state* ]]; then
+  assignees='[{"id":19,"node_id":"U_alice","login":"alice"}]'
 fi
 
 case "$path" in
@@ -107,23 +110,42 @@ case "$path" in
     comments='[{"id":1001,"issue_url":"https://api.github.com/repos/example/repo/issues/1","body":"evidence"},{"id":1002,"issue_url":"https://api.github.com/repos/example/repo/issues/2","body":"review context"}]'
     if [[ "${FIXTURE_MODE:-normal}" == live-drift || "${FIXTURE_MODE:-normal}" == capture-race && "$call" -gt 1 ]]; then
       comments='[{"id":1001,"issue_url":"https://api.github.com/repos/example/repo/issues/1","body":"evidence changed concurrently"},{"id":1002,"issue_url":"https://api.github.com/repos/example/repo/issues/2","body":"review context"}]'
+    elif [[ "${FIXTURE_MODE:-normal}" == post-state-provenance ]]; then
+      comments='[{"id":1001,"issue_url":"https://api.github.com/repos/example/repo/issues/1","body":"evidence"},{"id":1002,"issue_url":"https://api.github.com/repos/example/repo/issues/2","body":"review context"},{"body":"completion evidence","id":1003,"issue_url":"https://api.github.com/repos/example/repo/issues/1"}]'
     fi
     etag=fixture
     [[ "$call" -le 1 || "${FIXTURE_MODE:-normal}" != header-race && "${FIXTURE_MODE:-normal}" != capture-race ]] || etag=changed
     respond "$comments" "$etag"
     ;;
   repos/example/repo/issues/events*)
-    respond '[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.com/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.com/repos/example/repo/issues/2"}}]'
+    events='[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.com/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.com/repos/example/repo/issues/2"}}]'
+    [[ "${FIXTURE_MODE:-normal}" != post-state-provenance ]] || events='[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.com/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.com/repos/example/repo/issues/2"}},{"event":"closed","id":2003,"issue":{"number":1,"url":"https://api.github.com/repos/example/repo/issues/1"}}]'
+    respond "$events"
     ;;
   repos/example/repo/issues/1)
-    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.com/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one 研究\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    issue_body='Issue one 研究'; issue_state=open; state_reason=null; issue_comments=1
+    closed_at=null; closed_by=null; updated_at='"2026-08-02T00:00:00Z"'
+    dependencies='{"blocked_by":0,"blocking":0,"total_blocked_by":1,"total_blocking":0}'
+    if [[ "${FIXTURE_MODE:-normal}" == post-state* ]]; then
+      issue_body='Issue one repaired'; issue_state=closed; state_reason='"completed"'
+      closed_at='"2026-08-02T01:00:00Z"'; closed_by="$alice"; updated_at='"2026-08-02T01:00:00Z"'
+      dependencies='{"blocked_by":0,"blocking":0,"total_blocked_by":0,"total_blocking":0}'
+      [[ "${FIXTURE_MODE:-normal}" != post-state-provenance ]] || issue_comments=2
+      [[ "${FIXTURE_MODE:-normal}" != post-state-provenance ]] || updated_at='"2026-08-02T02:00:00Z"'
+    fi
+    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.com/repos/example/repo/issues/1\",\"number\":1,\"comments\":$issue_comments,\"state\":\"$issue_state\",\"state_reason\":$state_reason,\"body\":\"$issue_body\",\"labels\":$labels,\"assignee\":$alice,\"assignees\":$assignees,\"closed_at\":$closed_at,\"closed_by\":$closed_by,\"parent_issue_url\":null,\"sub_issues_summary\":{\"completed\":1,\"percent_completed\":100,\"total\":1},\"issue_dependencies_summary\":$dependencies,\"updated_at\":$updated_at}"
     ;;
   repos/example/repo/issues/3)
     call="$(bump issue3)"
     [[ "$call" -le 1 || -n "$if_none_match" ]] || { echo "stability GET missing If-None-Match" >&2; exit 1; }
-    body=Blocker etag=fixture
+    body=Blocker etag=fixture updated_at='"2026-08-01T00:00:00Z"'
+    dependencies='{"blocked_by":0,"blocking":1,"total_blocked_by":0,"total_blocking":1}'
+    if [[ "${FIXTURE_MODE:-normal}" == post-state* ]]; then
+      updated_at='"2026-08-02T01:00:00Z"'
+      dependencies='{"blocked_by":0,"blocking":0,"total_blocked_by":0,"total_blocking":0}'
+    fi
     [[ "${FIXTURE_MODE:-normal}" != issue-detail-race || "$call" -le 1 ]] || { body='Blocker changed concurrently'; etag=changed; }
-    respond "{\"id\":103,\"node_id\":\"I_three\",\"url\":\"https://api.github.com/repos/example/repo/issues/3\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"body\":\"$body\",\"labels\":[],\"assignees\":[],\"updated_at\":\"2026-08-01T00:00:00Z\"}" "$etag"
+    respond "{\"id\":103,\"node_id\":\"I_three\",\"url\":\"https://api.github.com/repos/example/repo/issues/3\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"state_reason\":\"completed\",\"body\":\"$body\",\"labels\":[],\"assignee\":null,\"assignees\":[],\"closed_at\":\"2026-08-01T00:00:00Z\",\"closed_by\":$alice,\"parent_issue_url\":\"https://api.github.com/repos/example/repo/issues/1\",\"sub_issues_summary\":{\"completed\":0,\"percent_completed\":0,\"total\":0},\"issue_dependencies_summary\":$dependencies,\"updated_at\":$updated_at}" "$etag"
     ;;
   repos/example/repo/issues/2)
     respond "{\"id\":102,\"node_id\":\"PR_two\",\"url\":\"https://api.github.com/repos/example/repo/issues/2\",\"number\":2,\"comments\":1,\"state\":\"open\",\"body\":\"Pull request conversation\",\"labels\":$labels,\"assignees\":[],\"pull_request\":{\"url\":\"https://api.github.com/repos/example/repo/pulls/2\"},\"updated_at\":\"2026-08-02T00:00:00Z\"}"
@@ -152,10 +174,12 @@ case "$path" in
     media_type='github.v4; format=json'
     [[ "${FIXTURE_MODE:-normal}" != graphql-media-race || "$call" -le 1 ]] || media_type='github.v4; format=json; drift=1'
     [[ "${FIXTURE_MODE:-normal}" != graphql-media-missing || "$call" -le 1 ]] || media_type=
-    if [[ "${FIXTURE_MODE:-normal}" == reordered ]]; then
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.com/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' fixture "$media_type"
+    if [[ "${FIXTURE_MODE:-normal}" == post-state* ]]; then
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.com/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":{"number":1},"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
+    elif [[ "${FIXTURE_MODE:-normal}" == reordered ]]; then
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.com/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' fixture "$media_type"
     else
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.com/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.com/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
     fi
     ;;
   *) echo "unexpected GitHub API path: $path" >&2; exit 1 ;;
@@ -184,6 +208,38 @@ verify_live() {
   rm -f "$TEST_FAKE_STATE"/*
   FIXTURE_MODE="$mode" PATH="$fake_bin:$PATH" ruby "$preflight" verify \
     --repo example/repo --controller "Codex /root" --bundle "$bundle" --live
+}
+
+plan_restore() {
+  local mode="$1" bundle="$2" forward_plan="$3"
+  rm -f "$TEST_FAKE_STATE"/*
+  FIXTURE_MODE="$mode" PATH="$fake_bin:$PATH" ruby "$preflight" plan-restore \
+    --repo example/repo --controller "Codex /root" --bundle "$bundle" --forward-plan "$forward_plan"
+}
+
+plan_restore_dry() {
+  local mode="$1" bundle="$2" forward_plan="$3" reverse_plan="$4" receipt="$5" post_bundle="$6"
+  rm -f "$TEST_FAKE_STATE"/*
+  FIXTURE_MODE="$mode" PATH="$fake_bin:$PATH" ruby "$preflight" plan-restore \
+    --repo example/repo --controller "Codex /root" --bundle "$bundle" --forward-plan "$forward_plan" \
+    --reverse-plan "$reverse_plan" --receipt "$receipt" --post-bundle "$post_bundle"
+}
+
+plan_restore_fails() {
+  local mode="$1" expected="$2" output exit_code
+  shift 2
+  rm -f "$TEST_FAKE_STATE"/*
+  set +e
+  output="$(FIXTURE_MODE="$mode" PATH="$fake_bin:$PATH" ruby "$preflight" plan-restore \
+    --repo example/repo --controller "Codex /root" "$@" 2>"$tmp_dir/plan-error.log")"
+  exit_code=$?
+  set -e
+  test "$exit_code" -eq 2
+  test -z "$output"
+  if ! grep -Fq "ERROR issue lifecycle preflight: $expected" "$tmp_dir/plan-error.log"; then
+    echo "plan-restore did not report the expected error: $(<"$tmp_dir/plan-error.log")" >&2
+    exit 1
+  fi
 }
 
 copy_bundle() {
@@ -270,6 +326,240 @@ test "$actual_files" = "$expected_files"
 )
 test "$(awk '{print $1}' "$tmp_dir/bundle-a/preflight.json.sha256")" = \
   "$(awk '{print $1}' "$tmp_dir/bundle-b/preflight.json.sha256")"
+
+ruby -rjson -rdigest - "$tmp_dir/bundle-a" "$tmp_dir/forward-plan.json" <<'RUBY'
+bundle, output = ARGV
+preflight_sha = File.read(File.join(bundle, "preflight.json.sha256")).split.first
+before = {
+  "assignees" => %w[alice bob],
+  "blocked_by" => [3],
+  "body" => "Issue one 研究",
+  "labels" => %w[enhancement ready-for-agent],
+  "parent" => nil,
+  "state" => {"reason" => nil, "value" => "open"}
+}
+after = before.merge(
+  "assignees" => ["alice"],
+  "blocked_by" => [],
+  "body" => "Issue one repaired",
+  "state" => {"reason" => "completed", "value" => "closed"}
+)
+plan = {
+  "controller" => "Codex /root",
+  "default_branch" => "main",
+  "default_branch_sha" => "a" * 40,
+  "operations" => [{"number" => 1, "precondition" => before, "target" => after}],
+  "preflight_manifest_sha256" => Digest::SHA256.file(File.join(bundle, "manifest.json")).hexdigest,
+  "preflight_sha256" => preflight_sha,
+  "repository" => "example/repo",
+  "schema" => "monday.issue_lifecycle_forward_plan.v1",
+  "target" => "GitHub Issue and pull request metadata in example/repo"
+}
+File.binwrite(output, JSON.generate(plan) + "\n")
+RUBY
+
+plan_tree_before="$(find "$tmp_dir/bundle-a" -type f -exec sha256sum {} \; | sort; sha256sum "$tmp_dir/forward-plan.json")"
+reverse_plan="$(plan_restore normal "$tmp_dir/bundle-a" "$tmp_dir/forward-plan.json")"
+test "$(find "$tmp_dir/bundle-a" -type f -exec sha256sum {} \; | sort; sha256sum "$tmp_dir/forward-plan.json")" = "$plan_tree_before"
+ruby -rjson -rdigest - "$tmp_dir/forward-plan.json" "$reverse_plan" <<'RUBY'
+forward_path, reverse_json = ARGV
+forward = JSON.parse(File.binread(forward_path))
+reverse = JSON.parse(reverse_json)
+operation = forward.fetch("operations").fetch(0)
+expected = {
+  "controller" => forward.fetch("controller"),
+  "default_branch" => forward.fetch("default_branch"),
+  "default_branch_sha" => forward.fetch("default_branch_sha"),
+  "forward_plan_sha256" => Digest::SHA256.file(forward_path).hexdigest,
+  "operations" => [{"number" => 1, "precondition" => operation.fetch("target"), "target" => operation.fetch("precondition")}],
+  "preflight_manifest_sha256" => forward.fetch("preflight_manifest_sha256"),
+  "preflight_sha256" => forward.fetch("preflight_sha256"),
+  "repository" => forward.fetch("repository"),
+  "schema" => "monday.issue_lifecycle_reverse_plan.v1",
+  "target" => forward.fetch("target")
+}
+abort "wrong reverse plan" unless reverse == expected
+abort "reverse plan is not canonical" unless reverse_json + "\n" == JSON.generate(reverse) + "\n"
+RUBY
+printf '%s\n' "$reverse_plan" >"$tmp_dir/reverse-plan.json"
+cp "$tmp_dir/forward-plan.json" "$tmp_dir/forward-duplicate-reason.json"
+ruby -rjson -e 'path = ARGV.fetch(0); plan = JSON.parse(File.binread(path)); plan.dig("operations", 0, "target", "state")["reason"] = "duplicate"; File.binwrite(path, JSON.generate(plan) + "\n")' "$tmp_dir/forward-duplicate-reason.json"
+test -n "$(plan_restore normal "$tmp_dir/bundle-a" "$tmp_dir/forward-duplicate-reason.json")"
+capture post-state "$tmp_dir/post-bundle"
+ruby -rjson -rdigest - "$tmp_dir/bundle-a" "$tmp_dir/forward-plan.json" "$tmp_dir/reverse-plan.json" "$tmp_dir/post-bundle" "$tmp_dir/receipt.json" <<'RUBY'
+bundle, forward_path, reverse_path, post_bundle, output = ARGV
+forward = JSON.parse(File.binread(forward_path))
+operation = forward.fetch("operations").fetch(0)
+post_manifest = JSON.parse(File.binread(File.join(post_bundle, "manifest.json")))
+digest = ->(object) { Digest::SHA256.hexdigest(JSON.generate(object) + "\n") }
+receipt = {
+  "api" => post_manifest.fetch("api"),
+  "controller" => forward.fetch("controller"),
+  "counts" => post_manifest.fetch("counts"),
+  "default_branch" => post_manifest.fetch("default_branch"),
+  "default_branch_sha" => post_manifest.fetch("default_branch_sha"),
+  "forward_plan_sha256" => Digest::SHA256.file(forward_path).hexdigest,
+  "operations" => [{
+    "comment_ids" => [],
+    "event_ids" => [],
+    "number" => operation.fetch("number"),
+    "precondition_sha256" => digest.call(operation.fetch("precondition")),
+    "result" => "passed",
+    "target_sha256" => digest.call(operation.fetch("target"))
+  }],
+  "pages" => post_manifest.fetch("pages"),
+  "postflight_manifest_sha256" => Digest::SHA256.file(File.join(post_bundle, "manifest.json")).hexdigest,
+  "postflight_sha256" => post_manifest.dig("preflight", "sha256"),
+  "preflight_manifest_sha256" => Digest::SHA256.file(File.join(bundle, "manifest.json")).hexdigest,
+  "preflight_sha256" => forward.fetch("preflight_sha256"),
+  "repository" => forward.fetch("repository"),
+  "reverse_plan_sha256" => Digest::SHA256.file(reverse_path).hexdigest,
+  "schema" => "monday.issue_lifecycle_receipt.v1",
+  "target" => forward.fetch("target")
+}
+File.binwrite(output, JSON.generate(receipt) + "\n")
+RUBY
+dry_inputs_before="$(find "$tmp_dir/bundle-a" "$tmp_dir/post-bundle" -type f -exec sha256sum {} \; | sort; sha256sum "$tmp_dir/forward-plan.json" "$tmp_dir/reverse-plan.json" "$tmp_dir/receipt.json")"
+dry_reverse="$(plan_restore_dry post-state "$tmp_dir/bundle-a" "$tmp_dir/forward-plan.json" "$tmp_dir/reverse-plan.json" "$tmp_dir/receipt.json" "$tmp_dir/post-bundle")"
+test "$dry_reverse" = "$reverse_plan"
+test "$(find "$tmp_dir/bundle-a" "$tmp_dir/post-bundle" -type f -exec sha256sum {} \; | sort; sha256sum "$tmp_dir/forward-plan.json" "$tmp_dir/reverse-plan.json" "$tmp_dir/receipt.json")" = "$dry_inputs_before"
+
+capture post-state-provenance "$tmp_dir/post-provenance"
+ruby -rjson -rdigest - "$tmp_dir/receipt.json" "$tmp_dir/post-provenance" "$tmp_dir/receipt-provenance.json" <<'RUBY'
+source, post_bundle, output = ARGV
+receipt = JSON.parse(File.binread(source))
+manifest = JSON.parse(File.binread(File.join(post_bundle, "manifest.json")))
+receipt["counts"] = manifest.fetch("counts")
+receipt.fetch("operations").first["comment_ids"] = [1003]
+receipt.fetch("operations").first["event_ids"] = [2003]
+receipt["pages"] = manifest.fetch("pages")
+receipt["postflight_manifest_sha256"] = Digest::SHA256.file(File.join(post_bundle, "manifest.json")).hexdigest
+receipt["postflight_sha256"] = manifest.dig("preflight", "sha256")
+File.binwrite(output, JSON.generate(receipt) + "\n")
+RUBY
+test "$(plan_restore_dry post-state-provenance "$tmp_dir/bundle-a" "$tmp_dir/forward-plan.json" "$tmp_dir/reverse-plan.json" "$tmp_dir/receipt-provenance.json" "$tmp_dir/post-provenance")" = "$reverse_plan"
+
+for mutation in stale-precondition unsupported-field no-op duplicate unknown-issue relationship-cycle unknown-label trailing-hyphen-login consecutive-hyphen-login numeric-login stale-manifest-identity stale-identity; do
+  cp "$tmp_dir/forward-plan.json" "$tmp_dir/forward-$mutation.json"
+  ruby -rjson -e '
+    path, mutation = ARGV
+    plan = JSON.parse(File.binread(path))
+    operation = plan.fetch("operations").first
+    case mutation
+    when "stale-precondition" then operation.fetch("precondition")["body"] = "stale"
+    when "unsupported-field" then operation.fetch("target")["title"] = "not supported"
+    when "no-op" then operation["target"] = operation.fetch("precondition")
+    when "duplicate" then plan.fetch("operations") << JSON.parse(JSON.generate(operation))
+    when "unknown-issue" then operation["number"] = 2
+    when "relationship-cycle" then operation.fetch("target")["parent"] = 3
+    when "unknown-label" then operation.fetch("target")["labels"] = ["missing-label"]
+    when "trailing-hyphen-login" then operation.fetch("target")["assignees"] = ["alice-"]
+    when "consecutive-hyphen-login" then operation.fetch("target")["assignees"] = ["alice--bob"]
+    when "numeric-login" then operation.fetch("target")["assignees"] = [123]
+    when "stale-manifest-identity" then plan["preflight_manifest_sha256"] = "0" * 64
+    when "stale-identity" then plan["default_branch_sha"] = "0" * 40
+    end
+    File.binwrite(path, JSON.generate(plan) + "\n")
+  ' "$tmp_dir/forward-$mutation.json" "$mutation"
+  case "$mutation" in
+    stale-precondition) expected='forward plan Issue #1 precondition does not match preflight' ;;
+    unsupported-field) expected='forward plan Issue #1 state schema is invalid' ;;
+    no-op) expected='forward plan Issue #1 operation is a no-op' ;;
+    duplicate) expected='forward plan contains duplicate Issue #1' ;;
+    unknown-issue) expected='forward plan references unknown Issue #2' ;;
+    relationship-cycle) expected='forward plan parent relationships contain a cycle' ;;
+    unknown-label|trailing-hyphen-login|consecutive-hyphen-login|numeric-login) expected='forward plan Issue #1 state identity is invalid' ;;
+    stale-manifest-identity|stale-identity) expected='forward plan identity is invalid' ;;
+  esac
+  plan_restore_fails normal "$expected" --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-$mutation.json"
+done
+copy_bundle cross-repo
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  graph = JSON.parse(File.binread(path))
+  reference = graph.fetch("items").find { |item| item["number"] == 1 }.dig("relationships", "blocked_by", 0)
+  reference.fetch("repository")["nameWithOwner"] = "other/repo"
+  reference["url"] = "https://github.com/other/repo/issues/3"
+  File.binwrite(path, JSON.generate(graph) + "\n")
+' "$tmp_dir/cross-repo/preflight.json"
+resign_preflight "$tmp_dir/cross-repo"
+cp "$tmp_dir/forward-plan.json" "$tmp_dir/forward-cross-repo.json"
+ruby -rjson -rdigest -e '
+  path, bundle = ARGV
+  plan = JSON.parse(File.binread(path))
+  plan["preflight_manifest_sha256"] = Digest::SHA256.file(File.join(bundle, "manifest.json")).hexdigest
+  plan["preflight_sha256"] = File.read(File.join(bundle, "preflight.json.sha256")).split.first
+  File.binwrite(path, JSON.generate(plan) + "\n")
+' "$tmp_dir/forward-cross-repo.json" "$tmp_dir/cross-repo"
+plan_restore_fails normal 'preflight Issue #1 relationship scope is unsupported' \
+  --bundle "$tmp_dir/cross-repo" --forward-plan "$tmp_dir/forward-cross-repo.json"
+plan_restore_fails live-drift 'pre-mutation live drift: Issue/PR graph changed' \
+  --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json"
+
+cp "$tmp_dir/reverse-plan.json" "$tmp_dir/reverse-tampered.json"
+ruby -rjson -e 'path = ARGV.fetch(0); plan = JSON.parse(File.binread(path)); plan.fetch("operations").first.fetch("target")["body"] = "tampered"; File.binwrite(path, JSON.generate(plan) + "\n")' "$tmp_dir/reverse-tampered.json"
+plan_restore_fails post-state 'saved reverse plan does not match the exact derived inverse' \
+  --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json" --reverse-plan "$tmp_dir/reverse-tampered.json" \
+  --receipt "$tmp_dir/receipt.json" --post-bundle "$tmp_dir/post-bundle"
+
+cp "$tmp_dir/receipt.json" "$tmp_dir/receipt-tampered.json"
+ruby -rjson -e 'path = ARGV.fetch(0); receipt = JSON.parse(File.binread(path)); receipt.fetch("operations").first["result"] = "failed"; File.binwrite(path, JSON.generate(receipt) + "\n")' "$tmp_dir/receipt-tampered.json"
+plan_restore_fails post-state 'restoration receipt identity is invalid' \
+  --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json" --reverse-plan "$tmp_dir/reverse-plan.json" \
+  --receipt "$tmp_dir/receipt-tampered.json" --post-bundle "$tmp_dir/post-bundle"
+
+for mutation in unsupported-metadata pr-metadata closing-reference derived-relationship assignee-summary parent-summary sub-issues-summary dependencies-summary closure-metadata updated-at comment-rewrite; do
+  cp -R "$tmp_dir/post-bundle" "$tmp_dir/post-$mutation"
+  ruby -rjson -e '
+    path, mutation = ARGV
+    graph = JSON.parse(File.binread(path))
+    issue = graph.fetch("items").find { |item| item["number"] == 1 }
+    case mutation
+    when "unsupported-metadata" then issue.fetch("issue")["node_id"] = "I_concurrent"
+    when "pr-metadata" then graph.fetch("items").find { |item| item["kind"] == "pull_request" }.dig("pull_request", "metadata")["title"] = "concurrent"
+    when "closing-reference" then issue.fetch("relationships")["closed_by_pull_requests"] = []
+    when "derived-relationship" then issue.fetch("relationships")["sub_issues"] = []
+    when "assignee-summary" then graph.fetch("items").find { |item| item["number"] == 3 }.fetch("issue")["assignee"] = {"id" => 99, "login" => "mallory"}
+    when "parent-summary" then graph.fetch("items").find { |item| item["number"] == 3 }.fetch("issue")["parent_issue_url"] = "https://api.github.com/repos/example/repo/issues/99"
+    when "sub-issues-summary" then issue.fetch("issue").fetch("sub_issues_summary")["total"] = 99
+    when "dependencies-summary" then graph.fetch("items").find { |item| item["number"] == 3 }.fetch("issue").fetch("issue_dependencies_summary")["total_blocking"] = 99
+    when "closure-metadata" then graph.fetch("items").find { |item| item["number"] == 3 }.fetch("issue")["closed_at"] = "2026-08-02T03:00:00Z"
+    when "updated-at" then issue.fetch("issue")["updated_at"] = "not-a-timestamp"
+    when "comment-rewrite" then issue.fetch("comments").first["body"] = "rewritten"
+    end
+    File.binwrite(path, JSON.generate(graph) + "\n")
+  ' "$tmp_dir/post-$mutation/preflight.json" "$mutation"
+  resign_preflight "$tmp_dir/post-$mutation"
+  case "$mutation" in
+    unsupported-metadata) expected='post-state Issue #1 unsupported metadata drift' ;;
+    pr-metadata) expected='post-state PR #2 metadata drift' ;;
+    closing-reference) expected='post-state Issue #1 closing-reference drift' ;;
+    derived-relationship) expected='post-state Issue #1 derived relationship drift' ;;
+    assignee-summary) expected='post-state Issue #3 assignee summary is inconsistent' ;;
+    parent-summary) expected='post-state Issue #3 parent summary is inconsistent' ;;
+    sub-issues-summary) expected='post-state Issue #1 sub-issues summary is inconsistent' ;;
+    dependencies-summary) expected='post-state Issue #3 dependency summary is inconsistent' ;;
+    closure-metadata) expected='post-state Issue #3 closure metadata drift' ;;
+    updated-at) expected='post-state Issue #1 updated_at is invalid' ;;
+    comment-rewrite) expected='post-state Issue #1 comments provenance is not append-only' ;;
+  esac
+  plan_restore_fails post-state "$expected" \
+    --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json" --reverse-plan "$tmp_dir/reverse-plan.json" \
+    --receipt "$tmp_dir/receipt.json" --post-bundle "$tmp_dir/post-$mutation"
+done
+plan_restore_fails post-state 'post-state Issue #3 derived relationship drift' \
+  --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json" --reverse-plan "$tmp_dir/reverse-plan.json" \
+  --receipt "$tmp_dir/receipt.json" --post-bundle "$tmp_dir/bundle-a"
+plan_restore_fails normal 'restoration live drift: Issue/PR graph changed' \
+  --bundle "$tmp_dir/bundle-a" --forward-plan "$tmp_dir/forward-plan.json" --reverse-plan "$tmp_dir/reverse-plan.json" \
+  --receipt "$tmp_dir/receipt.json" --post-bundle "$tmp_dir/post-bundle"
+
+set +e
+apply_stdout="$(PATH="$fake_bin:$PATH" ruby "$preflight" apply --repo example/repo --controller "Codex /root" 2>"$tmp_dir/apply-error.log")"
+apply_exit=$?
+set -e
+test "$apply_exit" -eq 2 && test -z "$apply_stdout"
+grep -Fq 'unsupported operation "apply"' "$tmp_dir/apply-error.log"
 
 ruby -rjson - "$tmp_dir/bundle-a" <<'RUBY'
 bundle = ARGV.fetch(0)
