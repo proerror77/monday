@@ -116,7 +116,7 @@ case "$path" in
     respond '[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.test/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.test/repos/example/repo/issues/2"}}]'
     ;;
   repos/example/repo/issues/1)
-    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.test/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.test/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one 研究\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
     ;;
   repos/example/repo/issues/3)
     call="$(bump issue3)"
@@ -219,17 +219,17 @@ set_json_field() {
 }
 
 verify_fails() {
-  local name="$1" bundle="$2"
-  shift 2
+  local name="$1" bundle="$2" expected="$3"
+  shift 3
   set +e
   output="$(verify "$bundle" "$@" 2>&1)"
   exit_code=$?
   set -e
   test "$exit_code" -eq 2
-  grep -Fq "ERROR issue lifecycle preflight:" <<<"$output" || {
-    echo "$name did not report a verifier error" >&2
+  if ! grep -Fq "ERROR issue lifecycle preflight:" <<<"$output" || ! grep -Fq "$expected" <<<"$output"; then
+    echo "$name did not report the expected verifier error: $output" >&2
     exit 1
-  }
+  fi
 }
 
 verify_live_fails() {
@@ -275,7 +275,7 @@ abort "missing graph" unless graph.fetch("label_catalog").length == 2 && graph.f
 issue = graph.fetch("items").find { |item| item["number"] == 1 }
 pull = graph.fetch("items").find { |item| item["number"] == 2 }
 blocker = graph.fetch("items").find { |item| item["number"] == 3 }
-abort "incomplete Issue metadata" unless %w[body labels assignees state].all? { |field| issue.fetch("issue").key?(field) } && issue["comments"].length == 1 && issue["events"].length == 1 && issue.dig("relationships", "blocked_by").map { |entry| entry["number"] } == [3]
+abort "incomplete Issue metadata" unless issue.dig("issue", "body") == "Issue one 研究" && %w[body labels assignees state].all? { |field| issue.fetch("issue").key?(field) } && issue["comments"].length == 1 && issue["events"].length == 1 && issue.dig("relationships", "blocked_by").map { |entry| entry["number"] } == [3]
 abort "ambiguous blocker" unless issue.dig("relationships", "blocked_by", 0, "repository", "nameWithOwner") == "example/repo"
 abort "ambiguous parent" unless blocker.dig("relationships", "parent", "repository", "nameWithOwner") == "example/repo"
 abort "missing close ref" unless issue.dig("relationships", "closed_by_pull_requests").map { |entry| entry["number"] } == [2]
@@ -309,56 +309,56 @@ verify "$tmp_dir/verify-v1-pages"
 
 copy_bundle verify-missing
 rm "$tmp_dir/verify-missing/manifest.json.sha256"
-verify_fails missing "$tmp_dir/verify-missing"
+verify_fails missing "$tmp_dir/verify-missing" "bundle file set is invalid"
 
 copy_bundle verify-extra
 touch "$tmp_dir/verify-extra/unexpected"
-verify_fails extra "$tmp_dir/verify-extra"
+verify_fails extra "$tmp_dir/verify-extra" "bundle file set is invalid"
 
 copy_bundle verify-symlink
 rm "$tmp_dir/verify-symlink/preflight.json"
 ln -s "$tmp_dir/bundle-a/preflight.json" "$tmp_dir/verify-symlink/preflight.json"
-verify_fails symlink "$tmp_dir/verify-symlink"
+verify_fails symlink "$tmp_dir/verify-symlink" "bundle entry preflight.json is not a regular file"
 
 copy_bundle verify-tampered
 printf ' ' >>"$tmp_dir/verify-tampered/preflight.json"
-verify_fails tampered "$tmp_dir/verify-tampered"
+verify_fails tampered "$tmp_dir/verify-tampered" "preflight.json digest mismatch"
 
 copy_bundle verify-digest
 printf '%064d  preflight.json\n' 0 >"$tmp_dir/verify-digest/preflight.json.sha256"
-verify_fails digest "$tmp_dir/verify-digest"
+verify_fails digest "$tmp_dir/verify-digest" "preflight.json digest mismatch"
 
 copy_bundle verify-noncanonical
 ruby -rjson -e 'path = ARGV.fetch(0); File.binwrite(path, JSON.pretty_generate(JSON.parse(File.binread(path))) + "\n")' "$tmp_dir/verify-noncanonical/preflight.json"
 rehash "$tmp_dir/verify-noncanonical" preflight.json
-verify_fails noncanonical "$tmp_dir/verify-noncanonical"
+verify_fails noncanonical "$tmp_dir/verify-noncanonical" "preflight.json is not canonical JSON"
 
 copy_bundle verify-schema
 set_json_field "$tmp_dir/verify-schema/manifest.json" schema '"monday.issue_lifecycle_manifest.v2"'
 rehash "$tmp_dir/verify-schema" manifest.json
-verify_fails schema "$tmp_dir/verify-schema"
+verify_fails schema "$tmp_dir/verify-schema" "manifest schema is invalid"
 
-verify_fails scope "$tmp_dir/bundle-a" --repo other/repo
+verify_fails scope "$tmp_dir/bundle-a" "manifest scope is invalid" --repo other/repo
 
 copy_bundle verify-api
 set_json_field "$tmp_dir/verify-api/manifest.json" api '{"rest_version":"wrong"}'
 rehash "$tmp_dir/verify-api" manifest.json
-verify_fails api "$tmp_dir/verify-api"
+verify_fails api "$tmp_dir/verify-api" "manifest API provenance is invalid"
 
 copy_bundle verify-pages
 set_json_field "$tmp_dir/verify-pages/manifest.json" pages '[]'
 rehash "$tmp_dir/verify-pages" manifest.json
-verify_fails pages "$tmp_dir/verify-pages"
+verify_fails pages "$tmp_dir/verify-pages" "manifest page inventory is empty"
 
 copy_bundle verify-counts
 set_json_field "$tmp_dir/verify-counts/manifest.json" counts '{"issues":999}'
 rehash "$tmp_dir/verify-counts" manifest.json
-verify_fails counts "$tmp_dir/verify-counts"
+verify_fails counts "$tmp_dir/verify-counts" "manifest counts do not match preflight"
 
 copy_bundle verify-branch
 set_json_field "$tmp_dir/verify-branch/manifest.json" default_branch_sha '"cccccccccccccccccccccccccccccccccccccccc"'
 rehash "$tmp_dir/verify-branch" manifest.json
-verify_fails branch "$tmp_dir/verify-branch"
+verify_fails branch "$tmp_dir/verify-branch" "manifest preflight identity is invalid"
 
 copy_bundle verify-item-schema
 ruby -rjson -e '
@@ -368,7 +368,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-item-schema/preflight.json"
 resign_preflight "$tmp_dir/verify-item-schema"
-verify_fails item-schema "$tmp_dir/verify-item-schema"
+verify_fails item-schema "$tmp_dir/verify-item-schema" "preflight Issue #1 schema is invalid"
 
 copy_bundle verify-pr-schema
 ruby -rjson -e '
@@ -378,7 +378,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-pr-schema/preflight.json"
 resign_preflight "$tmp_dir/verify-pr-schema"
-verify_fails pr-schema "$tmp_dir/verify-pr-schema"
+verify_fails pr-schema "$tmp_dir/verify-pr-schema" "preflight PR #2 schema is invalid"
 
 copy_bundle verify-relationship-schema
 ruby -rjson -e '
@@ -388,7 +388,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-relationship-schema/preflight.json"
 resign_preflight "$tmp_dir/verify-relationship-schema"
-verify_fails relationship-schema "$tmp_dir/verify-relationship-schema"
+verify_fails relationship-schema "$tmp_dir/verify-relationship-schema" "preflight Issue #1 schema is invalid"
 
 copy_bundle verify-rest-etag
 ruby -rjson -e '
@@ -398,7 +398,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-rest-etag/manifest.json"
 rehash "$tmp_dir/verify-rest-etag" manifest.json
-verify_fails rest-etag "$tmp_dir/verify-rest-etag"
+verify_fails rest-etag "$tmp_dir/verify-rest-etag" "manifest REST ETag provenance is invalid"
 
 copy_bundle verify-page-omission
 ruby -rjson -e '
@@ -408,7 +408,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-page-omission/manifest.json"
 rehash "$tmp_dir/verify-page-omission" manifest.json
-verify_fails page-omission "$tmp_dir/verify-page-omission"
+verify_fails page-omission "$tmp_dir/verify-page-omission" "manifest REST page inventory does not match preflight"
 
 copy_bundle verify-link-target
 ruby -rjson -e '
@@ -419,7 +419,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-link-target/manifest.json"
 rehash "$tmp_dir/verify-link-target" manifest.json
-verify_fails link-target "$tmp_dir/verify-link-target"
+verify_fails link-target "$tmp_dir/verify-link-target" "manifest REST pagination chain has an extra page"
 
 cp -R "$tmp_dir/bundle-canonical-link" "$tmp_dir/verify-page-size"
 ruby -rjson -e '
@@ -432,7 +432,7 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-page-size/manifest.json"
 rehash "$tmp_dir/verify-page-size" manifest.json
-verify_fails page-size "$tmp_dir/verify-page-size"
+verify_fails page-size "$tmp_dir/verify-page-size" "manifest REST Link scope is invalid"
 
 copy_bundle verify-entry-identity
 ruby -rjson -e '
@@ -442,16 +442,18 @@ ruby -rjson -e '
   File.binwrite(path, JSON.generate(object) + "\n")
 ' "$tmp_dir/verify-entry-identity/preflight.json"
 resign_preflight "$tmp_dir/verify-entry-identity"
-verify_fails entry-identity "$tmp_dir/verify-entry-identity"
+verify_fails entry-identity "$tmp_dir/verify-entry-identity" "preflight item #1 metadata is invalid"
 
 for field in comment label commit review review-comment check-run status; do
+  expected="preflight PR #2 schema is invalid"
+  [[ "$field" != comment && "$field" != label ]] || expected="preflight item #1 metadata is invalid"
   copy_bundle "verify-scope-$field"
   ruby -rjson -e '
     path, field = ARGV
     object = JSON.parse(File.binread(path))
     case field
     when "comment" then object.fetch("items").first.fetch("comments").first["issue_url"].sub!("example/repo", "other/repo")
-    when "label" then object.fetch("items").first.dig("issue", "labels").first.merge!("id" => 999, "name" => "outside-catalog")
+    when "label" then labels = object.fetch("items").first.dig("issue", "labels"); labels.first.merge!("id" => 999, "name" => "outside-catalog"); labels.sort_by! { |label| label["id"] }
     else
       pull = object.fetch("items").find { |item| item["kind"] == "pull_request" }.fetch("pull_request")
       case field
@@ -465,7 +467,7 @@ for field in comment label commit review review-comment check-run status; do
     File.binwrite(path, JSON.generate(object) + "\n")
   ' "$tmp_dir/verify-scope-$field/preflight.json" "$field"
   resign_preflight "$tmp_dir/verify-scope-$field"
-  verify_fails "scope-$field" "$tmp_dir/verify-scope-$field"
+  verify_fails "scope-$field" "$tmp_dir/verify-scope-$field" "$expected"
 done
 
 test "$(wc -l <"$api_log" | tr -d ' ')" = "$local_api_calls_before"

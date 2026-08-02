@@ -494,7 +494,7 @@ end
 def read_canonical_json(path)
   contents = File.binread(path)
   object = JSON.parse(contents)
-  raise "#{File.basename(path)} is not canonical JSON" unless contents == Canonical.dump(object)
+  raise "#{File.basename(path)} is not canonical JSON" unless contents.b == Canonical.dump(object).b
 
   object
 rescue JSON::ParserError => error
