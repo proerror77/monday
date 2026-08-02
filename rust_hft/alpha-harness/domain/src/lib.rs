@@ -18,6 +18,7 @@ pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v3"
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
+pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -95,6 +96,8 @@ pub enum DomainError {
     InvalidEvaluatorConfiguration,
     #[error("evaluation protocol is invalid")]
     InvalidEvaluationProtocol,
+    #[error("CEX Research Mission is invalid: {0}")]
+    InvalidCexResearchMission(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +243,432 @@ impl EvaluationProtocolV1 {
         self.validate()?;
         canonical_json_hash(self)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchVenueV1 {
+    Binance,
+}
+
+impl CexResearchVenueV1 {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Binance => "binance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchMarketV1 {
+    Spot,
+    Usdm,
+}
+
+impl CexResearchMarketV1 {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Usdm => "usdm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchContentRefV1 {
+    pub id: String,
+    pub content_sha256: String,
+}
+
+impl CexResearchContentRefV1 {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.id.trim().is_empty() || !valid_content_sha256(&self.content_sha256) {
+            return Err(DomainError::InvalidCexResearchMission(
+                "content reference is incomplete",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchInstrumentV1 {
+    pub venue: CexResearchVenueV1,
+    pub market: CexResearchMarketV1,
+    pub symbol: String,
+    pub horizon: EvaluationLabelSpecV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchHypothesisTargetV1 {
+    pub name: String,
+    pub horizon: EvaluationLabelSpecV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchFalsificationTestV1 {
+    pub test_id: String,
+    pub reject_when: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchHypothesisV1 {
+    pub hypothesis_id: String,
+    pub statement: String,
+    pub target: CexResearchHypothesisTargetV1,
+    pub required_feature_families: Vec<String>,
+    pub required_template_families: Vec<String>,
+    pub falsification_tests: Vec<CexResearchFalsificationTestV1>,
+    pub source_evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchInputBindingsV1 {
+    pub dataset: CexResearchContentRefV1,
+    pub snapshot: CexResearchContentRefV1,
+    pub partition: CexResearchContentRefV1,
+    pub source: CexResearchContentRefV1,
+    pub feature: CexResearchContentRefV1,
+    pub materialization: CexResearchContentRefV1,
+}
+
+impl CexResearchInputBindingsV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        for reference in [
+            &self.dataset,
+            &self.snapshot,
+            &self.partition,
+            &self.source,
+            &self.feature,
+            &self.materialization,
+        ] {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchPolicyBindingsV1 {
+    pub gp: CexResearchContentRefV1,
+    pub screening: CexResearchContentRefV1,
+    pub baseline: CexResearchContentRefV1,
+    pub subset_search: CexResearchContentRefV1,
+    pub weight: CexResearchContentRefV1,
+    pub evaluation: CexResearchContentRefV1,
+    pub replay: CexResearchContentRefV1,
+    pub holdout: CexResearchContentRefV1,
+}
+
+impl CexResearchPolicyBindingsV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        for reference in [
+            &self.gp,
+            &self.screening,
+            &self.baseline,
+            &self.subset_search,
+            &self.weight,
+            &self.evaluation,
+            &self.replay,
+            &self.holdout,
+        ] {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchEvidenceKindV1 {
+    TrainingValidation,
+    SignedPaper,
+    SignedShadow,
+    ExposedHoldout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchEvidenceSignatureV1 {
+    pub key_id: String,
+    pub signature_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchEvidenceRefV1 {
+    pub evidence_id: String,
+    pub kind: CexResearchEvidenceKindV1,
+    pub source_mission_id: String,
+    pub source_search_lineage_id: String,
+    pub artifact_sha256: String,
+    #[serde(default)]
+    pub signature: Option<CexResearchEvidenceSignatureV1>,
+    #[serde(default)]
+    pub holdout_id: Option<String>,
+}
+
+impl CexResearchEvidenceRefV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        if [
+            self.evidence_id.as_str(),
+            self.source_mission_id.as_str(),
+            self.source_search_lineage_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+            || !valid_content_sha256(&self.artifact_sha256)
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "evidence reference is incomplete",
+            ));
+        }
+        match self.kind {
+            CexResearchEvidenceKindV1::TrainingValidation
+                if self.signature.is_none() && self.holdout_id.is_none() => {}
+            CexResearchEvidenceKindV1::SignedPaper | CexResearchEvidenceKindV1::SignedShadow
+                if self.holdout_id.is_none()
+                    && self.signature.as_ref().is_some_and(|signature| {
+                        !signature.key_id.trim().is_empty()
+                            && valid_content_sha256(&signature.signature_sha256)
+                    }) => {}
+            CexResearchEvidenceKindV1::ExposedHoldout
+                if self.signature.is_none()
+                    && self
+                        .holdout_id
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()) => {}
+            _ => {
+                return Err(DomainError::InvalidCexResearchMission(
+                    "evidence kind fields are inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchSearchPlanV1 {
+    pub seed: u64,
+    #[serde(deserialize_with = "deserialize_cex_search_budget")]
+    pub budget: SearchBudget,
+    pub max_new_iterations: usize,
+}
+
+fn deserialize_cex_search_budget<'de, D>(deserializer: D) -> Result<SearchBudget, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictSearchBudget {
+        max_candidates: usize,
+        max_expansions: u64,
+        max_tokens: u64,
+        max_seconds: u64,
+    }
+
+    let budget = StrictSearchBudget::deserialize(deserializer)?;
+    Ok(SearchBudget {
+        max_candidates: budget.max_candidates,
+        max_expansions: budget.max_expansions,
+        max_tokens: budget.max_tokens,
+        max_seconds: budget.max_seconds,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchHoldoutV1 {
+    pub holdout_id: String,
+    pub state: CexResearchHoldoutStateV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchHoldoutStateV1 {
+    Unopened,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchMissionSpecV1 {
+    pub objective: String,
+    pub search_lineage_id: String,
+    pub data_mission_id: String,
+    pub instrument: CexResearchInstrumentV1,
+    pub hypotheses: Vec<CexResearchHypothesisV1>,
+    pub inputs: CexResearchInputBindingsV1,
+    pub policies: CexResearchPolicyBindingsV1,
+    pub evidence: Vec<CexResearchEvidenceRefV1>,
+    pub feature_fields: Vec<String>,
+    pub search: CexResearchSearchPlanV1,
+    pub evaluation_protocol: EvaluationProtocolV1,
+    pub holdout: CexResearchHoldoutV1,
+}
+
+impl CexResearchMissionSpecV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        if [
+            self.objective.as_str(),
+            self.search_lineage_id.as_str(),
+            self.data_mission_id.as_str(),
+            self.instrument.symbol.as_str(),
+            self.holdout.holdout_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+            || self.instrument.symbol != self.instrument.symbol.to_ascii_uppercase()
+            || self.instrument.horizon.horizon_buckets == 0
+            || self.instrument.horizon.observation_frequency_millis == 0
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "mission scope is incomplete",
+            ));
+        }
+        self.inputs.validate()?;
+        self.policies.validate()?;
+        self.search.budget.validate()?;
+        self.evaluation_protocol.validate()?;
+        if self.search.max_new_iterations == 0
+            || self.search.budget.max_tokens != 0
+            || self.evaluation_protocol.labels != self.instrument.horizon
+            || self.policies.evaluation.content_sha256 != self.evaluation_protocol.content_hash()?
+            || self.policies.subset_search.content_sha256 != canonical_json_hash(&self.search)?
+            || !non_empty_unique(&self.feature_fields)
+            || self.hypotheses.is_empty()
+            || self.evidence.is_empty()
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "mission policies or research plan are inconsistent",
+            ));
+        }
+
+        let mut evidence_ids = BTreeSet::new();
+        for evidence in &self.evidence {
+            evidence.validate()?;
+            if !evidence_ids.insert(evidence.evidence_id.as_str()) {
+                return Err(DomainError::InvalidCexResearchMission(
+                    "evidence ids are not unique",
+                ));
+            }
+            if evidence.kind == CexResearchEvidenceKindV1::ExposedHoldout
+                && (evidence.source_search_lineage_id == self.search_lineage_id
+                    || evidence.holdout_id.as_deref() == Some(self.holdout.holdout_id.as_str()))
+            {
+                return Err(DomainError::InvalidCexResearchMission(
+                    "exposed holdout evidence cannot feed the same search or holdout",
+                ));
+            }
+        }
+
+        let mut hypothesis_ids = BTreeSet::new();
+        for hypothesis in &self.hypotheses {
+            let mut test_ids = BTreeSet::new();
+            if hypothesis.hypothesis_id.trim().is_empty()
+                || hypothesis.statement.trim().is_empty()
+                || hypothesis.target.name.trim().is_empty()
+                || hypothesis.target.horizon != self.instrument.horizon
+                || !hypothesis_ids.insert(hypothesis.hypothesis_id.as_str())
+                || !non_empty_unique(&hypothesis.required_feature_families)
+                || !non_empty_unique(&hypothesis.required_template_families)
+                || hypothesis.falsification_tests.is_empty()
+                || hypothesis.falsification_tests.iter().any(|test| {
+                    test.test_id.trim().is_empty()
+                        || test.reject_when.trim().is_empty()
+                        || !test_ids.insert(test.test_id.as_str())
+                })
+                || !non_empty_unique(&hypothesis.source_evidence_ids)
+                || hypothesis
+                    .source_evidence_ids
+                    .iter()
+                    .any(|id| !evidence_ids.contains(id.as_str()))
+            {
+                return Err(DomainError::InvalidCexResearchMission(
+                    "hypothesis is incomplete or inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchOperationalMetadataV1 {
+    #[serde(default)]
+    pub submitted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexResearchMissionArtifactV1 {
+    pub schema_version: String,
+    pub spec: CexResearchMissionSpecV1,
+    #[serde(default)]
+    pub operational: CexResearchOperationalMetadataV1,
+}
+
+impl CexResearchMissionArtifactV1 {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_RESEARCH_MISSION_SCHEMA_V1 {
+            return Err(DomainError::InvalidCexResearchMission(
+                "schema version is unsupported",
+            ));
+        }
+        self.spec.validate()?;
+        let mission_id = self.semantic_id_unchecked()?;
+        if self.spec.evidence.iter().any(|evidence| {
+            evidence.kind == CexResearchEvidenceKindV1::ExposedHoldout
+                && evidence.source_mission_id == mission_id
+        }) {
+            return Err(DomainError::InvalidCexResearchMission(
+                "exposed holdout evidence cannot feed the same mission",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn semantic_id(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        self.semantic_id_unchecked()
+    }
+
+    fn semantic_id_unchecked(&self) -> Result<String, DomainError> {
+        #[derive(Serialize)]
+        struct SemanticMission<'a> {
+            schema_version: &'a str,
+            spec: &'a CexResearchMissionSpecV1,
+        }
+        let hash = canonical_json_hash(&SemanticMission {
+            schema_version: &self.schema_version,
+            spec: &self.spec,
+        })?;
+        Ok(format!("cex-mission-{hash}"))
+    }
+}
+
+fn non_empty_unique(values: &[String]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| !value.trim().is_empty())
+        && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+}
+
+fn valid_content_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2590,6 +3019,167 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn cex_mission_artifact(submitted_at: DateTime<Utc>) -> CexResearchMissionArtifactV1 {
+        let search = CexResearchSearchPlanV1 {
+            seed: 7,
+            budget: SearchBudget {
+                max_candidates: 2,
+                max_expansions: 2,
+                max_tokens: 0,
+                max_seconds: 30,
+            },
+            max_new_iterations: 1,
+        };
+        let evaluation_protocol = evaluation_protocol();
+        let reference = |id: &str, byte: char| CexResearchContentRefV1 {
+            id: id.to_string(),
+            content_sha256: byte.to_string().repeat(64),
+        };
+        CexResearchMissionArtifactV1 {
+            schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
+            spec: CexResearchMissionSpecV1 {
+                objective: "Test one falsifiable LOB hypothesis".to_string(),
+                search_lineage_id: "search-lineage-1".to_string(),
+                data_mission_id: "data-mission-1".to_string(),
+                instrument: CexResearchInstrumentV1 {
+                    venue: CexResearchVenueV1::Binance,
+                    market: CexResearchMarketV1::Usdm,
+                    symbol: "BTCUSDT".to_string(),
+                    horizon: evaluation_protocol.labels.clone(),
+                },
+                hypotheses: vec![CexResearchHypothesisV1 {
+                    hypothesis_id: "hypothesis-lob-imbalance-1".to_string(),
+                    statement: "LOB imbalance predicts the next five buckets".to_string(),
+                    target: CexResearchHypothesisTargetV1 {
+                        name: "forward_mid_return".to_string(),
+                        horizon: evaluation_protocol.labels.clone(),
+                    },
+                    required_feature_families: vec!["book_imbalance".to_string()],
+                    required_template_families: vec!["signed_rolling_imbalance".to_string()],
+                    falsification_tests: vec![CexResearchFalsificationTestV1 {
+                        test_id: "rank-ic-positive".to_string(),
+                        reject_when: "purged validation rank IC is non-positive".to_string(),
+                    }],
+                    source_evidence_ids: vec!["evidence-training-1".to_string()],
+                }],
+                inputs: CexResearchInputBindingsV1 {
+                    dataset: reference("dataset-cex-replay-a", 'a'),
+                    snapshot: reference("snapshot-a", 'b'),
+                    partition: reference("partition-a", 'c'),
+                    source: reference("source-a", 'd'),
+                    feature: reference("feature-a", 'e'),
+                    materialization: reference("materialization-a", 'f'),
+                },
+                policies: CexResearchPolicyBindingsV1 {
+                    gp: reference("gp-policy-1", '1'),
+                    screening: reference("screening-policy-1", '2'),
+                    baseline: reference("baseline-policy-1", '3'),
+                    subset_search: CexResearchContentRefV1 {
+                        id: "subset-search-policy-1".to_string(),
+                        content_sha256: canonical_json_hash(&search).unwrap(),
+                    },
+                    weight: reference("weight-policy-1", '4'),
+                    evaluation: CexResearchContentRefV1 {
+                        id: "evaluation-policy-1".to_string(),
+                        content_sha256: evaluation_protocol.content_hash().unwrap(),
+                    },
+                    replay: reference("replay-policy-1", '5'),
+                    holdout: reference("holdout-policy-1", '6'),
+                },
+                evidence: vec![CexResearchEvidenceRefV1 {
+                    evidence_id: "evidence-training-1".to_string(),
+                    kind: CexResearchEvidenceKindV1::TrainingValidation,
+                    source_mission_id: "earlier-mission-1".to_string(),
+                    source_search_lineage_id: "earlier-search-lineage-1".to_string(),
+                    artifact_sha256: "7".repeat(64),
+                    signature: None,
+                    holdout_id: None,
+                }],
+                feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+                search,
+                evaluation_protocol,
+                holdout: CexResearchHoldoutV1 {
+                    holdout_id: "holdout-fresh-1".to_string(),
+                    state: CexResearchHoldoutStateV1::Unopened,
+                },
+            },
+            operational: CexResearchOperationalMetadataV1 {
+                submitted_at: Some(submitted_at),
+            },
+        }
+    }
+
+    #[test]
+    fn cex_mission_identity_ignores_operational_timestamp() {
+        let now = Utc::now();
+        let first = cex_mission_artifact(now);
+        let second = cex_mission_artifact(now + Duration::hours(1));
+
+        first.validate().unwrap();
+        second.validate().unwrap();
+        assert_eq!(first.semantic_id().unwrap(), second.semantic_id().unwrap());
+    }
+
+    #[test]
+    fn cex_mission_rejects_unknown_schema_or_action_field() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.schema_version = "cex-research-mission-v2".to_string();
+        assert!(mission.validate().is_err());
+
+        let mut value = serde_json::to_value(cex_mission_artifact(Utc::now())).unwrap();
+        value["spec"]["actions"] = serde_json::json!(["open_holdout"]);
+        assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
+    }
+
+    #[test]
+    fn cex_mission_rejects_unknown_nested_search_budget_field() {
+        let mut value = serde_json::to_value(cex_mission_artifact(Utc::now())).unwrap();
+        value["spec"]["search"]["budget"]["open_holdout"] = serde_json::json!(true);
+        let shared_budget = value["spec"]["search"]["budget"].clone();
+
+        assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
+        assert!(serde_json::from_value::<SearchBudget>(shared_budget).is_ok());
+    }
+
+    #[test]
+    fn cex_mission_semantic_id_rejects_invalid_artifact() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.schema_version = "cex-research-mission-v2".to_string();
+
+        assert!(mission.semantic_id().is_err());
+    }
+
+    #[test]
+    fn cex_mission_requires_paper_and_shadow_signature_identity() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.evidence[0].kind = CexResearchEvidenceKindV1::SignedPaper;
+
+        assert!(mission.validate().is_err());
+
+        mission.spec.evidence[0].signature = Some(CexResearchEvidenceSignatureV1 {
+            key_id: "runtime-evidence-key-1".to_string(),
+            signature_sha256: "8".repeat(64),
+        });
+        mission.validate().unwrap();
+        mission.spec.evidence[0].kind = CexResearchEvidenceKindV1::SignedShadow;
+        mission.validate().unwrap();
+    }
+
+    #[test]
+    fn cex_mission_accepts_exposed_holdout_only_for_a_new_search_and_holdout() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.evidence[0].kind = CexResearchEvidenceKindV1::ExposedHoldout;
+        mission.spec.evidence[0].holdout_id = Some("earlier-holdout-1".to_string());
+        mission.validate().unwrap();
+
+        mission.spec.evidence[0].source_search_lineage_id = mission.spec.search_lineage_id.clone();
+        assert!(mission.validate().is_err());
+
+        mission.spec.evidence[0].source_search_lineage_id = "earlier-search-lineage-1".to_string();
+        mission.spec.evidence[0].holdout_id = Some(mission.spec.holdout.holdout_id.clone());
+        assert!(mission.validate().is_err());
     }
 
     #[test]
