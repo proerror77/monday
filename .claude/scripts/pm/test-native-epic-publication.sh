@@ -4,6 +4,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
 epic_sync="$repo_root/.claude/commands/pm/epic-sync.md"
 init="$repo_root/.claude/scripts/pm/init.sh"
+prd_new="$repo_root/.claude/commands/pm/prd-new.md"
+prd_parse="$repo_root/.claude/commands/pm/prd-parse.md"
+category_reader="$repo_root/.claude/scripts/pm/read-issue-category.sh"
 extract_bash_after() {
   local file="$1"
   local heading="$2"
@@ -43,16 +46,18 @@ write_section_script() {
   local target="$1"
   local setup="$2"
   local heading="$3"
+  local source="${4:-$epic_sync}"
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\nARGUMENTS=feature\n'
     printf '%s\n' "$setup"
-    extract_bash_after "$epic_sync" "$heading"
+    extract_bash_after "$source" "$heading"
   } > "$target"
   chmod +x "$target"
 }
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
-mkdir -p "$scratch/project" "$scratch/run-parent"
+mkdir -p "$scratch/project/.claude/scripts/pm" "$scratch/run-parent"
+cp "$category_reader" "$scratch/project/.claude/scripts/pm/read-issue-category.sh"
 write_publication_script "$scratch/quick-check.sh" "## Quick Check"
 if (
   cd "$scratch/project"
@@ -67,6 +72,7 @@ mkdir -p "$scratch/project/.claude/epics/feature"
 cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
 ---
 name: feature
+category: bug
 ---
 # Feature
 EOF
@@ -76,6 +82,71 @@ name: First task
 depends_on: []
 ---
 # First task
+EOF
+for category_case in missing invalid conflicting conflicting_spaced malformed; do
+  case "$category_case" in
+    missing)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+---
+# Feature
+EOF
+      ;;
+    invalid)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: feature
+---
+# Feature
+EOF
+      ;;
+    conflicting)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: bug
+category: enhancement
+---
+# Feature
+EOF
+      ;;
+    conflicting_spaced)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: bug
+category : enhancement
+---
+# Feature
+EOF
+      ;;
+    malformed)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: bug
+# Feature
+EOF
+      ;;
+  esac
+  if (
+    cd "$scratch/project"
+    RUN_ROOT_OUTPUT="$scratch/$category_case-category-root" \
+      MONDAY_EPIC_SYNC_TMP_PARENT="$scratch/run-parent" \
+      bash "$scratch/quick-check.sh"
+  ) > /dev/null 2>&1; then
+    echo "epic publication accepted $category_case category metadata" >&2
+    exit 1
+  fi
+done
+cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: bug
+---
+# Feature
 EOF
 for run in 1 2; do
   (
@@ -95,6 +166,164 @@ if [ "$first_root" = "$second_root" ] ||
   echo "epic publication reused or retained a scratch root" >&2
   exit 1
 fi
+grep -Eq '^category: \[bug or enhancement selected by the user\]$' "$prd_new"
+grep -Eq '^category: \[Exact category from the PRD\]$' "$prd_parse"
+parallel_category_block=$(awk '
+  /^Use Task tool for parallel creation:/ { capture=1; next }
+  /^Consolidate results from parallel agents:/ { exit }
+  capture { print }
+' "$epic_sync")
+parallel_category_guard=$(awk '
+  /# BATCH_CATEGORY_GUARD_START/ { capture=1; next }
+  /# BATCH_CATEGORY_GUARD_END/ { exit }
+  capture {
+    sub(/^    /, "")
+    print
+  }
+' "$epic_sync")
+if [ -z "$parallel_category_guard" ]; then
+  echo "parallel batch category guard is missing" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_block" | grep -Fq \
+  'batch_category=$(.claude/scripts/pm/read-issue-category.sh'
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_block" | grep -Fq -- \
+  '--label "$category,needs-triage"'
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_guard" | grep -Fq \
+  'if [ "$batch_category" != "$issue_category" ]; then'
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_guard" | grep -Fq \
+  'category="$issue_category"'
+mkdir -p "$scratch/batch-bin"
+batch_guard_log="$scratch/batch-gh.log"
+cat > "$scratch/batch-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$BATCH_GH_LOG"
+EOF
+chmod +x "$scratch/batch-bin/gh"
+cat > "$scratch/batch-guard.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+issue_category=bug
+ARGUMENTS=feature
+$parallel_category_guard
+gh issue create --title should-not-run
+gh issue edit 500 --add-label should-not-run
+EOF
+chmod +x "$scratch/batch-guard.sh"
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/mismatched-epic.md"
+mv "$scratch/mismatched-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+if (
+  cd "$scratch/project"
+  BATCH_GH_LOG="$batch_guard_log" PATH="$scratch/batch-bin:$PATH" \
+    bash "$scratch/batch-guard.sh"
+) > /dev/null 2>&1; then
+  echo "parallel batch accepted a changed epic category" >&2
+  exit 1
+fi
+if [ -s "$batch_guard_log" ]; then
+  echo "parallel batch category failure mutated GitHub" >&2
+  exit 1
+fi
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
+mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+mkdir -p "$scratch/project/.claude/prds"
+cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: bug
+---
+# PRD
+EOF
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/enhancement-prd.md"
+mv "$scratch/enhancement-prd.md" "$scratch/project/.claude/prds/feature.md"
+if (
+  cd "$scratch/project"
+  RUN_ROOT_OUTPUT="$scratch/prd-mismatch-root" \
+    MONDAY_EPIC_SYNC_TMP_PARENT="$scratch/run-parent" \
+    bash "$scratch/quick-check.sh"
+) > /dev/null 2>&1; then
+  echo "quick check accepted a PRD and epic category mismatch" >&2
+  exit 1
+fi
+cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: bug
+---
+# PRD
+EOF
+write_section_script "$scratch/verify-category.sh" "" \
+  "### Verify Category Contract" "$prd_parse"
+(
+  cd "$scratch/project"
+  bash "$scratch/verify-category.sh"
+) > /dev/null
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/enhancement-epic.md"
+mv "$scratch/enhancement-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+if (
+  cd "$scratch/project"
+  bash "$scratch/verify-category.sh"
+) > /dev/null 2>&1; then
+  echo "PRD parse accepted a category mismatch" >&2
+  exit 1
+fi
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
+mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+for prd_category_case in missing invalid conflicting; do
+  case "$prd_category_case" in
+    missing)
+      cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+---
+# PRD
+EOF
+      ;;
+    invalid)
+      cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: feature
+---
+# PRD
+EOF
+      ;;
+    conflicting)
+      cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: bug
+category: enhancement
+---
+# PRD
+EOF
+      ;;
+  esac
+  if (
+    cd "$scratch/project"
+    bash "$scratch/verify-category.sh"
+  ) > /dev/null 2>&1; then
+    echo "PRD parse accepted $prd_category_case category metadata" >&2
+    exit 1
+  fi
+done
+cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: bug
+---
+# PRD
+EOF
 if grep -Eq 'gh(-| )sub-issue' "$epic_sync" "$init"; then
   echo "native publication still requires the legacy extension" >&2
   exit 1
@@ -200,6 +429,9 @@ chmod +x "$scratch/bin/gh"
 cat > "$scratch/bin/mv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${MV_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$MV_LOG"
+fi
 if [ "${MV_FAIL_INSTALL:-0}" = 1 ]; then
   case "$1" in
     */rename-stage/501.md) exit 1 ;;
@@ -220,6 +452,7 @@ EOF
 publication_headings=(
   "## Quick Check"
   "## Native Relationship Preflight"
+  "## Existing Category Preflight"
   "### 1. Create or Resume Epic Issue"
   "### 2. Create or Resume Native Task Sub-Issues"
   "### 2b. Validate Complete Mapping"
@@ -230,7 +463,7 @@ write_publication_script "$scratch/publish.sh" "${publication_headings[@]}"
 
 run_publication() (
   cd "$scratch/project"
-  GH_LOG="$gh_log" GH_STATE_DIR="$scratch/gh-state" \
+  GH_LOG="$gh_log" GH_STATE_DIR="${2:-$scratch/gh-state}" \
     MONDAY_EPIC_SYNC_TMP_PARENT="$scratch/run-parent" \
     PATH="$scratch/bin:$PATH" RUN_ROOT_OUTPUT="$1" \
     bash "$scratch/publish.sh"
@@ -250,8 +483,8 @@ monday_source: 001
 ' "$scratch/project/.claude/epics/feature/001.md" > \
   "$scratch/project/.claude/epics/feature/501.md"
 rm "$scratch/project/.claude/epics/feature/001.md"
-printf '%s\n' enhancement ready-for-agent tracking > "$scratch/gh-state/500.labels"
-printf '%s\n' enhancement ready-for-agent > "$scratch/gh-state/501.labels"
+printf '%s\n' bug ready-for-agent tracking > "$scratch/gh-state/500.labels"
+printf '%s\n' bug ready-for-agent > "$scratch/gh-state/501.labels"
 run_publication "$scratch/resumed-root" > /dev/null
 
 if [ "$(grep -c '^issue create --title Epic:' "$gh_log")" -ne 1 ] ||
@@ -270,13 +503,69 @@ if [ "$(cat "$scratch/gh-state/502.blockers")" != 501 ]; then
   echo "native blocked-by relationship was not published" >&2
   exit 1
 fi
+for number in 500 501 502; do
+  if ! grep -Fxq bug "$scratch/gh-state/$number.labels" ||
+    grep -Fxq enhancement "$scratch/gh-state/$number.labels"; then
+    echo "bug category was not propagated to issue #$number" >&2
+    exit 1
+  fi
+done
+
+enhancement_state="$scratch/gh-state-enhancement"
+mkdir -p "$enhancement_state"
+: > "$enhancement_state/task-002-failed-once"
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/enhancement-epic.md"
+mv "$scratch/enhancement-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/enhancement-prd.md"
+mv "$scratch/enhancement-prd.md" "$scratch/project/.claude/prds/feature.md"
+: > "$gh_log"
+run_publication "$scratch/enhancement-root" "$enhancement_state" > /dev/null
+for number in 500 501 502; do
+  if ! grep -Fxq enhancement "$enhancement_state/$number.labels" ||
+    grep -Fxq bug "$enhancement_state/$number.labels"; then
+    echo "enhancement category was not propagated to issue #$number" >&2
+    exit 1
+  fi
+done
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
+mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/bug-prd.md"
+mv "$scratch/bug-prd.md" "$scratch/project/.claude/prds/feature.md"
+
+for mismatch_case in mismatch conflicting; do
+  mismatch_state="$scratch/gh-state-$mismatch_case"
+  mkdir -p "$mismatch_state"
+  cp "$scratch/gh-state/500.body" "$scratch/gh-state/500.labels" \
+    "$scratch/gh-state/501.body" "$scratch/gh-state/501.labels" \
+    "$scratch/gh-state/501.parent" "$mismatch_state/"
+  if [ "$mismatch_case" = mismatch ]; then
+    printf '%s\n' enhancement needs-triage > "$mismatch_state/501.labels"
+  else
+    printf '%s\n' bug enhancement needs-triage > "$mismatch_state/501.labels"
+  fi
+  : > "$gh_log"
+  if run_publication "$scratch/$mismatch_case-root" "$mismatch_state" > /dev/null 2>&1; then
+    echo "resumed publication accepted $mismatch_case category metadata" >&2
+    exit 1
+  fi
+  if grep -Eq '^issue create --(title|parent)|^issue edit [0-9]' "$gh_log"; then
+    echo "$mismatch_case category failure mutated a GitHub issue" >&2
+    exit 1
+  fi
+done
 
 rename_project="$scratch/rename-project"
 rename_root="$scratch/rename-root"
-mkdir -p "$rename_project/.claude/epics/feature" "$rename_root"
+mkdir -p "$rename_project/.claude/epics/feature" "$rename_project/.claude/scripts/pm" "$rename_root"
+cp "$category_reader" "$rename_project/.claude/scripts/pm/read-issue-category.sh"
 cat > "$rename_project/.claude/epics/feature/epic.md" <<'EOF'
 ---
 name: feature
+category: bug
 ---
 # Feature
 EOF
@@ -325,7 +614,10 @@ fi
 
 failure_project="$scratch/rename-failure-project"
 failure_root="$scratch/rename-failure-root"
-mkdir -p "$failure_project/.claude/epics/feature" "$failure_root"
+mv_failure_log="$scratch/mv-failure.log"
+mkdir -p "$failure_project/.claude/epics/feature" \
+  "$failure_project/.claude/scripts/pm" "$failure_root"
+cp "$category_reader" "$failure_project/.claude/scripts/pm/read-issue-category.sh"
 cp "$rename_project/.claude/epics/feature/epic.md" \
   "$failure_project/.claude/epics/feature/epic.md"
 cp "$rename_project/.claude/epics/feature/002.md" \
@@ -334,11 +626,17 @@ cp "$rename_project/.claude/epics/feature/501.md" \
   "$failure_project/.claude/epics/feature/002.md"
 if (
   cd "$failure_project"
+  : > "$mv_failure_log"
   GH_LOG="$gh_log" GH_STATE_DIR="$scratch/gh-state" MV_FAIL_INSTALL=1 \
+    MV_LOG="$mv_failure_log" \
     PATH="$scratch/bin:$PATH" MONDAY_EPIC_SYNC_TMP_PARENT="$failure_root" \
     bash "$scratch/rename.sh"
 ) > /dev/null 2>&1; then
   echo "task rename did not surface an install failure" >&2
+  exit 1
+fi
+if ! grep -Fq '/rename-stage/501.md' "$mv_failure_log"; then
+  echo "rename failure fixture did not reach the staged install" >&2
   exit 1
 fi
 if ! grep -Fq '# First original' "$failure_project/.claude/epics/feature/001.md" ||

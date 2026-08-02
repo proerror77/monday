@@ -27,6 +27,23 @@ if [ ! -f "$epic_dir/epic.md" ]; then
   exit 1
 fi
 
+if ! issue_category=$(.claude/scripts/pm/read-issue-category.sh "$epic_dir/epic.md"); then
+  echo "❌ Epic frontmatter requires exactly one category: bug or enhancement" >&2
+  exit 1
+fi
+
+prd_file=".claude/prds/$ARGUMENTS.md"
+if [ -f "$prd_file" ]; then
+  if ! prd_category=$(.claude/scripts/pm/read-issue-category.sh "$prd_file"); then
+    echo "❌ PRD frontmatter requires exactly one category: bug or enhancement" >&2
+    exit 1
+  fi
+  if [ "$prd_category" != "$issue_category" ]; then
+    echo "❌ PRD and epic categories do not match" >&2
+    exit 1
+  fi
+fi
+
 task_source_id() {
   source_id=$(sed -n '2,/^---$/s/^monday_source: *//p' "$1")
   [ -n "$source_id" ] || source_id=$(basename "$1" .md)
@@ -91,6 +108,53 @@ if ! gh issue create --help | grep -q -- '--parent' ||
 fi
 ```
 
+## Existing Category Preflight
+
+Verify every resumable marker before any `gh issue create` or `gh issue edit`:
+
+```bash
+verify_existing_category() {
+  local marker="$1"
+  local issue_urls match_count issue_number published_labels category_count
+
+  if ! issue_urls=$(gh api --paginate 'repos/{owner}/{repo}/issues?state=all&per_page=100' \
+    --jq ".[] | select((has(\"pull_request\") | not) and .body != null and (.body | contains(\"$marker\"))) | .html_url"); then
+    echo "❌ Could not look up existing publication for $marker" >&2
+    exit 1
+  fi
+  match_count=$(printf '%s\n' "$issue_urls" | awk 'NF { count++ } END { print count + 0 }')
+  if [ "$match_count" -gt 1 ]; then
+    echo "❌ Multiple issues use $marker" >&2
+    exit 1
+  elif [ "$match_count" -eq 0 ]; then
+    return
+  fi
+
+  issue_number="${issue_urls##*/}"
+  case "$issue_number" in
+    ''|*[!0-9]*) echo "❌ Could not parse issue number from $issue_urls" >&2; exit 1 ;;
+  esac
+  if ! published_labels=$(gh issue view "$issue_number" --json labels --jq '.labels[].name'); then
+    echo "❌ Could not read category for #$issue_number" >&2
+    exit 1
+  fi
+  category_count=$(printf '%s\n' "$published_labels" |
+    awk '$0 == "bug" || $0 == "enhancement" { count++ } END { print count + 0 }')
+  if [ "$category_count" -ne 1 ] ||
+    ! printf '%s\n' "$published_labels" | grep -Fxq "$issue_category"; then
+    echo "❌ Published issue #$issue_number category does not match the source epic" >&2
+    exit 1
+  fi
+}
+
+verify_existing_category "<!-- monday-source: epic:$ARGUMENTS -->"
+for task_file in "$epic_dir"/[0-9]*.md; do
+  [ -f "$task_file" ] || continue
+  source_id=$(task_source_id "$task_file")
+  verify_existing_category "<!-- monday-source: epic:$ARGUMENTS/task:$source_id -->"
+done
+```
+
 ## Instructions
 
 ### 1. Create or Resume Epic Issue
@@ -145,7 +209,6 @@ awk '
 
 epic_marker="<!-- monday-source: epic:$ARGUMENTS -->"
 printf '\n%s\n' "$epic_marker" >> "$epic_sync_tmp/epic-body.md"
-issue_category="enhancement"
 
 if ! epic_urls=$(gh api --paginate 'repos/{owner}/{repo}/issues?state=all&per_page=100' \
   --jq ".[] | select((has(\"pull_request\") | not) and .body != null and (.body | contains(\"$epic_marker\"))) | .html_url"); then
@@ -180,7 +243,7 @@ epic_category_count=$(printf '%s\n' "$published_epic_labels" | awk '$0 == "bug" 
 epic_state_count=$(printf '%s\n' "$published_epic_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { count++ } END { print count + 0 }')
 if [ "$published_epic_body" != "$(cat "$epic_sync_tmp/epic-body.md")" ] ||
   [ "$epic_category_count" -ne 1 ] || [ "$epic_state_count" -ne 1 ] ||
-  ! printf '%s\n' "$published_epic_labels" | grep -Fxq enhancement ||
+  ! printf '%s\n' "$published_epic_labels" | grep -Fxq "$issue_category" ||
   ! printf '%s\n' "$published_epic_labels" | grep -Fxq tracking; then
   echo "❌ Published tracking issue body or labels do not match" >&2
   exit 1
@@ -250,6 +313,20 @@ Task:
     Create GitHub sub-issues for tasks in epic $ARGUMENTS
     Parent epic issue: #$epic_number
     Scratch root: $epic_sync_tmp/batch-{X}
+
+    The controller captured this category before publication: issue_category=$issue_category
+    Before processing tasks, execute the following guard before any lookup or mutation:
+    # BATCH_CATEGORY_GUARD_START
+    if ! batch_category=$(.claude/scripts/pm/read-issue-category.sh ".claude/epics/$ARGUMENTS/epic.md"); then
+      echo "❌ Could not read the epic category in the publication batch" >&2
+      exit 1
+    fi
+    if [ "$batch_category" != "$issue_category" ]; then
+      echo "❌ Epic category changed during publication" >&2
+      exit 1
+    fi
+    category="$issue_category"
+    # BATCH_CATEGORY_GUARD_END
     
     Tasks to process:
     - {list of 3-4 task files}
@@ -262,7 +339,7 @@ Task:
        one matches; resume the one match; otherwise create with:
        gh issue create --parent $epic_number --title "$task_name" \
          --body-file {batch_body_file} \
-         --label "$issue_category,needs-triage"
+         --label "$category,needs-triage"
     4. Parse the returned or resumed URL and record exactly one line:
        task_file:issue_number
        in "$epic_sync_tmp/batch-{X}/mapping.txt".
@@ -359,7 +436,7 @@ while IFS=: read -r task_file task_number; do
   task_state_count=$(printf '%s\n' "$published_task_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { count++ } END { print count + 0 }')
   if [ "$published_task_body" != "$(cat "$expected_task_body")" ] ||
     [ "$task_category_count" -ne 1 ] || [ "$task_state_count" -ne 1 ] ||
-    ! printf '%s\n' "$published_task_labels" | grep -Fxq enhancement ||
+    ! printf '%s\n' "$published_task_labels" | grep -Fxq "$issue_category" ||
     [ "$published_parent" != "$epic_number" ]; then
     echo "❌ Published task #$task_number does not match body, labels, or parent" >&2
     exit 1
@@ -623,7 +700,7 @@ its dedicated worktree through `/rules/worktree-operations.md`.
 ✅ Synced to GitHub
   - Epic: #{epic_number} - {epic_title}
   - Tasks: {count} sub-issues created
-  - Labels applied: enhancement + needs-triage; tracking on the epic
+  - Labels applied: {bug or enhancement from PRD} + needs-triage; tracking on the epic
   - Files renamed: 001.md → {issue_id}.md
   - References updated: depends_on/conflicts_with now use issue IDs
   - Worktrees: one dedicated path per ready issue
