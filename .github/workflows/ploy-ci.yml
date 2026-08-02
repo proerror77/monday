@@ -161,6 +161,10 @@ jobs:
         working-directory: .
         run: .github/scripts/test-issue-lifecycle-audit.sh
 
+      - name: Test issue lifecycle preflight capture
+        working-directory: .
+        run: .github/scripts/test-issue-lifecycle-preflight.sh
+
       - name: Test issue lifecycle templates
         working-directory: .
         run: .github/scripts/test-issue-lifecycle-contract.sh
