@@ -1,0 +1,39 @@
+name: Issue Lifecycle Status Reconciliation
+
+"on":
+  issues:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  schedule:
+    - cron: "29 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: issue-lifecycle-status-reconciliation
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  reconcile-statuses:
+    name: Issue Lifecycle Status Reconciler
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Reconcile open pull-request statuses
+        run: >-
+          ruby .github/scripts/issue-lifecycle-status-reconcile.rb
+          --repo "$GITHUB_REPOSITORY"
+          --summary "$GITHUB_STEP_SUMMARY"
