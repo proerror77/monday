@@ -518,7 +518,7 @@ def collection_scope(request, repo)
   relative = path[%r{\Arepos/#{Regexp.escape(repo)}/(.+)\z}, 1] || path[%r{\Arepositories/[1-9][0-9]*/(.+)\z}, 1]
   return unless relative
 
-  filters = URI.decode_www_form(query.to_s).reject { |key, _| %w[after before page per_page].include?(key) }.sort
+  filters = URI.decode_www_form(query.to_s).reject { |key, _| %w[after before page].include?(key) }.sort
   [relative, filters]
 rescue ArgumentError
   nil

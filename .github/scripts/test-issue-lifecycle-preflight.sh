@@ -421,6 +421,19 @@ ruby -rjson -e '
 rehash "$tmp_dir/verify-link-target" manifest.json
 verify_fails link-target "$tmp_dir/verify-link-target"
 
+cp -R "$tmp_dir/bundle-canonical-link" "$tmp_dir/verify-page-size"
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("pages").each do |page|
+    page["request"].sub!("per_page=100", "per_page=1") if page["request"].include?("repositories/123456/labels")
+    page["link"].sub!("per_page=100", "per_page=1") if page["link"]
+  end
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-page-size/manifest.json"
+rehash "$tmp_dir/verify-page-size" manifest.json
+verify_fails page-size "$tmp_dir/verify-page-size"
+
 copy_bundle verify-entry-identity
 ruby -rjson -e '
   path = ARGV.fetch(0)
