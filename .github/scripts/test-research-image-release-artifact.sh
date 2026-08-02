@@ -32,6 +32,9 @@ assert_source manual-rebuild $'publish_target=research-runner\nresearch_mode=reb
 assert_source manual-nonresearch $'publish_target=hft-trading\nresearch_mode=none\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
   --event workflow_dispatch --target hft-trading --rebuild false \
   --current-sha "$other_sha" --current-run-id 5678
+assert_source manual-raw-ops-alias $'publish_target=binance-lob-archiver\nresearch_mode=none\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
+  --event workflow_dispatch --target polymarket-raw-ops --rebuild false \
+  --current-sha "$other_sha" --current-run-id 5678
 
 for rejected in failed-run pull-request-run branch-run implicit-rebuild; do
   case "$rejected" in
