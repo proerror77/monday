@@ -216,6 +216,29 @@ and (
       + .legacy_runtime.release_sha256 + "/polymarket-raw-ops")
     and .legacy_runtime.proc_exe == .legacy_runtime.release_path
   )
+  or
+  (
+    .baseline_mode == "rust_bootstrap"
+    and .baseline_degraded == true
+    and .baseline_health_start_required == false
+    and .baseline_runtime_stability_required == true
+    and .baseline_health_completion_required == false
+    and .baseline_health_snapshot == null
+    and .baseline_health_completion_snapshot == null
+    and .baseline_health_start_success_unix == null
+    and .baseline_health_cutoff_unix == null
+    and .baseline_health_start_written_at_unix == null
+    and .baseline_health_completion_written_at_unix == null
+    and .baseline_health_start_file_identity == null
+    and .baseline_health_completion_file_identity == null
+    and (.legacy_runtime |
+      runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200";
+        "6d942117a378a42f06376acb78dbc312c85e1146fc05ff17d1699b8a6007edec"))
+    and (.legacy_runtime.release_sha256 | sha256)
+    and .candidate_sha256 != .legacy_runtime.release_sha256
+    and .legacy_runtime.release_path == "/opt/monday/bin/polymarket-raw-ops"
+    and .legacy_runtime.proc_exe == .legacy_runtime.release_path
+  )
 )
 and (
   .shadow_runtime.exec_start == (
@@ -266,7 +289,7 @@ and .checks.market_oss_readback_parity == true
 and .checks.real_market_segment_preflight == true
 and (.comparison_mode == "legacy_overlap" or (
   .comparison_mode == "rust_self"
-  and .baseline_mode == "legacy_python"
+  and (.baseline_mode == "legacy_python" or .baseline_mode == "rust_bootstrap")
   and .baseline_runtime_stability_required == true
 ))
 and (.metrics.oss_uploaded_segments | positive_integer)

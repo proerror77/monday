@@ -193,7 +193,8 @@ secure_collector_directory() {
 
 verify_legacy_state_handoff_preflight() {
   local baseline_mode=$1 state_path=$2 parent owner group mode
-  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
+    || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode == legacy_python ]] || return 0
   parent=${state_path%/*}
   secure_collector_directory "$parent" || return 1
@@ -846,7 +847,8 @@ verify_legacy_health() {
 verify_cutover_target_preflight() {
   local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
   local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
-  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
+    || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
     || return 1
   secure_root_chain_or_absent "$control_dir" || return 1
@@ -928,6 +930,28 @@ verify_rust_runtime() {
   verify_rust_health_file "$HEALTH" "$started_epoch" "$health_policy"
 }
 
+verify_bootstrap_rust_runtime() {
+  local expected_binary=$1 expected_sha=$2 expected_pid=$3 expected_invocation_id=$4
+  local expected_restarts=${5:-0} pid cmdline restarts invocation_id
+  [[ $expected_binary == "$ACTIVE_BINARY" && -f $ACTIVE_BINARY && ! -L $ACTIVE_BINARY ]] \
+    || return 1
+  secure_regular_file "$ACTIVE_BINARY" || return 1
+  [[ -x $ACTIVE_BINARY ]] || return 1
+  printf '%s  %s\n' "$expected_sha" "$ACTIVE_BINARY" \
+    | sha256sum --check --strict >/dev/null || return 1
+  unit_active "$COLLECTOR_UNIT" || return 1
+  verify_effective_unit "$COLLECTOR_UNIT" "$COLLECTOR_FRAGMENT" "$RUST_EXEC" || return 1
+  pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
+  [[ $pid == "$expected_pid" ]] || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") || return 1
+  [[ $restarts == "$expected_restarts" ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT") || return 1
+  [[ $invocation_id == "$expected_invocation_id" ]] || return 1
+  [[ $(readlink -f -- "/proc/$pid/exe") == "$ACTIVE_BINARY" ]] || return 1
+  cmdline=$(proc_cmdline "$pid") || return 1
+  [[ $cmdline == "$RUST_EXEC " ]]
+}
+
 snapshot_legacy() {
   local rollback_dir=$1 baseline_mode=${2:-legacy_python}
   local baseline_release_path=${3:-} baseline_release_sha=${4:-} candidate_sha=${5:-}
@@ -956,6 +980,15 @@ snapshot_legacy() {
       || die 'active Rust symlink changed before rollback snapshot'
     verify_control_release "$CONTROL_DIR" "$baseline_release_sha" "$baseline_release_path" \
       || die 'global controls changed before rollback snapshot'
+  elif [[ $baseline_mode == rust_bootstrap ]]; then
+    [[ $baseline_release_path == "$ACTIVE_BINARY" && -f $ACTIVE_BINARY \
+      && ! -L $ACTIVE_BINARY ]] \
+      || die 'active Rust bootstrap binary changed before rollback snapshot'
+    secure_regular_file "$ACTIVE_BINARY"
+    [[ -x $ACTIVE_BINARY ]] || die 'active Rust bootstrap binary is not executable'
+    printf '%s  %s\n' "$baseline_release_sha" "$ACTIVE_BINARY" \
+      | sha256sum --check --strict >/dev/null \
+      || die 'active Rust bootstrap digest changed before rollback snapshot'
   fi
   if [[ -d $CONTROL_DIR && ! -L $CONTROL_DIR ]]; then
     secure_root_chain "$CONTROL_DIR" || die 'global control directory is not trusted'
@@ -984,12 +1017,20 @@ snapshot_legacy() {
     install -m 0755 "$LEGACY_UPLOADER" "$rollback_dir/bin/${PYTHON_ASSETS[1]}"
     install -m 0644 "$LEGACY_HEALTH_POLICY" \
       "$rollback_dir/control/polymarket-legacy-health-policy.jq"
-  else
+  elif [[ $baseline_mode == rust_release ]]; then
     printf '%s\n' "$baseline_release_path" >"$rollback_dir/bin/release-path"
     printf '%s\n' "$baseline_release_sha" >"$rollback_dir/bin/release-sha256"
     jq --arg path "$baseline_release_path" --arg sha "$baseline_release_sha" \
       '.active_symlink={target:$path,sha256:$sha}' "$state_json" >"$state_json.tmp"
     mv "$state_json.tmp" "$state_json"
+  elif [[ $baseline_mode == rust_bootstrap ]]; then
+    mode=$(stat -c %a -- "$ACTIVE_BINARY")
+    install -m "$mode" "$ACTIVE_BINARY" "$rollback_dir/bin/polymarket-raw-ops"
+    jq --arg path "$baseline_release_path" --arg sha "$baseline_release_sha" --arg mode "$mode" \
+      '.active_direct={path:$path,sha256:$sha,mode:$mode}' "$state_json" >"$state_json.tmp"
+    mv "$state_json.tmp" "$state_json"
+  else
+    die 'rollback snapshot has no valid baseline mode'
   fi
   for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
     enabled=false
@@ -1014,6 +1055,7 @@ restore_legacy() (
   local rollback_dir=$evidence_dir/rollback active_target actual_manifest_sha asset mode
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts rollback_mode
   local rollback_sha temporary_link previous_health_sha current_health_sha
+  local bootstrap_path bootstrap_sha bootstrap_mode bootstrap_restored
   local control_dir_present control_files=
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
   secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
@@ -1023,11 +1065,11 @@ restore_legacy() (
     cd "$rollback_dir"
     sha256sum --check --strict manifest.sha256 >/dev/null
   ) || die 'rollback snapshot checksum failed'
-  rollback_mode=$(jq -er '.baseline_mode // "legacy_python" | select(. == "legacy_python" or . == "rust_release")' \
+  rollback_mode=$(jq -er '.baseline_mode // "legacy_python" | select(. == "legacy_python" or . == "rust_release" or . == "rust_bootstrap")' \
     "$rollback_dir/state.json") || die 'rollback snapshot has no valid baseline mode'
   [[ $rollback_mode == rust_release ]] \
     && rollback_health_policy=$rollback_dir/control/polymarket-rust-health-policy.jq
-  secure_regular_file "$rollback_health_policy"
+  [[ $rollback_mode == rust_bootstrap ]] || secure_regular_file "$rollback_health_policy"
   if [[ -e $evidence_dir/cutover.json || -L $evidence_dir/cutover.json ]]; then
     secure_regular_file "$evidence_dir/cutover.json"
     expected_manifest_sha=$(jq -er '.rollback_manifest_sha256' "$evidence_dir/cutover.json") \
@@ -1078,7 +1120,9 @@ restore_legacy() (
     fi
     atomic_install 0755 "$rollback_dir/bin/${PYTHON_ASSETS[0]}" "$LEGACY_COLLECTOR"
     atomic_install 0755 "$rollback_dir/bin/${PYTHON_ASSETS[1]}" "$LEGACY_UPLOADER"
-  elif [[ ! -e $ACTIVE_BINARY || -L $ACTIVE_BINARY ]]; then
+  elif [[ $rollback_mode == rust_release ]]; then
+    [[ ! -e $ACTIVE_BINARY || -L $ACTIVE_BINARY ]] \
+      || die 'refusing to replace a non-symlink active Rust path'
     active_target=$(jq -er '.active_symlink.target' "$rollback_dir/state.json")
     rollback_sha=$(jq -er '.active_symlink.sha256' "$rollback_dir/state.json")
     [[ $active_target == "$RELEASE_ROOT/$rollback_sha/polymarket-raw-ops" ]] \
@@ -1098,8 +1142,49 @@ restore_legacy() (
     temporary_link="${ACTIVE_BINARY}.new.$$"; rm -f "$temporary_link"
     ln -s "$active_target" "$temporary_link"
     mv -Tf "$temporary_link" "$ACTIVE_BINARY"
-  elif [[ -e $ACTIVE_BINARY ]]; then
-    die 'refusing to replace a non-symlink active Rust path'
+  elif [[ $rollback_mode == rust_bootstrap ]]; then
+    bootstrap_path=$(jq -er '.active_direct.path' "$rollback_dir/state.json")
+    bootstrap_sha=$(jq -er '.active_direct.sha256 | select(test("^[a-f0-9]{64}$"))' \
+      "$rollback_dir/state.json")
+    bootstrap_mode=$(jq -er '.active_direct.mode | select(test("^[0-7]{3,4}$"))' \
+      "$rollback_dir/state.json")
+    (( (8#$bootstrap_mode & 0111) != 0 )) \
+      || die 'bootstrap rollback mode is not executable'
+    [[ $bootstrap_path == "$ACTIVE_BINARY" ]] \
+      || die 'bootstrap rollback path is not the canonical active binary'
+    secure_regular_file "$rollback_dir/bin/polymarket-raw-ops"
+    [[ -x $rollback_dir/bin/polymarket-raw-ops ]] \
+      || die 'bootstrap rollback binary is not executable'
+    printf '%s  %s\n' "$bootstrap_sha" "$rollback_dir/bin/polymarket-raw-ops" \
+      | sha256sum --check --strict >/dev/null \
+      || die 'bootstrap rollback binary checksum failed'
+    bootstrap_restored=false
+    if [[ -L $ACTIVE_BINARY ]]; then
+      active_target=$(readlink -f -- "$ACTIVE_BINARY")
+      [[ $active_target == "$RELEASE_ROOT"/*/polymarket-raw-ops ]] \
+        || die 'active Rust symlink points outside the immutable release root'
+      rm -f "$ACTIVE_BINARY"
+    elif [[ -e $ACTIVE_BINARY ]]; then
+      secure_regular_file "$ACTIVE_BINARY"
+      if printf '%s  %s\n' "$bootstrap_sha" "$ACTIVE_BINARY" \
+        | sha256sum --check --strict >/dev/null; then
+        bootstrap_restored=true
+      else
+        die 'active direct Rust binary differs from the bootstrap rollback image'
+      fi
+    fi
+    if [[ $bootstrap_restored == false ]]; then
+      atomic_install "$bootstrap_mode" "$rollback_dir/bin/polymarket-raw-ops" \
+        "$ACTIVE_BINARY"
+    fi
+    if [[ $control_dir_present == true ]]; then
+      while IFS= read -r asset; do
+        mode=$(jq -er --arg asset "$asset" '.control_modes[$asset]' "$rollback_dir/state.json")
+        atomic_install "$mode" "$rollback_dir/control/$asset" "$CONTROL_DIR/$asset"
+      done <<<"$control_files"
+    fi
+  else
+    die 'rollback snapshot has no valid baseline mode'
   fi
   if [[ $rollback_mode == legacy_python && ( -e $ACTIVE_BINARY || -L $ACTIVE_BINARY ) ]]; then
     [[ -L $ACTIVE_BINARY ]] || die 'refusing to remove a non-symlink active Rust path'
@@ -1135,27 +1220,34 @@ restore_legacy() (
       fi
       if [[ $rollback_mode == legacy_python ]]; then
         verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" && break
-      else
+      elif [[ $rollback_mode == rust_release ]]; then
         if verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
           "$rollback_invocation_id" 0 "$rollback_health_policy"; then
           current_health_sha=$(sha256sum "$HEALTH" | awk '{print $1}')
           [[ $current_health_sha != "$previous_health_sha" ]] && break
         fi
+      elif verify_bootstrap_rust_runtime "$bootstrap_path" "$bootstrap_sha" \
+        "$rollback_pid" "$rollback_invocation_id" 0; then
+        break
       fi
     fi
     sleep 5
   done
   [[ -n $rollback_pid ]] || die 'collector never produced a verifiable MainPID'
-  [[ $rollback_mode == legacy_python \
+  [[ $rollback_mode == legacy_python || $rollback_mode == rust_bootstrap \
     || ( -n $current_health_sha && $current_health_sha != "$previous_health_sha" ) ]] \
     || die 'Rust collector health did not advance after rollback restart'
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
-    || die 'Python collector identity did not recover during rollback'
-  else
+    verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
+      || die 'Python collector identity did not recover during rollback'
+  elif [[ $rollback_mode == rust_release ]]; then
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
       "$rollback_invocation_id" 0 "$rollback_health_policy" \
       || die 'Rust collector identity or health did not recover during rollback'
+  else
+    verify_bootstrap_rust_runtime "$bootstrap_path" "$bootstrap_sha" \
+      "$rollback_pid" "$rollback_invocation_id" 0 \
+      || die 'bootstrap Rust collector identity did not recover during rollback'
   fi
 
   for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
@@ -1171,20 +1263,26 @@ restore_legacy() (
     fi
   done
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
-    || die 'rollback did not preserve legacy runtime identity'
-  else
+    verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
+      || die 'rollback did not preserve legacy runtime identity'
+  elif [[ $rollback_mode == rust_release ]]; then
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
       "$rollback_invocation_id" 0 "$rollback_health_policy" || die 'restored Rust runtime changed'
+  else
+    verify_bootstrap_rust_runtime "$bootstrap_path" "$bootstrap_sha" \
+      "$rollback_pid" "$rollback_invocation_id" 0 || die 'restored bootstrap Rust runtime changed'
   fi
   verify_saved_unit_state "$rollback_dir/state.json" \
     || die 'rollback did not restore the saved collector/timer state'
   if [[ $rollback_mode == legacy_python ]]; then
-  verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
-    || die 'legacy runtime changed before rollback completion'
-  else
+    verify_legacy_runtime "$rollback_pid" 0 "$rollback_invocation_id" \
+      || die 'legacy runtime changed before rollback completion'
+  elif [[ $rollback_mode == rust_release ]]; then
     verify_rust_runtime "$active_target" "$started_epoch" "$rollback_pid" \
       "$rollback_invocation_id" 0 "$rollback_health_policy" || die 'Rust rollback did not hold'
+  else
+    verify_bootstrap_rust_runtime "$bootstrap_path" "$bootstrap_sha" \
+      "$rollback_pid" "$rollback_invocation_id" 0 || die 'bootstrap Rust rollback did not hold'
   fi
   printf '%s\n' "$evidence_dir"
 )
@@ -1268,7 +1366,7 @@ if [[ $mode == rollback ]]; then
   secure_regular_file "$rollback_dir/manifest.sha256"
   (cd "$rollback_dir" && sha256sum --check --strict manifest.sha256 >/dev/null) \
     || die 'rollback snapshot checksum failed'
-  rollback_mode=$(jq -er '.baseline_mode // "legacy_python" | select(. == "legacy_python" or . == "rust_release")' \
+  rollback_mode=$(jq -er '.baseline_mode // "legacy_python" | select(. == "legacy_python" or . == "rust_release" or . == "rust_bootstrap")' \
     "$rollback_dir/state.json") || die 'rollback snapshot has no valid baseline mode'
   snapshot_candidate=$(jq -er '.candidate_sha256 // empty | select(test("^[a-f0-9]{64}$"))' \
     "$rollback_dir/state.json" 2>/dev/null || true)
@@ -1312,6 +1410,8 @@ if [[ $mode == rollback ]]; then
     || die 'rollback snapshot has no candidate identity'
   rollback_candidate_path="$RELEASE_ROOT/$rollback_candidate/polymarket-raw-ops"
   rollback_saved_path=
+  rollback_saved_sha=
+  rollback_saved_mode=
   if [[ $rollback_mode == rust_release ]]; then
     rollback_saved_path=$(jq -er '.active_symlink.target' "$rollback_dir/state.json")
     rollback_saved_sha=$(jq -er '.active_symlink.sha256' "$rollback_dir/state.json")
@@ -1323,9 +1423,30 @@ if [[ $mode == rollback ]]; then
       || die 'saved baseline release is not executable'
     printf '%s  %s\n' "$rollback_saved_sha" "$rollback_saved_path" \
       | sha256sum --check --strict >/dev/null || die 'saved baseline release checksum failed'
+  elif [[ $rollback_mode == rust_bootstrap ]]; then
+    rollback_saved_path=$(jq -er '.active_direct.path' "$rollback_dir/state.json")
+    rollback_saved_sha=$(jq -er '.active_direct.sha256 | select(test("^[a-f0-9]{64}$"))' \
+      "$rollback_dir/state.json")
+    rollback_saved_mode=$(jq -er '.active_direct.mode | select(test("^[0-7]{3,4}$"))' \
+      "$rollback_dir/state.json") || die 'saved bootstrap mode is invalid'
+    (( (8#$rollback_saved_mode & 0111) != 0 )) \
+      || die 'saved bootstrap mode is not executable'
+    [[ $rollback_saved_path == "$ACTIVE_BINARY" ]] \
+      || die 'saved bootstrap path is not the canonical active binary'
+    secure_regular_file "$rollback_dir/bin/polymarket-raw-ops"
+    [[ -x $rollback_dir/bin/polymarket-raw-ops ]] \
+      || die 'saved bootstrap binary is not executable'
+    printf '%s  %s\n' "$rollback_saved_sha" "$rollback_dir/bin/polymarket-raw-ops" \
+      | sha256sum --check --strict >/dev/null || die 'saved bootstrap binary checksum failed'
   fi
   if [[ -L $ACTIVE_BINARY ]]; then
     rollback_active_path=$(readlink -f -- "$ACTIVE_BINARY")
+  elif [[ $rollback_mode == rust_bootstrap && -f $ACTIVE_BINARY ]]; then
+    secure_regular_file "$ACTIVE_BINARY"
+    printf '%s  %s\n' "$rollback_saved_sha" "$ACTIVE_BINARY" \
+      | sha256sum --check --strict >/dev/null \
+      || die 'active direct Rust binary differs from the saved bootstrap baseline'
+    rollback_active_path=$ACTIVE_BINARY
   elif [[ -e $ACTIVE_BINARY ]]; then
     die 'active release lineage is not a symlink'
   else
@@ -1439,7 +1560,7 @@ for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER
   "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
   secure_regular_file "$SCRIPT_DIR/$asset"
 done
-baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release")' \
+baseline_mode=$(jq -er '.baseline_mode | select(. == "legacy_python" or . == "rust_release" or . == "rust_bootstrap")' \
   "$gate_json") || die 'shadow gate has no valid baseline mode'
 baseline_runtime_stability_required=$(jq -er \
   '.baseline_runtime_stability_required | select(type == "boolean") | tostring' \
@@ -1471,7 +1592,7 @@ if [[ $baseline_mode == legacy_python ]]; then
     || die 'cutover requires an exact canonical legacy rollback runtime'
   # The immutable Gate policy above already admitted the atomic legacy health
   # snapshot. Promotion requires the same runtime identity, not a new cycle.
-else
+elif [[ $baseline_mode == rust_release ]]; then
   [[ $legacy_pid == "$gate_legacy_pid" ]] \
     || die 'Rust baseline MainPID changed after the shadow gate'
   gate_baseline_release_path=$(jq -er '.legacy_runtime.release_path' "$gate_json")
@@ -1498,6 +1619,25 @@ else
     || die 'active Rust uploader environment differs from the shadow gate'
   verify_upload_units "$baseline_pinned_upload_env" \
     || die 'active Rust upload units do not bind the baseline release'
+else
+  [[ $baseline_runtime_stability_required == true ]] \
+    || die 'bootstrap Rust baseline lacks the required runtime stability contract'
+  [[ $(jq -er '.baseline_degraded | select(. == true) | tostring' "$gate_json") == true ]] \
+    || die 'bootstrap Rust baseline is not explicitly degraded'
+  [[ $legacy_pid == "$gate_legacy_pid" ]] \
+    || die 'bootstrap Rust baseline MainPID changed after the shadow gate'
+  gate_baseline_release_path=$(jq -er '.legacy_runtime.release_path' "$gate_json")
+  gate_baseline_release_sha=$(jq -er \
+    '.legacy_runtime.release_sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+    "$gate_json")
+  gate_baseline_proc_exe=$(jq -er '.legacy_runtime.proc_exe' "$gate_json")
+  [[ $gate_baseline_release_path == "$ACTIVE_BINARY" \
+    && $gate_baseline_proc_exe == "$gate_baseline_release_path" \
+    && $gate_baseline_release_sha != "$candidate_sha" ]] \
+    || die 'gated bootstrap Rust baseline identity is invalid'
+  verify_bootstrap_rust_runtime "$gate_baseline_release_path" "$gate_baseline_release_sha" \
+    "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
+    || die 'bootstrap Rust baseline identity or restart counter changed after the shadow gate'
 fi
 verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
@@ -1541,7 +1681,8 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# Drain with the still-installed legacy uploader before changing any unit.
+# Drain only uploader configurations that the Gate could bind. A degraded
+# bootstrap baseline is deliberately not a release-control source.
 [[ $(sha256sum "$gate_terminal_receipt" | awk '{print $1}') \
   == "$gate_terminal_receipt_sha256" ]] \
   || die 'Gate terminal receipt changed before cutover transition'
@@ -1553,7 +1694,7 @@ transition_started=true
 systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
 if [[ $baseline_mode == legacy_python ]]; then
-render_upload_unit "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" \
+  render_upload_unit "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" \
   "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" "$pinned_upload_env"
 systemctl daemon-reload
 verify_effective_unit "$REFERENCE_UPLOAD_UNIT" \
@@ -1562,13 +1703,15 @@ verify_effective_unit "$REFERENCE_UPLOAD_UNIT" \
 grep -Fxq "EnvironmentFile=$pinned_upload_env" \
   "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" \
   || die 'legacy reference uploader is not pinned to the gated OSS configuration'
-else
+elif [[ $baseline_mode == rust_release ]]; then
   verify_upload_units "$baseline_pinned_upload_env" \
     || die 'Rust baseline upload units changed before drain'
 fi
-systemctl start "$REFERENCE_UPLOAD_UNIT"
-verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
-  || die 'legacy reference uploader drain did not complete successfully'
+if [[ $baseline_mode != rust_bootstrap ]]; then
+  systemctl start "$REFERENCE_UPLOAD_UNIT"
+  verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
+    || die 'legacy reference uploader drain did not complete successfully'
+fi
 if [[ $baseline_mode == rust_release ]]; then
   systemctl start "$MARKET_UPLOAD_UNIT"
   verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
@@ -1578,18 +1721,23 @@ legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
   || die 'could not capture the legacy collector journal cursor before stop'
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed during the legacy uploader drain'
-[[ $baseline_mode == legacy_python \
-  || $(oss_config_sha256 "$baseline_pinned_upload_env") == "$gate_oss_config_sha" ]] \
-  || die 'active Rust uploader configuration changed during drain'
+if [[ $baseline_mode == rust_release ]]; then
+  [[ $(oss_config_sha256 "$baseline_pinned_upload_env") == "$gate_oss_config_sha" ]] \
+    || die 'active Rust uploader configuration changed during drain'
+fi
 if [[ $baseline_mode == legacy_python ]]; then
 verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
   || die 'legacy collector identity or restart counter changed during uploader drain'
-else
+elif [[ $baseline_mode == rust_release ]]; then
   pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
   verify_rust_runtime "$gate_baseline_release_path" "$pre_stop_health_not_before" \
     "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
     "$LEGACY_HEALTH_POLICY" \
     || die 'Rust baseline identity or health changed during uploader drain'
+else
+  verify_bootstrap_rust_runtime "$gate_baseline_release_path" "$gate_baseline_release_sha" \
+    "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
+    || die 'bootstrap Rust baseline identity changed during uploader drain'
 fi
 
 systemctl stop "$COLLECTOR_UNIT"
