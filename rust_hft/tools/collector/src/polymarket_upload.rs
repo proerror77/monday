@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -58,11 +58,6 @@ const MAX_QUOTE_SOURCE_REGRESSION_MS: i64 = 30_000;
 // endpoint: in production (2026-08-01, three gate invocations) a just-PUT
 // object repeatedly returned 404 NoSuchKey for a few seconds past a 3x1s
 // retry window before becoming HEAD-able, failing every shadow gate.
-const OSS_READBACK_ATTEMPTS: usize = 120;
-#[cfg(not(test))]
-const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_millis(5);
 // Per-file readback timeout: verified objects are tens of MB on an internal
 // endpoint, so a hung download must fail fast instead of inheriting the
 // 300s upload timeout (36 downloads x 300s would otherwise cap the retry
@@ -73,6 +68,14 @@ const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 // this endpoint: a 109MiB multipart upload took ~150s to become HEAD-able
 // (2026-08-01T18:23 CST), failing a 12x5s loop at ~90s.
 const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(600);
+// Per-artifact verify-download retry: a just-PUT object can 404 NoSuchKey for
+// minutes on this endpoint (2026-08-02 production uploads), so each artifact
+// gets a bounded retry budget aligned with the gate script's 30x20s curve.
+const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 30;
+#[cfg(not(test))]
+const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -1894,17 +1897,64 @@ fn oss_upload_command(source: &str, destination: &str, config: &UploadConfig) ->
 
 fn run_checked(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
     command.stdout(Stdio::null());
-    let status = command_status_with_timeout(command, timeout)?;
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture child stderr"))?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            bail!("child process timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("child stderr reader panicked"))??;
+    let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if !detail.is_empty() {
+        eprintln!("{detail}");
+    }
     if !status.success() {
-        bail!("child process exited with {status}");
+        if detail.is_empty() {
+            bail!("child process exited with {status}");
+        }
+        bail!("child process exited with {status}: {detail}");
     }
     Ok(status)
+}
+
+/// A verify download miss is only worth retrying when the child process ran
+/// and exited non-zero (the just-PUT object is not visible yet); spawn or
+/// configuration failures must surface immediately.
+fn is_retryable_download_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_ascii_lowercase();
+        text.contains("nosuchkey")
+            || text.contains("http 404")
+            || text.contains("status code: 404")
+            || text.contains("status code 404")
+    })
 }
 
 fn download_remote_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
     budget_remaining: Duration,
+    max_attempts: usize,
     runner: &mut F,
 ) -> Result<(ExclusiveTempDir, BTreeMap<String, PathBuf>)>
 where
@@ -1931,16 +1981,44 @@ where
                 .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
             config,
         );
-        let file_budget = budget_remaining
-            .checked_sub(download_started.elapsed())
-            .unwrap_or(Duration::ZERO);
-        runner(
-            &mut command,
-            config
-                .oss_timeout
-                .min(OSS_READBACK_FILE_TIMEOUT)
-                .min(file_budget),
-        )?;
+        // A just-PUT object can 404 for minutes on this endpoint: retry the
+        // download on process-level misses, but fail immediately on
+        // configuration-style errors.
+        for attempt in 1..=max_attempts {
+            let file_budget = budget_remaining
+                .checked_sub(download_started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if file_budget.is_zero() {
+                bail!("remote artifact {name} exceeded OSS readback wall-clock budget");
+            }
+            let miss = match runner(
+                &mut command,
+                config
+                    .oss_timeout
+                    .min(OSS_READBACK_FILE_TIMEOUT)
+                    .min(file_budget),
+            ) {
+                Ok(status) if status.success() => break,
+                Ok(status) => {
+                    bail!("child process exited with {status} without retryable 404 detail")
+                }
+                Err(error) if is_retryable_download_failure(&error) => error.to_string(),
+                Err(error) => return Err(error),
+            };
+            if attempt == max_attempts {
+                bail!(
+                    "remote artifact {name} stayed unavailable after {max_attempts} download attempts: {miss}"
+                );
+            }
+            let retry_budget = budget_remaining
+                .checked_sub(download_started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if retry_budget.is_zero() {
+                bail!("remote artifact {name} exceeded OSS readback wall-clock budget");
+            }
+            eprintln!("oss verify download of {name} missed ({miss}); retrying");
+            std::thread::sleep(OSS_VERIFY_DOWNLOAD_RETRY_DELAY.min(retry_budget));
+        }
         regular_identity(&destination)?;
         downloaded.insert(name.to_owned(), destination);
     }
@@ -1997,33 +2075,15 @@ fn verify_remote_artifacts_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let mut last_error = None;
-    let started = std::time::Instant::now();
-    for attempt in 0..OSS_READBACK_ATTEMPTS {
-        let elapsed = started.elapsed();
-        if elapsed > OSS_READBACK_MAX_WALL_CLOCK {
-            break;
-        }
-        let budget_remaining = OSS_READBACK_MAX_WALL_CLOCK - elapsed;
-        match download_remote_artifacts_with(artifacts, config, budget_remaining, runner) {
-            Ok((_verify_dir, downloaded)) => {
-                return verify_downloaded_artifacts(artifacts, &downloaded);
-            }
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < OSS_READBACK_ATTEMPTS {
-            let remaining = OSS_READBACK_MAX_WALL_CLOCK
-                .saturating_sub(started.elapsed())
-                .min(OSS_READBACK_RETRY_DELAY);
-            if remaining.is_zero() {
-                break;
-            }
-            std::thread::sleep(remaining);
-        }
-    }
-    Err(last_error
-        .expect("readback retry loop must record an error")
-        .context("remote artifacts remained unreadable after bounded retries"))
+    // Keep the temp dir alive until the content comparison has run.
+    let (_verify_dir, downloaded) = download_remote_artifacts_with(
+        artifacts,
+        config,
+        OSS_READBACK_MAX_WALL_CLOCK,
+        OSS_VERIFY_DOWNLOAD_ATTEMPTS,
+        runner,
+    )?;
+    verify_downloaded_artifacts(artifacts, &downloaded)
 }
 
 fn remote_artifacts_exist_and_match_with<F>(
@@ -2035,7 +2095,7 @@ where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
     let Ok((_verify_dir, downloaded)) =
-        download_remote_artifacts_with(artifacts, config, Duration::MAX, runner)
+        download_remote_artifacts_with(artifacts, config, Duration::MAX, 1, runner)
     else {
         return Ok(false);
     };
@@ -2396,6 +2456,19 @@ mod tests {
         run_checked(&mut command, Duration::from_secs(1)).unwrap();
 
         assert_eq!(fs::read(captured).unwrap(), b"");
+    }
+
+    #[test]
+    fn only_explicit_not_found_errors_are_retryable() {
+        assert!(is_retryable_download_failure(&anyhow!(
+            "child process exited with status code: 404"
+        )));
+        assert!(is_retryable_download_failure(&anyhow!(
+            "child process exited with NoSuchKey"
+        )));
+        assert!(!is_retryable_download_failure(&anyhow!(
+            "child process exited with config version 404"
+        )));
     }
 
     fn valid_v2_trade_update() -> Value {
@@ -4146,7 +4219,9 @@ mod tests {
             if args[2].starts_with("oss://") {
                 if uploads == 0 || post_upload_downloads == 0 {
                     post_upload_downloads += usize::from(uploads > 0);
-                    bail!("NoSuchKey");
+                    // Production 404s surface through run_checked with the
+                    // NoSuchKey detail, which is the retryable class.
+                    bail!("child process exited with exit status: 1: 404 NoSuchKey");
                 }
                 post_upload_downloads += 1;
                 let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
@@ -4172,6 +4247,109 @@ mod tests {
     }
 
     #[test]
+    fn pre_upload_probe_is_single_shot_before_upload() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut remote = BTreeMap::<String, Vec<u8>>::new();
+        let mut probe_attempts = 0;
+        let mut uploads = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args.iter().any(|arg| arg == "--ignore-existing") {
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                remote.insert(name.to_owned(), fs::read(&args[2])?);
+                uploads += 1;
+                return Ok(success_status());
+            }
+            if uploads == 0 {
+                probe_attempts += 1;
+                bail!("child process exited with exit status: 1: 404 NoSuchKey");
+            }
+            let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+            fs::write(&args[3], &remote[name])?;
+            Ok(success_status())
+        };
+
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        assert_eq!(probe_attempts, 1);
+        assert_eq!(uploads, 3);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn remote_readback_budget_is_checked_before_attempt() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut attempts = 0;
+        let error = match download_remote_artifacts_with(
+            &artifacts,
+            &config,
+            Duration::ZERO,
+            1,
+            &mut |_, _| {
+                attempts += 1;
+                bail!("child process exited with exit status: 1: 404 NoSuchKey")
+            },
+        ) {
+            Ok(_) => panic!("zero budget must reject before invoking the runner"),
+            Err(error) => error,
+        };
+
+        assert_eq!(attempts, 0);
+        assert!(error.to_string().contains("wall-clock budget"));
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn remote_readback_non_404_exit_fails_without_retrying() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut attempts = 0;
+        let error = verify_remote_artifacts_with(&artifacts, &config, &mut |_, timeout| {
+            attempts += 1;
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf 'permission denied' >&2; exit 1"]);
+            run_checked(&mut command, timeout)
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("permission denied"));
+        assert!(source.exists());
+    }
+
+    #[test]
     fn remote_readback_retries_are_bounded() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
@@ -4187,15 +4365,82 @@ mod tests {
         let mut attempts = 0;
         let error = verify_remote_artifacts_with(&artifacts, &config, &mut |_, _| {
             attempts += 1;
-            bail!("NoSuchKey")
+            bail!("child process exited with exit status: 1: 404 NoSuchKey")
         })
         .unwrap_err();
 
-        assert_eq!(attempts, OSS_READBACK_ATTEMPTS);
-        assert!(error
-            .to_string()
-            .contains("remote artifacts remained unreadable after bounded retries"));
+        assert_eq!(attempts, OSS_VERIFY_DOWNLOAD_ATTEMPTS);
+        assert!(error.to_string().contains("stayed unavailable after"));
         assert!(source.exists());
+    }
+
+    #[test]
+    fn remote_readback_retries_transient_404_until_object_is_visible() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let remote = [&artifacts.data, &artifacts.manifest, &artifacts.success]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut attempts = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            attempts += 1;
+            if attempts <= 3 {
+                bail!("child process exited with exit status: 1: 404 NoSuchKey");
+            }
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+            fs::write(&args[3], &remote[name])?;
+            Ok(success_status())
+        };
+
+        verify_remote_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        assert_eq!(
+            attempts, 6,
+            "three transient 404s, then one success per artifact"
+        );
+    }
+
+    #[test]
+    fn remote_readback_config_error_fails_without_retrying() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut attempts = 0;
+        let error = verify_remote_artifacts_with(&artifacts, &config, &mut |_, _| {
+            attempts += 1;
+            bail!("ossutil config file not found")
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("ossutil config file not found"));
     }
 
     #[test]
