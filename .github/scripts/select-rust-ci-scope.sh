@@ -326,6 +326,7 @@ for path in "${paths[@]}"; do
     deployment/aliyun/*)
       control=true
       toolchain=true
+      select_job ploy/integration-regressions
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     rust_hft/*)

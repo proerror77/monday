@@ -74,6 +74,9 @@ assert_security_jobs() {
 
 job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image'
+  'pinned-aliyun|pull_request|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
+  'pinned-aliyun-push|push|pinned-aliyun.txt|ploy/integration-regressions,ci/rust'
+  'future-aliyun-pin|pull_request|future-aliyun-pin.txt|ploy/integration-regressions,ci/rust'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy'
   'shared-prediction|pull_request|shared-prediction.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
@@ -149,7 +152,7 @@ for flag in handoff json ondo focused toolchain; do assert_flag "$live" "$flag" 
 for flag in loop collector control; do assert_flag "$live" "$flag" false; done
 
 control=$(run_case control pull_request control.txt)
-assert_jobs "$control" 'ci/rust'
+assert_jobs "$control" 'ploy/integration-regressions,ci/rust'
 for flag in control toolchain; do assert_flag "$control" "$flag" true; done
 for flag in loop handoff json ondo collector focused; do assert_flag "$control" "$flag" false; done
 
@@ -230,6 +233,7 @@ ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
+grep -Fqx '      - "deployment/aliyun/**"' "$ploy_workflow"
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
 grep -Fqx "$always_condition" "$ploy_workflow"
 grep -Fqx '        working-directory: .' "$ploy_workflow"

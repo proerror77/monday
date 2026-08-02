@@ -8,7 +8,7 @@ on:
     paths:
       - "rust_hft/**"
       - ".cargo/**"
-      - "deployment/aliyun/research/**"
+      - "deployment/aliyun/**"
       - ".github/workflows/**"
       - ".github/actions/**"
       - ".github/scripts/**"
