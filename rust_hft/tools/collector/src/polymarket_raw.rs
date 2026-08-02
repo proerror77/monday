@@ -2372,9 +2372,25 @@ impl ReferenceCollector {
                 if let Some(cursor) = cursor.as_ref() {
                     params.push(("after_cursor".to_owned(), cursor.clone()));
                 }
-                let payload = self
-                    .get_json(&self.endpoints.gamma_markets, &params)
-                    .await?;
+                let payload = match self.get_json(&self.endpoints.gamma_markets, &params).await {
+                    Ok(payload) => payload,
+                    Err(error)
+                        if lane.is_closed()
+                            && error
+                                .downcast_ref::<reqwest::Error>()
+                                .and_then(reqwest::Error::status)
+                                == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) =>
+                    {
+                        let fallback_params = params
+                            .iter()
+                            .filter(|(key, _)| key != "tag_id")
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        self.get_json(&self.endpoints.gamma_markets, &fallback_params)
+                            .await?
+                    }
+                    Err(error) => return Err(error),
+                };
                 cursor = discovery.append_page(
                     lane,
                     &payload,
@@ -2996,6 +3012,29 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    fn read_http_request_path(connection: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+
+        connection.set_nonblocking(false).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1_024];
+            let bytes = connection.read(&mut chunk).unwrap();
+            assert!(bytes > 0, "HTTP request ended before its headers");
+            request.extend_from_slice(&chunk[..bytes]);
+        }
+        std::str::from_utf8(&request)
+            .unwrap()
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -4348,6 +4387,239 @@ mod tests {
         assert_eq!(closed["related_tags"], "false");
         assert_eq!(open["end_date_min"], "2026-07-15T00:00:00.000000Z");
         assert_eq!(closed["end_date_min"], "2026-07-14T02:00:00.000000Z");
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_500_retries_then_falls_back_without_the_crypto_tag() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = Vec::new();
+            while requests.len() < 5 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                let path = read_http_request_path(&mut connection);
+                let params = path
+                    .split_once('?')
+                    .map(|(_, query)| {
+                        query
+                            .split('&')
+                            .map(|pair| {
+                                let (key, value) = pair.split_once('=').unwrap();
+                                (
+                                    urlencoding::decode(key).unwrap().into_owned(),
+                                    urlencoding::decode(value).unwrap().into_owned(),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap();
+                let request_index = requests.len();
+                let body = match request_index {
+                    0 => {
+                        assert_eq!(params["closed"], "false");
+                        assert_eq!(params["tag_id"], "21");
+                        serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
+                    }
+                    1..=3 => {
+                        assert_eq!(params["closed"], "true");
+                        assert_eq!(params["tag_id"], "21");
+                        assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        requests.push(params);
+                        connection
+                            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                            .unwrap();
+                        continue;
+                    }
+                    4 => {
+                        assert_eq!(params["closed"], "true");
+                        assert!(!params.contains_key("tag_id"));
+                        assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        serde_json::to_vec(&json!({
+                            "markets": [
+                                market(
+                                    "Bitcoin Up or Down - 5 minutes",
+                                    "2026-07-15T01:55:00Z",
+                                    "2026-07-15T02:00:00Z",
+                                ),
+                                {
+                                    "id": "sports-market",
+                                    "conditionId": "sports-condition",
+                                    "question": "Will a team win?",
+                                    "startDate": "2026-07-15T01:55:00Z",
+                                    "endDate": "2026-07-15T02:00:00Z",
+                                    "clobTokenIds": ["yes", "no"],
+                                },
+                            ],
+                            "next_cursor": "",
+                        }))
+                        .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                requests.push(params);
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+            }
+            requests
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let result = collector.discover_markets(now).await;
+        let requests = server.join().unwrap();
+        let markets =
+            result.expect("a final closed-lane 500 must use the bounded untagged fallback");
+
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            markets.len(),
+            1,
+            "untagged fallback must retain target filtering"
+        );
+        assert_eq!(markets[0]["id"], "market-1");
+    }
+
+    #[tokio::test]
+    async fn untagged_gamma_fallback_requires_a_closed_final_500() {
+        const RETRYABLE_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        const BAD_REQUEST: &[u8] =
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        const EMPTY_PAGE: &[u8] = br#"{"markets":[],"next_cursor":""}"#;
+
+        for (scenario, expected_requests) in [
+            ("open_500", HTTP_GET_ATTEMPTS),
+            ("closed_non_500", 2),
+            ("failed_fallback", HTTP_GET_ATTEMPTS + 2),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let scenario = scenario.to_owned();
+            let server_scenario = scenario.clone();
+            let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+                let mut requests = Vec::new();
+                while requests.len() < expected_requests && Instant::now() < deadline {
+                    let (mut connection, _) = match listener.accept() {
+                        Ok(accepted) => accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    };
+                    let request_index = requests.len();
+                    requests.push(read_http_request_path(&mut connection));
+                    match (server_scenario.as_str(), request_index) {
+                        ("open_500", _) | ("failed_fallback", 1..=3) => {
+                            connection.write_all(RETRYABLE_500).unwrap();
+                        }
+                        ("closed_non_500", 1) | ("failed_fallback", 4) => {
+                            connection.write_all(BAD_REQUEST).unwrap();
+                        }
+                        ("closed_non_500", 0) | ("failed_fallback", 0) => {
+                            write!(
+                                connection,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                EMPTY_PAGE.len()
+                            )
+                            .unwrap();
+                            connection.write_all(EMPTY_PAGE).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let settle_deadline = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < settle_deadline {
+                    match listener.accept() {
+                        Ok((mut connection, _)) => {
+                            requests.push(read_http_request_path(&mut connection));
+                            write!(
+                                connection,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                EMPTY_PAGE.len()
+                            )
+                            .unwrap();
+                            connection.write_all(EMPTY_PAGE).unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    }
+                }
+                requests
+            });
+
+            let temp = TestDir::new();
+            let config = ReferenceConfig {
+                spool_dir: temp.path().to_owned(),
+                symbols: vec!["BTCUSDT".to_owned()],
+                ..ReferenceConfig::default()
+            };
+            let mut collector = ReferenceCollector::new(config).unwrap();
+            let base_url = format!("http://{address}");
+            collector.endpoints = ReferenceEndpoints {
+                gamma_markets: format!("{base_url}/markets/keyset"),
+                gamma_market: format!("{base_url}/markets"),
+                data_trades: format!("{base_url}/trades"),
+            };
+
+            let result = collector
+                .discover_markets(fixed_time("2026-07-15T02:00:00Z"))
+                .await;
+            let requests = server.join().unwrap();
+
+            assert!(result.is_err(), "{scenario} must fail closed");
+            assert_eq!(requests.len(), expected_requests, "{scenario}");
+            match scenario.as_str() {
+                "open_500" => {
+                    assert!(requests.iter().all(|request| {
+                        request.contains("closed=false") && request.contains("tag_id=21")
+                    }));
+                }
+                "closed_non_500" => {
+                    assert!(requests[0].contains("closed=false"));
+                    assert!(requests.iter().all(|request| request.contains("tag_id=21")));
+                }
+                "failed_fallback" => {
+                    assert!(requests[..4]
+                        .iter()
+                        .all(|request| request.contains("tag_id=21")));
+                    assert!(!requests[4].contains("tag_id="));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
