@@ -312,12 +312,6 @@ for path in "${paths[@]}"; do
       select_all_ploy_jobs
       continue
       ;;
-    docs/*|*.md|LICENSE*)
-      continue
-      ;;
-    rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
-      continue
-      ;;
     rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
       select_job ci/deployment-artifacts
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
@@ -328,6 +322,12 @@ for path in "${paths[@]}"; do
       toolchain=true
       select_job ploy/integration-regressions
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
+      ;;
+    docs/*|*.md|LICENSE*)
+      continue
+      ;;
+    rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
+      continue
       ;;
     rust_hft/*)
       needs_metadata=true
