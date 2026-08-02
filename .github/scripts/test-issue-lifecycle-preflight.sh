@@ -50,9 +50,12 @@ respond() {
     body="${body//\{\"number\":1\}/\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
     body="${body//\"number\":3,\"parent\":null/\"number\":3,\"parent\":\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
   fi
-  local media_header=
+  local media_header= link_header=
   [[ -z "$media_type" ]] || media_header="X-GitHub-Media-Type: ${media_type}"$'\r\n'
-  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nEtag: W/"%s"\r\nLast-Modified: Sat, 02 Aug 2026 00:00:00 GMT\r\nX-GitHub-Api-Version-Selected: 2026-03-10\r\n%s\r\n%s\n' "$etag" "$media_header" "$body"
+  if [[ "${FIXTURE_MODE:-normal}" == live-link-drift && "$path" == repos/example/repo/labels* ]]; then
+    link_header=$'Link: <https://api.github.com/repos/example/repo/labels?per_page=100&page=1>; rel="prev"\r\n'
+  fi
+  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nEtag: W/"%s"\r\nLast-Modified: Sat, 02 Aug 2026 00:00:00 GMT\r\nX-GitHub-Api-Version-Selected: 2026-03-10\r\n%s%s\r\n%s\n' "$etag" "$media_header" "$link_header" "$body"
 }
 
 respond_with_next() {
@@ -369,6 +372,26 @@ ruby -rjson -e '
 rehash "$tmp_dir/verify-rest-etag" manifest.json
 verify_fails rest-etag "$tmp_dir/verify-rest-etag"
 
+copy_bundle verify-page-omission
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("pages").reject! { |page| page["request"] == "repos/example/repo/issues/1" }
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-page-omission/manifest.json"
+rehash "$tmp_dir/verify-page-omission" manifest.json
+verify_fails page-omission "$tmp_dir/verify-page-omission"
+
+copy_bundle verify-entry-identity
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("items").first.fetch("comments").first.clear
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-entry-identity/preflight.json"
+resign_preflight "$tmp_dir/verify-entry-identity"
+verify_fails entry-identity "$tmp_dir/verify-entry-identity"
+
 test "$(wc -l <"$api_log" | tr -d ' ')" = "$local_api_calls_before"
 
 live_bundle_before="$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
@@ -376,7 +399,7 @@ live_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
 verify_live normal "$tmp_dir/bundle-a"
 test "$(wc -l <"$api_log" | tr -d ' ')" -gt "$live_api_calls_before"
 test "$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)" = "$live_bundle_before"
-for mode in live-drift incomplete missing-link capture-race header-race issue-detail-race closed-pr-race graphql-media-race graphql-media-missing; do
+for mode in live-drift live-link-drift incomplete missing-link capture-race header-race issue-detail-race closed-pr-race graphql-media-race graphql-media-missing; do
   verify_live_fails "$mode" "$tmp_dir/bundle-a"
 done
 

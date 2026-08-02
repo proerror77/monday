@@ -14,7 +14,7 @@ EVIDENCE_EXCLUSIONS = ["GitHub metadata mutation", "branch protection and requir
 PREFLIGHT_SCHEMA = "monday.issue_lifecycle_preflight.v1"
 MANIFEST_SCHEMA = "monday.issue_lifecycle_manifest.v1"
 BUNDLE_FILES = %w[manifest.json manifest.json.sha256 preflight.json preflight.json.sha256].freeze
-PAGE_KEYS = %w[api_version body_sha256 etag last_modified media_type phase protocol request status].freeze
+PAGE_KEYS = %w[api_version body_sha256 etag last_modified link media_type phase protocol request status].freeze
 
 module Canonical
   PRESERVE_ARRAY_ORDER = %w[comments commits events].freeze
@@ -280,6 +280,7 @@ class GitHubReadOnly
       "status" => status,
       "etag" => headers["etag"],
       "last_modified" => headers["last-modified"],
+      "link" => headers["link"],
       "api_version" => headers["x-github-api-version-selected"],
       "media_type" => headers["x-github-media-type"],
       "body_sha256" => Digest::SHA256.hexdigest(Canonical.dump(body))
@@ -507,14 +508,15 @@ def verify_sidecar(bundle, filename)
   actual
 end
 
-def verify_page_inventory!(pages, graphql_media_type)
+def verify_page_inventory!(pages, graphql_media_type, graph, repo)
   raise "manifest page inventory is empty" unless pages.is_a?(Array) && !pages.empty?
 
   pages.each do |page|
     unless page.is_a?(Hash) && page.keys.sort == PAGE_KEYS &&
            %w[capture stability_check].include?(page["phase"]) &&
            %w[graphql rest].include?(page["protocol"]) &&
-           !page["request"].to_s.empty? && page["body_sha256"].to_s.match?(/\A[0-9a-f]{64}\z/)
+           !page["request"].to_s.empty? && page["body_sha256"].to_s.match?(/\A[0-9a-f]{64}\z/) &&
+           (page["link"].nil? || page["link"].is_a?(String))
       raise "manifest page inventory entry is invalid"
     end
     expected_status = page["phase"] == "stability_check" && page["protocol"] == "rest" ? 304 : 200..299
@@ -548,6 +550,44 @@ def verify_page_inventory!(pages, graphql_media_type)
   unless rest_pages.any? && rest_pages.all? { |page| page["api_version"] == GitHubReadOnly::API_VERSION && !page["media_type"].to_s.empty? }
     raise "manifest REST provenance is incomplete"
   end
+
+  paginated = lambda do |path, count, known_total = false|
+    page_count = known_total ? [1, (count + 99) / 100].max : count / 100 + 1
+    separator = path.include?("?") ? "&" : "?"
+    (1..page_count).map { |page| "#{path}#{separator}per_page=100&page=#{page}" }
+  end
+  items = graph.fetch("items")
+  expected_rest = []
+  expected_rest.concat(paginated.call("repos/#{repo}/labels", graph.fetch("label_catalog").length))
+  expected_rest.concat(paginated.call("repos/#{repo}/issues?state=all&sort=created&direction=asc", items.length))
+  expected_rest.concat(paginated.call("repos/#{repo}/issues/comments?sort=created&direction=asc", items.sum { |item| item.fetch("comments").length }))
+  expected_rest.concat(paginated.call("repos/#{repo}/issues/events", items.sum { |item| item.fetch("events").length }))
+  items.each do |item|
+    number = item.fetch("number")
+    expected_rest << "repos/#{repo}/issues/#{number}"
+    next unless item.fetch("kind") == "pull_request"
+
+    pull_request = item.fetch("pull_request")
+    head_sha = pull_request.dig("metadata", "head", "sha")
+    expected_rest << "repos/#{repo}/pulls/#{number}"
+    %w[commits files reviews].each do |field|
+      expected_rest.concat(paginated.call("repos/#{repo}/pulls/#{number}/#{field}", pull_request.fetch(field).length))
+    end
+    expected_rest.concat(paginated.call("repos/#{repo}/pulls/#{number}/comments", pull_request.fetch("review_comments").length))
+    expected_rest.concat(paginated.call("repos/#{repo}/commits/#{head_sha}/check-runs?filter=all", pull_request.dig("check_runs", "total_count"), true))
+    expected_rest.concat(paginated.call("repos/#{repo}/commits/#{head_sha}/statuses", pull_request.fetch("statuses").length))
+  end
+  actual_rest = rest_pages.map { |page| page.fetch("request") }
+  raise "manifest REST page inventory does not match preflight" unless actual_rest.sort == expected_rest.sort
+
+  graphql_requests = pages.select { |page| page["phase"] == "capture" && page["protocol"] == "graphql" }.map { |page| page.fetch("request") }
+  issue_count = items.count { |item| item.fetch("kind") == "issue" }
+  graphql_page_count = [1, (issue_count + 49) / 50].max
+  graphql_prefix = "IssueLifecycleRelationships:"
+  unless graphql_requests.length == graphql_page_count && graphql_requests.count("#{graphql_prefix}START") == 1 &&
+         graphql_requests.all? { |request| request.start_with?(graphql_prefix) && request.length > graphql_prefix.length }
+    raise "manifest GraphQL page inventory does not match preflight"
+  end
 end
 
 def relationship_reference?(reference)
@@ -557,7 +597,16 @@ def relationship_reference?(reference)
     !reference.dig("repository", "nameWithOwner").to_s.empty?
 end
 
-def graph_counts(graph, repo)
+def unique_identity_fields?(entries, *fields)
+  return false unless entries.is_a?(Array) && entries.all? { |entry| entry.is_a?(Hash) }
+
+  fields.all? do |field|
+    identities = entries.map { |entry| entry[field] }
+    identities.all? { |identity| identity && !identity.to_s.empty? } && identities.uniq.length == identities.length
+  end
+end
+
+def validate_graph_and_count(graph, repo)
   unless graph.is_a?(Hash) && graph.keys.sort == %w[items label_catalog repository schema] && graph["schema"] == PREFLIGHT_SCHEMA
     raise "preflight schema is invalid"
   end
@@ -582,6 +631,8 @@ def graph_counts(graph, repo)
   pull_request_count = 0
   comment_count = 0
   event_count = 0
+  comment_ids = []
+  event_ids = []
   items.each do |item|
     raise "preflight item is invalid" unless item.is_a?(Hash) && item["number"].is_a?(Integer) && item["number"].positive?
 
@@ -592,8 +643,10 @@ def graph_counts(graph, repo)
     unless metadata.is_a?(Hash) && metadata["number"] == number && metadata.key?("body") &&
            %w[open closed].include?(metadata["state"]) && metadata["labels"].is_a?(Array) &&
            metadata["assignees"].is_a?(Array) && metadata["comments"] == comments&.length &&
-           comments.is_a?(Array) && comments.all? { |comment| comment.is_a?(Hash) } &&
-           events.is_a?(Array) && events.all? { |event| event.is_a?(Hash) }
+           unique_identity_fields?(metadata["labels"], "id", "name") &&
+           unique_identity_fields?(metadata["assignees"], "id", "login") &&
+           unique_identity_fields?(comments, "id") && comments.all? { |comment| (comment.dig("issue", "number") || issue_number_from_url(comment["issue_url"])) == number } &&
+           unique_identity_fields?(events, "id") && events.all? { |event| (event.dig("issue", "number") || issue_number_from_url(event["issue_url"])) == number }
       raise "preflight item ##{number} metadata is invalid"
     end
     case item["kind"]
@@ -619,12 +672,16 @@ def graph_counts(graph, repo)
              pull_request["metadata"].is_a?(Hash) && pull_request.dig("metadata", "number") == number &&
              pull_request.dig("metadata", "head", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
              pull_request.dig("metadata", "base", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
-             %w[commits files review_comments reviews statuses].all? { |key| pull_request[key].is_a?(Array) } &&
+             unique_identity_fields?(pull_request["commits"], "sha") && pull_request["commits"].all? { |commit| commit["sha"].match?(/\A[0-9a-f]{40}\z/i) } &&
+             unique_identity_fields?(pull_request["files"], "filename") &&
+             unique_identity_fields?(pull_request["reviews"], "id") &&
+             unique_identity_fields?(pull_request["review_comments"], "id") &&
+             unique_identity_fields?(pull_request["statuses"], "id") &&
              pull_request["commits"].length == pull_request.dig("metadata", "commits") &&
              pull_request["files"].length == pull_request.dig("metadata", "changed_files") &&
              pull_request["review_comments"].length == pull_request.dig("metadata", "review_comments") &&
              pull_request["check_runs"].is_a?(Hash) && pull_request["check_runs"].keys.sort == %w[check_runs total_count] &&
-             pull_request.dig("check_runs", "check_runs").is_a?(Array) &&
+             unique_identity_fields?(pull_request.dig("check_runs", "check_runs"), "id") &&
              pull_request.dig("check_runs", "total_count") == pull_request.dig("check_runs", "check_runs").length
         raise "preflight PR ##{number} schema is invalid"
       end
@@ -634,10 +691,13 @@ def graph_counts(graph, repo)
       raise "preflight item ##{number} kind is invalid"
     end
     numbers << number
+    comment_ids.concat(comments.map { |comment| comment.fetch("id") })
+    event_ids.concat(events.map { |event| event.fetch("id") })
     comment_count += comments.length
     event_count += events.length
   end
   raise "preflight contains duplicate item numbers" unless numbers.uniq.length == numbers.length
+  raise "preflight contains duplicate comment or event identities" unless comment_ids.uniq.length == comment_ids.length && event_ids.uniq.length == event_ids.length
 
   {
     "issues" => issue_count,
@@ -682,8 +742,8 @@ def verify_bundle(bundle, repo, controller)
          !api["graphql_media_type"].to_s.empty?
     raise "manifest API provenance is invalid"
   end
-  verify_page_inventory!(manifest.fetch("pages"), api.fetch("graphql_media_type"))
-  counts = graph_counts(graph, repo)
+  counts = validate_graph_and_count(graph, repo)
+  verify_page_inventory!(manifest.fetch("pages"), api.fetch("graphql_media_type"), graph, repo)
   raise "manifest counts do not match preflight" unless manifest["counts"] == counts
 
   repository = graph.fetch("repository")
