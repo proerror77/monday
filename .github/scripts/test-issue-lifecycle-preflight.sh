@@ -46,9 +46,9 @@ respond() {
     printf 'HTTP/2.0 304 Not Modified\r\nEtag: W/"%s"\r\n\r\n' "$etag"; exit 1
   fi
   if [[ "$path" == graphql && "${FIXTURE_MODE:-normal}" != missing-relationship ]]; then
-    body="${body//\{\"number\":3\}/\{\"number\":3,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/3\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
-    body="${body//\{\"number\":1\}/\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
-    body="${body//\"number\":3,\"parent\":null/\"number\":3,\"parent\":\{\"number\":1,\"url\":\"https:\/\/github.test\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
+    body="${body//\{\"number\":3\}/\{\"number\":3,\"url\":\"https:\/\/github.com\/example\/repo\/issues\/3\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
+    body="${body//\{\"number\":1\}/\{\"number\":1,\"url\":\"https:\/\/github.com\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
+    body="${body//\"number\":3,\"parent\":null/\"number\":3,\"parent\":\{\"number\":1,\"url\":\"https:\/\/github.com\/example\/repo\/issues\/1\",\"repository\":\{\"nameWithOwner\":\"example\/repo\"\}\}}"
   fi
   local media_header= link_header=
   [[ -z "$media_type" ]] || media_header="X-GitHub-Media-Type: ${media_type}"$'\r\n'
@@ -100,33 +100,33 @@ case "$path" in
     respond '[{"id":198,"name":"label-198"}]'
     ;;
   repos/example/repo/issues\?state=all*)
-    respond '[{"id":101,"number":1},{"id":103,"number":3},{"id":102,"number":2,"pull_request":{"url":"https://api.github.test/repos/example/repo/pulls/2"}}]'
+    respond '[{"id":101,"number":1},{"id":103,"number":3},{"id":102,"number":2,"pull_request":{"url":"https://api.github.com/repos/example/repo/pulls/2"}}]'
     ;;
   repos/example/repo/issues/comments*)
     call="$(bump comments)"
-    comments='[{"id":1001,"issue_url":"https://api.github.test/repos/example/repo/issues/1","body":"evidence"},{"id":1002,"issue_url":"https://api.github.test/repos/example/repo/issues/2","body":"review context"}]'
+    comments='[{"id":1001,"issue_url":"https://api.github.com/repos/example/repo/issues/1","body":"evidence"},{"id":1002,"issue_url":"https://api.github.com/repos/example/repo/issues/2","body":"review context"}]'
     if [[ "${FIXTURE_MODE:-normal}" == live-drift || "${FIXTURE_MODE:-normal}" == capture-race && "$call" -gt 1 ]]; then
-      comments='[{"id":1001,"issue_url":"https://api.github.test/repos/example/repo/issues/1","body":"evidence changed concurrently"},{"id":1002,"issue_url":"https://api.github.test/repos/example/repo/issues/2","body":"review context"}]'
+      comments='[{"id":1001,"issue_url":"https://api.github.com/repos/example/repo/issues/1","body":"evidence changed concurrently"},{"id":1002,"issue_url":"https://api.github.com/repos/example/repo/issues/2","body":"review context"}]'
     fi
     etag=fixture
     [[ "$call" -le 1 || "${FIXTURE_MODE:-normal}" != header-race && "${FIXTURE_MODE:-normal}" != capture-race ]] || etag=changed
     respond "$comments" "$etag"
     ;;
   repos/example/repo/issues/events*)
-    respond '[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.test/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.test/repos/example/repo/issues/2"}}]'
+    respond '[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.com/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.com/repos/example/repo/issues/2"}}]'
     ;;
   repos/example/repo/issues/1)
-    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.test/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one 研究\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.com/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one 研究\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
     ;;
   repos/example/repo/issues/3)
     call="$(bump issue3)"
     [[ "$call" -le 1 || -n "$if_none_match" ]] || { echo "stability GET missing If-None-Match" >&2; exit 1; }
     body=Blocker etag=fixture
     [[ "${FIXTURE_MODE:-normal}" != issue-detail-race || "$call" -le 1 ]] || { body='Blocker changed concurrently'; etag=changed; }
-    respond "{\"id\":103,\"node_id\":\"I_three\",\"url\":\"https://api.github.test/repos/example/repo/issues/3\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"body\":\"$body\",\"labels\":[],\"assignees\":[],\"updated_at\":\"2026-08-01T00:00:00Z\"}" "$etag"
+    respond "{\"id\":103,\"node_id\":\"I_three\",\"url\":\"https://api.github.com/repos/example/repo/issues/3\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"body\":\"$body\",\"labels\":[],\"assignees\":[],\"updated_at\":\"2026-08-01T00:00:00Z\"}" "$etag"
     ;;
   repos/example/repo/issues/2)
-    respond "{\"id\":102,\"node_id\":\"PR_two\",\"url\":\"https://api.github.test/repos/example/repo/issues/2\",\"number\":2,\"comments\":1,\"state\":\"open\",\"body\":\"Pull request conversation\",\"labels\":$labels,\"assignees\":[],\"pull_request\":{\"url\":\"https://api.github.test/repos/example/repo/pulls/2\"},\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    respond "{\"id\":102,\"node_id\":\"PR_two\",\"url\":\"https://api.github.com/repos/example/repo/issues/2\",\"number\":2,\"comments\":1,\"state\":\"open\",\"body\":\"Pull request conversation\",\"labels\":$labels,\"assignees\":[],\"pull_request\":{\"url\":\"https://api.github.com/repos/example/repo/pulls/2\"},\"updated_at\":\"2026-08-02T00:00:00Z\"}"
     ;;
   repos/example/repo/pulls/2)
     call="$(bump pull2)"
@@ -134,17 +134,17 @@ case "$path" in
     if [[ "${FIXTURE_MODE:-normal}" == closed-pr-race ]]; then
       state=closed; [[ "$call" -le 1 ]] || { title='Changed concurrently'; etag=changed; }
     fi
-    respond "{\"id\":202,\"node_id\":\"PR_two\",\"url\":\"https://api.github.test/repos/example/repo/pulls/2\",\"number\":2,\"state\":\"$state\",\"title\":\"$title\",\"head\":{\"ref\":\"feature\",\"sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"base\":{\"ref\":\"main\",\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"commits\":1,\"changed_files\":2,\"review_comments\":1}" "${etag:-fixture}"
+    respond "{\"id\":202,\"node_id\":\"PR_two\",\"url\":\"https://api.github.com/repos/example/repo/pulls/2\",\"number\":2,\"state\":\"$state\",\"title\":\"$title\",\"head\":{\"ref\":\"feature\",\"sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"base\":{\"ref\":\"main\",\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"commits\":1,\"changed_files\":2,\"review_comments\":1}" "${etag:-fixture}"
     ;;
   repos/example/repo/pulls/2/commits*) respond '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"message":"Refs #1"}}]' ;;
   repos/example/repo/pulls/2/files*) respond '[{"sha":"cccccccccccccccccccccccccccccccccccccccc","filename":"safe-copy.txt","status":"added"},{"sha":"cccccccccccccccccccccccccccccccccccccccc","filename":"safe.txt","status":"added"}]' ;;
-  repos/example/repo/pulls/2/reviews*) respond '[{"id":3001,"node_id":"PRR_review","state":"APPROVED","_links":{"pull_request":{"href":"https://api.github.test/repos/example/repo/pulls/2"}}}]' ;;
-  repos/example/repo/pulls/2/comments*) respond '[{"id":4001,"node_id":"PRRC_comment","pull_request_url":"https://api.github.test/repos/example/repo/pulls/2","body":"looks good"}]' ;;
+  repos/example/repo/pulls/2/reviews*) respond '[{"id":3001,"node_id":"PRR_review","state":"APPROVED","_links":{"pull_request":{"href":"https://api.github.com/repos/example/repo/pulls/2"}}}]' ;;
+  repos/example/repo/pulls/2/comments*) respond '[{"id":4001,"node_id":"PRRC_comment","pull_request_url":"https://api.github.com/repos/example/repo/pulls/2","body":"looks good"}]' ;;
   repos/example/repo/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs*)
     respond '{"total_count":1,"check_runs":[{"id":5001,"node_id":"CR_check","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"CI","status":"completed","conclusion":"success"}]}'
     ;;
   repos/example/repo/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/statuses*)
-    respond '[{"id":6001,"node_id":"SC_status","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","context":"legacy","state":"success"}]'
+    respond '[{"id":6001,"node_id":"SC_status","context":"legacy","state":"success"}]'
     ;;
   graphql)
     test "$(grep -o 'number url repository { nameWithOwner }' <<<"$query" | wc -l | tr -d ' ')" -eq 5
@@ -153,9 +153,9 @@ case "$path" in
     [[ "${FIXTURE_MODE:-normal}" != graphql-media-race || "$call" -le 1 ]] || media_type='github.v4; format=json; drift=1'
     [[ "${FIXTURE_MODE:-normal}" != graphql-media-missing || "$call" -le 1 ]] || media_type=
     if [[ "${FIXTURE_MODE:-normal}" == reordered ]]; then
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.test/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' fixture "$media_type"
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"nodes":[{"number":3,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":1,"nodes":[{"number":1}],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}},{"number":1,"parent":null,"subIssues":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"blockedBy":{"totalCount":1,"nodes":[{"number":3}],"pageInfo":{"hasNextPage":false}},"blocking":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"totalCount":1,"nodes":[{"number":2,"url":"https://github.com/example/repo/pull/2","repository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' fixture "$media_type"
     else
-      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.test/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
+      respond '{"data":{"repository":{"id":"R_repo","nameWithOwner":"example/repo","defaultBranchRef":{"name":"main","target":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"issues":{"totalCount":2,"pageInfo":{"endCursor":null,"hasNextPage":false},"nodes":[{"number":1,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[{"number":3}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[{"repository":{"nameWithOwner":"example/repo"},"url":"https://github.com/example/repo/pull/2","number":2}],"totalCount":1,"pageInfo":{"hasNextPage":false}}},{"number":3,"parent":null,"subIssues":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blockedBy":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},"blocking":{"nodes":[{"number":1}],"totalCount":1,"pageInfo":{"hasNextPage":false}},"closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}}}]}}}}' fixture "$media_type"
     fi
     ;;
   *) echo "unexpected GitHub API path: $path" >&2; exit 1 ;;
@@ -231,20 +231,25 @@ verify_fails() {
     exit 1
   fi
 }
-
 verify_live_fails() {
   local mode="$1" bundle="$2"
-  local before output exit_code
+  local before output exit_code expected
+  case "$mode" in
+    live-drift) expected="live verification drift: Issue/PR graph changed" ;;
+    live-link-drift) expected="live verification drift: page/header inventory changed" ;;
+    incomplete) expected="simulated missing pagination page" ;;
+    graphql-media-*) expected="manifest GraphQL media type does not match page inventory" ;;
+    *) expected="capture stability drift:" ;;
+  esac
   before="$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
   set +e
   output="$(verify_live "$mode" "$bundle" 2>&1)"
   exit_code=$?
   set -e
   test "$exit_code" -eq 2
-  grep -Fq "ERROR issue lifecycle preflight:" <<<"$output"
+  grep -Fq "ERROR issue lifecycle preflight:" <<<"$output" && grep -Fq "$expected" <<<"$output"
   test "$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)" = "$before"
 }
-
 : >"$api_log"
 capture normal "$tmp_dir/bundle-a"
 capture reordered "$tmp_dir/bundle-b"
@@ -298,14 +303,13 @@ RUBY
 local_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
 
 copy_bundle verify-v1-pages
-ruby -rjson -e '
-  path = ARGV.fetch(0)
-  object = JSON.parse(File.binread(path))
-  object.fetch("pages").each { |page| page.delete("link") }
-  File.binwrite(path, JSON.generate(object) + "\n")
-' "$tmp_dir/verify-v1-pages/manifest.json"
+ruby -rjson -e 'path = ARGV.fetch(0); object = JSON.parse(File.binread(path)); object.fetch("pages").each { |page| page.delete("link") }; File.binwrite(path, JSON.generate(object) + "\n")' "$tmp_dir/verify-v1-pages/manifest.json"
 rehash "$tmp_dir/verify-v1-pages" manifest.json
 verify "$tmp_dir/verify-v1-pages"
+cp -R "$tmp_dir/bundle-canonical-link" "$tmp_dir/verify-v1-multipage"
+ruby -rjson -e 'path = ARGV.fetch(0); object = JSON.parse(File.binread(path)); object.fetch("pages").each { |page| page.delete("link") }; File.binwrite(path, JSON.generate(object) + "\n")' "$tmp_dir/verify-v1-multipage/manifest.json"
+rehash "$tmp_dir/verify-v1-multipage" manifest.json
+verify_fails v1-multipage "$tmp_dir/verify-v1-multipage" "legacy manifest cannot verify multi-page REST provenance"
 
 copy_bundle verify-missing
 rm "$tmp_dir/verify-missing/manifest.json.sha256"
@@ -444,15 +448,21 @@ ruby -rjson -e '
 resign_preflight "$tmp_dir/verify-entry-identity"
 verify_fails entry-identity "$tmp_dir/verify-entry-identity" "preflight item #1 metadata is invalid"
 
-for field in comment label commit review review-comment check-run status; do
+for field in comment comment-host relationship-host relationship-repo relationship-kind relationship-number label commit review review-comment check-run status; do
   expected="preflight PR #2 schema is invalid"
-  [[ "$field" != comment && "$field" != label ]] || expected="preflight item #1 metadata is invalid"
+  [[ "$field" != comment && "$field" != comment-host && "$field" != label ]] || expected="preflight item #1 metadata is invalid"
+  [[ "$field" != relationship-* ]] || expected="preflight Issue #1 schema is invalid"
   copy_bundle "verify-scope-$field"
   ruby -rjson -e '
     path, field = ARGV
     object = JSON.parse(File.binread(path))
     case field
     when "comment" then object.fetch("items").first.fetch("comments").first["issue_url"].sub!("example/repo", "other/repo")
+    when "comment-host" then object.fetch("items").first.fetch("comments").first["issue_url"].sub!("api.github.com", "evil.example")
+    when "relationship-host" then object.fetch("items").first.fetch("relationships").fetch("blocked_by").first["url"].sub!("github.com", "evil.example")
+    when "relationship-repo" then object.fetch("items").first.fetch("relationships").fetch("blocked_by").first.dig("repository")["nameWithOwner"] = "other/repo"
+    when "relationship-kind" then object.fetch("items").first.fetch("relationships").fetch("blocked_by").first["url"].sub!("/issues/", "/pull/")
+    when "relationship-number" then object.fetch("items").first.fetch("relationships").fetch("blocked_by").first["url"].sub!("/3", "/999")
     when "label" then labels = object.fetch("items").first.dig("issue", "labels"); labels.first.merge!("id" => 999, "name" => "outside-catalog"); labels.sort_by! { |label| label["id"] }
     else
       pull = object.fetch("items").find { |item| item["kind"] == "pull_request" }.fetch("pull_request")
@@ -461,7 +471,7 @@ for field in comment label commit review review-comment check-run status; do
       when "review" then pull.fetch("reviews").first.dig("_links", "pull_request")["href"].sub!("example/repo", "other/repo")
       when "review-comment" then pull.fetch("review_comments").first["pull_request_url"].sub!("example/repo", "other/repo")
       when "check-run" then pull.dig("check_runs", "check_runs").first["head_sha"] = "d" * 40
-      when "status" then pull.fetch("statuses").first["sha"] = "d" * 40
+      when "status" then pull.fetch("statuses").first.delete("id")
       end
     end
     File.binwrite(path, JSON.generate(object) + "\n")

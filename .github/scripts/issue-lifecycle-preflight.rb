@@ -611,12 +611,11 @@ def verify_page_inventory!(pages, graphql_media_type, graph, repo, link_provenan
         page.fetch("request")
       end
     else
+      raise "legacy manifest cannot verify multi-page REST provenance" if page_count > 1
       requests = rest_pages.each_with_object([]) do |page, result|
         result << page.fetch("request") if collection_scope(page.fetch("request"), repo) == scope
       end
-      unless requests.length == page_count && requests.include?(start)
-        raise "legacy manifest REST page inventory does not match preflight"
-      end
+      raise "legacy manifest REST page inventory does not match preflight" unless requests == [start]
       requests
     end
   end
@@ -641,11 +640,16 @@ def verify_page_inventory!(pages, graphql_media_type, graph, repo, link_provenan
   end
 end
 
-def relationship_reference?(reference)
-  reference.is_a?(Hash) && reference.keys.sort == %w[number repository url] &&
-    reference["number"].is_a?(Integer) && reference["number"].positive? && !reference["url"].to_s.empty? &&
-    reference["repository"].is_a?(Hash) && reference["repository"].keys == ["nameWithOwner"] &&
-    !reference.dig("repository", "nameWithOwner").to_s.empty?
+def relationship_reference?(reference, kind)
+  return false unless reference.is_a?(Hash) && reference.keys.sort == %w[number repository url] &&
+                      reference["number"].is_a?(Integer) && reference["number"].positive? && reference["repository"].is_a?(Hash) &&
+                      reference["repository"].keys == ["nameWithOwner"]
+  repo = reference.dig("repository", "nameWithOwner")
+  url = URI(reference["url"].to_s)
+  repo.to_s.match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}) && url.is_a?(URI::HTTPS) && url.host == "github.com" &&
+    url.port == 443 && !url.userinfo && !url.query && !url.fragment && url.path == "/#{repo}/#{kind}/#{reference["number"]}"
+rescue URI::InvalidURIError
+  false
 end
 
 def unique_identity_fields?(entries, *fields)
@@ -659,7 +663,7 @@ end
 
 def api_url_path?(url, expected_path)
   uri = URI(url.to_s)
-  uri.is_a?(URI::HTTPS) && !uri.host.to_s.empty? && uri.path == expected_path
+  uri.is_a?(URI::HTTPS) && uri.host == "api.github.com" && uri.port == 443 && !uri.userinfo && !uri.query && !uri.fragment && uri.path == expected_path
 rescue URI::InvalidURIError
   false
 end
@@ -723,14 +727,14 @@ def validate_graph_and_count(graph, repo)
     case item["kind"]
     when "issue"
       relationships = item["relationships"]
-      relationship_lists = %w[blocked_by blocking closed_by_pull_requests sub_issues]
+      relationship_lists = { "blocked_by" => "issues", "blocking" => "issues", "closed_by_pull_requests" => "pull", "sub_issues" => "issues" }
       unless item.keys.sort == %w[comments events issue kind number relationships] &&
              relationships.is_a?(Hash) &&
              relationships.keys.sort == %w[blocked_by blocking closed_by_pull_requests number parent sub_issues] &&
              relationships["number"] == number &&
-             (!relationships["parent"] || relationship_reference?(relationships["parent"])) &&
-             relationship_lists.all? do |key|
-               relationships[key].is_a?(Array) && relationships[key].all? { |reference| relationship_reference?(reference) }
+             (!relationships["parent"] || relationship_reference?(relationships["parent"], "issues")) &&
+             relationship_lists.all? do |key, kind|
+               relationships[key].is_a?(Array) && relationships[key].all? { |reference| relationship_reference?(reference, kind) }
              end
         raise "preflight Issue ##{number} schema is invalid"
       end
@@ -749,7 +753,7 @@ def validate_graph_and_count(graph, repo)
              unique_identity_fields?(pull_request["files"], "filename") &&
              unique_identity_fields?(pull_request["reviews"], "id") && pull_request["reviews"].all? { |review| pull_request_object_scope?(review, repo, number) } &&
              unique_identity_fields?(pull_request["review_comments"], "id") && pull_request["review_comments"].all? { |comment| pull_request_object_scope?(comment, repo, number) } &&
-             unique_identity_fields?(pull_request["statuses"], "id") && pull_request["statuses"].all? { |status| status["sha"] == pull_request.dig("metadata", "head", "sha") } &&
+             unique_identity_fields?(pull_request["statuses"], "id") &&
              pull_request["commits"].length == pull_request.dig("metadata", "commits") &&
              pull_request["files"].length == pull_request.dig("metadata", "changed_files") &&
              pull_request["review_comments"].length == pull_request.dig("metadata", "review_comments") &&
