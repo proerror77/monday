@@ -460,8 +460,31 @@ impl CexResearchEvidenceRefV1 {
 #[serde(deny_unknown_fields)]
 pub struct CexResearchSearchPlanV1 {
     pub seed: u64,
+    #[serde(deserialize_with = "deserialize_cex_search_budget")]
     pub budget: SearchBudget,
     pub max_new_iterations: usize,
+}
+
+fn deserialize_cex_search_budget<'de, D>(deserializer: D) -> Result<SearchBudget, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictSearchBudget {
+        max_candidates: usize,
+        max_expansions: u64,
+        max_tokens: u64,
+        max_seconds: u64,
+    }
+
+    let budget = StrictSearchBudget::deserialize(deserializer)?;
+    Ok(SearchBudget {
+        max_candidates: budget.max_candidates,
+        max_expansions: budget.max_expansions,
+        max_tokens: budget.max_tokens,
+        max_seconds: budget.max_seconds,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,7 +627,7 @@ impl CexResearchMissionArtifactV1 {
             ));
         }
         self.spec.validate()?;
-        let mission_id = self.semantic_id()?;
+        let mission_id = self.semantic_id_unchecked()?;
         if self.spec.evidence.iter().any(|evidence| {
             evidence.kind == CexResearchEvidenceKindV1::ExposedHoldout
                 && evidence.source_mission_id == mission_id
@@ -617,6 +640,11 @@ impl CexResearchMissionArtifactV1 {
     }
 
     pub fn semantic_id(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        self.semantic_id_unchecked()
+    }
+
+    fn semantic_id_unchecked(&self) -> Result<String, DomainError> {
         #[derive(Serialize)]
         struct SemanticMission<'a> {
             schema_version: &'a str,
@@ -3103,6 +3131,24 @@ mod tests {
         let mut value = serde_json::to_value(cex_mission_artifact(Utc::now())).unwrap();
         value["spec"]["actions"] = serde_json::json!(["open_holdout"]);
         assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
+    }
+
+    #[test]
+    fn cex_mission_rejects_unknown_nested_search_budget_field() {
+        let mut value = serde_json::to_value(cex_mission_artifact(Utc::now())).unwrap();
+        value["spec"]["search"]["budget"]["open_holdout"] = serde_json::json!(true);
+        let shared_budget = value["spec"]["search"]["budget"].clone();
+
+        assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
+        assert!(serde_json::from_value::<SearchBudget>(shared_budget).is_ok());
+    }
+
+    #[test]
+    fn cex_mission_semantic_id_rejects_invalid_artifact() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.schema_version = "cex-research-mission-v2".to_string();
+
+        assert!(mission.semantic_id().is_err());
     }
 
     #[test]
