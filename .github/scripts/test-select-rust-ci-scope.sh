@@ -227,6 +227,7 @@ grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
+grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
 grep -Fqx '    needs: image-smoke-selector' "$ploy_workflow"
 grep -Fqx "$always_condition" "$ploy_workflow"
