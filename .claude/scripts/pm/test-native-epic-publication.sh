@@ -83,7 +83,7 @@ depends_on: []
 ---
 # First task
 EOF
-for category_case in missing invalid conflicting malformed; do
+for category_case in missing invalid conflicting conflicting_spaced malformed; do
   case "$category_case" in
     missing)
       cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
@@ -108,6 +108,16 @@ EOF
 name: feature
 category: bug
 category: enhancement
+---
+# Feature
+EOF
+      ;;
+    conflicting_spaced)
+      cat > "$scratch/project/.claude/epics/feature/epic.md" <<'EOF'
+---
+name: feature
+category: bug
+category : enhancement
 ---
 # Feature
 EOF
@@ -224,6 +234,25 @@ sed 's/^category: enhancement$/category: bug/' \
   "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
 mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
 mkdir -p "$scratch/project/.claude/prds"
+cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
+---
+name: feature
+category: bug
+---
+# PRD
+EOF
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/enhancement-prd.md"
+mv "$scratch/enhancement-prd.md" "$scratch/project/.claude/prds/feature.md"
+if (
+  cd "$scratch/project"
+  RUN_ROOT_OUTPUT="$scratch/prd-mismatch-root" \
+    MONDAY_EPIC_SYNC_TMP_PARENT="$scratch/run-parent" \
+    bash "$scratch/quick-check.sh"
+) > /dev/null 2>&1; then
+  echo "quick check accepted a PRD and epic category mismatch" >&2
+  exit 1
+fi
 cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
 ---
 name: feature
@@ -400,6 +429,9 @@ chmod +x "$scratch/bin/gh"
 cat > "$scratch/bin/mv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${MV_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$MV_LOG"
+fi
 if [ "${MV_FAIL_INSTALL:-0}" = 1 ]; then
   case "$1" in
     */rename-stage/501.md) exit 1 ;;
@@ -485,6 +517,9 @@ mkdir -p "$enhancement_state"
 sed 's/^category: bug$/category: enhancement/' \
   "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/enhancement-epic.md"
 mv "$scratch/enhancement-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/enhancement-prd.md"
+mv "$scratch/enhancement-prd.md" "$scratch/project/.claude/prds/feature.md"
 : > "$gh_log"
 run_publication "$scratch/enhancement-root" "$enhancement_state" > /dev/null
 for number in 500 501 502; do
@@ -497,6 +532,9 @@ done
 sed 's/^category: enhancement$/category: bug/' \
   "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
 mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/prds/feature.md" > "$scratch/bug-prd.md"
+mv "$scratch/bug-prd.md" "$scratch/project/.claude/prds/feature.md"
 
 for mismatch_case in mismatch conflicting; do
   mismatch_state="$scratch/gh-state-$mismatch_case"
@@ -576,7 +614,10 @@ fi
 
 failure_project="$scratch/rename-failure-project"
 failure_root="$scratch/rename-failure-root"
-mkdir -p "$failure_project/.claude/epics/feature" "$failure_root"
+mv_failure_log="$scratch/mv-failure.log"
+mkdir -p "$failure_project/.claude/epics/feature" \
+  "$failure_project/.claude/scripts/pm" "$failure_root"
+cp "$category_reader" "$failure_project/.claude/scripts/pm/read-issue-category.sh"
 cp "$rename_project/.claude/epics/feature/epic.md" \
   "$failure_project/.claude/epics/feature/epic.md"
 cp "$rename_project/.claude/epics/feature/002.md" \
@@ -585,11 +626,17 @@ cp "$rename_project/.claude/epics/feature/501.md" \
   "$failure_project/.claude/epics/feature/002.md"
 if (
   cd "$failure_project"
+  : > "$mv_failure_log"
   GH_LOG="$gh_log" GH_STATE_DIR="$scratch/gh-state" MV_FAIL_INSTALL=1 \
+    MV_LOG="$mv_failure_log" \
     PATH="$scratch/bin:$PATH" MONDAY_EPIC_SYNC_TMP_PARENT="$failure_root" \
     bash "$scratch/rename.sh"
 ) > /dev/null 2>&1; then
   echo "task rename did not surface an install failure" >&2
+  exit 1
+fi
+if ! grep -Fq '/rename-stage/501.md' "$mv_failure_log"; then
+  echo "rename failure fixture did not reach the staged install" >&2
   exit 1
 fi
 if ! grep -Fq '# First original' "$failure_project/.claude/epics/feature/001.md" ||

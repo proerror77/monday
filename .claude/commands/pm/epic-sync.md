@@ -32,6 +32,18 @@ if ! issue_category=$(.claude/scripts/pm/read-issue-category.sh "$epic_dir/epic.
   exit 1
 fi
 
+prd_file=".claude/prds/$ARGUMENTS.md"
+if [ -f "$prd_file" ]; then
+  if ! prd_category=$(.claude/scripts/pm/read-issue-category.sh "$prd_file"); then
+    echo "❌ PRD frontmatter requires exactly one category: bug or enhancement" >&2
+    exit 1
+  fi
+  if [ "$prd_category" != "$issue_category" ]; then
+    echo "❌ PRD and epic categories do not match" >&2
+    exit 1
+  fi
+fi
+
 task_source_id() {
   source_id=$(sed -n '2,/^---$/s/^monday_source: *//p' "$1")
   [ -n "$source_id" ] || source_id=$(basename "$1" .md)

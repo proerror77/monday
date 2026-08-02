@@ -7,10 +7,10 @@ category_file="${1:-}"
 awk '
   NR == 1 { if ($0 != "---") invalid=1; next }
   $0 == "---" { closed=1; exit }
-  /^category:[[:space:]]*/ {
+  /^category[[:space:]]*:[[:space:]]*/ {
     count++
     value=$0
-    sub(/^category:[[:space:]]*/, "", value)
+    sub(/^category[[:space:]]*:[[:space:]]*/, "", value)
   }
   END {
     if (invalid || !closed || count != 1 || (value != "bug" && value != "enhancement")) exit 1
