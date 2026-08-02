@@ -51,6 +51,7 @@ case "$event" in
     ;;
   workflow_dispatch)
     case "$target" in
+      polymarket-raw-ops) target=binance-lob-archiver ;;
       all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder) ;;
       *) printf 'unsupported publish target: %s\n' "$target" >&2; exit 1 ;;
     esac
