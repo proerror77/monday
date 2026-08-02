@@ -39,6 +39,11 @@ Do not bother the user with preflight checks progress ("I'm not going to ..."). 
    - If not, create it first
    - If unable to create, tell user: "❌ Cannot create PRD directory. Please manually create: .claude/prds/"
 
+4. **Require an explicit issue category:**
+   - Ask the user to choose exactly one category: `bug` or `enhancement`
+   - Accept only those exact values and stop if neither is provided
+   - Never infer or default the category from PRD prose.
+
 ## Instructions
 
 You are a product manager creating a comprehensive Product Requirements Document (PRD) for: **$ARGUMENTS**
@@ -99,6 +104,7 @@ Save the completed PRD to: `.claude/prds/$ARGUMENTS.md` with this exact structur
 ---
 name: $ARGUMENTS
 description: [Brief one-line description of the PRD]
+category: [bug or enhancement selected by the user]
 status: backlog
 created: [Current ISO date/time]
 ---
@@ -117,6 +123,7 @@ created: [Current ISO date/time]
 ### 4. Frontmatter Guidelines
 - **name**: Use the exact feature name (same as $ARGUMENTS)
 - **description**: Write a concise one-line summary of what this PRD covers
+- **category**: Use the user's explicit `bug` or `enhancement` selection
 - **status**: Always start with "backlog" for new PRDs
 - **created**: Get REAL current datetime by running: `date -u +"%Y-%m-%dT%H:%M:%SZ"`
   - Never use placeholder text
@@ -130,6 +137,7 @@ Before saving the PRD, verify:
 - [ ] Success criteria are measurable
 - [ ] Dependencies are clearly identified
 - [ ] Out of scope items are explicitly listed
+- [ ] Frontmatter contains exactly one explicit `bug` or `enhancement` category
 
 ### 6. Post-Creation
 

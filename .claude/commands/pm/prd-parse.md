@@ -32,7 +32,9 @@ Do not bother the user with preflight checks progress ("I'm not going to ..."). 
    - Stop execution if PRD doesn't exist
 
 3. **Validate PRD frontmatter:**
-   - Verify PRD has valid frontmatter with: name, description, status, created
+   - Verify PRD has valid frontmatter with: name, description, category, status, created
+   - Require exactly one `category` field whose value is `bug` or `enhancement`
+   - Stop on missing, duplicate, or any other category value
    - If frontmatter is invalid or missing, tell user: "❌ Invalid PRD frontmatter. Please check: .claude/prds/$ARGUMENTS.md"
    - Show what's missing or invalid
 
@@ -55,6 +57,7 @@ You are a technical lead converting a Product Requirements Document into a detai
 - Analyze all requirements and constraints
 - Understand the user stories and success criteria
 - Extract the PRD description from frontmatter
+- Extract the explicit PRD category from frontmatter
 
 ### 2. Technical Analysis
 - Identify architectural decisions needed
@@ -68,6 +71,7 @@ Create the epic file at: `.claude/epics/$ARGUMENTS/epic.md` with this exact stru
 ```markdown
 ---
 name: $ARGUMENTS
+category: [Exact category from the PRD]
 status: backlog
 created: [Current ISO date/time]
 progress: 0%
@@ -130,6 +134,7 @@ High-level task categories that will be created:
 
 ### 4. Frontmatter Guidelines
 - **name**: Use the exact feature name (same as $ARGUMENTS)
+- **category**: Copy the PRD category exactly; never infer or default it.
 - **status**: Always start with "backlog" for new epics
 - **created**: Get REAL current datetime by running: `date -u +"%Y-%m-%dT%H:%M:%SZ"`
 - **progress**: Always start with "0%" for new epics
@@ -149,6 +154,26 @@ Before saving the epic, verify:
 - [ ] Dependencies are technically accurate
 - [ ] Effort estimates are realistic
 - [ ] Architecture decisions are justified
+- [ ] Epic category exactly matches the source PRD category
+
+### Verify Category Contract
+
+After writing the epic, run this readback before reporting success:
+
+```bash
+if ! prd_category=$(.claude/scripts/pm/read-issue-category.sh ".claude/prds/$ARGUMENTS.md"); then
+  echo "❌ PRD frontmatter requires exactly one category: bug or enhancement" >&2
+  exit 1
+fi
+if ! epic_category=$(.claude/scripts/pm/read-issue-category.sh ".claude/epics/$ARGUMENTS/epic.md"); then
+  echo "❌ Epic frontmatter requires exactly one category: bug or enhancement" >&2
+  exit 1
+fi
+if [ "$epic_category" != "$prd_category" ]; then
+  echo "❌ Epic category does not match the source PRD" >&2
+  exit 1
+fi
+```
 
 ### 7. Post-Creation
 
