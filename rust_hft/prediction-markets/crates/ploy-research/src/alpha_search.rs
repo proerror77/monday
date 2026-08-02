@@ -10,8 +10,9 @@ use hft_search_kernel::{
 };
 
 use crate::autofactor::{
-    autofactor_runtime_contract_catalog, autofactor_target_horizon, factor_expr_hash,
-    AutoFactorDecision, AutoFactorOptions, AutoFactorReport, FactorExpr, LlmPriorSpec,
+    autofactor_runtime_contract_catalog, autofactor_target_contract, autofactor_target_horizon,
+    factor_expr_hash, AutoFactorDecision, AutoFactorOptions, AutoFactorReport, FactorExpr,
+    LlmPriorSpec,
 };
 use crate::factors_v2::ReviewSide;
 
@@ -20,6 +21,213 @@ pub const SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifac
 pub const FORMULA_MCTS_CHECKPOINT_VERSION: &str = "formula_mcts_checkpoint_v1";
 const FORMULA_MCTS_ROOT_ID: &str = "__formula_mcts_root__";
 const FORMULA_MCTS_SELECTION_BUDGET: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateReplayFactorIdentity {
+    version: String,
+    target: String,
+    side: Option<ReviewSide>,
+    name: String,
+    dsl_hash: String,
+    horizon: String,
+    runtime_score: String,
+}
+
+impl CandidateReplayFactorIdentity {
+    pub fn from_artifact(artifact: &serde_json::Value) -> Result<Self, AlphaSearchArtifactError> {
+        let source = artifact
+            .get("source_factor")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| identity_mismatch("candidate replay missing source_factor object"))?;
+        let version = required_identity_string(source, "version")?;
+        let target = required_identity_string(source, "target")?;
+        let name = required_identity_string(source, "name")?;
+        let dsl_hash = required_identity_string(source, "dsl_hash")?;
+        if dsl_hash.len() != 64
+            || !dsl_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(identity_mismatch(
+                "candidate replay source_factor dsl_hash must be 64 lowercase hex characters",
+            ));
+        }
+        let horizon = required_identity_string(source, "horizon")?;
+        if !source.contains_key("side") {
+            return Err(identity_mismatch(
+                "candidate replay source_factor missing side",
+            ));
+        }
+        let side = serde_json::from_value::<Option<ReviewSide>>(source["side"].clone())
+            .map_err(|_| identity_mismatch("candidate replay source_factor has invalid side"))?;
+
+        let target_contract = autofactor_target_contract(&target).ok_or_else(|| {
+            identity_mismatch(format!(
+                "candidate replay source_factor has unsupported target={target}"
+            ))
+        })?;
+        if is_side_bound_repricing_target(&target) {
+            if version != SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || side.is_none() {
+                return Err(identity_mismatch(format!(
+                    "repricing source_factor requires version={SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION} and side=Up|Down"
+                )));
+            }
+        } else if target_contract.official_settlement_required {
+            if version != ALPHA_SEARCH_ARTIFACT_VERSION || side.is_some() {
+                return Err(identity_mismatch(format!(
+                    "settlement source_factor requires version={ALPHA_SEARCH_ARTIFACT_VERSION} and side=null"
+                )));
+            }
+        } else {
+            return Err(identity_mismatch(format!(
+                "candidate replay source_factor has unsupported target={target}"
+            )));
+        }
+
+        let expected_horizon = target_contract.horizon.as_str();
+        if horizon != expected_horizon {
+            return Err(identity_mismatch(format!(
+                "candidate replay source_factor target={target} requires horizon={expected_horizon}, found {horizon}"
+            )));
+        }
+        for (field, expected) in [
+            ("version", version.as_str()),
+            ("target", target.as_str()),
+            ("name", name.as_str()),
+            ("dsl_hash", dsl_hash.as_str()),
+            ("horizon", horizon.as_str()),
+        ] {
+            validate_duplicate_identity_string("top-level", artifact, field, expected)?;
+        }
+        validate_duplicate_identity_side("top-level", artifact, side)?;
+        if let Some(decision_contract) = artifact.get("decision_contract") {
+            if !decision_contract.is_object() {
+                return Err(identity_mismatch(
+                    "candidate replay decision_contract must be an object",
+                ));
+            }
+            for (field, expected) in [("target", target.as_str()), ("horizon", horizon.as_str())] {
+                validate_duplicate_identity_string(
+                    "decision_contract",
+                    decision_contract,
+                    field,
+                    expected,
+                )?;
+            }
+            validate_duplicate_identity_side("decision_contract", decision_contract, side)?;
+        }
+
+        let runtime_score = artifact
+            .get("runtime_score")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| identity_mismatch("candidate replay missing runtime_score"))?
+            .to_string();
+        let expected_runtime_score = inferred_runtime_mapping(&name).runtime_score;
+        if expected_runtime_score.is_empty() {
+            return Err(identity_mismatch(format!(
+                "candidate replay source_factor has no canonical runtime score for name={name}"
+            )));
+        }
+        if runtime_score != expected_runtime_score {
+            return Err(identity_mismatch(format!(
+                "candidate replay runtime_score must be {expected_runtime_score}, found {runtime_score}"
+            )));
+        }
+
+        Ok(Self {
+            version,
+            target,
+            side,
+            name,
+            dsl_hash,
+            horizon,
+            runtime_score,
+        })
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn side(&self) -> Option<ReviewSide> {
+        self.side
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn dsl_hash(&self) -> &str {
+        &self.dsl_hash
+    }
+
+    pub fn horizon(&self) -> &str {
+        &self.horizon
+    }
+
+    pub fn runtime_score(&self) -> &str {
+        &self.runtime_score
+    }
+}
+
+fn identity_mismatch(reason: impl Into<String>) -> AlphaSearchArtifactError {
+    AlphaSearchArtifactError::IdentityMismatch(reason.into())
+}
+
+fn required_identity_string(
+    source: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, AlphaSearchArtifactError> {
+    source
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            identity_mismatch(format!(
+                "candidate replay source_factor missing non-empty {field}"
+            ))
+        })
+}
+
+fn validate_duplicate_identity_string(
+    location: &str,
+    artifact: &serde_json::Value,
+    field: &str,
+    expected: &str,
+) -> Result<(), AlphaSearchArtifactError> {
+    if let Some(found) = artifact.get(field) {
+        if found.as_str() != Some(expected) {
+            return Err(identity_mismatch(format!(
+                "candidate replay {location} {field} must match source_factor {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_duplicate_identity_side(
+    location: &str,
+    artifact: &serde_json::Value,
+    expected: Option<ReviewSide>,
+) -> Result<(), AlphaSearchArtifactError> {
+    let Some(found) = artifact.get("side") else {
+        return Ok(());
+    };
+    let found = serde_json::from_value::<Option<ReviewSide>>(found.clone())
+        .map_err(|_| identity_mismatch(format!("candidate replay {location} side is invalid")))?;
+    if found != expected {
+        return Err(identity_mismatch(format!(
+            "candidate replay {location} side must match source_factor"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlphaSearchArtifactSummary {
@@ -40,6 +248,8 @@ pub struct AlphaSearchRuntimeFeedback {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side: Option<ReviewSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsl_hash: Option<String>,
     pub runtime_score: String,
     pub base_factor: String,
     pub entry_signals: usize,
@@ -392,6 +602,7 @@ struct RuntimeAvoidFactorSummary {
 struct RuntimeAvoidance {
     base_factor: String,
     factor_family: String,
+    dsl_hash: Option<String>,
     runtime_score: Option<String>,
     reason: Option<String>,
     source: &'static str,
@@ -2389,6 +2600,7 @@ fn runtime_avoidances(
         out.push(RuntimeAvoidance {
             base_factor: feedback.base_factor.clone(),
             factor_family: normalized_factor_family(&feedback.base_factor),
+            dsl_hash: feedback.dsl_hash.clone(),
             runtime_score: Some(feedback.runtime_score.clone()),
             reason: Some("runtime_pass_through_collapse".to_string()),
             source: "runtime_replay_feedback",
@@ -2420,6 +2632,7 @@ fn runtime_avoidances(
             out.push(RuntimeAvoidance {
                 base_factor: item.base_factor.clone(),
                 factor_family: family,
+                dsl_hash: None,
                 runtime_score: item.runtime_score.clone(),
                 reason: item.reason.clone(),
                 source: "typed_prior",
@@ -2438,8 +2651,17 @@ fn matching_runtime_avoidance<'a>(
 ) -> Option<&'a RuntimeAvoidance> {
     let name = normalized_factor_key(&report.name);
     let family = normalized_factor_family(&report.name);
+    let dsl_hash = runtime_avoidances
+        .iter()
+        .any(|avoidance| avoidance.dsl_hash.is_some())
+        .then(|| factor_expr_hash(&report.expr).ok())
+        .flatten();
     runtime_avoidances.iter().find(|avoidance| {
-        !avoidance.factor_family.is_empty()
+        avoidance
+            .dsl_hash
+            .as_deref()
+            .is_none_or(|expected| dsl_hash.as_deref() == Some(expected))
+            && !avoidance.factor_family.is_empty()
             && (family == avoidance.factor_family
                 || name == avoidance.factor_family
                 || name == normalized_factor_key(&avoidance.base_factor))
@@ -2549,6 +2771,117 @@ fn normalized_factor_key(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::autofactor::{AutoFactorDecision, FactorExpr};
+
+    fn candidate_replay_identity_artifact(
+        version: &str,
+        target: &str,
+        side: Option<ReviewSide>,
+        horizon: &str,
+        name: &str,
+        runtime_score: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "runtime_score": runtime_score,
+            "decision_contract": {
+                "target": target,
+                "side": side,
+                "horizon": horizon,
+            },
+            "source_factor": {
+                "version": version,
+                "target": target,
+                "side": side,
+                "name": name,
+                "dsl_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "horizon": horizon,
+            }
+        })
+    }
+
+    #[test]
+    fn candidate_replay_identity_accepts_exact_settlement_and_repricing_roots() {
+        let settlement = candidate_replay_identity_artifact(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            "5m",
+            "auto_settlement_conservative_settlement_edge",
+            "autofactor_formula:auto_settlement_conservative_settlement_edge",
+        );
+        let settlement = CandidateReplayFactorIdentity::from_artifact(&settlement)
+            .expect("exact settlement identity");
+        assert_eq!(settlement.side(), None);
+        assert_eq!(settlement.horizon(), "5m");
+
+        let repricing = candidate_replay_identity_artifact(
+            SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_reprice_pnl_10s",
+            Some(ReviewSide::Up),
+            "10s",
+            "repricing_gap_side_10s",
+            "repricing_gap_side_10s",
+        );
+        let repricing = CandidateReplayFactorIdentity::from_artifact(&repricing)
+            .expect("exact repricing identity");
+        assert_eq!(repricing.side(), Some(ReviewSide::Up));
+        assert_eq!(repricing.target(), "full_depth_reprice_pnl_10s");
+    }
+
+    #[test]
+    fn candidate_replay_identity_rejects_ambiguous_or_spoofed_roots() {
+        let valid = candidate_replay_identity_artifact(
+            SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_reprice_pnl_10s",
+            Some(ReviewSide::Up),
+            "10s",
+            "repricing_gap_side_10s",
+            "repricing_gap_side_10s",
+        );
+        let mut missing_side = valid.clone();
+        missing_side["source_factor"]
+            .as_object_mut()
+            .expect("source factor")
+            .remove("side");
+        let mut wrong_horizon = valid.clone();
+        wrong_horizon["source_factor"]["horizon"] = serde_json::json!("5m");
+        let mut wrong_runtime_score = valid.clone();
+        wrong_runtime_score["runtime_score"] = serde_json::json!("autofactor_formula:other");
+        let mut malformed_dsl_hash = valid.clone();
+        malformed_dsl_hash["source_factor"]["dsl_hash"] = serde_json::json!("sha256:factor");
+        let mut conflicting_duplicate = valid.clone();
+        conflicting_duplicate["side"] = serde_json::json!("Down");
+        let mut conflicting_decision_target = valid.clone();
+        conflicting_decision_target["decision_contract"]["target"] =
+            serde_json::json!("full_depth_reprice_pnl_30s");
+        let mut conflicting_decision_horizon = valid.clone();
+        conflicting_decision_horizon["decision_contract"]["horizon"] = serde_json::json!("30s");
+        let mut conflicting_decision_side = valid.clone();
+        conflicting_decision_side["decision_contract"]["side"] = serde_json::json!("Down");
+        let legacy_pooled_repricing = candidate_replay_identity_artifact(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_reprice_pnl_10s",
+            None,
+            "10s",
+            "repricing_gap_side_10s",
+            "repricing_gap_side_10s",
+        );
+
+        for artifact in [
+            missing_side,
+            wrong_horizon,
+            wrong_runtime_score,
+            malformed_dsl_hash,
+            conflicting_duplicate,
+            conflicting_decision_target,
+            conflicting_decision_horizon,
+            conflicting_decision_side,
+            legacy_pooled_repricing,
+            serde_json::json!({"runtime_score": "autofactor_formula:missing_root"}),
+        ] {
+            CandidateReplayFactorIdentity::from_artifact(&artifact)
+                .expect_err("ambiguous or spoofed identity must fail closed");
+        }
+    }
 
     fn sample_report(name: &str) -> AutoFactorReport {
         AutoFactorReport {
@@ -3573,6 +3906,7 @@ mod tests {
             version: None,
             target: None,
             side: None,
+            dsl_hash: None,
             runtime_score: "autofactor_formula:mut_spread_adjusted_external_move_near_strike"
                 .to_string(),
             base_factor: "mut_spread_adjusted_external_move_near_strike".to_string(),
@@ -3602,6 +3936,54 @@ mod tests {
     }
 
     #[test]
+    fn candidate_replay_feedback_requires_matching_dsl_hash() {
+        let mut report = sample_report("mut_spread_adjusted_external_move_near_strike");
+        report.spearman_ic = 0.95;
+        report.icir = 3.0;
+        report.top_bucket_avg_label = 3.0;
+        let feedback = AlphaSearchRuntimeFeedback {
+            version: Some(ALPHA_SEARCH_ARTIFACT_VERSION.to_string()),
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            side: None,
+            dsl_hash: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
+            runtime_score: "autofactor_formula:mut_spread_adjusted_external_move_near_strike"
+                .to_string(),
+            base_factor: "mut_spread_adjusted_external_move_near_strike".to_string(),
+            entry_signals: 0,
+            direct_passes_at_configured_threshold: 146,
+            formula_evaluations: 2934,
+            depth_fillable: 2934,
+            executable_edge_pass_min_edge: 5,
+        };
+        let temp = tempfile::tempdir().expect("candidate replay output");
+
+        write_alpha_search_artifacts_with_state_and_runtime_feedback(
+            temp.path(),
+            "full_depth_settlement_executable_pnl",
+            &["conservative_settlement_edge".to_string()],
+            &[report],
+            &AutoFactorOptions::default(),
+            None,
+            Some(&feedback),
+            None,
+            None,
+        )
+        .expect("write artifacts with mismatched replay hash");
+
+        let metrics: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                temp.path()
+                    .join("full_depth_settlement_executable_pnl/node-metrics.json"),
+            )
+            .expect("read node metrics"),
+        )
+        .expect("parse node metrics");
+        assert_eq!(metrics[0]["runtime_pass_through_penalty"], 0.0);
+    }
+
+    #[test]
     fn runtime_pass_through_collapse_filters_mcts_expansion_nodes() {
         let mut collapsed = sample_report("mcts_spread_adjusted_external_move_near_strike");
         collapsed.spearman_ic = 0.95;
@@ -3613,6 +3995,7 @@ mod tests {
             version: None,
             target: None,
             side: None,
+            dsl_hash: None,
             runtime_score: "autofactor_formula:mut_spread_adjusted_external_move_near_strike"
                 .to_string(),
             base_factor: "mut_spread_adjusted_external_move_near_strike".to_string(),

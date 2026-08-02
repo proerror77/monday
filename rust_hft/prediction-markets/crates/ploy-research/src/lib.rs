@@ -126,9 +126,9 @@ pub use alpha_search::{
     write_alpha_search_artifacts_with_state_and_runtime_feedback,
     write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
     AlphaSearchArtifactError, AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback,
-    AlphaZooEntry, AlphaZooSnapshot, FormulaMctsCheckpoint, FormulaMctsCheckpointNode,
-    MctsSearchStateArtifact, MctsSearchStateNode, FORMULA_MCTS_CHECKPOINT_VERSION,
-    SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+    AlphaZooEntry, AlphaZooSnapshot, CandidateReplayFactorIdentity, FormulaMctsCheckpoint,
+    FormulaMctsCheckpointNode, MctsSearchStateArtifact, MctsSearchStateNode,
+    FORMULA_MCTS_CHECKPOINT_VERSION, SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
 };
 pub use attribution::{factor_pnl, regime_pnl, AttributionReport, RegimePnl};
 pub use autofactor::{

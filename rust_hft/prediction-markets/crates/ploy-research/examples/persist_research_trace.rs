@@ -16,7 +16,8 @@ use ploy_research::alpha_search::{
 use ploy_research::autofactor_target_horizon;
 use ploy_research::research_os::trace::trace_hash;
 use ploy_research::{
-    root_gene, AlphaZooEntry, AlphaZooSnapshot, FactorExpr, ResearchSnapshotManifest, ReviewSide,
+    root_gene, AlphaZooEntry, AlphaZooSnapshot, CandidateReplayFactorIdentity, FactorExpr,
+    ResearchSnapshotManifest, ReviewSide,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -29,7 +30,6 @@ const WRITER_AGENT: &str = "persist_research_trace";
 const EVALUATOR_VERSION: &str = "persist_research_trace_v1";
 const EVIDENCE_STAGE: &str = "factor_attribution";
 const EVALUATION_KIND: &str = "alpha_search_preview";
-const FACTOR_HORIZON: &str = "5m";
 
 #[derive(Debug, Clone)]
 struct TracePlan {
@@ -106,10 +106,10 @@ struct CandidateReplayTapeRow {
     strategy_profile: String,
     runtime_score: String,
     data_snapshot_id: String,
-    dsl_hash: Option<String>,
-    factor_name: Option<String>,
-    target: Option<String>,
-    horizon: Option<String>,
+    dsl_hash: String,
+    target: String,
+    horizon: String,
+    review_side: Option<ReviewSide>,
     recording_path: Option<String>,
     recording_sha256: Option<String>,
     config_path: Option<String>,
@@ -329,7 +329,7 @@ async fn main() -> Result<()> {
             &pool,
             &plan.run_id,
             Some(&dataset.data_snapshot_id),
-            replay.dsl_hash.as_deref(),
+            Some(replay.dsl_hash.as_str()),
             Some(&replay.candidate_replay_id),
             None,
             "candidate_replay_tape",
@@ -639,31 +639,8 @@ fn candidate_replay_row(
     .to_string();
     let candidate_replay_id = string_field(&artifact_json, "candidate_replay_id")
         .unwrap_or_else(|| format!("candidate_replay:{}", &artifact_sha256[..32]));
-    let source_factor = artifact_json
-        .get("source_factor")
-        .and_then(Value::as_object);
-    let dsl_hash = source_factor
-        .and_then(|item| item.get("dsl_hash"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let factor_name = source_factor
-        .and_then(|item| item.get("name"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| factor_name_from_runtime_score(&artifact_json));
-    let target = source_factor
-        .and_then(|item| item.get("target"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let horizon = source_factor
-        .and_then(|item| item.get("horizon"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| Some(FACTOR_HORIZON.to_string()));
+    let source_factor = CandidateReplayFactorIdentity::from_artifact(&artifact_json)
+        .with_context(|| format!("{} has invalid source_factor identity", path.display()))?;
     let promotion_ready = artifact_json
         .get("promotion_ready")
         .and_then(Value::as_bool)
@@ -692,12 +669,12 @@ fn candidate_replay_row(
         deployment_id: string_field(&artifact_json, "deployment_id"),
         strategy_profile: string_field(&artifact_json, "strategy_profile")
             .unwrap_or_else(|| "unknown".to_string()),
-        runtime_score: string_field(&artifact_json, "runtime_score").unwrap_or_default(),
+        runtime_score: source_factor.runtime_score().to_string(),
         data_snapshot_id: dataset.data_snapshot_id.clone(),
-        dsl_hash,
-        factor_name,
-        target,
-        horizon,
+        dsl_hash: source_factor.dsl_hash().to_string(),
+        target: source_factor.target().to_string(),
+        horizon: source_factor.horizon().to_string(),
+        review_side: source_factor.side(),
         recording_path: string_field(&artifact_json, "recording_path"),
         recording_sha256: string_field(&artifact_json, "recording_sha256"),
         config_path: string_field(&artifact_json, "config_path"),
@@ -871,16 +848,6 @@ fn canonical_candidate_replay_evidence_stage(
         }
     }
     Ok(canonical)
-}
-
-fn factor_name_from_runtime_score(value: &Value) -> Option<String> {
-    string_field(value, "runtime_score")
-        .and_then(|score| {
-            score
-                .strip_prefix("autofactor_formula:")
-                .map(ToOwned::to_owned)
-        })
-        .filter(|name| !name.is_empty())
 }
 
 fn factor_preview_row(
@@ -1666,48 +1633,41 @@ async fn find_candidate_replay_factor_id(
     pool: &PgPool,
     row: &CandidateReplayTapeRow,
 ) -> Result<Option<String>> {
-    if let Some(dsl_hash) = &row.dsl_hash {
-        let factor_id = sqlx::query_scalar(
-            r#"
-            SELECT factor_id::text
-            FROM factor_registry
-            WHERE dsl_hash = $1
-              AND review_side IS NULL
-              AND ($2::text IS NULL OR target = $2)
-              AND ($3::text IS NULL OR horizon = $3)
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(dsl_hash)
-        .bind(&row.target)
-        .bind(&row.horizon)
-        .fetch_optional(pool)
-        .await?;
-        if factor_id.is_some() {
-            return Ok(factor_id);
-        }
-    }
-    if let Some(factor_name) = &row.factor_name {
-        return Ok(sqlx::query_scalar(
-            r#"
-            SELECT factor_id::text
-            FROM factor_registry
-            WHERE factor_name = $1
-              AND review_side IS NULL
-              AND ($2::text IS NULL OR target = $2)
-              AND ($3::text IS NULL OR horizon = $3)
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(factor_name)
-        .bind(&row.target)
-        .bind(&row.horizon)
-        .fetch_optional(pool)
-        .await?);
-    }
-    Ok(None)
+    find_factor_id_by_identity(
+        pool,
+        &row.dsl_hash,
+        &row.target,
+        &row.horizon,
+        row.review_side,
+    )
+    .await
+}
+
+async fn find_factor_id_by_identity(
+    pool: &PgPool,
+    dsl_hash: &str,
+    target: &str,
+    horizon: &str,
+    review_side: Option<ReviewSide>,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT factor_id::text
+        FROM factor_registry
+        WHERE dsl_hash = $1
+          AND target = $2
+          AND horizon = $3
+          AND review_side IS NOT DISTINCT FROM $4
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(dsl_hash)
+    .bind(target)
+    .bind(horizon)
+    .bind(review_side.map(ReviewSide::as_str))
+    .fetch_optional(pool)
+    .await?)
 }
 
 fn candidate_replay_promotion_status(row: &CandidateReplayTapeRow) -> &'static str {
@@ -2363,6 +2323,53 @@ mod tests {
                 .expect("upsert pooled"),
             pooled_id
         );
+
+        assert_eq!(
+            find_factor_id_by_identity(
+                &pool,
+                &dsl_hash,
+                "full_depth_reprice_pnl_10s",
+                "10s",
+                Some(ReviewSide::Up),
+            )
+            .await
+            .expect("find Up identity"),
+            Some(up_id.clone())
+        );
+        assert_eq!(
+            find_factor_id_by_identity(
+                &pool,
+                &dsl_hash,
+                "full_depth_reprice_pnl_10s",
+                "10s",
+                Some(ReviewSide::Down),
+            )
+            .await
+            .expect("find Down identity"),
+            Some(down_id.clone())
+        );
+        assert_eq!(
+            find_factor_id_by_identity(
+                &pool,
+                &dsl_hash,
+                "full_depth_reprice_pnl_10s",
+                "10s",
+                None,
+            )
+            .await
+            .expect("find pooled identity"),
+            Some(pooled_id.clone())
+        );
+        assert!(find_factor_id_by_identity(
+            &pool,
+            &dsl_hash,
+            "full_depth_reprice_pnl_10s",
+            "30s",
+            Some(ReviewSide::Up),
+        )
+        .await
+        .expect("mismatched horizon lookup")
+        .is_none());
 
         let rows: Vec<(Option<String>, String)> = sqlx::query_as(
             "SELECT review_side, factor_id::text FROM factor_registry WHERE dsl_hash = $1",
