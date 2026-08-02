@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Image target to publish
+        description: Image target to publish (polymarket-raw-ops uses binance-lob-archiver's full collector bundle)
         required: true
         default: all
         type: choice
@@ -17,6 +17,7 @@ on:
           - research-runner
           - hft-trading
           - binance-lob-archiver
+          - polymarket-raw-ops
           - polymarket-evidence-compiler
           - polymarket-market-recorder
       rebuild_research_runner:

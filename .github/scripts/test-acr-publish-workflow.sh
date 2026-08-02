@@ -20,6 +20,8 @@ grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/
 grep -Fqx '  workflow_run:' "$workflow"
 grep -Fqx '    workflows: ["Prediction Markets CI"]' "$workflow"
 grep -Fqx '    branches: [main]' "$workflow"
+grep -Fqx "        description: Image target to publish (polymarket-raw-ops uses binance-lob-archiver's full collector bundle)" "$workflow"
+grep -Fqx '          - polymarket-raw-ops' "$workflow"
 grep -Fqx '  actions: read' "$workflow"
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
