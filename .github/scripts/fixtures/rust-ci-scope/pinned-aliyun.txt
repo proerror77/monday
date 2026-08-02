@@ -1,5 +1,6 @@
 deployment/aliyun/polymarket-market-tape.toml
 deployment/aliyun/polymarket-market-tape.service
 deployment/aliyun/polymarket-reference-collector.service
+deployment/aliyun/polymarket-reference-collector-shadow@.service
 deployment/aliyun/polymarket-market-tape-upload.service
 deployment/aliyun/polymarket-reference-upload.service
