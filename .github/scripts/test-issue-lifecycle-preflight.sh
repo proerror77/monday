@@ -24,7 +24,7 @@ for ((index = 0; index < ${#args[@]}; index++)); do
     graphql) path=graphql; method=POST ;;
     If-None-Match:*) if_none_match="${args[$index]#If-None-Match: }" ;;
     query=*) query="${args[$index]#query=}" ;;
-    repos/*) path="${args[$index]}" ;;
+    repos/*|repositories/*) path="${args[$index]}" ;;
   esac
 done
 operation="${query%%[[:space:]]*}"
@@ -59,6 +59,9 @@ respond() {
 }
 
 respond_with_next() {
+  if [[ -n "$if_none_match" && "$if_none_match" == 'W/"fixture"' ]]; then
+    printf 'HTTP/2.0 304 Not Modified\r\nEtag: W/"fixture"\r\n\r\n'; exit 1
+  fi
   printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nEtag: W/"fixture"\r\nLast-Modified: Sat, 02 Aug 2026 00:00:00 GMT\r\nLink: <%s>; rel="next"\r\nX-GitHub-Api-Version-Selected: 2026-03-10\r\nX-GitHub-Media-Type: github.v3; format=json\r\n\r\n%s\n' "$1" "$2"
 }
 
@@ -71,7 +74,10 @@ fi
 
 case "$path" in
   repos/example/repo/labels*)
-    if [[ "${FIXTURE_MODE:-normal}" == missing-link ]]; then
+    if [[ "${FIXTURE_MODE:-normal}" == canonical-link ]]; then
+      body="$(ruby -rjson -e 'puts JSON.generate([{"id" => 10, "name" => "enhancement"}, {"id" => 11, "name" => "ready-for-agent"}] + (100..197).map { |id| {"id" => id, "name" => "label-#{id}"} })')"
+      respond_with_next 'https://api.github.com/repositories/123456/labels?per_page=100&page=2&after=cursor' "$body"
+    elif [[ "${FIXTURE_MODE:-normal}" == missing-link ]]; then
       if [[ "$path" == *"&page=1"* ]]; then
         respond "$(ruby -rjson -e 'puts JSON.generate(100.times.map { |i| {"id" => i, "name" => "label-#{i}"} })')"
       else
@@ -90,6 +96,9 @@ case "$path" in
       respond "$labels"
     fi
     ;;
+  repositories/123456/labels*)
+    respond '[{"id":198,"name":"label-198"}]'
+    ;;
   repos/example/repo/issues\?state=all*)
     respond '[{"id":101,"number":1},{"id":103,"number":3},{"id":102,"number":2,"pull_request":{"url":"https://api.github.test/repos/example/repo/pulls/2"}}]'
     ;;
@@ -104,20 +113,20 @@ case "$path" in
     respond "$comments" "$etag"
     ;;
   repos/example/repo/issues/events*)
-    respond '[{"id":2001,"event":"labeled","issue":{"number":1}},{"id":2002,"event":"cross-referenced","issue":{"number":2}}]'
+    respond '[{"id":2001,"event":"labeled","issue":{"number":1,"url":"https://api.github.test/repos/example/repo/issues/1"}},{"id":2002,"event":"cross-referenced","issue":{"number":2,"url":"https://api.github.test/repos/example/repo/issues/2"}}]'
     ;;
   repos/example/repo/issues/1)
-    respond "{\"id\":101,\"node_id\":\"I_one\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    respond "{\"id\":101,\"node_id\":\"I_one\",\"url\":\"https://api.github.test/repos/example/repo/issues/1\",\"number\":1,\"comments\":1,\"state\":\"open\",\"body\":\"Issue one\",\"labels\":$labels,\"assignees\":$assignees,\"updated_at\":\"2026-08-02T00:00:00Z\"}"
     ;;
   repos/example/repo/issues/3)
     call="$(bump issue3)"
     [[ "$call" -le 1 || -n "$if_none_match" ]] || { echo "stability GET missing If-None-Match" >&2; exit 1; }
     body=Blocker etag=fixture
     [[ "${FIXTURE_MODE:-normal}" != issue-detail-race || "$call" -le 1 ]] || { body='Blocker changed concurrently'; etag=changed; }
-    respond "{\"id\":103,\"node_id\":\"I_three\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"body\":\"$body\",\"labels\":[],\"assignees\":[],\"updated_at\":\"2026-08-01T00:00:00Z\"}" "$etag"
+    respond "{\"id\":103,\"node_id\":\"I_three\",\"url\":\"https://api.github.test/repos/example/repo/issues/3\",\"number\":3,\"comments\":0,\"state\":\"closed\",\"body\":\"$body\",\"labels\":[],\"assignees\":[],\"updated_at\":\"2026-08-01T00:00:00Z\"}" "$etag"
     ;;
   repos/example/repo/issues/2)
-    respond "{\"id\":102,\"node_id\":\"PR_two\",\"number\":2,\"comments\":1,\"state\":\"open\",\"body\":\"Pull request conversation\",\"labels\":$labels,\"assignees\":[],\"pull_request\":{\"url\":\"https://api.github.test/repos/example/repo/pulls/2\"},\"updated_at\":\"2026-08-02T00:00:00Z\"}"
+    respond "{\"id\":102,\"node_id\":\"PR_two\",\"url\":\"https://api.github.test/repos/example/repo/issues/2\",\"number\":2,\"comments\":1,\"state\":\"open\",\"body\":\"Pull request conversation\",\"labels\":$labels,\"assignees\":[],\"pull_request\":{\"url\":\"https://api.github.test/repos/example/repo/pulls/2\"},\"updated_at\":\"2026-08-02T00:00:00Z\"}"
     ;;
   repos/example/repo/pulls/2)
     call="$(bump pull2)"
@@ -125,17 +134,17 @@ case "$path" in
     if [[ "${FIXTURE_MODE:-normal}" == closed-pr-race ]]; then
       state=closed; [[ "$call" -le 1 ]] || { title='Changed concurrently'; etag=changed; }
     fi
-    respond "{\"id\":202,\"node_id\":\"PR_two\",\"number\":2,\"state\":\"$state\",\"title\":\"$title\",\"head\":{\"ref\":\"feature\",\"sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"base\":{\"ref\":\"main\",\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"commits\":1,\"changed_files\":2,\"review_comments\":1}" "${etag:-fixture}"
+    respond "{\"id\":202,\"node_id\":\"PR_two\",\"url\":\"https://api.github.test/repos/example/repo/pulls/2\",\"number\":2,\"state\":\"$state\",\"title\":\"$title\",\"head\":{\"ref\":\"feature\",\"sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"base\":{\"ref\":\"main\",\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"commits\":1,\"changed_files\":2,\"review_comments\":1}" "${etag:-fixture}"
     ;;
   repos/example/repo/pulls/2/commits*) respond '[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"message":"Refs #1"}}]' ;;
   repos/example/repo/pulls/2/files*) respond '[{"sha":"cccccccccccccccccccccccccccccccccccccccc","filename":"safe-copy.txt","status":"added"},{"sha":"cccccccccccccccccccccccccccccccccccccccc","filename":"safe.txt","status":"added"}]' ;;
-  repos/example/repo/pulls/2/reviews*) respond '[{"id":3001,"node_id":"PRR_review","state":"APPROVED"}]' ;;
-  repos/example/repo/pulls/2/comments*) respond '[{"id":4001,"node_id":"PRRC_comment","body":"looks good"}]' ;;
+  repos/example/repo/pulls/2/reviews*) respond '[{"id":3001,"node_id":"PRR_review","state":"APPROVED","_links":{"pull_request":{"href":"https://api.github.test/repos/example/repo/pulls/2"}}}]' ;;
+  repos/example/repo/pulls/2/comments*) respond '[{"id":4001,"node_id":"PRRC_comment","pull_request_url":"https://api.github.test/repos/example/repo/pulls/2","body":"looks good"}]' ;;
   repos/example/repo/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/check-runs*)
-    respond '{"total_count":1,"check_runs":[{"id":5001,"node_id":"CR_check","name":"CI","status":"completed","conclusion":"success"}]}'
+    respond '{"total_count":1,"check_runs":[{"id":5001,"node_id":"CR_check","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"CI","status":"completed","conclusion":"success"}]}'
     ;;
   repos/example/repo/commits/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/statuses*)
-    respond '[{"id":6001,"node_id":"SC_status","context":"legacy","state":"success"}]'
+    respond '[{"id":6001,"node_id":"SC_status","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","context":"legacy","state":"success"}]'
     ;;
   graphql)
     test "$(grep -o 'number url repository { nameWithOwner }' <<<"$query" | wc -l | tr -d ' ')" -eq 5
@@ -239,6 +248,9 @@ verify_live_fails() {
 : >"$api_log"
 capture normal "$tmp_dir/bundle-a"
 capture reordered "$tmp_dir/bundle-b"
+capture live-link-drift "$tmp_dir/bundle-link-header"
+capture canonical-link "$tmp_dir/bundle-canonical-link"
+verify "$tmp_dir/bundle-canonical-link"
 bundle_before="$(find "$tmp_dir/bundle-a" -mindepth 1 -maxdepth 1 -type f -exec sha256sum {} \; | sort)"
 api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
 verify "$tmp_dir/bundle-a"
@@ -277,7 +289,23 @@ abort "missing conditional stability pages" unless manifest.fetch("pages").any? 
 abort "wrong counts" unless manifest.fetch("counts") == {"issues" => 2, "pull_requests" => 1, "labels" => 2, "issue_comments" => 2, "issue_events" => 2}
 RUBY
 
+ruby -rjson - "$tmp_dir/bundle-link-header/manifest.json" <<'RUBY'
+pages = JSON.parse(File.read(ARGV.fetch(0))).fetch("pages").select { |page| page["protocol"] == "rest" && page["request"].include?("/labels?") }
+abort "capture Link was not recorded" unless pages.find { |page| page["phase"] == "capture" }.fetch("link").include?('rel="prev"')
+abort "304 stability incorrectly copied capture Link" unless pages.find { |page| page["phase"] == "stability_check" }.fetch("link").nil?
+RUBY
+
 local_api_calls_before="$(wc -l <"$api_log" | tr -d ' ')"
+
+copy_bundle verify-v1-pages
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  object.fetch("pages").each { |page| page.delete("link") }
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-v1-pages/manifest.json"
+rehash "$tmp_dir/verify-v1-pages" manifest.json
+verify "$tmp_dir/verify-v1-pages"
 
 copy_bundle verify-missing
 rm "$tmp_dir/verify-missing/manifest.json.sha256"
@@ -382,6 +410,17 @@ ruby -rjson -e '
 rehash "$tmp_dir/verify-page-omission" manifest.json
 verify_fails page-omission "$tmp_dir/verify-page-omission"
 
+copy_bundle verify-link-target
+ruby -rjson -e '
+  path = ARGV.fetch(0)
+  object = JSON.parse(File.binread(path))
+  page = object.fetch("pages").find { |entry| entry["phase"] == "capture" && entry["request"].include?("/labels?") }
+  page["link"] = %q(<https://api.github.com/repos/example/repo/labels?per_page=100&page=2>; rel="next")
+  File.binwrite(path, JSON.generate(object) + "\n")
+' "$tmp_dir/verify-link-target/manifest.json"
+rehash "$tmp_dir/verify-link-target" manifest.json
+verify_fails link-target "$tmp_dir/verify-link-target"
+
 copy_bundle verify-entry-identity
 ruby -rjson -e '
   path = ARGV.fetch(0)
@@ -391,6 +430,30 @@ ruby -rjson -e '
 ' "$tmp_dir/verify-entry-identity/preflight.json"
 resign_preflight "$tmp_dir/verify-entry-identity"
 verify_fails entry-identity "$tmp_dir/verify-entry-identity"
+
+for field in comment label commit review review-comment check-run status; do
+  copy_bundle "verify-scope-$field"
+  ruby -rjson -e '
+    path, field = ARGV
+    object = JSON.parse(File.binread(path))
+    case field
+    when "comment" then object.fetch("items").first.fetch("comments").first["issue_url"].sub!("example/repo", "other/repo")
+    when "label" then object.fetch("items").first.dig("issue", "labels").first.merge!("id" => 999, "name" => "outside-catalog")
+    else
+      pull = object.fetch("items").find { |item| item["kind"] == "pull_request" }.fetch("pull_request")
+      case field
+      when "commit" then pull.fetch("commits").first["sha"] = "d" * 40
+      when "review" then pull.fetch("reviews").first.dig("_links", "pull_request")["href"].sub!("example/repo", "other/repo")
+      when "review-comment" then pull.fetch("review_comments").first["pull_request_url"].sub!("example/repo", "other/repo")
+      when "check-run" then pull.dig("check_runs", "check_runs").first["head_sha"] = "d" * 40
+      when "status" then pull.fetch("statuses").first["sha"] = "d" * 40
+      end
+    end
+    File.binwrite(path, JSON.generate(object) + "\n")
+  ' "$tmp_dir/verify-scope-$field/preflight.json" "$field"
+  resign_preflight "$tmp_dir/verify-scope-$field"
+  verify_fails "scope-$field" "$tmp_dir/verify-scope-$field"
+done
 
 test "$(wc -l <"$api_log" | tr -d ' ')" = "$local_api_calls_before"
 

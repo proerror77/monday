@@ -80,6 +80,34 @@ class GitHubReadOnly
 
   attr_reader :pages
 
+  def self.page_path(path, page)
+    separator = path.include?("?") ? "&" : "?"
+    "#{path}#{separator}per_page=100&page=#{page}"
+  end
+
+  def self.link_relations(header)
+    return {} unless header
+
+    header.split(",").each_with_object({}) do |part, relations|
+      match = part.match(/\A\s*<([^>]+)>;\s*rel="([^"]+)"\s*\z/)
+      raise "invalid pagination Link header" unless match
+
+      match[2].split.each do |relation|
+        raise "duplicate pagination Link relation #{relation}" if relations.key?(relation)
+
+        relations[relation] = api_path(match[1])
+      end
+    end
+  end
+
+  def self.api_path(url)
+    uri = URI(url)
+    raise "pagination link uses unexpected host #{uri.host.inspect}" unless uri.host == "api.github.com"
+
+    path = uri.path.sub(%r{\A/}, "")
+    uri.query ? "#{path}?#{uri.query}" : path
+  end
+
   def initialize(repo)
     unless repo.to_s.match?(/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/)
       raise "invalid repository #{repo.inspect}; expected OWNER/REPO"
@@ -113,7 +141,7 @@ class GitHubReadOnly
   end
 
   def paginate(path, collection_key: nil)
-    request_path = add_page(path, 1)
+    request_path = self.class.page_path(path, 1)
     seen_requests = {}
     seen_objects = {}
     items = []
@@ -142,11 +170,11 @@ class GitHubReadOnly
         items << entry
       end
 
-      next_url = next_link(headers["link"])
-      break if !next_url && (batch.length < 100 || expected_total == items.length)
+      next_path = self.class.link_relations(headers["link"])["next"]
+      break if !next_path && (batch.length < 100 || expected_total == items.length)
 
       page += 1
-      request_path = next_url ? api_path(next_url) : add_page(path, page)
+      request_path = next_path || self.class.page_path(path, page)
     end
 
     if expected_total && items.length != expected_total
@@ -233,7 +261,7 @@ class GitHubReadOnly
       unless status == 304 && headers["etag"] == etag
         raise "capture stability drift: endpoint/header #{page["request"]} changed during readback"
       end
-      @pages << page.merge("phase" => @phase, "status" => status, "etag" => headers["etag"], "last_modified" => headers["last-modified"], "api_version" => headers["x-github-api-version-selected"], "media_type" => headers["x-github-media-type"])
+      @pages << page.merge("phase" => @phase, "status" => status, "etag" => headers["etag"], "last_modified" => headers["last-modified"], "link" => headers["link"], "api_version" => headers["x-github-api-version-selected"], "media_type" => headers["x-github-media-type"])
     end
   end
 
@@ -285,29 +313,6 @@ class GitHubReadOnly
       "media_type" => headers["x-github-media-type"],
       "body_sha256" => Digest::SHA256.hexdigest(Canonical.dump(body))
     }
-  end
-
-  def add_page(path, page)
-    separator = path.include?("?") ? "&" : "?"
-    "#{path}#{separator}per_page=100&page=#{page}"
-  end
-
-  def next_link(header)
-    return unless header
-
-    header.split(",").each do |part|
-      match = part.match(/<([^>]+)>;\s*rel="([^"]+)"/)
-      return match[1] if match && match[2].split.include?("next")
-    end
-    nil
-  end
-
-  def api_path(url)
-    uri = URI(url)
-    raise "pagination link uses unexpected host #{uri.host.inspect}" unless uri.host == "api.github.com"
-
-    path = uri.path.sub(%r{\A/}, "")
-    uri.query ? "#{path}?#{uri.query}" : path
   end
 
   def object_identity(entry)
@@ -508,7 +513,18 @@ def verify_sidecar(bundle, filename)
   actual
 end
 
-def verify_page_inventory!(pages, graphql_media_type, graph, repo)
+def collection_scope(request, repo)
+  path, query = request.split("?", 2)
+  relative = path[%r{\Arepos/#{Regexp.escape(repo)}/(.+)\z}, 1] || path[%r{\Arepositories/[1-9][0-9]*/(.+)\z}, 1]
+  return unless relative
+
+  filters = URI.decode_www_form(query.to_s).reject { |key, _| %w[after before page per_page].include?(key) }.sort
+  [relative, filters]
+rescue ArgumentError
+  nil
+end
+
+def verify_page_inventory!(pages, graphql_media_type, graph, repo, link_provenance:)
   raise "manifest page inventory is empty" unless pages.is_a?(Array) && !pages.empty?
 
   pages.each do |page|
@@ -551,17 +567,18 @@ def verify_page_inventory!(pages, graphql_media_type, graph, repo)
     raise "manifest REST provenance is incomplete"
   end
 
+  collections = []
   paginated = lambda do |path, count, known_total = false|
     page_count = known_total ? [1, (count + 99) / 100].max : count / 100 + 1
-    separator = path.include?("?") ? "&" : "?"
-    (1..page_count).map { |page| "#{path}#{separator}per_page=100&page=#{page}" }
+    start = GitHubReadOnly.page_path(path, 1)
+    collections << [path, start, page_count, collection_scope(start, repo)]
   end
   items = graph.fetch("items")
   expected_rest = []
-  expected_rest.concat(paginated.call("repos/#{repo}/labels", graph.fetch("label_catalog").length))
-  expected_rest.concat(paginated.call("repos/#{repo}/issues?state=all&sort=created&direction=asc", items.length))
-  expected_rest.concat(paginated.call("repos/#{repo}/issues/comments?sort=created&direction=asc", items.sum { |item| item.fetch("comments").length }))
-  expected_rest.concat(paginated.call("repos/#{repo}/issues/events", items.sum { |item| item.fetch("events").length }))
+  paginated.call("repos/#{repo}/labels", graph.fetch("label_catalog").length)
+  paginated.call("repos/#{repo}/issues?state=all&sort=created&direction=asc", items.length)
+  paginated.call("repos/#{repo}/issues/comments?sort=created&direction=asc", items.sum { |item| item.fetch("comments").length })
+  paginated.call("repos/#{repo}/issues/events", items.sum { |item| item.fetch("events").length })
   items.each do |item|
     number = item.fetch("number")
     expected_rest << "repos/#{repo}/issues/#{number}"
@@ -571,14 +588,48 @@ def verify_page_inventory!(pages, graphql_media_type, graph, repo)
     head_sha = pull_request.dig("metadata", "head", "sha")
     expected_rest << "repos/#{repo}/pulls/#{number}"
     %w[commits files reviews].each do |field|
-      expected_rest.concat(paginated.call("repos/#{repo}/pulls/#{number}/#{field}", pull_request.fetch(field).length))
+      paginated.call("repos/#{repo}/pulls/#{number}/#{field}", pull_request.fetch(field).length)
     end
-    expected_rest.concat(paginated.call("repos/#{repo}/pulls/#{number}/comments", pull_request.fetch("review_comments").length))
-    expected_rest.concat(paginated.call("repos/#{repo}/commits/#{head_sha}/check-runs?filter=all", pull_request.dig("check_runs", "total_count"), true))
-    expected_rest.concat(paginated.call("repos/#{repo}/commits/#{head_sha}/statuses", pull_request.fetch("statuses").length))
+    paginated.call("repos/#{repo}/pulls/#{number}/comments", pull_request.fetch("review_comments").length)
+    paginated.call("repos/#{repo}/commits/#{head_sha}/check-runs?filter=all", pull_request.dig("check_runs", "total_count"), true)
+    paginated.call("repos/#{repo}/commits/#{head_sha}/statuses", pull_request.fetch("statuses").length)
   end
+  rest_by_request = rest_pages.to_h { |page| [page.fetch("request"), page] }
+  collection_requests = collections.flat_map do |path, start, page_count, scope|
+    if link_provenance
+      current = start
+      (0...page_count).map do |index|
+        page = rest_by_request.fetch(current) { raise "manifest REST pagination chain is incomplete" }
+        relations = GitHubReadOnly.link_relations(page["link"])
+        raise "manifest REST Link scope is invalid" unless relations.values.all? { |target| collection_scope(target, repo) == scope }
+
+        if index + 1 == page_count
+          raise "manifest REST pagination chain has an extra page" if relations["next"]
+        else
+          current = relations["next"] || GitHubReadOnly.page_path(path, index + 2)
+        end
+        page.fetch("request")
+      end
+    else
+      requests = rest_pages.each_with_object([]) do |page, result|
+        result << page.fetch("request") if collection_scope(page.fetch("request"), repo) == scope
+      end
+      unless requests.length == page_count && requests.include?(start)
+        raise "legacy manifest REST page inventory does not match preflight"
+      end
+      requests
+    end
+  end
+  raise "manifest REST page inventory overlaps collections" unless collection_requests.uniq.length == collection_requests.length
+  expected_rest.concat(collection_requests)
   actual_rest = rest_pages.map { |page| page.fetch("request") }
   raise "manifest REST page inventory does not match preflight" unless actual_rest.sort == expected_rest.sort
+
+  if link_provenance
+    rest_pages.reject { |page| collection_requests.include?(page.fetch("request")) }.each do |page|
+      raise "manifest detail page unexpectedly has Link provenance" if page["link"]
+    end
+  end
 
   graphql_requests = pages.select { |page| page["phase"] == "capture" && page["protocol"] == "graphql" }.map { |page| page.fetch("request") }
   issue_count = items.count { |item| item.fetch("kind") == "issue" }
@@ -606,6 +657,23 @@ def unique_identity_fields?(entries, *fields)
   end
 end
 
+def api_url_path?(url, expected_path)
+  uri = URI(url.to_s)
+  uri.is_a?(URI::HTTPS) && !uri.host.to_s.empty? && uri.path == expected_path
+rescue URI::InvalidURIError
+  false
+end
+
+def issue_object_scope?(object, repo, number)
+  url = object["issue_url"] || object.dig("issue", "url")
+  api_url_path?(url, "/repos/#{repo}/issues/#{number}")
+end
+
+def pull_request_object_scope?(object, repo, number)
+  url = object["pull_request_url"] || object.dig("_links", "pull_request", "href")
+  api_url_path?(url, "/repos/#{repo}/pulls/#{number}")
+end
+
 def validate_graph_and_count(graph, repo)
   unless graph.is_a?(Hash) && graph.keys.sort == %w[items label_catalog repository schema] && graph["schema"] == PREFLIGHT_SCHEMA
     raise "preflight schema is invalid"
@@ -625,6 +693,7 @@ def validate_graph_and_count(graph, repo)
          labels.map { |label| label["name"] }.uniq.length == labels.length
     raise "preflight label catalog is invalid"
   end
+  label_catalog = labels.to_h { |label| [label.fetch("id"), label.fetch("name")] }
 
   numbers = []
   issue_count = 0
@@ -641,12 +710,14 @@ def validate_graph_and_count(graph, repo)
     comments = item["comments"]
     events = item["events"]
     unless metadata.is_a?(Hash) && metadata["number"] == number && metadata.key?("body") &&
+           api_url_path?(metadata["url"], "/repos/#{repo}/issues/#{number}") &&
            %w[open closed].include?(metadata["state"]) && metadata["labels"].is_a?(Array) &&
            metadata["assignees"].is_a?(Array) && metadata["comments"] == comments&.length &&
            unique_identity_fields?(metadata["labels"], "id", "name") &&
+           metadata["labels"].all? { |label| label_catalog[label["id"]] == label["name"] } &&
            unique_identity_fields?(metadata["assignees"], "id", "login") &&
-           unique_identity_fields?(comments, "id") && comments.all? { |comment| (comment.dig("issue", "number") || issue_number_from_url(comment["issue_url"])) == number } &&
-           unique_identity_fields?(events, "id") && events.all? { |event| (event.dig("issue", "number") || issue_number_from_url(event["issue_url"])) == number }
+           unique_identity_fields?(comments, "id") && comments.all? { |comment| issue_object_scope?(comment, repo, number) } &&
+           unique_identity_fields?(events, "id") && events.all? { |event| issue_object_scope?(event, repo, number) }
       raise "preflight item ##{number} metadata is invalid"
     end
     case item["kind"]
@@ -670,18 +741,21 @@ def validate_graph_and_count(graph, repo)
       unless item.keys.sort == %w[comments events issue kind number pull_request] && pull_request.is_a?(Hash) &&
              pull_request.keys.sort == %w[check_runs commits files metadata review_comments reviews statuses] &&
              pull_request["metadata"].is_a?(Hash) && pull_request.dig("metadata", "number") == number &&
+             api_url_path?(pull_request.dig("metadata", "url"), "/repos/#{repo}/pulls/#{number}") &&
              pull_request.dig("metadata", "head", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
              pull_request.dig("metadata", "base", "sha").to_s.match?(/\A[0-9a-f]{40}\z/i) &&
              unique_identity_fields?(pull_request["commits"], "sha") && pull_request["commits"].all? { |commit| commit["sha"].match?(/\A[0-9a-f]{40}\z/i) } &&
+             pull_request["commits"].any? { |commit| commit["sha"] == pull_request.dig("metadata", "head", "sha") } &&
              unique_identity_fields?(pull_request["files"], "filename") &&
-             unique_identity_fields?(pull_request["reviews"], "id") &&
-             unique_identity_fields?(pull_request["review_comments"], "id") &&
-             unique_identity_fields?(pull_request["statuses"], "id") &&
+             unique_identity_fields?(pull_request["reviews"], "id") && pull_request["reviews"].all? { |review| pull_request_object_scope?(review, repo, number) } &&
+             unique_identity_fields?(pull_request["review_comments"], "id") && pull_request["review_comments"].all? { |comment| pull_request_object_scope?(comment, repo, number) } &&
+             unique_identity_fields?(pull_request["statuses"], "id") && pull_request["statuses"].all? { |status| status["sha"] == pull_request.dig("metadata", "head", "sha") } &&
              pull_request["commits"].length == pull_request.dig("metadata", "commits") &&
              pull_request["files"].length == pull_request.dig("metadata", "changed_files") &&
              pull_request["review_comments"].length == pull_request.dig("metadata", "review_comments") &&
              pull_request["check_runs"].is_a?(Hash) && pull_request["check_runs"].keys.sort == %w[check_runs total_count] &&
              unique_identity_fields?(pull_request.dig("check_runs", "check_runs"), "id") &&
+             pull_request.dig("check_runs", "check_runs").all? { |run| run["head_sha"] == pull_request.dig("metadata", "head", "sha") } &&
              pull_request.dig("check_runs", "total_count") == pull_request.dig("check_runs", "check_runs").length
         raise "preflight PR ##{number} schema is invalid"
       end
@@ -742,8 +816,16 @@ def verify_bundle(bundle, repo, controller)
          !api["graphql_media_type"].to_s.empty?
     raise "manifest API provenance is invalid"
   end
+  pages = manifest.fetch("pages")
+  link_provenance = pages.is_a?(Array) && pages.all? { |page| page.is_a?(Hash) && page.key?("link") }
+  if pages.is_a?(Array)
+    has_link = pages.any? { |page| page.is_a?(Hash) && page.key?("link") }
+    raise "manifest page Link provenance is inconsistent" if has_link && !link_provenance
+
+    manifest["pages"] = pages.map { |page| page.is_a?(Hash) && !page.key?("link") ? page.merge("link" => nil) : page }
+  end
   counts = validate_graph_and_count(graph, repo)
-  verify_page_inventory!(manifest.fetch("pages"), api.fetch("graphql_media_type"), graph, repo)
+  verify_page_inventory!(manifest.fetch("pages"), api.fetch("graphql_media_type"), graph, repo, link_provenance: link_provenance)
   raise "manifest counts do not match preflight" unless manifest["counts"] == counts
 
   repository = graph.fetch("repository")
@@ -752,7 +834,7 @@ def verify_bundle(bundle, repo, controller)
          manifest["preflight"] == { "file" => "preflight.json", "sha256" => preflight_sha }
     raise "manifest preflight identity is invalid"
   end
-  [graph, manifest]
+  [graph, manifest, link_provenance]
 rescue Errno::EACCES, Errno::ENOENT => error
   raise "bundle read failed: #{error.message}"
 end
@@ -795,15 +877,17 @@ def verify(options)
   raise "--controller NAME is required" if controller.to_s.strip.empty?
   raise "--bundle DIR is required" if bundle.to_s.empty?
 
-  graph, manifest = verify_bundle(bundle, repo, controller)
+  graph, manifest, link_provenance = verify_bundle(bundle, repo, controller)
   if options[:live]
     live_graph, live_counts, live_branch, live_branch_sha, live_pages = capture_graph(repo)
+    verify_page_inventory!(live_pages, manifest.dig("api", "graphql_media_type"), live_graph, repo, link_provenance: true)
     raise "live verification drift: Issue/PR graph changed" unless Canonical.value(live_graph) == Canonical.value(graph)
     raise "live verification drift: counts changed" unless live_counts == manifest["counts"]
     unless live_branch == manifest["default_branch"] && live_branch_sha == manifest["default_branch_sha"]
       raise "live verification drift: default branch changed"
     end
-    unless Canonical.value(live_pages) == Canonical.value(manifest["pages"])
+    comparison_pages = link_provenance ? live_pages : live_pages.map { |page| page.merge("link" => nil) }
+    unless Canonical.value(comparison_pages) == Canonical.value(manifest["pages"])
       raise "live verification drift: page/header inventory changed"
     end
   end
