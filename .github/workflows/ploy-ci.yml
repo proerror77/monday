@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: prediction-markets-${{ github.ref }}
+  group: prediction-markets-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
