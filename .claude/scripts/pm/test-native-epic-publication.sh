@@ -163,12 +163,66 @@ parallel_category_block=$(awk '
   /^Consolidate results from parallel agents:/ { exit }
   capture { print }
 ' "$epic_sync")
+parallel_category_guard=$(awk '
+  /# BATCH_CATEGORY_GUARD_START/ { capture=1; next }
+  /# BATCH_CATEGORY_GUARD_END/ { exit }
+  capture {
+    sub(/^    /, "")
+    print
+  }
+' "$epic_sync")
+if [ -z "$parallel_category_guard" ]; then
+  echo "parallel batch category guard is missing" >&2
+  exit 1
+fi
 # shellcheck disable=SC2016
 printf '%s\n' "$parallel_category_block" | grep -Fq \
-  'category=$(.claude/scripts/pm/read-issue-category.sh'
+  'batch_category=$(.claude/scripts/pm/read-issue-category.sh'
 # shellcheck disable=SC2016
 printf '%s\n' "$parallel_category_block" | grep -Fq -- \
   '--label "$category,needs-triage"'
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_guard" | grep -Fq \
+  'if [ "$batch_category" != "$issue_category" ]; then'
+# shellcheck disable=SC2016
+printf '%s\n' "$parallel_category_guard" | grep -Fq \
+  'category="$issue_category"'
+mkdir -p "$scratch/batch-bin"
+batch_guard_log="$scratch/batch-gh.log"
+cat > "$scratch/batch-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$BATCH_GH_LOG"
+EOF
+chmod +x "$scratch/batch-bin/gh"
+cat > "$scratch/batch-guard.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+issue_category=bug
+ARGUMENTS=feature
+$parallel_category_guard
+gh issue create --title should-not-run
+gh issue edit 500 --add-label should-not-run
+EOF
+chmod +x "$scratch/batch-guard.sh"
+sed 's/^category: bug$/category: enhancement/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/mismatched-epic.md"
+mv "$scratch/mismatched-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
+if (
+  cd "$scratch/project"
+  BATCH_GH_LOG="$batch_guard_log" PATH="$scratch/batch-bin:$PATH" \
+    bash "$scratch/batch-guard.sh"
+) > /dev/null 2>&1; then
+  echo "parallel batch accepted a changed epic category" >&2
+  exit 1
+fi
+if [ -s "$batch_guard_log" ]; then
+  echo "parallel batch category failure mutated GitHub" >&2
+  exit 1
+fi
+sed 's/^category: enhancement$/category: bug/' \
+  "$scratch/project/.claude/epics/feature/epic.md" > "$scratch/bug-epic.md"
+mv "$scratch/bug-epic.md" "$scratch/project/.claude/epics/feature/epic.md"
 mkdir -p "$scratch/project/.claude/prds"
 cat > "$scratch/project/.claude/prds/feature.md" <<'EOF'
 ---

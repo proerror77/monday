@@ -302,9 +302,19 @@ Task:
     Parent epic issue: #$epic_number
     Scratch root: $epic_sync_tmp/batch-{X}
 
-    Before processing tasks, read the exact category into the batch agent:
-    category=$(.claude/scripts/pm/read-issue-category.sh ".claude/epics/$ARGUMENTS/epic.md")
-    Stop if this read fails; never infer or default the category.
+    The controller captured this category before publication: issue_category=$issue_category
+    Before processing tasks, execute the following guard before any lookup or mutation:
+    # BATCH_CATEGORY_GUARD_START
+    if ! batch_category=$(.claude/scripts/pm/read-issue-category.sh ".claude/epics/$ARGUMENTS/epic.md"); then
+      echo "❌ Could not read the epic category in the publication batch" >&2
+      exit 1
+    fi
+    if [ "$batch_category" != "$issue_category" ]; then
+      echo "❌ Epic category changed during publication" >&2
+      exit 1
+    fi
+    category="$issue_category"
+    # BATCH_CATEGORY_GUARD_END
     
     Tasks to process:
     - {list of 3-4 task files}
