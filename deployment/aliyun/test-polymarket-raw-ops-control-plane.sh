@@ -121,7 +121,7 @@ supervisor_source=$(printf 'b%.0s' {1..40})
 supervisor_invocation=$(printf '1%.0s' {1..32})
 mkdir -p "$supervisor_fake_bin" "$supervisor_control_dir" \
   "$supervisor_root/etc/systemd/system" \
-  "$supervisor_root/run/monday" \
+  "$supervisor_root/run/monday" "$supervisor_root/opt/monday/bin" \
   "$supervisor_root/data/monday/evidence"
 cp "$GATE_CONTROL" "$supervisor_control"
 cp "$GATE_UNIT" "$supervisor_control_dir/${GATE_UNIT##*/}"
@@ -138,10 +138,32 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$supervisor_candidate"
 chmod 0755 "$supervisor_candidate"
 supervisor_candidate_sha=$(sha256sum "$supervisor_candidate" | awk '{print $1}')
 supervisor_unit="polymarket-raw-ops-gate@${supervisor_candidate_sha}.service"
+supervisor_baseline="$supervisor_root/opt/monday/bin/polymarket-raw-ops"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$supervisor_baseline"
+chmod 0755 "$supervisor_baseline"
+supervisor_baseline_sha=$(sha256sum "$supervisor_baseline" | awk '{print $1}')
+supervisor_probe_root="$supervisor_root/data/monday/evidence/polymarket-candidate-probes/$supervisor_candidate_sha"
+mkdir -p "$supervisor_probe_root"
+supervisor_probe="$supervisor_probe_root/gamma-tagged-500.json"
+jq -n --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
+  --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+  {schema:"monday.polymarket_gamma_tagged_500_recovery_probe.v1",
+   candidate_sha256:$candidate,source_revision:$source,observed_at:$observed_at,
+   gamma:{tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:500},
+          untagged_closed:{query:"closed=true",attempts:3,http_status:200}},
+   candidate_once:{exit_status:0,duration_seconds:23,health_updated_at:$observed_at}}
+' >"$supervisor_probe"
 mkdir "$supervisor_state"
 printf 'inactive\n' >"$supervisor_state/active"
 printf '%s\n' "$supervisor_invocation" >"$supervisor_state/invocation"
 printf 'inactive\n' >"$supervisor_state/shadow"
+printf 'inactive\n' >"$supervisor_state/baseline-active"
+printf '0\n' >"$supervisor_state/baseline-main-pid"
+printf '2\n' >"$supervisor_state/baseline-restarts"
+printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
+printf '%s\n' '/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200' \
+  >"$supervisor_state/baseline-exec"
+printf 'inactive\n' >"$supervisor_state/uploader-active"
 : >"$supervisor_calls"
 : >"$supervisor_gate_calls"
 
@@ -154,6 +176,20 @@ write_state() { printf '%s\n' "$2" >"$FAKE_SYSTEMCTL_STATE/$1"; }
 
 printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_CALLS"
 case "${1:-}" in
+  is-active)
+    [[ ${2:-} == --quiet && $# -eq 3 ]] || exit 2
+    unit=${3:-}
+    case "$unit" in
+      polymarket-reference-collector.service)
+        [[ $(read_state baseline-active) == active ]]
+        ;;
+      polymarket-reference-upload.service|polymarket-reference-upload.timer|\
+      polymarket-market-tape-upload.service|polymarket-market-tape-upload.timer)
+        [[ $(read_state uploader-active) == active ]]
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
   daemon-reload)
     [[ $# -eq 1 ]] || exit 2
     ;;
@@ -198,19 +234,48 @@ case "${1:-}" in
       ActiveState)
         if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
           read_state shadow
+        elif [[ $unit == polymarket-reference-collector.service ]]; then
+          read_state baseline-active
+        elif [[ $unit == polymarket-reference-upload.service \
+          || $unit == polymarket-reference-upload.timer \
+          || $unit == polymarket-market-tape-upload.service \
+          || $unit == polymarket-market-tape-upload.timer ]]; then
+          read_state uploader-active
         else
           read_state active
         fi
         ;;
-      InvocationID) read_state invocation ;;
+      InvocationID)
+        if [[ $unit == polymarket-reference-collector.service ]]; then
+          read_state baseline-invocation
+        else
+          read_state invocation
+        fi
+        ;;
       MainPID)
         if [[ $unit == polymarket-reference-collector-shadow@* ]]; then
           [[ $(read_state shadow) == active ]] && printf '5252\n' || printf '0\n'
+        elif [[ $unit == polymarket-reference-collector.service ]]; then
+          read_state baseline-main-pid
         else
           [[ $(read_state active) == active ]] && printf '4242\n' || printf '0\n'
         fi
         ;;
-      FragmentPath) printf '/etc/systemd/system/polymarket-raw-ops-gate@.service\n' ;;
+      NRestarts)
+        [[ $unit == polymarket-reference-collector.service ]] || exit 2
+        read_state baseline-restarts
+        ;;
+      ExecStart)
+        [[ $unit == polymarket-reference-collector.service ]] || exit 2
+        printf 'argv[]=%s;\n' "$(read_state baseline-exec)"
+        ;;
+      FragmentPath)
+        if [[ $unit == polymarket-reference-collector.service ]]; then
+          printf '/etc/systemd/system/polymarket-reference-collector.service\n'
+        else
+          printf '/etc/systemd/system/polymarket-raw-ops-gate@.service\n'
+        fi
+        ;;
       DropInPaths) printf '\n' ;;
       *) exit 2 ;;
     esac
@@ -365,16 +430,178 @@ ln -s "$supervisor_control_dir/${GATE_UNIT##*/}" "$installed_supervisor_unit"
 reject gate_control install
 rm "$installed_supervisor_unit"
 gate_control install >/dev/null
+
+# A recovery admission is not a generic gate bypass: it starts only with the
+# stopped direct bootstrap identity, a fresh exact candidate probe, and every
+# uploader/timer contained.
+supervisor_recovery_gate_invocation=$(printf '9%.0s' {1..32})
+set_supervisor_state invocation "$supervisor_recovery_gate_invocation"
+set_supervisor_state active inactive
+set_supervisor_state baseline-active inactive
+set_supervisor_state uploader-active inactive
+gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe" >"$supervisor_tmp/recover-start.json"
+jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
+  .phase == "running" and .systemd_invocation_id == $invocation
+' "$supervisor_tmp/recover-start.json" >/dev/null
+supervisor_recovery_request="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_recovery_gate_invocation/request.json"
+jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
+  --arg baseline "$supervisor_baseline_sha" '
+  .recovery.mode == "gamma_tagged_500"
+  and .recovery.candidate_probe.candidate_sha256 == $candidate
+  and .recovery.candidate_probe.source_revision == $source
+  and .recovery.baseline.binary_sha256 == $baseline
+  and .recovery.baseline.active_state == "inactive"
+  and .recovery.baseline.main_pid == 0
+' "$supervisor_recovery_request" >/dev/null
+gate_control cancel "$supervisor_candidate_sha" "$supervisor_recovery_gate_invocation" >/dev/null
+
+set_supervisor_state active inactive
+set_supervisor_state baseline-active active
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+set_supervisor_state baseline-active inactive
+set_supervisor_state uploader-active active
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+set_supervisor_state uploader-active inactive
+set_supervisor_state baseline-exec '/opt/monday/bin/not-polymarket-raw-ops collect-reference'
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+set_supervisor_state baseline-exec '/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+jq '.observed_at = "1970-01-01T00:00:00Z"' "$supervisor_probe" >"$supervisor_probe.stale"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe.stale"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe_root/missing.json"
+jq --arg wrong_candidate "$(printf 'f%.0s' {1..64})" \
+  '.candidate_sha256 = $wrong_candidate' "$supervisor_probe" >"$supervisor_probe.wrong-candidate"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe.wrong-candidate"
+recovery_mutations=$(grep -E \
+  '^(start|stop|restart|enable|disable) (polymarket-reference-collector[.]service|polymarket-reference-upload[.](service|timer)|polymarket-market-tape-upload[.](service|timer))$' \
+  "$supervisor_calls" || true)
+if [[ -n $recovery_mutations ]]; then
+  printf 'recovery admission mutated the contained baseline: %s\n' \
+    "$recovery_mutations" >&2
+  exit 1
+fi
+
+# A fresh probe admits once; its binding remains valid through the 900-second Gate.
+recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
+sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE" >"$recovery_binding_contract"
+sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
+sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
+(
+  set -euo pipefail
+  RUST_ACTIVE_BINARY="$supervisor_baseline" LEGACY_UNIT=polymarket-reference-collector.service
+  supervisor_baseline_invocation=$(<"$supervisor_state/baseline-invocation")
+  recovery_active_state=inactive recovery_fragment=/etc/systemd/system/polymarket-reference-collector.service
+  recovery_drop_ins='' recovery_exec='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+  recovery_restarts=2 recovery_invocation=$supervisor_baseline_invocation recovery_binary_sha=$supervisor_baseline_sha
+  recovery_binary_secure=true
+  recovery=$(jq -c .recovery "$supervisor_recovery_request")
+  recovery_observed_epoch=1000 recovery_now=$recovery_observed_epoch
+  date() {
+    [[ $1 == -u ]] || { command date "$@"; return; }
+    case "$2" in -d) printf '%s\n' "$recovery_observed_epoch" ;; +%s) printf '%s\n' "$recovery_now" ;; *) command date "$@" ;; esac
+  }
+  systemctl() {
+    case "$*" in
+      *ActiveState*) printf '%s\n' "$recovery_active_state" ;; *MainPID*) printf '0\n' ;;
+      *FragmentPath*) printf '%s\n' "$recovery_fragment" ;;
+      *DropInPaths*) printf '%s\n' "$recovery_drop_ins" ;; *NRestarts*) printf '%s\n' "$recovery_restarts" ;;
+      *InvocationID*) printf '%s\n' "$recovery_invocation" ;; *) return 1 ;;
+    esac
+  }
+  effective_exec_argv() { printf '%s\n' "$recovery_exec"; }
+  secure_control_file() { [[ $recovery_binary_secure == true ]]; }
+  sha256sum() { printf '%s  %s\n' "$recovery_binary_sha" "$1"; }
+  # shellcheck source=/dev/null
+  source "$recovery_binding_contract"
+  verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_now=$((recovery_observed_epoch + 901))
+  if verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery admission accepted a stale probe\n' >&2; exit 1
+  fi
+  verify_contained_recovery_baseline "$recovery" "$supervisor_candidate_sha" "$supervisor_source" || {
+    printf 'recovery identity check aged a valid Gate probe\n' >&2; exit 1
+  }
+  recovery_binary_secure=false
+  if verify_contained_recovery_baseline "$recovery" "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery identity check accepted an insecure baseline binary\n' >&2; exit 1
+  fi
+  recovery_binary_secure=true
+  for recovery_drift in active fragment drop_ins exec restarts invocation binary; do
+    recovery_active_state=inactive recovery_fragment=/etc/systemd/system/polymarket-reference-collector.service
+    recovery_drop_ins='' recovery_exec='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+    recovery_restarts=2 recovery_invocation=$supervisor_baseline_invocation recovery_binary_sha=$supervisor_baseline_sha
+    case "$recovery_drift" in
+      active) recovery_active_state=active ;; fragment) recovery_fragment=/tmp/wrong.service ;;
+      drop_ins) recovery_drop_ins=/etc/systemd/system/recovery.conf ;;
+      exec) recovery_exec='/opt/monday/bin/not-polymarket-raw-ops collect-reference' ;;
+      restarts) recovery_restarts=3 ;; invocation) recovery_invocation=$(printf 'b%.0s' {1..32}) ;;
+      binary) recovery_binary_sha=$(printf 'c%.0s' {1..64}) ;;
+    esac
+    if verify_contained_recovery_baseline "$recovery" "$supervisor_candidate_sha" "$supervisor_source"; then
+      printf 'recovery identity check accepted %s drift\n' "$recovery_drift" >&2; exit 1
+    fi
+  done
+)
+: >"$supervisor_calls"
+
+# Normal Gate requests intentionally omit recovery metadata. Both consumers
+# must preserve literal null rather than turning that optional value into a
+# jq failure.
+normal_optional_gate_contract="$supervisor_tmp/normal-optional-gate.sh"
+sed -n '/^recovery_json=$(jq -c.*\.recovery \/\/ null/,/^legacy_pid=0$/p' \
+  "$GATE" >"$normal_optional_gate_contract"
+normal_optional_cutover_contract="$supervisor_tmp/normal-optional-cutover.sh"
+sed -n '/^recovery_json=$(jq -c.*\.recovery \/\/ null/,/^contained_recovery=false$/p' \
+  "$CUTOVER" >"$normal_optional_cutover_contract"
+[[ -s $normal_optional_gate_contract && -s $normal_optional_cutover_contract ]] || {
+  printf 'optional recovery consumers are missing\n' >&2
+  exit 1
+}
+normal_optional_dir="$supervisor_tmp/normal-optional"
+mkdir "$normal_optional_dir"
+printf '%s\n' '{"schema":"monday.polymarket_gate_request.v1"}' \
+  >"$normal_optional_dir/request.json"
+if ! (
+  set -euo pipefail
+  MONDAY_POLYMARKET_GATE_INVOCATION_DIR="$normal_optional_dir"
+  die() { exit 77; }
+  # shellcheck source=/dev/null
+  source "$normal_optional_gate_contract"
+  [[ $recovery_json == null && $legacy_pid == 0 ]]
+); then
+  printf 'normal Gate request rejected an absent recovery binding\n' >&2
+  exit 1
+fi
+if ! (
+  set -euo pipefail
+  gate_json="$normal_optional_dir/request.json"
+  die() { exit 77; }
+  # shellcheck source=/dev/null
+  source "$normal_optional_cutover_contract"
+  [[ $recovery_json == null && $contained_recovery == false ]]
+); then
+  printf 'normal cutover rejected an absent recovery binding\n' >&2
+  exit 1
+fi
+
+supervisor_starts_before_normal=$(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true)
 start_supervisor "$supervisor_invocation" >"$supervisor_tmp/start.json"
 jq -e --arg unit "$supervisor_unit" --arg invocation "$supervisor_invocation" '
   .unit == $unit and .systemd_invocation_id == $invocation
   and .phase == "running" and .terminal_state == null' \
   "$supervisor_tmp/start.json" >/dev/null
-[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+supervisor_starts_after_normal=$(grep -Fxc "start $supervisor_unit" "$supervisor_calls")
+[[ $supervisor_starts_after_normal -eq $((supervisor_starts_before_normal + 1)) ]]
 assert_running_status "$supervisor_invocation"
 reject gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source"
-[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == 1 ]]
+[[ $(grep -Fxc "start $supervisor_unit" "$supervisor_calls") == "$supervisor_starts_after_normal" ]]
 if env "${gate_control_env[@]}" INVOCATION_ID="$supervisor_invocation" \
   FAKE_GATE_EXIT=17 "$supervisor_control" run "$supervisor_candidate_sha" \
   >/dev/null 2>&1; then
@@ -1403,8 +1630,8 @@ exercise_rust_bootstrap_identity() (
 exercise_rust_bootstrap_identity
 
 bootstrap_baseline_selection="$tmp_dir/bootstrap-baseline-selection.sh"
-sed -n '/^baseline_exec=$(effective_exec_argv/,/^baseline_health_start_required=false$/p' \
-  "$GATE" >"$bootstrap_baseline_selection"
+sed -n '/^  baseline_exec=$(effective_exec_argv/,/^  esac$/p' "$GATE" \
+  | sed 's/^  //' >"$bootstrap_baseline_selection"
 (
   set -euo pipefail
   LEGACY_UNIT=polymarket-reference-collector.service
@@ -1424,8 +1651,8 @@ sed -n '/^baseline_exec=$(effective_exec_argv/,/^baseline_health_start_required=
 )
 
 bootstrap_health_admission="$tmp_dir/bootstrap-health-admission.sh"
-sed -n '/^baseline_health_start_required=false$/,/^fi$/p' "$GATE" \
-  >"$bootstrap_health_admission"
+sed -n '/^  elif \[\[ \$baseline_mode == rust_bootstrap \]\]; then$/,/^  fi$/p' \
+  "$GATE" | sed '1d; $d; s/^    //' >"$bootstrap_health_admission"
 (
   set -euo pipefail
   baseline_mode=rust_bootstrap
@@ -1789,7 +2016,7 @@ cutover_state_handoff_line=$(grep -n \
 cutover_apply_handoff_line=$(grep -n \
   '^apply_legacy_state_handoff "$LEGACY_STATE" "$evidence_dir"' \
   "$CUTOVER" | cut -d: -f1)
-cutover_stop_collector_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' \
+cutover_stop_collector_line=$(grep -n '^[[:space:]]*systemctl stop "$COLLECTOR_UNIT"$' \
   "$CUTOVER" | tail -1 | cut -d: -f1)
 cutover_start_rust_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' \
   "$CUTOVER" | tail -1 | cut -d: -f1)
@@ -3814,6 +4041,65 @@ jq -e -f "$POLICY" "$tmp_dir/rust-bootstrap-gate.json" >/dev/null || {
   printf 'gate policy rejected a bounded Rust bootstrap recovery\n' >&2
   exit 1
 }
+jq '
+  .baseline_mode = "rust_bootstrap"
+  | .baseline_degraded = true
+  | .baseline_health_start_required = false
+  | .baseline_runtime_stability_required = false
+  | .baseline_health_completion_required = false
+  | .baseline_health_snapshot = null
+  | .baseline_health_completion_snapshot = null
+  | .baseline_health_start_success_unix = null
+  | .baseline_health_cutoff_unix = null
+  | .baseline_health_start_written_at_unix = null
+  | .baseline_health_completion_written_at_unix = null
+  | .baseline_health_start_file_identity = null
+  | .baseline_health_completion_file_identity = null
+  | .legacy_runtime = null
+  | .recovery = {
+      mode:"gamma_tagged_500",
+      baseline:{
+        active_state:"inactive",main_pid:0,
+        exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
+        fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
+        drop_in_paths:[],restarts:2,invocation_id:("2" * 32),
+        binary_path:"/opt/monday/bin/polymarket-raw-ops",
+        binary_sha256:(if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
+      },
+      candidate_probe:{
+        schema:"monday.polymarket_gamma_tagged_500_recovery_probe.v1",
+        candidate_sha256:.candidate_sha256,
+        source_revision:.deployment_source_revision,sha256:("3" * 64),
+        observed_at:"2026-07-15T00:00:01Z",
+        gamma:{
+          tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:500},
+          untagged_closed:{query:"closed=true",attempts:3,http_status:200}
+        },
+        candidate_once:{exit_status:0,duration_seconds:23,
+          health_updated_at:"2026-07-15T00:00:01Z"}
+      }
+    }
+' "$tmp_dir/rust-bootstrap-gate.json" >"$tmp_dir/contained-recovery-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/contained-recovery-gate.json" >/dev/null || {
+  printf 'gate policy rejected a verified contained bootstrap recovery\n' >&2
+  exit 1
+}
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/contained-recovery-gate.json" \
+    >"$tmp_dir/contained-recovery-$name.json"
+  if jq -e -f "$POLICY" "$tmp_dir/contained-recovery-$name.json" >/dev/null; then
+    printf 'contained recovery policy accepted %s drift\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+candidate_binding|.recovery.candidate_probe.candidate_sha256 = (if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
+source_binding|.recovery.candidate_probe.source_revision = (if .deployment_source_revision == ("0" * 40) then ("1" * 40) else ("0" * 40) end)
+baseline_active|.recovery.baseline.active_state = "active"
+runtime_stability|.baseline_runtime_stability_required = true
+missing_recovery|.recovery = null
+baseline_is_candidate|.recovery.baseline.binary_sha256 = .candidate_sha256
+legacy_runtime_present|.legacy_runtime = {exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference"}
+EOF
 jq '.metrics.legacy_metadata_count = 1' "$tmp_dir/rust-bootstrap-gate.json" \
   >"$tmp_dir/rust-bootstrap-metadata-only-gate.json"
 jq -e -f "$POLICY" "$tmp_dir/rust-bootstrap-metadata-only-gate.json" >/dev/null || {
@@ -4677,6 +4963,31 @@ grep -Fq 'NRestarts' "$CUTOVER"
 [[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$CUTOVER") -eq 3 ]]
 grep -Fq 'invocation_id:$rust_invocation_id' "$CUTOVER"
 grep -Fq 'verify_shadow_identity' "$GATE"
+grep -Fq 'verify_contained_bootstrap_recovery "$recovery_json" "$candidate_sha"' "$CUTOVER"
+grep -Fq 'contained recovery rollback would restart a saved baseline unit' "$CUTOVER"
+grep -Fq 'contained recovery rollback restarted a collector or uploader' "$CUTOVER"
+contained_recovery_guard_line=$(grep -nF \
+  'contained recovery rollback would restart a saved baseline unit' "$CUTOVER" \
+  | head -1 | cut -d: -f1 || true)
+contained_recovery_health_label_line=$(grep -nF \
+  '"pre-contained-recovery-rollback-' \
+  "$CUTOVER" | head -1 | cut -d: -f1 || true)
+restore_stop_line=$(grep -nF \
+  'systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"' "$CUTOVER" \
+  | head -1 | cut -d: -f1 || true)
+[[ $contained_recovery_guard_line =~ ^[1-9][0-9]*$ \
+  && $contained_recovery_health_label_line =~ ^[1-9][0-9]*$ \
+  && $restore_stop_line =~ ^[1-9][0-9]*$ \
+  && $contained_recovery_guard_line -lt $contained_recovery_health_label_line \
+  && $contained_recovery_health_label_line -lt $restore_stop_line ]] || {
+  printf 'contained recovery rollback mutates before validating or clearing health\n' >&2
+  exit 1
+}
+[[ $(sed -n "$((contained_recovery_health_label_line - 1))p" "$CUTOVER") \
+  == *'clear_health_before_restart "$evidence_dir"'* ]] || {
+  printf 'contained recovery rollback does not clear the candidate health file\n' >&2
+  exit 1
+}
 grep -Fq 'health_advanced=true' "$CUTOVER"
 grep -Fq 'updated_epoch >= started_epoch' "$CUTOVER"
 grep -Fq 'gate_legacy_pid' "$CUTOVER"
@@ -4716,9 +5027,10 @@ release_move_line=$(grep -n '^  mv "$staging" "$release_dir"$' "$GATE" \
   exit 1
 }
 
-cutover_stop_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' "$CUTOVER" | cut -d: -f1)
+cutover_stop_line=$(grep -n '^[[:space:]]*systemctl stop "$COLLECTOR_UNIT"$' \
+  "$CUTOVER" | tail -1 | cut -d: -f1)
 cutover_legacy_promotion="$tmp_dir/cutover-legacy-promotion.sh"
-sed -n '/^# Cutover depends on the current gate bundle/,/^systemctl stop "$COLLECTOR_UNIT"$/p' \
+sed -n '/^# Cutover depends on the current gate bundle/,/^[[:space:]]*systemctl stop "$COLLECTOR_UNIT"$/p' \
   "$CUTOVER" >"$cutover_legacy_promotion"
 cutover_legacy_promotion_joined="$tmp_dir/cutover-legacy-promotion-joined.sh"
 join_shell_continuations "$cutover_legacy_promotion" \
@@ -4752,21 +5064,21 @@ if grep -Fq 'verify_fresh_legacy_runtime' "$cutover_legacy_rollback"; then
 fi
 legacy_drain_line=$(grep -n '^[[:space:]]*verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
   | head -1 | cut -d: -f1)
-legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
+legacy_cursor_line=$(grep -n '^[[:space:]]*legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
   "$CUTOVER" | cut -d: -f1)
 legacy_final_runtime_line=$(grep -n \
-  '^verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
+  '^[[:space:]]*verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
   "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 legacy_final_oss_line=$(grep -n \
   'OSS configuration changed during the legacy uploader drain' "$CUTOVER" \
   | cut -d: -f1)
-legacy_journal_guard_line=$(grep -n '^verify_no_restart_after_cursor' "$CUTOVER" \
+legacy_journal_guard_line=$(grep -n '^[[:space:]]*verify_no_restart_after_cursor' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
-legacy_stopped_counter_line=$(grep -n '^stopped_legacy_restarts=' "$CUTOVER" \
+legacy_stopped_counter_line=$(grep -n '^[[:space:]]*stopped_legacy_restarts=' "$CUTOVER" \
   | cut -d: -f1)
 legacy_stopped_equality_line=$(grep -n \
-  '^\[\[ \$stopped_legacy_restarts == "\$gate_legacy_restarts" \]\]' "$CUTOVER" \
+  '^[[:space:]]*\[\[ \$stopped_legacy_restarts == "\$gate_legacy_restarts" \]\]' "$CUTOVER" \
   | cut -d: -f1)
 cutover_clear_line=$(grep -n '^clear_health_before_restart "$evidence_dir" pre-cutover$' \
   "$CUTOVER" | cut -d: -f1)

@@ -952,17 +952,66 @@ verify_bootstrap_rust_runtime() {
   [[ $cmdline == "$RUST_EXEC " ]]
 }
 
+verify_contained_bootstrap_recovery() {
+  local recovery=$1 candidate_sha=$2 source_revision=$3 baseline
+  local active_state main_pid fragment drop_ins exec_argv restarts invocation binary_sha unit
+  jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
+    .mode == "gamma_tagged_500"
+    and .candidate_probe.schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    and .candidate_probe.candidate_sha256 == $candidate
+    and .candidate_probe.source_revision == $source
+    and (.candidate_probe.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and .baseline.active_state == "inactive"
+    and .baseline.main_pid == 0
+    and .baseline.exec_start == "/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+    and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
+    and .baseline.drop_in_paths == []
+    and (.baseline.restarts | type == "number" and floor == . and . >= 0)
+    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
+    and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and .baseline.binary_sha256 != $candidate
+  ' <<<"$recovery" >/dev/null || return 1
+  baseline=$(jq -c .baseline <<<"$recovery") || return 1
+  active_state=$(systemctl show --property=ActiveState --value "$COLLECTOR_UNIT") || return 1
+  main_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT") || return 1
+  [[ $active_state == $(jq -er .active_state <<<"$baseline") && $main_pid == 0 ]] \
+    || return 1
+  fragment=$(systemctl show --property=FragmentPath --value "$COLLECTOR_UNIT") || return 1
+  drop_ins=$(systemctl show --property=DropInPaths --value "$COLLECTOR_UNIT") || return 1
+  exec_argv=$(effective_exec_argv "$COLLECTOR_UNIT") || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") || return 1
+  invocation=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT") || return 1
+  [[ $fragment == $(jq -er .fragment_path <<<"$baseline") && -z $drop_ins \
+    && $exec_argv == $(jq -er .exec_start <<<"$baseline") \
+    && $restarts == $(jq -er .restarts <<<"$baseline") \
+    && $invocation == $(jq -er .invocation_id <<<"$baseline") ]] || return 1
+  [[ -f $ACTIVE_BINARY && ! -L $ACTIVE_BINARY && -x $ACTIVE_BINARY ]] || return 1
+  secure_regular_file "$ACTIVE_BINARY" || return 1
+  binary_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}') || return 1
+  [[ $binary_sha == $(jq -er .binary_sha256 <<<"$baseline") ]] || return 1
+  for unit in "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER" \
+    "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
+    [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
+  done
+}
+
 snapshot_legacy() {
   local rollback_dir=$1 baseline_mode=${2:-legacy_python}
   local baseline_release_path=${3:-} baseline_release_sha=${4:-} candidate_sha=${5:-}
+  local contained_recovery=${6:-false}
   local state_json=$rollback_dir/state.json asset enabled active mode snapshot_asset
   local control_present=false control_assets control_files
   install -d -m 0750 "$rollback_dir/systemd" "$rollback_dir/bin" \
     "$rollback_dir/config" "$rollback_dir/control"
   secure_root_chain "$rollback_dir" \
     || die 'rollback snapshot directory chain is not trusted'
+  [[ $contained_recovery == true || $contained_recovery == false ]] \
+    || die 'rollback snapshot has an invalid recovery state'
   jq -n --arg baseline_mode "$baseline_mode" --arg candidate_sha "$candidate_sha" \
-    '{baseline_mode:$baseline_mode,candidate_sha256:$candidate_sha}' >"$state_json"
+    --argjson contained_recovery "$contained_recovery" \
+    '{baseline_mode:$baseline_mode,candidate_sha256:$candidate_sha,
+      contained_recovery:$contained_recovery}' >"$state_json"
   for asset in "${UNIT_ASSETS[@]}"; do
     secure_regular_file "/etc/systemd/system/$asset"
     mode=$(stat -c %a -- "/etc/systemd/system/$asset")
@@ -1060,6 +1109,7 @@ restore_legacy() (
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts rollback_mode
   local rollback_sha temporary_link previous_health_sha current_health_sha
   local bootstrap_path bootstrap_sha bootstrap_mode bootstrap_restored bootstrap_active_mode
+  local contained_recovery
   local control_dir_present control_files=
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
   secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
@@ -1071,6 +1121,19 @@ restore_legacy() (
   ) || die 'rollback snapshot checksum failed'
   rollback_mode=$(jq -er '.baseline_mode // "legacy_python" | select(. == "legacy_python" or . == "rust_release" or . == "rust_bootstrap")' \
     "$rollback_dir/state.json") || die 'rollback snapshot has no valid baseline mode'
+  contained_recovery=$(jq -er \
+    '(.contained_recovery // false) | select(type == "boolean") | tostring' \
+    "$rollback_dir/state.json") \
+    || die 'rollback snapshot has no valid contained recovery state'
+  if [[ $contained_recovery == true ]]; then
+    jq -e --arg collector "$COLLECTOR_UNIT" --arg reference_timer "$REFERENCE_UPLOAD_TIMER" \
+      --arg market_timer "$MARKET_UPLOAD_TIMER" '
+        .units[$collector].active == false
+        and .units[$reference_timer].active == false
+        and .units[$market_timer].active == false
+      ' "$rollback_dir/state.json" >/dev/null \
+      || die 'contained recovery rollback would restart a saved baseline unit'
+  fi
   [[ $rollback_mode == rust_release ]] \
     && rollback_health_policy=$rollback_dir/control/polymarket-rust-health-policy.jq
   [[ $rollback_mode == rust_bootstrap ]] || secure_regular_file "$rollback_health_policy"
@@ -1093,6 +1156,10 @@ restore_legacy() (
     die 'Rust rollback snapshot has no control release'
   fi
 
+  if [[ $contained_recovery == true ]]; then
+    clear_health_before_restart "$evidence_dir" \
+      "pre-contained-recovery-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  fi
   systemctl stop "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
   systemctl stop "$REFERENCE_UPLOAD_UNIT" "$MARKET_UPLOAD_UNIT"
   systemctl stop "$COLLECTOR_UNIT"
@@ -1100,8 +1167,9 @@ restore_legacy() (
   current_health_sha=
   [[ $rollback_mode == legacy_python || ! -f $HEALTH || -L $HEALTH ]] \
     || previous_health_sha=$(sha256sum "$HEALTH" | awk '{print $1}')
-  [[ $rollback_mode == rust_release ]] \
-    || clear_health_before_restart "$evidence_dir" "pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  if [[ $contained_recovery == false && $rollback_mode != rust_release ]]; then
+    clear_health_before_restart "$evidence_dir" "pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  fi
   for asset in "${UNIT_ASSETS[@]}"; do
     mode=$(jq -r --arg asset "$asset" '.unit_modes[$asset] // "0644"' \
       "$rollback_dir/state.json")
@@ -1208,6 +1276,29 @@ restore_legacy() (
   sync -f /etc/systemd/system
   sync -f /opt/monday
   systemctl daemon-reload
+  if [[ $contained_recovery == true ]]; then
+    systemctl reset-failed "$COLLECTOR_UNIT"
+    systemctl stop "$COLLECTOR_UNIT"
+    for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
+      if jq -e --arg unit "$asset" '.units[$unit].enabled == true' \
+        "$rollback_dir/state.json" >/dev/null; then
+        systemctl enable "$asset"
+      else
+        systemctl disable "$asset"
+      fi
+    done
+    for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER" \
+      "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
+      [[ $(systemctl show --property=ActiveState --value "$asset") == inactive ]] \
+        || die 'contained recovery rollback restarted a collector or uploader'
+    done
+    [[ $(systemctl show --property=MainPID --value "$COLLECTOR_UNIT") == 0 ]] \
+      || die 'contained recovery rollback left a collector process running'
+    verify_saved_unit_state "$rollback_dir/state.json" \
+      || die 'contained recovery rollback did not restore saved unit state'
+    printf '%s\n' "$evidence_dir"
+    return
+  fi
   systemctl reset-failed "$COLLECTOR_UNIT"
   [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
     || die 'legacy restart counter did not reset before rollback verification'
@@ -1585,6 +1676,22 @@ baseline_runtime_stability_required=$(jq -er \
   '.baseline_runtime_stability_required | select(type == "boolean") | tostring' \
   "$gate_json") \
   || die 'shadow gate has no valid baseline runtime stability contract'
+recovery_json=$(jq -c '.recovery // null' "$gate_json") \
+  || die 'shadow gate has no valid recovery binding'
+contained_recovery=false
+if [[ $recovery_json != null ]]; then
+  contained_recovery=true
+  [[ $baseline_mode == rust_bootstrap \
+    && $baseline_runtime_stability_required == false ]] \
+    || die 'contained recovery has an invalid baseline runtime contract'
+  [[ $(jq -er '.baseline_degraded | select(. == true) | tostring' "$gate_json") == true ]] \
+    || die 'contained recovery baseline is not explicitly degraded'
+  verify_contained_bootstrap_recovery "$recovery_json" "$candidate_sha" \
+    "$gate_source_revision" \
+    || die 'contained recovery baseline identity changed after the shadow gate'
+  gate_baseline_release_path=$(jq -er '.baseline.binary_path' <<<"$recovery_json")
+  gate_baseline_release_sha=$(jq -er '.baseline.binary_sha256' <<<"$recovery_json")
+else
 legacy_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] \
   || die 'cutover requires a verifiable active legacy reference collector PID'
@@ -1596,7 +1703,7 @@ gate_legacy_restarts=$(jq -er \
 gate_legacy_invocation_id=$(jq -er \
   '.legacy_runtime.invocation_id | select(type == "string" and test("^[a-f0-9]{32}$"))' \
   "$gate_json") || die 'shadow gate has no valid legacy systemd invocation ID'
-if [[ $baseline_mode == legacy_python ]]; then
+if [[ $contained_recovery == false && $baseline_mode == legacy_python ]]; then
   if [[ $baseline_runtime_stability_required == true ]]; then
     [[ $legacy_pid == "$gate_legacy_pid" ]] \
       || die 'legacy collector MainPID changed after the shadow gate'
@@ -1658,6 +1765,7 @@ else
     "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
     || die 'bootstrap Rust baseline identity or restart counter changed after the shadow gate'
 fi
+fi
 verify_cutover_target_preflight "$baseline_mode" "$ACTIVE_BINARY" \
   "$CONTROL_DIR" "${RELEASE_MANIFEST##*/}" secure_regular_file \
   || die 'production cutover target state would reject promotion'
@@ -1672,7 +1780,8 @@ mkdir -m 0750 "$evidence_dir" || die 'cutover evidence directory already exists'
 secure_root_chain "$evidence_dir" || die 'cutover evidence directory is not trusted'
 rollback_dir="$evidence_dir/rollback"
 snapshot_legacy "$rollback_dir" "$baseline_mode" \
-  "${gate_baseline_release_path:-}" "${gate_baseline_release_sha:-}" "$candidate_sha"
+  "${gate_baseline_release_path:-}" "${gate_baseline_release_sha:-}" "$candidate_sha" \
+  "$contained_recovery"
 
 transition_started=false
 cutover_succeeded=false
@@ -1726,7 +1835,7 @@ elif [[ $baseline_mode == rust_release ]]; then
   verify_upload_units "$baseline_pinned_upload_env" \
     || die 'Rust baseline upload units changed before drain'
 fi
-if [[ $baseline_mode != rust_bootstrap ]]; then
+if [[ $contained_recovery == false && $baseline_mode != rust_bootstrap ]]; then
   systemctl start "$REFERENCE_UPLOAD_UNIT"
   verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
     || die 'legacy reference uploader drain did not complete successfully'
@@ -1736,36 +1845,42 @@ if [[ $baseline_mode == rust_release ]]; then
   verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
     || die 'Rust market uploader drain did not complete successfully'
 fi
-legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
-  || die 'could not capture the legacy collector journal cursor before stop'
-[[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
-  || die 'OSS configuration changed during the legacy uploader drain'
-if [[ $baseline_mode == rust_release ]]; then
-  [[ $(oss_config_sha256 "$baseline_pinned_upload_env") == "$gate_oss_config_sha" ]] \
-    || die 'active Rust uploader configuration changed during drain'
-fi
-if [[ $baseline_mode == legacy_python ]]; then
-verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
-  || die 'legacy collector identity or restart counter changed during uploader drain'
-elif [[ $baseline_mode == rust_release ]]; then
-  pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
-  verify_rust_runtime "$gate_baseline_release_path" "$pre_stop_health_not_before" \
-    "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
-    "$LEGACY_HEALTH_POLICY" \
-    || die 'Rust baseline identity or health changed during uploader drain'
+if [[ $contained_recovery == true ]]; then
+  verify_contained_bootstrap_recovery "$recovery_json" "$candidate_sha" \
+    "$gate_source_revision" \
+    || die 'contained recovery baseline changed before promotion'
 else
-  verify_bootstrap_rust_runtime "$gate_baseline_release_path" "$gate_baseline_release_sha" \
-    "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
-    || die 'bootstrap Rust baseline identity changed during uploader drain'
-fi
+  legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
+    || die 'could not capture the legacy collector journal cursor before stop'
+  [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
+    || die 'OSS configuration changed during the legacy uploader drain'
+  if [[ $baseline_mode == rust_release ]]; then
+    [[ $(oss_config_sha256 "$baseline_pinned_upload_env") == "$gate_oss_config_sha" ]] \
+      || die 'active Rust uploader configuration changed during drain'
+  fi
+  if [[ $baseline_mode == legacy_python ]]; then
+  verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
+    || die 'legacy collector identity or restart counter changed during uploader drain'
+  elif [[ $baseline_mode == rust_release ]]; then
+    pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
+    verify_rust_runtime "$gate_baseline_release_path" "$pre_stop_health_not_before" \
+      "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
+      "$LEGACY_HEALTH_POLICY" \
+      || die 'Rust baseline identity or health changed during uploader drain'
+  else
+    verify_bootstrap_rust_runtime "$gate_baseline_release_path" "$gate_baseline_release_sha" \
+      "$legacy_pid" "$gate_legacy_invocation_id" "$gate_legacy_restarts" \
+      || die 'bootstrap Rust baseline identity changed during uploader drain'
+  fi
 
-systemctl stop "$COLLECTOR_UNIT"
-verify_no_restart_after_cursor \
-  "$COLLECTOR_UNIT" "$legacy_stop_cursor" "$gate_legacy_invocation_id" \
-  || die 'legacy collector journal recorded a restart during final stop'
-stopped_legacy_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
-[[ $stopped_legacy_restarts == "$gate_legacy_restarts" ]] \
-  || die 'legacy collector restarted between final verification and stop'
+  systemctl stop "$COLLECTOR_UNIT"
+  verify_no_restart_after_cursor \
+    "$COLLECTOR_UNIT" "$legacy_stop_cursor" "$gate_legacy_invocation_id" \
+    || die 'legacy collector journal recorded a restart during final stop'
+  stopped_legacy_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
+  [[ $stopped_legacy_restarts == "$gate_legacy_restarts" ]] \
+    || die 'legacy collector restarted between final verification and stop'
+fi
 legacy_state_handoff_json=null
 if [[ $baseline_mode == legacy_python ]]; then
 clear_health_before_restart "$evidence_dir" pre-cutover
@@ -1913,6 +2028,7 @@ jq -n \
   --arg journal_sha256 "$journal_sha" \
   --arg rollback_manifest_sha256 "$rollback_sha" \
   --arg rust_invocation_id "$rust_invocation_id" \
+  --argjson recovery "$recovery_json" \
   --argjson legacy_state_handoff "$legacy_state_handoff_json" \
   --argjson main_pid "$main_pid" \
   '{schema:$schema,baseline_mode:$baseline_mode,candidate_sha256:$candidate_sha256,
@@ -1924,6 +2040,7 @@ jq -n \
     gate_json_sha256:$gate_json_sha256,
     gate_terminal_receipt_sha256:$gate_terminal_receipt_sha256,
     gate_systemd_invocation_id:$gate_systemd_invocation_id,
+    recovery:$recovery,
     legacy_state_handoff:$legacy_state_handoff,
     completed_at:$completed_at,
     collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,

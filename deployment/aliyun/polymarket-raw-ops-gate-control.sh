@@ -12,6 +12,16 @@ readonly SCRIPT_DIR
 readonly CONTROL="$SCRIPT_DIR/${0##*/}"
 readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
 readonly UNIT_ASSET="$SCRIPT_DIR/$UNIT_TEMPLATE"
+readonly COLLECTOR_UNIT=polymarket-reference-collector.service
+readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+readonly RUST_ACTIVE_BINARY_PATH=/opt/monday/bin/polymarket-raw-ops
+readonly RECOVERY_PROBE_MAX_AGE_SECONDS=900
+readonly -a RECOVERY_UPLOAD_UNITS=(
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
 
 die() {
   printf 'Polymarket Gate control failed: %s\n' "$*" >&2
@@ -22,6 +32,7 @@ usage() {
   printf '%s\n' \
     "Usage: ${0##*/} install" \
     "Usage: ${0##*/} start <candidate-binary> <sha256> <source-revision>" \
+    "       ${0##*/} recover <candidate-binary> <sha256> <source-revision> <gamma-probe.json>" \
     "       ${0##*/} status <sha256> <systemd-invocation-id>" \
     "       ${0##*/} cancel <sha256> <systemd-invocation-id>"
 }
@@ -52,9 +63,13 @@ INSTALLED_UNIT=$(prefix_path "/etc/systemd/system/$UNIT_TEMPLATE")
 readonly INSTALLED_UNIT
 SYSTEMD_UNIT_DIR=$(prefix_path /etc/systemd/system)
 readonly SYSTEMD_UNIT_DIR
+RUST_ACTIVE_BINARY=$(prefix_path "$RUST_ACTIVE_BINARY_PATH")
+readonly RUST_ACTIVE_BINARY
+RECOVERY_PROBE_ROOT=$(prefix_path /data/monday/evidence/polymarket-candidate-probes)
+readonly RECOVERY_PROBE_ROOT
 readonly CONTROL_LOCK="$RUN_ROOT/control.lock"
 
-for command in awk chmod cmp date flock install jq ln mkdir mv rm sha256sum stat \
+for command in awk chmod cmp date flock install jq ln mkdir mv readlink rm sed sha256sum stat \
   sync systemctl tr; do
   command -v "$command" >/dev/null 2>&1 \
     || die "missing required command: $command"
@@ -91,6 +106,15 @@ unit_for() { printf '%s@%s.service\n' "$UNIT_PREFIX" "$1"; }
 runtime_request_for() { printf '%s/%s.request.json\n' "$RUN_ROOT" "$1"; }
 invocation_dir_for() { printf '%s/%s/%s\n' "$RECEIPT_ROOT" "$1" "$2"; }
 systemctl_value() { systemctl show "$1" --property="$2" --value; }
+
+effective_exec_argv() {
+  local unit=$1 raw argv
+  raw=$(systemctl_value "$unit" ExecStart) || return 1
+  argv=$(sed -nE 's/^.*argv\[\]=([^;]+);.*$/\1/p' <<<"$raw" \
+    | sed -E 's/[[:space:]]+$//')
+  [[ -n $argv ]] || return 1
+  printf '%s\n' "$argv"
+}
 
 sync_file() { [[ $test_mode == true ]] || sync "$1"; }
 sync_dir() { [[ $test_mode == true ]] || sync -f "$1"; }
@@ -174,7 +198,7 @@ install_gate_unit() {
 }
 
 write_runtime_request() {
-  local candidate_path=$1 candidate_sha=$2 source_revision=$3
+  local candidate_path=$1 candidate_sha=$2 source_revision=$3 recovery=${4:-null}
   local destination temporary control_sha gate_sha unit_sha
   destination=$(runtime_request_for "$candidate_sha")
   [[ ! -L $destination ]] || die 'runtime request is a symlink'
@@ -185,11 +209,12 @@ write_runtime_request() {
   jq -n --arg candidate "$candidate_sha" --arg candidate_path "$candidate_path" \
     --arg source "$source_revision" \
     --arg control_sha "$control_sha" --arg gate_sha "$gate_sha" \
-    --arg unit_sha "$unit_sha" '
+    --arg unit_sha "$unit_sha" --argjson recovery "$recovery" '
     {schema:"monday.polymarket_gate_request.v1",candidate_sha256:$candidate,
       candidate_path:$candidate_path,
       source_revision:$source,control_sha256:$control_sha,
       gate_sha256:$gate_sha,unit_sha256:$unit_sha}
+      + (if $recovery == null then {} else {recovery:$recovery} end)
   ' >"$temporary"
   chmod 0444 "$temporary"
   mv "$temporary" "$destination"
@@ -612,8 +637,108 @@ cancel_gate() {
   jq -c . "$receipt"
 }
 
+recovery_probe() {
+  local candidate_sha=$1 source_revision=$2 probe=$3 canonical now observed age
+  local probe_sha probe_json
+  candidate_sha=$(printf '%s' "$candidate_sha" | tr '[:upper:]' '[:lower:]')
+  source_revision=$(printf '%s' "$source_revision" | tr '[:upper:]' '[:lower:]')
+  valid_candidate "$candidate_sha" || die 'candidate SHA-256 is invalid'
+  valid_source "$source_revision" || die 'source revision is invalid'
+  canonical=$(readlink -f -- "$probe") || die 'recovery probe cannot be resolved'
+  [[ $canonical == "$RECOVERY_PROBE_ROOT/$candidate_sha/"* ]] \
+    || die 'recovery probe is outside the exact candidate evidence root'
+  secure_control_file "$canonical"
+  probe_json=$(jq -cS . "$canonical") || die 'recovery probe is not valid JSON'
+  jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
+    .schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    and .candidate_sha256 == $candidate and .source_revision == $source
+    and (.observed_at | type == "string"
+      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    and .gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+    and .gamma.untagged_closed == {query:"closed=true",attempts:3,http_status:200}
+    and .candidate_once.exit_status == 0
+    and (.candidate_once.duration_seconds | type == "number" and floor == . and . > 0 and . <= 180)
+    and .candidate_once.health_updated_at == .observed_at
+  ' <<<"$probe_json" >/dev/null || die 'recovery probe does not prove the bounded Gamma fallback'
+  observed=$(jq -er .observed_at <<<"$probe_json")
+  observed=$(date -u -d "$observed" +%s) || die 'recovery probe timestamp is invalid'
+  now=$(date -u +%s)
+  age=$((now - observed))
+  ((age >= 0 && age <= RECOVERY_PROBE_MAX_AGE_SECONDS)) \
+    || die 'recovery probe is stale or from the future'
+  probe_sha=$(sha256sum "$canonical" | awk '{print $1}')
+  jq -c --arg sha "$probe_sha" '. + {sha256:$sha}' <<<"$probe_json"
+}
+
+recovery_baseline() {
+  local candidate_sha=$1 active_state main_pid fragment drop_ins exec_argv
+  local restarts invocation binary_sha
+  active_state=$(systemctl_value "$COLLECTOR_UNIT" ActiveState) \
+    || die 'cannot read contained baseline state'
+  [[ $active_state == inactive ]] \
+    || die 'recovery requires the direct bootstrap baseline to be stopped'
+  main_pid=$(systemctl_value "$COLLECTOR_UNIT" MainPID) \
+    || die 'cannot read contained baseline MainPID'
+  [[ $main_pid == 0 ]] || die 'recovery baseline still has a managed process'
+  fragment=$(systemctl_value "$COLLECTOR_UNIT" FragmentPath) \
+    || die 'cannot read contained baseline fragment'
+  [[ $fragment == "/etc/systemd/system/$COLLECTOR_UNIT" ]] \
+    || die 'recovery baseline unit fragment is not exact'
+  drop_ins=$(systemctl_value "$COLLECTOR_UNIT" DropInPaths) \
+    || die 'cannot read contained baseline drop-ins'
+  [[ -z $drop_ins ]] || die 'recovery baseline has unexpected unit drop-ins'
+  exec_argv=$(effective_exec_argv "$COLLECTOR_UNIT") \
+    || die 'cannot read contained baseline ExecStart'
+  [[ $exec_argv == "$RUST_PRODUCTION_EXEC" ]] \
+    || die 'recovery baseline ExecStart is not the direct Rust bootstrap'
+  restarts=$(systemctl_value "$COLLECTOR_UNIT" NRestarts) \
+    || die 'cannot read contained baseline restart counter'
+  [[ $restarts =~ ^[0-9]+$ ]] \
+    || die 'contained baseline restart counter is invalid'
+  invocation=$(systemctl_value "$COLLECTOR_UNIT" InvocationID) \
+    || die 'cannot read contained baseline invocation ID'
+  valid_invocation "$invocation" || die 'contained baseline invocation ID is invalid'
+  [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY && -x $RUST_ACTIVE_BINARY ]] \
+    || die 'recovery baseline is not the direct executable'
+  secure_control_file "$RUST_ACTIVE_BINARY"
+  binary_sha=$(sha256sum "$RUST_ACTIVE_BINARY" | awk '{print $1}')
+  valid_candidate "$binary_sha" || die 'contained baseline digest is invalid'
+  [[ $candidate_sha != "$binary_sha" ]] \
+    || die 'candidate digest matches the contained bootstrap baseline'
+  jq -cn --arg active_state "$active_state" --arg exec_start "$exec_argv" \
+    --arg fragment_path "$fragment" --arg invocation_id "$invocation" \
+    --arg binary_path "$RUST_ACTIVE_BINARY_PATH" --arg binary_sha256 "$binary_sha" \
+    --argjson main_pid "$main_pid" --argjson restarts "$restarts" \
+    '{active_state:$active_state,main_pid:$main_pid,exec_start:$exec_start,
+      fragment_path:$fragment_path,drop_in_paths:[],restarts:$restarts,
+      invocation_id:$invocation_id,binary_path:$binary_path,binary_sha256:$binary_sha256}'
+}
+
+verify_recovery_uploaders_stopped() {
+  local unit active_state
+  for unit in "${RECOVERY_UPLOAD_UNITS[@]}"; do
+    active_state=$(systemctl_value "$unit" ActiveState) \
+      || die "cannot read recovery uploader state: $unit"
+    [[ $active_state == inactive ]] \
+      || die "recovery requires inactive uploader/timer: $unit"
+  done
+}
+
+recover_gate() {
+  local candidate_path=$1 candidate_sha=$2 source_revision=$3 probe=$4
+  local probe_json baseline_json recovery_json
+  candidate_sha=$(printf '%s' "$candidate_sha" | tr '[:upper:]' '[:lower:]')
+  source_revision=$(printf '%s' "$source_revision" | tr '[:upper:]' '[:lower:]')
+  probe_json=$(recovery_probe "$candidate_sha" "$source_revision" "$probe")
+  baseline_json=$(recovery_baseline "$candidate_sha")
+  verify_recovery_uploaders_stopped
+  recovery_json=$(jq -cn --argjson baseline "$baseline_json" --argjson probe "$probe_json" \
+    '{mode:"gamma_tagged_500",baseline:$baseline,candidate_probe:$probe}')
+  start_gate "$candidate_path" "$candidate_sha" "$source_revision" "$recovery_json"
+}
+
 start_gate() {
-  local candidate_path=$1 candidate_sha source_revision=$3 unit invocation env_file
+  local candidate_path=$1 candidate_sha source_revision=$3 recovery=${4:-null} unit invocation env_file
   local active_state main_pid
   candidate_sha=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
   source_revision=$(printf '%s' "$source_revision" | tr '[:upper:]' '[:lower:]')
@@ -645,7 +770,7 @@ start_gate() {
     || die 'cannot read Gate state before start'
   [[ $active_state == inactive || $active_state == failed ]] \
     || die 'a Gate job already owns this candidate'
-  write_runtime_request "$candidate_path" "$candidate_sha" "$source_revision"
+  write_runtime_request "$candidate_path" "$candidate_sha" "$source_revision" "$recovery"
   env_file="$RUN_ROOT/$candidate_sha.env"
   [[ ! -L $env_file ]] || die 'Gate EnvironmentFile is a symlink'
   printf 'MONDAY_POLYMARKET_GATE_CONTROL=%s\n' "$CONTROL" >"${env_file}.tmp.$$"
@@ -679,6 +804,10 @@ case "$action" in
   start)
     [[ $# -eq 4 ]] || { usage >&2; exit 2; }
     start_gate "$2" "$3" "$4"
+    ;;
+  recover)
+    [[ $# -eq 5 ]] || { usage >&2; exit 2; }
+    recover_gate "$2" "$3" "$4" "$5"
     ;;
   status)
     [[ $# -eq 3 ]] || { usage >&2; exit 2; }

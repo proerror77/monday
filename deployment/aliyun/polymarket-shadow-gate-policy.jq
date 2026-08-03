@@ -61,6 +61,38 @@ def legacy_health_snapshot($allow_bounded_rate_limits):
   and .stale_settlement_markets == []
   and (.overdue_unresolved_markets
     | type == "array" and all(.[]; type == "string" and length > 0));
+def contained_bootstrap_recovery($candidate; $source):
+  .mode == "gamma_tagged_500"
+  and (.candidate_probe.schema
+    == "monday.polymarket_gamma_tagged_500_recovery_probe.v1")
+  and .candidate_probe.candidate_sha256 == $candidate
+  and .candidate_probe.source_revision == $source
+  and (.candidate_probe.sha256 | sha256)
+  and (.candidate_probe.observed_at | utc_iso8601_unix | type == "number")
+  and .candidate_probe.gamma.tagged_closed
+    == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+  and .candidate_probe.gamma.untagged_closed
+    == {query:"closed=true",attempts:3,http_status:200}
+  and .candidate_probe.candidate_once.exit_status == 0
+  and (.candidate_probe.candidate_once.duration_seconds | positive_integer and . <= 180)
+  and .candidate_probe.candidate_once.health_updated_at
+    == .candidate_probe.observed_at
+  and .baseline.active_state == "inactive"
+  and .baseline.main_pid == 0
+  and .baseline.exec_start
+    == "/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+  and .baseline.fragment_path
+    == "/etc/systemd/system/polymarket-reference-collector.service"
+  and .baseline.drop_in_paths == []
+  and (.baseline.restarts | nonnegative_integer)
+  and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+  and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
+  and (.baseline.binary_sha256 | sha256)
+  and .baseline.binary_sha256 != $candidate;
+def recovery_matches_gate:
+  . as $gate
+  | ($gate.recovery | contained_bootstrap_recovery(
+      $gate.candidate_sha256; $gate.deployment_source_revision));
 
 .schema == "monday.polymarket_shadow_gate.v1"
 and (.candidate_sha256 | sha256)
@@ -139,6 +171,7 @@ and .passed == true
 and (
   (
     .baseline_mode == "legacy_python"
+    and .recovery == null
     and .baseline_runtime_stability_required == true
     and (
       .baseline_health_start_required == false
@@ -196,6 +229,7 @@ and (
   or
   (
     .baseline_mode == "rust_release"
+    and .recovery == null
     and .baseline_health_start_required == false
     and .baseline_runtime_stability_required == true
     and .baseline_health_completion_required == false
@@ -219,6 +253,7 @@ and (
   or
   (
     .baseline_mode == "rust_bootstrap"
+    and .recovery == null
     and .baseline_degraded == true
     and .baseline_health_start_required == false
     and .baseline_runtime_stability_required == true
@@ -238,6 +273,24 @@ and (
     and .candidate_sha256 != .legacy_runtime.release_sha256
     and .legacy_runtime.release_path == "/opt/monday/bin/polymarket-raw-ops"
     and .legacy_runtime.proc_exe == .legacy_runtime.release_path
+  )
+  or
+  (
+    .baseline_mode == "rust_bootstrap"
+    and .baseline_degraded == true
+    and .baseline_health_start_required == false
+    and .baseline_runtime_stability_required == false
+    and .baseline_health_completion_required == false
+    and .baseline_health_snapshot == null
+    and .baseline_health_completion_snapshot == null
+    and .baseline_health_start_success_unix == null
+    and .baseline_health_cutoff_unix == null
+    and .baseline_health_start_written_at_unix == null
+    and .baseline_health_completion_written_at_unix == null
+    and .baseline_health_start_file_identity == null
+    and .baseline_health_completion_file_identity == null
+    and .legacy_runtime == null
+    and recovery_matches_gate
   )
 )
 and (
@@ -290,7 +343,8 @@ and .checks.real_market_segment_preflight == true
 and (.comparison_mode == "legacy_overlap" or (
   .comparison_mode == "rust_self"
   and (.baseline_mode == "legacy_python" or .baseline_mode == "rust_bootstrap")
-  and .baseline_runtime_stability_required == true
+  and (.baseline_runtime_stability_required == true
+    or recovery_matches_gate)
 ))
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
