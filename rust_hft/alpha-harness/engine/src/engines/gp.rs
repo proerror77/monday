@@ -16,7 +16,7 @@ pub struct GeneticProgrammingEngine {
     max_depth: usize,
     candidate_namespace: Option<String>,
     governed_policy: Option<CexGpPolicyV1>,
-    population: Vec<FactorAst>,
+    population: Vec<(FactorAst, f64)>,
     seen: BTreeSet<String>,
 }
 
@@ -84,7 +84,21 @@ impl GeneticProgrammingEngine {
         let base = if self.population.is_empty() {
             self.field()
         } else {
-            let selected = self.population[self.rng.index(self.population.len())].clone();
+            let selected = if self.governed_policy.is_some() {
+                self.population[self.rng.index(self.population.len())]
+                    .0
+                    .clone()
+            } else {
+                let tournament = (0..self.population.len().min(3))
+                    .map(|_| self.rng.index(self.population.len()))
+                    .max_by(|left, right| {
+                        self.population[*left]
+                            .1
+                            .total_cmp(&self.population[*right].1)
+                    })
+                    .unwrap_or(0);
+                self.population[tournament].0.clone()
+            };
             if ast_depth(&selected) >= self.max_depth {
                 self.field()
             } else {
@@ -127,10 +141,16 @@ impl GeneticProgrammingEngine {
         )))
     }
 
-    fn remember(&mut self, ast: FactorAst) {
-        self.population.push(ast);
-        if self.population.len() > self.population_limit {
-            self.population.remove(0);
+    fn remember(&mut self, ast: FactorAst, score: f64) {
+        self.population.push((ast, score));
+        if self.governed_policy.is_some() {
+            if self.population.len() > self.population_limit {
+                self.population.remove(0);
+            }
+        } else {
+            self.population
+                .sort_by(|left, right| right.1.total_cmp(&left.1));
+            self.population.truncate(self.population_limit);
         }
     }
 }
@@ -183,11 +203,16 @@ impl ProposalEngine for GeneticProgrammingEngine {
         Err("GP could not produce a novel candidate within budget".to_string())
     }
 
-    fn observe(&mut self, proposal: &EngineProposal, _evaluation: &CandidateEvaluation) {
+    fn observe(&mut self, proposal: &EngineProposal, evaluation: &CandidateEvaluation) {
         let CandidateArtifact::Formula(ast) = &proposal.artifact else {
             return;
         };
-        self.remember(ast.clone());
+        let score = if self.governed_policy.is_some() {
+            0.0
+        } else {
+            evaluation.score
+        };
+        self.remember(ast.clone(), score);
     }
 
     fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
@@ -196,7 +221,12 @@ impl ProposalEngine for GeneticProgrammingEngine {
                 return Err("GP history contains a non-formula artifact".to_string());
             };
             self.seen.insert(ast.to_string());
-            self.remember(ast.clone());
+            let score = if self.governed_policy.is_some() {
+                0.0
+            } else {
+                observation.evaluation.score
+            };
+            self.remember(ast.clone(), score);
         }
         Ok(())
     }
@@ -231,6 +261,34 @@ mod tests {
         }
     }
 
+    fn scores_change_candidates(
+        mut left: GeneticProgrammingEngine,
+        mut right: GeneticProgrammingEngine,
+    ) -> bool {
+        let dataset = super::super::test_dataset();
+        let remaining = RemainingBudget {
+            candidates: 8,
+            expansions: 256,
+            tokens: 0,
+            milliseconds: 0,
+        };
+        for iteration in 1..=8 {
+            let context = dataset.proposal_context();
+            let left_proposal = left
+                .propose("mission", iteration, &context, &remaining)
+                .unwrap();
+            let right_proposal = right
+                .propose("mission", iteration, &context, &remaining)
+                .unwrap();
+            if left_proposal.artifact != right_proposal.artifact {
+                return true;
+            }
+            left.observe(&left_proposal, &evaluation(iteration as f64));
+            right.observe(&right_proposal, &evaluation(-(iteration as f64)));
+        }
+        false
+    }
+
     #[test]
     fn seeded_gp_is_reproducible() {
         let fields = vec!["oi".to_string(), "imbalance".to_string()];
@@ -250,43 +308,30 @@ mod tests {
         for _ in 0..20 {
             let ast = engine.build_candidate().unwrap();
             assert!(ast_depth(&ast) <= 3);
-            engine.population.push(ast);
+            engine.population.push((ast, 1.0));
         }
     }
 
     #[test]
-    fn evaluation_scores_cannot_change_the_next_gp_formula() {
+    fn generic_gp_remains_fitness_guided() {
         let fields = vec!["book_imbalance".to_string(), "spread_bps".to_string()];
-        let mut left = GeneticProgrammingEngine::new(7, fields.clone(), 8, 5).unwrap();
-        let mut right = GeneticProgrammingEngine::new(7, fields, 8, 5).unwrap();
-        let dataset = super::super::test_dataset();
-        let remaining = RemainingBudget {
-            candidates: 8,
-            expansions: 256,
-            tokens: 0,
-            milliseconds: 0,
-        };
-        let propose = |engine: &mut GeneticProgrammingEngine, iteration| {
-            engine
-                .propose(
-                    "mission",
-                    iteration,
-                    &dataset.proposal_context(),
-                    &remaining,
-                )
-                .unwrap()
-        };
+        let left = GeneticProgrammingEngine::new(7, fields.clone(), 8, 5).unwrap();
+        let right = GeneticProgrammingEngine::new(7, fields, 8, 5).unwrap();
+        assert!(scores_change_candidates(left, right));
+    }
 
-        for iteration in 1..=3 {
-            let left_proposal = propose(&mut left, iteration);
-            let right_proposal = propose(&mut right, iteration);
-            assert_eq!(left_proposal.artifact, right_proposal.artifact);
-            left.observe(&left_proposal, &evaluation(iteration as f64));
-            right.observe(&right_proposal, &evaluation(-(iteration as f64)));
-        }
-
-        let left_next = propose(&mut left, 4);
-        let right_next = propose(&mut right, 4);
-        assert_eq!(left_next.artifact, right_next.artifact);
+    #[test]
+    fn governed_gp_does_not_observe_evaluation_scores() {
+        let fields = vec!["book_imbalance".to_string(), "spread_bps".to_string()];
+        let budget = alpha_domain::SearchBudget {
+            max_candidates: 8,
+            max_expansions: 256,
+            max_tokens: 0,
+            max_seconds: 0,
+        };
+        let policy = CexGpPolicyV1::controlled_v1("policy", fields, 7, &budget).unwrap();
+        let left = GeneticProgrammingEngine::new_governed(policy.clone(), "mission").unwrap();
+        let right = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+        assert!(!scores_change_candidates(left, right));
     }
 }
