@@ -94,6 +94,9 @@ pub struct UploadConfig {
     pub zstd_timeout: Duration,
     pub oss_timeout: Duration,
     pub max_concurrent_uploads: usize,
+    pub zstd_threads: u64,
+    pub oss_parallel: u64,
+    pub oss_part_size: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -122,6 +125,12 @@ impl UploadConfig {
         }
         if !(1..=MAX_CONCURRENT_UPLOADS).contains(&self.max_concurrent_uploads) {
             bail!("max concurrent uploads must be between 1 and {MAX_CONCURRENT_UPLOADS}");
+        }
+        if self.oss_parallel == 0 {
+            bail!("oss parallel must be at least 1");
+        }
+        if self.oss_part_size.trim().is_empty() {
+            bail!("oss part size must be non-empty");
         }
         Ok(())
     }
@@ -900,7 +909,7 @@ fn strict_uuid(value: &str) -> bool {
         })
 }
 
-fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
     ensure_canonical_directory(spool_dir)?;
     let mut paths = Vec::new();
     for entry in fs::read_dir(spool_dir)? {
@@ -1820,11 +1829,8 @@ fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts,
     let data = append_name(source, ".zst")?;
     let (temporary_data, temporary_file) = exclusive_sibling(&data, ".tmp")?;
     let output = temporary_file.try_clone()?;
-    let mut command = Command::new("zstd");
-    command
-        .args(["-q", "-T1", "-3", "-c"])
-        .arg(source)
-        .stdout(Stdio::from(output));
+    let mut command = zstd_command(source, config);
+    command.stdout(Stdio::from(output));
     match command_status_with_timeout(&mut command, config.zstd_timeout) {
         Ok(status) if status.success() => {}
         Ok(status) => {
@@ -1880,6 +1886,15 @@ fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts,
     ))
 }
 
+fn zstd_command(source: &Path, config: &UploadConfig) -> Command {
+    let mut command = Command::new("zstd");
+    let threads = format!("-T{}", config.zstd_threads);
+    command
+        .args(["-q", threads.as_str(), "-3", "-c"])
+        .arg(source);
+    command
+}
+
 fn oss_copy_command(source: &str, destination: &str, config: &UploadConfig) -> Command {
     let mut command = Command::new("aliyun");
     command.args([
@@ -1894,6 +1909,11 @@ fn oss_copy_command(source: &str, destination: &str, config: &UploadConfig) -> C
         "--region",
         &config.region,
     ]);
+    command
+        .arg("--parallel")
+        .arg(config.oss_parallel.to_string())
+        .arg("--part-size")
+        .arg(&config.oss_part_size);
     command
 }
 
@@ -2686,6 +2706,9 @@ mod tests {
             zstd_timeout: Duration::from_secs(30),
             oss_timeout: Duration::from_secs(30),
             max_concurrent_uploads: 2,
+            zstd_threads: 0,
+            oss_parallel: 8,
+            oss_part_size: "32Mi".to_owned(),
         }
     }
 
@@ -2705,6 +2728,92 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("max concurrent uploads must be between 1 and 4"));
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn zstd_command_defaults_to_auto_threads() {
+        let root = TestDir::new();
+        let config = config(root.path());
+        let args = command_args(&zstd_command(Path::new("tape.ndjson"), &config));
+        assert_eq!(args, ["-q", "-T0", "-3", "-c", "tape.ndjson"]);
+    }
+
+    #[test]
+    fn zstd_command_threads_are_configurable() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.zstd_threads = 16;
+        let args = command_args(&zstd_command(Path::new("tape.ndjson"), &config));
+        assert_eq!(args, ["-q", "-T16", "-3", "-c", "tape.ndjson"]);
+    }
+
+    #[test]
+    fn oss_copy_command_includes_multipart_tuning() {
+        let root = TestDir::new();
+        let config = config(root.path());
+        let args = command_args(&oss_copy_command("src", "dst", &config));
+        assert_eq!(&args[..4], ["ossutil", "cp", "src", "dst"]);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--parallel", "8"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--part-size", "32Mi"]));
+    }
+
+    #[test]
+    fn oss_copy_command_tuning_is_configurable() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.oss_parallel = 12;
+        config.oss_part_size = "64Mi".to_owned();
+        let args = command_args(&oss_copy_command("src", "dst", &config));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--parallel", "12"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--part-size", "64Mi"]));
+    }
+
+    #[test]
+    fn oss_upload_command_keeps_no_clobber_with_tuning() {
+        let root = TestDir::new();
+        let config = config(root.path());
+        let args = command_args(&oss_upload_command("src", "dst", &config));
+        assert!(args.iter().any(|arg| arg == "--ignore-existing"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--parallel", "8"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--part-size", "32Mi"]));
+    }
+
+    #[test]
+    fn rejects_invalid_oss_copy_tuning() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.oss_parallel = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("oss parallel must be at least 1"));
+        config.oss_parallel = 8;
+        config.oss_part_size = " ".to_owned();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("oss part size must be non-empty"));
     }
 
     #[test]

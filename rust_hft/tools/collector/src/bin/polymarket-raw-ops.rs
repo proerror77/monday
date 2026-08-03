@@ -8,7 +8,7 @@ use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig}
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE,
-    DEFAULT_MAX_RETAINED_TRADE_IDS, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+    DEFAULT_MAX_RETAINED_TRADE_IDS, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
 };
 use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
@@ -76,6 +76,8 @@ enum Command {
         trade_finalization_stable_polls: u64,
         #[arg(long, default_value_t = 100)]
         per_market_delay_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_TAPE_MAX_BYTES)]
+        tape_max_bytes: u64,
         #[arg(long)]
         once: bool,
     },
@@ -235,6 +237,7 @@ async fn run(cli: Cli) -> Result<()> {
             trade_finalization_lag_secs,
             trade_finalization_stable_polls,
             per_market_delay_ms,
+            tape_max_bytes,
             once,
         } => {
             let config = ReferenceConfig {
@@ -253,6 +256,7 @@ async fn run(cli: Cli) -> Result<()> {
                 trade_finalization_lag_secs,
                 trade_finalization_stable_polls,
                 per_market_delay: Duration::from_millis(per_market_delay_ms),
+                tape_max_bytes,
             };
             run_reference(config, once).await
         }
@@ -275,6 +279,9 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let zstd_timeout = env_u64(zstd_timeout, "ZSTD_TIMEOUT_SECONDS", 300)?;
             let oss_timeout = env_u64(oss_timeout, "OSS_COPY_TIMEOUT_SECONDS", 300)?;
+            let zstd_threads = env_u64(None, "ZSTD_THREADS", 0)?;
+            let oss_parallel = env_u64(None, "OSS_PARALLEL", 8)?;
+            let oss_part_size = env_or(None, "OSS_PART_SIZE", "32Mi");
             let max_concurrent_uploads =
                 upload_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS);
             let config = UploadConfig {
@@ -293,6 +300,9 @@ async fn run(cli: Cli) -> Result<()> {
                 zstd_timeout: Duration::from_secs(zstd_timeout),
                 oss_timeout: Duration::from_secs(oss_timeout),
                 max_concurrent_uploads,
+                zstd_threads,
+                oss_parallel,
+                oss_part_size,
             };
             println!(
                 "{}",
@@ -407,6 +417,7 @@ mod tests {
             max_retained_trade_ids,
             max_trade_polls_per_cycle,
             max_concurrent_trade_polls,
+            tape_max_bytes,
             ..
         } = command
         else {
@@ -424,6 +435,10 @@ mod tests {
         assert_eq!(
             max_concurrent_trade_polls,
             ReferenceConfig::default().max_concurrent_trade_polls
+        );
+        assert_eq!(
+            tape_max_bytes,
+            ReferenceConfig::default().tape_max_bytes
         );
     }
 

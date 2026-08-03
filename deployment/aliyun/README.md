@@ -77,6 +77,73 @@ must ignore any artifact with an adjacent `<data>.SUPERSEDED.json` marker; the m
 names the canonical replacement and quarantine copy. This is the fail-closed path
 when the collector role can write but cannot delete an invalid historical object.
 
+A watchdog guards both upload lanes against silent stalls (issue #655: the
+market upload timer once sat inactive for 19 hours until the spool disk nearly
+filled, and the reference upload timer was later found silently dead as well).
+`polymarket-market-tape-upload-watchdog.timer` runs the oneshot
+`polymarket-market-tape-upload-watchdog.service` every two minutes. Each run
+logs one journal INFO line (tag `polymarket-upload-watchdog`) with, for each of
+the market (`/data/monday/spool/polymarket`) and reference
+(`/data/monday/spool/polymarket-reference`) spools, the pending rotated-tape
+count and the oldest rotated-tape age, plus `/data` free gigabytes. For each
+lane independently: if the upload timer (`polymarket-market-tape-upload.timer`
+or `polymarket-reference-upload.timer`) is not active, the watchdog starts it
+and logs a WARNING with the previous state; if the upload service is inactive
+while a rotated tape is older than 90 minutes, it starts the service with
+`--no-block` and logs why. A failed start is logged as an ERROR naming the
+lane, the remaining lane is still checked, and the run exits nonzero at the
+end so the failure surfaces in the oneshot unit result. The watchdog only ever
+starts units — it never stops or disables anything and never modifies tape
+files. It runs as root because it needs `systemctl start`; the remaining
+hardening matches the other units.
+
+Governed cutovers stop both upload timers and services on purpose, so the
+watchdog honors the runtime suppression file
+`/run/monday/polymarket-upload-watchdog.suppress`: while it exists, every run
+logs one `suppressed` INFO line and performs no remediation on either lane.
+The file lives under `/run` and never survives a reboot. Any controller that
+stops the upload timers MUST create the file before stopping them and remove
+it immediately after the cutover concludes:
+
+```bash
+sudo install -D /dev/null /run/monday/polymarket-upload-watchdog.suppress
+sudo rm -f /run/monday/polymarket-upload-watchdog.suppress
+```
+
+Install and enable it alongside the upload units. This is a governed runtime
+change with one named controller:
+
+- Controller: `CONTROLLER_NAME` (one named operator; no concurrent writers).
+- Target: host `monday-trade-data-26`, units
+  `polymarket-market-tape-upload-watchdog.service` and
+  `polymarket-market-tape-upload-watchdog.timer`.
+- Source identity: this repository at commit `SOURCE_REVISION`, files
+  `deployment/aliyun/polymarket-market-tape-upload-watchdog.sh`,
+  `deployment/aliyun/polymarket-market-tape-upload-watchdog.service`, and
+  `deployment/aliyun/polymarket-market-tape-upload-watchdog.timer`.
+- Stop rules: abort if `/data` is not mounted, if either existing upload timer
+  is failed rather than merely inactive, or if the post-install readback does
+  not match; rollback rather than retry in place.
+- Rollback: `sudo systemctl disable --now polymarket-market-tape-upload-watchdog.timer`,
+  then remove the three installed files and `sudo systemctl daemon-reload`.
+
+```bash
+sudo install -m 0755 deployment/aliyun/polymarket-market-tape-upload-watchdog.sh \
+  /opt/monday/bin/polymarket-market-tape-upload-watchdog.sh
+sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload-watchdog.service \
+  deployment/aliyun/polymarket-market-tape-upload-watchdog.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-market-tape-upload-watchdog.timer
+```
+
+Post-install readback (required before the change is considered live):
+
+```bash
+systemctl is-active polymarket-market-tape-upload-watchdog.timer
+journalctl -t polymarket-upload-watchdog -n 5
+```
+
 The companion `polymarket-reference-collector.service` polls the official Gamma and
 Data APIs every 30 seconds. It writes complete Gamma market payloads (including
 volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
