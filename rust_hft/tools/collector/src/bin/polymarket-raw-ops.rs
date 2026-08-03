@@ -279,6 +279,9 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let zstd_timeout = env_u64(zstd_timeout, "ZSTD_TIMEOUT_SECONDS", 300)?;
             let oss_timeout = env_u64(oss_timeout, "OSS_COPY_TIMEOUT_SECONDS", 300)?;
+            let zstd_threads = env_u64(None, "ZSTD_THREADS", 0)?;
+            let oss_parallel = env_u64(None, "OSS_PARALLEL", 8)?;
+            let oss_part_size = env_or(None, "OSS_PART_SIZE", "32Mi");
             let max_concurrent_uploads =
                 upload_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS);
             let config = UploadConfig {
@@ -297,6 +300,9 @@ async fn run(cli: Cli) -> Result<()> {
                 zstd_timeout: Duration::from_secs(zstd_timeout),
                 oss_timeout: Duration::from_secs(oss_timeout),
                 max_concurrent_uploads,
+                zstd_threads,
+                oss_parallel,
+                oss_part_size,
             };
             println!(
                 "{}",
