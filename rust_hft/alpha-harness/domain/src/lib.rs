@@ -1391,6 +1391,7 @@ impl CexGpPolicyV1 {
         budget: &SearchBudget,
     ) -> Result<Self, DomainError> {
         admitted_fields.sort();
+        admitted_fields.dedup();
         let policy = Self {
             schema_version: CEX_GP_POLICY_SCHEMA_V1.to_string(),
             policy_id: policy_id.into(),
@@ -1441,8 +1442,26 @@ impl CexGpPolicyV1 {
             ));
         }
         self.budget.validate()?;
+        if self.budget.max_expansions == 0 {
+            return Err(DomainError::InvalidCexGpPolicy(
+                "governed GP requires a positive expansion budget",
+            ));
+        }
+        if self.budget.max_seconds != 0 {
+            return Err(DomainError::InvalidCexGpPolicy(
+                "governed GP cannot depend on a wall-clock budget",
+            ));
+        }
+        let mut event_domain = None;
         for field in &self.admitted_fields {
-            validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(field.clone())))?;
+            let capability =
+                validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(field.clone())))?;
+            if event_domain.is_some_and(|domain| domain != capability.event_domain) {
+                return Err(DomainError::InvalidCexGpPolicy(
+                    "governed GP fields span live event domains",
+                ));
+            }
+            event_domain = Some(capability.event_domain);
         }
         Ok(())
     }
@@ -3988,6 +4007,35 @@ mod tests {
                 .unwrap(),
             )
             .is_err());
+
+        assert!(CexGpPolicyV1::controlled_v1(
+            "mixed-domain-policy",
+            vec!["book_imbalance".to_string(), "close".to_string()],
+            7,
+            &policy.budget,
+        )
+        .is_err());
+
+        let mut no_expansions = policy.budget.clone();
+        no_expansions.max_expansions = 0;
+        no_expansions.max_seconds = 1;
+        assert!(CexGpPolicyV1::controlled_v1(
+            "no-expansion-policy",
+            vec!["book_imbalance".to_string()],
+            7,
+            &no_expansions,
+        )
+        .is_err());
+
+        let mut wall_clock = policy.budget.clone();
+        wall_clock.max_seconds = 1;
+        assert!(CexGpPolicyV1::controlled_v1(
+            "wall-clock-policy",
+            vec!["book_imbalance".to_string()],
+            7,
+            &wall_clock,
+        )
+        .is_err());
     }
 
     #[test]
