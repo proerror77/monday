@@ -1274,35 +1274,58 @@ impl TapeWriter {
             return Ok(());
         }
         let target_hour = hour_key(now);
-        let size_capped = self.tape_max_bytes > 0 && self.tape_bytes >= self.tape_max_bytes;
-        if size_capped || self.hour.as_ref().is_some_and(|hour| hour != &target_hour) {
+        if self.hour.as_ref().is_some_and(|hour| hour != &target_hour) {
             self.rotate(now)?;
         }
-        let start_hour = self.hour.clone();
-        let start_sequence = self.sequence;
-        let start_tape_bytes = self.tape_bytes;
-        let start_offset = self
+        let mut start_hour = self.hour.clone();
+        let mut start_sequence = self.sequence;
+        let mut start_tape_bytes = self.tape_bytes;
+        let mut start_offset = self
             .file
             .as_ref()
             .context("active tape is closed")?
             .metadata()?
             .len();
-        self.hour = Some(target_hour);
+        self.hour = Some(target_hour.clone());
         let recorded_at = iso_z(now);
         let result = (|| -> Result<()> {
-            let file = self.file.as_mut().context("active tape is closed")?;
             for update in updates {
                 let update = update?;
-                let mut encoded = serde_json::to_vec(&json!({
-                    "sequence": self.sequence,
-                    "recorded_at": recorded_at,
-                    "update": update,
-                }))?;
-                encoded.push(b'\n');
+                let encode = |sequence: u64| -> Result<Vec<u8>> {
+                    let mut encoded = serde_json::to_vec(&json!({
+                        "sequence": sequence,
+                        "recorded_at": recorded_at,
+                        "update": update,
+                    }))?;
+                    encoded.push(b'\n');
+                    Ok(encoded)
+                };
+                let mut encoded = encode(self.sequence)?;
+                // Enforce the cap per record so one replayed cycle cannot
+                // overshoot it: rotate before the record that would cross the
+                // cap. An empty tape always accepts its first record.
+                if self.tape_max_bytes > 0
+                    && self.tape_bytes > 0
+                    && self.tape_bytes.saturating_add(u64::try_from(encoded.len())?)
+                        > self.tape_max_bytes
+                {
+                    self.rotate(now)?;
+                    encoded = encode(self.sequence)?;
+                    // The rotated tape is published; the rollback anchor moves
+                    // to the fresh segment so a later failure never truncates
+                    // across the rotation boundary.
+                    start_hour = None;
+                    start_sequence = 0;
+                    start_tape_bytes = 0;
+                    start_offset = 0;
+                    self.hour = Some(target_hour.clone());
+                }
+                let file = self.file.as_mut().context("active tape is closed")?;
                 file.write_all(&encoded)?;
                 self.sequence += 1;
                 self.tape_bytes += u64::try_from(encoded.len())?;
             }
+            let file = self.file.as_mut().context("active tape is closed")?;
             sync(file)?;
             release_clean_file_cache(file)?;
             Ok(())
@@ -5184,6 +5207,49 @@ mod tests {
                 .unwrap();
         assert_eq!(active["sequence"], 0);
         assert_eq!(active["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn size_cap_rotates_mid_batch_without_losing_or_duplicating_records() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let payload = "x".repeat(600_000);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        // One batch crosses the cap on its second record: the first record
+        // stays on the old tape, the rest land on the fresh tape in order.
+        writer
+            .write_updates(
+                &[
+                    json!({"kind": "first", "payload": payload}),
+                    json!({"kind": "second", "payload": payload}),
+                    json!({"kind": "third"}),
+                ],
+                now,
+            )
+            .unwrap();
+        assert!(!writer.needs_hour_context(now));
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let first_tape = fs::read_to_string(&rotated[0]).unwrap();
+        let first_rows = first_tape.lines().collect::<Vec<_>>();
+        assert_eq!(first_rows.len(), 1);
+        let first_row: Value = serde_json::from_str(first_rows[0]).unwrap();
+        assert_eq!(first_row["sequence"], 0);
+        assert_eq!(first_row["update"]["kind"], "first");
+
+        let active = fs::read_to_string(root.path().join(ACTIVE_TAPE)).unwrap();
+        let active_rows = active
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"]["kind"], "second");
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"]["kind"], "third");
     }
 
     #[test]
