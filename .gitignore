@@ -75,6 +75,9 @@ market_data.jsonl
 training_report_*.json
 backtest_report_*.json
 download_log.txt
+/aliyun_ecs_cost_report_20251005.txt
+/aliyun_ecs_detailed_report_20251005.txt
+/screenshot.webp
 
 # Environment files
 .env
