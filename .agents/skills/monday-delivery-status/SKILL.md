@@ -18,11 +18,11 @@ Produce a read-only status report. Never infer a later state from an earlier one
 
 ## State contract
 
-- **Code**: exact commit exists and focused local validation is known.
+- **Code**: exact commit exists and focused local validation passed; any failed focused check makes this state `failed`.
 - **CI**: required checks for that exact PR head finished successfully.
 - **Merge**: GitHub reports the exact head merged into the intended base.
 - **Release**: an artifact or image exists and its immutable identity matches the merged commit.
-- **Runtime**: the intended environment runs that immutable identity with the intended configuration.
+- **Runtime**: the intended environment runs that immutable identity with the intended configuration and passing health checks.
 - **Readback**: an independent query observes the expected terminal output or service behavior from the same deployed immutable identity and configuration.
 
 Do not collapse runner outages, code failures, mergeability, approval, deployment, or runtime health into one "CI failed" or "done" result.

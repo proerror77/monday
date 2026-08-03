@@ -11,14 +11,15 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 1. From the repository, run `.github/scripts/agent-worktree-preflight.sh report`.
 2. Read `git worktree list --porcelain` and preserve each exact path, branch or detached `HEAD`, and Git's `prunable` marker.
-3. For every dirty entry, report changed and untracked paths without modifying them.
-4. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
-5. Classify:
+3. Enumerate local branches with `git for-each-ref refs/heads` and report branches not attached to any worktree separately.
+4. For every dirty entry, report changed and untracked paths without modifying them.
+5. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
+6. Classify worktrees exactly once, using the preflight report as authoritative:
    - `active`: registered, clean, and not Git-prunable;
    - `dirty`: tracked or untracked changes exist;
    - `prunable`: Git itself marks the administrative worktree record prunable.
    Record ownership or session use only in `Owner/use`; it never changes `State`.
-6. Keep `cleanup-safe` separate from those three states. It requires explicit user authorization plus clean state, no unpushed work, resolved PR disposition, no active owner/session, and a recorded recovery identity.
+7. Keep `cleanup-safe` separate from those three states. It requires explicit user authorization plus clean state, no unpushed work, resolved PR disposition, no active owner/session, and a recorded recovery identity.
 
 ## Stop conditions
 
@@ -30,4 +31,5 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 Return totals for `active`, `dirty`, and `prunable`, followed by:
 `Path | Branch/HEAD | State | Dirty/unpushed | PR | Owner/use | Cleanup safety | Reason`.
+Then list unattached branches as `Branch | HEAD | Upstream/unpushed | PR | Owner/use | Cleanup safety | Reason`.
 List only evidence-backed cleanup candidates in a separate final section; do not recommend deletion without an exact authorized path list.

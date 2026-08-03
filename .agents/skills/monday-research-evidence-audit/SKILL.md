@@ -12,12 +12,13 @@ Audit existing evidence only. Do not collect data, run evaluation, publish resul
 1. Name one research contract, venue/instrument, time window, and expected terminal artifact.
 2. Follow immutable identities through every stage:
    - authenticated input manifest and source digest;
+   - venue admission or verifier receipt and ready-catalog identity when required;
    - cohort/partition and `ResearchSnapshot` digest;
-   - admitted typed Mission and policy/configuration digest;
-   - evaluator or MCTS run identity and terminal result;
+   - admitted typed Mission, policy/configuration digest, and selected evaluator repository/binary/OCI identity;
+   - evaluator or MCTS run identity, receipt-bound runtime identity, terminal result, and sealed-holdout isolation evidence;
    - immutable result bundle and checksum;
    - independent OSS or artifact-store readback of the same bytes and checksum.
-3. At each boundary, compare both the referenced identity and the actual content. Record `passed`, `missing`, `mismatch`, `stale`, or `not applicable`.
+3. At each boundary, compare both the referenced identity and the actual content. Record `passed`, `missing`, `mismatch`, `stale`, `unknown`, or `not applicable`. Use `unknown` for authentication, network, permission, or other observability gaps; reserve `missing` for verified absence.
 4. Check that fixtures, synthetic substitutes, unrelated collector health, CI success, and preparation logs are not being used as terminal research evidence.
 5. The overall result passes only when every required boundary passes for the same contract and window.
 
@@ -34,5 +35,5 @@ Stop following a branch when an identity breaks or cannot be read back. Continue
 
 ## Output
 
-Return `Stage | Result | Expected identity | Observed identity | Evidence | Gap` for the six stages above.
+Return `Stage | Result | Expected identity | Observed identity | Evidence | Gap` for the seven stages above.
 End with `Overall: passed` or `Overall: incomplete`, followed by the earliest broken boundary and the smallest read-only check needed next.
