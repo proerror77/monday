@@ -1,5 +1,6 @@
 //! Persistent, budgeted AutoResearch mission kernel.
 
+pub mod baselines;
 pub mod engines;
 pub mod evaluation;
 pub mod formula_evaluator;

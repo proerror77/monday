@@ -5,6 +5,7 @@ mod offline_rl;
 
 use hft_search_kernel::DeterministicRng;
 
+pub(crate) use bayesian::solve;
 pub use bayesian::BayesianOptimizerEngine;
 pub use gp::GeneticProgrammingEngine;
 pub use mcts::{CexMctsSearchIdentityV1, MctsEngine, MctsNodeSnapshot, MCTS_CHECKPOINT_VERSION};

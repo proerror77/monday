@@ -197,6 +197,17 @@ impl FormulaEvaluator {
         )
     }
 
+    pub(crate) fn evaluate_signals(
+        &self,
+        rows: &[ResearchRow],
+        signals: &[f64],
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+        evaluator_version: &str,
+        protocol: &EvaluationProtocolV1,
+    ) -> Result<CandidateEvaluation, String> {
+        self.evaluate_ranges(rows, signals, ranges, evaluator_version, protocol)
+    }
+
     pub fn evaluate_sealed(
         &self,
         proposal: &EngineProposal,
@@ -443,7 +454,7 @@ fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
     }
 }
 
-fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<f64>, String> {
+pub(crate) fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<f64>, String> {
     match ast {
         FactorAst::Terminal(FactorTerminal::Field(field)) if field == "signal" => {
             Ok(rows.iter().map(|row| row.signal).collect())
