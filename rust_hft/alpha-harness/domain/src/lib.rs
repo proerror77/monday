@@ -1537,6 +1537,11 @@ pub enum CexFactorScreeningVerdictV1 {
 #[serde(rename_all = "snake_case")]
 pub enum CexFactorRejectionCodeV1 {
     ScreeningFailed,
+    CoverageGateFailed,
+    PredictiveGateFailed,
+    TradingGateFailed,
+    CapacityGateFailed,
+    MultipleTestingGateFailed,
     DuplicateCandidate,
     EvaluationFailed,
     EngineFailure,
@@ -1559,6 +1564,7 @@ pub struct CexFactorScreeningAttemptV1 {
 #[serde(rename_all = "snake_case")]
 pub enum CexFactorOrientationV1 {
     Positive,
+    Negative,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1737,6 +1743,70 @@ pub struct CexFactorEvaluationEvidenceV2 {
     pub evidence: CandidateEvaluation,
 }
 
+impl CexFactorEvaluationEvidenceV2 {
+    pub fn rejection_codes(&self) -> Result<Vec<CexFactorRejectionCodeV1>, DomainError> {
+        self.evidence.validate()?;
+        if self.evidence.passed {
+            return Ok(vec![]);
+        }
+        let config = self.evidence.formula_config()?;
+        let (protocol, _) = self.evidence.protocol_binding()?;
+        let metrics = &self.evidence.metrics;
+        let mut codes = Vec::new();
+        if metrics
+            .folds
+            .iter()
+            .any(|fold| fold.row_count < config.min_validation_rows)
+        {
+            codes.push(CexFactorRejectionCodeV1::CoverageGateFailed);
+        }
+        if !metrics.predictive.passes(&config, true) {
+            codes.push(CexFactorRejectionCodeV1::PredictiveGateFailed);
+        }
+        if metrics.folds.iter().any(|fold| {
+            fold.trade_count < config.min_trades
+                || fold.mean_net_return <= config.min_fold_mean_return
+                || fold.max_drawdown > config.max_drawdown
+        }) {
+            codes.push(CexFactorRejectionCodeV1::TradingGateFailed);
+        }
+        if protocol.costs.capacity_enabled()
+            && metrics.folds.iter().any(|fold| {
+                fold.max_book_depth_fraction
+                    .is_none_or(|fraction| fraction > protocol.costs.max_book_depth_fraction)
+            })
+        {
+            codes.push(CexFactorRejectionCodeV1::CapacityGateFailed);
+        }
+        if metrics.adjusted_score < config.min_aggregate_score {
+            codes.push(CexFactorRejectionCodeV1::MultipleTestingGateFailed);
+        }
+        if codes.is_empty() {
+            return Err(DomainError::InvalidCexFactorBank(
+                "failed evaluation has no structured screening rejection",
+            ));
+        }
+        Ok(codes)
+    }
+
+    fn orientation(&self) -> Result<CexFactorOrientationV1, DomainError> {
+        self.evidence.validate()?;
+        let predictive = &self.evidence.metrics.predictive;
+        let signed_ic = predictive
+            .time_series_rank_ic
+            .filter(|value| *value != 0.0)
+            .or_else(|| predictive.time_series_ic.filter(|value| *value != 0.0))
+            .ok_or(DomainError::InvalidCexFactorBank(
+                "accepted factor orientation is not identified by predictive evidence",
+            ))?;
+        Ok(if signed_ic.is_sign_positive() {
+            CexFactorOrientationV1::Positive
+        } else {
+            CexFactorOrientationV1::Negative
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFactorScreeningAttemptV2 {
@@ -1779,15 +1849,24 @@ impl CexFactorBankRevisionV2 {
         let entries = attempts
             .iter()
             .filter(|attempt| attempt.verdict == CexFactorScreeningVerdictV1::Accepted)
-            .map(|attempt| CexFactorBankEntryV1 {
-                factor_id: format!("cex-factor-{}", attempt.ast_sha256),
-                candidate_id: attempt.candidate_id.clone(),
-                canonical_ast: attempt.canonical_ast.clone(),
-                ast_sha256: attempt.ast_sha256.clone(),
-                orientation: CexFactorOrientationV1::Positive,
-                source_features: factor_ast_source_features(&attempt.canonical_ast),
+            .map(|attempt| {
+                let orientation = attempt
+                    .evaluation
+                    .as_ref()
+                    .ok_or(DomainError::InvalidCexFactorBank(
+                        "accepted factor is missing evaluation evidence",
+                    ))?
+                    .orientation()?;
+                Ok(CexFactorBankEntryV1 {
+                    factor_id: format!("cex-factor-{}", attempt.ast_sha256),
+                    candidate_id: attempt.candidate_id.clone(),
+                    canonical_ast: attempt.canonical_ast.clone(),
+                    ast_sha256: attempt.ast_sha256.clone(),
+                    orientation,
+                    source_features: factor_ast_source_features(&attempt.canonical_ast),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, DomainError>>()?;
         let mut revision = Self {
             schema_version: CEX_FACTOR_BANK_SCHEMA_V2.to_string(),
             revision_id: String::new(),
@@ -1823,6 +1902,7 @@ impl CexFactorBankRevisionV2 {
         let mut candidate_ids = BTreeSet::new();
         let mut accepted_ids = BTreeSet::new();
         let mut accepted_asts = BTreeSet::new();
+        let mut accepted_orientations = BTreeMap::new();
         for attempt in &self.attempts {
             if attempt.candidate_id.trim().is_empty()
                 || self
@@ -1857,13 +1937,33 @@ impl CexFactorBankRevisionV2 {
                     ));
                 }
             }
+            let derived_rejection_codes = attempt
+                .evaluation
+                .as_ref()
+                .map(CexFactorEvaluationEvidenceV2::rejection_codes)
+                .transpose()?;
+            let accepted_codes_are_bound = derived_rejection_codes
+                .as_ref()
+                .is_some_and(|codes| codes.is_empty() && attempt.rejection_codes == *codes);
+            let rejected_codes_are_bound = match &derived_rejection_codes {
+                Some(codes) => !codes.is_empty() && attempt.rejection_codes == *codes,
+                None => {
+                    attempt.rejection_codes.len() == 1
+                        && matches!(
+                            attempt.rejection_codes[0],
+                            CexFactorRejectionCodeV1::DuplicateCandidate
+                                | CexFactorRejectionCodeV1::EvaluationFailed
+                                | CexFactorRejectionCodeV1::EngineFailure
+                        )
+                }
+            };
             match attempt.verdict {
                 CexFactorScreeningVerdictV1::Accepted
                     if attempt
                         .evaluation
                         .as_ref()
                         .is_some_and(|value| value.evidence.passed)
-                        && attempt.rejection_codes.is_empty()
+                        && accepted_codes_are_bound
                         && attempt.rejection_details.is_empty()
                         && attempt.post_warmup_coverage_rows > 0 =>
                 {
@@ -1873,9 +1973,17 @@ impl CexFactorBankRevisionV2 {
                         ));
                     }
                     accepted_ids.insert(attempt.candidate_id.as_str());
+                    accepted_orientations.insert(
+                        attempt.candidate_id.as_str(),
+                        attempt
+                            .evaluation
+                            .as_ref()
+                            .expect("accepted evidence was checked by the match guard")
+                            .orientation()?,
+                    );
                 }
                 CexFactorScreeningVerdictV1::Rejected
-                    if !attempt.rejection_codes.is_empty()
+                    if rejected_codes_are_bound
                         && !attempt.rejection_details.is_empty()
                         && attempt
                             .rejection_details
@@ -1908,6 +2016,10 @@ impl CexFactorBankRevisionV2 {
             || self.entries.iter().any(|entry| {
                 !factor_ids.insert(entry.factor_id.as_str())
                     || !accepted_ids.contains(entry.candidate_id.as_str())
+                    || accepted_orientations
+                        .get(entry.candidate_id.as_str())
+                        .copied()
+                        != Some(entry.orientation)
                     || entry.factor_id != format!("cex-factor-{}", entry.ast_sha256)
                     || entry.source_features != factor_ast_source_features(&entry.canonical_ast)
                     || self.attempts.iter().all(|attempt| {
@@ -4259,6 +4371,34 @@ mod tests {
     #[test]
     fn factor_bank_entry_bindings_fail_closed_when_rehashed() {
         let original = factor_bank();
+        assert_eq!(
+            original.entries[0].orientation,
+            CexFactorOrientationV1::Positive
+        );
+        let mut wrong_orientation = original.clone();
+        wrong_orientation.entries[0].orientation = CexFactorOrientationV1::Negative;
+        rebind_factor_bank(&mut wrong_orientation);
+        assert!(wrong_orientation.validate().is_err());
+
+        let mut rejected = original.clone();
+        let evaluation = rejected.attempts[0].evaluation.as_mut().unwrap();
+        let mut config = evaluation.evidence.formula_config().unwrap();
+        config.min_aggregate_score = 10.0;
+        evaluation.evidence.evaluator_config = serde_json::to_value(&config).unwrap();
+        evaluation.evidence.passed = false;
+        evaluation.evidence.failure_reasons = vec!["adjusted score rejected".to_string()];
+        rejected.screening_policy.content_sha256 = canonical_json_hash(&config).unwrap();
+        rejected.attempts[0].verdict = CexFactorScreeningVerdictV1::Rejected;
+        rejected.attempts[0].rejection_codes =
+            vec![CexFactorRejectionCodeV1::MultipleTestingGateFailed];
+        rejected.attempts[0].rejection_details = vec!["adjusted score rejected".to_string()];
+        rejected.entries.clear();
+        rebind_factor_bank(&mut rejected);
+        rejected.validate().unwrap();
+        rejected.attempts[0].rejection_codes = vec![CexFactorRejectionCodeV1::ScreeningFailed];
+        rebind_factor_bank(&mut rejected);
+        assert!(rejected.validate().is_err());
+
         let mut forged_id = original.clone();
         forged_id.entries[0].factor_id = "forged".to_string();
         rebind_factor_bank(&mut forged_id);
