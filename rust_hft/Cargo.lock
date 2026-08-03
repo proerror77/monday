@@ -4924,6 +4924,7 @@ dependencies = [
  "hft-data",
  "itertools 0.12.1",
  "ordered-float 3.9.2",
+ "parquet",
  "serde",
  "serde_json",
  "serde_yaml",
