@@ -670,9 +670,7 @@ where
                                     if !limit_reached && recording_error.is_none() {
                                         match writer.append(recorded_update) {
                                             Ok(AppendOutcome::Written) => {}
-                                            Ok(AppendOutcome::LimitReached) => {
-                                                limit_reached = true
-                                            }
+                                            Ok(AppendOutcome::LimitReached) => limit_reached = true,
                                             Err(error) => recording_error = Some(error),
                                         }
                                     }
