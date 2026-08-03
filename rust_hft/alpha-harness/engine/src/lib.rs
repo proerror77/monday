@@ -454,8 +454,11 @@ where
                         }
                         Err((failure_class, error)) => {
                             self.proposal_engine.abandon(&proposal);
-                            let persist_candidate =
-                                is_novel && failure_class != "live_capability_reject";
+                            let persist_candidate = (is_novel
+                                && failure_class != "live_capability_reject")
+                                || (failure_class == "duplicate_candidate"
+                                    && self.proposal_engine.kind()
+                                        == EngineKind::GeneticProgramming);
                             let candidate_id =
                                 persist_candidate.then(|| proposal.candidate_id.clone());
                             let candidate = persist_candidate
@@ -913,11 +916,12 @@ mod tests {
 
     struct FixedFormulaEngine {
         ast: FactorAst,
+        kind: EngineKind,
     }
 
     impl ProposalEngine for FixedFormulaEngine {
         fn kind(&self) -> EngineKind {
-            EngineKind::ManualSeed
+            self.kind.clone()
         }
 
         fn propose(
@@ -1512,7 +1516,10 @@ mod tests {
 
         let outcome = AutoResearchKernel::new(
             &mut store,
-            FixedFormulaEngine { ast },
+            FixedFormulaEngine {
+                ast,
+                kind: EngineKind::ManualSeed,
+            },
             CountingPassingEvaluator(evaluator_calls.clone()),
         )
         .run("mission-1", &dataset(), RunControl::default())
@@ -1532,6 +1539,45 @@ mod tests {
         assert_eq!(
             lineage.iterations[0].failure_explanation.as_deref(),
             Some("unsupported live operator: rank")
+        );
+    }
+
+    #[test]
+    fn rejected_gp_duplicates_remain_queryable() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mut mission = mission();
+        mission.search_budget.max_candidates = 2;
+        mission.completion_policy.min_kept_candidates = 2;
+        store.create_mission(&mission).unwrap();
+        let ast = FactorAst::call(
+            FactorOperator::Add,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+            ],
+        )
+        .unwrap();
+
+        AutoResearchKernel::new(
+            &mut store,
+            FixedFormulaEngine {
+                ast,
+                kind: EngineKind::GeneticProgramming,
+            },
+            PassingEvaluator,
+        )
+        .run("mission-1", &dataset(), RunControl::default())
+        .unwrap();
+
+        let lineage = store.mission_lineage("mission-1").unwrap();
+        assert_eq!(lineage.candidates.len(), 2);
+        assert_eq!(
+            lineage.iterations[1].failure_class.as_deref(),
+            Some("duplicate_candidate")
+        );
+        assert_eq!(
+            lineage.iterations[1].candidate_artifact_id.as_deref(),
+            Some("mission-1-candidate-2")
         );
     }
 
