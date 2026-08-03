@@ -18,11 +18,9 @@ use tracing::{error, info, warn};
 use crate::traits::{Feed, MarketUpdate};
 
 const FLUSH_EVERY_RECORDS: usize = 256;
-// Snapshot lifecycle state only once the writer is this close to max_bytes.
-// The margin must exceed the largest possible serialized record line
-// (production quote lines are a few KB at depth 0), so any record that can
-// trip the cap is appended on a tick where the snapshot already exists. A
-// max_bytes smaller than the margin counts as always near the cap.
+// Snapshot lifecycle state for ordinary updates only once the writer is this
+// close to max_bytes. Lifecycle boundary updates bypass the margin because
+// preparing them mutates the state that must be replayed after rotation.
 const SIZE_ROTATION_SNAPSHOT_MARGIN_BYTES: u64 = 1024 * 1024;
 
 fn rotation_path(path: &Path) -> PathBuf {
@@ -606,15 +604,26 @@ where
                 });
                 near_bytes || near_records
             });
-        let mut event_checkpoints =
-            if (rotation_due || near_size_limit) && include_event_checkpoints {
-                self.active_event_updates
-                    .iter()
-                    .map(|(event_id, update)| (event_id.clone(), update.clone()))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        let lifecycle_boundary = matches!(
+            &update,
+            MarketUpdate::EventDiscovered { .. } | MarketUpdate::EventExpired { .. }
+        );
+        let lifecycle_limit_configured = self.policy.rotate_on_limit
+            && lifecycle_boundary
+            && self.writer.as_ref().is_some_and(|writer| {
+                writer.limits.max_bytes.is_some() || writer.limits.max_records.is_some()
+            });
+        let checkpoint_snapshot_captured =
+            (rotation_due || near_size_limit || lifecycle_limit_configured)
+                && include_event_checkpoints;
+        let mut event_checkpoints = if checkpoint_snapshot_captured {
+            self.active_event_updates
+                .iter()
+                .map(|(event_id, update)| (event_id.clone(), update.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         event_checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
         let rotate_on_limit = self.policy.rotate_on_limit;
         let recorded_update = if self.writer.is_some() {
@@ -663,19 +672,21 @@ where
                             );
                             match writer.rotate() {
                                 Ok(Some(_)) => {
-                                    // LimitReached implies the writer was near
-                                    // the cap, so the pre-boundary snapshot
-                                    // exists; recompute lazily as a fail-safe
-                                    // rather than silently dropping
-                                    // checkpoints.
-                                    debug_assert!(near_size_limit);
+                                    // Lifecycle boundaries always snapshot
+                                    // before mutation. An unexpectedly large
+                                    // non-lifecycle record may cross the cap
+                                    // outside the margin; recomputing is safe
+                                    // because it did not mutate lifecycle state.
+                                    debug_assert!(
+                                        checkpoint_snapshot_captured || !lifecycle_boundary
+                                    );
                                     if include_event_checkpoints
-                                        && event_checkpoints.is_empty()
+                                        && !checkpoint_snapshot_captured
                                         && !self.active_event_updates.is_empty()
                                     {
                                         warn!(
                                             path = %writer.path.display(),
-                                            "Near-limit lifecycle snapshot missing; recomputing after the boundary update, so an expiring event may lose its checkpoint",
+                                            "Large non-lifecycle update crossed the size-rotation snapshot margin; recomputing lifecycle checkpoints",
                                         );
                                         event_checkpoints = self
                                             .active_event_updates
@@ -1415,6 +1426,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             updates[..3]
         );
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 2);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, discovered);
+        assert_eq!(second_tape[1].sequence, 1);
+        assert_eq!(second_tape[1].update, expired);
+
+        let _ = fs::remove_file(rotated[0].clone());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn oversized_expiry_crossing_snapshot_margin_keeps_its_discovered_checkpoint() {
+        let now = Utc::now();
+        let event_id = "x".repeat(1_200_000);
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: event_id.clone().into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-oversized".into(),
+            down_token: "down-oversized".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let filler = MarketUpdate::SpotPrice {
+            symbol: "s".repeat(150_000).into(),
+            price: dec!(100000),
+            ts: now + Duration::milliseconds(1),
+        };
+        let expired = MarketUpdate::EventExpired {
+            event_id: event_id.into(),
+            end_time: now + Duration::minutes(5),
+            resolved_up_won: Some(true),
+        };
+        let updates = vec![discovered.clone(), filler, expired.clone()];
+        let path = temp_log_path("recording-feed-oversized-expiry-rotation");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: None,
+                    max_bytes: Some(2_500_000),
+                },
+                rotate_on_limit: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        assert!(feed.writer.is_some());
+        drop(feed);
+
+        assert_eq!(forwarded, updates);
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
         let second_tape = recorded_updates(&path);
         assert_eq!(second_tape.len(), 2);
         assert_eq!(second_tape[0].sequence, 0);
