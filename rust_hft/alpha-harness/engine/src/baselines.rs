@@ -19,6 +19,128 @@ pub struct CexBaselineRun {
     pub gate: CexBaselineGateV1,
 }
 
+pub fn verify_cex_baseline_artifact(
+    context: &EngineContext<'_>,
+    factor_bank: &CexFactorBankRevisionV2,
+    artifact: &CexBaselineArtifactV1,
+) -> Result<(), String> {
+    artifact
+        .validate()
+        .map_err(|error| format!("baseline artifact validation failed: {error}"))?;
+    factor_bank
+        .validate()
+        .map_err(|error| format!("factor bank validation failed: {error}"))?;
+    if artifact.factor_bank_revision_id != factor_bank.revision_id
+        || artifact.research_dataset != factor_bank.research_dataset
+        || artifact.evaluation_policy != factor_bank.evaluation_policy
+        || artifact.walk_forward_partition != factor_bank.walk_forward_partition
+    {
+        return Err("baseline artifact Factor Bank binding drifted".to_string());
+    }
+    validate_context_identity(
+        context,
+        factor_bank,
+        &artifact.evaluation_policy,
+        &artifact.target,
+    )?;
+    let (factor_ids, factors) = evaluate_factor_features(context, factor_bank)?;
+    if artifact.factor_ids != factor_ids {
+        return Err("baseline artifact factor ordering drifted".to_string());
+    }
+    let features = transpose_factors(&factors, context.rows().len())?;
+    if artifact.folds.len() != context.folds().len() {
+        return Err("baseline artifact fold count drifted".to_string());
+    }
+    let labels = labels(context.rows());
+    let mut signals = vec![0.0; context.rows().len()];
+    let mut ranges = Vec::with_capacity(artifact.folds.len());
+    for (fold_index, (fold, context_fold)) in artifact.folds.iter().zip(context.folds()).enumerate()
+    {
+        let validation = fold.validation_range.start..fold.validation_range.end;
+        if fold.train_range.start != context_fold.train.start
+            || fold.train_range.end != context_fold.train.end
+            || fold.purge_range.start != context_fold.purge.start
+            || fold.purge_range.end != context_fold.purge.end
+            || fold.validation_range.start != context_fold.validation.start
+            || fold.validation_range.end != context_fold.validation.end
+            || fold.embargo_range.start != context_fold.embargo.start
+            || fold.embargo_range.end != context_fold.embargo.end
+            || validation.end > features.len()
+            || fold.predictions.len() != validation.len()
+        {
+            return Err(format!(
+                "baseline fold {} validation range drifted",
+                fold_index + 1
+            ));
+        }
+        let predictions = match &fold.model {
+            CexBaselineModelV1::Ridge { .. } => {
+                let fit = fit_ridge(
+                    &features,
+                    &labels,
+                    context_fold.train.clone(),
+                    artifact.baseline_policy.ridge_l2,
+                )?;
+                let refit_model = CexBaselineModelV1::Ridge {
+                    intercept: fit.intercept,
+                    means: fit.means.clone(),
+                    scales: fit.scales.clone(),
+                    coefficients: fit.coefficients.clone(),
+                };
+                if refit_model != fold.model {
+                    return Err(format!(
+                        "baseline fold {} Ridge model drifted",
+                        fold_index + 1
+                    ));
+                }
+                predict_fold_ridge(&fit, &features, &validation)?
+            }
+            CexBaselineModelV1::ShallowCart { .. } => {
+                let tree = fit_cart(
+                    &features,
+                    &labels,
+                    context_fold.train.clone(),
+                    artifact.baseline_policy.cart_max_depth,
+                    artifact.baseline_policy.cart_min_leaf,
+                    &factor_ids,
+                )?;
+                let refit_model = CexBaselineModelV1::ShallowCart {
+                    root: cart_node(tree.clone()),
+                };
+                if refit_model != fold.model {
+                    return Err(format!(
+                        "baseline fold {} CART model drifted",
+                        fold_index + 1
+                    ));
+                }
+                predict_fold_cart(&tree, &features, &validation)?
+            }
+        };
+        if !predictions_equal(&predictions, &fold.predictions) {
+            return Err(format!(
+                "baseline fold {} predictions drifted",
+                fold_index + 1
+            ));
+        }
+        for (index, prediction) in validation.clone().zip(predictions) {
+            signals[index] = prediction;
+        }
+        ranges.push(validation);
+    }
+    let evaluator = FormulaEvaluator::new(artifact.baseline_policy.evaluator_config.clone())?;
+    let evaluation = evaluator.evaluate_signals(
+        context.rows(),
+        &signals,
+        ranges,
+        CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+        context.protocol(),
+    )?;
+    if evaluation != artifact.evaluation {
+        return Err("baseline evaluation drifted".to_string());
+    }
+    Ok(())
+}
+
 pub fn evaluate_cex_baselines(
     context: &EngineContext<'_>,
     factor_bank: &CexFactorBankRevisionV2,
@@ -52,30 +174,7 @@ pub fn evaluate_cex_baselines(
             gate,
         });
     }
-    let mut entries = factor_bank.entries.iter().collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.factor_id.cmp(&right.factor_id));
-    let factor_ids = entries
-        .iter()
-        .map(|entry| entry.factor_id.clone())
-        .collect::<Vec<_>>();
-    let factors = entries
-        .iter()
-        .map(|entry| {
-            let mut values = evaluate_ast(&entry.canonical_ast, context.rows())?;
-            if values.iter().any(|value| !value.is_finite()) {
-                return Err(format!(
-                    "factor {} produced a non-finite value",
-                    entry.factor_id
-                ));
-            }
-            if entry.orientation == CexFactorOrientationV1::Negative {
-                for value in &mut values {
-                    *value = normalize_zero(-*value);
-                }
-            }
-            Ok(values)
-        })
-        .collect::<Result<Vec<Vec<f64>>, String>>()?;
+    let (factor_ids, factors) = evaluate_factor_features(context, factor_bank)?;
     let feature_rows = transpose_factors(&factors, context.rows().len())?;
     let ridge = fit_artifact(
         context,
@@ -169,6 +268,44 @@ fn validate_fold_range(fold: &WalkForwardFold, row_count: usize) -> Result<(), S
     Ok(())
 }
 
+fn evaluate_factor_features(
+    context: &EngineContext<'_>,
+    factor_bank: &CexFactorBankRevisionV2,
+) -> Result<(Vec<String>, Vec<Vec<f64>>), String> {
+    let mut entries = factor_bank.entries.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.factor_id.cmp(&right.factor_id));
+    let factor_ids = entries
+        .iter()
+        .map(|entry| entry.factor_id.clone())
+        .collect::<Vec<_>>();
+    let factors = evaluate_factor_features_from_entries(context, &entries)?;
+    Ok((factor_ids, factors))
+}
+
+fn evaluate_factor_features_from_entries(
+    context: &EngineContext<'_>,
+    entries: &[&alpha_domain::CexFactorBankEntryV1],
+) -> Result<Vec<Vec<f64>>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let mut values = evaluate_ast(&entry.canonical_ast, context.rows())?;
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "factor {} produced a non-finite value",
+                    entry.factor_id
+                ));
+            }
+            if entry.orientation == CexFactorOrientationV1::Negative {
+                for value in &mut values {
+                    *value = normalize_zero(-*value);
+                }
+            }
+            Ok(values)
+        })
+        .collect::<Result<Vec<Vec<f64>>, String>>()
+}
+
 fn transpose_factors(factors: &[Vec<f64>], row_count: usize) -> Result<Vec<Vec<f64>>, String> {
     if factors.is_empty() || factors.iter().any(|factor| factor.len() != row_count) {
         return Err("Factor Bank feature matrix is invalid".to_string());
@@ -259,7 +396,7 @@ fn fit_artifact(
         BaselineKind::Ridge => CexBaselineModelKindV1::Ridge,
         BaselineKind::ShallowCart => CexBaselineModelKindV1::ShallowCart,
     };
-    CexBaselineArtifactV1::new(
+    let artifact = CexBaselineArtifactV1::new(
         mission_id.to_string(),
         factor_bank.revision_id.clone(),
         factor_ids,
@@ -272,7 +409,9 @@ fn fit_artifact(
         folds,
         evaluation,
     )
-    .map_err(|error| format!("baseline artifact validation failed: {error}"))
+    .map_err(|error| format!("baseline artifact validation failed: {error}"))?;
+    verify_cex_baseline_artifact(context, factor_bank, &artifact)?;
+    Ok(artifact)
 }
 
 fn labels(rows: &[crate::evaluation::ResearchRow]) -> Vec<f64> {
@@ -308,9 +447,23 @@ fn predict_fold_cart(
         .collect()
 }
 
+fn predictions_equal(left: &[f64], right: &[f64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 fn cart_node(node: CartNode) -> CexBaselineCartNodeV1 {
     match node {
-        CartNode::Leaf { value } => CexBaselineCartNodeV1::Leaf { value },
+        CartNode::Leaf {
+            value,
+            sample_count,
+        } => CexBaselineCartNodeV1::Leaf {
+            value,
+            sample_count,
+        },
         CartNode::Split {
             feature_index,
             threshold,
@@ -337,6 +490,7 @@ pub(crate) struct RidgeFit {
 pub(crate) enum CartNode {
     Leaf {
         value: f64,
+        sample_count: usize,
     },
     Split {
         feature_index: usize,
@@ -519,6 +673,7 @@ fn fit_cart_node(
     if depth >= max_depth || indices.len() < min_leaf.saturating_mul(2) {
         return CartNode::Leaf {
             value: normalize_zero(value),
+            sample_count: indices.len(),
         };
     }
 
@@ -575,6 +730,7 @@ fn fit_cart_node(
     let Some((_, feature_index, threshold)) = best else {
         return CartNode::Leaf {
             value: normalize_zero(value),
+            sample_count: indices.len(),
         };
     };
     let (left, right): (Vec<_>, Vec<_>) = indices
@@ -629,7 +785,7 @@ pub(crate) fn predict_cart(model: &CartNode, features: &[f64]) -> Result<f64, St
         return Err("invalid CART prediction inputs".to_string());
     }
     let prediction = match model {
-        CartNode::Leaf { value } => *value,
+        CartNode::Leaf { value, .. } => *value,
         CartNode::Split {
             feature_index,
             threshold,
