@@ -1490,6 +1490,170 @@ mod tests {
     }
 
     #[test]
+    fn mission_execute_then_mcts_refuses_after_replaying_passing_baselines() {
+        let mut fixture = fixture("mcts-baseline-gate");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let db = results.join("alpha.duckdb");
+        let producer_id = fixture.mission.semantic_id().unwrap();
+        let mut store = AlphaStore::open(&db).unwrap();
+        let producer = store.get_mission(&producer_id).unwrap();
+        let gate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        assert_eq!(gate["passed"], true);
+        let gate_id = gate["gate_id"].as_str().unwrap().to_string();
+        let gate_revision = store.get_registry_revision(&gate_id).unwrap();
+        assert_eq!(gate_revision.registry_kind, "cex_baseline_gate");
+        assert_eq!(
+            gate_revision.parent_revision_id,
+            gate["factor_bank_revision_id"].as_str().map(str::to_owned)
+        );
+
+        let mut consumer = producer;
+        consumer.mission_id = format!("{producer_id}-mcts-consumer");
+        consumer.baseline_artifact_id = Some(gate_id);
+        consumer.status = MissionStatus::Pending;
+        consumer.terminal_reason = None;
+        consumer.created_at = Utc::now();
+        consumer.updated_at = consumer.created_at;
+        let consumer_id = consumer.mission_id.clone();
+        store.create_mission(&consumer).unwrap();
+        drop(store);
+
+        let args = RunMissionArgs {
+            db,
+            mission_id: consumer_id,
+            engine: EngineChoice::Mcts,
+            seed: fixture.mission.spec.search.seed,
+            feature_fields: fixture.mission.spec.feature_fields.clone(),
+            offline_trace: None,
+            max_new_iterations: Some(1),
+            dataset: DatasetArgs {
+                dataset_manifest: results.join("cex-replay-dataset-manifest.json"),
+                validation: ValidationArgs::from_protocol(
+                    &fixture.mission.spec.evaluation_protocol,
+                ),
+            },
+        };
+        let error = mission::execute_mission(&args, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Factor-Bank subset adapter (#601) is required"));
+        let store = AlphaStore::open(&args.db).unwrap();
+        assert_eq!(
+            store.get_mission(&args.mission_id).unwrap().status,
+            MissionStatus::Pending
+        );
+        assert!(store
+            .mission_lineage(&args.mission_id)
+            .unwrap()
+            .iterations
+            .is_empty());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn mcts_rejects_a_tampered_published_gate_before_transition() {
+        let mut fixture = fixture("mcts-tampered-gate");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let db = results.join("alpha.duckdb");
+        let producer_id = fixture.mission.semantic_id().unwrap();
+        let mut store = AlphaStore::open(&db).unwrap();
+        let producer = store.get_mission(&producer_id).unwrap();
+        let gate_revision = store
+            .get_registry_revision(
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(results.join("baseline-gate.json")).unwrap(),
+                )
+                .unwrap()["gate_id"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut tampered_gate: alpha_domain::CexBaselineGateV1 =
+            serde_json::from_value(gate_revision.payload.clone()).unwrap();
+        tampered_gate.policy_hash = "0".repeat(64);
+        tampered_gate.gate_id.clear();
+        tampered_gate.gate_id = format!(
+            "cex-baseline-gate-{}",
+            canonical_json_hash(&tampered_gate).unwrap()
+        );
+        tampered_gate.validate().unwrap();
+        let tampered_gate_id = tampered_gate.gate_id.clone();
+        store
+            .put_registry_revision(&alpha_store::RegistryRevision {
+                revision_id: tampered_gate_id.clone(),
+                registry_kind: gate_revision.registry_kind,
+                asset_id: gate_revision.asset_id,
+                parent_revision_id: gate_revision.parent_revision_id,
+                payload: serde_json::to_value(&tampered_gate).unwrap(),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        let mut consumer = producer;
+        consumer.mission_id = format!("{producer_id}-mcts-tampered");
+        consumer.baseline_artifact_id = Some(tampered_gate_id);
+        consumer.status = MissionStatus::Pending;
+        consumer.terminal_reason = None;
+        consumer.created_at = Utc::now();
+        consumer.updated_at = consumer.created_at;
+        let consumer_id = consumer.mission_id.clone();
+        store.create_mission(&consumer).unwrap();
+        drop(store);
+
+        let args = RunMissionArgs {
+            db,
+            mission_id: consumer_id,
+            engine: EngineChoice::Mcts,
+            seed: fixture.mission.spec.search.seed,
+            feature_fields: fixture.mission.spec.feature_fields.clone(),
+            offline_trace: None,
+            max_new_iterations: Some(1),
+            dataset: DatasetArgs {
+                dataset_manifest: results.join("cex-replay-dataset-manifest.json"),
+                validation: ValidationArgs::from_protocol(
+                    &fixture.mission.spec.evaluation_protocol,
+                ),
+            },
+        };
+        let error = mission::execute_mission(&args, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("baseline gate producer binding drifted"));
+        let store = AlphaStore::open(&args.db).unwrap();
+        assert_eq!(
+            store.get_mission(&args.mission_id).unwrap().status,
+            MissionStatus::Pending
+        );
+        assert!(store
+            .mission_lineage(&args.mission_id)
+            .unwrap()
+            .iterations
+            .is_empty());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn execute_rejects_mixed_hypothesis_targets_before_side_effects() {
         let mut fixture = fixture("mixed-hypothesis-targets");
         let mut second = fixture.mission.spec.hypotheses[0].clone();
