@@ -5175,8 +5175,11 @@ legacy_test_reference_allowlist=$(sed -n \
   printf 'Rust Fast Gates has no legacy-runtime reference allowlist\n' >&2
   exit 1
 }
+legacy_test_reference=$(grep -n -Fx \
+  "  LEGACY_EXEC='/usr/bin/pyth""on3 /opt/monday/bin/polymarket_reference_collector.py'" "$0")
+legacy_test_reference="deployment/aliyun/test-polymarket-raw-ops-control-plane.sh:$legacy_test_reference"
 printf '%s\n' \
-  "deployment/aliyun/test-polymarket-raw-ops-control-plane.sh:17:  LEGACY_EXEC='/usr/bin/pyth""on3 /opt/monday/bin/polymarket_reference_collector.py'" \
+  "$legacy_test_reference" \
   | grep -E -x "$legacy_test_reference_allowlist" >/dev/null || {
     printf 'Rust Fast Gates rejects the control-plane identity fixture\n' >&2
     exit 1
