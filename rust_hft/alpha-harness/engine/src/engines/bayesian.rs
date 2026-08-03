@@ -336,7 +336,7 @@ impl BayesianCheckpointV1 {
     }
 }
 
-fn solve(mut matrix: Vec<Vec<f64>>, mut values: Vec<f64>) -> Result<Vec<f64>, String> {
+pub(crate) fn solve(mut matrix: Vec<Vec<f64>>, mut values: Vec<f64>) -> Result<Vec<f64>, String> {
     let size = values.len();
     for pivot in 0..size {
         let best = (pivot..size)
