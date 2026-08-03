@@ -178,6 +178,11 @@ impl ProposalEngine for GeneticProgrammingEngine {
             return Err("GP expansion budget is exhausted".to_string());
         }
         let governed = self.governed_policy.is_some();
+        if let Some(policy) = &self.governed_policy {
+            let iteration = u64::try_from(iteration_index)
+                .map_err(|_| "GP iteration index exceeds the deterministic seed range")?;
+            self.rng = DeterministicRng::new(policy.seed.wrapping_add(iteration));
+        }
         let max_attempts = if governed {
             1
         } else {
@@ -333,5 +338,72 @@ mod tests {
         let left = GeneticProgrammingEngine::new_governed(policy.clone(), "mission").unwrap();
         let right = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
         assert!(!scores_change_candidates(left, right));
+    }
+
+    #[test]
+    fn governed_gp_resume_matches_the_uninterrupted_sequence() {
+        let budget = alpha_domain::SearchBudget {
+            max_candidates: 8,
+            max_expansions: 256,
+            max_tokens: 0,
+            max_seconds: 0,
+        };
+        let policy = CexGpPolicyV1::controlled_v1(
+            "policy",
+            vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+            7,
+            &budget,
+        )
+        .unwrap();
+        let dataset = super::super::test_dataset();
+        let remaining = RemainingBudget {
+            candidates: 8,
+            expansions: 256,
+            tokens: 0,
+            milliseconds: 0,
+        };
+        let mut uninterrupted =
+            GeneticProgrammingEngine::new_governed(policy.clone(), "mission").unwrap();
+        let mut history = Vec::new();
+        let mut expected = Vec::new();
+        for iteration in 1..=4 {
+            let proposal = uninterrupted
+                .propose(
+                    "mission",
+                    iteration,
+                    &dataset.proposal_context(),
+                    &remaining,
+                )
+                .unwrap();
+            let evaluation = evaluation(1.0);
+            uninterrupted.observe(&proposal, &evaluation);
+            if iteration <= 2 {
+                history.push(HistoricalObservation {
+                    proposal,
+                    evaluation,
+                });
+            } else {
+                expected.push(proposal.artifact);
+            }
+        }
+
+        let mut resumed = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+        resumed.restore(&history).unwrap();
+        let actual = (3..=4)
+            .map(|iteration| {
+                let proposal = resumed
+                    .propose(
+                        "mission",
+                        iteration,
+                        &dataset.proposal_context(),
+                        &remaining,
+                    )
+                    .unwrap();
+                resumed.observe(&proposal, &evaluation(1.0));
+                proposal.artifact
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 }
