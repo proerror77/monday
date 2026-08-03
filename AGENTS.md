@@ -1,163 +1,77 @@
 # Monday Agent Instructions
 
-## Working Defaults
+## Mission and authority
 
-- Work autonomously on clear, reversible tasks. Ask only before a destructive,
-  irreversible, or genuinely ambiguous action.
-- Verify claims from repository, runtime, or deployed-state evidence. Preserve
-  unrelated user changes.
-- Prefer the installed Matt Pocock engineering skills. Use the narrowest match:
-  `to-prd` for product definition, `triage` for intake, `diagnosing-bugs` for
-  root cause, `tdd` for behavior changes, `implement` for an approved change,
-  and `code-review` before merge.
-- Do not default to Superpowers or require the user to name a Matt skill. Use
-  another installed skill only when it more directly matches the request or the
-  user explicitly asks for that workflow.
+- Monday is one Rust-first, multi-venue system. Research lives in
+  `rust_hft/alpha-harness`, acquisition in `rust_hft/tools/collector`, prediction
+  markets in `rust_hft/prediction-markets`, and runtime/risk/execution in
+  `rust_hft/apps/live`, `rust_hft/risk-control`, and `rust_hft/execution-gateway`.
+- Research may emit typed candidates and signed deployment envelopes. It may not
+  submit orders, change risk limits, or resume a paused runtime. Live stays
+  disabled until a separately reviewed runtime contract proves every gate.
+- Follow the nearest nested `AGENTS.md`; prediction-market work also follows
+  `rust_hft/prediction-markets/AGENTS.md`.
 
-## Mandatory Matt Engineering Flow
+## Fast workflow
 
-Every development request must explicitly enter through the appropriate Matt
-Pocock skill before code, deployment configuration, or runtime changes begin.
-Do not treat a long conversation, a TODO list, or a dirty worktree as a
-substitute for a scoped work item.
+- Work autonomously on clear, reversible tasks. Preserve unrelated user changes;
+  ask only before destructive, irreversible, or genuinely ambiguous actions.
+- Use the lightest workflow that preserves evidence:
+  - Read-only/status: inspect and answer directly; no PRD, issue, branch, or worktree.
+  - Small specified change: no PRD or issue; focused failing check, minimum patch,
+    focused validation, then diff review.
+  - Defect or runtime drift: use `diagnosing-bugs` to prove the cause first.
+  - Multi-step or multi-session outcome: use `to-prd`, then `to-issues`.
+  - Approved issue: use `implement`, which drives `tdd`, then `code-review`.
+- Prefer the narrowest applicable Matt Pocock skill. Use another skill only when
+  it fits better or the user asks for it.
 
-- For a multi-step or multi-session outcome, first use `to-prd`, then
-  `to-issues`; each issue gets its own branch, change contract, acceptance
-  evidence, and out-of-scope boundary.
-- For an approved issue, use `implement`, which drives `tdd`, then finish with
-  `code-review` before commit or PR.
-- For an incoming report, use `triage`; for a defect or runtime drift, use
-  `diagnosing-bugs` to establish a focused failing proof before proposing a
-  fix.
-- For a small, already-specified behavior change, use `tdd` directly; state
-  why a PRD is unnecessary in the PR description.
-- Before starting a new issue, re-state the current PRD/issue contract and
-  stop if the requested work would add a different behavior, trust domain, or
-  rollout unit. Create or update the relevant issue instead of extending the
-  active one.
+## Durable guards from repeated failures
 
-### GitHub Issue Lifecycle
+- Refresh `origin/main` and live GitHub/runtime state before claims or new work.
+  A local checkout, old green run, or screen view is not current truth.
+- Keep Code, CI, merge, release, runtime, and readback as separate states. Claim
+  only the latest state backed by an exact SHA/digest and direct readback.
+- One change is one independently testable and rollbackable behavior. Do not mix
+  Research, Governance, and Runtime. Keep collector deployment, cohort/snapshot,
+  evaluator/MCTS, and result publication as separate rollout units.
+- Never replace missing real data with fixtures, fabricate completeness, weaken a
+  fail-closed gate, or call a successful preparation step terminal evidence.
+- Publishing an issue, PR, artifact, image, or job is not completion. Read back
+  its relationships, checks, immutable identity, terminal result, and output.
 
-- GitHub issue metadata is authoritative. Local PRD/epic files may add context
-  but must not gate issue status, close, or reopen operations.
-- Publish issue bodies through `--body-file`; do not encode multiline Markdown
-  as escaped shell text. Every issue must have exactly one category (`bug` or
-  `enhancement`) and one triage state. Use `tracking` for PRD/parent issues and
-  `runtime` for contracts that require live mutation or evidence.
-- Record parent/sub-issue and blocked-by relationships with GitHub's native
-  issue relationships. Prose sections remain readable summaries, not the
-  dependency source of truth.
-- Partial or stacked work uses `Refs #N`. Only a PR targeting `main` that
-  completes the whole code contract may use `Closes #N`. The same restriction
-  applies to the `close`, `fix`, and `resolve` keyword families in commit
-  messages.
-- A `runtime` or `tracking` issue is never closed by a PR. Runtime closure
-  requires target, controller, candidate/configuration, rollback, stop-rule,
-  result, and cleanup evidence. Parent closure requires a separate acceptance
-  audit after its final direct sub-issue closes.
+## Scope and ownership
 
-For the Polymarket research lane specifically, collector deployment, cohort and
-snapshot construction, evaluator/MCTS execution, and result publication are
-separate issues. A deployment gate must not become an excuse to modify research
-logic, and a research issue must not change a production collector.
+- One active contract has one writer and one writable branch/worktree; when
+  published, it has one PR. Reuse a clean, owned worktree only for the same
+  contract; otherwise create a recorded `codex/<slug>` worktree from the base SHA.
+- Record `agent-worktree.yml`. Before edits, commits, rebases, pushes, or merges,
+  re-read branch, `HEAD`, status, and PR head; stop on movement or overlapping ownership.
+- Do not delete branches or worktrees without explicit authorization and exact
+  checks for dirty files, unpushed commits, PR state, and active ownership.
+- A PR is one behavior and rollback unit. Use the PR template. At 25 changed files
+  or 750 non-generated lines, split unless a named reviewer approves an atomic exception.
+- GitHub metadata is authoritative. Follow `docs/agents/issue-tracker.md`, issue
+  templates, lifecycle checks, and `/pm:issue-close`. Runtime/tracking issues
+  close from their own evidence, never from a PR.
+- Runtime, deployment, and collector cutovers require one named controller,
+  exact target/candidate/configuration/rollback identities, stop rules, and readback.
 
-## Karpathy-Inspired Coding Principles
+## Focused validation
 
-- **Think Before Coding.** State material assumptions explicitly. When ambiguity
-  would change behavior or scope, present the plausible interpretations and ask
-  rather than choosing silently. Surface tradeoffs and push back when a simpler
-  approach is sufficient.
-- **Simplicity First.** Prefer the minimum code that solves the requested
-  problem. Do not add speculative features, single-use abstractions,
-  unrequested flexibility, or handling for scenarios excluded by proven
-  invariants. Never simplify away validation, security, data-loss prevention,
-  or other trust-boundary checks.
-- **Surgical Changes.** Every changed line must trace to the request. Match the
-  existing style; do not refactor, reformat, or remove unrelated code. Remove
-  only the imports, variables, or functions made obsolete by the current change.
-- **Goal-Driven Execution.** Define success criteria before non-trivial work;
-  reproduce bugs with a focused test, preserve before/after checks for
-  refactors, and loop until focused validation passes. For multi-step work, use
-  a brief `step -> verification` plan.
+- Run the smallest check that can disprove the change, then the owning crate or
+  workflow check. Do not compile the full workspace for ordinary changes.
+- From `rust_hft/`, use `cargo test -p <changed-crate> --locked` and scoped Clippy.
+  Run `cargo metadata --locked --no-deps` only after workspace-graph changes.
+- For instruction, workflow, or shell changes, run `git diff --check` plus the
+  closest contract test. Run `.github/scripts/agent-worktree-preflight.sh` in a
+  managed worktree. Report unrelated or unavailable checks separately.
 
-## Pull Request Scope Guardrail
+## Repeated workflows become skills
 
-A pull request is one behavior contract and one rollout/rollback unit. Do not
-combine independently reviewable work merely because it shares a broad goal.
-
-Before opening a PR, record in its description a one-sentence change contract,
-its acceptance evidence, and explicit out-of-scope work. Split the work when
-any of these is true:
-
-- it crosses trust domains (Research, Governance, Runtime) without one
-  inseparable end-to-end contract;
-- a collector/data contract, execution/risk policy, readiness/deployment, or
-  promotion rule can be merged, reverted, or tested independently;
-- it needs different reviewers or has more than one separately testable
-  failure mode;
-- it would exceed an available review-tool limit. Confirm that limit before
-  opening the PR and keep below it.
-
-At 25 changed files or 750 non-generated lines, stop and assess a split. Split
-unless an inseparable end-to-end safety contract requires atomic delivery. An
-atomic exception needs an explicitly named reviewer approval and must explain
-why each part cannot be safely merged and rolled back on its own.
-
-Use a stacked PR only for a real dependency. State its base PR and merge order.
-After each layer's base is merged, that layer must compile and remain
-fail-closed on its own; otherwise keep the inseparable safety contract atomic.
-Put review fixes in the focused PR that owns the behavior; do not append them
-to an unrelated umbrella branch. Keep lockfiles, generated artifacts, and
-mechanical renames with the PR that requires them.
-
-Every PR description must include: change contract, out of scope, dependency
-or merge order, focused validation, and rollout/rollback impact; write `None`
-where a field does not apply. A safety boundary needs a targeted counterexample
-test, not only workspace compilation.
-
-## Concurrent Work Control
-
-- A section, issue, and PR are one independently mergeable and rollbackable
-  behavior contract unless a declared stacked dependency says otherwise.
-- Before any write for a new contract, create a dedicated worktree under
-  `.worktrees/codex/<slug>` using approved worktree tooling. Use a
-  `codex/<slug>` branch from the declared integration base; record the exact
-  base SHA rather than assuming `main` is the correct base.
-- Before delegation, record the contract, write owner, worktree path, branch,
-  base SHA, allowed files, and declared dependency. Do not share a writable
-  worktree between agents, even when their file lists do not overlap.
-- Store that record in the worktree-private path returned by
-  `git rev-parse --git-path agent-worktree.yml`; it must not be committed or
-  replace the shared policy documents.
-- A worktree status report must distinguish active, dirty, and prunable
-  entries. Removing a worktree or branch requires explicit user authorization.
-- Each branch, worktree, and PR has exactly one write owner at a time. Record
-  the owner and current head before delegating; reviewers and researchers are
-  read-only unless ownership is explicitly transferred.
-- Before every edit, commit, push, rebase, or merge, re-read the branch name,
-  `HEAD`, worktree status, and PR head. Stop if any value moved unexpectedly;
-  never absorb an unexplained concurrent change into the current PR.
-- Do not run writable agents on overlapping files or the same dependency lane.
-  A predecessor PR must merge before its dependent branch is rewritten or
-  promoted, unless the stack and merge order were declared in advance.
-- A behavior fix belongs to one PR only. Close or archive stale experiments
-  before another implementation of the same contract is promoted.
-- Runtime, deployment, and collector cutover commands require one named
-  controller. Other tasks may inspect them read-only until control is handed
-  over explicitly.
-
-## Branch and Worktree Lifecycle
-
-- Keep GitHub's `delete_branch_on_merge` enabled. After verifying a merge,
-  confirm that the remote head branch is gone; delete it manually only if
-  auto-delete did not run. Then use `git fetch --prune` to remove stale local
-  tracking refs without touching local branches or worktrees.
-- A closed-but-unmerged PR is not cleanup-safe by default. First classify it as
-  superseded, intentionally abandoned, or work to resume; only the first two
-  may be deleted with explicit authorization.
-- Before deleting a local branch or worktree, record its PR state, HEAD,
-  upstream/push state, and whether its worktree is clean. A dirty worktree
-  must be reviewed and either committed as its own contract, explicitly kept,
-  or explicitly discarded; never delete it merely to reduce branch count.
-- After a cleanup pass, report active, dirty, and prunable worktrees plus the
-  local and remote branch counts.
+- Keep this file as a router. After the same multi-step workflow succeeds twice,
+  package it as `.agents/skills/<name>/SKILL.md` instead of adding its procedure here.
+- One skill owns one job and states triggers, inputs, steps, stop conditions,
+  verification, and output. Reuse repository scripts/docs; do not copy them.
+- Validate skills manually before scheduling or write access. Runtime skills stay
+  fail-closed and never broaden user authority.
