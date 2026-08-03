@@ -4,12 +4,13 @@ use crate::{
 };
 use alpha_domain::{
     canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
-    CexFactorBankRevisionV2, CexGpPolicyV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
-    MissionStatus, ResearchMission,
+    CexBaselinePolicyV1, CexFactorBankRevisionV2, CexGpPolicyV1, CexResearchContentRefV1,
+    CexResearchMissionArtifactV1, MissionStatus, ResearchMission,
 };
 use alpha_engine::{
+    baselines::verify_cex_baseline_artifact,
     engines::{GeneticProgrammingEngine, OfflineRlEngine, OfflineTrace},
-    evaluation::prepare_dataset,
+    evaluation::{prepare_dataset, EngineContext},
     formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
     llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
@@ -114,6 +115,7 @@ fn execute_mission_inner(
         validate_mcts_baseline_gate(
             &store,
             &mission,
+            Some(&research_context),
             &research_dataset,
             &walk_forward_partition,
             &evaluation_protocol_hash,
@@ -152,6 +154,7 @@ fn execute_mission_inner(
 fn validate_mcts_baseline_gate(
     store: &AlphaStore,
     mission: &ResearchMission,
+    research_context: Option<&EngineContext<'_>>,
     research_dataset: &CexResearchContentRefV1,
     walk_forward_partition: &CexResearchContentRefV1,
     evaluation_protocol_hash: &str,
@@ -221,6 +224,9 @@ fn validate_mcts_baseline_gate(
     if control_mission.semantic_id().map_err(anyhow::Error::msg)? != gate.mission_id {
         bail!("MCTS source research mission identity drifted");
     }
+    let baseline_policy =
+        CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
+    baseline_policy.validate_binding(&control_mission.spec.policies.baseline)?;
 
     let ridge = match gate.ridge_artifact_id.as_deref() {
         Some(ridge_id) => Some(read_mcts_baseline_artifact(
@@ -229,6 +235,8 @@ fn validate_mcts_baseline_gate(
             CEX_BASELINE_RIDGE_REGISTRY_KIND,
             &factor_bank,
             &control_mission,
+            &baseline_policy,
+            research_context.context("MCTS baseline artifact verification context is missing")?,
             research_dataset,
             walk_forward_partition,
             evaluation_protocol_hash,
@@ -243,6 +251,8 @@ fn validate_mcts_baseline_gate(
             CEX_BASELINE_CART_REGISTRY_KIND,
             &factor_bank,
             &control_mission,
+            &baseline_policy,
+            research_context.context("MCTS baseline artifact verification context is missing")?,
             research_dataset,
             walk_forward_partition,
             evaluation_protocol_hash,
@@ -250,8 +260,14 @@ fn validate_mcts_baseline_gate(
         )?),
         None => None,
     };
-    gate.validate_binding(&factor_bank, ridge.as_ref(), cart.as_ref())
-        .map_err(anyhow::Error::msg)?;
+    gate.validate_binding(
+        &control_mission,
+        &baseline_policy,
+        &factor_bank,
+        ridge.as_ref(),
+        cart.as_ref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     if !gate.passed {
         bail!("MCTS baseline gate did not pass");
     }
@@ -265,6 +281,8 @@ fn read_mcts_baseline_artifact(
     registry_kind: &str,
     factor_bank: &CexFactorBankRevisionV2,
     control_mission: &CexResearchMissionArtifactV1,
+    baseline_policy: &CexBaselinePolicyV1,
+    research_context: &EngineContext<'_>,
     research_dataset: &CexResearchContentRefV1,
     walk_forward_partition: &CexResearchContentRefV1,
     evaluation_protocol_hash: &str,
@@ -283,7 +301,7 @@ fn read_mcts_baseline_artifact(
         .context("MCTS baseline artifact payload is invalid")?;
     artifact.validate().map_err(anyhow::Error::msg)?;
     artifact
-        .validate_binding(control_mission, factor_bank)
+        .validate_binding(control_mission, baseline_policy, factor_bank)
         .map_err(anyhow::Error::msg)?;
     if artifact.model_kind != model_kind
         || artifact.mission_id != control_mission.semantic_id().map_err(anyhow::Error::msg)?
@@ -295,6 +313,8 @@ fn read_mcts_baseline_artifact(
     {
         bail!("MCTS baseline artifact identity drifted");
     }
+    verify_cex_baseline_artifact(research_context, factor_bank, &artifact)
+        .map_err(anyhow::Error::msg)?;
     Ok(artifact)
 }
 
@@ -527,6 +547,7 @@ mod tests {
         let error = validate_mcts_baseline_gate(
             &store,
             &mission,
+            None,
             &reference("cex-research-dataset-1"),
             &reference("cex-walk-forward-partition-1"),
             &"b".repeat(64),
