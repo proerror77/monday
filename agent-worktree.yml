@@ -1,7 +1,7 @@
 owner: codex
-contract: cex-baseline-evidence
-base_sha: 10673253846297318ecd632fc2eb85fe02911523
-branch: codex/cex-baseline-evidence
+contract: cex-baseline-training-validation-v1
+base_sha: 2515e0bc4d202cdd695c288bf6461e344a16f1ff
+branch: codex/cex-baseline-training-validation-v1
 scope:
   - rust_hft/alpha-harness/domain
   - rust_hft/alpha-harness/app
