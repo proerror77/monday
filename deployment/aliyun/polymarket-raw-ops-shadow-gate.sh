@@ -442,6 +442,11 @@ legacy_runtime_budget_observation() {
 }
 
 verify_baseline_identity() {
+  if [[ ${baseline_recovery:-false} == true ]]; then
+    verify_contained_recovery_baseline "$recovery_json" "$candidate_sha" \
+      "$source_revision"
+    return
+  fi
   if [[ $baseline_mode == legacy_python ]]; then
     verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
     return
@@ -469,6 +474,74 @@ verify_baseline_identity() {
   printf '%s  %s\n' "$baseline_release_sha" "$baseline_release_path" \
     | sha256sum --check --strict >/dev/null || return 1
   [[ $(readlink -f -- "/proc/$legacy_pid/exe") == "$baseline_release_path" ]]
+}
+
+verify_recovery_binding() {
+  local recovery=$1 candidate=$2 source=$3
+  jq -e --arg candidate "$candidate" --arg source "$source" '
+    .mode == "gamma_tagged_500"
+    and .candidate_probe.schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    and .candidate_probe.candidate_sha256 == $candidate
+    and .candidate_probe.source_revision == $source
+    and (.candidate_probe.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and (.candidate_probe.observed_at | type == "string"
+      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    and .candidate_probe.gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+    and .candidate_probe.gamma.untagged_closed == {query:"closed=true",attempts:3,http_status:200}
+    and .candidate_probe.candidate_once.exit_status == 0
+    and (.candidate_probe.candidate_once.duration_seconds | type == "number"
+      and floor == . and . > 0 and . <= 180)
+    and .candidate_probe.candidate_once.health_updated_at == .candidate_probe.observed_at
+    and .baseline.active_state == "inactive"
+    and .baseline.main_pid == 0
+    and .baseline.exec_start == "/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200"
+    and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
+    and .baseline.drop_in_paths == []
+    and (.baseline.restarts | type == "number" and floor == . and . >= 0)
+    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
+    and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    and .baseline.binary_sha256 != $candidate
+  ' <<<"$recovery" >/dev/null
+}
+
+verify_recovery_admission() {
+  local recovery=$1 candidate=$2 source=$3 observed now age
+  verify_recovery_binding "$recovery" "$candidate" "$source" || return 1
+  observed=$(jq -er '.candidate_probe.observed_at' <<<"$recovery") || return 1
+  observed=$(date -u -d "$observed" +%s) || return 1
+  now=$(date -u +%s) || return 1
+  age=$((now - observed))
+  ((age >= 0 && age <= 900))
+}
+
+verify_contained_recovery_baseline() {
+  local recovery=$1 candidate=$2 source=$3 expected active_state main_pid
+  local exec_argv fragment drop_ins restarts invocation binary_sha unit
+  verify_recovery_binding "$recovery" "$candidate" "$source" || return 1
+  expected=$(jq -c .baseline <<<"$recovery") || return 1
+  active_state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT") || return 1
+  main_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT") || return 1
+  [[ $active_state == $(jq -er .active_state <<<"$expected") && $main_pid == 0 ]] \
+    || return 1
+  fragment=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") || return 1
+  drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT") || return 1
+  exec_argv=$(effective_exec_argv "$LEGACY_UNIT") || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT") || return 1
+  invocation=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT") || return 1
+  [[ $fragment == $(jq -er .fragment_path <<<"$expected") && -z $drop_ins \
+    && $exec_argv == $(jq -er .exec_start <<<"$expected") \
+    && $restarts == $(jq -er .restarts <<<"$expected") \
+    && $invocation == $(jq -er .invocation_id <<<"$expected") ]] || return 1
+  [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY && -x $RUST_ACTIVE_BINARY ]] \
+    || return 1
+  secure_control_file "$RUST_ACTIVE_BINARY" || return 1
+  binary_sha=$(sha256sum "$RUST_ACTIVE_BINARY" | awk '{print $1}') || return 1
+  [[ $binary_sha == $(jq -er .binary_sha256 <<<"$expected") ]] || return 1
+  for unit in polymarket-reference-upload.service polymarket-reference-upload.timer \
+    polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+    [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
+  done
 }
 
 verify_cutover_target_preflight() {
@@ -1259,63 +1332,84 @@ secure_root_chain /run/monday || die 'runtime control directory is not trusted'
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
 
-baseline_exec=$(effective_exec_argv "$LEGACY_UNIT") || \
-  die 'active reference collector has no verifiable ExecStart'
 baseline_release_path=
 baseline_release_sha=
-case "$baseline_exec" in
-  "$LEGACY_EXEC")
-    baseline_mode=legacy_python
-    baseline_label=Python
-    ;;
-  "$RUST_PRODUCTION_EXEC")
-    if [[ -L $RUST_ACTIVE_BINARY ]]; then
-      baseline_mode=rust_release
-      baseline_label='Rust production'
-      baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
-        die 'active Rust collector symlink cannot be resolved'
-      [[ $baseline_release_path =~ ^$RELEASE_ROOT/([a-f0-9]{64})/polymarket-raw-ops$ ]] \
-        || die 'active Rust collector does not resolve to an immutable release'
-      baseline_release_sha=${BASH_REMATCH[1]}
-    else
-      baseline_mode=rust_bootstrap
-      baseline_label='Rust bootstrap'
-      [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY ]] \
-        || die 'active Rust collector is neither an immutable release nor a direct bootstrap binary'
-      baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
-        die 'active Rust bootstrap binary cannot be resolved'
-      [[ $baseline_release_path == "$RUST_ACTIVE_BINARY" ]] \
-        || die 'active Rust bootstrap binary is not a direct canonical path'
-      baseline_release_sha=$(sha256sum "$baseline_release_path" | awk '{print $1}')
-      [[ $baseline_release_sha =~ ^[a-f0-9]{64}$ ]] \
-        || die 'active Rust bootstrap binary digest is invalid'
-    fi
-    [[ $candidate_sha != "$baseline_release_sha" ]] || \
-      die 'candidate digest matches the active Rust release'
-    ;;
-  *) die 'active reference collector ExecStart is not an approved baseline' ;;
-esac
 baseline_health_start_required=false
 baseline_runtime_stability_required=true
 baseline_degraded=false
-if [[ $baseline_mode == legacy_python ]]; then
-  baseline_health_start_required=$LEGACY_HEALTH_START_REQUIRED
-  baseline_runtime_stability_required=$LEGACY_RUNTIME_STABILITY_REQUIRED
-elif [[ $baseline_mode == rust_bootstrap ]]; then
-  ! verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" "$RUST_HEALTH_POLICY" \
-    || die 'healthy unregistered Rust baseline must be adopted before a normal release gate'
+baseline_recovery=false
+recovery_json=$(jq -c '.recovery // null' \
+  "$MONDAY_POLYMARKET_GATE_INVOCATION_DIR/request.json") \
+  || die 'Gate request has no valid recovery binding'
+legacy_pid=0
+legacy_restarts=0
+legacy_invocation_id=
+if [[ $recovery_json != null ]]; then
+  baseline_mode=rust_bootstrap
+  baseline_label='contained Rust bootstrap'
+  baseline_recovery=true
+  baseline_runtime_stability_required=false
   baseline_degraded=true
+  baseline_release_path=$(jq -er '.baseline.binary_path' <<<"$recovery_json")
+  baseline_release_sha=$(jq -er '.baseline.binary_sha256' <<<"$recovery_json")
+else
+  baseline_exec=$(effective_exec_argv "$LEGACY_UNIT") || \
+    die 'active reference collector has no verifiable ExecStart'
+  case "$baseline_exec" in
+    "$LEGACY_EXEC")
+      baseline_mode=legacy_python
+      baseline_label=Python
+      ;;
+    "$RUST_PRODUCTION_EXEC")
+      if [[ -L $RUST_ACTIVE_BINARY ]]; then
+        baseline_mode=rust_release
+        baseline_label='Rust production'
+        baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
+          die 'active Rust collector symlink cannot be resolved'
+        [[ $baseline_release_path =~ ^$RELEASE_ROOT/([a-f0-9]{64})/polymarket-raw-ops$ ]] \
+          || die 'active Rust collector does not resolve to an immutable release'
+        baseline_release_sha=${BASH_REMATCH[1]}
+      else
+        baseline_mode=rust_bootstrap
+        baseline_label='Rust bootstrap'
+        [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY ]] \
+          || die 'active Rust collector is neither an immutable release nor a direct bootstrap binary'
+        baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
+          die 'active Rust bootstrap binary cannot be resolved'
+        [[ $baseline_release_path == "$RUST_ACTIVE_BINARY" ]] \
+          || die 'active Rust bootstrap binary is not a direct canonical path'
+        baseline_release_sha=$(sha256sum "$baseline_release_path" | awk '{print $1}')
+        [[ $baseline_release_sha =~ ^[a-f0-9]{64}$ ]] \
+          || die 'active Rust bootstrap binary digest is invalid'
+      fi
+      [[ $candidate_sha != "$baseline_release_sha" ]] || \
+        die 'candidate digest matches the active Rust release'
+      ;;
+    *) die 'active reference collector ExecStart is not an approved baseline' ;;
+  esac
+  if [[ $baseline_mode == legacy_python ]]; then
+    baseline_health_start_required=$LEGACY_HEALTH_START_REQUIRED
+    baseline_runtime_stability_required=$LEGACY_RUNTIME_STABILITY_REQUIRED
+  elif [[ $baseline_mode == rust_bootstrap ]]; then
+    ! verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" "$RUST_HEALTH_POLICY" \
+      || die 'healthy unregistered Rust baseline must be adopted before a normal release gate'
+    baseline_degraded=true
+  fi
+  legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
+  [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
+  legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
+  [[ $legacy_restarts =~ ^[0-9]+$ ]] \
+    || die 'active legacy collector has no verifiable restart counter'
+  legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
+  [[ $legacy_invocation_id =~ ^[a-f0-9]{32}$ ]] \
+    || die 'active legacy collector has no verifiable systemd invocation ID'
 fi
-legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
-[[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
-legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
-[[ $legacy_restarts =~ ^[0-9]+$ ]] \
-  || die 'active legacy collector has no verifiable restart counter'
-legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
-[[ $legacy_invocation_id =~ ^[a-f0-9]{32}$ ]] \
-  || die 'active legacy collector has no verifiable systemd invocation ID'
+if [[ $baseline_recovery == true ]]; then
+  verify_recovery_admission "$recovery_json" "$candidate_sha" "$source_revision" \
+    || die 'contained recovery probe is stale, from the future, or does not bind the candidate'
+fi
 verify_baseline_identity \
-  || die 'active reference collector identity or restart counter is not exact'
+  || die 'reference collector recovery/baseline identity is not exact'
 ! baseline_health_requires_continuous_freshness "$baseline_mode" \
   || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
   || die 'active Rust collector health is not fresh and fail-closed clean'
@@ -1835,22 +1929,41 @@ canonical_uploaded_segments=$(jq -er \
 
 verify_baseline_identity \
   || die 'baseline collector identity changed while parity or OSS readback was running'
-baseline_proc_exe=''
-if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap ]]; then
-  baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") \
-    || die 'could not capture the production Rust executable identity'
-fi
 verify_current_oss_config
-legacy_exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
-  || die 'could not capture the effective legacy ExecStart'
-legacy_cmdline=$(proc_cmdline "$legacy_pid") \
-  || die 'could not capture the exact legacy command line'
-legacy_cmdline_argv=${legacy_cmdline% }
-legacy_cmdline_sha=$(printf '%s' "$legacy_cmdline_argv" | sha256sum | awk '{print $1}')
-legacy_fragment_path=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT")
-legacy_drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT")
-legacy_drop_ins_json=$(jq -cn --arg value "$legacy_drop_ins" \
-  '$value | split(" ") | map(select(length > 0))')
+legacy_runtime_json=null
+recovery_evidence=null
+if [[ $baseline_recovery == true ]]; then
+  recovery_evidence=$recovery_json
+else
+  baseline_proc_exe=''
+  if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap ]]; then
+    baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") \
+      || die 'could not capture the production Rust executable identity'
+  fi
+  legacy_exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
+    || die 'could not capture the effective legacy ExecStart'
+  legacy_cmdline=$(proc_cmdline "$legacy_pid") \
+    || die 'could not capture the exact legacy command line'
+  legacy_cmdline_argv=${legacy_cmdline% }
+  legacy_cmdline_sha=$(printf '%s' "$legacy_cmdline_argv" | sha256sum | awk '{print $1}')
+  legacy_fragment_path=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT")
+  legacy_drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT")
+  legacy_drop_ins_json=$(jq -cn --arg value "$legacy_drop_ins" \
+    '$value | split(" ") | map(select(length > 0))')
+  legacy_runtime_json=$(jq -cn --arg exec "$legacy_exec_argv" \
+    --arg cmdline "$legacy_cmdline_argv" --arg cmdline_sha "$legacy_cmdline_sha" \
+    --arg fragment "$legacy_fragment_path" --argjson drop_ins "$legacy_drop_ins_json" \
+    --argjson pid "$legacy_pid" --argjson restarts "$legacy_restarts" \
+    --arg invocation "$legacy_invocation_id" --arg path "$baseline_release_path" \
+    --arg sha "$baseline_release_sha" --arg proc_exe "$baseline_proc_exe" \
+    --arg mode "$baseline_mode" '
+      {exec_start:$exec,cmdline:$cmdline,cmdline_sha256:$cmdline_sha,
+       fragment_path:$fragment,drop_in_paths:$drop_ins,main_pid:$pid,
+       restarts:$restarts,invocation_id:$invocation}
+      + (if $mode == "rust_release" or $mode == "rust_bootstrap" then
+           {release_path:$path,proc_exe:$proc_exe,release_sha256:$sha}
+         else {} end)')
+fi
 completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 production_eligible=true
 [[ $test_only == false ]] || production_eligible=false
@@ -1866,16 +1979,7 @@ jq \
   --arg started_at "$started_at" \
   --arg completed_at "$completed_at" \
   --arg baseline_mode "$baseline_mode" \
-  --arg legacy_exec "$legacy_exec_argv" \
-  --arg legacy_cmdline "$legacy_cmdline_argv" \
-  --arg legacy_cmdline_sha256 "$legacy_cmdline_sha" \
-  --arg legacy_invocation_id "$legacy_invocation_id" \
-  --arg legacy_fragment_path "$legacy_fragment_path" \
-  --argjson legacy_drop_in_paths "$legacy_drop_ins_json" \
-  --argjson legacy_pid "$legacy_pid" \
-  --argjson legacy_restarts "$legacy_restarts" \
-  --arg baseline_release_path "$baseline_release_path" \
-  --arg baseline_release_sha256 "$baseline_release_sha" --arg baseline_proc_exe "$baseline_proc_exe" \
+  --argjson recovery "$recovery_evidence" --argjson legacy_runtime "$legacy_runtime_json" \
   --arg shadow_exec "$shadow_exec_argv" \
   --arg shadow_cmdline "$shadow_cmdline_argv" \
   --arg shadow_invocation_id "$shadow_invocation_id" \
@@ -1943,14 +2047,8 @@ jq \
     baseline_health_completion_file_identity:
       $baseline_health_completion_file_identity,
     real_market_preflight:$real_market_preflight,
-    legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
-        cmdline_sha256:$legacy_cmdline_sha256,
-        fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
-        main_pid:$legacy_pid,restarts:$legacy_restarts,
-        invocation_id:$legacy_invocation_id}
-      + if $baseline_mode == "rust_release" or $baseline_mode == "rust_bootstrap" then
-          {release_path:$baseline_release_path,proc_exe:$baseline_proc_exe,
-            release_sha256:$baseline_release_sha256} else {} end),
+    recovery:$recovery,
+    legacy_runtime:$legacy_runtime,
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
       fragment_path:$shadow_fragment_path,drop_in_paths:$shadow_drop_in_paths,
       main_pid:$shadow_pid,restarts:$shadow_restarts,
