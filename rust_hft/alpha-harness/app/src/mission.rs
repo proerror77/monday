@@ -2,7 +2,9 @@ use crate::{
     cli::{print_json, EngineChoice, LearnMissionArgs, MissionStatusArgs, RunMissionArgs},
     data_mission,
 };
-use alpha_domain::{canonical_json_hash, MissionStatus, ResearchMission};
+use alpha_domain::{
+    canonical_json_hash, CexGpPolicyV1, CexResearchContentRefV1, MissionStatus, ResearchMission,
+};
 use alpha_engine::{
     engines::{
         CexMctsSearchIdentityV1, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
@@ -40,6 +42,8 @@ pub struct MissionRunReport {
     pub engine: EngineChoice,
     pub engine_authority: ResearchEngineAuthority,
     pub dataset_manifest_id: String,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
 }
 
 pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
@@ -47,6 +51,23 @@ pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
 }
 
 pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<MissionRunReport> {
+    execute_mission_inner(args, resume, None)
+}
+
+pub(crate) fn execute_governed_gp_mission(
+    args: &RunMissionArgs,
+    resume: bool,
+    policy: &CexGpPolicyV1,
+    candidate_namespace: &str,
+) -> anyhow::Result<MissionRunReport> {
+    execute_mission_inner(args, resume, Some((policy, candidate_namespace)))
+}
+
+fn execute_mission_inner(
+    args: &RunMissionArgs,
+    resume: bool,
+    governed_gp: Option<(&CexGpPolicyV1, &str)>,
+) -> anyhow::Result<MissionRunReport> {
     validate_live_mission_args(args)?;
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
@@ -70,6 +91,20 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let dataset = prepare_dataset(rows, &protocol)?;
+    let research_context = dataset.engine_context();
+    let research_dataset_sha256 = canonical_json_hash(&research_context.rows())?;
+    let research_dataset = CexResearchContentRefV1 {
+        id: format!("cex-research-dataset-{research_dataset_sha256}"),
+        content_sha256: research_dataset_sha256,
+    };
+    let walk_forward_partition_sha256 = canonical_json_hash(&serde_json::json!({
+        "research_dataset": &research_dataset,
+        "folds": research_context.folds(),
+    }))?;
+    let walk_forward_partition = CexResearchContentRefV1 {
+        id: format!("cex-walk-forward-partition-{walk_forward_partition_sha256}"),
+        content_sha256: walk_forward_partition_sha256,
+    };
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
     let evaluator_config_hash =
         canonical_json_hash(&evaluator.config_evidence().map_err(anyhow::Error::msg)?)?;
@@ -80,6 +115,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         &mission,
         &evaluation_protocol_hash,
         &evaluator_config_hash,
+        governed_gp,
     )?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
@@ -101,6 +137,8 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
             _ => ResearchEngineAuthority::CandidateResearchOnly,
         },
         dataset_manifest_id: manifest.manifest_id().to_string(),
+        research_dataset,
+        walk_forward_partition,
     })
 }
 
@@ -155,6 +193,7 @@ fn build_engine(
     mission: &ResearchMission,
     evaluation_protocol_hash: &str,
     evaluator_config_hash: &str,
+    governed_gp: Option<(&CexGpPolicyV1, &str)>,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
     validate_live_mission_args(args)?;
     let fields = args
@@ -178,10 +217,27 @@ fn build_engine(
     let primary = fields[0].clone();
     let secondary = fields.get(1).cloned().unwrap_or_else(|| primary.clone());
     let engine: Box<dyn ProposalEngine> = match args.engine {
-        EngineChoice::Gp => Box::new(
-            GeneticProgrammingEngine::new(args.seed, fields.clone(), 32, 5)
-                .map_err(anyhow::Error::msg)?,
-        ),
+        EngineChoice::Gp => match governed_gp {
+            Some((policy, candidate_namespace)) => {
+                if fields != policy.admitted_fields
+                    || args.seed != policy.seed
+                    || mission.search_budget != policy.budget
+                {
+                    bail!("mission GP execution drifted from its frozen policy");
+                }
+                Box::new(
+                    GeneticProgrammingEngine::new_governed(
+                        policy.clone(),
+                        candidate_namespace.to_string(),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                )
+            }
+            None => Box::new(
+                GeneticProgrammingEngine::new(args.seed, fields.clone(), 32, 5)
+                    .map_err(anyhow::Error::msg)?,
+            ),
+        },
         EngineChoice::Mcts => Box::new(
             MctsEngine::new_live_bound(
                 args.seed,

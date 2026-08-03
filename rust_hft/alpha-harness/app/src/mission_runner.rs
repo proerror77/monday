@@ -5,10 +5,13 @@ use crate::{
     data_mission, governance, mission,
 };
 use alpha_domain::{
-    canonical_json_hash, CexResearchMissionArtifactV1, EvaluationCostsV1, MissionCompletionPolicy,
-    MissionStatus, ResearchMission, ValidatorMode,
+    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexFactorBankRevisionV2,
+    CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2,
+    CexFactorScreeningVerdictV1, CexGpPolicyV1, CexResearchMissionArtifactV1, EvaluationCostsV1,
+    FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy, MissionStatus,
+    ResearchMission, ValidatorMode,
 };
-use alpha_store::{AlphaStore, RegistryRevision, StoreError};
+use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_research_manifest::{
@@ -155,9 +158,17 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             .context("CEX Research Mission artifact is invalid JSON or schema")?;
     control_mission.validate()?;
     mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
+    let gp_policy = CexGpPolicyV1::controlled_v1(
+        control_mission.spec.policies.gp.id.clone(),
+        control_mission.spec.feature_fields.clone(),
+        control_mission.spec.search.seed,
+        &control_mission.spec.search.budget,
+    )?;
+    gp_policy.validate_binding(&control_mission.spec.policies.gp)?;
+    data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
     let mission_id = control_mission.semantic_id()?;
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
-    let engine = EngineChoice::Mcts;
+    let engine = EngineChoice::Gp;
 
     let (_, feature_sha256) =
         fetch_to_file(&client, &args.feature_url, &feature_path, MAX_FEATURE_BYTES)?;
@@ -271,12 +282,17 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         search_budget: control_mission.spec.search.budget.clone(),
         completion_policy: MissionCompletionPolicy::default(),
         prompt_snapshot_id: None,
-        search_policy_snapshot_id: control_mission.spec.policies.subset_search.id.clone(),
+        search_policy_snapshot_id: control_mission.spec.policies.gp.id.clone(),
         status: MissionStatus::Pending,
         terminal_reason: None,
         created_at: now,
         updated_at: now,
     };
+    if canonical_json_hash(&FormulaEvaluatorConfig::for_mission(&research_mission)?)?
+        != control_mission.spec.policies.screening.content_sha256
+    {
+        bail!("Mission screening policy does not match the evaluator configuration");
+    }
     data_mission::write_json_atomic(&results_dir.join("mission.json"), &research_mission)?;
     store.create_mission(&research_mission)?;
     data_mission::write_json_atomic(&results_dir.join("mission-create.json"), &research_mission)?;
@@ -296,20 +312,41 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         max_new_iterations: Some(control_mission.spec.search.max_new_iterations),
         dataset: dataset.clone(),
     };
-    let mut run_report = mission::execute_mission(&run_args, false)?;
+    let mut run_report = mission::execute_governed_gp_mission(
+        &run_args,
+        false,
+        &gp_policy,
+        &control_mission.spec.search_lineage_id,
+    )?;
     while run_report.status == MissionStatus::Paused {
         let previous_iterations = run_report.total_iterations;
-        run_report = mission::execute_mission(&run_args, true)?;
+        run_report = mission::execute_governed_gp_mission(
+            &run_args,
+            true,
+            &gp_policy,
+            &control_mission.spec.search_lineage_id,
+        )?;
         if run_report.total_iterations <= previous_iterations
             && run_report.status == MissionStatus::Paused
         {
-            bail!("resumed MCTS mission made no progress");
+            bail!("resumed mission made no progress");
         }
     }
     data_mission::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
 
-    let store = AlphaStore::open(&db)?;
+    let mut store = AlphaStore::open(&db)?;
     let lineage = store.mission_lineage(&mission_id)?;
+    let factor_bank = build_factor_bank(&control_mission, &gp_policy, &run_report, &lineage)?;
+    let factor_bank_payload = serde_json::to_value(&factor_bank)?;
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: factor_bank.revision_id.clone(),
+        registry_kind: "cex_factor_bank".to_string(),
+        asset_id: control_mission.spec.instrument.symbol.clone(),
+        parent_revision_id: Some(run_report.dataset_manifest_id.clone()),
+        payload: factor_bank_payload,
+        created_at: Utc::now(),
+    })?;
+    data_mission::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
     let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
@@ -352,6 +389,123 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         bundle_bytes,
         bundle_sha256,
     })
+}
+
+fn build_factor_bank(
+    control_mission: &CexResearchMissionArtifactV1,
+    gp_policy: &CexGpPolicyV1,
+    run_report: &mission::MissionRunReport,
+    lineage: &MissionLineage,
+) -> anyhow::Result<CexFactorBankRevisionV2> {
+    let mut attempts = Vec::with_capacity(lineage.iterations.len());
+    for iteration in &lineage.iterations {
+        let candidate_id = iteration
+            .candidate_artifact_id
+            .as_deref()
+            .with_context(|| {
+                format!(
+                    "iteration {} has no auditable candidate artifact",
+                    iteration.iteration_id
+                )
+            })?;
+        let candidate = lineage
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+            .with_context(|| format!("candidate {candidate_id} is missing from lineage"))?;
+        if candidate.mission_id != run_report.mission_id
+            || candidate.iteration_id != iteration.iteration_id
+        {
+            bail!("candidate {candidate_id} does not match its mission iteration");
+        }
+        let canonical_ast = match &candidate.artifact {
+            CandidateArtifact::Formula(ast) => ast.clone(),
+            _ => bail!("governed GP lineage contains a non-formula candidate"),
+        };
+        let ast_sha256 = canonical_json_hash(&canonical_ast)?;
+        let evaluation = iteration
+            .evaluation_artifact_id
+            .as_deref()
+            .map(|evaluation_id| {
+                let stored = lineage
+                    .evaluations
+                    .iter()
+                    .find(|evaluation| evaluation.record.evaluation_id == evaluation_id)
+                    .with_context(|| {
+                        format!("evaluation {evaluation_id} is missing from lineage")
+                    })?;
+                if stored.record.mission_id != run_report.mission_id
+                    || stored.record.candidate_id != candidate_id
+                    || stored.record.dataset_manifest_id != run_report.dataset_manifest_id
+                    || stored.record.evaluation_protocol_hash
+                        != control_mission.spec.policies.evaluation.content_sha256
+                {
+                    bail!("evaluation {evaluation_id} does not match its screening lineage");
+                }
+                let evidence: CandidateEvaluation =
+                    serde_json::from_value(stored.record.payload.clone())?;
+                evidence.validate()?;
+                Ok::<_, anyhow::Error>(CexFactorEvaluationEvidenceV2 {
+                    candidate_id: candidate_id.to_string(),
+                    candidate_ast_sha256: ast_sha256.clone(),
+                    research_dataset: run_report.research_dataset.clone(),
+                    walk_forward_partition: run_report.walk_forward_partition.clone(),
+                    evidence,
+                })
+            })
+            .transpose()?;
+        let verdict = if iteration.verdict == IterationVerdict::Keep {
+            CexFactorScreeningVerdictV1::Accepted
+        } else {
+            CexFactorScreeningVerdictV1::Rejected
+        };
+        let rejection_codes = match iteration.verdict {
+            IterationVerdict::Keep => vec![],
+            IterationVerdict::Discard => evaluation
+                .as_ref()
+                .context("discarded candidate is missing screening evidence")?
+                .rejection_codes()?,
+            IterationVerdict::Crash => vec![match iteration.failure_class.as_deref() {
+                Some("duplicate_candidate") => CexFactorRejectionCodeV1::DuplicateCandidate,
+                Some("evaluation_error") => CexFactorRejectionCodeV1::EvaluationFailed,
+                _ => CexFactorRejectionCodeV1::EngineFailure,
+            }],
+        };
+        let rejection_details = evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.evidence.failure_reasons.clone())
+            .filter(|reasons| !reasons.is_empty())
+            .or_else(|| {
+                iteration
+                    .failure_explanation
+                    .clone()
+                    .map(|reason| vec![reason])
+            })
+            .unwrap_or_default();
+        let post_warmup_coverage_rows = evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.evidence.metrics.row_count)
+            .unwrap_or(0);
+        attempts.push(CexFactorScreeningAttemptV2 {
+            candidate_id: candidate_id.to_string(),
+            canonical_ast,
+            ast_sha256,
+            post_warmup_coverage_rows,
+            verdict,
+            rejection_codes,
+            rejection_details,
+            evaluation,
+        });
+    }
+    Ok(CexFactorBankRevisionV2::new(
+        control_mission.spec.search_lineage_id.clone(),
+        gp_policy.clone(),
+        control_mission.spec.policies.screening.clone(),
+        control_mission.spec.policies.evaluation.clone(),
+        run_report.research_dataset.clone(),
+        run_report.walk_forward_partition.clone(),
+        attempts,
+    )?)
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
@@ -1087,6 +1241,160 @@ mod tests {
     }
 
     #[test]
+    fn execute_screens_gp_candidates_into_an_immutable_factor_bank() {
+        let mut fixture = fixture("gp-factor-bank");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+        let results = fixture.args.work_dir.join("results");
+        let run: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("mission-run.json")).unwrap())
+                .unwrap();
+        assert_eq!(run["engine"], "Gp");
+
+        let factor_bank: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        assert_eq!(factor_bank["schema_version"], "cex-factor-bank-v2");
+        assert_eq!(factor_bank["research_dataset"], run["research_dataset"]);
+        let entries = factor_bank["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries
+            .iter()
+            .all(|entry| entry["orientation"] == "positive"));
+        assert!(results.join("gp-policy.json").exists());
+        let typed: CexFactorBankRevisionV2 = serde_json::from_value(factor_bank.clone()).unwrap();
+        typed.validate().unwrap();
+        let mut forged = typed.clone();
+        forged.screening_policy.content_sha256 = "0".repeat(64);
+        forged.revision_id.clear();
+        forged.revision_id = format!("cex-factor-bank-{}", canonical_json_hash(&forged).unwrap());
+        assert!(forged.validate().is_err());
+        let revision_id = factor_bank["revision_id"].as_str().unwrap();
+        let mut store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let revision = store.get_registry_revision(revision_id).unwrap();
+        assert_eq!(revision.registry_kind, "cex_factor_bank");
+        assert_eq!(
+            revision.parent_revision_id.as_deref(),
+            run["dataset_manifest_id"].as_str()
+        );
+        assert_eq!(revision.payload, factor_bank);
+        let mut conflict = revision.clone();
+        conflict.payload["schema_version"] = serde_json::json!("tampered");
+        assert!(matches!(
+            store.put_registry_revision(&conflict),
+            Err(StoreError::DuplicateRecord)
+        ));
+        assert!(store
+            .mission_lineage(fixture.mission.semantic_id().unwrap().as_str())
+            .unwrap()
+            .iterations
+            .iter()
+            .all(|iteration| iteration.engine == alpha_domain::EngineKind::GeneticProgramming));
+        assert!(!results.join("mcts-research-receipt.json").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_gp_policy_drift_before_screening() {
+        let mut fixture = fixture("gp-policy-drift");
+        fixture.mission.spec.policies.gp.content_sha256 = "f".repeat(64);
+        write_mission(&mut fixture);
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("GP policy identity or content hash"));
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_records_duplicate_gp_attempts_with_a_typed_rejection() {
+        let mut fixture = fixture("gp-duplicate-audit");
+        fixture.mission.spec.search.seed = 1;
+        fixture.mission.spec.search.budget.max_candidates = 6;
+        fixture.mission.spec.search.budget.max_expansions = 6;
+        rewrite_features(&mut fixture, |row| row.label = 0.0);
+        rebind_mission_inputs(&mut fixture);
+
+        execute(fixture.args.clone()).unwrap();
+
+        let factor_bank = read_factor_bank(&fixture.args);
+        let attempts = factor_bank["attempts"].as_array().unwrap();
+        let duplicate = attempts
+            .iter()
+            .find(|attempt| {
+                attempt["rejection_details"]
+                    .as_array()
+                    .is_some_and(|details| {
+                        details.iter().any(|detail| {
+                            detail
+                                .as_str()
+                                .is_some_and(|detail| detail.contains("duplicated an existing"))
+                        })
+                    })
+            })
+            .expect("fixture must exercise a duplicate GP proposal");
+        assert_eq!(
+            duplicate["rejection_codes"],
+            serde_json::json!(["duplicate_candidate"])
+        );
+        let screened = attempts
+            .iter()
+            .find(|attempt| attempt["verdict"] == "rejected" && attempt["evaluation"].is_object())
+            .expect("fixture must exercise an evaluated rejection");
+        let rejection_codes = screened["rejection_codes"].as_array().unwrap();
+        assert!(rejection_codes.contains(&serde_json::json!("predictive_gate_failed")));
+        assert!(!rejection_codes.contains(&serde_json::json!("screening_failed")));
+        let entries = factor_bank["entries"].as_array().unwrap();
+        assert!(attempts
+            .iter()
+            .filter(|attempt| attempt["verdict"] == "rejected")
+            .all(|attempt| entries
+                .iter()
+                .all(|entry| entry["candidate_id"] != attempt["candidate_id"])));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_is_deterministic_and_ignores_holdout_only_values() {
+        let mut fixture = fixture("gp-holdout-isolation");
+        fixture.mission.spec.search.budget.max_candidates = 4;
+        fixture.mission.spec.search.budget.max_expansions = 4;
+        fixture.mission.spec.search.max_new_iterations = 1;
+        resign_mission(&mut fixture);
+        execute(fixture.args.clone()).unwrap();
+        let first = read_factor_bank(&fixture.args);
+
+        fixture.mission.spec.search.max_new_iterations = 4;
+        resign_mission(&mut fixture);
+        fixture.args.work_dir = fixture.root.join("work-2");
+        fixture.args.result_put_url = fixture.root.join("result-2.zip").to_string_lossy().into();
+        execute(fixture.args.clone()).unwrap();
+        assert_eq!(read_factor_bank(&fixture.args), first);
+
+        let last: chrono::DateTime<Utc> =
+            serde_json::from_value(fixture.materialization["last_event_time"].clone()).unwrap();
+        let holdout_start = last - ChronoDuration::seconds(29);
+        rewrite_features(&mut fixture, |row| {
+            if row.event_time >= holdout_start {
+                row.label = -row.label;
+            }
+        });
+        rebind_mission_inputs(&mut fixture);
+        fixture.args.work_dir = fixture.root.join("work-3");
+        fixture.args.result_put_url = fixture.root.join("result-3.zip").to_string_lossy().into();
+        execute(fixture.args.clone()).unwrap();
+        assert_eq!(read_factor_bank(&fixture.args), first);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn execute_preserves_prior_holdout_evidence_in_reused_work_dir() {
         let fixture = fixture("preserve-prior-holdout");
         let results = fixture.args.work_dir.join("results");
@@ -1387,10 +1695,18 @@ mod tests {
                 max_candidates: 1,
                 max_expansions: 1,
                 max_tokens: 0,
-                max_seconds: 5,
+                max_seconds: 0,
             },
             max_new_iterations: 1,
         };
+        let feature_fields = vec!["book_imbalance".to_string(), "spread_bps".to_string()];
+        let gp_policy = CexGpPolicyV1::controlled_v1(
+            "gp-policy-1",
+            feature_fields.clone(),
+            search.seed,
+            &search.budget,
+        )
+        .unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -1400,7 +1716,7 @@ mod tests {
         let dataset =
             CexReplayDatasetManifestV1::new(format!("dataset-{feature_sha256}"), snapshot.clone())
                 .unwrap();
-        let mission = CexResearchMissionArtifactV1 {
+        let mut mission = CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
             spec: CexResearchMissionSpecV1 {
                 objective: "test objective".to_string(),
@@ -1454,7 +1770,10 @@ mod tests {
                     },
                 },
                 policies: CexResearchPolicyBindingsV1 {
-                    gp: reference("gp-policy-1", '1'),
+                    gp: CexResearchContentRefV1 {
+                        id: gp_policy.policy_id.clone(),
+                        content_sha256: gp_policy.content_hash().unwrap(),
+                    },
                     screening: reference("screening-policy-1", '2'),
                     baseline: reference("baseline-policy-1", '3'),
                     subset_search: CexResearchContentRefV1 {
@@ -1478,7 +1797,7 @@ mod tests {
                     signature: None,
                     holdout_id: None,
                 }],
-                feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+                feature_fields,
                 search,
                 evaluation_protocol,
                 holdout: CexResearchHoldoutV1 {
@@ -1490,6 +1809,10 @@ mod tests {
                 submitted_at: Some(Utc::now()),
             },
         };
+        mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(mission.spec.search.budget.max_candidates).unwrap(),
+        )
+        .unwrap();
         mission.validate().unwrap();
         let mission_path = root.join("mission.json");
         std::fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
@@ -1533,6 +1856,11 @@ mod tests {
         resign_materialization(fixture);
     }
 
+    fn read_factor_bank(args: &ExecuteMissionArgs) -> serde_json::Value {
+        let file = File::open(args.work_dir.join("results/factor-bank.json")).unwrap();
+        serde_json::from_reader(file).unwrap()
+    }
+
     fn write_mission(fixture: &mut Fixture) {
         std::fs::write(
             &fixture.mission_path,
@@ -1543,8 +1871,22 @@ mod tests {
     }
 
     fn resign_mission(fixture: &mut Fixture) {
+        let gp_policy = CexGpPolicyV1::controlled_v1(
+            fixture.mission.spec.policies.gp.id.clone(),
+            fixture.mission.spec.feature_fields.clone(),
+            fixture.mission.spec.search.seed,
+            &fixture.mission.spec.search.budget,
+        );
+        if let Ok(gp_policy) = gp_policy {
+            fixture.mission.spec.policies.gp.content_sha256 = gp_policy.content_hash().unwrap();
+        }
         fixture.mission.spec.policies.subset_search.content_sha256 =
             canonical_json_hash(&fixture.mission.spec.search).unwrap();
+        fixture.mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(fixture.mission.spec.search.budget.max_candidates)
+                .unwrap(),
+        )
+        .unwrap();
         fixture.mission.spec.policies.evaluation.content_sha256 = fixture
             .mission
             .spec
