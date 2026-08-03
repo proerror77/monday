@@ -1499,6 +1499,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_discovery_crossing_snapshot_margin_is_not_duplicated() {
+        let now = Utc::now();
+        let filler = MarketUpdate::SpotPrice {
+            symbol: "s".repeat(150_000).into(),
+            price: dec!(100000),
+            ts: now,
+        };
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: "x".repeat(1_200_000).into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-oversized".into(),
+            down_token: "down-oversized".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let updates = vec![filler, discovered.clone()];
+        let path = temp_log_path("recording-feed-oversized-discovery-rotation");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: None,
+                    max_bytes: Some(1_300_000),
+                },
+                rotate_on_limit: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        assert!(feed.writer.is_some());
+        drop(feed);
+
+        assert_eq!(forwarded, updates);
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 1);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, discovered);
+
+        let _ = fs::remove_file(rotated[0].clone());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn recording_feed_keeps_failure_but_not_its_synthetic_empty_quote() {
         let now = Utc::now();
         let discovered = MarketUpdate::EventDiscovered {
