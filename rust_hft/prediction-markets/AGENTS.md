@@ -27,3 +27,9 @@ Former standalone `deployment` and `infra` material is preserved only under
 This module has no nested workflow authority and no Python compatibility lane.
 Do not restore either tree to the module root without an explicit architecture
 and security review.
+
+- When a change supersedes a `ploy-*` identifier, compatibility entrypoint,
+  imported contract, or parallel implementation, remove the obsolete path in
+  the same change unless a verified cutover must happen first. Cutover-only code
+  must additionally name the exact removal scope and the readback condition that
+  triggers deletion; do not extend it with new behavior.

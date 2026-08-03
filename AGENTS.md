@@ -26,6 +26,33 @@
 - Prefer the narrowest applicable Matt Pocock skill. Use another skill only when
   it fits better or the user asks for it.
 
+## Engineering decisions
+
+- Backward compatibility is not a goal. Remove deprecated paths and their
+  callers, aliases, configuration, tests, documentation, and deployment
+  assets. Do not add shims, dual implementations, silent fallbacks, or migration
+  branches merely to keep obsolete behavior alive.
+- Ship the smallest end-to-end implementation that satisfies the current
+  contract. Add capability only after that path works and has focused evidence.
+- Reuse existing modules, standard-library or platform features, and installed
+  dependencies before writing new infrastructure or adding a dependency. If
+  they do not satisfy the requirement, prefer a mature, maintained library when
+  it reduces total complexity or reliability risk. Read the relevant
+  documentation and types before deciding existing code cannot support the need.
+- Add a module, abstraction, configuration option, or indirect layer only when a
+  current requirement creates a distinct responsibility, authority boundary, or
+  lifecycle.
+- Keep changes on the canonical long-term architecture. Do not introduce a
+  production path known to require replacement; transitional cutover code must
+  have an owner, removal condition, and removal issue.
+- Before designing a non-trivial solution, inspect how mature products solve the
+  same class of problem and prefer proven patterns and conventions. Localized
+  changes do not require external product research.
+- Applied database migrations and immutable historical evidence are records, not
+  active compatibility surfaces. Preserve required audit history, but keep
+  historical decoding read-only and unable to write, resume, promote, deploy, or
+  execute.
+
 ## Durable guards from repeated failures
 
 - Refresh `origin/main` and live GitHub/runtime state before claims or new work.
