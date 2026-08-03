@@ -78,9 +78,9 @@ pub struct RuntimeSection {
     pub to: Option<String>,
     /// Optional NDJSON log path for canonical `MarketUpdate` recording.
     pub record_market_updates_to: Option<PathBuf>,
-    /// Optional hard cap for a bounded canonical `MarketUpdate` recording.
+    /// Optional per-tape record cap; reaching it rotates into a fresh tape.
     pub record_market_updates_max_records: Option<u64>,
-    /// Optional hard cap for a bounded canonical `MarketUpdate` recording.
+    /// Optional per-tape byte cap; reaching it rotates into a fresh tape.
     pub record_market_updates_max_bytes: Option<u64>,
     /// Optional interval for rotating the active tape without restarting the feed.
     pub record_market_updates_rotate_seconds: Option<u64>,

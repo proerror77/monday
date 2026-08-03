@@ -625,7 +625,62 @@ where
                 if let Some(recorded_update) = recorded_update.as_ref() {
                     match writer.append(recorded_update) {
                         Ok(AppendOutcome::Written) => {}
-                        Ok(AppendOutcome::LimitReached) => limit_reached = true,
+                        Ok(AppendOutcome::LimitReached) => {
+                            // A 24/7 recorder must not go silent at the cap:
+                            // rotate into a fresh tape and keep recording.
+                            info!(
+                                path = %writer.path.display(),
+                                records = writer.next_sequence,
+                                bytes = writer.bytes_written,
+                                reason = "size_limit",
+                                "Market-update tape reached its recording limit; rotating",
+                            );
+                            match writer.rotate() {
+                                Ok(Some(_)) => {
+                                    // Snapshot the lifecycle state captured
+                                    // before the current update, mirroring the
+                                    // rotation_due checkpoint ordering.
+                                    let mut checkpoints = if include_event_checkpoints {
+                                        self.active_event_updates
+                                            .iter()
+                                            .filter(|(event_id, _)| {
+                                                !matches!(&update, MarketUpdate::EventDiscovered { event_id: current, .. } if current.as_ref() == event_id.as_str())
+                                            })
+                                            .map(|(event_id, checkpoint)| {
+                                                (event_id.clone(), checkpoint.clone())
+                                            })
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
+                                    for (_, checkpoint) in &checkpoints {
+                                        match writer.append(checkpoint) {
+                                            Ok(AppendOutcome::Written) => {}
+                                            Ok(AppendOutcome::LimitReached) => {
+                                                limit_reached = true;
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                recording_error = Some(error);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !limit_reached && recording_error.is_none() {
+                                        match writer.append(recorded_update) {
+                                            Ok(AppendOutcome::Written) => {}
+                                            Ok(AppendOutcome::LimitReached) => {
+                                                limit_reached = true
+                                            }
+                                            Err(error) => recording_error = Some(error),
+                                        }
+                                    }
+                                }
+                                Ok(None) => limit_reached = true,
+                                Err(error) => recording_error = Some(error),
+                            }
+                        }
                         Err(error) => recording_error = Some(error),
                     }
                 }
@@ -804,8 +859,33 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    fn rotated_tapes_for(path: &Path) -> Vec<PathBuf> {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let prefix = format!("{stem}.");
+        let mut rotated = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|candidate| {
+                candidate.as_path() != path
+                    && candidate
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        rotated.sort();
+        rotated
+    }
+
+    fn recorded_updates(path: &Path) -> Vec<RecordedMarketUpdate> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<RecordedMarketUpdate>(line).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn recording_feed_stops_after_record_limit_without_blocking_feed() {
+    async fn recording_feed_rotates_after_record_limit_without_losing_updates() {
         let now = Utc::now();
         let updates = vec![
             MarketUpdate::SpotPrice {
@@ -824,7 +904,7 @@ mod tests {
                 ts: now + Duration::seconds(2),
             },
         ];
-        let path = temp_log_path("recording-feed-limit");
+        let path = temp_log_path("recording-feed-limit-rotation");
         let mut feed = RecordingFeed::with_limits(
             crate::HistoricalFeed::new(updates.clone()),
             &path,
@@ -839,17 +919,193 @@ mod tests {
         while let Some(update) = feed.next().await {
             forwarded.push(update);
         }
+        assert!(feed.writer.is_some());
         drop(feed);
 
-        let mut replay = RecordedFeed::from_path(&path).unwrap();
-        let mut replayed = Vec::new();
-        while let Some(update) = replay.next().await {
-            replayed.push(update);
+        assert_eq!(forwarded, updates);
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
+        let first_tape = recorded_updates(&rotated[0]);
+        assert_eq!(first_tape.len(), 2);
+        assert_eq!(first_tape[0].sequence, 0);
+        assert_eq!(first_tape[1].sequence, 1);
+        assert_eq!(
+            first_tape
+                .iter()
+                .map(|record| record.update.clone())
+                .collect::<Vec<_>>(),
+            updates[..2]
+        );
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 1);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, updates[2]);
+
+        let _ = fs::remove_file(rotated[0].clone());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn size_limit_rotates_tape_and_replays_active_event_checkpoints_first() {
+        let now = Utc::now();
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: "evt-size".into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-size".into(),
+            down_token: "down-size".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        // A long token id makes each quote line ~1.5 KB so a 4096-byte cap
+        // fits the discovery plus two quotes before rotating on the third.
+        let token = "up-size-".repeat(150);
+        let quote = |millis: i64, bid: Decimal| MarketUpdate::Quote {
+            token_id: token.clone().into(),
+            bid: Some(bid),
+            ask: Some(bid + dec!(0.01)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(millis),
+        };
+        let updates = vec![
+            discovered.clone(),
+            quote(0, dec!(0.49)),
+            quote(100, dec!(0.50)),
+            quote(200, dec!(0.51)),
+            quote(300, dec!(0.52)),
+        ];
+        let path = temp_log_path("recording-feed-size-rotation");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: None,
+                    max_bytes: Some(4096),
+                },
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
         }
+        assert!(feed.writer.is_some());
+        drop(feed);
 
         assert_eq!(forwarded, updates);
-        assert_eq!(replayed, updates[..2]);
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
+        let first_tape = recorded_updates(&rotated[0]);
+        assert_eq!(
+            first_tape
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (0..first_tape.len() as u64).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            first_tape[0].update,
+            MarketUpdate::EventDiscovered { .. }
+        ));
+        let split = first_tape.len();
+        assert_eq!(
+            first_tape
+                .iter()
+                .map(|record| record.update.clone())
+                .collect::<Vec<_>>(),
+            updates[..split]
+        );
+        // The fresh tape opens with the active-event checkpoint at sequence
+        // zero, then continues with the remaining updates in order.
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), updates.len() - split + 1);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, discovered);
+        for (offset, record) in second_tape[1..].iter().enumerate() {
+            assert_eq!(record.sequence, offset as u64 + 1);
+        }
+        assert_eq!(
+            second_tape[1..]
+                .iter()
+                .map(|record| record.update.clone())
+                .collect::<Vec<_>>(),
+            updates[split..]
+        );
 
+        let _ = fs::remove_file(rotated[0].clone());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_replay_beyond_the_cap_disables_the_writer() {
+        let now = Utc::now();
+        // Two active events whose checkpoints cannot share one tape under the
+        // cap: a genuine misconfiguration that must keep the fail-safe. The
+        // first discovery line alone exceeds half the cap, so rotating when
+        // the second one arrives leaves no room to append it after the
+        // checkpoint replay.
+        let discovered = |event_id: String| MarketUpdate::EventDiscovered {
+            event_id: event_id.into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-a".into(),
+            down_token: "down-a".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let first = discovered("e".repeat(2800));
+        let second = discovered("f".repeat(1200));
+        let quote = MarketUpdate::Quote {
+            token_id: "up-a".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.50)),
+            bid_size: None,
+            ask_size: None,
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(1),
+        };
+        let updates = vec![first.clone(), second.clone(), quote.clone()];
+        let path = temp_log_path("recording-feed-checkpoint-overflow");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: None,
+                    max_bytes: Some(4096),
+                },
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        assert_eq!(forwarded, updates);
+        assert!(feed.writer.is_none());
+        drop(feed);
+
+        // The fresh tape holds only the replayed checkpoints that fit; the
+        // recorder disabled itself instead of going over the cap.
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 1);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, first);
+
+        for tape in rotated_tapes_for(&path) {
+            let _ = fs::remove_file(tape);
+        }
         let _ = fs::remove_file(path);
     }
 
