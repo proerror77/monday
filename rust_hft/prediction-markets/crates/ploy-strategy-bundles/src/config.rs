@@ -78,10 +78,16 @@ pub struct RuntimeSection {
     pub to: Option<String>,
     /// Optional NDJSON log path for canonical `MarketUpdate` recording.
     pub record_market_updates_to: Option<PathBuf>,
-    /// Optional per-tape record cap; reaching it rotates into a fresh tape.
+    /// Optional per-tape record cap; reaching it stops recording unless
+    /// rotate-on-limit is enabled.
     pub record_market_updates_max_records: Option<u64>,
-    /// Optional per-tape byte cap; reaching it rotates into a fresh tape.
+    /// Optional per-tape byte cap; reaching it stops recording unless
+    /// rotate-on-limit is enabled.
     pub record_market_updates_max_bytes: Option<u64>,
+    /// Opt into rotating into a fresh tape when a per-tape cap is reached.
+    /// Defaults to false, which stops recording at the cap for bounded
+    /// evidence capture.
+    pub record_market_updates_rotate_on_limit: Option<bool>,
     /// Optional interval for rotating the active tape without restarting the feed.
     pub record_market_updates_rotate_seconds: Option<u64>,
     /// Optional allow-list of update kinds to persist. Empty records all kinds.
@@ -433,6 +439,10 @@ impl FullConfig {
         RecordingPolicy {
             limits: self.record_market_updates_limits(),
             rotate_seconds: self.runtime.record_market_updates_rotate_seconds,
+            rotate_on_limit: self
+                .runtime
+                .record_market_updates_rotate_on_limit
+                .unwrap_or(false),
             include_kinds: self.runtime.record_market_updates_include_kinds.clone(),
             quote_sample_ms: self.runtime.record_market_updates_quote_sample_ms,
             quote_depth_levels: self.runtime.record_market_updates_quote_depth_levels,
@@ -707,6 +717,7 @@ max_updates = 10000
 record_market_updates_to = "tmp/sample.ndjson"
 record_market_updates_max_records = 1000
 record_market_updates_max_bytes = 1048576
+record_market_updates_rotate_on_limit = true
 record_market_updates_rotate_seconds = 3600
 record_market_updates_include_kinds = ["quote", "event_discovered", "event_expired", "reference_price"]
 record_market_updates_quote_sample_ms = 500
@@ -761,6 +772,10 @@ max_sweep_price_delta = 0.003
             Some(1_048_576)
         );
         assert_eq!(
+            config.runtime.record_market_updates_rotate_on_limit,
+            Some(true)
+        );
+        assert_eq!(
             config.runtime.record_market_updates_rotate_seconds,
             Some(3600)
         );
@@ -779,6 +794,7 @@ max_sweep_price_delta = 0.003
                     max_bytes: Some(1_048_576),
                 },
                 rotate_seconds: Some(3600),
+                rotate_on_limit: true,
                 include_kinds: vec![
                     RecordingKind::Quote,
                     RecordingKind::EventDiscovered,
@@ -892,6 +908,21 @@ mode = "dryrun"
         assert_eq!(config.feed_broadcast_capacity(), 8192);
         assert!(config.feed_lag_policy_allowed(RuntimeMode::Live));
         assert!(config.feed_lag_policy_allowed(RuntimeMode::DryRun));
+    }
+
+    #[test]
+    fn rotate_on_limit_defaults_to_off_for_bounded_capture() {
+        let minimal = r#"
+[runtime]
+mode = "dryrun"
+record_market_updates_to = "tmp/bounded.ndjson"
+record_market_updates_max_bytes = 1048576
+
+[strategy]
+"#;
+        let config = FullConfig::from_toml(minimal).unwrap();
+        assert_eq!(config.runtime.record_market_updates_rotate_on_limit, None);
+        assert!(!config.record_market_updates_policy().rotate_on_limit);
     }
 
     #[test]
@@ -1431,6 +1462,7 @@ taker_fee_rate = 0.07
             "record_market_updates_to",
             "record_market_updates_max_records",
             "record_market_updates_max_bytes",
+            "record_market_updates_rotate_on_limit",
             "record_market_updates_rotate_seconds",
         ] {
             dryrun_runtime.remove(recording_key);

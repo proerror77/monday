@@ -91,6 +91,9 @@ pub struct RecordingPolicy {
     pub limits: RecordingLimits,
     /// Rotate the active tape without restarting the feed process.
     pub rotate_seconds: Option<u64>,
+    /// Rotate into a fresh tape when a `limits` cap is reached. False keeps
+    /// the legacy behavior of stopping recording at the cap.
+    pub rotate_on_limit: bool,
     /// Empty preserves the historical behavior of recording every update kind.
     pub include_kinds: Vec<RecordingKind>,
     /// Minimum event-time spacing between recorded quotes for the same token.
@@ -582,15 +585,22 @@ where
                 .policy
                 .include_kinds
                 .contains(&RecordingKind::EventDiscovered);
-        let mut event_checkpoints = if rotation_due && include_event_checkpoints {
-            self.active_event_updates
-                .iter()
-                .map(|(event_id, update)| (event_id.clone(), update.clone()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // Mirror the rotation_due capture-before semantics for size-limit
+        // rotation: snapshot the lifecycle state before the boundary update
+        // is processed, but only when a limit rotation is actually possible.
+        let size_rotation_armed = self.policy.rotate_on_limit
+            && (self.policy.limits.max_records.is_some() || self.policy.limits.max_bytes.is_some());
+        let mut event_checkpoints =
+            if (rotation_due || size_rotation_armed) && include_event_checkpoints {
+                self.active_event_updates
+                    .iter()
+                    .map(|(event_id, update)| (event_id.clone(), update.clone()))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
         event_checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
+        let rotate_on_limit = self.policy.rotate_on_limit;
         let recorded_update = if self.writer.is_some() {
             self.prepare_recorded_update(&update)
         } else {
@@ -625,7 +635,7 @@ where
                 if let Some(recorded_update) = recorded_update.as_ref() {
                     match writer.append(recorded_update) {
                         Ok(AppendOutcome::Written) => {}
-                        Ok(AppendOutcome::LimitReached) => {
+                        Ok(AppendOutcome::LimitReached) if rotate_on_limit => {
                             // A 24/7 recorder must not go silent at the cap:
                             // rotate into a fresh tape and keep recording.
                             info!(
@@ -637,24 +647,11 @@ where
                             );
                             match writer.rotate() {
                                 Ok(Some(_)) => {
-                                    // Snapshot the lifecycle state captured
-                                    // before the current update, mirroring the
-                                    // rotation_due checkpoint ordering.
-                                    let mut checkpoints = if include_event_checkpoints {
-                                        self.active_event_updates
-                                            .iter()
-                                            .filter(|(event_id, _)| {
-                                                !matches!(&update, MarketUpdate::EventDiscovered { event_id: current, .. } if current.as_ref() == event_id.as_str())
-                                            })
-                                            .map(|(event_id, checkpoint)| {
-                                                (event_id.clone(), checkpoint.clone())
-                                            })
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
-                                    for (_, checkpoint) in &checkpoints {
+                                    // Replay the lifecycle snapshot captured
+                                    // before the boundary update was
+                                    // processed, mirroring the rotation_due
+                                    // checkpoint ordering.
+                                    for (_, checkpoint) in &event_checkpoints {
                                         match writer.append(checkpoint) {
                                             Ok(AppendOutcome::Written) => {}
                                             Ok(AppendOutcome::LimitReached) => {
@@ -679,6 +676,7 @@ where
                                 Err(error) => recording_error = Some(error),
                             }
                         }
+                        Ok(AppendOutcome::LimitReached) => limit_reached = true,
                         Err(error) => recording_error = Some(error),
                     }
                 }
@@ -903,12 +901,16 @@ mod tests {
             },
         ];
         let path = temp_log_path("recording-feed-limit-rotation");
-        let mut feed = RecordingFeed::with_limits(
+        let mut feed = RecordingFeed::with_policy(
             crate::HistoricalFeed::new(updates.clone()),
             &path,
-            RecordingLimits {
-                max_records: Some(2),
-                max_bytes: None,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: Some(2),
+                    max_bytes: None,
+                },
+                rotate_on_limit: true,
+                ..RecordingPolicy::default()
             },
         )
         .unwrap();
@@ -940,6 +942,57 @@ mod tests {
         assert_eq!(second_tape[0].update, updates[2]);
 
         let _ = fs::remove_file(rotated[0].clone());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn recording_feed_stops_at_record_limit_when_rotate_on_limit_is_off() {
+        let now = Utc::now();
+        let updates = vec![
+            MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100000),
+                ts: now,
+            },
+            MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100010),
+                ts: now + Duration::seconds(1),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100020),
+                ts: now + Duration::seconds(2),
+            },
+        ];
+        let path = temp_log_path("recording-feed-limit-stop");
+        let mut feed = RecordingFeed::with_limits(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingLimits {
+                max_records: Some(2),
+                max_bytes: None,
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        assert!(feed.writer.is_none());
+        drop(feed);
+
+        assert_eq!(forwarded, updates);
+        assert!(rotated_tapes_for(&path).is_empty());
+        let tape = recorded_updates(&path);
+        assert_eq!(
+            tape.iter()
+                .map(|record| record.update.clone())
+                .collect::<Vec<_>>(),
+            updates[..2]
+        );
+
         let _ = fs::remove_file(path);
     }
 
@@ -985,6 +1038,7 @@ mod tests {
                     max_records: None,
                     max_bytes: Some(4096),
                 },
+                rotate_on_limit: true,
                 ..RecordingPolicy::default()
             },
         )
@@ -1081,6 +1135,7 @@ mod tests {
                     max_records: None,
                     max_bytes: Some(4096),
                 },
+                rotate_on_limit: true,
                 ..RecordingPolicy::default()
             },
         )
@@ -1104,6 +1159,84 @@ mod tests {
         for tape in rotated_tapes_for(&path) {
             let _ = fs::remove_file(tape);
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn expired_boundary_update_keeps_its_discovered_checkpoint_on_size_rotation() {
+        let now = Utc::now();
+        // The expiring event id is long enough that the EventExpired record
+        // itself trips the cap; the fresh tape must still open with the
+        // event's discovered checkpoint, snapshotted before the boundary
+        // update was processed.
+        let event_id = "x".repeat(1300);
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: event_id.clone().into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-exp".into(),
+            down_token: "down-exp".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let quote = MarketUpdate::Quote {
+            token_id: "up-exp".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.50)),
+            bid_size: None,
+            ask_size: None,
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::milliseconds(1),
+        };
+        let expired = MarketUpdate::EventExpired {
+            event_id: event_id.into(),
+            end_time: now + Duration::minutes(5),
+            resolved_up_won: Some(true),
+        };
+        let updates = vec![discovered.clone(), quote.clone(), expired.clone()];
+        let path = temp_log_path("recording-feed-expired-boundary-rotation");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: None,
+                    max_bytes: Some(3200),
+                },
+                rotate_on_limit: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        assert!(feed.writer.is_some());
+        drop(feed);
+
+        assert_eq!(forwarded, updates);
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
+        let first_tape = recorded_updates(&rotated[0]);
+        assert_eq!(
+            first_tape
+                .iter()
+                .map(|record| record.update.clone())
+                .collect::<Vec<_>>(),
+            vec![discovered.clone(), quote]
+        );
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 2);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, discovered);
+        assert_eq!(second_tape[1].sequence, 1);
+        assert_eq!(second_tape[1].update, expired);
+
+        let _ = fs::remove_file(rotated[0].clone());
         let _ = fs::remove_file(path);
     }
 
@@ -1513,6 +1646,7 @@ mod tests {
             RecordingPolicy {
                 limits: RecordingLimits::default(),
                 rotate_seconds: None,
+                rotate_on_limit: false,
                 include_kinds: vec![
                     RecordingKind::Quote,
                     RecordingKind::EventDiscovered,
