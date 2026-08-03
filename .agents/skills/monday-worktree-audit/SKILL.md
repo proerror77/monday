@@ -14,9 +14,10 @@ Produce a read-only inventory. Classification is not deletion authorization.
 3. For every dirty entry, report changed and untracked paths without modifying them.
 4. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
 5. Classify:
-   - `active`: registered and clean, or current ownership/use is present;
+   - `active`: registered, clean, and not Git-prunable;
    - `dirty`: tracked or untracked changes exist;
    - `prunable`: Git itself marks the administrative worktree record prunable.
+   Record ownership or session use only in `Owner/use`; it never changes `State`.
 6. Keep `cleanup-safe` separate from those three states. It requires explicit user authorization plus clean state, no unpushed work, resolved PR disposition, no active owner/session, and a recorded recovery identity.
 
 ## Stop conditions
