@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monday Delivery Status"
+  short_description: "Separate live delivery states with exact evidence"
+  default_prompt: "Use $monday-delivery-status to report the current delivery state of this Monday change."

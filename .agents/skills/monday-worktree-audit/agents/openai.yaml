@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monday Worktree Audit"
+  short_description: "Classify worktrees safely without cleanup"
+  default_prompt: "Use $monday-worktree-audit to classify the current Monday worktrees."
