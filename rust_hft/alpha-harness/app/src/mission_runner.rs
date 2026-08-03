@@ -34,6 +34,7 @@ use std::{
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
+const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
@@ -161,6 +162,21 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(&mission_path)?)
             .context("CEX Research Mission artifact is invalid JSON or schema")?;
     control_mission.validate()?;
+    let baseline_target = control_mission
+        .spec
+        .hypotheses
+        .first()
+        .context("CEX Research Mission has no baseline target")?
+        .target
+        .clone();
+    if control_mission
+        .spec
+        .hypotheses
+        .iter()
+        .any(|hypothesis| hypothesis.target != baseline_target)
+    {
+        bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
+    }
     mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
     let gp_policy = CexGpPolicyV1::controlled_v1(
         control_mission.spec.policies.gp.id.clone(),
@@ -255,6 +271,15 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         asset_id: control_mission.spec.instrument.symbol.clone(),
         parent_revision_id: Some(dataset_manifest.manifest_id.clone()),
         payload: semantic_mission,
+        created_at: now,
+    })?;
+    let baseline_policy_revision_id = baseline_policy.content_hash()?;
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: baseline_policy_revision_id,
+        registry_kind: CEX_BASELINE_POLICY_REGISTRY_KIND.to_string(),
+        asset_id: control_mission.spec.instrument.symbol.clone(),
+        parent_revision_id: Some(mission_id.clone()),
+        payload: serde_json::to_value(&baseline_policy)?,
         created_at: now,
     })?;
     data_mission::write_json_atomic(
@@ -364,21 +389,6 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     )?;
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
     let baseline_context = baseline_dataset.engine_context();
-    let baseline_target = control_mission
-        .spec
-        .hypotheses
-        .first()
-        .context("CEX Research Mission has no baseline target")?
-        .target
-        .clone();
-    if control_mission
-        .spec
-        .hypotheses
-        .iter()
-        .any(|hypothesis| hypothesis.target != baseline_target)
-    {
-        bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
-    }
     let baseline_run = evaluate_cex_baselines(
         &baseline_context,
         &factor_bank,
@@ -392,6 +402,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &mut store,
         &results_dir,
         &control_mission,
+        &baseline_policy,
         &factor_bank,
         baseline_run,
     )?;
@@ -443,6 +454,7 @@ fn persist_baseline_evidence(
     store: &mut AlphaStore,
     results_dir: &Path,
     control_mission: &CexResearchMissionArtifactV1,
+    baseline_policy: &CexBaselinePolicyV1,
     factor_bank: &CexFactorBankRevisionV2,
     run: alpha_engine::baselines::CexBaselineRun,
 ) -> anyhow::Result<()> {
@@ -452,7 +464,7 @@ fn persist_baseline_evidence(
         if ridge.is_some() || cart.is_some() {
             bail!("empty Factor Bank baseline evaluation returned model artifacts");
         }
-        gate.validate_binding(factor_bank, None, None)?;
+        gate.validate_binding(control_mission, baseline_policy, factor_bank, None, None)?;
         store.put_registry_revision(&RegistryRevision {
             revision_id: gate.gate_id.clone(),
             registry_kind: CEX_BASELINE_GATE_REGISTRY_KIND.to_string(),
@@ -467,9 +479,15 @@ fn persist_baseline_evidence(
 
     let ridge = ridge.context("non-empty Factor Bank baseline is missing Ridge artifact")?;
     let cart = cart.context("non-empty Factor Bank baseline is missing CART artifact")?;
-    ridge.validate_binding(control_mission, factor_bank)?;
-    cart.validate_binding(control_mission, factor_bank)?;
-    gate.validate_binding(factor_bank, Some(&ridge), Some(&cart))?;
+    ridge.validate_binding(control_mission, baseline_policy, factor_bank)?;
+    cart.validate_binding(control_mission, baseline_policy, factor_bank)?;
+    gate.validate_binding(
+        control_mission,
+        baseline_policy,
+        factor_bank,
+        Some(&ridge),
+        Some(&cart),
+    )?;
     for (artifact_id, registry_kind, payload) in [
         (
             ridge.artifact_id.clone(),
@@ -1432,6 +1450,10 @@ mod tests {
         let gate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
                 .unwrap();
+        let policy: CexBaselinePolicyV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-policy.json")).unwrap())
+                .unwrap();
+        let policy_hash = policy.content_hash().unwrap();
 
         assert_eq!(ridge["model_kind"], "ridge");
         assert_eq!(cart["model_kind"], "shallow_cart");
@@ -1444,6 +1466,55 @@ mod tests {
         assert_eq!(gate["passed"], true);
         assert_eq!(gate["ridge_artifact_id"], ridge["artifact_id"]);
         assert_eq!(gate["cart_artifact_id"], cart["artifact_id"]);
+        assert_eq!(gate["policy_hash"], policy_hash);
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let policy_revision = store.get_registry_revision(&policy_hash).unwrap();
+        assert_eq!(
+            policy_revision.registry_kind,
+            CEX_BASELINE_POLICY_REGISTRY_KIND
+        );
+        assert_eq!(policy_revision.revision_id, policy_hash);
+        assert_eq!(
+            policy_revision.asset_id,
+            fixture.mission.spec.instrument.symbol
+        );
+        assert_eq!(
+            policy_revision.parent_revision_id.as_deref(),
+            Some(fixture.mission.semantic_id().unwrap().as_str())
+        );
+        assert_eq!(
+            policy_revision.payload,
+            serde_json::to_value(&policy).unwrap()
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_mixed_hypothesis_targets_before_side_effects() {
+        let mut fixture = fixture("mixed-hypothesis-targets");
+        let mut second = fixture.mission.spec.hypotheses[0].clone();
+        second.hypothesis_id = "hypothesis-2".to_string();
+        second.target.name = "forward_mid_return_other".to_string();
+        fixture.mission.spec.hypotheses.push(second);
+        write_mission(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CEX Research Mission hypotheses do not share one frozen baseline target"));
+        assert!(!fixture.args.work_dir.join("input/features.jsonl").exists());
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/gp-policy.json")
+            .exists());
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/baseline-policy.json")
+            .exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
