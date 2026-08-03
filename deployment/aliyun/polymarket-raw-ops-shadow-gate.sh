@@ -213,7 +213,8 @@ secure_collector_directory() {
 
 verify_legacy_state_handoff_preflight() {
   local baseline_mode=$1 state_path=$2 parent owner group mode
-  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
+    || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode == legacy_python ]] || return 0
   parent=${state_path%/*}
   secure_collector_directory "$parent" || return 1
@@ -447,6 +448,19 @@ verify_baseline_identity() {
   fi
   verify_runtime_identity "$RUST_PRODUCTION_EXEC" "$legacy_pid" \
     "$legacy_restarts" "$legacy_invocation_id" || return 1
+  if [[ $baseline_mode == rust_bootstrap ]]; then
+    [[ $baseline_release_path == "$RUST_ACTIVE_BINARY" \
+      && -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY ]] || return 1
+    [[ $(readlink -f -- "$RUST_ACTIVE_BINARY") == "$baseline_release_path" ]] \
+      || return 1
+    secure_control_file "$baseline_release_path"
+    [[ -x $baseline_release_path ]] || return 1
+    printf '%s  %s\n' "$baseline_release_sha" "$baseline_release_path" \
+      | sha256sum --check --strict >/dev/null || return 1
+    [[ $(readlink -f -- "/proc/$legacy_pid/exe") == "$baseline_release_path" ]]
+    return
+  fi
+  [[ $baseline_mode == rust_release ]] || return 1
   [[ $(readlink -f -- "$RUST_ACTIVE_BINARY") == "$baseline_release_path" ]] \
     || return 1
   secure_release_directory "${baseline_release_path%/*}" || return 1
@@ -460,7 +474,8 @@ verify_baseline_identity() {
 verify_cutover_target_preflight() {
   local baseline_mode=$1 active_binary=$2 control_dir=$3 release_manifest_name=$4
   local file_verifier=$5 unit fragment expected_fragment drop_ins asset assets
-  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release ]] || return 1
+  [[ $baseline_mode == legacy_python || $baseline_mode == rust_release \
+    || $baseline_mode == rust_bootstrap ]] || return 1
   [[ $baseline_mode != legacy_python || ( ! -e $active_binary && ! -L $active_binary ) ]] \
     || return 1
   secure_root_chain_or_absent "$control_dir" || return 1
@@ -1254,13 +1269,27 @@ case "$baseline_exec" in
     baseline_label=Python
     ;;
   "$RUST_PRODUCTION_EXEC")
-    baseline_mode=rust_release
-    baseline_label='Rust production'
-    baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
-      die 'active Rust collector symlink cannot be resolved'
-    [[ $baseline_release_path =~ ^$RELEASE_ROOT/([a-f0-9]{64})/polymarket-raw-ops$ ]] \
-      || die 'active Rust collector does not resolve to an immutable release'
-    baseline_release_sha=${BASH_REMATCH[1]}
+    if [[ -L $RUST_ACTIVE_BINARY ]]; then
+      baseline_mode=rust_release
+      baseline_label='Rust production'
+      baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
+        die 'active Rust collector symlink cannot be resolved'
+      [[ $baseline_release_path =~ ^$RELEASE_ROOT/([a-f0-9]{64})/polymarket-raw-ops$ ]] \
+        || die 'active Rust collector does not resolve to an immutable release'
+      baseline_release_sha=${BASH_REMATCH[1]}
+    else
+      baseline_mode=rust_bootstrap
+      baseline_label='Rust bootstrap'
+      [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY ]] \
+        || die 'active Rust collector is neither an immutable release nor a direct bootstrap binary'
+      baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
+        die 'active Rust bootstrap binary cannot be resolved'
+      [[ $baseline_release_path == "$RUST_ACTIVE_BINARY" ]] \
+        || die 'active Rust bootstrap binary is not a direct canonical path'
+      baseline_release_sha=$(sha256sum "$baseline_release_path" | awk '{print $1}')
+      [[ $baseline_release_sha =~ ^[a-f0-9]{64}$ ]] \
+        || die 'active Rust bootstrap binary digest is invalid'
+    fi
     [[ $candidate_sha != "$baseline_release_sha" ]] || \
       die 'candidate digest matches the active Rust release'
     ;;
@@ -1268,9 +1297,14 @@ case "$baseline_exec" in
 esac
 baseline_health_start_required=false
 baseline_runtime_stability_required=true
+baseline_degraded=false
 if [[ $baseline_mode == legacy_python ]]; then
   baseline_health_start_required=$LEGACY_HEALTH_START_REQUIRED
   baseline_runtime_stability_required=$LEGACY_RUNTIME_STABILITY_REQUIRED
+elif [[ $baseline_mode == rust_bootstrap ]]; then
+  ! verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" "$RUST_HEALTH_POLICY" \
+    || die 'healthy unregistered Rust baseline must be adopted before a normal release gate'
+  baseline_degraded=true
 fi
 legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
@@ -1534,7 +1568,7 @@ parity_window_started_at=
 while :; do
   now_uptime=$SECONDS
   elapsed=$((now_uptime - start_uptime))
-  if [[ $baseline_mode == rust_release \
+  if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap \
     || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
     verify_baseline_identity \
       || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
@@ -1712,7 +1746,7 @@ shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
   || die 'Rust shadow did not remain a single continuous process'
 verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
   || die 'final Rust shadow systemd identity differs from the gated candidate'
-if [[ $baseline_mode == rust_release \
+if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap \
   || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
   verify_baseline_identity \
     || die 'baseline collector identity changed before parity evidence was captured'
@@ -1772,7 +1806,7 @@ parity_args=(
   --ended-at-unix "$common_cutoff"
   --output "$parity_json"
 )
-if [[ $baseline_mode == legacy_python ]]; then
+if [[ $baseline_mode == legacy_python || $baseline_mode == rust_bootstrap ]]; then
   parity_args+=(--allow-empty-legacy)
 fi
 "$release_binary" "${parity_args[@]}" \
@@ -1802,7 +1836,10 @@ canonical_uploaded_segments=$(jq -er \
 verify_baseline_identity \
   || die 'baseline collector identity changed while parity or OSS readback was running'
 baseline_proc_exe=''
-[[ $baseline_mode != rust_release ]] || baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") || die 'could not capture the production Rust executable identity'
+if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap ]]; then
+  baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") \
+    || die 'could not capture the production Rust executable identity'
+fi
 verify_current_oss_config
 legacy_exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
   || die 'could not capture the effective legacy ExecStart'
@@ -1856,6 +1893,7 @@ jq \
   --argjson baseline_health_start_required "$baseline_health_start_required" \
   --argjson baseline_runtime_stability_required \
     "$baseline_runtime_stability_required" \
+  --argjson baseline_degraded "$baseline_degraded" \
   --argjson baseline_health_completion_required "$LEGACY_HEALTH_COMPLETION_REQUIRED" \
   --argjson baseline_health_snapshot "$baseline_health_snapshot" \
   --argjson baseline_health_completion_snapshot "$baseline_health_completion_snapshot" \
@@ -1892,6 +1930,7 @@ jq \
     production_eligible:$production_eligible,
     baseline_health_start_required:$baseline_health_start_required,
     baseline_runtime_stability_required:$baseline_runtime_stability_required,
+    baseline_degraded:$baseline_degraded,
     baseline_health_completion_required:$baseline_health_completion_required,
     baseline_health_snapshot:$baseline_health_snapshot,
     baseline_health_completion_snapshot:$baseline_health_completion_snapshot,
@@ -1909,7 +1948,7 @@ jq \
         fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
         main_pid:$legacy_pid,restarts:$legacy_restarts,
         invocation_id:$legacy_invocation_id}
-      + if $baseline_mode == "rust_release" then
+      + if $baseline_mode == "rust_release" or $baseline_mode == "rust_bootstrap" then
           {release_path:$baseline_release_path,proc_exe:$baseline_proc_exe,
             release_sha256:$baseline_release_sha256} else {} end),
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
@@ -1943,8 +1982,8 @@ if [[ $production_eligible == true ]]; then
     "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
     "$control_archive_sha" "$release_binary" "$release_control_dir" \
     || die 'release manifest, candidate, or installed control bundle changed during gate'
-  if [[ $baseline_mode == rust_release \
-    || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
+if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap \
+  || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
     verify_baseline_identity \
       || die 'baseline collector identity changed before the gate marker was published'
   fi

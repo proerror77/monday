@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Static contract greps intentionally use literal shell expressions.
 # Extracted production snippets invoke test doubles and variables indirectly.
-# shellcheck disable=SC1090,SC2016,SC2034,SC2317,SC2329
+# shellcheck disable=SC1090,SC2016,SC2030,SC2031,SC2034,SC2154,SC2317,SC2329
 set -euo pipefail
 
 export LC_ALL=C
@@ -1359,6 +1359,88 @@ exercise_rust_baseline_identity() (
 )
 exercise_rust_baseline_identity
 
+exercise_rust_bootstrap_identity() (
+  set -euo pipefail
+  RUST_ACTIVE_BINARY="$tmp_dir/bootstrap-active" baseline_mode=rust_bootstrap legacy_pid=42
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+  legacy_restarts=1 legacy_invocation_id=$(printf '1%.0s' {1..32})
+  baseline_release_sha=$(printf '8%.0s' {1..64})
+  baseline_release_path="$RUST_ACTIVE_BINARY"
+  printf 'test\n' >"$RUST_ACTIVE_BINARY"; chmod +x "$RUST_ACTIVE_BINARY"
+  mock_active=$RUST_ACTIVE_BINARY mock_proc=$RUST_ACTIVE_BINARY
+  mock_digest=true mock_runtime=true
+  verify_runtime_identity() { [[ $mock_runtime == true ]]; }
+  verify_legacy_identity() { return 1; }
+  secure_release_directory() { return 1; }
+  secure_control_file() { [[ -f $1 && ! -L $1 ]]; }
+  readlink() {
+    [[ $3 == "$RUST_ACTIVE_BINARY" ]] && printf '%s\n' "$mock_active" \
+      || printf '%s\n' "$mock_proc"
+  }
+  sha256sum() { cat >/dev/null; [[ $mock_digest == true ]]; }
+  # shellcheck source=/dev/null
+  source "$baseline_identity_contract"
+  verify_baseline_identity || {
+    printf 'bootstrap Rust baseline identity was rejected\n' >&2
+    exit 1
+  }
+  for drift in active proc digest runtime; do
+    mock_active=$RUST_ACTIVE_BINARY mock_proc=$RUST_ACTIVE_BINARY
+    mock_digest=true mock_runtime=true
+    case "$drift" in
+      active) mock_active=/tmp/wrong ;;
+      proc) mock_proc=/tmp/wrong ;;
+      digest) mock_digest=false ;;
+      runtime) mock_runtime=false ;;
+    esac
+    verify_baseline_identity && {
+      printf 'accepted bootstrap %s drift\n' "$drift" >&2
+      exit 1
+    }
+  done
+  return 0
+)
+exercise_rust_bootstrap_identity
+
+bootstrap_baseline_selection="$tmp_dir/bootstrap-baseline-selection.sh"
+sed -n '/^baseline_exec=$(effective_exec_argv/,/^baseline_health_start_required=false$/p' \
+  "$GATE" >"$bootstrap_baseline_selection"
+(
+  set -euo pipefail
+  LEGACY_UNIT=polymarket-reference-collector.service
+  LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+  RUST_ACTIVE_BINARY="$tmp_dir/bootstrap-selected-active"
+  RELEASE_ROOT="$tmp_dir/releases"
+  candidate_sha=$(printf 'a%.0s' {1..64})
+  printf 'bootstrap\n' >"$RUST_ACTIVE_BINARY"
+  effective_exec_argv() { printf '%s\n' "$RUST_PRODUCTION_EXEC"; }
+  die() { printf 'bootstrap baseline selection was rejected\n' >&2; return 1; }
+  # shellcheck source=/dev/null
+  source "$bootstrap_baseline_selection"
+  [[ $baseline_mode == rust_bootstrap \
+    && $baseline_release_path == "$RUST_ACTIVE_BINARY" \
+    && $baseline_release_sha =~ ^[a-f0-9]{64}$ ]]
+)
+
+bootstrap_health_admission="$tmp_dir/bootstrap-health-admission.sh"
+sed -n '/^baseline_health_start_required=false$/,/^fi$/p' "$GATE" \
+  >"$bootstrap_health_admission"
+(
+  set -euo pipefail
+  baseline_mode=rust_bootstrap
+  LEGACY_SPOOL="$tmp_dir/bootstrap-health-spool"
+  bootstrap_health_policy=
+  verify_fresh_baseline_health() {
+    bootstrap_health_policy=${2:-}
+    return 1
+  }
+  die() { printf 'bootstrap health admission was rejected\n' >&2; return 1; }
+  # shellcheck source=/dev/null
+  source "$bootstrap_health_admission"
+  [[ $baseline_degraded == true && $bootstrap_health_policy == "$RUST_HEALTH_POLICY" ]]
+)
+
 # The long shadow observation must not start when the production cutover target
 # already contains state that the promotion path will reject. Keep the same
 # read-only contract in both scripts so the Gate and final cutover cannot drift.
@@ -2176,6 +2258,177 @@ set -e
   printf 'manual rollback admitted an unrelated active release\n' >&2
   exit 1
 }
+
+# A bootstrap recovery snapshots a direct binary, not an immutable-release
+# symlink. Manual rollback must admit only that exact direct binary and must
+# still reject a different direct binary before it mutates the saved state.
+make_bootstrap_lineage_evidence() {
+  local name=$1 marker_state=$2 direct_mode=${3:-0755} evidence manifest_sha
+  evidence="$lineage_evidence_root/$name"
+  mkdir -p "$evidence/rollback/bin"
+  printf 'saved-baseline\n' >"$evidence/rollback/bin/polymarket-raw-ops"
+  chmod +x "$evidence/rollback/bin/polymarket-raw-ops"
+  jq -n --arg candidate "$lineage_candidate_sha" --arg path "$lineage_active" \
+    --arg sha "$lineage_saved_sha" \
+    --arg mode "$direct_mode" \
+    '{baseline_mode:"rust_bootstrap",candidate_sha256:$candidate,
+      active_direct:{path:$path,sha256:$sha,mode:$mode}}' \
+    >"$evidence/rollback/state.json"
+  (cd "$evidence/rollback" && sha256sum state.json bin/polymarket-raw-ops >manifest.sha256)
+  if [[ $marker_state == pending ]]; then
+    manifest_sha=$(sha256sum "$evidence/rollback/manifest.sha256" | awk '{print $1}')
+    jq -n --arg candidate "$lineage_candidate_sha" --arg manifest "$manifest_sha" \
+      '{candidate_sha256:$candidate,rollback_manifest_sha256:$manifest}' \
+      >"$evidence/cutover.json"
+    (cd "$evidence" && sha256sum cutover.json >PASSED.rollback-pending.sha256)
+  fi
+  printf '%s\n' "$evidence"
+}
+exercise_manual_bootstrap_lineage() (
+  set -euo pipefail
+  local evidence=$1 active_contents=$2 active_mode=${3:-0755} mutation_log=$1/mutations
+  EVIDENCE_ROOT=$lineage_evidence_root RELEASE_ROOT=$lineage_release_root
+  ACTIVE_BINARY=$lineage_active mode=rollback
+  set -- rollback "$evidence"
+  : >"$mutation_log"
+  rm -f "$ACTIVE_BINARY"
+  printf '%s\n' "$active_contents" >"$ACTIVE_BINARY"
+  chmod "$active_mode" "$ACTIVE_BINARY"
+  secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
+  secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  stat() {
+    [[ ${1:-} == -c && ${2:-} == %a && ${3:-} == -- && ${4:-} == "$ACTIVE_BINARY" ]] \
+      || return 1
+    [[ $active_mode == 0644 ]] && printf '644\n' || printf '755\n'
+  }
+  prepare_rollback_evidence() { printf 'prepare\n' >>"$mutation_log"; }
+  restore_legacy() { printf 'restore\n' >>"$mutation_log"; }
+  finalize_rollback_evidence() { printf 'finalize\n' >>"$mutation_log"; }
+  die() { printf 'manual bootstrap lineage rejected: %s\n' "$*" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "$manual_lineage_contract"
+)
+bootstrap_lineage=$(make_bootstrap_lineage_evidence bootstrap-saved pending)
+exercise_manual_bootstrap_lineage "$bootstrap_lineage" saved-baseline >/dev/null
+[[ $(<"$bootstrap_lineage/mutations") == $'prepare\nrestore\nfinalize' ]] || {
+  printf 'manual rollback rejected the exact direct bootstrap baseline\n' >&2
+  exit 1
+}
+bootstrap_drift_lineage=$(make_bootstrap_lineage_evidence bootstrap-drift pending)
+set +e
+exercise_manual_bootstrap_lineage "$bootstrap_drift_lineage" unrelated-bootstrap >/dev/null 2>&1
+bootstrap_drift_status=$?
+set -e
+[[ $bootstrap_drift_status -ne 0 && ! -s $bootstrap_drift_lineage/mutations ]] || {
+  printf 'manual rollback admitted a different direct bootstrap binary\n' >&2
+  exit 1
+}
+bootstrap_bad_mode_lineage=$(make_bootstrap_lineage_evidence bootstrap-bad-mode pending invalid)
+set +e
+exercise_manual_bootstrap_lineage "$bootstrap_bad_mode_lineage" saved-baseline >/dev/null 2>&1
+bootstrap_bad_mode_status=$?
+set -e
+[[ $bootstrap_bad_mode_status -ne 0 && ! -s $bootstrap_bad_mode_lineage/mutations ]] || {
+  printf 'manual rollback admitted malformed bootstrap rollback metadata\n' >&2
+  exit 1
+}
+bootstrap_nonexec_lineage=$(make_bootstrap_lineage_evidence bootstrap-nonexec pending 0644)
+set +e
+exercise_manual_bootstrap_lineage "$bootstrap_nonexec_lineage" saved-baseline >/dev/null 2>&1
+bootstrap_nonexec_status=$?
+set -e
+[[ $bootstrap_nonexec_status -ne 0 && ! -s $bootstrap_nonexec_lineage/mutations ]] || {
+  printf 'manual rollback admitted a non-executable bootstrap rollback image\n' >&2
+  exit 1
+}
+bootstrap_active_mode_drift_lineage=$(make_bootstrap_lineage_evidence bootstrap-active-mode-drift pending)
+set +e
+exercise_manual_bootstrap_lineage "$bootstrap_active_mode_drift_lineage" saved-baseline 0644 \
+  >/dev/null 2>&1
+bootstrap_active_mode_drift_status=$?
+set -e
+[[ $bootstrap_active_mode_drift_status -ne 0 \
+  && ! -s $bootstrap_active_mode_drift_lineage/mutations ]] || {
+  printf 'manual rollback admitted bootstrap mode drift before evidence invalidation\n' >&2
+  exit 1
+}
+
+# The bootstrap admission allows an absent global control directory. Its
+# snapshot must still have a verifiable manifest, and a direct binary changed
+# during the copy must not enter the rollback payload.
+snapshot_legacy_contract="$tmp_dir/snapshot-legacy-contract.sh"
+sed -n '/^snapshot_legacy() {$/,/^}$/p' "$CUTOVER" >"$snapshot_legacy_contract"
+[[ -s $snapshot_legacy_contract ]] || {
+  printf 'bootstrap rollback snapshot contract is missing\n' >&2
+  exit 1
+}
+exercise_bootstrap_snapshot() (
+  set -euo pipefail
+  local case_name=$1 copy_drift=${2:-false} root rollback systemd_fixture candidate_sha baseline_sha
+  root="$tmp_dir/bootstrap-snapshot-$case_name"
+  rollback="$root/rollback"
+  systemd_fixture="$root/systemd"
+  mkdir -p "$systemd_fixture" "$root/bin"
+  UNIT_ASSETS=(
+    polymarket-reference-collector.service
+    polymarket-reference-upload.service
+    polymarket-reference-upload.timer
+    polymarket-market-tape-upload.service
+    polymarket-market-tape-upload.timer
+  )
+  COLLECTOR_UNIT=polymarket-reference-collector.service
+  REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
+  MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+  for asset in "${UNIT_ASSETS[@]}"; do
+    printf 'unit=%s\n' "$asset" >"$systemd_fixture/$asset"
+  done
+  UPLOAD_ENV="$root/upload.env"
+  printf 'upload-env\n' >"$UPLOAD_ENV"
+  ACTIVE_BINARY="$root/bin/polymarket-raw-ops"
+  printf 'bootstrap-original\n' >"$ACTIVE_BINARY"
+  chmod 0755 "$ACTIVE_BINARY"
+  CONTROL_DIR="$root/absent-control"
+  candidate_sha=$(printf 'c%.0s' {1..64})
+  baseline_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}')
+  printf 'bootstrap-replaced\n' >"$root/replaced"
+  secure_root_chain() { return 0; }
+  secure_regular_file() { return 0; }
+  unit_enabled() { return 1; }
+  unit_active() { return 1; }
+  stat() { printf '0755\n'; }
+  sync() { :; }
+  install() {
+    local install_mode input destination
+    if [[ ${1:-} == -d ]]; then
+      command install "$@"
+      return
+    fi
+    [[ ${1:-} == -m && $# -eq 4 ]] || {
+      command install "$@"
+      return
+    }
+    install_mode=$2
+    input=$3
+    destination=$4
+    [[ $input != /etc/systemd/system/* ]] \
+      || input="$systemd_fixture/${input##*/}"
+    [[ $input != "$ACTIVE_BINARY" || $copy_drift != true ]] \
+      || input="$root/replaced"
+    command install -m "$install_mode" "$input" "$destination"
+  }
+  die() { printf 'snapshot rejected: %s\n' "$*" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "$snapshot_legacy_contract"
+  snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
+  (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
+  jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+)
+exercise_bootstrap_snapshot absent-control
+if exercise_bootstrap_snapshot copied-binary-drift true; then
+  printf 'bootstrap snapshot accepted a binary changed during copy\n' >&2
+  exit 1
+fi
 
 cutover_failure_cleanup="$tmp_dir/cutover-failure-cleanup.sh"
 sed -n '/^on_exit() {$/,/^}$/p' "$CUTOVER" >"$cutover_failure_cleanup"
@@ -3548,6 +3801,38 @@ release_sha|.legacy_runtime.release_sha256 = "not-a-digest"
 proc_exe|.legacy_runtime.proc_exe = "/tmp/polymarket-raw-ops"
 candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
 EOF
+jq '.baseline_mode = "rust_bootstrap"
+  | .comparison_mode = "rust_self"
+  | .baseline_degraded = true
+  | .metrics.legacy_trade_count = 0
+  | .metrics.legacy_metadata_count = 0
+  | .metrics.legacy_settlement_count = 0
+  | .legacy_runtime.release_path = "/opt/monday/bin/polymarket-raw-ops"
+  | .legacy_runtime.proc_exe = "/opt/monday/bin/polymarket-raw-ops"' \
+  "$tmp_dir/rust-release-gate.json" >"$tmp_dir/rust-bootstrap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/rust-bootstrap-gate.json" >/dev/null || {
+  printf 'gate policy rejected a bounded Rust bootstrap recovery\n' >&2
+  exit 1
+}
+jq '.metrics.legacy_metadata_count = 1' "$tmp_dir/rust-bootstrap-gate.json" \
+  >"$tmp_dir/rust-bootstrap-metadata-only-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/rust-bootstrap-metadata-only-gate.json" >/dev/null || {
+  printf 'gate policy rejected metadata-only bootstrap Rust-self evidence\n' >&2
+  exit 1
+}
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/rust-bootstrap-gate.json" >"$tmp_dir/rust-bootstrap-$name.json"
+  if jq -e -f "$POLICY" "$tmp_dir/rust-bootstrap-$name.json" >/dev/null; then
+    printf 'Rust bootstrap gate accepted %s drift\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+release_path|.legacy_runtime.release_path = "/tmp/polymarket-raw-ops"
+proc_exe|.legacy_runtime.proc_exe = "/tmp/polymarket-raw-ops"
+comparison_mode|.comparison_mode = "legacy_overlap"
+degraded|.baseline_degraded = false
+candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
+EOF
 jq '.legacy_runtime += {
     release_sha256:("'"$baseline_sha"'"),
     release_path:("/opt/monday/releases/polymarket-raw-ops/" + "'"$baseline_sha"'" + "/polymarket-raw-ops"),
@@ -4389,7 +4674,7 @@ grep -Fq 'FragmentPath' "$CUTOVER"
 grep -Fq 'DropInPaths' "$CUTOVER"
 grep -Fq 'NRestarts' "$CUTOVER"
 [[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$GATE") -eq 2 ]]
-[[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$CUTOVER") -eq 2 ]]
+[[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$CUTOVER") -eq 3 ]]
 grep -Fq 'invocation_id:$rust_invocation_id' "$CUTOVER"
 grep -Fq 'verify_shadow_identity' "$GATE"
 grep -Fq 'health_advanced=true' "$CUTOVER"
@@ -4465,7 +4750,7 @@ if grep -Fq 'verify_fresh_legacy_runtime' "$cutover_legacy_rollback"; then
   printf 'legacy rollback still waits for a full-cycle health publication\n' >&2
   exit 1
 fi
-legacy_drain_line=$(grep -n '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
+legacy_drain_line=$(grep -n '^[[:space:]]*verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
   | head -1 | cut -d: -f1)
 legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
   "$CUTOVER" | cut -d: -f1)
@@ -4514,7 +4799,7 @@ rollback_restart_line=$(grep -n '^  systemctl restart "$COLLECTOR_UNIT"$' "$CUTO
     exit 1
   }
 rollback_state_line=$(grep -n '^  verify_saved_unit_state' "$CUTOVER" | cut -d: -f1)
-rollback_final_runtime_line=$(grep -n '^  verify_legacy_runtime "$rollback_pid" 0' "$CUTOVER" \
+rollback_final_runtime_line=$(grep -n '^[[:space:]]*verify_legacy_runtime "$rollback_pid" 0' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 ((rollback_state_line < rollback_final_runtime_line)) || {
   printf 'rollback lacks a final runtime check after restoring unit state\n' >&2
@@ -4716,12 +5001,15 @@ for retry_case in pid-delayed exe-delayed preexec-delayed; do
   fi
 done
 
+snapshot_nullglob_line=$(grep -n '^    shopt -s nullglob$' "$CUTOVER" | cut -d: -f1)
 snapshot_manifest_line=$(grep -n \
   '^    sha256sum state.json systemd/\* bin/\* config/\* control/\* >manifest.sha256$' \
   "$CUTOVER" | cut -d: -f1)
 snapshot_sync_line=$(grep -n '^  sync -f "$rollback_dir"$' "$CUTOVER" | head -1 \
   | cut -d: -f1)
-((snapshot_manifest_line < snapshot_sync_line)) || {
+[[ -n $snapshot_nullglob_line && -n $snapshot_manifest_line \
+  && $snapshot_nullglob_line -lt $snapshot_manifest_line \
+  && $snapshot_manifest_line -lt $snapshot_sync_line ]] || {
   printf 'rollback snapshot is not synchronized after its checksum manifest\n' >&2
   exit 1
 }
@@ -4751,10 +5039,10 @@ restore_first_stop_line=$(grep -n '^  systemctl stop "\$REFERENCE_UPLOAD_TIMER" 
 }
 
 active_target_line=$(grep -n '^    active_target=$(readlink -f -- "\$ACTIVE_BINARY")$' "$CUTOVER" \
-  | cut -d: -f1)
+  | tail -1 | cut -d: -f1)
 active_target_guard_line=$(grep -n \
-  'active_target == "\$RELEASE_ROOT"/\*/polymarket-raw-ops' "$CUTOVER" | cut -d: -f1)
-active_rm_line=$(grep -n '^    rm -f "\$ACTIVE_BINARY"$' "$CUTOVER" | cut -d: -f1)
+  'active_target == "\$RELEASE_ROOT"/\*/polymarket-raw-ops' "$CUTOVER" | tail -1 | cut -d: -f1)
+active_rm_line=$(grep -n '^    rm -f "\$ACTIVE_BINARY"$' "$CUTOVER" | tail -1 | cut -d: -f1)
 active_link_line=$(grep -n '^ln -s "\$candidate_binary" "\$temporary_link"$' "$CUTOVER" \
   | cut -d: -f1)
 ((active_target_line < active_target_guard_line \
@@ -4881,6 +5169,21 @@ if grep -Fq ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-' "$CI_WORKFLOW
 fi
 grep -Fq -- '--allow-match-regex "${legacy_runtime_reference_allowlist}"' "$CI_WORKFLOW"
 grep -Fq 'deployment/aliyun/polymarket-raw-ops-cutover[.]sh:' "$CI_WORKFLOW"
+legacy_test_reference_allowlist=$(sed -n \
+  "s/^[[:space:]]*legacy_runtime_reference_allowlist='\(.*\)'$/\1/p" "$CI_WORKFLOW")
+[[ -n $legacy_test_reference_allowlist ]] || {
+  printf 'Rust Fast Gates has no legacy-runtime reference allowlist\n' >&2
+  exit 1
+}
+legacy_test_reference=$(grep -n -Fx \
+  "  LEGACY_EXEC='/usr/bin/pyth""on3 /opt/monday/bin/polymarket_reference_collector.py'" "$0")
+legacy_test_reference="deployment/aliyun/test-polymarket-raw-ops-control-plane.sh:$legacy_test_reference"
+printf '%s\n' \
+  "$legacy_test_reference" \
+  | grep -E -x "$legacy_test_reference_allowlist" >/dev/null || {
+    printf 'Rust Fast Gates rejects the control-plane identity fixture\n' >&2
+    exit 1
+  }
 
 grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GATE"
 grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"
