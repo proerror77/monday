@@ -100,6 +100,10 @@ path = "src/bin/binance-usdm-reference-artifact-verifier.rs"
 name = "binance-usdm-reference-upload"
 path = "src/bin/binance-usdm-reference-upload.rs"
 
+[[bin]]
+name = "binance-replay-parquet-cache-warmer"
+path = "src/bin/binance-replay-parquet-cache-warmer.rs"
+
 [lib]
 name = "hft_collector"
 path = "src/lib.rs"

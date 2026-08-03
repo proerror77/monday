@@ -7,9 +7,23 @@ use anyhow::{bail, Context};
 use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
+use parquet::schema::parser::parse_message_type;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+
+const CANONICAL_PARQUET_SCHEMA: &str =
+    "timestamp_us:int64,sequence:int64,event:utf8,payload_json:utf8";
+const CANONICAL_PARQUET_MESSAGE: &str = "
+message binance_replay {
+  REQUIRED INT64 timestamp_us;
+  REQUIRED INT64 sequence;
+  REQUIRED BINARY event (UTF8);
+  REQUIRED BINARY payload_json (UTF8);
+}
+";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BacktestConfig {
@@ -72,6 +86,9 @@ impl BacktestConfig {
     }
 
     pub fn validate_data_artifact(&self) -> anyhow::Result<VerifiedBacktestData> {
+        if self.data.format.eq_ignore_ascii_case("parquet") {
+            return self.validate_parquet_artifact();
+        }
         if !self.data.format.eq_ignore_ascii_case("ndjson") {
             bail!("unsupported backtest data format: {}", self.data.format);
         }
@@ -125,6 +142,81 @@ impl BacktestConfig {
                 manifest_sha256: actual_manifest_sha256,
                 config_sha256: hex::encode(Sha256::digest(serde_json::to_vec(self)?)),
                 source_revision: manifest.source_revision,
+                replay_rows: manifest.rows,
+            },
+        })
+    }
+
+    fn validate_parquet_artifact(&self) -> anyhow::Result<VerifiedBacktestData> {
+        if !self.data.require_sequence {
+            bail!("backtests require data.require_sequence=true");
+        }
+        if self
+            .data
+            .start_ts
+            .zip(self.data.end_ts)
+            .is_some_and(|(start, end)| start > end)
+        {
+            bail!("backtest time window start_ts must not exceed end_ts");
+        }
+        let manifest_path = self
+            .data
+            .manifest_path
+            .as_deref()
+            .context("backtests require data.manifest_path")?;
+        let expected_manifest_sha256 = valid_sha256(
+            self.data
+                .manifest_sha256
+                .as_deref()
+                .context("backtests require data.manifest_sha256")?,
+            "data.manifest_sha256",
+        )?;
+        let manifest_bytes = fs::read(resolve_path(manifest_path))
+            .with_context(|| format!("无法读取回测数据 manifest: {manifest_path}"))?;
+        let actual_manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+        if actual_manifest_sha256 != expected_manifest_sha256 {
+            bail!(
+                "backtest manifest SHA-256 mismatch: expected {expected_manifest_sha256}, actual {actual_manifest_sha256}"
+            );
+        }
+        let manifest: CanonicalParquetManifest = serde_json::from_slice(&manifest_bytes)
+            .context("无法解析 canonical Parquet manifest")?;
+        manifest.validate()?;
+        self.validate_modalities()?;
+
+        let artifact_path = resolve_path(&self.data.path);
+        if !artifact_path.is_file() {
+            bail!("无法读取本地 canonical Parquet: {}", self.data.path);
+        }
+        let configured_name = artifact_path
+            .file_name()
+            .context("data.path must name a canonical Parquet artifact")?;
+        if manifest.artifact_path.file_name() != Some(configured_name) {
+            bail!("data.path does not match manifest artifact_path");
+        }
+        let bytes = fs::read(&artifact_path)
+            .with_context(|| format!("无法读取回测数据: {}", self.data.path))?;
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != manifest.artifact_sha256 {
+            bail!(
+                "backtest data SHA-256 mismatch: expected {}, actual {actual}",
+                manifest.artifact_sha256
+            );
+        }
+        let (replay_bytes, replay_rows) = read_canonical_parquet(
+            &artifact_path,
+            &manifest,
+            self.data.start_ts,
+            self.data.end_ts,
+        )?;
+        self.validate_execution_model()?;
+        Ok(VerifiedBacktestData {
+            bytes: replay_bytes,
+            evidence: BacktestInputEvidence {
+                manifest_sha256: actual_manifest_sha256,
+                config_sha256: hex::encode(Sha256::digest(serde_json::to_vec(self)?)),
+                source_revision: manifest.source_revision,
+                replay_rows,
             },
         })
     }
@@ -177,6 +269,7 @@ pub struct BacktestInputEvidence {
     pub manifest_sha256: String,
     pub config_sha256: String,
     pub source_revision: String,
+    pub replay_rows: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -221,6 +314,100 @@ struct BacktestDataManifest {
     artifact_path: String,
     artifact_sha256: String,
     point_in_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalParquetManifest {
+    dataset_kind: String,
+    schema_version: String,
+    format: String,
+    parquet_schema: String,
+    mission_id: String,
+    market: String,
+    symbol: String,
+    dataset: String,
+    modalities: Vec<String>,
+    source_revision: String,
+    source_segments: Vec<CanonicalSourceSegmentEvidence>,
+    rows: usize,
+    first_event_time_us: i64,
+    last_event_time_us: i64,
+    sequence_start: u64,
+    sequence_end: u64,
+    artifact_path: std::path::PathBuf,
+    artifact_sha256: String,
+    point_in_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalSourceSegmentEvidence {
+    file: String,
+    sha256: String,
+    collector_manifest_sha256: String,
+    success_marker_sha256: String,
+    start_received_at_ns: u64,
+    end_received_at_ns: u64,
+    events: u64,
+}
+
+impl CanonicalParquetManifest {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.dataset_kind != "backtest_canonical_replay_parquet"
+            || self.schema_version != "binance-replay-parquet-v1"
+            || self.format != "parquet"
+            || self.parquet_schema != CANONICAL_PARQUET_SCHEMA
+            || self.mission_id.trim().is_empty()
+            || self.market.trim().is_empty()
+            || self.symbol.trim().is_empty()
+            || self.dataset.trim().is_empty()
+            || self.modalities != vec!["lob".to_string()]
+            || !self.point_in_time
+            || self.rows == 0
+            || self.source_segments.is_empty()
+            || self.first_event_time_us > self.last_event_time_us
+            || self.sequence_start != 1
+            || self.sequence_end < self.sequence_start
+            || self.sequence_end - self.sequence_start + 1 != self.rows as u64
+            || self.artifact_path.is_absolute()
+            || self
+                .artifact_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("canonical Parquet manifest is incomplete or unsupported");
+        }
+        valid_sha256(&self.artifact_sha256, "manifest.artifact_sha256")?;
+        valid_sha256(&self.source_revision, "manifest.source_revision")?;
+        if self.artifact_path != std::path::Path::new(&format!("{}.parquet", self.artifact_sha256))
+        {
+            bail!("canonical Parquet artifact path is not content addressed");
+        }
+        let mut source_hashes = Vec::with_capacity(self.source_segments.len());
+        let mut unique = HashSet::new();
+        for segment in &self.source_segments {
+            if segment.file.trim().is_empty()
+                || segment.events == 0
+                || segment.start_received_at_ns > segment.end_received_at_ns
+                || !unique.insert(&segment.sha256)
+            {
+                bail!("canonical source segment evidence is incomplete or duplicated");
+            }
+            valid_sha256(&segment.sha256, "source segment sha256")?;
+            valid_sha256(
+                &segment.collector_manifest_sha256,
+                "source collector manifest sha256",
+            )?;
+            valid_sha256(
+                &segment.success_marker_sha256,
+                "source success marker sha256",
+            )?;
+            source_hashes.push(segment.sha256.as_str());
+        }
+        if source_revision(source_hashes) != self.source_revision {
+            bail!("canonical source revision does not match source segments");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -631,6 +818,93 @@ fn validate_event_tape(bytes: &[u8], manifest: &BacktestDataManifest) -> anyhow:
         bail!("event tape coverage does not match its manifest");
     }
     Ok(())
+}
+
+fn read_canonical_parquet(
+    artifact_path: &Path,
+    manifest: &CanonicalParquetManifest,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+) -> anyhow::Result<(Vec<u8>, usize)> {
+    let reader = SerializedFileReader::new(File::open(artifact_path)?)?;
+    let required_schema = parse_message_type(CANONICAL_PARQUET_MESSAGE)?;
+    let schema_descriptor = reader.metadata().file_metadata().schema_descr_ptr();
+    let actual_schema = schema_descriptor.root_schema();
+    if actual_schema != &required_schema {
+        bail!("canonical Parquet schema does not match the manifest contract");
+    }
+
+    let mut output = Vec::new();
+    let mut rows = 0_usize;
+    let mut replay_rows = 0_usize;
+    let mut first_timestamp = None;
+    let mut last_timestamp = None;
+    let mut expected_sequence = manifest.sequence_start;
+    let mut previous_timestamp = None;
+    for row in reader.get_row_iter(Some(required_schema))? {
+        let row = row?;
+        let timestamp_us = row
+            .get_long(0)
+            .context("canonical Parquet row timestamp is not int64")?;
+        let sequence = row
+            .get_long(1)
+            .context("canonical Parquet row sequence is not int64")?;
+        let sequence =
+            u64::try_from(sequence).context("canonical Parquet row sequence is negative")?;
+        let event = row
+            .get_string(2)
+            .context("canonical Parquet row event is not UTF-8")?;
+        let payload_json = row
+            .get_string(3)
+            .context("canonical Parquet row payload is not UTF-8")?;
+        if event != "snapshot" && event != "l2_update" {
+            bail!("canonical Parquet row has unsupported event {event}");
+        }
+        if sequence != expected_sequence
+            || previous_timestamp.is_some_and(|previous| timestamp_us < previous)
+        {
+            bail!("canonical Parquet rows are not continuous and time ordered");
+        }
+        let mut value: serde_json::Value = serde_json::from_str(payload_json)
+            .context("canonical Parquet payload is invalid JSON")?;
+        let object = value
+            .as_object_mut()
+            .context("canonical Parquet payload must be a JSON object")?;
+        object.insert("timestamp".to_string(), timestamp_us.into());
+        object.insert("sequence".to_string(), sequence.into());
+        object.insert("event".to_string(), event.as_str().into());
+        if start_ts.is_none_or(|start| timestamp_us >= start)
+            && end_ts.is_none_or(|end| timestamp_us <= end)
+        {
+            serde_json::to_writer(&mut output, &value)?;
+            output.push(b'\n');
+            replay_rows = replay_rows
+                .checked_add(1)
+                .context("canonical Parquet replay row count overflow")?;
+        }
+
+        rows = rows
+            .checked_add(1)
+            .context("canonical Parquet row count overflow")?;
+        first_timestamp.get_or_insert(timestamp_us);
+        last_timestamp = Some(timestamp_us);
+        previous_timestamp = Some(timestamp_us);
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .context("canonical Parquet sequence overflow")?;
+    }
+    if rows != manifest.rows
+        || first_timestamp != Some(manifest.first_event_time_us)
+        || last_timestamp != Some(manifest.last_event_time_us)
+        || expected_sequence
+            != manifest
+                .sequence_end
+                .checked_add(1)
+                .context("canonical Parquet sequence overflow")?
+    {
+        bail!("canonical Parquet coverage does not match its manifest");
+    }
+    Ok((output, replay_rows))
 }
 
 fn valid_sha256<'a>(value: &'a str, field: &str) -> anyhow::Result<&'a str> {

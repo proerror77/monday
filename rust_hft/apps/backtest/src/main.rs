@@ -385,6 +385,7 @@ mod tests {
                 manifest_sha256: "a".repeat(64),
                 config_sha256: "b".repeat(64),
                 source_revision: "c".repeat(64),
+                replay_rows: 0,
             }),
         };
 
