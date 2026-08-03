@@ -5,12 +5,13 @@ use crate::{
     data_mission, governance, mission,
 };
 use alpha_domain::{
-    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexFactorBankRevisionV2,
-    CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2,
-    CexFactorScreeningVerdictV1, CexGpPolicyV1, CexResearchMissionArtifactV1, EvaluationCostsV1,
-    FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy, MissionStatus,
-    ResearchMission, ValidatorMode,
+    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselinePolicyV1,
+    CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1,
+    CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1, CexGpPolicyV1,
+    CexResearchMissionArtifactV1, EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict,
+    MissionCompletionPolicy, MissionStatus, ResearchMission, ValidatorMode,
 };
+use alpha_engine::{baselines::evaluate_cex_baselines, evaluation::prepare_dataset};
 use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -33,6 +34,9 @@ use std::{
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
+const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
+const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
+const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -166,6 +170,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     )?;
     gp_policy.validate_binding(&control_mission.spec.policies.gp)?;
     data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
+    let baseline_policy =
+        CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
+    baseline_policy.validate_binding(&control_mission.spec.policies.baseline)?;
+    data_mission::write_json_atomic(&results_dir.join("baseline-policy.json"), &baseline_policy)?;
     let mission_id = control_mission.semantic_id()?;
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
@@ -299,7 +307,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     drop(store);
 
     let dataset = DatasetArgs {
-        dataset_manifest: dataset_manifest_path,
+        dataset_manifest: dataset_manifest_path.clone(),
         validation,
     };
     let run_args = RunMissionArgs {
@@ -347,6 +355,46 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         created_at: Utc::now(),
     })?;
     data_mission::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
+    let baseline_dataset_manifest =
+        data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
+    let baseline_rows = baseline_dataset_manifest.load_rows(
+        evaluation_protocol.costs.fee_bps,
+        evaluation_protocol.costs.funding_bps,
+        evaluation_protocol.costs.latency_bps,
+    )?;
+    let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
+    let baseline_context = baseline_dataset.engine_context();
+    let baseline_target = control_mission
+        .spec
+        .hypotheses
+        .first()
+        .context("CEX Research Mission has no baseline target")?
+        .target
+        .clone();
+    if control_mission
+        .spec
+        .hypotheses
+        .iter()
+        .any(|hypothesis| hypothesis.target != baseline_target)
+    {
+        bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
+    }
+    let baseline_run = evaluate_cex_baselines(
+        &baseline_context,
+        &factor_bank,
+        &baseline_policy,
+        &mission_id,
+        baseline_target,
+        &control_mission.spec.policies.evaluation,
+    )
+    .map_err(anyhow::Error::msg)?;
+    persist_baseline_evidence(
+        &mut store,
+        &results_dir,
+        &control_mission,
+        &factor_bank,
+        baseline_run,
+    )?;
     let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
@@ -389,6 +437,69 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         bundle_bytes,
         bundle_sha256,
     })
+}
+
+fn persist_baseline_evidence(
+    store: &mut AlphaStore,
+    results_dir: &Path,
+    control_mission: &CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    run: alpha_engine::baselines::CexBaselineRun,
+) -> anyhow::Result<()> {
+    let alpha_engine::baselines::CexBaselineRun { ridge, cart, gate } = run;
+    let asset_id = control_mission.spec.instrument.symbol.clone();
+    if factor_bank.entries.is_empty() {
+        if ridge.is_some() || cart.is_some() {
+            bail!("empty Factor Bank baseline evaluation returned model artifacts");
+        }
+        gate.validate_binding(factor_bank, None, None)?;
+        store.put_registry_revision(&RegistryRevision {
+            revision_id: gate.gate_id.clone(),
+            registry_kind: CEX_BASELINE_GATE_REGISTRY_KIND.to_string(),
+            asset_id,
+            parent_revision_id: Some(factor_bank.revision_id.clone()),
+            payload: serde_json::to_value(&gate)?,
+            created_at: Utc::now(),
+        })?;
+        data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
+        return Ok(());
+    }
+
+    let ridge = ridge.context("non-empty Factor Bank baseline is missing Ridge artifact")?;
+    let cart = cart.context("non-empty Factor Bank baseline is missing CART artifact")?;
+    ridge.validate_binding(control_mission, factor_bank)?;
+    cart.validate_binding(control_mission, factor_bank)?;
+    gate.validate_binding(factor_bank, Some(&ridge), Some(&cart))?;
+    for (artifact_id, registry_kind, payload) in [
+        (
+            ridge.artifact_id.clone(),
+            CEX_BASELINE_RIDGE_REGISTRY_KIND,
+            serde_json::to_value(&ridge)?,
+        ),
+        (
+            cart.artifact_id.clone(),
+            CEX_BASELINE_CART_REGISTRY_KIND,
+            serde_json::to_value(&cart)?,
+        ),
+        (
+            gate.gate_id.clone(),
+            CEX_BASELINE_GATE_REGISTRY_KIND,
+            serde_json::to_value(&gate)?,
+        ),
+    ] {
+        store.put_registry_revision(&RegistryRevision {
+            revision_id: artifact_id,
+            registry_kind: registry_kind.to_string(),
+            asset_id: asset_id.clone(),
+            parent_revision_id: Some(factor_bank.revision_id.clone()),
+            payload,
+            created_at: Utc::now(),
+        })?;
+    }
+    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), &ridge)?;
+    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), &cart)?;
+    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
+    Ok(())
 }
 
 fn build_factor_bank(
@@ -1300,6 +1411,43 @@ mod tests {
     }
 
     #[test]
+    fn execute_emits_passing_ridge_and_cart_baseline_evidence() {
+        let mut fixture = fixture("ridge-cart-baselines");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let ridge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("ridge-baseline.json")).unwrap())
+                .unwrap();
+        let cart: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
+                .unwrap();
+        let gate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(ridge["model_kind"], "ridge");
+        assert_eq!(cart["model_kind"], "shallow_cart");
+        assert_eq!(
+            ridge["factor_bank_revision_id"],
+            cart["factor_bank_revision_id"]
+        );
+        assert_eq!(ridge["folds"].as_array().unwrap().len(), 2);
+        assert_eq!(cart["folds"].as_array().unwrap().len(), 2);
+        assert_eq!(gate["passed"], true);
+        assert_eq!(gate["ridge_artifact_id"], ridge["artifact_id"]);
+        assert_eq!(gate["cart_artifact_id"], cart["artifact_id"]);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn execute_rejects_gp_policy_drift_before_screening() {
         let mut fixture = fixture("gp-policy-drift");
         fixture.mission.spec.policies.gp.content_sha256 = "f".repeat(64);
@@ -1707,6 +1855,7 @@ mod tests {
             &search.budget,
         )
         .unwrap();
+        let baseline_policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -1775,7 +1924,10 @@ mod tests {
                         content_sha256: gp_policy.content_hash().unwrap(),
                     },
                     screening: reference("screening-policy-1", '2'),
-                    baseline: reference("baseline-policy-1", '3'),
+                    baseline: CexResearchContentRefV1 {
+                        id: baseline_policy.policy_id.clone(),
+                        content_sha256: baseline_policy.content_hash().unwrap(),
+                    },
                     subset_search: CexResearchContentRefV1 {
                         id: "subset-search-policy-1".to_string(),
                         content_sha256: canonical_json_hash(&search).unwrap(),
@@ -1879,6 +2031,12 @@ mod tests {
         );
         if let Ok(gp_policy) = gp_policy {
             fixture.mission.spec.policies.gp.content_sha256 = gp_policy.content_hash().unwrap();
+        }
+        if let Ok(baseline_policy) =
+            CexBaselinePolicyV1::controlled_v1(fixture.mission.spec.policies.baseline.id.clone())
+        {
+            fixture.mission.spec.policies.baseline.content_sha256 =
+                baseline_policy.content_hash().unwrap();
         }
         fixture.mission.spec.policies.subset_search.content_sha256 =
             canonical_json_hash(&fixture.mission.spec.search).unwrap();
