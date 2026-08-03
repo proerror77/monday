@@ -5,7 +5,8 @@ use crate::{
 };
 use alpha_domain::{
     CandidateArtifact, EvaluationCostsV1, EvaluationProtocolV1,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
@@ -124,7 +125,9 @@ impl FormulaEvaluator {
         let mut failures = Vec::new();
         let require_icir = matches!(
             evaluator_version,
-            WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+            WALK_FORWARD_EVALUATOR_VERSION
+                | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+                | ONNX_WALK_FORWARD_EVALUATOR_VERSION
         );
         if predictive
             .time_series_ic
@@ -1108,6 +1111,46 @@ mod tests {
                     "book_imbalance".to_string(),
                 ))),
                 &input.engine_context(),
+            )
+            .unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.metrics.predictive.time_series_icir, None);
+        assert_eq!(result.metrics.predictive.time_series_rank_icir, None);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("time-series ICIR")));
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("time-series RankICIR")));
+        result.validate().unwrap();
+    }
+
+    #[test]
+    fn cex_baseline_requires_icir_and_rank_icir_when_they_are_missing() {
+        let input = prepare_dataset(rows(0.0), &protocol(0.0, 1)).unwrap();
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let context = input.engine_context();
+        let signals = context
+            .rows()
+            .iter()
+            .map(|row| row.signal)
+            .collect::<Vec<_>>();
+        let ranges = context
+            .folds()
+            .iter()
+            .map(|fold| fold.validation.clone())
+            .collect::<Vec<_>>();
+
+        let result = evaluator
+            .evaluate_signals(
+                context.rows(),
+                &signals,
+                ranges,
+                CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+                context.protocol(),
             )
             .unwrap();
 
