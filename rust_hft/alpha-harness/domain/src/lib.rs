@@ -15,6 +15,7 @@ pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
 pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v4";
 pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v4";
+pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v1";
 pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v3";
 pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v3";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
@@ -109,6 +110,8 @@ pub enum DomainError {
     InvalidCexGpCandidate(&'static str),
     #[error("CEX Factor Bank is invalid: {0}")]
     InvalidCexFactorBank(&'static str),
+    #[error("CEX baseline is invalid: {0}")]
+    InvalidCexBaseline(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1131,7 +1134,9 @@ impl CandidateEvaluation {
         if let Some(protocol) = protocol {
             let (expected_folds, expected_rows, expected_fold_rows) =
                 match self.evaluator_version.as_str() {
-                    WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION => (
+                    WALK_FORWARD_EVALUATOR_VERSION
+                    | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+                    | ONNX_WALK_FORWARD_EVALUATOR_VERSION => (
                         protocol.walk_forward.fold_count,
                         protocol
                             .walk_forward
@@ -1173,6 +1178,7 @@ impl CandidateEvaluation {
         if matches!(
             self.evaluator_version.as_str(),
             WALK_FORWARD_EVALUATOR_VERSION
+                | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
                 | SEALED_HOLDOUT_EVALUATOR_VERSION
                 | ONNX_WALK_FORWARD_EVALUATOR_VERSION
                 | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
@@ -1180,7 +1186,9 @@ impl CandidateEvaluation {
             let config = self.formula_config()?;
             let require_icir = matches!(
                 self.evaluator_version.as_str(),
-                WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                WALK_FORWARD_EVALUATOR_VERSION
+                    | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+                    | ONNX_WALK_FORWARD_EVALUATOR_VERSION
             );
             let capacity_passed = protocol.is_none_or(|protocol| {
                 !protocol.costs.capacity_enabled()
@@ -2059,6 +2067,661 @@ pub fn factor_ast_source_features(ast: &FactorAst) -> Vec<String> {
         }
     }
     fields.into_iter().collect()
+}
+
+pub const CEX_BASELINE_POLICY_SCHEMA_V1: &str = "cex-baseline-policy-v1";
+pub const CEX_BASELINE_ARTIFACT_SCHEMA_V1: &str = "cex-baseline-artifact-v1";
+pub const CEX_BASELINE_GATE_SCHEMA_V1: &str = "cex-baseline-gate-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexBaselineTieBreakV1 {
+    LossThenFeatureThenThreshold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexBaselinePolicyV1 {
+    pub schema_version: String,
+    pub policy_id: String,
+    pub ridge_l2: f64,
+    pub cart_max_depth: usize,
+    pub cart_min_leaf: usize,
+    pub cart_tie_break: CexBaselineTieBreakV1,
+    pub evaluator_config: FormulaEvaluatorConfig,
+}
+
+impl CexBaselinePolicyV1 {
+    pub fn controlled_v1(policy_id: impl Into<String>) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: CEX_BASELINE_POLICY_SCHEMA_V1.to_string(),
+            policy_id: policy_id.into(),
+            ridge_l2: 1.0e-6,
+            cart_max_depth: 3,
+            cart_min_leaf: 5,
+            cart_tie_break: CexBaselineTieBreakV1::LossThenFeatureThenThreshold,
+            evaluator_config: FormulaEvaluatorConfig::for_trials(2)?,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_BASELINE_POLICY_SCHEMA_V1
+            || self.policy_id.trim().is_empty()
+            || self.ridge_l2.to_bits() != 1.0e-6_f64.to_bits()
+            || self.cart_max_depth != 3
+            || self.cart_min_leaf != 5
+            || self.cart_tie_break != CexBaselineTieBreakV1::LossThenFeatureThenThreshold
+            || self.evaluator_config != FormulaEvaluatorConfig::for_trials(2)?
+        {
+            return Err(DomainError::InvalidCexBaseline("baseline policy drifted"));
+        }
+        self.evaluator_config.validate()
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        canonical_json_hash(self)
+    }
+
+    pub fn validate_binding(&self, binding: &CexResearchContentRefV1) -> Result<(), DomainError> {
+        binding.validate()?;
+        if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
+            return Err(DomainError::InvalidCexBaseline(
+                "baseline policy binding invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexBaselineModelKindV1 {
+    Ridge,
+    ShallowCart,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "model_kind", rename_all = "snake_case")]
+pub enum CexBaselineModelV1 {
+    Ridge {
+        intercept: f64,
+        means: Vec<f64>,
+        scales: Vec<f64>,
+        coefficients: Vec<f64>,
+    },
+    ShallowCart {
+        root: CexBaselineCartNodeV1,
+    },
+}
+
+impl CexBaselineModelV1 {
+    pub fn kind(&self) -> CexBaselineModelKindV1 {
+        match self {
+            Self::Ridge { .. } => CexBaselineModelKindV1::Ridge,
+            Self::ShallowCart { .. } => CexBaselineModelKindV1::ShallowCart,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "node_kind", rename_all = "snake_case")]
+pub enum CexBaselineCartNodeV1 {
+    Leaf {
+        value: f64,
+    },
+    Split {
+        feature_index: usize,
+        threshold: f64,
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexBaselineRangeV1 {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl CexBaselineRangeV1 {
+    pub const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    fn validate(&self, allow_empty: bool) -> Result<(), DomainError> {
+        if self.start > self.end || (!allow_empty && self.start == self.end) {
+            return Err(DomainError::InvalidCexBaseline("fold range is invalid"));
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexBaselineFoldV1 {
+    pub fold_index: usize,
+    pub fold_id: CexResearchContentRefV1,
+    pub train_range: CexBaselineRangeV1,
+    pub purge_range: CexBaselineRangeV1,
+    pub validation_range: CexBaselineRangeV1,
+    pub embargo_range: CexBaselineRangeV1,
+    pub predictions: Vec<f64>,
+    pub model: CexBaselineModelV1,
+}
+
+impl CexBaselineFoldV1 {
+    pub fn new(
+        fold_index: usize,
+        train_range: CexBaselineRangeV1,
+        purge_range: CexBaselineRangeV1,
+        validation_range: CexBaselineRangeV1,
+        embargo_range: CexBaselineRangeV1,
+        predictions: Vec<f64>,
+        model: CexBaselineModelV1,
+    ) -> Result<Self, DomainError> {
+        let mut fold = Self {
+            fold_index,
+            fold_id: CexResearchContentRefV1 {
+                id: String::new(),
+                content_sha256: String::new(),
+            },
+            train_range,
+            purge_range,
+            validation_range,
+            embargo_range,
+            predictions,
+            model,
+        };
+        let hash = fold_ranges_hash(&fold)?;
+        fold.fold_id = CexResearchContentRefV1 {
+            id: format!("cex-baseline-fold-{}-{hash}", fold_index),
+            content_sha256: hash,
+        };
+        if fold_index == 0
+            || fold.train_range.validate(false).is_err()
+            || fold.purge_range.validate(true).is_err()
+            || fold.validation_range.validate(false).is_err()
+            || fold.embargo_range.validate(true).is_err()
+            || fold.train_range.end > fold.purge_range.start
+            || fold.purge_range.end > fold.validation_range.start
+            || fold.validation_range.end > fold.embargo_range.start
+            || fold.predictions.len() != fold.validation_range.len()
+        {
+            return Err(DomainError::InvalidCexBaseline("fold schedule is invalid"));
+        }
+        Ok(fold)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexBaselineArtifactV1 {
+    pub schema_version: String,
+    pub artifact_id: String,
+    pub mission_id: String,
+    pub factor_bank_revision_id: String,
+    pub factor_ids: Vec<String>,
+    pub target: CexResearchHypothesisTargetV1,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
+    pub evaluation_policy: CexResearchContentRefV1,
+    pub baseline_policy: CexBaselinePolicyV1,
+    pub model_kind: CexBaselineModelKindV1,
+    pub folds: Vec<CexBaselineFoldV1>,
+    pub evaluation: CandidateEvaluation,
+}
+
+impl CexBaselineArtifactV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mission_id: String,
+        factor_bank_revision_id: String,
+        factor_ids: Vec<String>,
+        target: CexResearchHypothesisTargetV1,
+        research_dataset: CexResearchContentRefV1,
+        walk_forward_partition: CexResearchContentRefV1,
+        evaluation_policy: CexResearchContentRefV1,
+        baseline_policy: CexBaselinePolicyV1,
+        model_kind: CexBaselineModelKindV1,
+        folds: Vec<CexBaselineFoldV1>,
+        evaluation: CandidateEvaluation,
+    ) -> Result<Self, DomainError> {
+        let mut artifact = Self {
+            schema_version: CEX_BASELINE_ARTIFACT_SCHEMA_V1.to_string(),
+            artifact_id: String::new(),
+            mission_id,
+            factor_bank_revision_id,
+            factor_ids,
+            target,
+            research_dataset,
+            walk_forward_partition,
+            evaluation_policy,
+            baseline_policy,
+            model_kind,
+            folds,
+            evaluation,
+        };
+        artifact.artifact_id = artifact.expected_artifact_id()?;
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_BASELINE_ARTIFACT_SCHEMA_V1
+            || self.artifact_id != self.expected_artifact_id()?
+            || self.mission_id.trim().is_empty()
+            || self.factor_bank_revision_id.trim().is_empty()
+            || !non_empty_unique(&self.factor_ids)
+            || self.factor_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.target.name.trim().is_empty()
+            || self.target.horizon.horizon_buckets == 0
+            || self.target.horizon.observation_frequency_millis == 0
+            || self.folds.is_empty()
+        {
+            return Err(DomainError::InvalidCexBaseline("artifact identity invalid"));
+        }
+        self.research_dataset.validate()?;
+        self.walk_forward_partition.validate()?;
+        self.evaluation_policy.validate()?;
+        self.baseline_policy.validate()?;
+        self.evaluation.validate()?;
+        if self.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || self.evaluation.protocol_binding()?.1 != self.evaluation_policy.content_sha256
+            || self.evaluation.formula_config()? != self.baseline_policy.evaluator_config
+            || self.evaluation.metrics.folds.len() != self.folds.len()
+            || self
+                .evaluation
+                .metrics
+                .folds
+                .iter()
+                .enumerate()
+                .any(|(index, metric)| {
+                    metric.fold_index != index + 1
+                        || metric.row_count != self.folds[index].predictions.len()
+                })
+            || self.folds.iter().enumerate().any(|(index, fold)| {
+                fold.fold_index != index + 1
+                    || fold.predictions.len() != fold.validation_range.len()
+                    || fold.train_range.validate(false).is_err()
+                    || fold.purge_range.validate(true).is_err()
+                    || fold.validation_range.validate(false).is_err()
+                    || fold.embargo_range.validate(true).is_err()
+                    || fold.train_range.end > fold.purge_range.start
+                    || fold.purge_range.end > fold.validation_range.start
+                    || fold.validation_range.end > fold.embargo_range.start
+                    || fold_ranges_hash(fold).map_or(true, |hash| {
+                        fold.fold_id.content_sha256 != hash
+                            || fold.fold_id.id
+                                != format!("cex-baseline-fold-{}-{hash}", fold.fold_index)
+                    })
+                    || fold.fold_id.validate().is_err()
+                    || !fold.predictions.iter().all(|value| value.is_finite())
+                    || fold.model.kind() != self.model_kind
+                    || model_validate(&fold.model, self.factor_ids.len(), &self.baseline_policy)
+                        .is_err()
+            })
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "fold/model evidence invalid",
+            ));
+        }
+        if self.walk_forward_partition.content_sha256 != artifact_partition_hash(self)?
+            || self.walk_forward_partition.id
+                != format!(
+                    "cex-walk-forward-partition-{}",
+                    self.walk_forward_partition.content_sha256
+                )
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "partition identity invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        let mut semantic = self.clone();
+        semantic.artifact_id.clear();
+        canonical_json_hash(&semantic)
+    }
+
+    pub fn validate_binding(
+        &self,
+        mission: &CexResearchMissionArtifactV1,
+        factor_bank: &CexFactorBankRevisionV2,
+    ) -> Result<(), DomainError> {
+        mission.validate()?;
+        factor_bank.validate()?;
+        self.validate()?;
+        let expected_factor_ids = factor_bank
+            .entries
+            .iter()
+            .map(|entry| entry.factor_id.clone())
+            .collect::<Vec<_>>();
+        let mut expected_factor_ids = expected_factor_ids;
+        expected_factor_ids.sort();
+        if self.mission_id != mission.semantic_id()?
+            || self.factor_bank_revision_id != factor_bank.revision_id
+            || self.factor_ids != expected_factor_ids
+            || self.research_dataset != factor_bank.research_dataset
+            || self.walk_forward_partition != factor_bank.walk_forward_partition
+            || self.evaluation_policy != mission.spec.policies.evaluation
+            || self.target.horizon != mission.spec.instrument.horizon
+            || !mission
+                .spec
+                .hypotheses
+                .iter()
+                .any(|hypothesis| hypothesis.target == self.target)
+        {
+            return Err(DomainError::InvalidCexBaseline("artifact binding drifted"));
+        }
+        self.baseline_policy
+            .validate_binding(&mission.spec.policies.baseline)
+    }
+
+    fn expected_artifact_id(&self) -> Result<String, DomainError> {
+        let mut semantic = self.clone();
+        semantic.artifact_id.clear();
+        Ok(format!(
+            "cex-baseline-artifact-{}",
+            canonical_json_hash(&semantic)?
+        ))
+    }
+}
+
+fn fold_ranges_hash(fold: &CexBaselineFoldV1) -> Result<String, DomainError> {
+    #[derive(Serialize)]
+    struct Ranges {
+        train: CexBaselineRangeV1,
+        purge: CexBaselineRangeV1,
+        validation: CexBaselineRangeV1,
+        embargo: CexBaselineRangeV1,
+    }
+    canonical_json_hash(&Ranges {
+        train: fold.train_range,
+        purge: fold.purge_range,
+        validation: fold.validation_range,
+        embargo: fold.embargo_range,
+    })
+}
+
+fn artifact_partition_hash(artifact: &CexBaselineArtifactV1) -> Result<String, DomainError> {
+    let folds = artifact
+        .folds
+        .iter()
+        .map(|fold| {
+            serde_json::json!({
+                "train": fold.train_range,
+                "purge": fold.purge_range,
+                "validation": fold.validation_range,
+                "embargo": fold.embargo_range,
+            })
+        })
+        .collect::<Vec<_>>();
+    canonical_json_hash(&serde_json::json!({
+        "research_dataset": &artifact.research_dataset,
+        "folds": folds,
+    }))
+}
+
+fn model_validate(
+    model: &CexBaselineModelV1,
+    arity: usize,
+    policy: &CexBaselinePolicyV1,
+) -> Result<(), DomainError> {
+    match model {
+        CexBaselineModelV1::Ridge {
+            intercept,
+            means,
+            scales,
+            coefficients,
+        } if intercept.is_finite()
+            && means.len() == arity
+            && scales.len() == arity
+            && coefficients.len() == arity
+            && means.iter().all(|value| value.is_finite())
+            && scales.iter().all(|value| value.is_finite() && *value > 0.0)
+            && coefficients.iter().all(|value| value.is_finite()) =>
+        {
+            Ok(())
+        }
+        CexBaselineModelV1::ShallowCart { root } => validate_cart_node(root, arity, policy, 0),
+        _ => Err(DomainError::InvalidCexBaseline("fitted model is invalid")),
+    }
+}
+
+fn validate_cart_node(
+    node: &CexBaselineCartNodeV1,
+    arity: usize,
+    policy: &CexBaselinePolicyV1,
+    depth: usize,
+) -> Result<(), DomainError> {
+    if depth > policy.cart_max_depth {
+        return Err(DomainError::InvalidCexBaseline("CART exceeds max depth"));
+    }
+    match node {
+        CexBaselineCartNodeV1::Leaf { value } if value.is_finite() => Ok(()),
+        CexBaselineCartNodeV1::Split {
+            feature_index,
+            threshold,
+            left,
+            right,
+        } if *feature_index < arity && threshold.is_finite() && depth < policy.cart_max_depth => {
+            validate_cart_node(left, arity, policy, depth + 1)?;
+            validate_cart_node(right, arity, policy, depth + 1)
+        }
+        _ => Err(DomainError::InvalidCexBaseline("CART node is invalid")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexBaselineFailureCodeV1 {
+    EmptyFactorBank,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexBaselineGateV1 {
+    pub schema_version: String,
+    pub gate_id: String,
+    pub mission_id: String,
+    pub policy_id: String,
+    pub policy_hash: String,
+    pub factor_bank_revision_id: String,
+    pub ridge_artifact_id: Option<String>,
+    pub cart_artifact_id: Option<String>,
+    pub passed: bool,
+    pub failure_codes: Vec<CexBaselineFailureCodeV1>,
+}
+
+impl CexBaselineGateV1 {
+    pub fn new(
+        ridge: &CexBaselineArtifactV1,
+        cart: &CexBaselineArtifactV1,
+    ) -> Result<Self, DomainError> {
+        ridge.validate()?;
+        cart.validate()?;
+        if ridge.model_kind != CexBaselineModelKindV1::Ridge
+            || cart.model_kind != CexBaselineModelKindV1::ShallowCart
+            || ridge.mission_id != cart.mission_id
+            || ridge.factor_bank_revision_id != cart.factor_bank_revision_id
+            || ridge.factor_ids != cart.factor_ids
+            || ridge.target != cart.target
+            || ridge.research_dataset != cart.research_dataset
+            || ridge.walk_forward_partition != cart.walk_forward_partition
+            || ridge.evaluation_policy != cart.evaluation_policy
+            || ridge.baseline_policy != cart.baseline_policy
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "baseline artifacts not jointly bound",
+            ));
+        }
+        let passed = ridge.evaluation.passed && cart.evaluation.passed;
+        let failure_codes = if passed {
+            vec![]
+        } else {
+            vec![CexBaselineFailureCodeV1::InsufficientEvidence]
+        };
+        let mut gate = Self {
+            schema_version: CEX_BASELINE_GATE_SCHEMA_V1.to_string(),
+            gate_id: String::new(),
+            mission_id: ridge.mission_id.clone(),
+            policy_id: ridge.baseline_policy.policy_id.clone(),
+            policy_hash: ridge.baseline_policy.content_hash()?,
+            factor_bank_revision_id: ridge.factor_bank_revision_id.clone(),
+            ridge_artifact_id: Some(ridge.artifact_id.clone()),
+            cart_artifact_id: Some(cart.artifact_id.clone()),
+            passed,
+            failure_codes,
+        };
+        gate.gate_id = gate.expected_gate_id()?;
+        gate.validate()?;
+        Ok(gate)
+    }
+
+    pub fn empty_factor_bank(
+        mission_id: impl Into<String>,
+        policy: &CexBaselinePolicyV1,
+        factor_bank: &CexFactorBankRevisionV2,
+    ) -> Result<Self, DomainError> {
+        policy.validate()?;
+        factor_bank.validate()?;
+        if !factor_bank.entries.is_empty() {
+            return Err(DomainError::InvalidCexBaseline("factor bank is not empty"));
+        }
+        let mut gate = Self {
+            schema_version: CEX_BASELINE_GATE_SCHEMA_V1.to_string(),
+            gate_id: String::new(),
+            mission_id: mission_id.into(),
+            policy_id: policy.policy_id.clone(),
+            policy_hash: policy.content_hash()?,
+            factor_bank_revision_id: factor_bank.revision_id.clone(),
+            ridge_artifact_id: None,
+            cart_artifact_id: None,
+            passed: false,
+            failure_codes: vec![CexBaselineFailureCodeV1::EmptyFactorBank],
+        };
+        gate.gate_id = gate.expected_gate_id()?;
+        gate.validate()?;
+        Ok(gate)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_BASELINE_GATE_SCHEMA_V1
+            || self.gate_id != self.expected_gate_id()?
+            || self.mission_id.trim().is_empty()
+            || self.policy_id.trim().is_empty()
+            || !valid_content_sha256(&self.policy_hash)
+            || self.factor_bank_revision_id.trim().is_empty()
+            || self.failure_codes.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(DomainError::InvalidCexBaseline(
+                "baseline gate identity invalid",
+            ));
+        }
+        match (
+            &self.ridge_artifact_id,
+            &self.cart_artifact_id,
+            self.passed,
+            self.failure_codes.as_slice(),
+        ) {
+            (None, None, false, [CexBaselineFailureCodeV1::EmptyFactorBank]) => Ok(()),
+            (Some(ridge), Some(cart), true, [])
+                if valid_baseline_artifact_id(ridge)
+                    && valid_baseline_artifact_id(cart)
+                    && ridge != cart =>
+            {
+                Ok(())
+            }
+            (Some(ridge), Some(cart), false, [CexBaselineFailureCodeV1::InsufficientEvidence])
+                if valid_baseline_artifact_id(ridge)
+                    && valid_baseline_artifact_id(cart)
+                    && ridge != cart =>
+            {
+                Ok(())
+            }
+            _ => Err(DomainError::InvalidCexBaseline(
+                "baseline gate result inconsistent",
+            )),
+        }
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        let mut semantic = self.clone();
+        semantic.gate_id.clear();
+        canonical_json_hash(&semantic)
+    }
+
+    pub fn validate_binding(
+        &self,
+        factor_bank: &CexFactorBankRevisionV2,
+        ridge: Option<&CexBaselineArtifactV1>,
+        cart: Option<&CexBaselineArtifactV1>,
+    ) -> Result<(), DomainError> {
+        self.validate()?;
+        factor_bank.validate()?;
+        if self.factor_bank_revision_id != factor_bank.revision_id {
+            return Err(DomainError::InvalidCexBaseline(
+                "baseline gate factor bank drifted",
+            ));
+        }
+        match (ridge, cart, &self.ridge_artifact_id, &self.cart_artifact_id) {
+            (None, None, None, None) if factor_bank.entries.is_empty() => Ok(()),
+            (Some(ridge), Some(cart), Some(ridge_id), Some(cart_id))
+                if ridge.artifact_id == *ridge_id && cart.artifact_id == *cart_id =>
+            {
+                let expected_factor_ids = factor_bank
+                    .entries
+                    .iter()
+                    .map(|entry| entry.factor_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if ridge.factor_ids != expected_factor_ids || cart.factor_ids != expected_factor_ids
+                {
+                    return Err(DomainError::InvalidCexBaseline(
+                        "baseline gate factor ids drifted",
+                    ));
+                }
+                if Self::new(ridge, cart)? != *self {
+                    return Err(DomainError::InvalidCexBaseline(
+                        "baseline gate binding drifted",
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(DomainError::InvalidCexBaseline(
+                "baseline gate artifacts missing",
+            )),
+        }
+    }
+
+    fn expected_gate_id(&self) -> Result<String, DomainError> {
+        let mut semantic = self.clone();
+        semantic.gate_id.clear();
+        Ok(format!(
+            "cex-baseline-gate-{}",
+            canonical_json_hash(&semantic)?
+        ))
+    }
+}
+
+fn valid_baseline_artifact_id(value: &str) -> bool {
+    value
+        .strip_prefix("cex-baseline-artifact-")
+        .is_some_and(valid_content_sha256)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5404,5 +6067,73 @@ mod tests {
             verify_envelope(&signed, &trusted, &policy(), now, |_| false).unwrap_err(),
             DomainError::RuntimeBindingMismatch
         );
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn baseline_artifacts_and_joint_gate_are_content_bound() {
+        let bank = factor_bank();
+        let protocol = evaluation_protocol();
+        let policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
+        let mut evaluation = bank.attempts[0]
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        let config = policy.evaluator_config.clone();
+        let adjusted_score = config.adjusted_score(evaluation.metrics.raw_score).unwrap();
+        evaluation.evaluator_version = CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        evaluation.evaluator_config = serde_json::to_value(&config).unwrap();
+        evaluation.score = adjusted_score;
+        evaluation.metrics.adjusted_score = adjusted_score;
+        evaluation.validate().unwrap();
+        let ranges = [0, 35, 70].map(|offset| { let t = 200 + offset; (CexBaselineRangeV1::new(0, t), CexBaselineRangeV1::new(t, t + 5), CexBaselineRangeV1::new(t + 5, t + 35), CexBaselineRangeV1::new(t + 35, t + 36)) });
+        let folds = |model: CexBaselineModelV1| ranges.iter().enumerate().map(|(i, (train, purge, validation, embargo))| CexBaselineFoldV1::new(i + 1, *train, *purge, *validation, *embargo, vec![0.1; 30], model.clone()).unwrap()).collect::<Vec<_>>();
+        let partition_hash = canonical_json_hash(&serde_json::json!({"research_dataset": &bank.research_dataset, "folds": ranges.iter().map(|(train, purge, validation, embargo)| serde_json::json!({"train": train, "purge": purge, "validation": validation, "embargo": embargo})).collect::<Vec<_>>() })).unwrap();
+        let partition = CexResearchContentRefV1 {
+            id: format!("cex-walk-forward-partition-{partition_hash}"),
+            content_sha256: partition_hash,
+        };
+        let target = CexResearchHypothesisTargetV1 {
+            name: "forward_mid_return".to_string(),
+            horizon: protocol.labels.clone(),
+        };
+        let factor_ids = bank
+            .entries
+            .iter()
+            .map(|entry| entry.factor_id.clone())
+            .collect::<Vec<_>>();
+        let ridge = CexBaselineArtifactV1::new("mission-1".to_string(), bank.revision_id.clone(), factor_ids, target, bank.research_dataset, partition, bank.evaluation_policy, policy, CexBaselineModelKindV1::Ridge, folds(CexBaselineModelV1::Ridge { intercept: 0.0, means: vec![0.0], scales: vec![1.0], coefficients: vec![0.1] }), evaluation).unwrap();
+        let mut cart = ridge.clone();
+        cart.model_kind = CexBaselineModelKindV1::ShallowCart;
+        for fold in &mut cart.folds { fold.model = CexBaselineModelV1::ShallowCart { root: CexBaselineCartNodeV1::Leaf { value: 0.1 } }; }
+        cart.artifact_id = cart.expected_artifact_id().unwrap();
+        let _gate = CexBaselineGateV1::new(&ridge, &cart).unwrap();
+
+        let mut non_finite = ridge.clone();
+        if let CexBaselineModelV1::Ridge { coefficients, .. } = &mut non_finite.folds[0].model {
+            coefficients[0] = f64::NAN;
+        }
+        assert!(non_finite.validate().is_err());
+        let mut partition_drift = ridge;
+        partition_drift.walk_forward_partition.content_sha256 = "0".repeat(64);
+        assert!(partition_drift.validate().is_err());
+        let mut empty = factor_bank();
+        empty.attempts[0].verdict = CexFactorScreeningVerdictV1::Rejected;
+        empty.attempts[0].rejection_codes = vec![CexFactorRejectionCodeV1::EvaluationFailed];
+        empty.attempts[0].rejection_details = vec!["insufficient evidence".to_string()];
+        empty.attempts[0].evaluation = None; empty.attempts[0].post_warmup_coverage_rows = 0;
+        empty.entries.clear();
+        empty.revision_id = empty.expected_revision_id().unwrap();
+        empty.validate().unwrap();
+        let policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
+        let gate = CexBaselineGateV1::empty_factor_bank("mission-1", &policy, &empty).unwrap();
+        assert!(!gate.passed);
+        assert_eq!(
+            gate.failure_codes,
+            [CexBaselineFailureCodeV1::EmptyFactorBank]
+        );
+        assert!(gate.validate_binding(&empty, None, None).is_ok());
     }
 }
