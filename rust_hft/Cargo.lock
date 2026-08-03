@@ -4992,6 +4992,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "zstd",
 ]
 
 [[package]]

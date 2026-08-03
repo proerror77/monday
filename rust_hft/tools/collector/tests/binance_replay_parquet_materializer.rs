@@ -65,11 +65,11 @@ fn valid_rows() -> Vec<Value> {
     vec![
         json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":2,"websocket_streams":2}),
         json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
-        json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
-        diff(600, 101, 101, 100, json!([["100", "11"]]), json!([])),
+        json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100.00000000","10.01000000"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
+        diff(600, 101, 101, 100, json!([["100.00000000", "11.01000000"]]), json!([])),
         trade(700),
         diff(1_400, 102, 102, 101, json!([]), json!([["102", "3"]])),
-        json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":102,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","11"],["99","5"]],"asks":[["102","3"],["103","6"]],"reason":"test","replay_safe":true}),
+        json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":102,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100.00000000","11.01000000"],["99","5"]],"asks":[["102","3"],["103","6"]],"reason":"test","replay_safe":true}),
     ]
 }
 
@@ -89,22 +89,14 @@ impl Fixture {
         ));
         fs::create_dir_all(&directory).unwrap();
         let directory = fs::canonicalize(directory).unwrap();
-        let raw = directory.join("part-1.jsonl");
         let data = directory.join("part-1.jsonl.zst");
-        let mut raw_file = File::create(&raw).unwrap();
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&data).unwrap(), 3).unwrap();
         for row in rows {
-            serde_json::to_writer(&mut raw_file, row).unwrap();
-            raw_file.write_all(b"\n").unwrap();
+            serde_json::to_writer(&mut encoder, row).unwrap();
+            encoder.write_all(b"\n").unwrap();
         }
-        assert!(Command::new("zstd")
-            .args(["-q", "-f"])
-            .arg(&raw)
-            .arg("-o")
-            .arg(&data)
-            .status()
-            .unwrap()
-            .success());
-        fs::remove_file(raw).unwrap();
+        encoder.finish().unwrap().sync_all().unwrap();
 
         let content_sha256 = sha256_file(&data);
         let event_types = rows.iter().fold(BTreeMap::new(), |mut counts, row| {
@@ -238,7 +230,7 @@ fn cli_materializes_a_verified_triplet_into_a_content_addressed_parquet_partitio
     assert_eq!(rows[0].get_string(2).unwrap(), "snapshot");
     assert_eq!(rows[1].get_string(2).unwrap(), "l2_update");
     let payload: Value = serde_json::from_str(rows[0].get_string(3).unwrap()).unwrap();
-    assert_eq!(payload["bids"][0], json!([100.0, 10.0]));
+    assert_eq!(payload["bids"][0], json!(["100.00000000", "10.01000000"]));
 
     let retry = fixture.materialize(&artifact_dir);
     assert!(retry.status.success());
