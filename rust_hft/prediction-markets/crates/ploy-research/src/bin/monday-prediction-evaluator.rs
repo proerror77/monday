@@ -44,8 +44,8 @@ use ploy_research::{
     write_alpha_search_artifacts_with_state_and_runtime_feedback,
     write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
     AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions,
-    AutoFactorV2Target, FactorComboV1Options, FactorObservation, FactorObservationV2,
-    FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
+    AutoFactorV2Target, CandidateReplayFactorIdentity, FactorComboV1Options, FactorObservation,
+    FactorObservationV2, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
     LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
     MetaLabelWalkForwardOptions, RepricePilotMetrics, RepricePilotSelection, RepricingIcOptions,
@@ -1006,15 +1006,16 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 mod tests {
     use super::{
         parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
-        settlement_time_cohort_from_args, sorted_distinct_reprice_pilot_market_ids,
-        validate_expected_prediction_policy, validate_pipeline_smoke_args,
-        validate_prediction_snapshot_contract_id, validate_prediction_snapshot_profile,
-        validate_report_observation_count, validate_reprice_pilot_config,
-        validate_time_cohort_range, write_pipeline_smoke_report, write_report_set,
-        ReportArtifactContext, RepricePilotConfig,
+        runtime_feedback_for_lane, settlement_time_cohort_from_args,
+        sorted_distinct_reprice_pilot_market_ids, validate_expected_prediction_policy,
+        validate_pipeline_smoke_args, validate_prediction_snapshot_contract_id,
+        validate_prediction_snapshot_profile, validate_report_observation_count,
+        validate_reprice_pilot_config, validate_time_cohort_range, write_pipeline_smoke_report,
+        write_report_set, ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
+    use ploy_research::{AlphaSearchRuntimeFeedback, ReviewSide};
     use sha2::{Digest, Sha256};
     use std::fs;
 
@@ -1026,6 +1027,48 @@ mod tests {
         ));
         fs::write(&path, payload).expect("write parity fixture");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn candidate_replay_feedback_routes_only_to_the_exact_target_and_side() {
+        let feedback = AlphaSearchRuntimeFeedback {
+            version: Some("alpha_search_artifacts_v2".to_string()),
+            target: Some("full_depth_reprice_pnl_10s".to_string()),
+            side: Some(ReviewSide::Up),
+            dsl_hash: None,
+            runtime_score: "autofactor_formula:up_factor".to_string(),
+            base_factor: "up_factor".to_string(),
+            entry_signals: 1,
+            direct_passes_at_configured_threshold: 1,
+            formula_evaluations: 1,
+            depth_fillable: 1,
+            executable_edge_pass_min_edge: 1,
+        };
+
+        assert!(runtime_feedback_for_lane(
+            Some(&feedback),
+            "full_depth_reprice_pnl_10s",
+            Some(ReviewSide::Up)
+        )
+        .is_some());
+        assert!(runtime_feedback_for_lane(
+            Some(&feedback),
+            "full_depth_reprice_pnl_10s",
+            Some(ReviewSide::Down)
+        )
+        .is_none());
+        assert!(runtime_feedback_for_lane(
+            Some(&feedback),
+            "full_depth_reprice_pnl_30s",
+            Some(ReviewSide::Up)
+        )
+        .is_none());
+        assert!(runtime_feedback_for_lane(
+            Some(&feedback),
+            "full_depth_settlement_executable_pnl",
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -1480,23 +1523,13 @@ fn read_alpha_zoo_snapshot(path: &str) -> AlphaZooSnapshot {
         .unwrap_or_else(|err| panic!("parse alpha zoo snapshot JSON {path} failed: {err}"))
 }
 
-fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRuntimeFeedback> {
+fn runtime_feedback_from_candidate_replay(path: &str) -> AlphaSearchRuntimeFeedback {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("read candidate strategy replay JSON {path} failed: {err}"));
     let json: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("parse candidate strategy replay JSON {path} failed: {err}"));
-    let runtime_score = json
-        .get("runtime_score")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let base_factor = runtime_score
-        .strip_prefix("autofactor_formula:")
-        .unwrap_or(runtime_score.as_str())
-        .to_string();
-    if base_factor.is_empty() {
-        return None;
-    }
+    let identity = CandidateReplayFactorIdentity::from_artifact(&json)
+        .unwrap_or_else(|err| panic!("candidate strategy replay identity {path} failed: {err}"));
     let diagnostics = json
         .get("strategy_diagnostics")
         .and_then(serde_json::Value::as_object);
@@ -1525,12 +1558,13 @@ fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRunti
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or_else(|| metric("settlement_autofactor_predictive_score_ge_025"));
-    Some(AlphaSearchRuntimeFeedback {
-        version: None,
-        target: None,
-        side: None,
-        runtime_score,
-        base_factor,
+    AlphaSearchRuntimeFeedback {
+        version: Some(identity.version().to_string()),
+        target: Some(identity.target().to_string()),
+        side: identity.side(),
+        dsl_hash: Some(identity.dsl_hash().to_string()),
+        runtime_score: identity.runtime_score().to_string(),
+        base_factor: identity.name().to_string(),
         entry_signals: metric("entry_signals"),
         direct_passes_at_configured_threshold: direct_passes,
         formula_evaluations: metric("settlement_autofactor_formula_evaluations").max(
@@ -1550,7 +1584,15 @@ fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRunti
         executable_edge_pass_min_edge: metric(
             "settlement_autofactor_executable_edge_pass_min_edge",
         ),
-    })
+    }
+}
+
+fn runtime_feedback_for_lane<'a>(
+    feedback: Option<&'a AlphaSearchRuntimeFeedback>,
+    target: &str,
+    side: Option<ReviewSide>,
+) -> Option<&'a AlphaSearchRuntimeFeedback> {
+    feedback.filter(|feedback| feedback.target.as_deref() == Some(target) && feedback.side == side)
 }
 
 fn filter_autofactor_reports(
@@ -2355,7 +2397,7 @@ async fn main() {
     }
     let runtime_feedback = candidate_strategy_replay_json
         .as_deref()
-        .and_then(runtime_feedback_from_candidate_replay);
+        .map(runtime_feedback_from_candidate_replay);
     if let Some(feedback) = runtime_feedback.as_ref() {
         eprintln!(
             "alpha search runtime feedback loaded: runtime_score={} entry_signals={} direct_passes={} executable_edge_pass_min_edge={} formula_evaluations={}",
@@ -2385,6 +2427,8 @@ async fn main() {
     ] {
         let target_name = target.as_str();
         let side = target.review_side();
+        let lane_runtime_feedback =
+            runtime_feedback_for_lane(runtime_feedback.as_ref(), target_name, side);
         let plan_names = side
             .is_none()
             .then_some(alpha_search_plan_names.as_slice())
@@ -2409,18 +2453,36 @@ async fn main() {
                     alpha_search_output_dir.as_deref(),
                     alpha_search_input_names.as_ref(),
                 ) {
-                    if side.is_none() {
-                        match write_alpha_search_artifacts_with_state_and_runtime_feedback(
-                            output_dir,
-                            target_name,
-                            input_names,
-                            &reports,
-                            &autofactor_options,
-                            mcts_state.as_ref(),
-                            runtime_feedback.as_ref(),
-                            llm_prior.as_ref(),
-                            alpha_zoo.as_ref(),
-                        ) {
+                    let write_result = match side {
+                        Some(side) => lane_runtime_feedback.map(|feedback| {
+                            write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+                                output_dir,
+                                target_name,
+                                side,
+                                input_names,
+                                &reports,
+                                &autofactor_options,
+                                None,
+                                Some(feedback),
+                                None,
+                            )
+                        }),
+                        None => Some(
+                            write_alpha_search_artifacts_with_state_and_runtime_feedback(
+                                output_dir,
+                                target_name,
+                                input_names,
+                                &reports,
+                                &autofactor_options,
+                                mcts_state.as_ref(),
+                                lane_runtime_feedback,
+                                llm_prior.as_ref(),
+                                alpha_zoo.as_ref(),
+                            ),
+                        ),
+                    };
+                    if let Some(write_result) = write_result {
+                        match write_result {
                             Ok(summary) => eprintln!(
                                 "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
                                 summary.target,
