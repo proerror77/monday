@@ -1242,7 +1242,13 @@ mod tests {
 
     #[test]
     fn execute_screens_gp_candidates_into_an_immutable_factor_bank() {
-        let fixture = fixture("gp-factor-bank");
+        let mut fixture = fixture("gp-factor-bank");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
         execute(fixture.args.clone()).unwrap();
         let results = fixture.args.work_dir.join("results");
         let run: serde_json::Value =
@@ -1255,9 +1261,9 @@ mod tests {
                 .unwrap();
         assert_eq!(factor_bank["schema_version"], "cex-factor-bank-v2");
         assert_eq!(factor_bank["research_dataset"], run["research_dataset"]);
-        assert!(factor_bank["entries"]
-            .as_array()
-            .unwrap()
+        let entries = factor_bank["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries
             .iter()
             .all(|entry| entry["orientation"] == "positive"));
         assert!(results.join("gp-policy.json").exists());
