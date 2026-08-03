@@ -3,15 +3,23 @@
 # (issue #655). Runs every two minutes from
 # polymarket-market-tape-upload-watchdog.timer. It only ever starts units; it
 # never stops, disables, or deletes anything and never modifies tape files.
+#
+# Cutover suppression: when $SUPPRESS_FILE exists, all remediation is skipped
+# for both lanes so a governed cutover can stop the upload timers without the
+# watchdog restarting them mid-cutover. The file lives under /run and does not
+# survive a reboot.
 set -eu
 
 readonly TAG=polymarket-upload-watchdog
 readonly ACTIVE_TAPE=market-updates.ndjson
 readonly STALE_SECONDS=5400
+readonly SUPPRESS_FILE=/run/monday/polymarket-upload-watchdog.suppress
 
+readonly MARKET_LANE=market
 readonly MARKET_SPOOL=/data/monday/spool/polymarket
 readonly MARKET_TIMER=polymarket-market-tape-upload.timer
 readonly MARKET_SERVICE=polymarket-market-tape-upload.service
+readonly REFERENCE_LANE=reference
 readonly REFERENCE_SPOOL=/data/monday/spool/polymarket-reference
 readonly REFERENCE_TIMER=polymarket-reference-upload.timer
 readonly REFERENCE_SERVICE=polymarket-reference-upload.service
@@ -45,21 +53,35 @@ lane_stats() {
   done
 }
 
-# Self-heal one upload lane: $1 timer unit, $2 service unit, $3 spool dir,
-# $4 pending rotated tapes, $5 oldest rotated tape age in seconds.
-check_lane() {
-  timer_state=$(unit_state "$1")
-  if [ "$timer_state" != "active" ]; then
-    log warning "$1 was '$timer_state'; starting it (see issue #655)"
-    systemctl start "$1"
+# start_unit LANE UNIT [start arguments...]: starts a unit without letting a
+# failure abort the run; logs an ERROR naming the lane and records the failure
+# so the script exits nonzero after every lane has been checked.
+start_unit() {
+  lane=$1
+  unit=$2
+  shift 2
+  if ! systemctl start "$@" "$unit"; then
+    log err "lane $lane: failed to start $unit"
+    remediation_failed=1
   fi
-  service_state=$(unit_state "$2")
+}
+
+# Self-heal one upload lane: $1 lane label, $2 timer unit, $3 service unit,
+# $4 spool dir, $5 pending rotated tapes, $6 oldest rotated tape age in
+# seconds.
+check_lane() {
+  timer_state=$(unit_state "$2")
+  if [ "$timer_state" != "active" ]; then
+    log warning "$2 was '$timer_state'; starting it (see issue #655)"
+    start_unit "$1" "$2"
+  fi
+  service_state=$(unit_state "$3")
   case $service_state in
     active | activating | deactivating) ;;
     *)
-      if [ "$4" -gt 0 ] && [ "$5" -gt "$STALE_SECONDS" ]; then
-        log warning "$2 is '$service_state' with $4 rotated tape(s) pending in $3 and oldest age ${5}s > ${STALE_SECONDS}s; starting it with --no-block"
-        systemctl start --no-block "$2"
+      if [ "$5" -gt 0 ] && [ "$6" -gt "$STALE_SECONDS" ]; then
+        log warning "$3 is '$service_state' with $5 rotated tape(s) pending in $4 and oldest age ${6}s > ${STALE_SECONDS}s; starting it with --no-block"
+        start_unit "$1" "$3" --no-block
       fi
       ;;
   esac
@@ -74,9 +96,21 @@ reference_pending=$pending
 reference_oldest=$oldest_age
 data_free_gb=$(df -kP /data | awk 'NR==2 {printf "%d", $4 / 1048576}')
 
-log info "market_pending_rotated_tapes=$market_pending market_oldest_tape_age_seconds=$market_oldest reference_pending_rotated_tapes=$reference_pending reference_oldest_tape_age_seconds=$reference_oldest data_free_gb=$data_free_gb"
+stats="market_pending_rotated_tapes=$market_pending market_oldest_tape_age_seconds=$market_oldest reference_pending_rotated_tapes=$reference_pending reference_oldest_tape_age_seconds=$reference_oldest data_free_gb=$data_free_gb"
 
-check_lane "$MARKET_TIMER" "$MARKET_SERVICE" "$MARKET_SPOOL" \
+if [ -e "$SUPPRESS_FILE" ]; then
+  log info "suppressed: $SUPPRESS_FILE present; skipping all remediation ($stats)"
+  exit 0
+fi
+log info "$stats"
+
+remediation_failed=0
+check_lane "$MARKET_LANE" "$MARKET_TIMER" "$MARKET_SERVICE" "$MARKET_SPOOL" \
   "$market_pending" "$market_oldest"
-check_lane "$REFERENCE_TIMER" "$REFERENCE_SERVICE" "$REFERENCE_SPOOL" \
-  "$reference_pending" "$reference_oldest"
+check_lane "$REFERENCE_LANE" "$REFERENCE_TIMER" "$REFERENCE_SERVICE" \
+  "$REFERENCE_SPOOL" "$reference_pending" "$reference_oldest"
+
+if [ "$remediation_failed" -ne 0 ]; then
+  log err "one or more lanes failed remediation; see earlier ERROR lines"
+  exit 1
+fi
