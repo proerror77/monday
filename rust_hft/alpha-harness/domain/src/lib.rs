@@ -3409,8 +3409,22 @@ fn canonical_payload(envelope: &DeploymentEnvelope) -> Result<Vec<u8>, DomainErr
 }
 
 pub fn canonical_json_hash(value: &impl Serialize) -> Result<String, DomainError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| DomainError::CanonicalSerialization)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    struct HashWriter(Sha256);
+
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value).map_err(|_| DomainError::CanonicalSerialization)?;
+    Ok(hex::encode(writer.0.finalize()))
 }
 
 pub fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> Result<String, DomainError> {
@@ -4434,6 +4448,16 @@ mod tests {
         let mut unknown_field = serde_json::to_value(changed).unwrap();
         unknown_field["unversioned_override"] = serde_json::json!(true);
         assert!(serde_json::from_value::<EvaluationProtocolV1>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn canonical_json_hash_preserves_the_json_wire_identity() {
+        let value = serde_json::json!({"a": [1, 2], "b": "factor"});
+
+        assert_eq!(
+            canonical_json_hash(&value).unwrap(),
+            "1e3a5aff3658e8f687f4a34d3e5a9d51d3a43a96941e70b52e9241d917bf93ff"
+        );
     }
 
     #[test]
