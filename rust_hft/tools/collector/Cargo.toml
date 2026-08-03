@@ -32,6 +32,7 @@ libc = "0.2"
 rust_decimal = { version = "1", features = ["serde"] }
 rustix = { version = "0.38", features = ["process"] }
 ordered-float = "4"
+parquet = { version = "59.1", default-features = false, features = ["zstd"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
