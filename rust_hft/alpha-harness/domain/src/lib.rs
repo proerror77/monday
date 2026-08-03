@@ -23,6 +23,7 @@ pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receip
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
+pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -1700,6 +1701,213 @@ impl CexFactorBankRevisionV1 {
                 != accepted_ids
             || self.entries.iter().any(|entry| {
                 !accepted_ids.contains(entry.candidate_id.as_str())
+                    || entry.factor_id != format!("cex-factor-{}", entry.ast_sha256)
+                    || entry.source_features != factor_ast_source_features(&entry.canonical_ast)
+                    || self.attempts.iter().all(|attempt| {
+                        attempt.candidate_id != entry.candidate_id
+                            || attempt.canonical_ast != entry.canonical_ast
+                            || attempt.ast_sha256 != entry.ast_sha256
+                    })
+            })
+        {
+            return Err(DomainError::InvalidCexFactorBank(
+                "entries do not exactly bind accepted screening attempts",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expected_revision_id(&self) -> Result<String, DomainError> {
+        let mut semantic = self.clone();
+        semantic.revision_id.clear();
+        Ok(format!(
+            "cex-factor-bank-{}",
+            canonical_json_hash(&semantic)?
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFactorEvaluationEvidenceV2 {
+    pub candidate_id: String,
+    pub candidate_ast_sha256: String,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
+    pub evidence: CandidateEvaluation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFactorScreeningAttemptV2 {
+    pub candidate_id: String,
+    pub canonical_ast: FactorAst,
+    pub ast_sha256: String,
+    pub post_warmup_coverage_rows: usize,
+    pub verdict: CexFactorScreeningVerdictV1,
+    pub rejection_codes: Vec<CexFactorRejectionCodeV1>,
+    pub rejection_details: Vec<String>,
+    pub evaluation: Option<CexFactorEvaluationEvidenceV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFactorBankRevisionV2 {
+    pub schema_version: String,
+    pub revision_id: String,
+    pub search_lineage_id: String,
+    pub gp_policy: CexGpPolicyV1,
+    pub screening_policy: CexResearchContentRefV1,
+    pub evaluation_policy: CexResearchContentRefV1,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
+    pub attempts: Vec<CexFactorScreeningAttemptV2>,
+    pub entries: Vec<CexFactorBankEntryV1>,
+}
+
+impl CexFactorBankRevisionV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        search_lineage_id: String,
+        gp_policy: CexGpPolicyV1,
+        screening_policy: CexResearchContentRefV1,
+        evaluation_policy: CexResearchContentRefV1,
+        research_dataset: CexResearchContentRefV1,
+        walk_forward_partition: CexResearchContentRefV1,
+        attempts: Vec<CexFactorScreeningAttemptV2>,
+    ) -> Result<Self, DomainError> {
+        let entries = attempts
+            .iter()
+            .filter(|attempt| attempt.verdict == CexFactorScreeningVerdictV1::Accepted)
+            .map(|attempt| CexFactorBankEntryV1 {
+                factor_id: format!("cex-factor-{}", attempt.ast_sha256),
+                candidate_id: attempt.candidate_id.clone(),
+                canonical_ast: attempt.canonical_ast.clone(),
+                ast_sha256: attempt.ast_sha256.clone(),
+                orientation: CexFactorOrientationV1::Positive,
+                source_features: factor_ast_source_features(&attempt.canonical_ast),
+            })
+            .collect();
+        let mut revision = Self {
+            schema_version: CEX_FACTOR_BANK_SCHEMA_V2.to_string(),
+            revision_id: String::new(),
+            search_lineage_id,
+            gp_policy,
+            screening_policy,
+            evaluation_policy,
+            research_dataset,
+            walk_forward_partition,
+            attempts,
+            entries,
+        };
+        revision.revision_id = revision.expected_revision_id()?;
+        revision.validate()?;
+        Ok(revision)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_FACTOR_BANK_SCHEMA_V2
+            || self.revision_id != self.expected_revision_id()?
+            || self.search_lineage_id.trim().is_empty()
+            || self.attempts.is_empty()
+        {
+            return Err(DomainError::InvalidCexFactorBank(
+                "schema, semantic identity, or required lineage is invalid",
+            ));
+        }
+        self.gp_policy.validate()?;
+        self.screening_policy.validate()?;
+        self.evaluation_policy.validate()?;
+        self.research_dataset.validate()?;
+        self.walk_forward_partition.validate()?;
+        let mut candidate_ids = BTreeSet::new();
+        let mut accepted_ids = BTreeSet::new();
+        let mut accepted_asts = BTreeSet::new();
+        for attempt in &self.attempts {
+            if attempt.candidate_id.trim().is_empty()
+                || self
+                    .gp_policy
+                    .validate_candidate(&attempt.canonical_ast)
+                    .is_err()
+                || attempt.ast_sha256 != canonical_json_hash(&attempt.canonical_ast)?
+                || !candidate_ids.insert(attempt.candidate_id.as_str())
+            {
+                return Err(DomainError::InvalidCexFactorBank(
+                    "screening attempt identity or AST binding is invalid",
+                ));
+            }
+            if let Some(evaluation) = &attempt.evaluation {
+                evaluation.research_dataset.validate()?;
+                evaluation.walk_forward_partition.validate()?;
+                evaluation.evidence.validate()?;
+                let formula_config = evaluation.evidence.formula_config()?;
+                if evaluation.evidence.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+                    || evaluation.candidate_id != attempt.candidate_id
+                    || evaluation.candidate_ast_sha256 != attempt.ast_sha256
+                    || evaluation.research_dataset != self.research_dataset
+                    || evaluation.walk_forward_partition != self.walk_forward_partition
+                    || evaluation.evidence.protocol_binding()?.1
+                        != self.evaluation_policy.content_sha256
+                    || formula_config.multiple_testing_trials < self.gp_policy.budget.max_candidates
+                    || canonical_json_hash(&formula_config)? != self.screening_policy.content_sha256
+                    || attempt.post_warmup_coverage_rows != evaluation.evidence.metrics.row_count
+                {
+                    return Err(DomainError::InvalidCexFactorBank(
+                        "screening evaluation policy binding is invalid",
+                    ));
+                }
+            }
+            match attempt.verdict {
+                CexFactorScreeningVerdictV1::Accepted
+                    if attempt
+                        .evaluation
+                        .as_ref()
+                        .is_some_and(|value| value.evidence.passed)
+                        && attempt.rejection_codes.is_empty()
+                        && attempt.rejection_details.is_empty()
+                        && attempt.post_warmup_coverage_rows > 0 =>
+                {
+                    if !accepted_asts.insert(attempt.ast_sha256.as_str()) {
+                        return Err(DomainError::InvalidCexFactorBank(
+                            "accepted factor identities must be unique",
+                        ));
+                    }
+                    accepted_ids.insert(attempt.candidate_id.as_str());
+                }
+                CexFactorScreeningVerdictV1::Rejected
+                    if !attempt.rejection_codes.is_empty()
+                        && !attempt.rejection_details.is_empty()
+                        && attempt
+                            .rejection_details
+                            .iter()
+                            .all(|detail| !detail.trim().is_empty())
+                        && attempt.post_warmup_coverage_rows
+                            == attempt
+                                .evaluation
+                                .as_ref()
+                                .map_or(0, |evaluation| evaluation.evidence.metrics.row_count)
+                        && attempt
+                            .evaluation
+                            .as_ref()
+                            .is_none_or(|evaluation| !evaluation.evidence.passed) => {}
+                _ => {
+                    return Err(DomainError::InvalidCexFactorBank(
+                        "screening verdict and evidence are inconsistent",
+                    ));
+                }
+            }
+        }
+        let mut factor_ids = BTreeSet::new();
+        if self.entries.len() != accepted_ids.len()
+            || self
+                .entries
+                .iter()
+                .map(|entry| entry.candidate_id.as_str())
+                .collect::<BTreeSet<_>>()
+                != accepted_ids
+            || self.entries.iter().any(|entry| {
+                !factor_ids.insert(entry.factor_id.as_str())
+                    || !accepted_ids.contains(entry.candidate_id.as_str())
                     || entry.factor_id != format!("cex-factor-{}", entry.ast_sha256)
                     || entry.source_features != factor_ast_source_features(&entry.canonical_ast)
                     || self.attempts.iter().all(|attempt| {
@@ -3872,26 +4080,24 @@ mod tests {
         .unwrap()
     }
 
-    fn factor_bank() -> CexFactorBankRevisionV1 {
+    fn factor_bank() -> CexFactorBankRevisionV2 {
         let protocol = evaluation_protocol();
         let config = FormulaEvaluatorConfig::for_trials(10).unwrap();
         let raw_score = 5.0;
         let adjusted_score = config.adjusted_score(raw_score).unwrap();
-        let evaluation = CandidateEvaluation {
-            passed: true,
-            score: adjusted_score,
-            failure_reasons: vec![],
-            evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
-            evaluator_config: serde_json::to_value(&config).unwrap(),
-            evaluation_protocol: Some(protocol.clone()),
-            evaluation_protocol_hash: Some(protocol.content_hash().unwrap()),
-            metrics: EvaluationMetrics {
-                predictive: PredictiveMetrics::from_folds(vec![FoldPredictiveMetrics {
-                    fold_index: 1,
-                    row_count: 30,
-                    time_series_ic: Some(0.1),
-                    time_series_rank_ic: Some(0.1),
-                }]),
+        let fold_predictive = [0.09, 0.10, 0.11]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| FoldPredictiveMetrics {
+                fold_index: index + 1,
+                row_count: 30,
+                time_series_ic: Some(value),
+                time_series_rank_ic: Some(value),
+            })
+            .collect();
+        let folds = (1..=3)
+            .map(|fold_index| FoldEvaluationMetrics {
+                fold_index,
                 row_count: 30,
                 trade_count: 30,
                 total_turnover: 30.0,
@@ -3900,19 +4106,29 @@ mod tests {
                 max_drawdown: 0.01,
                 net_sharpe: 1.0,
                 raw_score,
+                max_book_depth_fraction: None,
+            })
+            .collect();
+        let evaluation = CandidateEvaluation {
+            passed: true,
+            score: adjusted_score,
+            failure_reasons: vec![],
+            evaluator_version: WALK_FORWARD_EVALUATOR_VERSION.to_string(),
+            evaluator_config: serde_json::to_value(&config).unwrap(),
+            evaluation_protocol: Some(protocol.clone()),
+            evaluation_protocol_hash: Some(protocol.content_hash().unwrap()),
+            metrics: EvaluationMetrics {
+                predictive: PredictiveMetrics::from_folds(fold_predictive),
+                row_count: 90,
+                trade_count: 90,
+                total_turnover: 90.0,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.09,
+                max_drawdown: 0.01,
+                net_sharpe: 1.0,
+                raw_score,
                 adjusted_score,
-                folds: vec![FoldEvaluationMetrics {
-                    fold_index: 1,
-                    row_count: 30,
-                    trade_count: 30,
-                    total_turnover: 30.0,
-                    mean_net_return: 0.001,
-                    cumulative_net_return: 0.03,
-                    max_drawdown: 0.01,
-                    net_sharpe: 1.0,
-                    raw_score,
-                    max_book_depth_fraction: None,
-                }],
+                folds,
             },
         };
         let ast = FactorAst::call(
@@ -3923,33 +4139,107 @@ mod tests {
             ],
         )
         .unwrap();
+        let candidate_id = "candidate-1".to_string();
+        let ast_sha256 = canonical_json_hash(&ast).unwrap();
         let reference = |id: &str, hash: String| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: hash,
         };
-        CexFactorBankRevisionV1::new(
+        let gp_policy = CexGpPolicyV1::controlled_v1(
+            "gp-policy-1",
+            vec!["book_imbalance".to_string(), "spread_bps".to_string()],
+            7,
+            &SearchBudget {
+                max_candidates: 4,
+                max_expansions: 16,
+                max_tokens: 0,
+                max_seconds: 0,
+            },
+        )
+        .unwrap();
+        let research_dataset = reference("dataset-1", "d".repeat(64));
+        let walk_forward_partition = reference("partition-1", "e".repeat(64));
+        CexFactorBankRevisionV2::new(
             "lineage-1".to_string(),
-            reference("gp-policy-1", "1".repeat(64)),
+            gp_policy,
             reference("screening-policy-1", canonical_json_hash(&config).unwrap()),
             reference("evaluation-policy-1", protocol.content_hash().unwrap()),
-            "dataset-1".to_string(),
-            "partition-1".to_string(),
-            vec![CexFactorScreeningAttemptV1 {
-                candidate_id: "candidate-1".to_string(),
-                ast_sha256: canonical_json_hash(&ast).unwrap(),
+            research_dataset.clone(),
+            walk_forward_partition.clone(),
+            vec![CexFactorScreeningAttemptV2 {
+                candidate_id: candidate_id.clone(),
+                ast_sha256: ast_sha256.clone(),
                 canonical_ast: ast,
-                post_warmup_coverage_rows: 30,
+                post_warmup_coverage_rows: 90,
                 verdict: CexFactorScreeningVerdictV1::Accepted,
                 rejection_codes: vec![],
                 rejection_details: vec![],
-                evaluation: Some(evaluation),
+                evaluation: Some(CexFactorEvaluationEvidenceV2 {
+                    candidate_id,
+                    candidate_ast_sha256: ast_sha256,
+                    research_dataset,
+                    walk_forward_partition,
+                    evidence: evaluation,
+                }),
             }],
         )
         .unwrap()
     }
 
-    fn rebind_factor_bank(revision: &mut CexFactorBankRevisionV1) {
+    fn rebind_factor_bank(revision: &mut CexFactorBankRevisionV2) {
         revision.revision_id = revision.expected_revision_id().unwrap();
+    }
+
+    #[test]
+    fn legacy_factor_bank_v1_json_remains_readable() {
+        let current = factor_bank();
+        let attempt = &current.attempts[0];
+        let legacy = serde_json::json!({
+            "schema_version": CEX_FACTOR_BANK_SCHEMA_V1,
+            "revision_id": "legacy-revision-id",
+            "search_lineage_id": current.search_lineage_id,
+            "gp_policy": {
+                "id": "gp-policy-1",
+                "content_sha256": "1".repeat(64),
+            },
+            "screening_policy": current.screening_policy,
+            "evaluation_policy": current.evaluation_policy,
+            "research_dataset_id": "dataset-1",
+            "walk_forward_partition_id": "partition-1",
+            "attempts": [{
+                "candidate_id": attempt.candidate_id,
+                "canonical_ast": attempt.canonical_ast,
+                "ast_sha256": attempt.ast_sha256,
+                "post_warmup_coverage_rows": attempt.post_warmup_coverage_rows,
+                "verdict": attempt.verdict,
+                "rejection_codes": attempt.rejection_codes,
+                "rejection_details": attempt.rejection_details,
+                "evaluation": attempt.evaluation.as_ref().unwrap().evidence,
+            }],
+            "entries": current.entries,
+        });
+
+        let mut restored: CexFactorBankRevisionV1 = serde_json::from_value(legacy).unwrap();
+        restored.revision_id = restored.expected_revision_id().unwrap();
+
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
+    fn factor_bank_rejects_multiple_testing_trials_below_gp_budget() {
+        let mut revision = factor_bank();
+        let config = FormulaEvaluatorConfig::for_trials(3).unwrap();
+        let evaluation = revision.attempts[0].evaluation.as_mut().unwrap();
+        let adjusted_score = config
+            .adjusted_score(evaluation.evidence.metrics.raw_score)
+            .unwrap();
+        evaluation.evidence.evaluator_config = serde_json::to_value(&config).unwrap();
+        evaluation.evidence.score = adjusted_score;
+        evaluation.evidence.metrics.adjusted_score = adjusted_score;
+        revision.screening_policy.content_sha256 = canonical_json_hash(&config).unwrap();
+        rebind_factor_bank(&mut revision);
+
+        assert!(revision.validate().is_err());
     }
 
     #[test]
@@ -3975,6 +4265,99 @@ mod tests {
         duplicate.entries.push(duplicate.entries[0].clone());
         rebind_factor_bank(&mut duplicate);
         assert!(duplicate.validate().is_err());
+
+        let original = factor_bank();
+        let mut invalid_ast = original.clone();
+        let ast = FactorAst::Call {
+            operator: FactorOperator::Add,
+            args: vec![FactorAst::Terminal(FactorTerminal::Field(
+                "book_imbalance".to_string(),
+            ))],
+        };
+        let ast_sha256 = canonical_json_hash(&ast).unwrap();
+        invalid_ast.attempts[0].canonical_ast = ast.clone();
+        invalid_ast.attempts[0].ast_sha256 = ast_sha256.clone();
+        invalid_ast.attempts[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .candidate_ast_sha256 = ast_sha256.clone();
+        invalid_ast.entries[0].canonical_ast = ast.clone();
+        invalid_ast.entries[0].ast_sha256 = ast_sha256.clone();
+        invalid_ast.entries[0].factor_id = format!("cex-factor-{ast_sha256}");
+        invalid_ast.entries[0].source_features = factor_ast_source_features(&ast);
+        rebind_factor_bank(&mut invalid_ast);
+        assert!(invalid_ast.validate().is_err());
+
+        let mut duplicate_factor = original.clone();
+        let mut second_attempt = duplicate_factor.attempts[0].clone();
+        second_attempt.candidate_id = "candidate-2".to_string();
+        second_attempt.evaluation.as_mut().unwrap().candidate_id = "candidate-2".to_string();
+        duplicate_factor.attempts.push(second_attempt);
+        let mut second_entry = duplicate_factor.entries[0].clone();
+        second_entry.candidate_id = "candidate-2".to_string();
+        duplicate_factor.entries.push(second_entry);
+        rebind_factor_bank(&mut duplicate_factor);
+        assert!(duplicate_factor.validate().is_err());
+
+        let mut unknown_evaluator = original.clone();
+        unknown_evaluator.attempts[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .evidence
+            .evaluator_version = "unknown-evaluator".to_string();
+        rebind_factor_bank(&mut unknown_evaluator);
+        assert!(unknown_evaluator.validate().is_err());
+
+        let mut holdout_evaluator = original.clone();
+        holdout_evaluator.attempts[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .evidence
+            .evaluator_version = SEALED_HOLDOUT_EVALUATOR_VERSION.to_string();
+        rebind_factor_bank(&mut holdout_evaluator);
+        assert!(holdout_evaluator.validate().is_err());
+
+        let mut wrong_candidate = original.clone();
+        wrong_candidate.attempts[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .candidate_id = "forged".to_string();
+        rebind_factor_bank(&mut wrong_candidate);
+        assert!(wrong_candidate.validate().is_err());
+
+        let mut wrong_dataset = original.clone();
+        wrong_dataset.attempts[0]
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .research_dataset
+            .content_sha256 = "a".repeat(64);
+        rebind_factor_bank(&mut wrong_dataset);
+        assert!(wrong_dataset.validate().is_err());
+
+        let mut contradictory = original.clone();
+        contradictory.attempts[0].rejection_details = vec!["rejected".to_string()];
+        rebind_factor_bank(&mut contradictory);
+        assert!(contradictory.validate().is_err());
+
+        let mut undocumented_rejection = original.clone();
+        undocumented_rejection.attempts[0].verdict = CexFactorScreeningVerdictV1::Rejected;
+        undocumented_rejection.attempts[0].rejection_codes =
+            vec![CexFactorRejectionCodeV1::EngineFailure];
+        undocumented_rejection.attempts[0].evaluation = None;
+        undocumented_rejection.attempts[0].post_warmup_coverage_rows = 0;
+        undocumented_rejection.entries.clear();
+        rebind_factor_bank(&mut undocumented_rejection);
+        assert!(undocumented_rejection.validate().is_err());
+
+        let mut wrong_coverage = original;
+        wrong_coverage.attempts[0].post_warmup_coverage_rows = 1;
+        rebind_factor_bank(&mut wrong_coverage);
+        assert!(wrong_coverage.validate().is_err());
     }
 
     #[test]
