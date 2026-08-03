@@ -3,13 +3,12 @@ use crate::{
     data_mission,
 };
 use alpha_domain::{
-    canonical_json_hash, CexGpPolicyV1, CexResearchContentRefV1, MissionStatus, ResearchMission,
+    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
+    CexFactorBankRevisionV2, CexGpPolicyV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
+    MissionStatus, ResearchMission,
 };
 use alpha_engine::{
-    engines::{
-        CexMctsSearchIdentityV1, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
-        OfflineTrace,
-    },
+    engines::{GeneticProgrammingEngine, OfflineRlEngine, OfflineTrace},
     evaluation::prepare_dataset,
     formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
@@ -24,6 +23,11 @@ pub(crate) const BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR: &str =
     "Bayesian window search is research-only and cannot produce live-executable formulas";
 pub(crate) const OFFLINE_RL_LIVE_CAPABILITY_ERROR: &str =
     "Offline RL search is research-only and cannot produce live-executable formulas";
+const CEX_FACTOR_BANK_REGISTRY_KIND: &str = "cex_factor_bank";
+const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
+const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
+const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
+const CEX_MCTS_CANDIDATE_SPACE_ID: &str = "live-factor-ast-add-secondary-v1";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +94,7 @@ fn execute_mission_inner(
     )?;
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
+    let evaluation_protocol_hash = protocol.content_hash()?;
     let dataset = prepare_dataset(rows, &protocol)?;
     let research_context = dataset.engine_context();
     let research_dataset_sha256 = canonical_json_hash(&research_context.rows())?;
@@ -105,18 +110,20 @@ fn execute_mission_inner(
         id: format!("cex-walk-forward-partition-{walk_forward_partition_sha256}"),
         content_sha256: walk_forward_partition_sha256,
     };
+    if matches!(args.engine, EngineChoice::Mcts) {
+        validate_mcts_baseline_gate(
+            &store,
+            &mission,
+            &research_dataset,
+            &walk_forward_partition,
+            &evaluation_protocol_hash,
+        )?;
+        bail!(
+            "MCTS candidate space {CEX_MCTS_CANDIDATE_SPACE_ID} is not authorized for CEX Factor Bank missions; Factor-Bank subset adapter (#601) is required"
+        );
+    }
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
-    let evaluator_config_hash =
-        canonical_json_hash(&evaluator.config_evidence().map_err(anyhow::Error::msg)?)?;
-    let evaluation_protocol_hash = protocol.content_hash()?;
-    let proposal_engine = build_engine(
-        args,
-        &dataset,
-        &mission,
-        &evaluation_protocol_hash,
-        &evaluator_config_hash,
-        governed_gp,
-    )?;
+    let proposal_engine = build_engine(args, &dataset, &mission, governed_gp)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
         &args.mission_id,
@@ -140,6 +147,155 @@ fn execute_mission_inner(
         research_dataset,
         walk_forward_partition,
     })
+}
+
+fn validate_mcts_baseline_gate(
+    store: &AlphaStore,
+    mission: &ResearchMission,
+    research_dataset: &CexResearchContentRefV1,
+    walk_forward_partition: &CexResearchContentRefV1,
+    evaluation_protocol_hash: &str,
+) -> anyhow::Result<()> {
+    let gate_id = mission
+        .baseline_artifact_id
+        .as_deref()
+        .context("MCTS requires a baseline gate identity")?;
+    let gate_revision = store
+        .get_registry_revision(gate_id)
+        .with_context(|| format!("MCTS baseline gate registry revision {gate_id} is missing"))?;
+    if gate_revision.registry_kind != CEX_BASELINE_GATE_REGISTRY_KIND
+        || gate_revision.revision_id != gate_id
+    {
+        bail!("MCTS baseline gate registry kind or identity is invalid");
+    }
+    let gate: CexBaselineGateV1 = serde_json::from_value(gate_revision.payload.clone())
+        .context("MCTS baseline gate payload is invalid")?;
+    gate.validate().map_err(anyhow::Error::msg)?;
+
+    let factor_bank_revision = store
+        .get_registry_revision(&gate.factor_bank_revision_id)
+        .with_context(|| {
+            format!(
+                "MCTS Factor Bank registry revision {} is missing",
+                gate.factor_bank_revision_id
+            )
+        })?;
+    if factor_bank_revision.registry_kind != CEX_FACTOR_BANK_REGISTRY_KIND
+        || factor_bank_revision.revision_id != gate.factor_bank_revision_id
+        || factor_bank_revision.parent_revision_id.as_deref()
+            != Some(mission.dataset_manifest_id.as_str())
+    {
+        bail!("MCTS Factor Bank registry binding drifted");
+    }
+    if gate_revision.parent_revision_id.as_deref() != Some(gate.factor_bank_revision_id.as_str()) {
+        bail!("MCTS baseline gate parent revision drifted");
+    }
+    let factor_bank: CexFactorBankRevisionV2 =
+        serde_json::from_value(factor_bank_revision.payload.clone())
+            .context("MCTS Factor Bank payload is invalid")?;
+    factor_bank.validate().map_err(anyhow::Error::msg)?;
+    if factor_bank.research_dataset != *research_dataset
+        || factor_bank.walk_forward_partition != *walk_forward_partition
+    {
+        bail!("MCTS Factor Bank research identity drifted");
+    }
+    let control_revision = store
+        .get_registry_revision(&gate.mission_id)
+        .with_context(|| {
+            format!(
+                "MCTS source research mission registry revision {} is missing",
+                gate.mission_id
+            )
+        })?;
+    if control_revision.registry_kind != "cex_research_mission"
+        || control_revision.revision_id != gate.mission_id
+        || control_revision.parent_revision_id.as_deref()
+            != Some(mission.dataset_manifest_id.as_str())
+    {
+        bail!("MCTS source research mission registry binding drifted");
+    }
+    let control_mission: CexResearchMissionArtifactV1 =
+        serde_json::from_value(control_revision.payload.clone())
+            .context("MCTS source research mission payload is invalid")?;
+    control_mission.validate().map_err(anyhow::Error::msg)?;
+    if control_mission.semantic_id().map_err(anyhow::Error::msg)? != gate.mission_id {
+        bail!("MCTS source research mission identity drifted");
+    }
+
+    let ridge = match gate.ridge_artifact_id.as_deref() {
+        Some(ridge_id) => Some(read_mcts_baseline_artifact(
+            store,
+            ridge_id,
+            CEX_BASELINE_RIDGE_REGISTRY_KIND,
+            &factor_bank,
+            &control_mission,
+            research_dataset,
+            walk_forward_partition,
+            evaluation_protocol_hash,
+            CexBaselineModelKindV1::Ridge,
+        )?),
+        None => None,
+    };
+    let cart = match gate.cart_artifact_id.as_deref() {
+        Some(cart_id) => Some(read_mcts_baseline_artifact(
+            store,
+            cart_id,
+            CEX_BASELINE_CART_REGISTRY_KIND,
+            &factor_bank,
+            &control_mission,
+            research_dataset,
+            walk_forward_partition,
+            evaluation_protocol_hash,
+            CexBaselineModelKindV1::ShallowCart,
+        )?),
+        None => None,
+    };
+    gate.validate_binding(&factor_bank, ridge.as_ref(), cart.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    if !gate.passed {
+        bail!("MCTS baseline gate did not pass");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_mcts_baseline_artifact(
+    store: &AlphaStore,
+    artifact_id: &str,
+    registry_kind: &str,
+    factor_bank: &CexFactorBankRevisionV2,
+    control_mission: &CexResearchMissionArtifactV1,
+    research_dataset: &CexResearchContentRefV1,
+    walk_forward_partition: &CexResearchContentRefV1,
+    evaluation_protocol_hash: &str,
+    model_kind: CexBaselineModelKindV1,
+) -> anyhow::Result<CexBaselineArtifactV1> {
+    let revision = store.get_registry_revision(artifact_id).with_context(|| {
+        format!("MCTS baseline artifact registry revision {artifact_id} is missing")
+    })?;
+    if revision.registry_kind != registry_kind
+        || revision.revision_id != artifact_id
+        || revision.parent_revision_id.as_deref() != Some(factor_bank.revision_id.as_str())
+    {
+        bail!("MCTS baseline artifact registry binding drifted");
+    }
+    let artifact: CexBaselineArtifactV1 = serde_json::from_value(revision.payload.clone())
+        .context("MCTS baseline artifact payload is invalid")?;
+    artifact.validate().map_err(anyhow::Error::msg)?;
+    artifact
+        .validate_binding(control_mission, factor_bank)
+        .map_err(anyhow::Error::msg)?;
+    if artifact.model_kind != model_kind
+        || artifact.mission_id != control_mission.semantic_id().map_err(anyhow::Error::msg)?
+        || artifact.factor_bank_revision_id != factor_bank.revision_id
+        || artifact.research_dataset != *research_dataset
+        || artifact.walk_forward_partition != *walk_forward_partition
+        || artifact.evaluation_policy.content_sha256 != evaluation_protocol_hash
+        || artifact.evaluation.protocol_binding()?.1 != evaluation_protocol_hash
+    {
+        bail!("MCTS baseline artifact identity drifted");
+    }
+    Ok(artifact)
 }
 
 pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
@@ -191,8 +347,6 @@ fn build_engine(
     args: &RunMissionArgs,
     dataset: &alpha_engine::evaluation::PreparedDataset,
     mission: &ResearchMission,
-    evaluation_protocol_hash: &str,
-    evaluator_config_hash: &str,
     governed_gp: Option<(&CexGpPolicyV1, &str)>,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
     validate_live_mission_args(args)?;
@@ -215,7 +369,6 @@ fn build_engine(
     let fields = fields.into_iter().collect::<Vec<_>>();
     validate_live_feature_fields(&fields)?;
     let primary = fields[0].clone();
-    let secondary = fields.get(1).cloned().unwrap_or_else(|| primary.clone());
     let engine: Box<dyn ProposalEngine> = match args.engine {
         EngineChoice::Gp => match governed_gp {
             Some((policy, candidate_namespace)) => {
@@ -238,22 +391,8 @@ fn build_engine(
                     .map_err(anyhow::Error::msg)?,
             ),
         },
-        EngineChoice::Mcts => Box::new(
-            MctsEngine::new_live_bound(
-                args.seed,
-                primary.clone(),
-                secondary,
-                1.414,
-                5,
-                CexMctsSearchIdentityV1::for_mission(
-                    mission,
-                    evaluation_protocol_hash.to_string(),
-                    evaluator_config_hash.to_string(),
-                    args.max_new_iterations,
-                )
-                .map_err(anyhow::Error::msg)?,
-            )
-            .map_err(anyhow::Error::msg)?,
+        EngineChoice::Mcts => bail!(
+            "MCTS candidate space {CEX_MCTS_CANDIDATE_SPACE_ID} is not authorized for CEX Factor Bank missions; Factor-Bank subset adapter (#601) is required"
         ),
         EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
         EngineChoice::OfflineRl => {
@@ -337,6 +476,9 @@ fn live_event_domain_name(domain: LiveEventDomain) -> &'static str {
 mod tests {
     use super::*;
     use crate::cli::{DatasetArgs, ValidationArgs};
+    use alpha_domain::{MissionCompletionPolicy, SearchBudget, ValidatorMode};
+    use chrono::Utc;
+    use hft_research_manifest::ManifestId;
     use std::path::PathBuf;
 
     #[test]
@@ -349,6 +491,49 @@ mod tests {
             error.to_string(),
             "feature fields span live event domains: snapshot and bar"
         );
+    }
+
+    #[test]
+    fn mcts_shared_fan_in_requires_an_immutable_baseline_gate() {
+        let store = AlphaStore::open_in_memory().unwrap();
+        let mission = ResearchMission {
+            mission_id: "consumer-mission".to_string(),
+            objective: "test objective".to_string(),
+            hypothesis_scope: "test hypothesis".to_string(),
+            mutable_scope: vec!["factor_ast".to_string()],
+            dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
+            baseline_artifact_id: None,
+            validation_mode: ValidatorMode::MissionValidator,
+            validator_spec: serde_json::json!({}),
+            search_budget: SearchBudget {
+                max_candidates: 1,
+                max_expansions: 1,
+                max_tokens: 0,
+                max_seconds: 1,
+            },
+            completion_policy: MissionCompletionPolicy::default(),
+            prompt_snapshot_id: None,
+            search_policy_snapshot_id: "policy-1".to_string(),
+            status: MissionStatus::Pending,
+            terminal_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let reference = |id: &str| CexResearchContentRefV1 {
+            id: id.to_string(),
+            content_sha256: "a".repeat(64),
+        };
+
+        let error = validate_mcts_baseline_gate(
+            &store,
+            &mission,
+            &reference("cex-research-dataset-1"),
+            &reference("cex-walk-forward-partition-1"),
+            &"b".repeat(64),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("baseline gate identity"));
     }
 
     #[test]
