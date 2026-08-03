@@ -49,6 +49,13 @@ pub const DEFAULT_MAX_RETAINED_TRADE_IDS: usize = 4_000_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
+// Default cap on one active tape's bytes before fail-closed rotation. At
+// tick-level recording a single UTC-hour tape reached 20-25 GiB (#655), and
+// upload processing needs ~1.6x the tape size of transient spool disk.
+pub const DEFAULT_TAPE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+// A nonzero cap below one record's order of magnitude would rotate every
+// write batch and flood the uploader with trivial tapes.
+const MIN_TAPE_MAX_BYTES: u64 = 1024 * 1024;
 const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(100);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
@@ -195,6 +202,7 @@ pub struct ReferenceConfig {
     pub trade_finalization_lag_secs: i64,
     pub trade_finalization_stable_polls: u64,
     pub per_market_delay: Duration,
+    pub tape_max_bytes: u64,
 }
 
 impl Default for ReferenceConfig {
@@ -218,6 +226,7 @@ impl Default for ReferenceConfig {
             trade_finalization_lag_secs: 1_800,
             trade_finalization_stable_polls: 3,
             per_market_delay: MIN_TRADE_REQUEST_SPACING,
+            tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
         }
     }
 }
@@ -264,6 +273,9 @@ impl ReferenceConfig {
                 "trade request spacing must be at least {}ms",
                 MIN_TRADE_REQUEST_SPACING.as_millis()
             );
+        }
+        if self.tape_max_bytes != 0 && self.tape_max_bytes < MIN_TAPE_MAX_BYTES {
+            bail!("tape size cap must be 0 (disabled) or at least {MIN_TAPE_MAX_BYTES} bytes");
         }
         if self.settlement_lookback_secs < MIN_SETTLEMENT_LOOKBACK_SECS {
             bail!("settlement lookback must cover at least {MIN_SETTLEMENT_LOOKBACK_SECS} seconds");
@@ -856,6 +868,8 @@ struct TapeWriter {
     active: PathBuf,
     hour: Option<String>,
     sequence: u64,
+    tape_bytes: u64,
+    tape_max_bytes: u64,
     file: Option<File>,
 }
 
@@ -1076,6 +1090,8 @@ impl TapeWriter {
             active,
             hour: None,
             sequence: 0,
+            tape_bytes: 0,
+            tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
             file: None,
         };
         writer.recover_active(recover, expected_active)?;
@@ -1135,6 +1151,7 @@ impl TapeWriter {
         release_clean_file_cache(reader.get_ref())?;
         file.seek(SeekFrom::End(0))?;
         self.sequence = expected;
+        self.tape_bytes = valid_bytes;
         self.hour = first_recorded.map(|value| value.format("%Y%m%dT%H").to_string());
         self.file = Some(file);
         Ok(())
@@ -1215,6 +1232,7 @@ impl TapeWriter {
         }
         File::open(&self.spool_dir)?.sync_all()?;
         self.sequence = 0;
+        self.tape_bytes = 0;
         self.hour = None;
         self.file = Some(open_append(&self.active)?);
         Ok(rotated)
@@ -1259,29 +1277,55 @@ impl TapeWriter {
         if self.hour.as_ref().is_some_and(|hour| hour != &target_hour) {
             self.rotate(now)?;
         }
-        let start_hour = self.hour.clone();
-        let start_sequence = self.sequence;
-        let start_offset = self
+        let mut start_hour = self.hour.clone();
+        let mut start_sequence = self.sequence;
+        let mut start_tape_bytes = self.tape_bytes;
+        let mut start_offset = self
             .file
             .as_ref()
             .context("active tape is closed")?
             .metadata()?
             .len();
-        self.hour = Some(target_hour);
+        self.hour = Some(target_hour.clone());
         let recorded_at = iso_z(now);
         let result = (|| -> Result<()> {
-            let file = self.file.as_mut().context("active tape is closed")?;
             for update in updates {
                 let update = update?;
-                let mut encoded = serde_json::to_vec(&json!({
-                    "sequence": self.sequence,
-                    "recorded_at": recorded_at,
-                    "update": update,
-                }))?;
-                encoded.push(b'\n');
+                let encode = |sequence: u64| -> Result<Vec<u8>> {
+                    let mut encoded = serde_json::to_vec(&json!({
+                        "sequence": sequence,
+                        "recorded_at": recorded_at,
+                        "update": update,
+                    }))?;
+                    encoded.push(b'\n');
+                    Ok(encoded)
+                };
+                let mut encoded = encode(self.sequence)?;
+                // Enforce the cap per record so one replayed cycle cannot
+                // overshoot it: rotate before the record that would cross the
+                // cap. An empty tape always accepts its first record.
+                if self.tape_max_bytes > 0
+                    && self.tape_bytes > 0
+                    && self.tape_bytes.saturating_add(u64::try_from(encoded.len())?)
+                        > self.tape_max_bytes
+                {
+                    self.rotate(now)?;
+                    encoded = encode(self.sequence)?;
+                    // The rotated tape is published; the rollback anchor moves
+                    // to the fresh segment so a later failure never truncates
+                    // across the rotation boundary.
+                    start_hour = None;
+                    start_sequence = 0;
+                    start_tape_bytes = 0;
+                    start_offset = 0;
+                    self.hour = Some(target_hour.clone());
+                }
+                let file = self.file.as_mut().context("active tape is closed")?;
                 file.write_all(&encoded)?;
                 self.sequence += 1;
+                self.tape_bytes += u64::try_from(encoded.len())?;
             }
+            let file = self.file.as_mut().context("active tape is closed")?;
             sync(file)?;
             release_clean_file_cache(file)?;
             Ok(())
@@ -1289,6 +1333,7 @@ impl TapeWriter {
         if let Err(error) = result {
             self.hour = start_hour;
             self.sequence = start_sequence;
+            self.tape_bytes = start_tape_bytes;
             let file = self.file.as_mut().context("active tape is closed")?;
             file.set_len(start_offset)?;
             file.seek(SeekFrom::End(0))?;
@@ -2196,6 +2241,7 @@ impl ReferenceCollector {
         let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
             recover_state_from_tape_row(&mut state, row, trade_cutoff)
         })?;
+        writer.tape_max_bytes = config.tape_max_bytes;
         let recovered_active = writer.sequence > 0;
         if recovered_active {
             let validation = validate_reference_tape_for_recovery(&writer.active, startup_at)
@@ -5101,6 +5147,193 @@ mod tests {
             })
             .count();
         assert_eq!(rotated, 1);
+    }
+
+    fn rotated_tapes(root: &Path) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.as_ref() != ACTIVE_TAPE
+                    && name.starts_with("market-updates.")
+                    && name.ends_with(".ndjson")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn first_sequence(path: &Path) -> u64 {
+        let first = fs::read_to_string(path).unwrap().lines().next().unwrap().to_owned();
+        serde_json::from_str::<Value>(&first).unwrap()["sequence"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn size_cap_rotates_an_oversized_active_tape_within_the_same_second() {
+        let root = TestDir::new();
+        let first = fixed_time("2026-07-15T01:00:00.000000Z");
+        let second = fixed_time("2026-07-15T01:00:00.100000Z");
+        let third = fixed_time("2026-07-15T01:00:00.200000Z");
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(&[json!({"kind": "first", "payload": payload})], first)
+            .unwrap();
+        assert!(!writer.needs_hour_context(second));
+        writer
+            .write_updates(&[json!({"kind": "second", "payload": payload})], second)
+            .unwrap();
+        assert!(!writer.needs_hour_context(third));
+        writer
+            .write_updates(&[json!({"kind": "third"})], third)
+            .unwrap();
+        writer.close().unwrap();
+
+        // Both rotations landed inside one second, so the microsecond
+        // timestamp names must stay unique and upload-discoverable.
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 2);
+        let discovered = crate::polymarket_upload::discover_rotated_tapes(root.path()).unwrap();
+        assert!(rotated.iter().all(|path| discovered.contains(path)));
+        // Every closed tape starts at sequence 0 for the upload-side scan.
+        assert!(rotated.iter().all(|path| first_sequence(path) == 0));
+        let active: Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join(ACTIVE_TAPE)).unwrap())
+                .unwrap();
+        assert_eq!(active["sequence"], 0);
+        assert_eq!(active["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn size_cap_rotates_mid_batch_without_losing_or_duplicating_records() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let payload = "x".repeat(600_000);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        // One batch crosses the cap on its second record: the first record
+        // stays on the old tape, the rest land on the fresh tape in order.
+        writer
+            .write_updates(
+                &[
+                    json!({"kind": "first", "payload": payload}),
+                    json!({"kind": "second", "payload": payload}),
+                    json!({"kind": "third"}),
+                ],
+                now,
+            )
+            .unwrap();
+        assert!(!writer.needs_hour_context(now));
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let first_tape = fs::read_to_string(&rotated[0]).unwrap();
+        let first_rows = first_tape.lines().collect::<Vec<_>>();
+        assert_eq!(first_rows.len(), 1);
+        let first_row: Value = serde_json::from_str(first_rows[0]).unwrap();
+        assert_eq!(first_row["sequence"], 0);
+        assert_eq!(first_row["update"]["kind"], "first");
+
+        let active = fs::read_to_string(root.path().join(ACTIVE_TAPE)).unwrap();
+        let active_rows = active
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"]["kind"], "second");
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn utc_hour_rotation_still_triggers_below_the_size_cap() {
+        let root = TestDir::new();
+        let first = fixed_time("2026-07-15T01:59:59Z");
+        let second = fixed_time("2026-07-15T02:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(&[json!({"kind": "first"})], first)
+            .unwrap();
+        writer
+            .write_updates(&[json!({"kind": "second"})], second)
+            .unwrap();
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(first_sequence(&rotated[0]), 0);
+        let active: Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join(ACTIVE_TAPE)).unwrap())
+                .unwrap();
+        assert_eq!(active["sequence"], 0);
+        assert_eq!(active["update"]["kind"], "second");
+    }
+
+    #[test]
+    fn zero_size_cap_disables_size_based_rotation() {
+        let root = TestDir::new();
+        let first = fixed_time("2026-07-15T01:00:00Z");
+        let second = fixed_time("2026-07-15T01:00:01Z");
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = 0;
+        writer
+            .write_updates(&[json!({"kind": "first", "payload": payload})], first)
+            .unwrap();
+        writer
+            .write_updates(&[json!({"kind": "second"})], second)
+            .unwrap();
+        writer.close().unwrap();
+
+        assert!(rotated_tapes(root.path()).is_empty());
+        let rows = fs::read_to_string(root.path().join(ACTIVE_TAPE)).unwrap();
+        assert_eq!(rows.lines().count(), 2);
+    }
+
+    #[test]
+    fn tape_size_cap_validation_fails_closed() {
+        let config = |tape_max_bytes| ReferenceConfig {
+            tape_max_bytes,
+            ..ReferenceConfig::default()
+        };
+        config(0).validate().unwrap();
+        config(MIN_TAPE_MAX_BYTES).validate().unwrap();
+        config(DEFAULT_TAPE_MAX_BYTES).validate().unwrap();
+        let error = config(MIN_TAPE_MAX_BYTES - 1).validate().unwrap_err();
+        assert!(error.to_string().contains("tape size cap"));
+    }
+
+    #[test]
+    fn tape_size_cap_survives_crash_recovery() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let later = fixed_time("2026-07-15T01:00:01Z");
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer
+                .write_updates(&[json!({"kind": "first", "payload": payload})], now)
+                .unwrap();
+        }
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        assert!(writer.tape_bytes >= MIN_TAPE_MAX_BYTES);
+        writer
+            .write_updates(&[json!({"kind": "second"})], later)
+            .unwrap();
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(first_sequence(&rotated[0]), 0);
     }
 
     #[test]

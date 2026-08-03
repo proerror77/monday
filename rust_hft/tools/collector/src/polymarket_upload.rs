@@ -909,7 +909,7 @@ fn strict_uuid(value: &str) -> bool {
         })
 }
 
-fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
     ensure_canonical_directory(spool_dir)?;
     let mut paths = Vec::new();
     for entry in fs::read_dir(spool_dir)? {
