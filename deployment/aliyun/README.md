@@ -77,6 +77,34 @@ must ignore any artifact with an adjacent `<data>.SUPERSEDED.json` marker; the m
 names the canonical replacement and quarantine copy. This is the fail-closed path
 when the collector role can write but cannot delete an invalid historical object.
 
+A watchdog guards both upload lanes against silent stalls (issue #655: the
+market upload timer once sat inactive for 19 hours until the spool disk nearly
+filled, and the reference upload timer was later found silently dead as well).
+`polymarket-market-tape-upload-watchdog.timer` runs the oneshot
+`polymarket-market-tape-upload-watchdog.service` every two minutes. Each run
+logs one journal INFO line (tag `polymarket-upload-watchdog`) with, for each of
+the market (`/data/monday/spool/polymarket`) and reference
+(`/data/monday/spool/polymarket-reference`) spools, the pending rotated-tape
+count and the oldest rotated-tape age, plus `/data` free gigabytes. For each
+lane independently: if the upload timer (`polymarket-market-tape-upload.timer`
+or `polymarket-reference-upload.timer`) is not active, the watchdog starts it
+and logs a WARNING with the previous state; if the upload service is inactive
+while a rotated tape is older than 90 minutes, it starts the service with
+`--no-block` and logs why. The watchdog only ever starts units — it never
+stops or disables anything and never modifies tape files. It runs as root
+because it needs `systemctl start`; the remaining hardening matches the other
+units. Install and enable it alongside the upload units:
+
+```bash
+sudo install -m 0755 deployment/aliyun/polymarket-market-tape-upload-watchdog.sh \
+  /opt/monday/bin/polymarket-market-tape-upload-watchdog.sh
+sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload-watchdog.service \
+  deployment/aliyun/polymarket-market-tape-upload-watchdog.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-market-tape-upload-watchdog.timer
+```
+
 The companion `polymarket-reference-collector.service` polls the official Gamma and
 Data APIs every 30 seconds. It writes complete Gamma market payloads (including
 volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
