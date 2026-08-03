@@ -557,6 +557,24 @@ pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::
     persist_output_file(temporary, path, "JSON evidence")
 }
 
+pub fn write_json_create_once(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let mut temporary = temporary_output_file(path, ".monday-json-")?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), value)?;
+    temporary.as_file().sync_all()?;
+    ensure_output_path_is_not_symlink(path, "JSON evidence")?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "JSON evidence destination already exists: {}",
+                path.display()
+            )
+        }
+        Err(error) => Err(error.error)
+            .with_context(|| format!("atomically create JSON evidence at {}", path.display())),
+    }
+}
+
 pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
     manifest
         .artifact_path
@@ -599,6 +617,22 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn write_json_create_once_rejects_overwrite() {
+        let root = tempfile::tempdir().expect("create create-once output test root");
+        let path = root.path().join("evidence.json");
+        write_json_create_once(&path, &serde_json::json!({"version": 1})).unwrap();
+
+        let error = write_json_create_once(&path, &serde_json::json!({"version": 2}))
+            .expect_err("create-once evidence must reject an existing destination");
+
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\n  \"version\": 1\n}"
+        );
     }
 
     #[cfg(unix)]

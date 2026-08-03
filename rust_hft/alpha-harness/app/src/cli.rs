@@ -1,6 +1,6 @@
 use crate::{
-    data_mission, governance, loop_control, mission, mission_runner, prediction_dispatch,
-    prediction_runner, prediction_snapshot,
+    baseline_evidence, data_mission, governance, loop_control, mission, mission_runner,
+    prediction_dispatch, prediction_runner, prediction_snapshot,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -69,6 +69,7 @@ enum Command {
 enum MissionCommand {
     Create(CreateMissionArgs),
     Execute(Box<ExecuteMissionArgs>),
+    BaselineEvidence(BaselineEvidenceArgs),
     Run(RunMissionArgs),
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
@@ -370,6 +371,17 @@ pub struct ExecuteMissionArgs {
     pub result_put_url: String,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct BaselineEvidenceArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    /// Create-once training-validation-v1 output path.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
 pub enum EngineChoice {
     Gp,
@@ -614,6 +626,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("mission execution worker failed")?
             }
+            MissionCommand::BaselineEvidence(args) => baseline_evidence::produce(args),
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),

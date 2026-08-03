@@ -74,6 +74,25 @@ separate governed precommit boundary. This schema binds prior-evidence
 identities; later holdout and Paper/Shadow gates own receipt and signature
 verification.
 
+Create the `training-validation-v1` reference used by a CEX mission from one
+completed legacy mission without reopening or mutating its DuckDB lineage:
+
+```bash
+cargo run -p alpha-harness -- mission baseline-evidence \
+  --db var/alpha.duckdb \
+  --mission-id legacy-btcusdt-1 \
+  --output var/evidence/training-validation.json
+```
+
+The producer selects exactly one passing purged walk-forward candidate, embeds
+the candidate and `CandidateEvaluation`, binds the dataset/protocol/config and
+lineage hashes, records the source mission and registered dataset manifest
+content hashes, rejects sealed-holdout output, and creates the JSON destination
+without overwriting an existing file. `artifact_sha256` is the canonical JSON
+content identity of the wrapper, not the hash of a pretty-printed transport
+file. Use its printed `evidence_reference` in the reviewed CEX mission artifact;
+this does not grant Paper, Shadow, or Live authority.
+
 For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text

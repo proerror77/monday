@@ -1,0 +1,8 @@
+owner: codex
+contract: cex-baseline-evidence
+base_sha: 10673253846297318ecd632fc2eb85fe02911523
+branch: codex/cex-baseline-evidence
+scope:
+  - rust_hft/alpha-harness/domain
+  - rust_hft/alpha-harness/app
+no_external_runtime_mutation: true

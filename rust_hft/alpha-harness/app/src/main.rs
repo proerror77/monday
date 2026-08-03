@@ -1,3 +1,4 @@
+mod baseline_evidence;
 mod cli;
 mod data_mission;
 mod governance;

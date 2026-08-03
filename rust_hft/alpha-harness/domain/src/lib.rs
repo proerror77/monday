@@ -23,6 +23,7 @@ pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receip
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
+pub const TRAINING_VALIDATION_SCHEMA_V1: &str = "training-validation-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -108,6 +109,8 @@ pub enum DomainError {
     InvalidCexGpCandidate(&'static str),
     #[error("CEX Factor Bank is invalid: {0}")]
     InvalidCexFactorBank(&'static str),
+    #[error("training-validation evidence is invalid: {0}")]
+    InvalidTrainingValidationEvidence(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,6 +668,234 @@ impl CexResearchMissionArtifactV1 {
             spec: &self.spec,
         })?;
         Ok(format!("cex-mission-{hash}"))
+    }
+}
+
+/// Immutable walk-forward evidence produced from a completed legacy Mission run.
+///
+/// The contract deliberately carries the candidate and evaluation payloads so an
+/// admission reader can verify the derived hashes without reopening DuckDB. It is
+/// training/validation evidence only: sealed-holdout evaluation is a later,
+/// separately governed boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrainingValidationEvidenceV1 {
+    pub schema_version: String,
+    pub evidence_id: String,
+    pub source_mission_id: String,
+    pub source_mission_sha256: String,
+    pub source_search_lineage_id: String,
+    pub dataset_manifest_id: String,
+    pub dataset_manifest_sha256: String,
+    pub candidate_id: String,
+    pub candidate_content_sha256: String,
+    pub candidate: CandidateArtifact,
+    pub evaluation_id: String,
+    pub evaluation_content_sha256: String,
+    pub evaluation_record_sha256: String,
+    pub evaluator_version: String,
+    pub evaluator_config_sha256: String,
+    pub evaluation_protocol_hash: String,
+    pub evaluation: CandidateEvaluation,
+    pub holdout_opened: bool,
+    pub artifact_sha256: String,
+}
+
+#[derive(Serialize)]
+struct TrainingValidationIdentity<'a> {
+    schema_version: &'a str,
+    source_mission_id: &'a str,
+    source_mission_sha256: &'a str,
+    source_search_lineage_id: &'a str,
+    dataset_manifest_id: &'a str,
+    dataset_manifest_sha256: &'a str,
+    candidate_id: &'a str,
+    candidate_content_sha256: &'a str,
+    candidate: &'a CandidateArtifact,
+    evaluation_id: &'a str,
+    evaluation_content_sha256: &'a str,
+    evaluation_record_sha256: &'a str,
+    evaluator_version: &'a str,
+    evaluator_config_sha256: &'a str,
+    evaluation_protocol_hash: &'a str,
+    evaluation: &'a CandidateEvaluation,
+    holdout_opened: bool,
+}
+
+impl TrainingValidationEvidenceV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_mission_id: impl Into<String>,
+        source_mission_sha256: impl Into<String>,
+        source_search_lineage_id: impl Into<String>,
+        dataset_manifest_id: impl Into<String>,
+        dataset_manifest_sha256: impl Into<String>,
+        candidate_id: impl Into<String>,
+        evaluation_id: impl Into<String>,
+        evaluation_record_sha256: impl Into<String>,
+        candidate: CandidateArtifact,
+        evaluation: CandidateEvaluation,
+    ) -> Result<Self, DomainError> {
+        evaluation.validate()?;
+        let (_, evaluation_protocol_hash) = evaluation.protocol_binding()?;
+        let candidate_content_sha256 = canonical_json_hash(&candidate)?;
+        let evaluation_content_sha256 = canonical_json_hash(&evaluation)?;
+        let evaluator_config_sha256 = canonical_json_hash(&evaluation.evaluator_config)?;
+        let mut evidence = Self {
+            schema_version: TRAINING_VALIDATION_SCHEMA_V1.to_string(),
+            evidence_id: String::new(),
+            source_mission_id: source_mission_id.into(),
+            source_mission_sha256: source_mission_sha256.into(),
+            source_search_lineage_id: source_search_lineage_id.into(),
+            dataset_manifest_id: dataset_manifest_id.into(),
+            dataset_manifest_sha256: dataset_manifest_sha256.into(),
+            candidate_id: candidate_id.into(),
+            candidate_content_sha256,
+            candidate,
+            evaluation_id: evaluation_id.into(),
+            evaluation_content_sha256,
+            evaluation_record_sha256: evaluation_record_sha256.into(),
+            evaluator_version: evaluation.evaluator_version.clone(),
+            evaluator_config_sha256,
+            evaluation_protocol_hash: evaluation_protocol_hash.to_string(),
+            evaluation,
+            holdout_opened: false,
+            artifact_sha256: String::new(),
+        };
+        let artifact_sha256 = evidence.content_hash()?;
+        evidence.artifact_sha256 = artifact_sha256.clone();
+        evidence.evidence_id = format!("training-validation-{artifact_sha256}");
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    pub fn evidence_reference(&self) -> CexResearchEvidenceRefV1 {
+        CexResearchEvidenceRefV1 {
+            evidence_id: self.evidence_id.clone(),
+            kind: CexResearchEvidenceKindV1::TrainingValidation,
+            source_mission_id: self.source_mission_id.clone(),
+            source_search_lineage_id: self.source_search_lineage_id.clone(),
+            artifact_sha256: self.artifact_sha256.clone(),
+            signature: None,
+            holdout_id: None,
+        }
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        canonical_json_hash(&TrainingValidationIdentity {
+            schema_version: &self.schema_version,
+            source_mission_id: &self.source_mission_id,
+            source_mission_sha256: &self.source_mission_sha256,
+            source_search_lineage_id: &self.source_search_lineage_id,
+            dataset_manifest_id: &self.dataset_manifest_id,
+            dataset_manifest_sha256: &self.dataset_manifest_sha256,
+            candidate_id: &self.candidate_id,
+            candidate_content_sha256: &self.candidate_content_sha256,
+            candidate: &self.candidate,
+            evaluation_id: &self.evaluation_id,
+            evaluation_content_sha256: &self.evaluation_content_sha256,
+            evaluation_record_sha256: &self.evaluation_record_sha256,
+            evaluator_version: &self.evaluator_version,
+            evaluator_config_sha256: &self.evaluator_config_sha256,
+            evaluation_protocol_hash: &self.evaluation_protocol_hash,
+            evaluation: &self.evaluation,
+            holdout_opened: self.holdout_opened,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != TRAINING_VALIDATION_SCHEMA_V1 {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "schema version is unsupported",
+            ));
+        }
+        if [
+            self.source_mission_id.as_str(),
+            self.dataset_manifest_id.as_str(),
+            self.candidate_id.as_str(),
+            self.evaluation_id.as_str(),
+            self.evaluator_version.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "source or evaluator identity is incomplete",
+            ));
+        }
+        for hash in [&self.source_mission_sha256, &self.dataset_manifest_sha256] {
+            if !valid_content_sha256(hash) {
+                return Err(DomainError::InvalidTrainingValidationEvidence(
+                    "mission or dataset manifest hash is invalid",
+                ));
+            }
+        }
+        if !self
+            .source_search_lineage_id
+            .strip_prefix("search-lineage-")
+            .is_some_and(valid_content_sha256)
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "search lineage identity is invalid",
+            ));
+        }
+        for hash in [
+            &self.candidate_content_sha256,
+            &self.evaluation_content_sha256,
+            &self.evaluation_record_sha256,
+            &self.evaluator_config_sha256,
+            &self.evaluation_protocol_hash,
+            &self.artifact_sha256,
+        ] {
+            if !valid_content_sha256(hash) {
+                return Err(DomainError::InvalidTrainingValidationEvidence(
+                    "evidence hash is invalid",
+                ));
+            }
+        }
+        if !self.evaluation.passed
+            || self.holdout_opened
+            || self.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+            || self.evaluator_version != self.evaluation.evaluator_version
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "training-validation evidence must be a passing unopened purged walk-forward output",
+            ));
+        }
+        if canonical_json_hash(&self.candidate)? != self.candidate_content_sha256
+            || canonical_json_hash(&self.evaluation)? != self.evaluation_content_sha256
+            || canonical_json_hash(&self.evaluation.evaluator_config)?
+                != self.evaluator_config_sha256
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "embedded evidence hashes do not match",
+            ));
+        }
+        if !matches!(&self.candidate, CandidateArtifact::Formula(ast) if validate_live_formula(ast).is_ok())
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "baseline candidate is not a live formula",
+            ));
+        }
+        self.evaluation
+            .validate()
+            .map_err(|_| DomainError::InvalidTrainingValidationEvidence("evaluation is invalid"))?;
+        let (_, protocol_hash) = self.evaluation.protocol_binding().map_err(|_| {
+            DomainError::InvalidTrainingValidationEvidence("evaluation protocol is unbound")
+        })?;
+        if protocol_hash != self.evaluation_protocol_hash {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "evaluation protocol hash does not match",
+            ));
+        }
+        if self.content_hash()? != self.artifact_sha256
+            || self.evidence_id != format!("training-validation-{}", self.artifact_sha256)
+        {
+            return Err(DomainError::InvalidTrainingValidationEvidence(
+                "artifact identity does not match its payload",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -4856,6 +5087,119 @@ mod tests {
         assert_eq!(
             verify_envelope(&signed, &trusted, &policy(), now, |_| false).unwrap_err(),
             DomainError::RuntimeBindingMismatch
+        );
+    }
+
+    fn training_validation_evidence() -> TrainingValidationEvidenceV1 {
+        let protocol = evaluation_protocol();
+        let protocol_hash = protocol.content_hash().unwrap();
+        let config = FormulaEvaluatorConfig::for_trials(10).unwrap();
+        let raw_score = 5.0;
+        let adjusted_score = config.adjusted_score(raw_score).unwrap();
+        let predictive_folds = (1..=3)
+            .map(|fold_index| FoldPredictiveMetrics {
+                fold_index,
+                row_count: 30,
+                time_series_ic: Some(0.1),
+                time_series_rank_ic: Some(0.1),
+            })
+            .collect::<Vec<_>>();
+        let trading_folds = (1..=3)
+            .map(|fold_index| FoldEvaluationMetrics {
+                fold_index,
+                row_count: 30,
+                trade_count: 30,
+                total_turnover: 30.0,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.03,
+                max_drawdown: 0.01,
+                net_sharpe: 1.0,
+                raw_score,
+                max_book_depth_fraction: None,
+            })
+            .collect::<Vec<_>>();
+        let evaluation = CandidateEvaluation {
+            passed: true,
+            score: adjusted_score,
+            failure_reasons: vec![],
+            evaluator_version: WALK_FORWARD_EVALUATOR_VERSION.to_string(),
+            evaluator_config: serde_json::to_value(&config).unwrap(),
+            evaluation_protocol: Some(protocol),
+            evaluation_protocol_hash: Some(protocol_hash),
+            metrics: EvaluationMetrics {
+                predictive: PredictiveMetrics::from_folds(predictive_folds),
+                row_count: 90,
+                trade_count: 90,
+                total_turnover: 90.0,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.09,
+                max_drawdown: 0.01,
+                net_sharpe: 1.0,
+                raw_score,
+                adjusted_score,
+                folds: trading_folds,
+            },
+        };
+        TrainingValidationEvidenceV1::new(
+            "legacy-mission-1",
+            &"c".repeat(64),
+            format!("search-lineage-{}", "a".repeat(64)),
+            "dataset-1",
+            &"d".repeat(64),
+            "candidate-1",
+            "evaluation-1",
+            "b".repeat(64),
+            CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
+                "best_bid".to_string(),
+            ))),
+            evaluation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn training_validation_evidence_binds_walk_forward_only() {
+        let evidence = training_validation_evidence();
+        assert_eq!(
+            evidence.evidence_id,
+            format!("training-validation-{}", evidence.artifact_sha256)
+        );
+        assert!(!evidence.holdout_opened);
+        assert!(evidence.validate().is_ok());
+        assert!(evidence.evidence_reference().validate().is_ok());
+
+        let mut holdout_opened = evidence.clone();
+        holdout_opened.holdout_opened = true;
+        assert_eq!(
+            holdout_opened.validate(),
+            Err(DomainError::InvalidTrainingValidationEvidence(
+                "training-validation evidence must be a passing unopened purged walk-forward output"
+            ))
+        );
+
+        let mut sealed = evidence;
+        sealed.evaluator_version = SEALED_HOLDOUT_EVALUATOR_VERSION.to_string();
+        assert_eq!(
+            sealed.validate(),
+            Err(DomainError::InvalidTrainingValidationEvidence(
+                "training-validation evidence must be a passing unopened purged walk-forward output"
+            ))
+        );
+    }
+
+    #[test]
+    fn training_validation_evidence_rejects_a_failed_evaluation() {
+        let mut evidence = training_validation_evidence();
+        evidence.evaluation.passed = false;
+        evidence.evaluation.failure_reasons = vec!["failed gate".to_string()];
+        evidence.artifact_sha256 = evidence.content_hash().unwrap();
+        evidence.evidence_id = format!("training-validation-{}", evidence.artifact_sha256);
+
+        assert_eq!(
+            evidence.validate(),
+            Err(DomainError::InvalidTrainingValidationEvidence(
+                "training-validation evidence must be a passing unopened purged walk-forward output"
+            ))
         );
     }
 }

@@ -22,6 +22,7 @@ use alpha_engine::{
 use alpha_onnx_evaluator::OnnxEvaluator;
 use alpha_store::{
     AlphaStore, ApprovalRecord, EvaluationRecord, MissionLineage, RegistryRevision, StoreError,
+    StoredCandidate, StoredEvaluation,
 };
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
@@ -62,6 +63,37 @@ pub(crate) fn selected_walk_forward_candidate(
     Ok(selected_walk_forward_candidate_in_lineage(&lineage)?.map(|(candidate_id, _)| candidate_id))
 }
 
+pub(crate) fn selected_walk_forward_evidence(
+    store: &AlphaStore,
+    mission_id: &str,
+) -> anyhow::Result<Option<(StoredCandidate, StoredEvaluation)>> {
+    let lineage = store.mission_lineage(mission_id)?;
+    let Some((candidate_id, evaluation_id, protocol_hash)) =
+        selected_walk_forward_evidence_binding_in_lineage(&lineage)?
+    else {
+        return Ok(None);
+    };
+    let candidate = lineage
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == candidate_id)
+        .cloned()
+        .with_context(|| format!("selected candidate {candidate_id} is missing from lineage"))?;
+    let evaluation = lineage
+        .evaluations
+        .iter()
+        .find(|evaluation| {
+            evaluation.record.evaluation_id == evaluation_id
+                && evaluation.record.candidate_id == candidate_id
+                && evaluation.record.evaluation_protocol_hash == protocol_hash
+        })
+        .cloned()
+        .with_context(|| {
+            format!("selected evaluation {evaluation_id} for candidate {candidate_id} is missing")
+        })?;
+    Ok(Some((candidate, evaluation)))
+}
+
 fn validated_walk_forward_candidates_in_lineage(
     lineage: &MissionLineage,
 ) -> anyhow::Result<Vec<String>> {
@@ -87,6 +119,29 @@ fn selected_walk_forward_candidate_in_lineage(
 fn validated_walk_forward_evidence_in_lineage(
     lineage: &MissionLineage,
 ) -> anyhow::Result<Vec<(String, String)>> {
+    let mut candidates = validated_walk_forward_evidence_bindings_in_lineage(lineage)?
+        .into_iter()
+        .map(|(candidate_id, _, protocol_hash)| (candidate_id, protocol_hash))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn selected_walk_forward_evidence_binding_in_lineage(
+    lineage: &MissionLineage,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    let evidence = validated_walk_forward_evidence_bindings_in_lineage(lineage)?;
+    match evidence.as_slice() {
+        [] => Ok(None),
+        [selected] => Ok(Some(selected.clone())),
+        _ => bail!("baseline evidence requires exactly one canonical walk-forward evaluation"),
+    }
+}
+
+fn validated_walk_forward_evidence_bindings_in_lineage(
+    lineage: &MissionLineage,
+) -> anyhow::Result<Vec<(String, String, String)>> {
     let expected_config = FormulaEvaluator::for_mission(&lineage.mission)
         .map_err(anyhow::Error::msg)?
         .config_evidence()
@@ -156,16 +211,20 @@ fn validated_walk_forward_evidence_in_lineage(
                 .with_context(|| {
                     format!("walk-forward evaluation {evaluation_id} has no bound protocol")
                 })?;
-            if stored.record.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
+            if stored.record.mission_id != lineage.mission.mission_id
+                || stored.record.dataset_manifest_id != lineage.mission.dataset_manifest_id.as_str()
                 || stored.record.evaluation_protocol_hash != protocol_hash
             {
                 continue;
             }
-            candidates.push((candidate_id.to_string(), protocol_hash.to_string()));
+            candidates.push((
+                candidate_id.to_string(),
+                evaluation_id.to_string(),
+                protocol_hash.to_string(),
+            ));
         }
     }
     candidates.sort();
-    candidates.dedup();
     Ok(candidates)
 }
 
@@ -1579,6 +1638,21 @@ mod tests {
                 .unwrap()
                 .0,
             "candidate-1"
+        );
+
+        let mut duplicate_evaluation = lineage.clone();
+        let mut duplicate_iteration = duplicate_evaluation.iterations[0].clone();
+        duplicate_iteration.iteration_id = "iteration-2".to_string();
+        duplicate_iteration.evaluation_artifact_id = Some("evaluation-2".to_string());
+        duplicate_evaluation.iterations.push(duplicate_iteration);
+        let mut second_evaluation = duplicate_evaluation.evaluations[0].clone();
+        second_evaluation.record.evaluation_id = "evaluation-2".to_string();
+        duplicate_evaluation.evaluations.push(second_evaluation);
+        assert!(
+            selected_walk_forward_evidence_binding_in_lineage(&duplicate_evaluation)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one canonical walk-forward evaluation")
         );
 
         let mut ambiguous = lineage.clone();
