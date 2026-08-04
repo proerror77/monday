@@ -73,7 +73,6 @@ members = [
     "infra-services/core/redis",
     "infra-services/core/metrics",
     "infra-services/core/secrets",
-    "infra-services/core/venue",
     "infra-services/core/ipc",
     "infra-services/core/grpc-server",
     "infra-services/testing",

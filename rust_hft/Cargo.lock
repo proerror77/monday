@@ -5755,19 +5755,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-infra-venue"
-version = "0.1.0"
-dependencies = [
- "hft-core",
- "hft-ports",
- "rust_decimal",
- "serde",
- "serde_yaml",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "hft-instrument"
 version = "0.1.0"
 dependencies = [
