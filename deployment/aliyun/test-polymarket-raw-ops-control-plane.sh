@@ -4371,7 +4371,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
   gate_seconds=$MINIMUM_GATE_SECONDS
   candidate_sha=unused run_id=unused release_binary=unused
   oss_bucket=unused oss_endpoint=unused oss_region=unused aliyun_profile=unused
-  zstd_timeout_seconds=300 oss_copy_timeout_seconds=300 oss_config_sha=unused
+  zstd_timeout_seconds=3600 oss_copy_timeout_seconds=1800 oss_config_sha=unused
   source_revision=unused deployment_bundle_sha=unused release_manifest_sha=unused
   control_archive_sha=unused
   identity_checks=0
