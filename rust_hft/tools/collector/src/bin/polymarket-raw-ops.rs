@@ -7,8 +7,7 @@ use hft_collector::polymarket_evidence_artifact::{
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
-    DEFAULT_MAX_MARKETS_PER_LANE,
-    DEFAULT_MAX_RETAINED_TRADE_IDS, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
+    DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
 };
 use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
@@ -60,8 +59,6 @@ enum Command {
         settlement_lookback_secs: i64,
         #[arg(long, default_value_t = DEFAULT_MAX_MARKETS_PER_LANE)]
         max_markets: usize,
-        #[arg(long, default_value_t = DEFAULT_MAX_RETAINED_TRADE_IDS)]
-        max_retained_trade_ids: usize,
         #[arg(long, default_value_t = DEFAULT_MAX_TRADE_POLLS_PER_CYCLE)]
         max_trade_polls_per_cycle: usize,
         #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_TRADE_POLLS)]
@@ -229,7 +226,6 @@ async fn run(cli: Cli) -> Result<()> {
             market_lookback_secs,
             settlement_lookback_secs,
             max_markets,
-            max_retained_trade_ids,
             max_trade_polls_per_cycle,
             max_concurrent_trade_polls,
             http_timeout,
@@ -248,7 +244,6 @@ async fn run(cli: Cli) -> Result<()> {
                 market_lookback_secs,
                 settlement_lookback_secs,
                 max_markets,
-                max_retained_trade_ids,
                 max_trade_polls_per_cycle,
                 max_concurrent_trade_polls,
                 http_timeout: positive_duration(http_timeout, "HTTP timeout")?,
@@ -414,7 +409,6 @@ mod tests {
             .command;
         let Command::CollectReference {
             max_markets,
-            max_retained_trade_ids,
             max_trade_polls_per_cycle,
             max_concurrent_trade_polls,
             tape_max_bytes,
@@ -425,10 +419,6 @@ mod tests {
         };
         assert_eq!(max_markets, ReferenceConfig::default().max_markets);
         assert_eq!(
-            max_retained_trade_ids,
-            ReferenceConfig::default().max_retained_trade_ids
-        );
-        assert_eq!(
             max_trade_polls_per_cycle,
             ReferenceConfig::default().max_trade_polls_per_cycle
         );
@@ -436,10 +426,7 @@ mod tests {
             max_concurrent_trade_polls,
             ReferenceConfig::default().max_concurrent_trade_polls
         );
-        assert_eq!(
-            tape_max_bytes,
-            ReferenceConfig::default().tape_max_bytes
-        );
+        assert_eq!(tape_max_bytes, ReferenceConfig::default().tape_max_bytes);
     }
 
     #[test]
@@ -457,10 +444,7 @@ mod tests {
         let Command::CollectReference { market_ids, .. } = command else {
             panic!("collect-reference must select the collector command");
         };
-        assert_eq!(
-            market_ids,
-            vec!["2959141".to_owned(), "2959146".to_owned()]
-        );
+        assert_eq!(market_ids, vec!["2959141".to_owned(), "2959146".to_owned()]);
     }
 
     #[test]
@@ -570,8 +554,8 @@ mod tests {
                 PathBuf::from(format!("/tmp/second.{suffix}")),
             ]
         };
-        let triplets = reference_triplets(paths("data"), paths("manifest"), paths("success"))
-            .unwrap();
+        let triplets =
+            reference_triplets(paths("data"), paths("manifest"), paths("success")).unwrap();
         assert_eq!(triplets[1].data, PathBuf::from("/tmp/second.data"));
         assert!(reference_triplets(paths("data"), vec![], paths("success")).is_err());
     }
