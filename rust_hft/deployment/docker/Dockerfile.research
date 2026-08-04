@@ -26,6 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --locked \
     -p hft-collector \
     --bin lob-pit-materializer \
+    --bin binance-replay-parquet-materializer \
     && CARGO_TARGET_DIR=/work/target/prediction-markets \
     cargo --config 'build.rustc-wrapper=""' build \
     --manifest-path prediction-markets/Cargo.toml \
@@ -39,6 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
     && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
     && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer \
+    && install -D -m 0755 /work/target/release/binance-replay-parquet-materializer /out/bin/binance-replay-parquet-materializer \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot

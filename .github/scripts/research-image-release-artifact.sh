@@ -13,6 +13,7 @@ binaries=(
   hft-backtest
   alpha-harness
   lob-pit-materializer
+  binance-replay-parquet-materializer
   monday-prediction-research
   monday-prediction-evaluator
   monday-prediction-snapshot
@@ -64,7 +65,7 @@ case "$mode" in
        .target == $target and
        .cargo_locks == {"Cargo.lock":$root_lock_sha256,
          "prediction-markets/Cargo.lock":$prediction_lock_sha256} and
-       (.binaries | length) == 6' "$manifest" >/dev/null
+       (.binaries | length) == 7' "$manifest" >/dev/null
     for binary in "${binaries[@]}"; do
       expected=$(jq -er --arg file "$binary" \
         '.binaries | map(select(.file == $file)) | if length == 1 then .[0].sha256 else error("binary manifest mismatch") end' \

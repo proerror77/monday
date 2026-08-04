@@ -241,11 +241,12 @@ ext4 filesystem, mount it at `/build-cache`, and persist its UUID in
 `/etc/fstab`. On later builders, attach and mount the existing filesystem; do
 not format it again.
 
-The image contains six stable entrypoints:
+The image contains seven stable entrypoints:
 
 - `/usr/local/bin/hft-backtest`
 - `/usr/local/bin/alpha-harness`
 - `/usr/local/bin/lob-pit-materializer`
+- `/usr/local/bin/binance-replay-parquet-materializer`
 - `/usr/local/bin/monday-prediction-research`
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`

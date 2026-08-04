@@ -6,6 +6,7 @@ expected=(
   hft-backtest
   alpha-harness
   lob-pit-materializer
+  binance-replay-parquet-materializer
   monday-prediction-research
   monday-prediction-evaluator
   monday-prediction-snapshot
