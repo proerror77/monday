@@ -1563,6 +1563,87 @@ mod tests {
     }
 
     #[test]
+    fn mcts_rejects_a_domain_valid_failed_gate_before_transition() {
+        let fixture = fixture("mcts-failed-empty-gate");
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let db = results.join("alpha.duckdb");
+        let producer_id = fixture.mission.semantic_id().unwrap();
+        let mut store = AlphaStore::open(&db).unwrap();
+        let producer = store.get_mission(&producer_id).unwrap();
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        assert!(factor_bank.entries.is_empty());
+        let baseline_policy =
+            CexBaselinePolicyV1::controlled_v1(fixture.mission.spec.policies.baseline.id.clone())
+                .unwrap();
+        let gate: alpha_domain::CexBaselineGateV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        assert!(!gate.passed);
+        assert_eq!(
+            gate.failure_codes,
+            vec![alpha_domain::CexBaselineFailureCodeV1::EmptyFactorBank]
+        );
+        gate.validate().unwrap();
+        assert_eq!(
+            gate,
+            alpha_domain::CexBaselineGateV1::empty_factor_bank(
+                &producer_id,
+                &baseline_policy,
+                &factor_bank
+            )
+            .unwrap()
+        );
+        let gate_revision = store.get_registry_revision(&gate.gate_id).unwrap();
+        assert_eq!(gate_revision.registry_kind, "cex_baseline_gate");
+        assert_eq!(gate_revision.payload, serde_json::to_value(&gate).unwrap());
+
+        let mut consumer = producer;
+        consumer.mission_id = format!("{producer_id}-mcts-failed");
+        consumer.baseline_artifact_id = Some(gate.gate_id.clone());
+        consumer.status = MissionStatus::Pending;
+        consumer.terminal_reason = None;
+        consumer.created_at = Utc::now();
+        consumer.updated_at = consumer.created_at;
+        let consumer_id = consumer.mission_id.clone();
+        store.create_mission(&consumer).unwrap();
+        drop(store);
+
+        let args = RunMissionArgs {
+            db,
+            mission_id: consumer_id,
+            engine: EngineChoice::Mcts,
+            seed: fixture.mission.spec.search.seed,
+            feature_fields: fixture.mission.spec.feature_fields.clone(),
+            offline_trace: None,
+            max_new_iterations: Some(1),
+            dataset: DatasetArgs {
+                dataset_manifest: results.join("cex-replay-dataset-manifest.json"),
+                validation: ValidationArgs::from_protocol(
+                    &fixture.mission.spec.evaluation_protocol,
+                ),
+            },
+        };
+        let error = mission::execute_mission(&args, false).unwrap_err();
+
+        assert_eq!(error.to_string(), "MCTS baseline gate did not pass");
+        let store = AlphaStore::open(&args.db).unwrap();
+        assert_eq!(
+            store.get_mission(&args.mission_id).unwrap().status,
+            MissionStatus::Pending
+        );
+        assert!(store
+            .mission_lineage(&args.mission_id)
+            .unwrap()
+            .iterations
+            .is_empty());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn mcts_rejects_a_tampered_published_gate_before_transition() {
         let mut fixture = fixture("mcts-tampered-gate");
         fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
