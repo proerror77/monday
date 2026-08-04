@@ -6,7 +6,6 @@ on:
     paths:
       - '.github/workflows/docker-smoke.yml'
       - 'deploy/**'
-      - 'deployment/docker/**'
       - 'rust_hft/Cargo.toml'
       - 'rust_hft/Cargo.lock'
       - 'rust_hft/docker/**'
@@ -17,7 +16,6 @@ on:
     paths:
       - '.github/workflows/docker-smoke.yml'
       - 'deploy/**'
-      - 'deployment/docker/**'
       - 'rust_hft/Cargo.toml'
       - 'rust_hft/Cargo.lock'
       - 'rust_hft/docker/**'
