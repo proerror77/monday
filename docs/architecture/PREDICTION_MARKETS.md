@@ -242,13 +242,12 @@ scheduled event expiry—to precede the first retained validation decision.
 Existing v1 snapshots therefore require a deterministic rebuild from retained
 raw data; they are never silently upgraded.
 
-The prediction LoopRun also keeps an append-only ledger for every LLM call and
-links each accepted proposal to its full retry lineage. Prompts, responses,
-priors, evaluator attempts, feedback, and deterministic decisions are
-content-addressed. A persisted response can be replayed after a process crash
-without another provider call; missing responses and rejected retries remain
-explicit evidence rather than disappearing from the budget. Neither loop owns
-execution or live activation.
+The active prediction LoopRun uses bounded MCTS checkpoints. Before an advisor
+provider call, it durably marks the call as consumed. If the process is
+interrupted before the advisor result is checkpointed, resume fails closed
+instead of replaying the response or spending another provider call. The MCTS
+runner does not claim a durable provider, model, usage, or retry-lineage ledger.
+Neither loop owns execution or live activation.
 
 ## Source and provenance
 

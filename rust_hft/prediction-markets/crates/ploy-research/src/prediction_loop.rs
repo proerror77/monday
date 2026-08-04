@@ -1,7 +1,7 @@
 //! Rust-owned policy and shared contracts for BTC or SOL prediction-market research.
 //!
 //! The active search loop is the bounded MCTS runner. This module has no execution or
-//! live-trading authority. Continuous-contract research remains in Monday.s separate
+//! live-trading authority. Continuous-contract research remains in Monday's separate
 //! `alpha-harness` workspace.
 
 use std::collections::{BTreeMap, BTreeSet};

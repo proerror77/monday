@@ -85,7 +85,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Add a resumable Monday prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
 - [x] Retire the superseded non-MCTS prediction LoopRun engine, ledger, crash-recovery helpers, and engine-only tests after the governed runner cut over to bounded MCTS.
 - [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.
-- [x] Recover LLM provider, model, and usage provenance from the same content-addressed response envelope after a crash.
+- [x] Make interrupted MCTS advisor calls fail closed after durable budget consumption; do not replay provider responses or claim provider, model, or usage envelope recovery.
 - [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
 - [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink opening/settlement authority.
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
