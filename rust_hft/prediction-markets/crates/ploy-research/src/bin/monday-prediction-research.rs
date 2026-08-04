@@ -18,7 +18,7 @@ use ploy_research::factors_v2::SettlementProbabilityComponentProfile;
 use ploy_research::prediction_llm::OpenAiCompatibleProposalClient;
 use ploy_research::prediction_loop::{
     current_prediction_policy_snapshot_id, prediction_prior_for_blends, research_brief_snapshot_id,
-    run_or_resume, validate_prediction_run_inputs, LoopRunStatus, PredictionEvaluationOutput,
+    validate_prediction_run_inputs, LoopRunStatus, PredictionEvaluationOutput,
     PredictionEvaluationRequest, PredictionEvaluator, PredictionResearchMission,
     ProposalCallOutput, ProposalClient,
 };
@@ -39,7 +39,7 @@ const MAX_EVALUATOR_LOG_BYTES: usize = 16 * 1024 * 1024;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research [--legacy-loop] <mission.json> <snapshot-dir> <output-dir>"
+        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research <mission.json> <snapshot-dir> <output-dir>"
     );
     std::process::exit(2);
 }
@@ -1011,12 +1011,8 @@ fn main() {
             return;
         }
     }
-    let (legacy_loop, mission_path, snapshot_dir, output_dir) = match args.as_slice() {
-        [mission_path, snapshot_dir, output_dir] => (false, mission_path, snapshot_dir, output_dir),
-        [flag, mission_path, snapshot_dir, output_dir] if flag == "--legacy-loop" => {
-            (true, mission_path, snapshot_dir, output_dir)
-        }
-        _ => usage(),
+    let [mission_path, snapshot_dir, output_dir] = args.as_slice() else {
+        usage();
     };
     let mission: PredictionResearchMission =
         read_json(Path::new(mission_path)).unwrap_or_else(|reason| {
@@ -1038,35 +1034,20 @@ fn main() {
     } else {
         SettlementProbabilityComponentProfile::FullSurface
     };
-    if legacy_loop && component_profile == SettlementProbabilityComponentProfile::MarketMidpointOnly
-    {
-        eprintln!("ERROR: --legacy-loop does not implement the reduced-authority baseline");
-        std::process::exit(2);
-    }
     let timeout = Duration::from_secs(mission.search_budget.max_seconds.max(1));
     let mut client = LazyProposalClient::new(timeout);
     let mut evaluator = RustProcessEvaluator::new().unwrap_or_else(|reason| {
         eprintln!("ERROR: {reason}");
         std::process::exit(2);
     });
-    let summary = (if legacy_loop {
-        run_or_resume(
-            mission,
-            Path::new(snapshot_dir),
-            Path::new(output_dir),
-            &mut client,
-            &mut evaluator,
-        )
-    } else {
-        run_or_resume_prediction_mcts_with_component_profile(
-            mission,
-            Path::new(snapshot_dir),
-            Path::new(output_dir),
-            &mut client,
-            &mut evaluator,
-            component_profile,
-        )
-    })
+    let summary = run_or_resume_prediction_mcts_with_component_profile(
+        mission,
+        Path::new(snapshot_dir),
+        Path::new(output_dir),
+        &mut client,
+        &mut evaluator,
+        component_profile,
+    )
     .unwrap_or_else(|reason| {
         eprintln!("ERROR: {reason}");
         std::process::exit(2);
