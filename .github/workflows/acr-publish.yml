@@ -171,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked -p hft-backtest -p alpha-harness
-          cargo build --release --locked -p hft-collector --bin lob-pit-materializer
+          cargo build --release --locked -p hft-collector --bin lob-pit-materializer --bin binance-replay-parquet-materializer
           CARGO_TARGET_DIR=target/prediction-markets \
             cargo build \
               --manifest-path prediction-markets/Cargo.toml \
@@ -243,6 +243,7 @@ jobs:
             research-release/research-bin/hft-backtest \
             research-release/research-bin/alpha-harness \
             research-release/research-bin/lob-pit-materializer \
+            research-release/research-bin/binance-replay-parquet-materializer \
             research-release/research-bin/monday-prediction-research \
             research-release/research-bin/monday-prediction-evaluator \
             research-release/research-bin/monday-prediction-snapshot
@@ -364,7 +365,7 @@ jobs:
             "$IMAGE")
           test "$actual_source_revision" = "$SOURCE_REVISION"
           docker run --rm --entrypoint /bin/sh "$IMAGE" -ceu '
-            for binary in hft-backtest alpha-harness lob-pit-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+            for binary in hft-backtest alpha-harness lob-pit-materializer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
               test -x "/usr/local/bin/$binary"
             done
           '
@@ -372,6 +373,10 @@ jobs:
             --entrypoint /usr/local/bin/monday-prediction-research \
             "$IMAGE" \
             --print-policy-snapshot-id | grep -Eq '^sha256:[0-9a-f]{64}$'
+          docker run --rm \
+            --entrypoint /usr/local/bin/binance-replay-parquet-materializer \
+            "$IMAGE" \
+            --help >/dev/null
 
       - name: Package bare-metal trading host contract
         if: matrix.repository == 'hft-trading'
