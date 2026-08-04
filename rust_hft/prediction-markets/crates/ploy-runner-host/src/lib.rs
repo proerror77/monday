@@ -43,21 +43,19 @@ fn print_usage_for(program: &str) {
     eprintln!("  --deployment-id <id>     Platform deployment identity for order attribution");
     eprintln!("  --output-json <path>     Write a machine-readable runtime evaluation");
     eprintln!("  --dry-run                Force dry-run mode (simulated execution)");
-    eprintln!("  --foreground             Run in foreground (default, kept for compat)");
     eprintln!("  --control-generation <generation>  Canonical daemon control generation");
     #[cfg(feature = "ops")]
     ops::print_usage();
 }
 
 fn print_mode_usage(program: &str) {
-    eprintln!("Usage: {program} --config <path> [--deployment-id <id>] [--dry-run] [--foreground] [--control-generation <generation>]");
+    eprintln!("Usage: {program} --config <path> [--deployment-id <id>] [--dry-run] [--control-generation <generation>]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --config <path>          Unified TOML config file (required)");
     eprintln!("  --deployment-id <id>     Platform deployment identity for order attribution");
     eprintln!("  --output-json <path>     Write a machine-readable runtime evaluation");
     eprintln!("  --dry-run                Force dry-run mode (simulated execution)");
-    eprintln!("  --foreground             Run in foreground (default, kept for compat)");
     eprintln!("  --control-generation <generation>  Canonical daemon control generation");
 }
 
@@ -174,12 +172,7 @@ fn normalize_mode_args(mut args: Vec<String>) -> Vec<String> {
     match args.get(1).map(String::as_str) {
         None
         | Some(
-            "--config"
-            | "--deployment-id"
-            | "--output-json"
-            | "--dry-run"
-            | "--foreground"
-            | "--control-generation",
+            "--config" | "--deployment-id" | "--output-json" | "--dry-run" | "--control-generation",
         ) => {
             args.insert(1, "run".to_string());
         }

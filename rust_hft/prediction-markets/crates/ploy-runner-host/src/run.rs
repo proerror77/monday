@@ -42,7 +42,6 @@ pub async fn run_command(args: &[String], command: Option<&str>) {
                 output_json = args.get(i).map(PathBuf::from);
             }
             "--dry-run" => force_dry_run = true,
-            "--foreground" => {}
             "--control-generation" => {
                 if i + 1 >= args.len() || args[i + 1].starts_with("--") {
                     eprintln!("Error: --control-generation requires a value");
