@@ -1484,6 +1484,14 @@ fn retain_requested_market_state(state: &mut CollectorState, requested: &BTreeSe
     state
         .markets
         .retain(|market_id, _| requested.contains(market_id));
+    let retained_conditions = state
+        .markets
+        .values()
+        .filter_map(|tracked| tracked.condition_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .recovered_trade_ids
+        .retain(|condition_id, _| retained_conditions.contains(condition_id));
     state.markets.len() != prior_market_count
 }
 
@@ -1993,10 +2001,18 @@ fn trade_completion_update(
     symbol: &str,
     market_window_secs: u64,
     snapshot: &TradeSnapshot,
+    recovered_record_ids: Option<&BTreeSet<String>>,
     retrieved_at: DateTime<Utc>,
     finalization_lag_secs: i64,
     stable_polls_required: u64,
 ) -> Value {
+    let completion_record_ids = snapshot
+        .record_ids
+        .iter()
+        .chain(recovered_record_ids.into_iter().flatten())
+        .collect::<BTreeSet<_>>();
+    let completion_ids_sha256 =
+        trade_record_ids_sha256(completion_record_ids.iter().map(|id| id.as_str()));
     json!({
         "kind": TRADE_COMPLETION_KIND,
         "market_id": market_id,
@@ -2004,8 +2020,8 @@ fn trade_completion_update(
         "symbol": symbol,
         "market_window_secs": market_window_secs,
         "record_id_version": TRADE_ID_VERSION,
-        "trade_count": snapshot.count(),
-        "trade_record_ids_sha256": snapshot.ids_sha256,
+        "trade_count": completion_record_ids.len(),
+        "trade_record_ids_sha256": completion_ids_sha256,
         "source": "polymarket_data_api",
         "retrieved_at": iso_z(retrieved_at),
         "completeness_basis": TRADE_COMPLETION_BASIS,
@@ -2731,6 +2747,7 @@ impl ReferenceCollector {
                                     &target.symbol,
                                     target.window_secs,
                                     &snapshot,
+                                    next_state.recovered_trade_ids.get(&condition_id),
                                     trade_received_at,
                                     self.config.trade_finalization_lag_secs,
                                     self.config.trade_finalization_stable_polls,
@@ -4692,6 +4709,14 @@ mod tests {
                 ..TrackedMarket::default()
             },
         );
+        state.recovered_trade_ids.insert(
+            "allowed-condition".to_owned(),
+            BTreeSet::from(["allowed-trade".to_owned()]),
+        );
+        state.recovered_trade_ids.insert(
+            "unrelated-condition".to_owned(),
+            BTreeSet::from(["unrelated-trade".to_owned()]),
+        );
 
         assert!(retain_requested_market_state(
             &mut state,
@@ -4699,6 +4724,11 @@ mod tests {
         ));
         assert_eq!(state.markets.len(), 1);
         assert!(state.markets.contains_key("2959141"));
+        assert_eq!(state.recovered_trade_ids.len(), 1);
+        assert!(state.recovered_trade_ids.contains_key("allowed-condition"));
+        assert!(!state
+            .recovered_trade_ids
+            .contains_key("unrelated-condition"));
     }
     #[cfg(unix)]
     #[test]
@@ -4923,6 +4953,7 @@ mod tests {
             "BTCUSDT",
             300,
             &snapshot,
+            None,
             now,
             0,
             2,
@@ -5019,6 +5050,7 @@ mod tests {
             "BTCUSDT",
             300,
             &snapshot,
+            None,
             now,
             60,
             2,
@@ -5028,6 +5060,23 @@ mod tests {
         assert_eq!(
             completion["trade_record_ids_sha256"],
             trade_record_ids_sha256(["trade-a", "trade-b"])
+        );
+        let recovered_ids = BTreeSet::from(["trade-a".to_owned(), "trade-c".to_owned()]);
+        let recovered_completion = trade_completion_update(
+            "market-1",
+            "condition-1",
+            "BTCUSDT",
+            300,
+            &snapshot,
+            Some(&recovered_ids),
+            now,
+            60,
+            2,
+        );
+        assert_eq!(recovered_completion["trade_count"], 3);
+        assert_eq!(
+            recovered_completion["trade_record_ids_sha256"],
+            trade_record_ids_sha256(["trade-a", "trade-b", "trade-c"])
         );
         let row = json!({"update": completion});
         let trade_row = json!({"update": valid_trade_update(now, now.timestamp())});
