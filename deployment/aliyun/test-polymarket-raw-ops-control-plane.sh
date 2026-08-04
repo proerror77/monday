@@ -4839,6 +4839,14 @@ shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"$' "$GATE" | cut -d:
 grep -Fq '.canonical_uploaded_segments' "$GATE"
 grep -Fq 'oss_config_sha256' "$GATE"
 grep -Fq 'oss_config_sha256' "$CUTOVER"
+if grep -Fq \
+  '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' "$GATE"; then
+  printf 'Gate still hard-blocks operator-tuned upload timeouts\n' >&2
+  exit 1
+fi
+grep -Fq '[[ $zstd_timeout_seconds =~ ^[1-9][0-9]*$' "$GATE"
+grep -Fq '&& $oss_copy_timeout_seconds =~ ^[1-9][0-9]*$ ]]' "$GATE"
+grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$GATE"
 grep -Fq 'polymarket-legacy-health-policy.jq' "$GATE"
 grep -Fq 'polymarket-legacy-health-policy.jq' "$CUTOVER"
 grep -Fq 'polymarket-rust-health-policy.jq' "$GATE"
