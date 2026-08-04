@@ -860,6 +860,7 @@ struct TapeWriter {
     sequence: u64,
     tape_bytes: u64,
     tape_max_bytes: u64,
+    recovery_pending: bool,
     file: Option<File>,
 }
 
@@ -1082,6 +1083,7 @@ impl TapeWriter {
             sequence: 0,
             tape_bytes: 0,
             tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
+            recovery_pending: false,
             file: None,
         };
         writer.recover_active(recover, expected_active)?;
@@ -1264,7 +1266,8 @@ impl TapeWriter {
             return Ok(());
         }
         let target_hour = hour_key(now);
-        if self.hour.as_ref().is_some_and(|hour| hour != &target_hour) {
+        let hour_rotation_pending = self.hour.as_ref().is_some_and(|hour| hour != &target_hour);
+        if hour_rotation_pending && !self.recovery_pending {
             self.rotate(now)?;
         }
         let mut start_hour = self.hour.clone();
@@ -1276,7 +1279,9 @@ impl TapeWriter {
             .context("active tape is closed")?
             .metadata()?
             .len();
-        self.hour = Some(target_hour.clone());
+        if !hour_rotation_pending || !self.recovery_pending {
+            self.hour = Some(target_hour.clone());
+        }
         let recorded_at = iso_z(now);
         let result = (|| -> Result<()> {
             for update in updates {
@@ -1301,6 +1306,9 @@ impl TapeWriter {
                         .saturating_add(u64::try_from(encoded.len())?)
                         > self.tape_max_bytes
                 {
+                    if self.recovery_pending {
+                        bail!("active tape reached its byte cap while recovered trade IDs remain");
+                    }
                     self.rotate(now)?;
                     encoded = encode(self.sequence)?;
                     // The rotated tape is published; the rollback anchor moves
@@ -1361,6 +1369,32 @@ fn active_reference_tape_metadata(active: &Path, effective_uid: u32) -> Result<f
     Ok(active_metadata)
 }
 
+fn recover_pending_trade_conditions(pending: &mut BTreeSet<String>, row: &Value) -> Result<()> {
+    let Some(update) = row.get("update").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let kind = update
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let condition_id = update.get("condition_id").and_then(Value::as_str);
+    if kind == "polymarket_trade"
+        && update.get("record_id_version").and_then(Value::as_str) == Some(TRADE_ID_VERSION)
+    {
+        if let Some(condition_id) = condition_id {
+            pending.insert(condition_id.to_owned());
+            if pending.len() > DEFAULT_MAX_MARKETS_PER_LANE {
+                bail!("active reference tape exceeds the bounded pending-market limit");
+            }
+        }
+    } else if kind == TRADE_COMPLETION_KIND {
+        if let Some(condition_id) = condition_id {
+            pending.remove(condition_id);
+        }
+    }
+    Ok(())
+}
+
 fn finalize_reference_tape_at_as(
     spool_dir: &Path,
     now: DateTime<Utc>,
@@ -1393,8 +1427,15 @@ where
     validate_reference_tape_for_recovery(&active, now)
         .context("active reference tape failed uploader validation")?;
     after_validation()?;
-    let mut writer =
-        TapeWriter::new_with_recovery_expected(spool_dir, |_| Ok(()), Some(&active_metadata))?;
+    let mut pending = BTreeSet::new();
+    let mut writer = TapeWriter::new_with_recovery_expected(
+        spool_dir,
+        |row| recover_pending_trade_conditions(&mut pending, row),
+        Some(&active_metadata),
+    )?;
+    if !pending.is_empty() {
+        bail!("refusing to finalize active tape with incomplete recovered trade conditions");
+    }
     writer.rotate(now)
 }
 
@@ -1910,6 +1951,7 @@ fn advance_trade_finalization(
     tracked: &mut TrackedMarket,
     now: DateTime<Utc>,
     retrieved_at: &str,
+    settlement_available: bool,
     snapshot_changed: bool,
     truncated: bool,
     malformed: bool,
@@ -1917,12 +1959,16 @@ fn advance_trade_finalization(
     lag_secs: i64,
     stable_polls_required: u64,
 ) -> bool {
-    if tracked.settlement_seen_at.is_none() {
+    if settlement_available && tracked.settlement_seen_at.is_none() {
         tracked.settlement_seen_at = Some(retrieved_at.to_owned());
     }
     if snapshot_changed {
         tracked.last_trade_change_at = Some(retrieved_at.to_owned());
         tracked.trade_finalization_stable_polls = 0;
+    }
+    if !settlement_available {
+        tracked.trade_finalization_stable_polls = 0;
+        return false;
     }
     let latest_anchor = [
         parse_optional_datetime(tracked.settlement_seen_at.as_deref()),
@@ -1991,6 +2037,7 @@ fn recover_state_from_tape_row(
     state: &mut CollectorState,
     row: &Value,
     recovery_limit: usize,
+    recovered_total: &mut usize,
 ) -> Result<()> {
     let Some(update) = row.get("update").and_then(Value::as_object) else {
         return Ok(());
@@ -2017,12 +2064,11 @@ fn recover_state_from_tape_row(
                     }
                     recovered.len()
                 };
-                let total = state
-                    .recovered_trade_ids
-                    .values()
-                    .map(BTreeSet::len)
-                    .sum::<usize>();
-                if recovered_len > MAX_TRADE_ROWS_PER_SNAPSHOT || total > recovery_limit {
+                *recovered_total = (*recovered_total)
+                    .checked_add(1)
+                    .context("active tape recovered trade row count overflow")?;
+                if recovered_len > MAX_TRADE_ROWS_PER_SNAPSHOT || *recovered_total > recovery_limit
+                {
                     bail!("active tape recovered trade rows exceed bounded recovery limit");
                 }
             }
@@ -2041,7 +2087,11 @@ fn recover_state_from_tape_row(
             tracked.settled = true;
             tracked.trade_complete = true;
             if let Some(condition_id) = condition_id {
-                state.recovered_trade_ids.remove(condition_id);
+                if let Some(recovered) = state.recovered_trade_ids.remove(condition_id) {
+                    *recovered_total = (*recovered_total)
+                        .checked_sub(recovered.len())
+                        .context("active tape recovered trade row count underflow")?;
+                }
             }
         }
     } else if matches!(kind, "market_metadata" | "market_settlement") {
@@ -2137,8 +2187,9 @@ impl ReferenceCollector {
             .max_trade_polls_per_cycle
             .checked_mul(MAX_TRADE_ROWS_PER_SNAPSHOT)
             .context("trade recovery capacity overflow")?;
+        let mut recovered_total = 0;
         let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
-            recover_state_from_tape_row(&mut state, row, recovery_limit)
+            recover_state_from_tape_row(&mut state, row, recovery_limit, &mut recovered_total)
         })?;
         writer.tape_max_bytes = config.tape_max_bytes;
         let recovered_active = writer.sequence > 0;
@@ -2154,6 +2205,7 @@ impl ReferenceCollector {
             cache_release?;
         }
         let state_scoped = retain_requested_market_state(&mut state, &config.market_ids);
+        writer.recovery_pending = !state.recovered_trade_ids.is_empty();
         validate_state_bounds(&state, config.max_markets)?;
         // Rewrite old state once so the obsolete retained-ID map is removed.
         // The active tape remains the crash-recovery source until it is rotated.
@@ -2650,19 +2702,18 @@ impl ReferenceCollector {
                                 tracked.trade_snapshot_ids_sha256 =
                                     Some(snapshot.ids_sha256.clone());
                             }
-                            if settlement_available
-                                && advance_trade_finalization(
-                                    &mut tracked,
-                                    now,
-                                    &retrieved_at,
-                                    snapshot_changed,
-                                    truncated,
-                                    !malformed.is_empty(),
-                                    was_settled,
-                                    self.config.trade_finalization_lag_secs,
-                                    self.config.trade_finalization_stable_polls,
-                                )
-                            {
+                            if advance_trade_finalization(
+                                &mut tracked,
+                                now,
+                                &retrieved_at,
+                                settlement_available,
+                                snapshot_changed,
+                                truncated,
+                                !malformed.is_empty(),
+                                was_settled,
+                                self.config.trade_finalization_lag_secs,
+                                self.config.trade_finalization_stable_polls,
+                            ) {
                                 for update in trade_updates(
                                     &next_state,
                                     market_id,
@@ -2747,6 +2798,7 @@ impl ReferenceCollector {
         let recorded_at = self.now();
         validate_cycle_hour(&target_hour, recorded_at)?;
         validate_state_bounds(&next_state, self.config.max_markets)?;
+        self.writer.recovery_pending = !next_state.recovered_trade_ids.is_empty();
         updates.replay(&mut self.writer, recorded_at)?;
         if missing_target_symbols.is_empty() {
             next_state.context_seed_hour = Some(target_hour);
@@ -4807,6 +4859,7 @@ mod tests {
             now,
             &iso_z(now),
             true,
+            true,
             false,
             false,
             true,
@@ -4817,6 +4870,7 @@ mod tests {
             &mut tracked,
             now,
             &iso_z(now),
+            true,
             false,
             false,
             false,
@@ -4828,6 +4882,7 @@ mod tests {
             &mut tracked,
             now,
             &iso_z(now),
+            true,
             false,
             false,
             false,
@@ -4887,6 +4942,7 @@ mod tests {
             &mut tracked,
             now,
             &iso_z(now),
+            true,
             false,
             false,
             false,
@@ -4898,6 +4954,7 @@ mod tests {
             &mut tracked,
             now,
             &iso_z(now),
+            true,
             false,
             false,
             false,
@@ -4910,12 +4967,41 @@ mod tests {
             now,
             &iso_z(now),
             true,
+            true,
             false,
             false,
             true,
             1_800,
             2,
         ));
+        assert_eq!(tracked.trade_finalization_stable_polls, 0);
+    }
+
+    #[test]
+    fn finalization_tracks_late_trade_change_without_settlement_data() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut tracked = TrackedMarket {
+            settlement_seen_at: Some("2026-07-15T01:00:00Z".to_owned()),
+            last_trade_change_at: Some("2026-07-15T01:00:00Z".to_owned()),
+            settled: true,
+            ..TrackedMarket::default()
+        };
+        assert!(!advance_trade_finalization(
+            &mut tracked,
+            now,
+            &iso_z(now),
+            false,
+            true,
+            false,
+            false,
+            true,
+            0,
+            1,
+        ));
+        assert_eq!(
+            tracked.last_trade_change_at.as_deref(),
+            Some(iso_z(now).as_str())
+        );
         assert_eq!(tracked.trade_finalization_stable_polls, 0);
     }
 
@@ -4944,8 +5030,13 @@ mod tests {
             trade_record_ids_sha256(["trade-a", "trade-b"])
         );
         let row = json!({"update": completion});
+        let trade_row = json!({"update": valid_trade_update(now, now.timestamp())});
         let mut recovered = CollectorState::default();
-        recover_state_from_tape_row(&mut recovered, &row, 0).unwrap();
+        let mut recovered_total = 0;
+        recover_state_from_tape_row(&mut recovered, &trade_row, 1, &mut recovered_total).unwrap();
+        assert_eq!(recovered_total, 1);
+        recover_state_from_tape_row(&mut recovered, &row, 1, &mut recovered_total).unwrap();
+        assert_eq!(recovered_total, 0);
         let tracked = &recovered.markets["market-1"];
         assert!(tracked.settled);
         assert!(tracked.trade_complete);
@@ -4980,6 +5071,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2]["sequence"], 2);
+    }
+
+    #[test]
+    fn deferred_hour_rotation_runs_after_recovery_completes() {
+        let root = TestDir::new();
+        let first_hour = fixed_time("2026-07-15T01:00:00Z");
+        let second_hour = fixed_time("2026-07-15T02:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[json!({"kind": "first"})], first_hour)
+            .unwrap();
+        writer.recovery_pending = true;
+        writer
+            .write_updates(&[json!({"kind": "second"})], second_hour)
+            .unwrap();
+        assert!(rotated_tapes(root.path()).is_empty());
+        assert_eq!(writer.hour.as_deref(), Some(hour_key(first_hour).as_str()));
+
+        writer.recovery_pending = false;
+        writer
+            .write_updates(&[json!({"kind": "third"})], second_hour)
+            .unwrap();
+        assert_eq!(rotated_tapes(root.path()).len(), 1);
+        assert_eq!(writer.sequence, 1);
+    }
+
+    #[test]
+    fn finalizer_refuses_incomplete_recovered_trade_conditions() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer
+                .write_updates(&[valid_trade_update(now, now.timestamp())], now)
+                .unwrap();
+        }
+        let before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let error = finalize_reference_tape_at(root.path(), now + TimeDelta::seconds(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete recovered trade conditions"));
+        assert_eq!(fs::read(root.path().join(ACTIVE_TAPE)).unwrap(), before);
+        assert!(rotated_tapes(root.path()).is_empty());
     }
 
     #[test]
@@ -5927,7 +6061,7 @@ mod tests {
     #[test]
     fn collector_preserves_partial_trade_ids_across_two_restarts() {
         let root = TestDir::new();
-        let trade_recorded_at = utc_now();
+        let trade_recorded_at = utc_now() - chrono::Duration::hours(1);
         let trade_ts = trade_recorded_at.timestamp();
         let trade_update = valid_trade_update(trade_recorded_at, trade_ts);
         let record_id = trade_update["record_id"].as_str().unwrap().to_owned();
@@ -5950,6 +6084,12 @@ mod tests {
 
         let mut collector = ReferenceCollector::new(config.clone()).unwrap();
         assert!(collector.state.recovered_trade_ids["condition-1"].contains(&record_id));
+        let later = trade_recorded_at + chrono::Duration::hours(1);
+        collector
+            .writer
+            .write_updates(&[valid_trade_update(later, trade_ts + 1)], later)
+            .unwrap();
+        assert!(rotated_tapes(root.path()).is_empty());
         collector.writer.close().unwrap();
         drop(collector);
 
