@@ -34,7 +34,6 @@ pub fn build_worker_launch_spec(
         config_path.to_string_lossy().into_owned(),
         "--deployment-id".to_string(),
         record.deployment_id.clone(),
-        "--foreground".to_string(),
         "--control-generation".to_string(),
         CANONICAL_CONTROL_GENERATION.to_string(),
     ];
@@ -462,6 +461,7 @@ mod tests {
             .map(|window| window[1].as_str());
         assert_eq!(deployment_id_arg, Some("pm5d.v2.paper"));
         assert!(spec.args.contains(&"--dry-run".to_string()));
+        assert!(!spec.args.contains(&"--foreground".to_string()));
         assert!(spec.args.windows(2).any(|window| {
             window[0] == "--control-generation"
                 && window[1] == ploy_deployments::CANONICAL_CONTROL_GENERATION
