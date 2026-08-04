@@ -1,0 +1,138 @@
+# Suspended CEX baseline contract. Resolve every REPLACE_WITH_* value before
+# a separately authorized controller may unsuspend this Job.
+#
+# This example is intentionally one non-indexed completion: one symbol, one
+# UTC window, and LOB-only input. The controller must reject any
+# manifest/configuration that disagrees with these identities or enables
+# trades, volume factors, or another modality.
+#
+# The independent controller owns result publication: create the result-ref
+# once and never overwrite it. After completion it must read back the Job UID,
+# image digest, manifest/config hashes, and result identity independently; any
+# placeholder or mismatch is a hard failure.
+#
+# The controller must provision an immutable default.yaml in
+# monday-cex-baseline-config whose manifest path/hash match the declared data
+# identity, and pre-create safe PVC subpaths for the declared data and result
+# identities before unsuspending this Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-cex-baseline
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-cex-baseline
+    app.kubernetes.io/part-of: monday
+    research.monday/plane: cex
+    research.monday/contract: cex-baseline-v1
+  annotations:
+    research.monday/contract-version: cex-baseline-v1
+    research.monday/source-revision: REPLACE_WITH_40_HEX_SOURCE_SHA
+    research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+    research.monday/data-manifest-ref: REPLACE_WITH_DATA_MANIFEST_OBJECT_KEY
+    research.monday/data-manifest-sha256: REPLACE_WITH_64_HEX_DATA_MANIFEST_SHA256
+    research.monday/config-ref: monday-cex-baseline-config/default.yaml
+    research.monday/config-sha256: REPLACE_WITH_64_HEX_CONFIG_SHA256
+    research.monday/result-ref: REPLACE_WITH_IMMUTABLE_RESULT_OBJECT_KEY
+    research.monday/symbol: REPLACE_WITH_ONE_CEX_SYMBOL
+    research.monday/window-start-us: REPLACE_WITH_WINDOW_START_US
+    research.monday/window-end-us: REPLACE_WITH_WINDOW_END_US
+    research.monday/modalities: lob
+    research.monday/output-write: create-once
+    research.monday/controller-readback: required
+    research.monday/credentials: no-production
+spec:
+  suspend: true
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-cex-baseline
+        app.kubernetes.io/part-of: monday
+        research.monday/plane: cex
+        research.monday/contract: cex-baseline-v1
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+        research.monday/node-pool: cex-research
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backtest
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MONDAY_CEX_DATA_MANIFEST_REF
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['research.monday/data-manifest-ref']
+            - name: MONDAY_CEX_RESULT_REF
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['research.monday/result-ref']
+          args:
+            - --config
+            - /work/config/default.yaml
+            - --output-dir
+            - /work/results
+          resources:
+            requests:
+              cpu: "3500m"
+              memory: 8Gi
+            limits:
+              cpu: "3500m"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: config
+              mountPath: /work/config
+              readOnly: true
+            - name: data
+              mountPath: /work/data
+              readOnly: true
+              subPathExpr: $(MONDAY_CEX_DATA_MANIFEST_REF)
+            - name: results
+              mountPath: /work/results
+              subPathExpr: $(MONDAY_CEX_RESULT_REF)
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: monday-cex-baseline-config
+            items:
+              - key: default.yaml
+                path: default.yaml
+        - name: data
+          persistentVolumeClaim:
+            claimName: monday-backtest-cache
+            readOnly: true
+        - name: results
+          persistentVolumeClaim:
+            claimName: monday-backtest-results
+        - name: tmp
+          emptyDir: {}
