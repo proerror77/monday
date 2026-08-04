@@ -46,19 +46,10 @@ pub struct TradeEvent {
     pub price: String, // Price
     #[serde(rename = "q")]
     pub quantity: String, // Quantity
-    #[serde(rename = "b")]
-    #[serde(default)]
-    pub _buyer_order_id: Option<u64>, // Legacy buyer order ID
-    #[serde(rename = "a")]
-    #[serde(default)]
-    pub _seller_order_id: Option<u64>, // Legacy seller order ID
     #[serde(rename = "T")]
     pub trade_time: u64, // Trade time
     #[serde(rename = "m")]
     pub is_buyer_maker: bool, // Is the buyer the market maker?
-    #[serde(rename = "M")]
-    #[serde(default)]
-    pub _ignore: Option<bool>, // Legacy ignore field
 }
 
 /// Binance K線事件

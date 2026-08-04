@@ -6,7 +6,6 @@
 
 pub mod converter;
 pub mod errors;
-pub mod rest_helpers;
 pub mod subscriptions;
 pub mod ws_helpers;
 

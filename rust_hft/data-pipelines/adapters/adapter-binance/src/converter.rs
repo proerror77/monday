@@ -431,11 +431,8 @@ mod tests {
             trade_id: 12345,
             price: "45000.00".to_string(),
             quantity: "0.1".to_string(),
-            _buyer_order_id: Some(111),
-            _seller_order_id: Some(222),
             trade_time: 123456789,
             is_buyer_maker: false,
-            _ignore: Some(false),
         };
 
         let trade_event = MessageConverter::convert_trade_event(trade).unwrap();

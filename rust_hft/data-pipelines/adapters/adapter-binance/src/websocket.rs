@@ -1,8 +1,6 @@
 //! Binance WebSocket 連接管理
 //!
-//! 提供兩種消息接收接口：
-//! - `receive_message()`: 返回 String，向後兼容，易於使用
-//! - `receive_message_bytes()`: 返回 Bytes，零拷貝，高性能
+//! WebSocket frames are exposed with receive metrics for the market-data path.
 
 use adapters_common::ws_helpers::constants;
 use bytes::Bytes;
@@ -172,50 +170,6 @@ impl BinanceWebSocket {
         }
 
         streams
-    }
-
-    /// 接收消息 (String 接口 - 向後兼容)
-    pub async fn receive_message(&mut self) -> HftResult<Option<String>> {
-        match self.client.receive_message().await {
-            Ok(Some((msg, _metrics))) => Ok(Some(msg)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(HftError::Network(format!("接收消息失敗: {}", e))),
-        }
-    }
-
-    /// 接收消息 (Bytes 接口 - 零拷貝高性能)
-    ///
-    /// 此方法返回 `Bytes` 而非 `String`，避免了 String 分配和 UTF-8 驗證開銷。
-    /// 適合需要直接在原始字節上進行 JSON 解析的高性能場景。
-    ///
-    /// # 性能優勢
-    /// - 零數據拷貝：直接返回 WebSocket 幀的底層緩衝區
-    /// - 延遲 UTF-8 驗證：由調用方決定何時進行字符串轉換
-    /// - SIMD JSON 友好：可直接傳遞給 simd-json 進行解析
-    ///
-    /// # 使用示例
-    /// ```ignore
-    /// # use data_adapter_binance::BinanceWebSocket;
-    /// # use hft_core::Symbol;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut ws = BinanceWebSocket::new();
-    /// ws.connect_and_subscribe(vec![Symbol::new("BTCUSDT")]).await?;
-    ///
-    /// while let Some(bytes) = ws.receive_message_bytes().await? {
-    ///     // 直接在原始字節上進行 JSON 解析 (simd-json)
-    ///     // let mut buf = bytes.to_vec();
-    ///     // let value = simd_json::to_borrowed_value(&mut buf)?;
-    ///
-    ///     // 或轉換為 String (如需要)
-    ///     // let text = String::from_utf8(bytes.to_vec())?;
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn receive_message_bytes(&mut self) -> HftResult<Option<Bytes>> {
-        self.receive_message_bytes_with_metrics()
-            .await
-            .map(|message| message.map(|(bytes, _)| bytes))
     }
 
     pub async fn receive_message_bytes_with_metrics(
