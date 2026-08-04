@@ -2,7 +2,7 @@
 # a separately authorized controller may unsuspend this Job.
 #
 # This example is intentionally one non-indexed completion: one symbol, one
-# half-open UTC window, and LOB-only input. The controller must reject any
+# UTC window, and LOB-only input. The controller must reject any
 # manifest/configuration that disagrees with these identities or enables
 # trades, volume factors, or another modality.
 #
@@ -10,6 +10,11 @@
 # once and never overwrite it. After completion it must read back the Job UID,
 # image digest, manifest/config hashes, and result identity independently; any
 # placeholder or mismatch is a hard failure.
+#
+# The controller must provision an immutable default.yaml in
+# monday-cex-baseline-config whose manifest path/hash match the declared data
+# identity, and pre-create safe PVC subpaths for the declared data and result
+# identities before unsuspending this Job.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -26,7 +31,7 @@ metadata:
     research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
     research.monday/data-manifest-ref: REPLACE_WITH_DATA_MANIFEST_OBJECT_KEY
     research.monday/data-manifest-sha256: REPLACE_WITH_64_HEX_DATA_MANIFEST_SHA256
-    research.monday/config-ref: monday-backtest-config/default.yaml
+    research.monday/config-ref: monday-cex-baseline-config/default.yaml
     research.monday/config-sha256: REPLACE_WITH_64_HEX_CONFIG_SHA256
     research.monday/result-ref: REPLACE_WITH_IMMUTABLE_RESULT_OBJECT_KEY
     research.monday/symbol: REPLACE_WITH_ONE_CEX_SYMBOL
@@ -72,10 +77,19 @@ spec:
         - name: backtest
           image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
+          env:
+            - name: MONDAY_CEX_DATA_MANIFEST_REF
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['research.monday/data-manifest-ref']
+            - name: MONDAY_CEX_RESULT_REF
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['research.monday/result-ref']
           args:
             - --config
             - /work/config/default.yaml
-            - --output
+            - --output-dir
             - /work/results
           resources:
             requests:
@@ -100,14 +114,16 @@ spec:
             - name: data
               mountPath: /work/data
               readOnly: true
+              subPathExpr: $(MONDAY_CEX_DATA_MANIFEST_REF)
             - name: results
               mountPath: /work/results
+              subPathExpr: $(MONDAY_CEX_RESULT_REF)
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config
           configMap:
-            name: monday-backtest-config
+            name: monday-cex-baseline-config
             items:
               - key: default.yaml
                 path: default.yaml
