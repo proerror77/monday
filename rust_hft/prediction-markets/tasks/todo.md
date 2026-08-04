@@ -83,7 +83,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
 - [x] Pin a canonical reviewed Linux prediction-policy graph and fail closed when its lockfile or policy path-manifest inputs change; preserve package, checksum, and feature evidence, exclude host/proc-macro runtime dependencies, then pin the v5 identity in both mission templates.
 - [x] Add a resumable Monday prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
-- [x] Implement the complete authoritative prediction LoopRun and tests in `ploy-research` Rust without introducing a Python runner; retire the Binance-to-opening-reference backfill helper.
+- [x] Retire the superseded non-MCTS prediction LoopRun engine, ledger, crash-recovery helpers, and engine-only tests after the governed runner cut over to bounded MCTS.
 - [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.
 - [x] Recover LLM provider, model, and usage provenance from the same content-addressed response envelope after a crash.
 - [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
