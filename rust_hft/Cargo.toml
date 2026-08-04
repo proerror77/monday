@@ -105,7 +105,6 @@ members = [
     # Tools & Utilities
     "tools/collector",
     "tools/dataset",
-    "tools/infer-cli",
     "tools/hyperliquid-demo",
     "tools/ws_test",
     "tools/harnessctl",

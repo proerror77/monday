@@ -5674,19 +5674,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-infer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clickhouse 0.12.2",
- "hft-infer-onnx",
- "ndarray 0.15.6",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hft-infer-onnx"
 version = "0.1.0"
 dependencies = [
