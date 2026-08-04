@@ -86,67 +86,6 @@ fn create_dir_all_durable(path: &Path, context: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove only loop-owned crash leftovers whose filename ends in a parseable
-/// UUID. The output lock must already be held, so no active writer can own one.
-pub(crate) fn cleanup_stale_temporary_files(output_root: &Path) -> Result<usize, String> {
-    fn visit(directory: &Path) -> Result<usize, String> {
-        let mut removed = 0_usize;
-        for entry in fs::read_dir(directory).map_err(|error| {
-            format!(
-                "read temporary-file directory {}: {error}",
-                directory.display()
-            )
-        })? {
-            let entry = entry.map_err(|error| format!("read temporary-file entry: {error}"))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("inspect temporary-file entry: {error}"))?;
-            if file_type.is_symlink() {
-                return Err(format!(
-                    "prediction output contains a symlink: {}",
-                    entry.path().display()
-                ));
-            }
-            if file_type.is_dir() {
-                removed = removed.saturating_add(visit(&entry.path())?);
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let uuid_start = name.len().checked_sub(40);
-            let owned_temporary = name.starts_with(".prediction-loop-tmp-")
-                && name.ends_with(".tmp")
-                && uuid_start.is_some_and(|start| {
-                    start > 0
-                        && name.as_bytes().get(start - 1) == Some(&b'-')
-                        && uuid::Uuid::parse_str(&name[start..name.len() - 4]).is_ok()
-                });
-            if owned_temporary {
-                fs::remove_file(entry.path()).map_err(|error| {
-                    format!(
-                        "remove stale temporary file {}: {error}",
-                        entry.path().display()
-                    )
-                })?;
-                removed = removed.saturating_add(1);
-            }
-        }
-        if removed > 0 {
-            File::open(directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
-                    format!(
-                        "sync temporary-file directory {}: {error}",
-                        directory.display()
-                    )
-                })?;
-        }
-        Ok(removed)
-    }
-
-    visit(output_root)
-}
-
 fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(values) => {
@@ -175,15 +114,6 @@ pub(crate) fn write_content_addressed_json<T: Serialize>(
 ) -> Result<ArtifactRef, String> {
     let body = canonical_json_bytes(value)?;
     write_content_addressed(output_root, directory, prefix, "json", &body)
-}
-
-pub(crate) fn write_content_addressed_text(
-    output_root: &Path,
-    directory: &Path,
-    prefix: &str,
-    body: &str,
-) -> Result<ArtifactRef, String> {
-    write_content_addressed(output_root, directory, prefix, "txt", body.as_bytes())
 }
 
 fn write_content_addressed(
@@ -555,37 +485,6 @@ mod tests {
         };
         assert!(artifact_path(&root, &escaped).is_err());
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cleanup_removes_only_uuid_bound_loop_temporaries() {
-        let root = std::env::temp_dir().join(format!(
-            "ploy-prediction-loop-cleanup-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).expect("create nested output");
-        let stale = nested.join(format!(
-            ".prediction-loop-tmp-evidence-{}-{}.tmp",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let deceptive = nested.join(format!(
-            ".evidence-{}-{}.tmp",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let unrelated = nested.join(".user.tmp");
-        fs::write(&stale, b"complete but unpublished").expect("write stale temp");
-        fs::write(&deceptive, b"not loop-owned").expect("write deceptive temp");
-        fs::write(&unrelated, b"user file").expect("write unrelated temp");
-
-        assert_eq!(cleanup_stale_temporary_files(&root).expect("cleanup"), 1);
-        assert!(!stale.exists());
-        assert!(deceptive.exists());
-        assert!(unrelated.exists());
-        fs::remove_dir_all(root).expect("remove cleanup fixture");
     }
 
     #[cfg(unix)]
