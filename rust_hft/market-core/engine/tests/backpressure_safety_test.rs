@@ -2,7 +2,7 @@
 
 use engine::dataflow::{BackpressurePolicy, IngestionConfig};
 use engine::{create_execution_queues, ExecutionQueueConfig, LifecycleIntentSubmitError};
-use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
+use hft_core::{AccountId, OrderType, Quantity, Side, Symbol, TimeInForce};
 use ports::{
     ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentLifecycle, OrderIntentRejectReason,
 };
@@ -237,11 +237,18 @@ fn test_execution_intent_queue_full_rejects_new_intent() {
         batch_size: 8,
     };
     let (mut engine_queues, mut worker_queues) = create_execution_queues(config);
+    let account_id = AccountId("queue-test".to_string());
 
-    assert!(engine_queues.send_intent(test_intent()).is_ok());
-    assert!(engine_queues.send_intent(test_intent()).is_ok());
-    assert!(engine_queues.send_intent(test_intent()).is_ok());
-    assert!(engine_queues.send_intent(test_intent()).is_err());
+    assert!(engine_queues
+        .send_intent(account_id.clone(), test_intent())
+        .is_ok());
+    assert!(engine_queues
+        .send_intent(account_id.clone(), test_intent())
+        .is_ok());
+    assert!(engine_queues
+        .send_intent(account_id.clone(), test_intent())
+        .is_ok());
+    assert!(engine_queues.send_intent(account_id, test_intent()).is_err());
 
     assert_eq!(engine_queues.stats().intents_sent, 3);
     assert_eq!(engine_queues.stats().intent_queue_full_count, 1);
@@ -331,7 +338,7 @@ async fn intent_submission_wakes_worker_without_polling_delay() {
     tokio::task::yield_now().await;
 
     engine_queues
-        .send_intent(test_intent())
+        .send_intent(AccountId("notify-test".to_string()), test_intent())
         .expect("intent accepted");
     tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
         .await

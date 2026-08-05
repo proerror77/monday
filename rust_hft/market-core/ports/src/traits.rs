@@ -122,6 +122,12 @@ pub trait ExecutionClient: Send + Sync {
         false
     }
 
+    /// Returns true only for Monday's in-process simulated adapter. Simulated Paper/Shadow runs
+    /// do not represent an external account and therefore do not enter real-account admission.
+    fn is_simulated_execution(&self) -> bool {
+        false
+    }
+
     /// Confirms that the engine has applied a generation-tagged synchronization marker and every
     /// earlier execution report to OMS, portfolio, and risk state. Live adapters may keep their
     /// placement gate closed until this acknowledgement arrives.
@@ -206,6 +212,7 @@ pub struct AccountBalance {
     pub usd_value: Option<rust_decimal::Decimal>,
 }
 
+<<<<<<< HEAD
 /// Typed asset-level inventory used for Spot reconciliation. This is deliberately not a
 /// `Position`: the venue's asset identity and available/locked amounts remain intact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +282,52 @@ pub enum AssetInventoryCapability {
     PositionSnapshotRequired,
     AuthoritativeAssetInventory { product_type: ProductType },
     Unsupported,
+}
+
+/// The only executable environments. Paper is deliberately not an account admission state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountExecutionEnvironment {
+    Testnet,
+    Live,
+}
+
+/// Authoritative account status as observed from the venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountReadbackState {
+    Enabled,
+    Restricted,
+    Disabled,
+}
+
+/// Opaque, externally read-back account facts. Identifiers link an audit record without carrying
+/// credential material or raw exchange responses through the execution path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountExternalReadback {
+    pub state: AccountReadbackState,
+    pub balances: Vec<AccountBalance>,
+    pub capability: AccountCapability,
+    pub regional_compliance_attestation_id: String,
+    pub receipt_id: String,
+    pub evidence_digest: String,
+    pub validated_at: Timestamp,
+    pub valid_until: Timestamp,
+}
+
+/// Runtime-owned admission record required before an intent can reach an execution adapter.
+/// `credential_reference` is an opaque secret-manager reference; credential values never belong
+/// in this contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountExecutionAdmission {
+    pub account_id: AccountId,
+    pub venue: VenueId,
+    pub product_type: ProductType,
+    pub environment: AccountExecutionEnvironment,
+    pub credential_reference: String,
+    pub readback: AccountExternalReadback,
+    pub max_order_notional: rust_decimal::Decimal,
+    pub max_open_orders: usize,
+    pub kill_switch_active: bool,
+    pub ready: bool,
 }
 
 /// Account-level fill record used by control-plane inspection and REST catch-up.
@@ -783,6 +836,7 @@ pub trait RiskManager: Send + Sync {
                 intent,
                 lifecycle,
                 client_order_id,
+                account_id,
             } = envelope;
             let reviewed =
                 self.review_with_venue_specs(vec![intent], &projected_account, venue_specs);
@@ -809,6 +863,7 @@ pub trait RiskManager: Send + Sync {
                     intent: approved,
                     lifecycle,
                     client_order_id: client_order_id.clone(),
+                    account_id: account_id.clone(),
                 });
             }
         }
@@ -904,6 +959,7 @@ pub struct OrderUpdate {
 pub struct RegisterOrderParams {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
+    pub account_id: Option<hft_core::AccountId>,
     pub symbol: Symbol,
     pub side: Side,
     pub qty: Quantity,
@@ -916,6 +972,7 @@ pub struct RegisterOrderParams {
 pub struct OrderRecord {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
+    pub account_id: Option<hft_core::AccountId>,
     pub symbol: Symbol,
     pub side: Side,
     pub qty: Quantity,

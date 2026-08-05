@@ -107,6 +107,7 @@ impl ExecutionClient for SimulatedExecutionClient {
         self.send_event(ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
             quantity: intent.quantity,
@@ -244,6 +245,10 @@ impl ExecutionClient for SimulatedExecutionClient {
         Ok(Box::pin(stream))
     }
 
+    fn is_simulated_execution(&self) -> bool {
+        true
+    }
+
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         Ok(self.open_orders.lock().await.values().cloned().collect())
     }
@@ -286,6 +291,13 @@ mod tests {
             strategy_id: "sim-test".to_string(),
             target_venue: Some(VenueId::MOCK),
         }
+    }
+
+    #[test]
+    fn simulated_execution_is_marked_non_external() {
+        let client = SimulatedExecutionClient::new(VenueId::MOCK);
+
+        assert!(client.is_simulated_execution());
     }
 
     #[tokio::test]
