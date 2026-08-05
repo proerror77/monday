@@ -1582,11 +1582,23 @@ impl ExecutionWorker {
                                 Ok(())
                             }
                             Err(e) => {
+                                let outcome_unknown = Self::submission_outcome_may_be_unknown(&e);
+                                if outcome_unknown {
+                                    self.accepting_intents = false;
+                                    self.emergency_latched = true;
+                                    self.reject_queued_intents_for_disabled_intake().await;
+                                }
                                 warn!(
                                     "替換訂單失敗: {} - {} (client={})",
                                     order_id.0, e, client_idx
                                 );
-                                Err(e.to_string())
+                                if outcome_unknown {
+                                    Err(format!(
+                                        "order replacement outcome is unknown; execution intake latched and reconciliation required: {e}"
+                                    ))
+                                } else {
+                                    Err(e.to_string())
+                                }
                             }
                         }
                     }
@@ -2341,6 +2353,7 @@ mod tests {
         healthy: Option<bool>,
         finite_stream: bool,
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
+        modify_error: bool,
     }
 
     struct MockExecutionClient {
@@ -2388,7 +2401,13 @@ mod tests {
             _new_quantity: Option<Quantity>,
             _new_price: Option<Price>,
         ) -> HftResult<()> {
-            Ok(())
+            if self.state.lock().unwrap().modify_error {
+                Err(HftError::Execution(
+                    "amend reconciliation required".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
@@ -2915,6 +2934,80 @@ mod tests {
             )
             .expect_err("emergency replacement")
             .contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_replacement_latches_intake_and_requires_reconciliation() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            modify_error: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state,
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        engine_queues
+            .send_intent(create_test_intent("BTCUSDT"))
+            .expect("queue intent before ambiguous replacement");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let order_id = OrderId("replace-order".to_string());
+        let symbol = Symbol::new("123");
+        worker.order_to_client.insert(order_id.clone(), 0);
+        worker.tracked_orders.insert(
+            order_id.clone(),
+            TrackedOrder {
+                symbol: symbol.clone(),
+                strategy_id: "test".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+                side: Side::Buy,
+                limit_price: Some(Price::from_f64(0.5).unwrap()),
+                remaining_quantity: Quantity::from_f64(10.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
+            },
+        );
+        let (reply, result) = oneshot::channel();
+
+        worker
+            .handle_control_command(ControlCommand::ReplaceOrder {
+                order_id: order_id.clone(),
+                symbol,
+                new_quantity: Some(Quantity::from_f64(8.0).unwrap()),
+                new_price: Some(Price::from_f64(0.4).unwrap()),
+                reply,
+            })
+            .await;
+
+        assert!(result
+            .await
+            .expect("replacement result")
+            .expect_err("ambiguous replacement")
+            .contains("reconciliation required"));
+        assert!(!worker.accepting_intents);
+        assert!(worker.emergency_latched);
+        assert!(worker.queues.receive_envelopes().is_empty());
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [ExecutionEvent::OrderReject { .. }]
+        ));
+        let tracked = worker.tracked_orders.get(&order_id).unwrap();
+        assert_eq!(
+            tracked.remaining_quantity,
+            Quantity::from_f64(10.0).unwrap()
+        );
+        assert_eq!(tracked.limit_price, Some(Price::from_f64(0.5).unwrap()));
     }
 
     #[test]

@@ -23,7 +23,10 @@ use ports::{
 };
 use rust_decimal::Decimal;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 use ws_order::BybitWsOrderClient;
@@ -42,6 +45,7 @@ pub struct BybitExecutionClient {
     http: Option<HttpClient>,
     signer: BybitSigner,
     event_tx: Option<broadcast::Sender<ExecutionEvent>>,
+    private_stream_connected: Option<Arc<AtomicBool>>,
     connected: bool,
     // 韌性執行器 (重試 + 熔斷器)
     resilient_executor: Option<Arc<ResilientExecutor>>,
@@ -274,6 +278,7 @@ impl BybitExecutionClient {
             signer: BybitSigner::new(config.credentials.clone()),
             config,
             event_tx: None,
+            private_stream_connected: None,
             connected: false,
             resilient_executor: None,
             alert_callback: None,
@@ -443,7 +448,8 @@ impl BybitExecutionClient {
     }
 
     fn mutation_event_receiver(&self) -> HftResult<broadcast::Receiver<ExecutionEvent>> {
-        self.event_tx
+        let receiver = self
+            .event_tx
             .as_ref()
             .map(|sender| sender.subscribe())
             .ok_or_else(|| {
@@ -451,7 +457,50 @@ impl BybitExecutionClient {
                     "Bybit private execution stream is not connected for mutation confirmation"
                         .to_string(),
                 )
-            })
+            })?;
+        self.require_mutation_stream_connected()?;
+        Ok(receiver)
+    }
+
+    fn require_mutation_stream_connected(&self) -> HftResult<()> {
+        if self
+            .private_stream_connected
+            .as_ref()
+            .is_some_and(|connected| connected.load(Ordering::Acquire))
+        {
+            Ok(())
+        } else {
+            Err(HftError::Execution(
+                "Bybit private stream disconnected before mutation; request not submitted"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn require_continuous_mutation_stream(
+        &self,
+        events: &mut broadcast::Receiver<ExecutionEvent>,
+    ) -> HftResult<()> {
+        loop {
+            match events.try_recv() {
+                Ok(ExecutionEvent::ConnectionStatus {
+                    connected: false, ..
+                }) => {
+                    return Err(HftError::Execution(
+                        "Bybit private stream disconnected before mutation; request not submitted"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => {
+                    return Err(HftError::Execution(format!(
+                        "Bybit private stream continuity failed before mutation; request not submitted: {error}"
+                    )));
+                }
+            }
+        }
+        self.require_mutation_stream_connected()
     }
 
     async fn wait_for_cancellation(
@@ -506,6 +555,104 @@ impl BybitExecutionClient {
                 self.config.timeout_ms
             ))
         })?
+    }
+
+    async fn wait_for_amend(
+        &self,
+        events: &mut broadcast::Receiver<ExecutionEvent>,
+        order: &OpenOrder,
+    ) -> HftResult<()> {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.timeout_ms),
+            async {
+                loop {
+                    let event = events.recv().await.map_err(|error| {
+                        HftError::Execution(format!(
+                            "Bybit private amend confirmation stream failed: {error}"
+                        ))
+                    })?;
+                    let matches_order = |order_id: &OrderId| {
+                        order_id == &order.order_id
+                            || order.client_order_id.as_deref() == Some(order_id.0.as_str())
+                    };
+                    match event {
+                        ExecutionEvent::OrderAck { order_id, .. }
+                            if matches_order(&order_id) =>
+                        {
+                            return Ok(());
+                        }
+                        ExecutionEvent::OrderReject {
+                            order_id, reason, ..
+                        } if matches_order(&order_id) => {
+                            return Err(HftError::Exchange(format!(
+                                "Bybit amend was rejected for {}: {reason}",
+                                order.order_id.0
+                            )));
+                        }
+                        ExecutionEvent::OrderCanceled { order_id, .. }
+                            if matches_order(&order_id) =>
+                        {
+                            return Err(HftError::Exchange(format!(
+                                "Bybit amend did not leave {} open",
+                                order.order_id.0
+                            )));
+                        }
+                        ExecutionEvent::ConnectionStatus {
+                            connected: false, ..
+                        } => {
+                            return Err(HftError::Execution(
+                                "Bybit private amend confirmation stream disconnected".to_string(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            HftError::Timeout(format!(
+                "Bybit amend confirmation timed out after {}ms; outcome unknown and reconciliation required",
+                self.config.timeout_ms
+            ))
+        })?
+    }
+
+    async fn confirm_order_amended(
+        &self,
+        order: &OpenOrder,
+        new_quantity: Option<Quantity>,
+        new_price: Option<Price>,
+    ) -> HftResult<()> {
+        let confirmed = self
+            .list_open_orders()
+            .await
+            .map_err(|error| {
+                HftError::Execution(format!(
+                    "Bybit amend readback failed; outcome unknown and reconciliation required: {error}"
+                ))
+            })?
+            .into_iter()
+            .find(|candidate| candidate.order_id == order.order_id)
+            .ok_or_else(|| {
+                HftError::Execution(format!(
+                    "Bybit amend receipt has no open order for {}; reconciliation required",
+                    order.order_id.0
+                ))
+            })?;
+        if new_quantity.is_some_and(|quantity| confirmed.original_quantity != quantity) {
+            return Err(HftError::Execution(format!(
+                "Bybit amend receipt has unexpected quantity for {}; reconciliation required",
+                order.order_id.0
+            )));
+        }
+        if new_price.is_some_and(|price| confirmed.price != Some(price)) {
+            return Err(HftError::Execution(format!(
+                "Bybit amend receipt has unexpected price for {}; reconciliation required",
+                order.order_id.0
+            )));
+        }
+        Ok(())
     }
 
     /// 發送執行告警
@@ -648,8 +795,7 @@ fn parse_bybit_open_orders_response(
 }
 
 fn bybit_order_matches(order: &OpenOrder, requested: &OrderId) -> bool {
-    order.order_id == *requested
-        || order.client_order_id.as_deref() == Some(requested.0.as_str())
+    order.order_id == *requested || order.client_order_id.as_deref() == Some(requested.0.as_str())
 }
 
 fn has_private_credentials(credentials: &BybitCredentials) -> bool {
@@ -765,6 +911,7 @@ async fn run_bybit_private_ws(
     url: String,
     credentials: BybitCredentials,
     event_tx: broadcast::Sender<ExecutionEvent>,
+    private_stream_connected: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
     initial: BybitPrivateSocket,
 ) {
@@ -808,6 +955,7 @@ async fn run_bybit_private_ws(
             }
         };
         if disconnected {
+            private_stream_connected.store(false, Ordering::Release);
             let _ = event_tx.send(ExecutionEvent::ConnectionStatus {
                 connected: false,
                 timestamp: hft_core::now_micros(),
@@ -821,6 +969,7 @@ async fn run_bybit_private_ws(
                 Ok(connected) => {
                     ws = connected;
                     backoff = std::time::Duration::from_millis(100);
+                    private_stream_connected.store(true, Ordering::Release);
                     let _ = event_tx.send(ExecutionEvent::ConnectionStatus {
                         connected: true,
                         timestamp: hft_core::now_micros(),
@@ -1011,6 +1160,7 @@ impl ExecutionClient for BybitExecutionClient {
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
             self.require_private_access("cancel_order")?;
+            let mut mutation_events = self.mutation_event_receiver()?;
             let remote_order = self
                 .list_open_orders()
                 .await?
@@ -1022,13 +1172,13 @@ impl ExecutionClient for BybitExecutionClient {
                         order_id.0
                     ))
                 })?;
-            let mut mutation_events = self.mutation_event_receiver()?;
             let body = serde_json::json!({
                 "category": "spot",
                 "symbol": remote_order.symbol.as_str(),
                 "orderId": remote_order.order_id.0.clone(),
             })
             .to_string();
+            self.require_continuous_mutation_stream(&mut mutation_events)?;
             let result = match self
                 .submit_order_mutation(
                     "/v5/order/cancel",
@@ -1084,13 +1234,84 @@ impl ExecutionClient for BybitExecutionClient {
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
+            self.require_private_access("modify_order")?;
+            let mut mutation_events = self.mutation_event_receiver()?;
             if new_quantity.is_none() && new_price.is_none() {
-                return Ok(());
+                return Err(HftError::InvalidOrder(
+                    "Bybit amend requires a new quantity or price".to_string(),
+                ));
             }
-            return Err(HftError::Config(format!(
-                "Bybit live modify is disabled for order {}; asynchronous amend confirmation is not implemented",
-                order_id.0
-            )));
+            let remote_order = self
+                .list_open_orders()
+                .await?
+                .into_iter()
+                .find(|order| bybit_order_matches(order, order_id))
+                .ok_or_else(|| {
+                    HftError::OrderNotFound(format!(
+                        "Bybit venue snapshot has no open order for {}",
+                        order_id.0
+                    ))
+                })?;
+            if remote_order.order_type != hft_core::OrderType::Limit {
+                return Err(HftError::InvalidOrder(format!(
+                    "Bybit amend requires an existing Spot limit order; cancel and submit a reviewed intent for {}",
+                    order_id.0
+                )));
+            }
+            if remote_order.filled_quantity.0 != Decimal::ZERO {
+                return Err(HftError::InvalidOrder(format!(
+                    "Bybit amend requires an unfilled order; cancel and submit a reviewed intent for {}",
+                    order_id.0
+                )));
+            }
+            if new_quantity.is_some_and(|quantity| quantity.0 <= Decimal::ZERO) {
+                return Err(HftError::InvalidOrder(
+                    "Bybit amend quantity must be positive".to_string(),
+                ));
+            }
+            if new_quantity.is_some_and(|quantity| quantity > remote_order.remaining_quantity) {
+                return Err(HftError::Risk(format!(
+                    "Bybit amend cannot increase quantity for {} without a new risk-reviewed intent",
+                    order_id.0
+                )));
+            }
+            if new_price.is_some_and(|price| price.0 <= Decimal::ZERO) {
+                return Err(HftError::InvalidOrder(
+                    "Bybit amend price must be positive".to_string(),
+                ));
+            }
+            let mut request = serde_json::json!({
+                "category": "spot",
+                "symbol": remote_order.symbol.as_str(),
+                "orderId": remote_order.order_id.0.clone(),
+            });
+            if let Some(quantity) = new_quantity {
+                request["qty"] = serde_json::Value::String(quantity.0.to_string());
+            }
+            if let Some(price) = new_price {
+                request["price"] = serde_json::Value::String(price.0.to_string());
+            }
+            self.require_continuous_mutation_stream(&mut mutation_events)?;
+            self.submit_order_mutation(
+                "/v5/order/amend",
+                "order amend",
+                request.to_string(),
+                &remote_order.order_id.0,
+            )
+            .await?;
+            self.wait_for_amend(&mut mutation_events, &remote_order)
+                .await?;
+            self.confirm_order_amended(&remote_order, new_quantity, new_price)
+                .await?;
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(ExecutionEvent::OrderModified {
+                    order_id: order_id.clone(),
+                    new_quantity,
+                    new_price,
+                    timestamp: hft_core::now_micros(),
+                });
+            }
+            return Ok(());
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -1224,11 +1445,14 @@ impl ExecutionClient for BybitExecutionClient {
                 connect_bybit_private_ws(&self.config.ws_private_url, &self.config.credentials)
                     .await?;
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let private_stream_connected = Arc::new(AtomicBool::new(true));
             self.shutdown_tx = Some(shutdown_tx);
+            self.private_stream_connected = Some(Arc::clone(&private_stream_connected));
             tokio::spawn(run_bybit_private_ws(
                 self.config.ws_private_url.clone(),
                 self.config.credentials.clone(),
                 tx.clone(),
+                private_stream_connected,
                 shutdown_rx,
                 ws,
             ));
@@ -1246,6 +1470,7 @@ impl ExecutionClient for BybitExecutionClient {
         }
         self.ws_order = None;
         self.event_tx = None;
+        self.private_stream_connected = None;
         self.connected = false;
         Ok(())
     }
@@ -1295,7 +1520,9 @@ impl ExecutionClient for BybitExecutionClient {
             let next_cursor = response
                 .result
                 .as_ref()
-                .ok_or_else(|| HftError::Parse("Bybit open-orders response missing result".to_string()))?
+                .ok_or_else(|| {
+                    HftError::Parse("Bybit open-orders response missing result".to_string())
+                })?
                 .next_page_cursor
                 .clone()
                 .ok_or_else(|| {
@@ -1320,12 +1547,12 @@ impl ExecutionClient for BybitExecutionClient {
             "Bybit open-order pagination exceeded 100 pages".to_string(),
         ))
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use hft_core::{OrderType, ProductType, Side, Symbol, TimeInForce};
     use integration::signing::BybitCredentials;
     use ports::{ExecutionClient, OrderIntent, OrderIntentLifecycle};
@@ -1404,6 +1631,7 @@ mod tests {
     ) -> broadcast::Sender<ExecutionEvent> {
         let (tx, _) = broadcast::channel(4);
         client.event_tx = Some(tx.clone());
+        client.private_stream_connected = Some(Arc::new(AtomicBool::new(true)));
         tx
     }
 
@@ -1417,8 +1645,24 @@ mod tests {
         quantity: &str,
         price: &str,
     ) -> String {
+        spot_open_orders_response_with_order_type(
+            order_id,
+            client_order_id,
+            quantity,
+            price,
+            "Limit",
+        )
+    }
+
+    fn spot_open_orders_response_with_order_type(
+        order_id: &str,
+        client_order_id: &str,
+        quantity: &str,
+        price: &str,
+        order_type: &str,
+    ) -> String {
         format!(
-            r#"{{"retCode":0,"retMsg":"OK","result":{{"list":[{{"orderId":"{order_id}","orderLinkId":"{client_order_id}","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"{quantity}","cumExecQty":"0","price":"{price}","orderStatus":"New","createdTime":"1","updatedTime":"2"}}],"nextPageCursor":""}}}}"#
+            r#"{{"retCode":0,"retMsg":"OK","result":{{"list":[{{"orderId":"{order_id}","orderLinkId":"{client_order_id}","symbol":"BTCUSDT","side":"Buy","orderType":"{order_type}","qty":"{quantity}","cumExecQty":"0","price":"{price}","orderStatus":"New","createdTime":"1","updatedTime":"2"}}],"nextPageCursor":""}}}}"#
         )
     }
 
@@ -1620,7 +1864,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_spot_intent_is_rejected_before_private_transport() {
-        let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Testnet)).unwrap();
+        let mut client =
+            BybitExecutionClient::new(make_test_config(ExecutionMode::Testnet)).unwrap();
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
             asset_class: hft_core::AssetClass::Crypto,
@@ -1642,8 +1887,7 @@ mod tests {
 
     #[tokio::test]
     async fn order_envelope_preserves_the_venue_link_id() {
-        let mut client =
-            BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
+        let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
         let envelope = OrderIntentEnvelope::new(
             OrderIntent::crypto_spot(
                 Symbol::new("BTCUSDT"),
@@ -1694,8 +1938,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_modify_fails_before_network_io() {
-        let config = make_test_config(ExecutionMode::Live);
+    async fn private_amend_without_credentials_fails_before_network_io() {
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.credentials = BybitCredentials {
+            api_key: String::new(),
+            secret_key: String::new(),
+        };
         let mut client = BybitExecutionClient::new(config).unwrap();
 
         let error = client
@@ -1707,7 +1955,32 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, HftError::Config(message) if message.contains("disabled")));
+        assert!(
+            matches!(error, HftError::Authentication(message) if message.contains("API credentials"))
+        );
+    }
+
+    #[tokio::test]
+    async fn live_amend_without_credentials_fails_before_network_io() {
+        let mut config = make_test_config(ExecutionMode::Live);
+        config.credentials = BybitCredentials {
+            api_key: String::new(),
+            secret_key: String::new(),
+        };
+        let mut client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client
+            .modify_order(
+                &OrderId("exchange-order".to_string()),
+                Some(Quantity::from_f64(0.002).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, HftError::Authentication(message) if message.contains("API credentials"))
+        );
     }
 
     #[tokio::test]
@@ -1822,8 +2095,10 @@ mod tests {
         let _ = missing_server.await.unwrap();
 
         let (cyclic_base_url, cyclic_server) = bybit_rest_server(vec![
-            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#.to_string(),
-            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#
+                .to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#
+                .to_string(),
         ])
         .await;
         let mut cyclic_config = make_test_config(ExecutionMode::Testnet);
@@ -1868,8 +2143,327 @@ mod tests {
             .unwrap_err();
         let requests = server.await.unwrap();
 
-        assert!(matches!(error, HftError::Execution(message) if message.contains("reconciliation required")));
+        assert!(
+            matches!(error, HftError::Execution(message) if message.contains("reconciliation required"))
+        );
         assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn amend_uses_venue_order_id_and_emits_oms_update_after_readback() {
+        let (base_url, mut request_signal, server) = bybit_rest_server_with_request_signal(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1"}}"#.to_string(),
+            spot_open_orders_response_with_values("venue-1", "client-1", "0.5", "90"),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let mut stream = client.execution_stream().await.unwrap();
+        let confirmation = tokio::spawn(async move {
+            loop {
+                match request_signal.recv().await {
+                    Some(1) => break,
+                    Some(_) => {}
+                    None => panic!("amend request was not observed"),
+                }
+            }
+            publish_private_ws_event(
+                &events,
+                &serde_json::json!({
+                    "topic": "order.spot",
+                    "data": [{
+                        "category": "spot",
+                        "orderId": "venue-1",
+                        "orderLinkId": "client-1",
+                        "updatedTime": "2",
+                        "orderStatus": "New"
+                    }]
+                }),
+            );
+        });
+
+        client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                Some(Price::from_f64(90.0).unwrap()),
+            )
+            .await
+            .unwrap();
+        confirmation.await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ExecutionEvent::OrderAck { order_id, .. }
+                if order_id == OrderId("client-1".to_string())
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ExecutionEvent::OrderModified {
+                order_id,
+                new_quantity: Some(quantity),
+                new_price: Some(price),
+                ..
+            } if order_id == OrderId("client-1".to_string())
+                && quantity == Quantity::from_f64(0.5).unwrap()
+                && price == Price::from_f64(90.0).unwrap()
+        ));
+        assert!(requests[0].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
+        assert!(requests[1].starts_with("POST /v5/order/amend"));
+        assert!(requests[1].contains(r#""category":"spot""#));
+        assert!(requests[1].contains(r#""orderId":"venue-1""#));
+        assert!(requests[1].contains(r#""qty":"0.5""#));
+        assert!(requests[1].contains(r#""price":"90""#));
+        assert!(requests[2].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
+    }
+
+    #[tokio::test]
+    async fn amend_readback_failure_requires_reconciliation() {
+        let (base_url, mut request_signal, server) = bybit_rest_server_with_request_signal(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1"}}"#.to_string(),
+            r#"{"retCode":10006,"retMsg":"Too many visits","result":{"list":[],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let confirmation = tokio::spawn(async move {
+            loop {
+                match request_signal.recv().await {
+                    Some(1) => break,
+                    Some(_) => {}
+                    None => panic!("amend request was not observed"),
+                }
+            }
+            publish_private_ws_event(
+                &events,
+                &serde_json::json!({
+                    "topic": "order.spot",
+                    "data": [{
+                        "category": "spot",
+                        "orderId": "venue-1",
+                        "orderLinkId": "client-1",
+                        "updatedTime": "2",
+                        "orderStatus": "New"
+                    }]
+                }),
+            );
+        });
+
+        let error = client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        confirmation.await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HftError::Execution(message) if message.contains("reconciliation required")
+        ));
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn explicit_amend_rejection_is_not_ambiguous() {
+        let (base_url, mut request_signal, server) = bybit_rest_server_with_request_signal(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1"}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let rejection = tokio::spawn(async move {
+            loop {
+                match request_signal.recv().await {
+                    Some(1) => break,
+                    Some(_) => {}
+                    None => panic!("amend request was not observed"),
+                }
+            }
+            publish_private_ws_event(
+                &events,
+                &serde_json::json!({
+                    "topic": "order.spot",
+                    "data": [{
+                        "category": "spot",
+                        "orderId": "venue-1",
+                        "orderLinkId": "client-1",
+                        "updatedTime": "2",
+                        "orderStatus": "Rejected",
+                        "rejectReason": "EC_OrigClOrdIDDoesNotExist"
+                    }]
+                }),
+            );
+        });
+
+        let error = client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        rejection.await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HftError::Exchange(message) if message.contains("EC_OrigClOrdIDDoesNotExist")
+        ));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn amend_confirmation_timeout_requires_reconciliation() {
+        let (base_url, server) = bybit_rest_server(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1"}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        config.timeout_ms = 100;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let _events = attach_mutation_events(&mut client);
+
+        let error = client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HftError::Timeout(message) if message.contains("reconciliation required")
+        ));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disconnected_private_stream_blocks_amend_before_submission() {
+        let (base_url, mut request_signal, server) =
+            bybit_rest_server_with_request_signal(vec![spot_open_orders_response(
+                "venue-1", "client-1",
+            )])
+            .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let private_stream_connected =
+            Arc::clone(client.private_stream_connected.as_ref().unwrap());
+        let disconnect = tokio::spawn(async move {
+            assert_eq!(request_signal.recv().await, Some(0));
+            private_stream_connected.store(false, Ordering::Release);
+            let _ = events.send(ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: hft_core::now_micros(),
+            });
+        });
+
+        let error = client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        disconnect.await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HftError::Execution(message) if message.contains("before mutation")
+        ));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_amend_response_is_not_retried() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":10000,"retMsg":"timeout","result":null}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        client.resilient_executor = Some(Arc::new(ResilientExecutor::new(
+            "bybit-test",
+            RetryConfig {
+                max_retries: 2,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                backoff_multiplier: 1.0,
+                retry_on_init_error: true,
+            },
+            CircuitBreakerConfig::default(),
+        )));
+
+        let error = client
+            .submit_order_mutation(
+                "/v5/order/amend",
+                "order amend",
+                r#"{"category":"spot","symbol":"BTCUSDT","orderId":"venue-1","qty":"0.5"}"#
+                    .to_string(),
+                "venue-1",
+            )
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(
+            matches!(error, HftError::Execution(message) if message.contains("reconciliation required"))
+        );
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quantity_only_amend_rejects_existing_non_limit_spot_order() {
+        let (base_url, server) =
+            bybit_rest_server(vec![spot_open_orders_response_with_order_type(
+                "venue-1", "client-1", "1", "100", "Market",
+            )])
+            .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let _events = attach_mutation_events(&mut client);
+
+        let error = client
+            .modify_order(
+                &OrderId("client-1".to_string()),
+                Some(Quantity::from_f64(0.5).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            error,
+            HftError::InvalidOrder(message) if message.contains("limit order")
+        ));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
     }
 
     #[tokio::test]
@@ -2060,7 +2654,10 @@ mod tests {
             }),
         );
 
-        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
