@@ -89,11 +89,11 @@ grep -Fqx 'RUN cargo fetch --locked' "$source_test_dockerfile"
 grep -Fqx '    CARGO_HOME=/opt/monday-source-test-cargo \' "$source_test_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/local/bin/monday-source-test"]' "$source_test_dockerfile"
 grep -Fqx 'export CARGO_BUILD_JOBS=2' "$source_test_entrypoint"
-test "$(rg -n '^RUN cargo fetch --locked$' "$source_test_dockerfile" | cut -d: -f1)" \
-  -lt "$(rg -n '^ENV CARGO_NET_OFFLINE=true$' "$source_test_dockerfile" | cut -d: -f1)"
+test "$(grep -n '^RUN cargo fetch --locked$' "$source_test_dockerfile" | cut -d: -f1)" \
+  -lt "$(grep -n '^ENV CARGO_NET_OFFLINE=true$' "$source_test_dockerfile" | cut -d: -f1)"
 grep -Fqx 'source/rust_hft/config/secrets.yaml' "$dockerignore"
 grep -Fqx 'source/rust_hft/clickhouse_credentials.txt' "$dockerignore"
-if rg -qi 'credential|secret|api[_-]?key|password|access[_-]?token' "$source_test_dockerfile" "$source_test_entrypoint"; then
+if grep -Eqi 'credential|secret|api[_-]?key|password|access[_-]?token' "$source_test_dockerfile" "$source_test_entrypoint"; then
   printf 'source-test image contract mentions a credential surface\n' >&2
   exit 1
 fi
@@ -139,7 +139,7 @@ grep -Fq 'allowPrivilegeEscalation: false' "$source_test_job"
 grep -Fq 'readOnlyRootFilesystem: true' "$source_test_job"
 grep -Fq 'emptyDir:' "$source_test_job"
 grep -Fq 'research-source-test@sha256:' "$source_test_job"
-if rg -q 'command:|nodeName:|tolerations:|secretKeyRef:|env:|envFrom:|persistentVolumeClaim:|configMap:|hostPath:' "$source_test_job"; then
+if grep -Eq 'command:|nodeName:|tolerations:|secretKeyRef:|env:|envFrom:|persistentVolumeClaim:|configMap:|hostPath:' "$source_test_job"; then
   printf 'source-test Job template widens its execution or storage boundary\n' >&2
   exit 1
 fi
