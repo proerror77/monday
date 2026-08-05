@@ -492,23 +492,12 @@ impl TokenizedSecuritiesRiskManager {
             return Err("tokenized admission requires positive price and quantity");
         }
         let notional = price * intent.quantity.0;
-        let signed_notional = match intent.side {
-            Side::Buy => notional,
-            Side::Sell => -notional,
-        };
-        if matches!(intent.side, Side::Sell)
-            && notional > attestation.account_symbol_notional
-        {
-            return Err("sell exceeds attested symbol exposure");
-        }
         let projected_symbol_notional =
-            attestation.account_symbol_notional + pending_symbol_notional + signed_notional;
+            attestation.account_symbol_notional + pending_symbol_notional + notional;
         let projected_asset_class_notional = attestation.account_asset_class_notional
             + pending_asset_class_notional
-            + signed_notional;
-        if projected_symbol_notional < Decimal::ZERO
-            || projected_symbol_notional > self.config.max_notional_per_symbol
-            || projected_asset_class_notional < Decimal::ZERO
+            + notional;
+        if projected_symbol_notional > self.config.max_notional_per_symbol
             || projected_asset_class_notional > self.config.max_asset_class_notional
         {
             return Err("order exceeds tokenized notional limit");
@@ -527,7 +516,7 @@ impl TokenizedSecuritiesRiskManager {
                 evidence_observed_at: Some(attestation.observed_at),
                 ..Default::default()
             },
-            signed_notional,
+            notional,
             attestation.account_asset_class_notional,
         ))
     }
@@ -1156,6 +1145,30 @@ mod tests {
         assert!(
             review(Some(asset_class_near_limit)).is_empty(),
             "existing asset-class exposure must count toward the cap"
+        );
+
+        let mut sell_near_limit = intent.clone();
+        sell_near_limit.side = Side::Sell;
+        let mut sell_near_limit_attestation = valid_attestation.clone();
+        sell_near_limit_attestation.account_symbol_notional = Decimal::from(950);
+        sell_near_limit_attestation.account_asset_class_notional = Decimal::from(1_950);
+        let sell_near_limit_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                sell_near_limit_attestation,
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
+                .review_with_venue_specs(
+                    vec![sell_near_limit],
+                    &sell_near_limit_account,
+                    &specs,
+                )
+                .is_empty(),
+            "attestation-only admission must not infer covered sells"
         );
 
         let mut inconsistent_asset_class_exposure = valid_attestation.clone();
