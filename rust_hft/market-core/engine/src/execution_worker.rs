@@ -4224,6 +4224,7 @@ mod tests {
                 balances: None,
                 positions: None,
                 recent_fills: None,
+                ..Default::default()
             }],
         });
 
