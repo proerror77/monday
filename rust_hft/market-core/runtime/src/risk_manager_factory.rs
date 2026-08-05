@@ -301,30 +301,56 @@ impl TokenizedSecuritiesRiskManager {
                 .get(&intent.symbol)
                 .copied()
                 .unwrap_or(rust_decimal::Decimal::ZERO);
-            match self.runtime_attestation_context(
-                &intent,
+            if let Some((notional, attested_asset_class_notional)) = self.admit_tokenized_intent(
+                &mut intent,
                 account,
                 pending_symbol_notional,
                 pending_asset_class_notional,
                 account_asset_class_notional,
             ) {
-                Ok((context, notional, attested_asset_class_notional)) => {
-                    // The base RiskManager's stable admission interface still consumes a
-                    // ComplianceContext. Replace every strategy-supplied value only after the
-                    // runtime-owned attestation has been verified.
-                    intent.compliance_context = context;
-                    *pending_symbol_notionals
-                        .entry(intent.symbol.clone())
-                        .or_insert(rust_decimal::Decimal::ZERO) += notional;
-                    pending_asset_class_notional += notional;
-                    account_asset_class_notional = Some(attested_asset_class_notional);
-                    approved.push(intent);
-                }
-                Err(reason) => warn!(symbol = %intent.symbol, %reason, "证券 token 运行时证明不足，拒绝意图"),
+                *pending_symbol_notionals
+                    .entry(intent.symbol.clone())
+                    .or_insert(rust_decimal::Decimal::ZERO) += notional;
+                pending_asset_class_notional += notional;
+                account_asset_class_notional = Some(attested_asset_class_notional);
+                approved.push(intent);
             }
         }
 
         approved
+    }
+
+    fn admit_tokenized_intent(
+        &self,
+        intent: &mut ports::OrderIntent,
+        account: &ports::AccountView,
+        pending_symbol_notional: rust_decimal::Decimal,
+        pending_asset_class_notional: rust_decimal::Decimal,
+        expected_account_asset_class_notional: Option<rust_decimal::Decimal>,
+    ) -> Option<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+        match self.runtime_attestation_context(
+            intent,
+            account,
+            pending_symbol_notional,
+            pending_asset_class_notional,
+            expected_account_asset_class_notional,
+        ) {
+            Ok((context, notional, attested_asset_class_notional)) => {
+                // The base RiskManager's stable admission interface still consumes a
+                // ComplianceContext. Replace every strategy-supplied value only after the
+                // runtime-owned attestation has been verified.
+                intent.compliance_context = context;
+                Some((notional, attested_asset_class_notional))
+            }
+            Err(reason) => {
+                warn!(
+                    symbol = %intent.symbol,
+                    %reason,
+                    "证券 token 运行时证明不足，拒绝意图"
+                );
+                None
+            }
+        }
     }
 
     fn runtime_attestation_context(
@@ -439,7 +465,9 @@ impl TokenizedSecuritiesRiskManager {
         if attestation.top_depth_usd < self.config.min_top_depth_usd {
             return Err("top-of-book depth is insufficient");
         }
-        if attestation.spread_bps > self.config.max_spread_bps {
+        if attestation.spread_bps < Decimal::ZERO
+            || attestation.spread_bps > self.config.max_spread_bps
+        {
             return Err("spread is too wide");
         }
         if attestation.account_symbol_notional < Decimal::ZERO
@@ -447,24 +475,41 @@ impl TokenizedSecuritiesRiskManager {
         {
             return Err("reconciled tokenized exposure is invalid");
         }
+        if attestation.account_asset_class_notional < attestation.account_symbol_notional {
+            return Err("tokenized asset-class exposure is inconsistent");
+        }
         if let Some(expected) = expected_account_asset_class_notional {
             if attestation.account_asset_class_notional != expected {
                 return Err("tokenized asset-class exposure is inconsistent");
             }
         }
 
-        let notional = intent
+        let price = intent
             .price
             .ok_or("tokenized admission requires a priced order")?
-            .0
-            * intent.quantity.0;
-        if notional <= Decimal::ZERO
-            || attestation.account_symbol_notional + pending_symbol_notional + notional
-                > self.config.max_notional_per_symbol
-            || attestation.account_asset_class_notional
-                + pending_asset_class_notional
-                + notional
-                > self.config.max_asset_class_notional
+            .0;
+        if price <= Decimal::ZERO || intent.quantity.0 <= Decimal::ZERO {
+            return Err("tokenized admission requires positive price and quantity");
+        }
+        let notional = price * intent.quantity.0;
+        let signed_notional = match intent.side {
+            Side::Buy => notional,
+            Side::Sell => -notional,
+        };
+        if matches!(intent.side, Side::Sell)
+            && notional > attestation.account_symbol_notional
+        {
+            return Err("sell exceeds attested symbol exposure");
+        }
+        let projected_symbol_notional =
+            attestation.account_symbol_notional + pending_symbol_notional + signed_notional;
+        let projected_asset_class_notional = attestation.account_asset_class_notional
+            + pending_asset_class_notional
+            + signed_notional;
+        if projected_symbol_notional < Decimal::ZERO
+            || projected_symbol_notional > self.config.max_notional_per_symbol
+            || projected_asset_class_notional < Decimal::ZERO
+            || projected_asset_class_notional > self.config.max_asset_class_notional
         {
             return Err("order exceeds tokenized notional limit");
         }
@@ -482,7 +527,7 @@ impl TokenizedSecuritiesRiskManager {
                 evidence_observed_at: Some(attestation.observed_at),
                 ..Default::default()
             },
-            notional,
+            signed_notional,
             attestation.account_asset_class_notional,
         ))
     }
@@ -519,6 +564,47 @@ impl RiskManager for TokenizedSecuritiesRiskManager {
         let filtered = self.filter(intents, account);
         self.base_risk_manager
             .review_with_venue_specs(filtered, account, venue_specs)
+    }
+
+    fn review_envelopes_with_venue_specs(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        account: &ports::AccountView,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let mut filtered = Vec::with_capacity(envelopes.len());
+        let mut pending_symbol_notionals = HashMap::new();
+        let mut pending_asset_class_notional = rust_decimal::Decimal::ZERO;
+        let mut account_asset_class_notional = None;
+
+        for mut envelope in envelopes {
+            if !Self::is_tokenized(&envelope.intent) {
+                filtered.push(envelope);
+                continue;
+            }
+
+            let pending_symbol_notional = pending_symbol_notionals
+                .get(&envelope.intent.symbol)
+                .copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            if let Some((notional, attested_asset_class_notional)) = self.admit_tokenized_intent(
+                &mut envelope.intent,
+                account,
+                pending_symbol_notional,
+                pending_asset_class_notional,
+                account_asset_class_notional,
+            ) {
+                *pending_symbol_notionals
+                    .entry(envelope.intent.symbol.clone())
+                    .or_insert(rust_decimal::Decimal::ZERO) += notional;
+                pending_asset_class_notional += notional;
+                account_asset_class_notional = Some(attested_asset_class_notional);
+                filtered.push(envelope);
+            }
+        }
+
+        self.base_risk_manager
+            .review_envelopes_with_venue_specs(filtered, account, venue_specs)
     }
 
     fn on_execution_event(&mut self, event: &ports::ExecutionEvent) {
@@ -896,17 +982,20 @@ mod tests {
             top_depth_usd: Decimal::from(20_000),
             spread_bps: Decimal::from(5),
         };
-        let review = |attestation: Option<ports::TokenizedSecuritiesRuntimeAttestation>| {
-            let account = ports::AccountView {
-                account_id: Some(account_id.clone()),
-                tokenized_securities_attestations: attestation
-                    .map(|attestation| HashMap::from([(attestation_key.clone(), attestation)]))
-                    .unwrap_or_default(),
-                ..Default::default()
+        let review_with_config =
+            |config: &SystemRiskConfig,
+             attestation: Option<ports::TokenizedSecuritiesRuntimeAttestation>| {
+                let account = ports::AccountView {
+                    account_id: Some(account_id.clone()),
+                    tokenized_securities_attestations: attestation
+                        .map(|attestation| HashMap::from([(attestation_key.clone(), attestation)]))
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                let mut manager = RiskManagerFactory::create_strategy_aware_risk_manager(config);
+                manager.review_with_venue_specs(vec![intent.clone()], &account, &specs)
             };
-            let mut manager = RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config);
-            manager.review_with_venue_specs(vec![intent.clone()], &account, &specs)
-        };
+        let review = |attestation| review_with_config(&risk_config, attestation);
 
         let approved = review(Some(valid_attestation.clone()));
         assert_eq!(approved.len(), 1);
@@ -972,7 +1061,9 @@ mod tests {
 
         let mut padded_allowed_jurisdiction = valid_attestation.clone();
         padded_allowed_jurisdiction.jurisdiction = Some(" AE ".to_string());
-        padded_allowed_jurisdiction.account_capability.jurisdiction = Some(" AE ".to_string());
+        padded_allowed_jurisdiction
+            .account_capability
+            .jurisdiction = Some(" AE ".to_string());
         let padded_allowed = review(Some(padded_allowed_jurisdiction));
         assert_eq!(padded_allowed.len(), 1);
         assert_eq!(
@@ -1013,6 +1104,10 @@ mod tests {
         let mut wide_spread = valid_attestation.clone();
         wide_spread.spread_bps = Decimal::from(11);
         assert!(review(Some(wide_spread)).is_empty(), "wide spread");
+
+        let mut negative_spread = valid_attestation.clone();
+        negative_spread.spread_bps = Decimal::from(-1);
+        assert!(review(Some(negative_spread)).is_empty(), "negative spread");
 
         let mut negative_symbol_exposure = valid_attestation.clone();
         negative_symbol_exposure.account_symbol_notional = Decimal::from(-1);
@@ -1063,6 +1158,13 @@ mod tests {
             "existing asset-class exposure must count toward the cap"
         );
 
+        let mut inconsistent_asset_class_exposure = valid_attestation.clone();
+        inconsistent_asset_class_exposure.account_symbol_notional = Decimal::from(900);
+        assert!(
+            review(Some(inconsistent_asset_class_exposure)).is_empty(),
+            "asset-class exposure cannot be below one symbol exposure"
+        );
+
         let mut batched_intent = intent.clone();
         batched_intent.quantity = Quantity(Decimal::from(6));
         let batched_account = ports::AccountView {
@@ -1083,6 +1185,29 @@ mod tests {
                 .len(),
             1,
             "cumulative batch notional must not exceed the symbol cap"
+        );
+
+        let mut batched_envelope_intent = intent.clone();
+        batched_envelope_intent.quantity = Quantity(Decimal::from(6));
+        assert_eq!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
+                .review_envelopes_with_venue_specs(
+                    vec![
+                        ports::OrderIntentEnvelope::new(
+                            batched_envelope_intent.clone(),
+                            ports::OrderIntentLifecycle::new(now, u64::MAX),
+                        ),
+                        ports::OrderIntentEnvelope::new(
+                            batched_envelope_intent,
+                            ports::OrderIntentLifecycle::new(now, u64::MAX),
+                        ),
+                    ],
+                    &batched_account,
+                    &specs,
+                )
+                .len(),
+            1,
+            "envelope admission must retain the tokenized batch cap"
         );
 
         let mut second_intent = intent.clone();
@@ -1144,21 +1269,11 @@ mod tests {
             },
             ..risk_config.clone()
         };
-        let no_corporate_action_freeze_account = ports::AccountView {
-            account_id: Some(account_id.clone()),
-            tokenized_securities_attestations: HashMap::from([(
-                attestation_key.clone(),
-                valid_attestation.clone(),
-            )]),
-            ..Default::default()
-        };
         assert!(
-            RiskManagerFactory::create_strategy_aware_risk_manager(&no_corporate_action_freeze)
-                .review_with_venue_specs(
-                    vec![intent.clone()],
-                    &no_corporate_action_freeze_account,
-                    &specs,
-                )
+            review_with_config(
+                &no_corporate_action_freeze,
+                Some(valid_attestation.clone()),
+            )
                 .is_empty(),
             "corporate-action freeze must be configured"
         );
@@ -1170,21 +1285,8 @@ mod tests {
             },
             ..risk_config.clone()
         };
-        let unconfigured_limit_account = ports::AccountView {
-            account_id: Some(account_id.clone()),
-            tokenized_securities_attestations: HashMap::from([(
-                attestation_key.clone(),
-                valid_attestation.clone(),
-            )]),
-            ..Default::default()
-        };
         assert!(
-            RiskManagerFactory::create_strategy_aware_risk_manager(&unconfigured_limit)
-                .review_with_venue_specs(
-                    vec![intent.clone()],
-                    &unconfigured_limit_account,
-                    &specs,
-                )
+            review_with_config(&unconfigured_limit, Some(valid_attestation.clone()))
                 .is_empty(),
             "all tokenized limits must be configured"
         );
@@ -1196,21 +1298,8 @@ mod tests {
             },
             ..risk_config.clone()
         };
-        let unconfigured_evidence_age_account = ports::AccountView {
-            account_id: Some(account_id.clone()),
-            tokenized_securities_attestations: HashMap::from([(
-                attestation_key.clone(),
-                valid_attestation.clone(),
-            )]),
-            ..Default::default()
-        };
         assert!(
-            RiskManagerFactory::create_strategy_aware_risk_manager(&unconfigured_evidence_age)
-                .review_with_venue_specs(
-                    vec![intent.clone()],
-                    &unconfigured_evidence_age_account,
-                    &specs,
-                )
+            review_with_config(&unconfigured_evidence_age, Some(valid_attestation.clone()))
                 .is_empty(),
             "attestation freshness limit must be configured"
         );
@@ -1221,21 +1310,8 @@ mod tests {
         };
         let mut stale_with_fresh_market_data = valid_attestation.clone();
         stale_with_fresh_market_data.observed_at = now.saturating_sub(60_000_001);
-        let stale_with_fresh_market_data_account = ports::AccountView {
-            account_id: Some(account_id.clone()),
-            tokenized_securities_attestations: HashMap::from([(
-                attestation_key.clone(),
-                stale_with_fresh_market_data,
-            )]),
-            ..Default::default()
-        };
         assert!(
-            RiskManagerFactory::create_strategy_aware_risk_manager(&independent_evidence_age)
-                .review_with_venue_specs(
-                    vec![intent.clone()],
-                    &stale_with_fresh_market_data_account,
-                    &specs,
-                )
+            review_with_config(&independent_evidence_age, Some(stale_with_fresh_market_data))
                 .is_empty(),
             "market-data staleness must not extend attestation freshness"
         );
@@ -1247,20 +1323,14 @@ mod tests {
             },
             ..risk_config.clone()
         };
-        let disabled_account = ports::AccountView {
-            account_id: Some(account_id),
-            tokenized_securities_attestations: HashMap::from([(
-                attestation_key,
-                ports::TokenizedSecuritiesRuntimeAttestation {
+        assert!(
+            review_with_config(
+                &disabled_config,
+                Some(ports::TokenizedSecuritiesRuntimeAttestation {
                     observed_at: hft_core::now_micros(),
                     ..valid_attestation
-                },
-            )]),
-            ..Default::default()
-        };
-        assert!(
-            RiskManagerFactory::create_strategy_aware_risk_manager(&disabled_config)
-                .review_with_venue_specs(vec![intent], &disabled_account, &specs)
+                }),
+            )
                 .is_empty(),
             "allow_trading remains a fail-closed gate"
         );
