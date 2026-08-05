@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.91-bookworm AS source-test
+FROM rust:1.91-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS source-test
 
 ARG SOURCE_REVISION
 WORKDIR /work
@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --create-home --uid 1000 --gid 1000 research
 
 COPY --chown=research:research source/rust_hft/ /work/
-RUN cargo fetch --locked
+RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"
 
 ENV CARGO_NET_OFFLINE=true
 

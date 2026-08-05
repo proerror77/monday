@@ -326,7 +326,7 @@ artifacts between image builds. ACK Jobs never run `cargo build` or `cargo run`.
 
 `k8s/source-test-job.example.yaml` is the separate, non-production exception
 for source validation. It uses only a digest-pinned `research-source-test`
-image built from an exact source SHA by the trusted `main` ACR workflow. Its
+image built from the current exact `main` SHA by the trusted ACR workflow. Its
 entrypoint accepts only `binance-bstocks-attestation` and `bybit-spot`, each
 running a fixed `cargo test --offline --locked` command. It has no mounted
 Secret, ConfigMap, PVC, data input, or exchange credential; it cannot invoke
@@ -336,7 +336,7 @@ proves neither application runtime nor Testnet/Live authority. It is independent
 of the suspended `monday-spot-cex-baseline-689`, which remains frozen pending
 separate governance reconciliation by its owner.
 
-The publisher accepts one exact SHA tag, refuses to overwrite that tag, and
+The publisher accepts only the current `main` SHA, refuses to overwrite that tag, and
 records the immutable digest used by a Job; it creates neither a service nor a
 persistent build cache. The Job TTL cleans up its Pod and Job after the receipt.
 Registry retention or removal remains an ACR-owner action after that receipt.

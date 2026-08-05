@@ -76,6 +76,10 @@ case "$event" in
         printf 'source-test publication requires an exact 40-hex source SHA\n' >&2
         exit 1
       }
+      [[ $source_test_sha == "$current_sha" ]] || {
+        printf 'source-test publication requires the current trusted main SHA\n' >&2
+        exit 1
+      }
       research_mode=none
       source_sha=$source_test_sha
     else

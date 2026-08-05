@@ -71,28 +71,34 @@ test "$(grep -Fc 'persist-credentials: false' <<<"$source_test_block")" -eq 2
 grep -Fq 'rm -rf -- source/.git' <<<"$source_test_block"
 grep -Fq 'context: .' <<<"$source_test_block"
 grep -Fq 'file: rust_hft/deployment/docker/Dockerfile.source-test' <<<"$source_test_block"
-grep -Fq 'research-source-test@${{ steps.build.outputs.digest }}' <<<"$source_test_block"
+grep -Fq 'load: true' <<<"$source_test_block"
+grep -Fq 'push: false' <<<"$source_test_block"
+grep -Fq 'provenance: false' <<<"$source_test_block"
+grep -Fq 'research-source-test@${{ steps.push.outputs.digest }}' <<<"$source_test_block"
 grep -Fq 'docker run --rm --network none --read-only' <<<"$source_test_block"
 grep -Fq -- '--tmpfs /tmp:rw,nosuid,nodev,size=16g' <<<"$source_test_block"
-grep -Fq 'provenance: mode=max' <<<"$source_test_block"
 grep -Fq 'com.monday.image.retention=single-ack-test' <<<"$source_test_block"
 grep -Fq 'Refuse source-test tag overwrite' <<<"$source_test_block"
-grep -Fq 'docker manifest inspect "$IMAGE_TAG"' <<<"$source_test_block"
+grep -Fq 'if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then' <<<"$source_test_block"
+grep -Fq '*"manifest unknown"*|*"no such manifest"*) ;;' <<<"$source_test_block"
+grep -Fq 'docker buildx imagetools inspect "$IMAGE_TAG" --format' <<<"$source_test_block"
+test "$(grep -n '^      - name: Verify source-test image before publication$' "$workflow" | cut -d: -f1)" \
+  -lt "$(grep -n '^      - name: Push verified source-test image$' "$workflow" | cut -d: -f1)"
 if grep -Fq 'research-source-test:run-' <<<"$source_test_block" || grep -Fq 'cache-to: type=gha,mode=max,scope=acr-research-source-test' <<<"$source_test_block"; then
   printf 'source-test image contract retains a mutable tag or persistent build cache\n' >&2
   exit 1
 fi
 
-grep -Fqx 'FROM rust:1.91-bookworm AS source-test' "$source_test_dockerfile"
+grep -Fqx 'FROM rust:1.91-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS source-test' "$source_test_dockerfile"
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx 'COPY --chown=research:research source/rust_hft/ /work/' "$source_test_dockerfile"
-grep -Fqx 'RUN cargo fetch --locked' "$source_test_dockerfile"
+grep -Fqx 'RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile"
 grep -Fqx 'USER 1000:1000' "$source_test_dockerfile"
 grep -Fqx '    CARGO_HOME=/opt/monday-source-test-cargo \' "$source_test_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/local/bin/monday-source-test"]' "$source_test_dockerfile"
 grep -Fqx 'export CARGO_BUILD_JOBS=2' "$source_test_entrypoint"
-test "$(grep -n '^RUN cargo fetch --locked$' "$source_test_dockerfile" | cut -d: -f1)" \
+test "$(grep -n -F 'RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile" | cut -d: -f1)" \
   -lt "$(grep -n '^ENV CARGO_NET_OFFLINE=true$' "$source_test_dockerfile" | cut -d: -f1)"
 grep -Fqx 'source/rust_hft/config/secrets.yaml' "$dockerignore"
 grep -Fqx 'source/rust_hft/clickhouse_credentials.txt' "$dockerignore"
@@ -103,7 +109,14 @@ fi
 
 mkdir -p "$source_test_tmp_dir/bin"
 mkdir -p "$source_test_tmp_dir/cargo-home"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$*"' >"$source_test_tmp_dir/bin/cargo"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'if [[ "$*" == *" -- --list" ]]; then' \
+  '  if [[ "${SOURCE_TEST_EMPTY_LIST:-}" == true ]]; then exit 0; fi' \
+  '  printf "%s\\n" "approved::test: test"' \
+  'else' \
+  '  printf "%s\\n" "$*"' \
+  'fi' >"$source_test_tmp_dir/bin/cargo"
 chmod 0755 "$source_test_tmp_dir/bin/cargo"
 CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
   PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" binance-bstocks-attestation \
@@ -115,6 +128,11 @@ CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_d
   >"$source_test_tmp_dir/bybit-source-test.out"
 diff -u <(printf '%s\n' 'test --offline --locked -p hft-execution-adapter-bybit --lib') \
   "$source_test_tmp_dir/bybit-source-test.out"
+if SOURCE_TEST_EMPTY_LIST=true CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
+  PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" binance-bstocks-attestation >/dev/null 2>&1; then
+  printf 'source-test entrypoint accepted a profile with no matching tests\n' >&2
+  exit 1
+fi
 if CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
   PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" arbitrary-profile >/dev/null 2>&1; then
   printf 'source-test entrypoint accepted an unapproved profile\n' >&2
