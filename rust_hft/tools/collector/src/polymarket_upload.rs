@@ -4448,8 +4448,8 @@ mod tests {
                     .to_str()
                     .unwrap()
                     .to_owned();
-                remote.entry(name).or_insert(fs::read(&args[2])?);
                 operations.push(format!("upload:{name}"));
+                remote.entry(name).or_insert(fs::read(&args[2])?);
                 uploads += 1;
             }
             Ok(success_status())
