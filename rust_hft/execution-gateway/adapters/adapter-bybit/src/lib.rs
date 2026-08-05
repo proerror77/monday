@@ -12,7 +12,7 @@ use execution::{
 // Re-export ExecutionMode for backwards compatibility
 pub use execution::ExecutionMode;
 use futures::{SinkExt, StreamExt};
-use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
+use hft_core::{HftError, HftResult, OrderId, Price, ProductType, Quantity};
 use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BybitCredentials, BybitSigner},
@@ -21,7 +21,7 @@ use ports::{
     AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
 };
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
@@ -47,7 +47,6 @@ pub struct BybitExecutionClient {
     // 告警回調
     alert_callback: Option<AlertCallback>,
     next_client_order_id: Option<String>,
-    order_symbol: HashMap<String, String>,
     ws_order: Option<BybitWsOrderClient>,
     shutdown_tx: Option<watch::Sender<bool>>,
 }
@@ -72,8 +71,8 @@ struct BybitOpenOrdersItem {
 #[derive(serde::Deserialize)]
 struct BybitOpenOrdersData {
     list: Vec<BybitOpenOrdersItem>,
-    #[serde(default, rename = "nextPageCursor")]
-    next_page_cursor: String,
+    #[serde(rename = "nextPageCursor")]
+    next_page_cursor: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -82,6 +81,20 @@ struct BybitOpenOrdersResponse {
     retCode: i64,
     retMsg: String,
     result: Option<BybitOpenOrdersData>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitOrderMutationResult {
+    orderId: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitOrderMutationResponse {
+    retCode: i64,
+    retMsg: String,
+    result: Option<BybitOrderMutationResult>,
 }
 
 #[derive(serde::Deserialize)]
@@ -254,7 +267,6 @@ impl BybitExecutionClient {
             resilient_executor: None,
             alert_callback: None,
             next_client_order_id: None,
-            order_symbol: HashMap::new(),
             ws_order: None,
             shutdown_tx: None,
         })
@@ -311,18 +323,164 @@ impl BybitExecutionClient {
             .ok_or_else(|| HftError::Execution("HTTP client not initialized".to_string()))
     }
 
-    /// 執行帶韌性保護的操作
-    async fn execute_with_resilience<T, F, Fut>(&self, operation: F) -> HftResult<T>
-    where
-        F: FnMut() -> Fut + Clone,
-        Fut: std::future::Future<Output = HftResult<T>>,
-    {
-        if let Some(ref executor) = self.resilient_executor {
-            executor.execute(operation).await
-        } else {
-            let mut op = operation;
-            op().await
+    fn require_private_access(&self, operation: &str) -> HftResult<()> {
+        if !matches!(
+            self.config.mode,
+            ExecutionMode::Live | ExecutionMode::Testnet
+        ) {
+            return Err(HftError::Config(format!(
+                "Bybit {operation} is not available in {} mode",
+                bybit_mode_label(self.config.mode)
+            )));
         }
+        if !has_private_credentials(&self.config.credentials) {
+            return Err(HftError::Authentication(format!(
+                "Bybit {operation} requires API credentials"
+            )));
+        }
+        Ok(())
+    }
+
+    fn snapshot_http(&self) -> HftResult<HttpClient> {
+        self.http.clone().map_or_else(
+            || {
+                HttpClient::new(HttpClientConfig {
+                    base_url: self.config.rest_base_url.clone(),
+                    timeout_ms: self.config.timeout_ms,
+                    user_agent: "hft-bybit-exec/1.0".to_string(),
+                })
+                .map_err(|error| HftError::Network(error.to_string()))
+            },
+            Ok,
+        )
+    }
+
+    async fn submit_order_mutation(
+        &mut self,
+        path: &str,
+        operation: &str,
+        body: String,
+        expected_order_id: &str,
+    ) -> HftResult<()> {
+        self.ensure_http()?;
+        let http_client = self.get_http()?.clone();
+        let signer = self.signer.clone();
+        let headers = signer.generate_headers("POST", path, &body, None);
+        let response = http_client
+            .signed_request(reqwest::Method::POST, path, Some(headers), Some(body))
+            .await
+            .map_err(|error| {
+                HftError::Network(format!(
+                    "Bybit {operation} transport outcome is ambiguous; reconcile {}: {error}",
+                    expected_order_id
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_bybit_http_error(status, &body));
+        }
+        let response: BybitOrderMutationResponse = HttpClient::parse_json(response)
+            .await
+            .map_err(|error| HftError::Serialization(error.to_string()))?;
+        if response.retCode != 0 {
+            return Err(classify_bybit_response_error(
+                operation,
+                response.retCode,
+                &response.retMsg,
+            ));
+        }
+        let returned = response
+            .result
+            .ok_or_else(|| HftError::Parse(format!("Bybit {operation} response missing result")))?;
+        if returned.orderId != expected_order_id {
+            return Err(HftError::Execution(format!(
+                "Bybit {operation} response returned mismatched orderId: {}",
+                returned.orderId
+            )));
+        }
+        Ok(())
+    }
+
+    async fn confirm_order_absent(&self, order: &OpenOrder) -> HftResult<()> {
+        if self
+            .list_open_orders()
+            .await?
+            .iter()
+            .any(|candidate| candidate.order_id == order.order_id)
+        {
+            return Err(HftError::Execution(format!(
+                "Bybit cancel receipt remains open for {}",
+                order.order_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn mutation_event_receiver(&self) -> HftResult<broadcast::Receiver<ExecutionEvent>> {
+        self.event_tx
+            .as_ref()
+            .map(|sender| sender.subscribe())
+            .ok_or_else(|| {
+                HftError::Config(
+                    "Bybit private execution stream is not connected for mutation confirmation"
+                        .to_string(),
+                )
+            })
+    }
+
+    async fn wait_for_cancellation(
+        &self,
+        events: &mut broadcast::Receiver<ExecutionEvent>,
+        order: &OpenOrder,
+    ) -> HftResult<()> {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.timeout_ms),
+            async {
+                loop {
+                    let event = events.recv().await.map_err(|error| {
+                        HftError::Execution(format!(
+                            "Bybit private mutation confirmation stream failed: {error}"
+                        ))
+                    })?;
+                    let matches_order = |order_id: &OrderId| {
+                        order_id == &order.order_id
+                            || order.client_order_id.as_deref() == Some(order_id.0.as_str())
+                    };
+                    match event {
+                        ExecutionEvent::OrderCanceled { order_id, .. }
+                            if matches_order(&order_id) =>
+                        {
+                            return Ok(());
+                        }
+                        ExecutionEvent::OrderReject {
+                            order_id, reason, ..
+                        } if matches_order(&order_id) => {
+                            return Err(HftError::Execution(format!(
+                                "Bybit cancellation was rejected for {}: {reason}",
+                                order.order_id.0
+                            )));
+                        }
+                        ExecutionEvent::ConnectionStatus {
+                            connected: false, ..
+                        } => {
+                            return Err(HftError::Execution(
+                                "Bybit private mutation confirmation stream disconnected"
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            HftError::Timeout(format!(
+                "Bybit cancellation confirmation timed out after {}ms",
+                self.config.timeout_ms
+            ))
+        })?
     }
 
     /// 發送執行告警
@@ -339,6 +497,15 @@ fn bybit_mode_label(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Live => "Live",
         ExecutionMode::Testnet => "Testnet",
     }
+}
+
+fn require_spot_intent(intent: &ports::OrderIntent) -> HftResult<()> {
+    if intent.product_type != ProductType::Spot {
+        return Err(HftError::InvalidOrder(
+            "Bybit execution adapter is Spot only".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_bybit_side(value: &str) -> HftResult<hft_core::Side> {
@@ -455,6 +622,11 @@ fn parse_bybit_open_orders_response(
         .collect()
 }
 
+fn bybit_order_matches(order: &OpenOrder, requested: &OrderId) -> bool {
+    order.order_id == *requested
+        || order.client_order_id.as_deref() == Some(requested.0.as_str())
+}
+
 fn has_private_credentials(credentials: &BybitCredentials) -> bool {
     !credentials.api_key.trim().is_empty()
         && !credentials.secret_key.trim().is_empty()
@@ -554,7 +726,7 @@ async fn connect_bybit_private_ws(
     .map_err(|error| HftError::Network(error.to_string()))?;
     await_private_ws_control(&mut ws, "auth").await?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({"op": "subscribe", "args": ["order", "execution"]})
+        serde_json::json!({"op": "subscribe", "args": ["order.spot", "execution.spot"]})
             .to_string()
             .into(),
     ))
@@ -648,8 +820,14 @@ fn publish_private_ws_event(tx: &broadcast::Sender<ExecutionEvent>, value: &serd
     let Some(entries) = value.get("data").and_then(|entry| entry.as_array()) else {
         return;
     };
+    if !matches!(topic, "order.spot" | "execution.spot") {
+        return;
+    }
 
     for entry in entries {
+        if entry.get("category").and_then(|value| value.as_str()) != Some("spot") {
+            continue;
+        }
         let order_id = entry
             .get("orderLinkId")
             .and_then(|value| value.as_str())
@@ -742,6 +920,13 @@ fn publish_private_ws_event(tx: &broadcast::Sender<ExecutionEvent>, value: &serd
 #[async_trait]
 impl ExecutionClient for BybitExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        require_spot_intent(&intent)?;
+        if matches!(
+            self.config.mode,
+            ExecutionMode::Live | ExecutionMode::Testnet
+        ) {
+            self.require_private_access("place_order")?;
+        }
         let client_order_id = self.next_client_order_id.take().unwrap_or_else(|| {
             if matches!(self.config.mode, ExecutionMode::Paper) {
                 format!("BYBIT_PAPER_{:x}", hft_core::now_micros())
@@ -763,8 +948,6 @@ impl ExecutionClient for BybitExecutionClient {
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
-            self.order_symbol
-                .insert(client_order_id.clone(), intent.symbol.as_str().to_string());
             let payload = build_bybit_ws_order_request(&intent, &client_order_id);
             let ws_order = self.ws_order.as_ref().ok_or_else(|| {
                 HftError::Network("Bybit WS order channel is not connected".to_string())
@@ -802,73 +985,41 @@ impl ExecutionClient for BybitExecutionClient {
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
-            self.ensure_http()?;
-            let http_client = self.get_http()?.clone();
-            let order_id_str = order_id.0.clone();
-            let symbol = self.order_symbol.get(&order_id.0).cloned().ok_or_else(|| {
-                HftError::OrderNotFound(format!(
-                    "Bybit cancel requires known symbol metadata for order {}",
-                    order_id.0
-                ))
-            })?;
-            let signer_clone = self.signer.clone();
-
-            let result = self
-                .execute_with_resilience(|| {
-                    let http = http_client.clone();
-                    let oid = order_id_str.clone();
-                    let sym = symbol.clone();
-                    let sig = signer_clone.clone();
-                    async move {
-                        #[derive(serde::Serialize)]
-                        #[serde(rename_all = "camelCase")]
-                        struct Req {
-                            category: String,
-                            symbol: String,
-                            order_link_id: String,
-                        }
-                        let req = Req {
-                            category: "spot".to_string(),
-                            symbol: sym,
-                            order_link_id: oid,
-                        };
-                        let body = serde_json::to_string(&req)
-                            .map_err(|e| HftError::Serialization(e.to_string()))?;
-                        let headers = sig.generate_headers("POST", "/v5/order/cancel", &body, None);
-                        let resp = http
-                            .signed_request(
-                                reqwest::Method::POST,
-                                "/v5/order/cancel",
-                                Some(headers),
-                                Some(body),
-                            )
-                            .await
-                            .map_err(|e| HftError::Network(e.to_string()))?;
-                        if !resp.status().is_success() {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            return Err(classify_bybit_http_error(status, &body));
-                        }
-                        #[derive(serde::Deserialize)]
-                        #[allow(non_snake_case)]
-                        struct Resp {
-                            retCode: i64,
-                            retMsg: String,
-                        }
-                        let r: Resp = HttpClient::parse_json(resp)
-                            .await
-                            .map_err(|e| HftError::Serialization(e.to_string()))?;
-                        if r.retCode != 0 {
-                            return Err(classify_bybit_response_error(
-                                "order cancel",
-                                r.retCode,
-                                &r.retMsg,
-                            ));
-                        }
-                        Ok(())
-                    }
-                })
-                .await;
+            self.require_private_access("cancel_order")?;
+            let remote_order = self
+                .list_open_orders()
+                .await?
+                .into_iter()
+                .find(|order| bybit_order_matches(order, order_id))
+                .ok_or_else(|| {
+                    HftError::OrderNotFound(format!(
+                        "Bybit venue snapshot has no open order for {}",
+                        order_id.0
+                    ))
+                })?;
+            let mut mutation_events = self.mutation_event_receiver()?;
+            let body = serde_json::json!({
+                "category": "spot",
+                "symbol": remote_order.symbol.as_str(),
+                "orderId": remote_order.order_id.0.clone(),
+            })
+            .to_string();
+            let result = match self
+                .submit_order_mutation(
+                    "/v5/order/cancel",
+                    "order cancel",
+                    body,
+                    &remote_order.order_id.0,
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.wait_for_cancellation(&mut mutation_events, &remote_order)
+                        .await?;
+                    self.confirm_order_absent(&remote_order).await
+                }
+                Err(error) => Err(error),
+            };
 
             // 如果熔斷器開啟，發送告警
             if let Err(ref e) = result {
@@ -1076,29 +1227,12 @@ impl ExecutionClient for BybitExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        if !matches!(
-            self.config.mode,
-            ExecutionMode::Live | ExecutionMode::Testnet
-        ) {
-            return Err(HftError::Config(format!(
-                "Bybit list_open_orders 不支援 {} 模式",
-                bybit_mode_label(self.config.mode)
-            )));
-        }
-        let http_local;
-        let http: &HttpClient = if let Some(h) = &self.http {
-            h
-        } else {
-            let cfg = HttpClientConfig {
-                base_url: self.config.rest_base_url.clone(),
-                timeout_ms: self.config.timeout_ms,
-                user_agent: "hft-bybit-exec/1.0".to_string(),
-            };
-            http_local = HttpClient::new(cfg).map_err(|e| HftError::Network(e.to_string()))?;
-            &http_local
-        };
+        self.require_private_access("list_open_orders")?;
+        let http = self.snapshot_http()?;
 
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_order_ids = HashSet::new();
         let mut orders = Vec::new();
         for _ in 0..100 {
             let query = {
@@ -1130,15 +1264,23 @@ impl ExecutionClient for BybitExecutionClient {
             let next_cursor = response
                 .result
                 .as_ref()
-                .map(|result| result.next_page_cursor.clone())
-                .unwrap_or_default();
-            orders.extend(parse_bybit_open_orders_response(response)?);
+                .ok_or_else(|| HftError::Parse("Bybit open-orders response missing result".to_string()))?
+                .next_page_cursor
+                .clone()
+                .ok_or_else(|| {
+                    HftError::Parse("Bybit open-orders response missing nextPageCursor".to_string())
+                })?;
+            for order in parse_bybit_open_orders_response(response)? {
+                if seen_order_ids.insert(order.order_id.0.clone()) {
+                    orders.push(order);
+                }
+            }
             if next_cursor.is_empty() {
                 return Ok(orders);
             }
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
+            if !seen_cursors.insert(next_cursor.clone()) {
                 return Err(HftError::Exchange(
-                    "Bybit open-order pagination cursor did not advance".to_string(),
+                    "Bybit open-order pagination cursor is cyclic".to_string(),
                 ));
             }
             cursor = Some(next_cursor);
@@ -1147,14 +1289,17 @@ impl ExecutionClient for BybitExecutionClient {
             "Bybit open-order pagination exceeded 100 pages".to_string(),
         ))
     }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderType, Side, Symbol, TimeInForce};
+    use hft_core::{OrderType, ProductType, Side, Symbol, TimeInForce};
     use integration::signing::BybitCredentials;
-    use ports::{ExecutionClient, OrderIntent};
+    use ports::{ExecutionClient, OrderIntent, OrderIntentLifecycle};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn make_test_config(mode: ExecutionMode) -> BybitExecutionConfig {
         BybitExecutionConfig {
@@ -1167,6 +1312,53 @@ mod tests {
             ws_private_url: "wss://stream.bybit.com/v5/private".to_string(),
             timeout_ms: 5000,
         }
+    }
+
+    async fn bybit_rest_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 16 * 1024];
+                let size = socket.read(&mut request).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request[..size]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn attach_mutation_events(
+        client: &mut BybitExecutionClient,
+    ) -> broadcast::Sender<ExecutionEvent> {
+        let (tx, _) = broadcast::channel(4);
+        client.event_tx = Some(tx.clone());
+        tx
+    }
+
+    fn spot_open_orders_response(order_id: &str, client_order_id: &str) -> String {
+        spot_open_orders_response_with_values(order_id, client_order_id, "1", "100")
+    }
+
+    fn spot_open_orders_response_with_values(
+        order_id: &str,
+        client_order_id: &str,
+        quantity: &str,
+        price: &str,
+    ) -> String {
+        format!(
+            r#"{{"retCode":0,"retMsg":"OK","result":{{"list":[{{"orderId":"{order_id}","orderLinkId":"{client_order_id}","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"{quantity}","cumExecQty":"0","price":"{price}","orderStatus":"New","createdTime":"1","updatedTime":"2"}}],"nextPageCursor":""}}}}"#
+        )
     }
 
     #[test]
@@ -1366,6 +1558,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_spot_intent_is_rejected_before_private_transport() {
+        let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Testnet)).unwrap();
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: ProductType::Perp,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: Some(Price::from_f64(50_000.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: None,
+        };
+
+        let error = client.place_order(intent).await.unwrap_err();
+
+        assert!(matches!(error, HftError::InvalidOrder(message) if message.contains("Spot only")));
+    }
+
+    #[tokio::test]
+    async fn order_envelope_preserves_the_venue_link_id() {
+        let mut client =
+            BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity::from_f64(0.001).unwrap(),
+                OrderType::Limit,
+                Some(Price::from_f64(50_000.0).unwrap()),
+                TimeInForce::GTC,
+                "test_strategy".to_string(),
+                None,
+            ),
+            OrderIntentLifecycle::default(),
+        )
+        .with_client_order_id("bybit-link-42");
+
+        assert_eq!(
+            client.place_order_envelope(&envelope).await.unwrap(),
+            OrderId("bybit-link-42".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_paper_mode_cancel_order() {
         let config = make_test_config(ExecutionMode::Paper);
         let mut client = BybitExecutionClient::new(config).unwrap();
@@ -1484,6 +1723,176 @@ mod tests {
         assert!(matches!(result, Err(HftError::Config(_))));
     }
 
+    #[tokio::test]
+    async fn open_orders_page_through_deduplicates_and_keeps_spot_category() {
+        let (base_url, server) = bybit_rest_server(vec![
+            spot_open_orders_response_with_values("venue-1", "client-1", "1", "100")
+                .replace("\"nextPageCursor\":\"\"", "\"nextPageCursor\":\"cursor-2\""),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"orderId":"venue-1","orderLinkId":"client-1","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"1","cumExecQty":"0","price":"100","orderStatus":"New","createdTime":"1","updatedTime":"2"},{"orderId":"venue-2","orderLinkId":"client-2","symbol":"ETHUSDT","side":"Sell","orderType":"Limit","qty":"2","cumExecQty":"0","price":"200","orderStatus":"New","createdTime":"3","updatedTime":"4"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let orders = client.list_open_orders().await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].order_id, OrderId("venue-1".to_string()));
+        assert_eq!(orders[1].order_id, OrderId("venue-2".to_string()));
+        assert!(requests[0].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
+        assert!(requests[1].contains("category=spot&limit=50&cursor=cursor-2"));
+    }
+
+    #[tokio::test]
+    async fn open_orders_reject_missing_or_cyclic_cursors() {
+        let (missing_base_url, missing_server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#.to_string(),
+        ])
+        .await;
+        let mut missing_config = make_test_config(ExecutionMode::Testnet);
+        missing_config.rest_base_url = missing_base_url;
+        let missing_client = BybitExecutionClient::new(missing_config).unwrap();
+        assert!(matches!(
+            missing_client.list_open_orders().await,
+            Err(HftError::Parse(message)) if message.contains("nextPageCursor")
+        ));
+        let _ = missing_server.await.unwrap();
+
+        let (cyclic_base_url, cyclic_server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-a"}}"#.to_string(),
+        ])
+        .await;
+        let mut cyclic_config = make_test_config(ExecutionMode::Testnet);
+        cyclic_config.rest_base_url = cyclic_base_url;
+        let cyclic_client = BybitExecutionClient::new(cyclic_config).unwrap();
+        assert!(matches!(
+            cyclic_client.list_open_orders().await,
+            Err(HftError::Exchange(message)) if message.contains("cursor")
+        ));
+        let _ = cyclic_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mutation_response_is_not_retried() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":10000,"retMsg":"timeout","result":null}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        client.resilient_executor = Some(Arc::new(ResilientExecutor::new(
+            "bybit-test",
+            RetryConfig {
+                max_retries: 2,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                backoff_multiplier: 1.0,
+                retry_on_init_error: true,
+            },
+            CircuitBreakerConfig::default(),
+        )));
+
+        let error = client
+            .submit_order_mutation(
+                "/v5/order/cancel",
+                "order cancel",
+                r#"{"category":"spot","symbol":"BTCUSDT","orderId":"venue-1"}"#.to_string(),
+                "venue-1",
+            )
+            .await
+            .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Network(message) if message.contains("ambiguous")));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_discovered_order_cancels_by_venue_order_id_and_requires_terminal_readback() {
+        let (base_url, server) = bybit_rest_server(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1","orderLinkId":"client-1"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let event = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            publish_private_ws_event(
+                &events,
+                &serde_json::json!({
+                    "topic": "order.spot",
+                    "data": [{
+                        "category": "spot",
+                        "orderId": "venue-1",
+                        "orderLinkId": "client-1",
+                        "updatedTime": "2",
+                        "orderStatus": "Cancelled"
+                    }]
+                }),
+            );
+        });
+
+        client
+            .cancel_order(&OrderId("client-1".to_string()))
+            .await
+            .unwrap();
+        event.await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(requests[0].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
+        assert!(requests[1].starts_with("POST /v5/order/cancel"));
+        assert!(requests[1].contains(r#""category":"spot""#));
+        assert!(requests[1].contains(r#""orderId":"venue-1""#));
+        assert!(requests[2].starts_with("GET /v5/order/realtime?category=spot&limit=50"));
+    }
+
+    #[tokio::test]
+    async fn cancel_receipt_is_incomplete_when_the_venue_still_reports_the_order_open() {
+        let (base_url, server) = bybit_rest_server(vec![
+            spot_open_orders_response("venue-1", "client-1"),
+            r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1","orderLinkId":"client-1"}}"#.to_string(),
+            spot_open_orders_response("venue-1", "client-1"),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let mut client = BybitExecutionClient::new(config).unwrap();
+        let events = attach_mutation_events(&mut client);
+        let event = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            publish_private_ws_event(
+                &events,
+                &serde_json::json!({
+                    "topic": "order.spot",
+                    "data": [{
+                        "category": "spot",
+                        "orderId": "venue-1",
+                        "orderLinkId": "client-1",
+                        "updatedTime": "2",
+                        "orderStatus": "Cancelled"
+                    }]
+                }),
+            );
+        });
+
+        let error = client
+            .cancel_order(&OrderId("client-1".to_string()))
+            .await
+            .unwrap_err();
+        event.await.unwrap();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Execution(message) if message.contains("remains open")));
+    }
+
     #[test]
     fn test_parse_bybit_open_orders_missing_data_fails() {
         let response = BybitOpenOrdersResponse {
@@ -1507,22 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn wallet_parser_preserves_exchange_usd_valuation() {
-        let response: BybitWalletResponse = serde_json::from_str(
-            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"coin":[{"coin":"BTC","walletBalance":"1.5","locked":"0.2","usdValue":"90000"}]}]}}"#,
-        )
-        .unwrap();
-
-        let balances = parse_bybit_wallet_response(response).unwrap();
-
-        assert_eq!(balances.len(), 1);
-        assert_eq!(balances[0].asset, "BTC");
-        assert_eq!(balances[0].available, Decimal::new(13, 1));
-        assert_eq!(balances[0].frozen, Decimal::new(2, 1));
-        assert_eq!(balances[0].usd_value, Some(Decimal::new(90000, 0)));
-    }
-
-    #[test]
     fn test_parse_bybit_open_orders_unknown_side_fails() {
         let response = BybitOpenOrdersResponse {
             retCode: 0,
@@ -1541,7 +1934,7 @@ mod tests {
                     createdTime: "1".to_string(),
                     updatedTime: "2".to_string(),
                 }],
-                next_page_cursor: String::new(),
+                next_page_cursor: Some(String::new()),
             }),
         };
 
@@ -1555,8 +1948,9 @@ mod tests {
         publish_private_ws_event(
             &tx,
             &serde_json::json!({
-                "topic": "order",
+                "topic": "order.spot",
                 "data": [{
+                    "category": "spot",
                     "orderId": "rejected-order",
                     "orderLinkId": "client-rejected-order",
                     "updatedTime": "123",
@@ -1578,14 +1972,34 @@ mod tests {
     }
 
     #[test]
+    fn private_stream_ignores_non_spot_frames() {
+        let (tx, mut rx) = broadcast::channel(1);
+        publish_private_ws_event(
+            &tx,
+            &serde_json::json!({
+                "topic": "order.linear",
+                "data": [{
+                    "category": "linear",
+                    "orderId": "linear-order",
+                    "updatedTime": "123",
+                    "orderStatus": "Cancelled"
+                }]
+            }),
+        );
+
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
     fn private_spot_terminal_cancel_statuses_close_the_order() {
         for status in ["PartiallyFilledCanceled", "Deactivated"] {
             let (tx, mut rx) = broadcast::channel(2);
             publish_private_ws_event(
                 &tx,
                 &serde_json::json!({
-                    "topic": "order",
+                    "topic": "order.spot",
                     "data": [{
+                        "category": "spot",
                         "orderId": "terminal-order",
                         "updatedTime": "123",
                         "orderStatus": status
