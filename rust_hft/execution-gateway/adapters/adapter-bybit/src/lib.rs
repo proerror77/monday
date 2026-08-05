@@ -159,6 +159,16 @@ fn parse_bybit_wallet_response(response: BybitWalletResponse) -> HftResult<Vec<A
     Ok(balances)
 }
 
+fn bybit_ambiguous_mutation_error(
+    operation: &str,
+    expected_order_id: &str,
+    detail: &str,
+) -> HftError {
+    HftError::Execution(format!(
+        "Bybit {operation} outcome is ambiguous for {expected_order_id}; reconciliation required before retry: {detail}"
+    ))
+}
+
 fn classify_bybit_response_error(operation: &str, code: i64, message: &str) -> HftError {
     let detail = format!("Bybit {operation} failed: {code} {message}");
     match code {
@@ -370,25 +380,39 @@ impl BybitExecutionClient {
             .signed_request(reqwest::Method::POST, path, Some(headers), Some(body))
             .await
             .map_err(|error| {
-                HftError::Network(format!(
-                    "Bybit {operation} transport outcome is ambiguous; reconcile {}: {error}",
-                    expected_order_id
-                ))
+                let detail = error.to_string();
+                bybit_ambiguous_mutation_error(operation, expected_order_id, &detail)
             })?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(classify_bybit_http_error(status, &body));
+            return Err(
+                if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                    bybit_ambiguous_mutation_error(
+                        operation,
+                        expected_order_id,
+                        &format!("HTTP {status}: {body}"),
+                    )
+                } else {
+                    classify_bybit_http_error(status, &body)
+                },
+            );
         }
         let response: BybitOrderMutationResponse = HttpClient::parse_json(response)
             .await
             .map_err(|error| HftError::Serialization(error.to_string()))?;
         if response.retCode != 0 {
-            return Err(classify_bybit_response_error(
-                operation,
-                response.retCode,
-                &response.retMsg,
-            ));
+            return Err(
+                if matches!(response.retCode, 10000 | 10016 | 170007 | 170146) {
+                    bybit_ambiguous_mutation_error(
+                        operation,
+                        expected_order_id,
+                        &format!("{} {}", response.retCode, response.retMsg),
+                    )
+                } else {
+                    classify_bybit_response_error(operation, response.retCode, &response.retMsg)
+                },
+            );
         }
         let returned = response
             .result
@@ -1338,6 +1362,36 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
+    async fn bybit_rest_server_with_request_signal(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<usize>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (index, body) in responses.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 16 * 1024];
+                let size = socket.read(&mut request).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request[..size]).to_string());
+                let _ = signal_tx.send(index);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), signal_rx, task)
+    }
+
     fn attach_mutation_events(
         client: &mut BybitExecutionClient,
     ) -> broadcast::Sender<ExecutionEvent> {
@@ -1807,13 +1861,13 @@ mod tests {
             .unwrap_err();
         let requests = server.await.unwrap();
 
-        assert!(matches!(error, HftError::Network(message) if message.contains("ambiguous")));
+        assert!(matches!(error, HftError::Execution(message) if message.contains("reconciliation required")));
         assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
     async fn restart_discovered_order_cancels_by_venue_order_id_and_requires_terminal_readback() {
-        let (base_url, server) = bybit_rest_server(vec![
+        let (base_url, mut request_signal, server) = bybit_rest_server_with_request_signal(vec![
             spot_open_orders_response("venue-1", "client-1"),
             r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1","orderLinkId":"client-1"}}"#.to_string(),
             r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":""}}"#.to_string(),
@@ -1824,7 +1878,13 @@ mod tests {
         let mut client = BybitExecutionClient::new(config).unwrap();
         let events = attach_mutation_events(&mut client);
         let event = tokio::spawn(async move {
-            tokio::task::yield_now().await;
+            loop {
+                match request_signal.recv().await {
+                    Some(1) => break,
+                    Some(_) => {}
+                    None => panic!("cancel request was not observed"),
+                }
+            }
             publish_private_ws_event(
                 &events,
                 &serde_json::json!({
@@ -1856,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_receipt_is_incomplete_when_the_venue_still_reports_the_order_open() {
-        let (base_url, server) = bybit_rest_server(vec![
+        let (base_url, mut request_signal, server) = bybit_rest_server_with_request_signal(vec![
             spot_open_orders_response("venue-1", "client-1"),
             r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"venue-1","orderLinkId":"client-1"}}"#.to_string(),
             spot_open_orders_response("venue-1", "client-1"),
@@ -1867,7 +1927,13 @@ mod tests {
         let mut client = BybitExecutionClient::new(config).unwrap();
         let events = attach_mutation_events(&mut client);
         let event = tokio::spawn(async move {
-            tokio::task::yield_now().await;
+            loop {
+                match request_signal.recv().await {
+                    Some(1) => break,
+                    Some(_) => {}
+                    None => panic!("cancel request was not observed"),
+                }
+            }
             publish_private_ws_event(
                 &events,
                 &serde_json::json!({
