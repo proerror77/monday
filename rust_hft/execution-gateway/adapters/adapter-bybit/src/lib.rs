@@ -18,7 +18,8 @@ use integration::{
     signing::{BybitCredentials, BybitSigner},
 };
 use ports::{
-    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
+    AccountBalance, AssetInventoryCapability, BoxStream, ExecutionClient, ExecutionEvent,
+    OpenOrder, OrderIntentEnvelope,
 };
 use rust_decimal::Decimal;
 use std::collections::HashSet;
@@ -1117,6 +1118,12 @@ impl ExecutionClient for BybitExecutionClient {
             return Ok(Box::pin(s));
         }
         Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn asset_inventory_capability(&self) -> AssetInventoryCapability {
+        AssetInventoryCapability::AuthoritativeAssetInventory {
+            product_type: ProductType::Spot,
+        }
     }
 
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {

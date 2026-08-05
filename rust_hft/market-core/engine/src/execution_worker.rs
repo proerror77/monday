@@ -13,8 +13,8 @@ use futures::{FutureExt, StreamExt};
 use hft_core::{now_micros, AccountId, HftError, LatencyStage, OrderId, Price, Quantity};
 use hft_core::{Symbol, VenueId};
 use ports::{
-    AccountBalance, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent,
-    OrderIntentEnvelope,
+    AccountBalance, AssetInventoryCapability, AssetInventoryRecord, ExecutionClient,
+    ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -1847,6 +1847,26 @@ pub struct ClientReconcileSnapshot {
     pub balances: Option<Result<Vec<AccountBalance>, HftError>>,
     pub positions: Option<Result<Vec<ports::Position>, HftError>>,
     pub recent_fills: Option<Result<Vec<ports::AccountFill>, HftError>>,
+    /// Capability and raw asset inventory are carried together so Spot assets cannot be
+    /// mistaken for derivatives positions or accepted without an explicit venue declaration.
+    pub asset_inventory_capability: Option<AssetInventoryCapability>,
+    pub asset_inventory: Option<Result<Vec<AssetInventoryRecord>, HftError>>,
+}
+
+impl Default for ClientReconcileSnapshot {
+    fn default() -> Self {
+        Self {
+            client_index: 0,
+            venue: None,
+            account_id: None,
+            open_orders: Ok(Vec::new()),
+            balances: None,
+            positions: None,
+            recent_fills: None,
+            asset_inventory_capability: None,
+            asset_inventory: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1879,6 +1899,38 @@ impl WorkerReconcileSnapshot {
                         .recent_fills
                         .as_ref()
                         .is_none_or(|fills| fills.is_ok())
+            })
+    }
+
+    pub(crate) fn resolved_asset_inventory_capability(
+        client: &ClientReconcileSnapshot,
+    ) -> AssetInventoryCapability {
+        client.asset_inventory_capability.unwrap_or_else(|| {
+            if client.positions.is_some() {
+                AssetInventoryCapability::PositionSnapshotRequired
+            } else {
+                AssetInventoryCapability::Unsupported
+            }
+        })
+    }
+
+    pub fn account_holdings_complete(&self) -> bool {
+        !self.clients.is_empty()
+            && self.clients.iter().all(|client| {
+                match Self::resolved_asset_inventory_capability(client) {
+                    AssetInventoryCapability::PositionSnapshotRequired => client
+                        .positions
+                        .as_ref()
+                        .is_some_and(|result| result.is_ok()),
+                    AssetInventoryCapability::AuthoritativeAssetInventory { .. } => {
+                        client.asset_inventory.as_ref().is_some_and(|result| {
+                            result.as_ref().is_ok_and(|records| {
+                                records.iter().all(|record| record.validate().is_ok())
+                            })
+                        })
+                    }
+                    AssetInventoryCapability::Unsupported => false,
+                }
             })
     }
 }
@@ -2090,13 +2142,27 @@ impl ExecutionWorker {
                 }
             }
 
+            let inventory_capability = client.asset_inventory_capability();
             let balances = if include_balances {
                 Some(client.get_balance().await)
             } else {
                 None
             };
-            let positions = if include_positions && client.supports_position_snapshot() {
+            let positions = if include_positions
+                && matches!(
+                    inventory_capability,
+                    AssetInventoryCapability::PositionSnapshotRequired
+                ) {
                 Some(client.get_positions().await)
+            } else {
+                None
+            };
+            let asset_inventory = if include_balances
+                && matches!(
+                    inventory_capability,
+                    AssetInventoryCapability::AuthoritativeAssetInventory { .. }
+                ) {
+                Some(client.get_asset_inventory().await)
             } else {
                 None
             };
@@ -2121,6 +2187,8 @@ impl ExecutionWorker {
                 balances,
                 positions,
                 recent_fills,
+                asset_inventory_capability: Some(inventory_capability),
+                asset_inventory,
             });
         }
 
@@ -2147,6 +2215,7 @@ mod tests {
             balances: None,
             positions: None,
             recent_fills: None,
+            ..Default::default()
         };
 
         let one_account = WorkerReconcileSnapshot {

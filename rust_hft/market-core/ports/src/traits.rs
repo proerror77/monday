@@ -137,6 +137,25 @@ pub trait ExecutionClient: Send + Sync {
         ))
     }
 
+    /// Declares how this client represents account holdings. A Spot wallet is an asset inventory,
+    /// not a derivatives position; unknown clients remain fail-closed.
+    fn asset_inventory_capability(&self) -> AssetInventoryCapability {
+        if self.supports_position_snapshot() {
+            AssetInventoryCapability::PositionSnapshotRequired
+        } else {
+            AssetInventoryCapability::Unsupported
+        }
+    }
+
+    /// Fetches the authoritative asset-level inventory declared by the client capability.
+    async fn get_asset_inventory(&self) -> HftResult<Vec<AssetInventoryRecord>> {
+        self.get_balance()
+            .await?
+            .into_iter()
+            .map(AssetInventoryRecord::try_from)
+            .collect()
+    }
+
     /// Whether this client can return an account-level position snapshot.
     fn supports_position_snapshot(&self) -> bool {
         false
@@ -182,6 +201,77 @@ pub struct AccountBalance {
     pub usd_value: Option<rust_decimal::Decimal>,
 }
 
+/// Typed asset-level inventory used for Spot reconciliation. This is deliberately not a
+/// `Position`: the venue's asset identity and available/locked amounts remain intact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetInventoryRecord {
+    pub asset: String,
+    pub available: rust_decimal::Decimal,
+    pub locked: rust_decimal::Decimal,
+    pub total: rust_decimal::Decimal,
+    pub usd_value: Option<rust_decimal::Decimal>,
+}
+
+impl AssetInventoryRecord {
+    pub fn validate(&self) -> HftResult<()> {
+        if self.asset.trim().is_empty() {
+            return Err(HftError::Parse(
+                "asset inventory has an empty asset".to_string(),
+            ));
+        }
+        if self.available < rust_decimal::Decimal::ZERO
+            || self.locked < rust_decimal::Decimal::ZERO
+            || self.total < rust_decimal::Decimal::ZERO
+        {
+            return Err(HftError::Parse(format!(
+                "asset inventory {} contains a negative amount",
+                self.asset
+            )));
+        }
+        if self.available + self.locked != self.total {
+            return Err(HftError::Parse(format!(
+                "asset inventory {} does not balance available + locked = total",
+                self.asset
+            )));
+        }
+        if self.total != rust_decimal::Decimal::ZERO
+            && self
+                .usd_value
+                .is_none_or(|value| value < rust_decimal::Decimal::ZERO)
+        {
+            return Err(HftError::Parse(format!(
+                "asset inventory {} is missing a non-negative valuation",
+                self.asset
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<AccountBalance> for AssetInventoryRecord {
+    type Error = HftError;
+
+    fn try_from(balance: AccountBalance) -> HftResult<Self> {
+        let record = Self {
+            asset: balance.asset,
+            available: balance.available,
+            locked: balance.frozen,
+            total: balance.total,
+            usd_value: balance.usd_value,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+/// Explicit account-holdings capability. Unsupported/unknown is never healthy by inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssetInventoryCapability {
+    PositionSnapshotRequired,
+    AuthoritativeAssetInventory { product_type: ProductType },
+    Unsupported,
+}
+
 /// Account-level fill record used by control-plane inspection and REST catch-up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountFill {
@@ -206,6 +296,9 @@ pub struct AccountView {
     #[serde(default)]
     pub tokenized_securities_attestations:
         std::collections::HashMap<InstrumentKey, TokenizedSecuritiesRuntimeAttestation>,
+    /// Local asset-level inventory model. Wallet assets are never coerced into `positions`.
+    #[serde(default)]
+    pub asset_inventory: std::collections::HashMap<String, AssetInventoryRecord>,
     pub cash_balance: rust_decimal::Decimal,
     pub positions: std::collections::HashMap<Symbol, Position>,
     pub unrealized_pnl: rust_decimal::Decimal,
@@ -225,6 +318,7 @@ impl Default for AccountView {
         Self {
             account_id: None,
             tokenized_securities_attestations: std::collections::HashMap::new(),
+            asset_inventory: std::collections::HashMap::new(),
             cash_balance: rust_decimal::Decimal::ZERO,
             positions: std::collections::HashMap::new(),
             unrealized_pnl: rust_decimal::Decimal::ZERO,
