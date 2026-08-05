@@ -736,8 +736,10 @@ load_oss_config_snapshot() {
   aliyun_profile=$(env_value ALIYUN_PROFILE)
   zstd_timeout_seconds=$(env_value ZSTD_TIMEOUT_SECONDS)
   oss_copy_timeout_seconds=$(env_value OSS_COPY_TIMEOUT_SECONDS)
-  [[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]] \
-    || die 'real market preflight budget requires 300-second upload timeouts'
+  # Development policy: upload timeout values remain bound into OSS configuration evidence.
+  [[ $zstd_timeout_seconds =~ ^[1-9][0-9]*$ \
+    && $oss_copy_timeout_seconds =~ ^[1-9][0-9]*$ ]] \
+    || die 'upload timeouts must be positive whole seconds'
   oss_config_sha=$(printf '%s\n' \
     "OSS_BUCKET=$oss_bucket" \
     "OSS_ENDPOINT=$oss_endpoint" \

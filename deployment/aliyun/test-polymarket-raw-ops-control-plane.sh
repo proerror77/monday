@@ -4300,11 +4300,13 @@ shadow_start_line=$(grep -n '^systemctl start "$shadow_unit"' "$GATE" \
   printf 'Gate does not run bounded real preflight before shadow startup\n' >&2
   exit 1
 }
-grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' \
-  "$GATE" || {
-  printf 'Gate runtime budget does not bind the configured upload timeouts\n' >&2
+if grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]' "$GATE"; then
+  printf 'Gate still hard-blocks operator-tuned upload timeouts\n' >&2
   exit 1
-}
+fi
+grep -Fq '[[ $zstd_timeout_seconds =~ ^[1-9][0-9]*$' "$GATE"
+grep -Fq '&& $oss_copy_timeout_seconds =~ ^[1-9][0-9]*$ ]]' "$GATE"
+grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$GATE"
 (
   # shellcheck source=/dev/null
   source "$legacy_runtime_budget_contract"
@@ -4324,14 +4326,14 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
     esac
   }
   monotonic_uptime_seconds() { printf '20906\n'; }
-  zstd_timeout_seconds=300
-  oss_copy_timeout_seconds=300
+  zstd_timeout_seconds=3600
+  oss_copy_timeout_seconds=1800
   required=$((REAL_MARKET_PREFLIGHT_BUDGET_SECONDS \
     + MINIMUM_GATE_SECONDS \
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 2820 ]] || {
+  [[ $required -eq 7620 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -4369,7 +4371,7 @@ grep -Fq '[[ $zstd_timeout_seconds == 300 && $oss_copy_timeout_seconds == 300 ]]
   gate_seconds=$MINIMUM_GATE_SECONDS
   candidate_sha=unused run_id=unused release_binary=unused
   oss_bucket=unused oss_endpoint=unused oss_region=unused aliyun_profile=unused
-  zstd_timeout_seconds=300 oss_copy_timeout_seconds=300 oss_config_sha=unused
+  zstd_timeout_seconds=3600 oss_copy_timeout_seconds=1800 oss_config_sha=unused
   source_revision=unused deployment_bundle_sha=unused release_manifest_sha=unused
   control_archive_sha=unused
   identity_checks=0
