@@ -1853,6 +1853,7 @@ pub(crate) fn atomic_json(path: &Path, payload: &Value) -> Result<()> {
     result
 }
 
+#[cfg(test)]
 fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts, Value)> {
     let scan = scan_tape_with_identity(
         source,
