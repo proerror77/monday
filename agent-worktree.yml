@@ -1,0 +1,7 @@
+owner: codex
+contract: remote-build-workspace-guard
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/remote-build-workspace-guard
+branch: codex/remote-build-workspace-guard
+base_sha: acab1d04985d31ad4a0a1ffa970241d860841ea9
+allowed_files: AGENTS.md,.agents/skills/monday-remote-build/SKILL.md,agent-worktree.yml
+dependency: none
