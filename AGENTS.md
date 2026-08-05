@@ -66,6 +66,8 @@
   fail-closed gate, or call a successful preparation step terminal evidence.
 - Publishing an issue, PR, artifact, image, or job is not completion. Read back
   its relationships, checks, immutable identity, terminal result, and output.
+- Remote build or validation tasks must use `monday-remote-build`; never place a
+  workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
 
 ## Scope and ownership
 
