@@ -33,6 +33,7 @@ impl SystemRuntime {
             market_plans: self.market_plans.clone(),
             execution_client_venues: self.execution_client_venues.clone(),
             execution_client_accounts: self.execution_client_accounts.clone(),
+            execution_account_admissions: self.execution_account_admissions.clone(),
             portfolio_manager: self.portfolio_manager.clone(),
             adapter_bridge: None, // IPC 專用實例不持有 bridge
         }

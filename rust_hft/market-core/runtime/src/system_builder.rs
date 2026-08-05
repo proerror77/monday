@@ -253,6 +253,8 @@ pub struct SystemBuilder {
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 跟蹤執行客戶端對應的帳戶（可選）
     execution_client_accounts: Vec<Option<hft_core::AccountId>>,
+    // Runtime-owned external account proofs. Empty is intentionally deny-all at the worker.
+    execution_account_admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
 }
 
 impl SystemBuilder {
@@ -267,6 +269,7 @@ impl SystemBuilder {
             shard_config: None,
             execution_client_venues: Vec::new(),
             execution_client_accounts: Vec::new(),
+            execution_account_admissions: HashMap::new(),
         }
     }
 
@@ -286,6 +289,16 @@ impl SystemBuilder {
     /// 獲取系統配置（用於測試）
     pub fn config(&self) -> &SystemConfig {
         &self.config
+    }
+
+    /// Supplies externally validated, opaque account evidence to the execution boundary.
+    /// This intentionally has no YAML/credential-value path; an empty map denies execution.
+    pub fn with_execution_account_admissions(
+        mut self,
+        admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
+    ) -> Self {
+        self.execution_account_admissions = admissions;
+        self
     }
 
     /// 註冊事件消費者
@@ -715,6 +728,7 @@ impl SystemBuilder {
             market_plans: self.market_stream_plans,
             execution_client_venues: self.execution_client_venues,
             execution_client_accounts: self.execution_client_accounts,
+            execution_account_admissions: self.execution_account_admissions,
             portfolio_manager,
             adapter_bridge: None,
         }
@@ -759,6 +773,8 @@ pub struct SystemRuntime {
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 執行客戶端到帳戶的映射（可選）
     execution_client_accounts: Vec<Option<hft_core::AccountId>>,
+    // Runtime-owned external account proofs; only this map reaches the worker admission gate.
+    execution_account_admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
     portfolio_manager: Option<PortfolioManager>,
     // 🔥 修復資源洩漏：保存 AdapterBridge 以便優雅關閉
     adapter_bridge: Option<engine::AdapterBridge>,
@@ -1068,6 +1084,39 @@ impl SystemRuntime {
                 .enumerate()
                 .filter_map(|(index, account)| account.clone().map(|account| (account, index)))
                 .collect::<std::collections::HashMap<_, _>>();
+            let account_environments = self
+                .execution_client_accounts
+                .iter()
+                .enumerate()
+                .filter_map(|(client_idx, account)| {
+                    let account = account.as_ref()?;
+                    let client_venue = *self.execution_client_venues.get(client_idx)?;
+                    let mut matching_venues = self
+                        .config
+                        .venues
+                        .iter()
+                        .filter(|venue| {
+                            venue.account_id.as_deref() == Some(account.0.as_str())
+                                && venue_type_to_venue_id(&venue.venue_type) == client_venue
+                        });
+                    let venue = matching_venues.next()?;
+                    if matching_venues.next().is_some() {
+                        warn!(account_id = %account.0, "duplicate account environment binding rejected");
+                        return None;
+                    }
+                    let environment = match venue.execution_mode.as_deref() {
+                        Some(mode) if mode.eq_ignore_ascii_case("testnet") => {
+                            AccountExecutionEnvironment::Testnet
+                        }
+                        Some(mode) if mode.eq_ignore_ascii_case("live") => {
+                            AccountExecutionEnvironment::Live
+                        }
+                        _ => return None,
+                    };
+                    Some((account.clone(), environment))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let account_admissions = self.execution_account_admissions.clone();
             let mut venue_to_client = self
                 .execution_client_venues
                 .iter()
@@ -1135,6 +1184,8 @@ impl SystemRuntime {
                     venue_to_client,
                     strategy_to_client,
                     Some(account_to_client.clone()),
+                    Some(account_admissions.clone()),
+                    Some(account_environments.clone()),
                 )
             } else {
                 // 沒有路由器配置，使用預設邏輯
@@ -1168,6 +1219,8 @@ impl SystemRuntime {
                     venue_to_client,
                     strategy_to_client,
                     Some(account_to_client),
+                    Some(account_admissions),
+                    Some(account_environments),
                 )
             };
             self.execution_worker_tasks.push(worker_handle);
