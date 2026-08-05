@@ -1,8 +1,8 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:0ec363051667a229f6d51e27f0fddf503bf45b63784a9ed64613ebdcdb5f32d2
-input:Cargo.toml=sha256:fbcd5c33c246ade9700e461e9fd62c1f56f3af262ac67d8206a29b4d0bf626f9
+input:Cargo.lock=sha256:b6ba644a4668166f7e7db4c2f4e02a0e55427cb090d6b6676340919ddc38ba4d
+input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
 input:crates/ploy-research/Cargo.toml=sha256:6ca7b4b9068c6eee63e2d766399b7d79b9b0d300391149eb43b0905c8adfa957
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
@@ -125,7 +125,7 @@ package:rand_core@0.9.5|source=registry+https://github.com/rust-lang/crates.io-i
 package:reqwest@0.12.28|source=registry+https://github.com/rust-lang/crates.io-index|checksum=eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147|features=__rustls,__rustls-ring,__tls,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider
 package:reqwest@0.13.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3|features=__rustls,__rustls-aws-lc-rs,__tls,blocking,json,rustls
 package:ring@0.17.14|source=registry+https://github.com/rust-lang/crates.io-index|checksum=a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7|features=alloc,default,dev_urandom_fallback
-package:rust_decimal@1.42.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=be2a24f50780bc85f09cc6ac299bdf1424302742d77221106859c9d8b102126a|features=default,maths,serde,serde-with-str,std
+package:rust_decimal@1.42.1|source=git+https://github.com/proerror77/monday-rust-decimal-security-694?rev=4f7bc6f02d7920b6416988914ae86d25f6670b22#4f7bc6f02d7920b6416988914ae86d25f6670b22|checksum=none|features=default,maths,serde,serde-with-str,std
 package:rustls-native-certs@0.8.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d|features=
 package:rustls-pki-types@1.15.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046|features=alloc,default,std
 package:rustls-platform-verifier@0.7.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0|features=
@@ -145,7 +145,7 @@ package:smallvec@1.15.2|source=registry+https://github.com/rust-lang/crates.io-i
 package:socket2@0.6.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4|features=all
 package:sqlx-core@0.8.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6|features=_rt-tokio,_tls-rustls,_tls-rustls-ring-webpki,any,chrono,crc,default,json,migrate,offline,rust_decimal,rustls,serde,serde_json,sha2,tokio,tokio-stream,webpki-roots
 package:sqlx-postgres@0.8.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46|features=any,chrono,json,migrate,rust_decimal
-package:sqlx@0.8.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1fefb893899429669dcdd979aff487bd78f4064e5e7907e4269081e0ef7d97dc|features=_rt-tokio,any,chrono,default,derive,json,macros,migrate,postgres,runtime-tokio,runtime-tokio-rustls,rust_decimal,sqlx-macros,sqlx-postgres,tls-rustls-ring,tls-rustls-ring-webpki
+package:sqlx@0.8.6|source=git+https://github.com/proerror77/sqlx-security-695?rev=6690e9870298d7b65042538f4c1e943ed3e318ec#6690e9870298d7b65042538f4c1e943ed3e318ec|checksum=none|features=_rt-tokio,any,chrono,default,derive,json,macros,migrate,postgres,runtime-tokio,runtime-tokio-rustls,rust_decimal,sqlx-macros,sqlx-postgres,tls-rustls-ring,tls-rustls-ring-webpki
 package:stable_deref_trait@1.2.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596|features=
 package:stringprep@0.1.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1|features=
 package:subtle@2.6.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292|features=
