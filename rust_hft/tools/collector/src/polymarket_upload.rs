@@ -2054,7 +2054,7 @@ where
     Ok((verify_dir, downloaded))
 }
 
-fn verify_downloaded_artifacts(
+fn verify_downloaded_paths(
     artifacts: &Artifacts,
     downloaded: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
@@ -2121,7 +2121,7 @@ where
         OSS_VERIFY_DOWNLOAD_ATTEMPTS,
         runner,
     )?;
-    verify_downloaded_artifacts(artifacts, &downloaded)
+    verify_downloaded_paths(artifacts, &downloaded)
 }
 
 #[cfg(test)]
@@ -2171,7 +2171,7 @@ where
     else {
         return Ok(false);
     };
-    verify_downloaded_artifacts(artifacts, &downloaded)?;
+    verify_downloaded_paths(artifacts, &downloaded)?;
     Ok(true)
 }
 
