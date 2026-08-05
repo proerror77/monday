@@ -129,3 +129,7 @@ lto = false
 codegen-units = 8
 incremental = true
 debug = 1
+
+[patch.crates-io]
+sqlx = { git = "https://github.com/proerror77/sqlx-security-695", rev = "6690e9870298d7b65042538f4c1e943ed3e318ec" }
+rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }
