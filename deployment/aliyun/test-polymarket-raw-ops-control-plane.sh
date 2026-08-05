@@ -1107,11 +1107,28 @@ release_binary="$VERIFY"
 empty_case="$preflight_root/empty-case"
 mkdir -p "$empty_case/source" "$empty_case/spool" "$empty_case/download" \
   "$empty_case/evidence"
+empty_stderr="$empty_case/evidence/preflight.stderr"
 if real_market_segment_preflight "$empty_case/source" "$empty_case/spool" \
-  "$empty_case/download" "$empty_case/evidence"; then
+  "$empty_case/download" "$empty_case/evidence" 2>"$empty_stderr"; then
   printf 'real-segment preflight accepted an empty production spool\n' >&2
   exit 1
 fi
+grep -Fxq 'real market preflight found no eligible closed market segment' \
+  "$empty_stderr" || {
+  printf 'empty production spool has no exact fail-closed reason\n' >&2
+  exit 1
+}
+if grep -Fq \
+  'candidate rejected a real production closed market segment before shadow startup' \
+  "$GATE"; then
+  printf 'Gate still misattributes preflight setup failures to the candidate\n' >&2
+  exit 1
+fi
+grep -Fq 'real production closed-market preflight failed before shadow startup' \
+  "$GATE" || {
+  printf 'Gate has no neutral real-market preflight failure summary\n' >&2
+  exit 1
+}
 
 insecure_case="$preflight_root/insecure-case"
 mkdir -p "$insecure_case/source" "$insecure_case/spool" \
