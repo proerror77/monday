@@ -4318,6 +4318,30 @@ mod tests {
     }
 
     #[test]
+    fn stages_single_utc_hour_from_the_validated_source() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let scan = scan_tape_with_identity(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        let source_identity = scan.identity;
+        let staging = ExclusiveTempDir::create(root.path(), ".split").unwrap();
+
+        let (chunk, reused_scan) = stage_validated_single_hour(&tape, staging.path(), scan)
+            .unwrap()
+            .expect("sample tape stays within one UTC hour");
+
+        assert_eq!(regular_identity(&chunk).unwrap(), source_identity);
+        assert_eq!(reused_scan.identity, source_identity);
+        assert_eq!(
+            reused_scan.manifest["source_file"].as_str(),
+            chunk.file_name().and_then(|name| name.to_str())
+        );
+    }
+
+    #[test]
     fn hash_triplet_and_remote_tamper_are_fail_closed() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
