@@ -1,10 +1,9 @@
 owner: codex
-contract: bybit-spot-amend-708
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/bybit-spot-amend-708
-branch: codex/bybit-spot-amend-708
-base_sha: 5ece48748e60c1ce3866d267398b426aa58c2943
-scope:
+contract: bybit-spot-account-fills-709
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/bybit-spot-account-fills-709
+branch: codex/bybit-spot-account-fills-709
+base_sha: 46a5ae7d351c91c828e57275c5e08e93cd450c3e
+allowed_files:
   - rust_hft/execution-gateway/adapters/adapter-bybit/src/lib.rs
-  - rust_hft/market-core/engine/src/execution_worker.rs
-dependency: bybit-spot-recovery-703
+dependency: bybit-spot-asset-inventory-707
 no_external_runtime_mutation: true
