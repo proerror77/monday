@@ -84,8 +84,11 @@ if grep -Fq 'research-source-test:run-' <<<"$source_test_block" || grep -Fq 'cac
 fi
 
 grep -Fqx 'FROM rust:1.91-bookworm AS source-test' "$source_test_dockerfile"
+grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
+grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx 'COPY --chown=research:research source/rust_hft/ /work/' "$source_test_dockerfile"
 grep -Fqx 'RUN cargo fetch --locked' "$source_test_dockerfile"
+grep -Fqx 'USER 1000:1000' "$source_test_dockerfile"
 grep -Fqx '    CARGO_HOME=/opt/monday-source-test-cargo \' "$source_test_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/local/bin/monday-source-test"]' "$source_test_dockerfile"
 grep -Fqx 'export CARGO_BUILD_JOBS=2' "$source_test_entrypoint"
@@ -134,6 +137,10 @@ grep -Fq 'kubernetes.io/arch: amd64' "$source_test_job"
 grep -Fq 'workload: backtest' "$source_test_job"
 grep -Fq 'name: monday-acr' "$source_test_job"
 grep -Fq 'runAsNonRoot: true' "$source_test_job"
+test "$(grep -Fxc '        runAsUser: 1000' "$source_test_job")" -eq 1
+test "$(grep -Fxc '        runAsGroup: 1000' "$source_test_job")" -eq 1
+test "$(grep -Fxc '            runAsUser: 1000' "$source_test_job")" -eq 1
+test "$(grep -Fxc '            runAsGroup: 1000' "$source_test_job")" -eq 1
 grep -Fq 'type: RuntimeDefault' "$source_test_job"
 grep -Fq 'allowPrivilegeEscalation: false' "$source_test_job"
 grep -Fq 'readOnlyRootFilesystem: true' "$source_test_job"
