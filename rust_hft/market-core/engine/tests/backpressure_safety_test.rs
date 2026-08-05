@@ -248,7 +248,9 @@ fn test_execution_intent_queue_full_rejects_new_intent() {
     assert!(engine_queues
         .send_intent(account_id.clone(), test_intent())
         .is_ok());
-    assert!(engine_queues.send_intent(account_id, test_intent()).is_err());
+    assert!(engine_queues
+        .send_intent(account_id, test_intent())
+        .is_err());
 
     assert_eq!(engine_queues.stats().intents_sent, 3);
     assert_eq!(engine_queues.stats().intent_queue_full_count, 1);
