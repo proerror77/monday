@@ -18,11 +18,11 @@ use integration::{
     signing::{BybitCredentials, BybitSigner},
 };
 use ports::{
-    AccountBalance, AssetInventoryCapability, BoxStream, ExecutionClient, ExecutionEvent,
-    OpenOrder, OrderIntentEnvelope,
+    AccountBalance, AccountFill, AssetInventoryCapability, AssetInventoryRecord, BoxStream,
+    ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
 };
 use rust_decimal::Decimal;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -109,10 +109,13 @@ struct BybitWalletCoin {
     walletBalance: String,
     locked: String,
     usdValue: String,
+    spotBorrow: String,
 }
 
 #[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
 struct BybitWalletAccount {
+    accountType: String,
     coin: Vec<BybitWalletCoin>,
 }
 
@@ -123,6 +126,35 @@ struct BybitWalletResponse {
     retMsg: String,
     #[serde(default)]
     result: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitRecentFillItem {
+    execId: String,
+    orderId: String,
+    symbol: String,
+    side: String,
+    execPrice: String,
+    execQty: String,
+    #[serde(default)]
+    execFee: String,
+    execTime: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BybitRecentFillsData {
+    list: Vec<BybitRecentFillItem>,
+    #[serde(rename = "nextPageCursor")]
+    next_page_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitRecentFillsResponse {
+    retCode: i64,
+    retMsg: String,
+    result: Option<BybitRecentFillsData>,
 }
 
 fn parse_bybit_wallet_response(response: BybitWalletResponse) -> HftResult<Vec<AccountBalance>> {
@@ -140,8 +172,28 @@ fn parse_bybit_wallet_response(response: BybitWalletResponse) -> HftResult<Vec<A
             })?,
         )
         .map_err(|error| HftError::Parse(format!("Bybit wallet response: {error}")))?;
-    let mut balances = Vec::new();
-    for coin in accounts.into_iter().flat_map(|account| account.coin) {
+    if accounts.len() != 1 || accounts[0].accountType != "UNIFIED" {
+        return Err(HftError::Parse(
+            "Bybit wallet response must contain exactly one UNIFIED account".to_string(),
+        ));
+    }
+    let account = accounts.into_iter().next().expect("length checked");
+    if account.coin.is_empty() {
+        return Err(HftError::Parse(
+            "Bybit wallet response contains no assets".to_string(),
+        ));
+    }
+    let mut balances = Vec::with_capacity(account.coin.len());
+    let mut seen_assets = HashSet::new();
+    for coin in account.coin {
+        if coin.coin.is_empty()
+            || coin.coin.trim() != coin.coin
+            || !seen_assets.insert(coin.coin.clone())
+        {
+            return Err(HftError::Parse(
+                "Bybit wallet response contains an empty or duplicate asset".to_string(),
+            ));
+        }
         let total = coin.walletBalance.parse::<Decimal>().map_err(|error| {
             HftError::Parse(format!("Bybit {} walletBalance: {error}", coin.coin))
         })?;
@@ -153,15 +205,95 @@ fn parse_bybit_wallet_response(response: BybitWalletResponse) -> HftResult<Vec<A
             .usdValue
             .parse::<Decimal>()
             .map_err(|error| HftError::Parse(format!("Bybit {} usdValue: {error}", coin.coin)))?;
-        balances.push(AccountBalance {
+        if usd_value < Decimal::ZERO {
+            return Err(HftError::Parse(format!(
+                "Bybit {} has negative usdValue",
+                coin.coin
+            )));
+        }
+        let spot_borrow = coin
+            .spotBorrow
+            .parse::<Decimal>()
+            .map_err(|error| HftError::Parse(format!("Bybit {} spotBorrow: {error}", coin.coin)))?;
+        if spot_borrow != Decimal::ZERO {
+            return Err(HftError::Parse(format!(
+                "Bybit {} has non-zero spotBorrow, which is not represented by Spot inventory",
+                coin.coin
+            )));
+        }
+        let balance = AccountBalance {
             asset: coin.coin,
+            // Inventory conservation only; per-symbol Spot order capacity requires a separate gate.
             available: total - frozen,
             frozen,
             total,
             usd_value: Some(usd_value),
-        });
+        };
+        AssetInventoryRecord::try_from(balance.clone())?;
+        balances.push(balance);
     }
     Ok(balances)
+}
+
+fn parse_bybit_recent_fills_response(
+    response: BybitRecentFillsResponse,
+) -> HftResult<(Vec<AccountFill>, String)> {
+    if response.retCode != 0 {
+        return Err(classify_bybit_response_error(
+            "recent-fills query",
+            response.retCode,
+            &response.retMsg,
+        ));
+    }
+    let data = response
+        .result
+        .ok_or_else(|| HftError::Parse("Bybit recent-fills response missing result".to_string()))?;
+    let next_cursor = data.next_page_cursor.ok_or_else(|| {
+        HftError::Parse("Bybit recent-fills response missing nextPageCursor".to_string())
+    })?;
+    let fills = data
+        .list
+        .into_iter()
+        .map(|item| {
+            if item.execId.is_empty()
+                || item.execId.trim() != item.execId
+                || item.orderId.is_empty()
+                || item.orderId.trim() != item.orderId
+                || item.symbol.is_empty()
+                || item.symbol.trim() != item.symbol
+            {
+                return Err(HftError::Parse(
+                    "Bybit recent fill missing execId, orderId, or symbol".to_string(),
+                ));
+            }
+            let price = Price::from_str(&item.execPrice).map_err(|error| {
+                HftError::Parse(format!("Bybit execPrice parse failed: {error}"))
+            })?;
+            if price.0 <= Decimal::ZERO {
+                return Err(HftError::Parse(
+                    "Bybit execution price must be positive".to_string(),
+                ));
+            }
+            let fee = (!item.execFee.is_empty())
+                .then(|| {
+                    item.execFee.parse::<Decimal>().map_err(|error| {
+                        HftError::Parse(format!("Bybit execFee parse failed: {error}"))
+                    })
+                })
+                .transpose()?;
+            Ok(AccountFill {
+                fill_id: item.execId,
+                order_id: OrderId(item.orderId),
+                symbol: hft_core::Symbol::from(item.symbol),
+                side: parse_bybit_side(&item.side)?,
+                price,
+                quantity: parse_bybit_quantity("execQty", &item.execQty, false)?,
+                fee,
+                timestamp: parse_bybit_timestamp("execTime", &item.execTime)?,
+            })
+        })
+        .collect::<HftResult<Vec<_>>>()?;
+    Ok((fills, next_cursor))
 }
 
 fn bybit_ambiguous_mutation_error(
@@ -737,10 +869,12 @@ fn parse_bybit_price(value: &str, order_type: hft_core::OrderType) -> HftResult<
 }
 
 fn parse_bybit_timestamp(field: &str, value: &str) -> HftResult<u64> {
-    value
+    let ts_ms = value
         .parse::<u64>()
-        .map(|ts_ms| ts_ms * 1000)
-        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))
+        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))?;
+    ts_ms
+        .checked_mul(1000)
+        .ok_or_else(|| HftError::Parse(format!("Bybit {} timestamp overflows micros", field)))
 }
 
 fn parse_bybit_open_orders_response(
@@ -1348,18 +1482,8 @@ impl ExecutionClient for BybitExecutionClient {
     }
 
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
-        if !matches!(
-            self.config.mode,
-            ExecutionMode::Live | ExecutionMode::Testnet
-        ) {
-            return Err(HftError::Config(
-                "Bybit authoritative balances require live/testnet mode".to_string(),
-            ));
-        }
-        let http = self
-            .http
-            .as_ref()
-            .ok_or_else(|| HftError::Config("Bybit HTTP client is not connected".to_string()))?;
+        self.require_private_access("get_balance")?;
+        let http = self.snapshot_http()?;
         let query = "accountType=UNIFIED";
         let path = format!("/v5/account/wallet-balance?{query}");
         let headers =
@@ -1378,6 +1502,98 @@ impl ExecutionClient for BybitExecutionClient {
             .await
             .map_err(|error| HftError::Parse(format!("Bybit wallet response: {error}")))?;
         parse_bybit_wallet_response(response)
+    }
+
+    fn supports_position_snapshot(&self) -> bool {
+        false
+    }
+
+    async fn get_positions(&self) -> HftResult<Vec<ports::Position>> {
+        Err(HftError::Config(
+            "Bybit Spot inventory is represented by wallet-balance snapshots, not derivatives positions"
+                .to_string(),
+        ))
+    }
+
+    fn supports_recent_fills_snapshot(&self) -> bool {
+        true
+    }
+
+    async fn list_recent_fills(&self) -> HftResult<Vec<AccountFill>> {
+        self.require_private_access("list_recent_fills")?;
+        let http = self.snapshot_http()?;
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_fills = HashMap::<String, AccountFill>::new();
+        let mut fills = Vec::new();
+        for _ in 0..100 {
+            let query = {
+                let mut query = "category=spot&limit=100".to_string();
+                if let Some(cursor) = &cursor {
+                    if !cursor.is_ascii()
+                        || cursor
+                            .bytes()
+                            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'&' | b'#'))
+                    {
+                        return Err(HftError::Parse(
+                            "Bybit recent-fill cursor contains unsafe query characters".to_string(),
+                        ));
+                    }
+                    query.push_str("&cursor=");
+                    query.push_str(cursor);
+                }
+                query
+            };
+            let path = format!("/v5/execution/list?{query}");
+            let headers = self
+                .signer
+                .generate_headers("GET", "/v5/execution/list", &query, None);
+            let response = http
+                .get(&path, Some(headers))
+                .await
+                .map_err(|error| HftError::Network(error.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(classify_bybit_http_error(status, &body));
+            }
+            let response: BybitRecentFillsResponse = HttpClient::parse_json(response)
+                .await
+                .map_err(|error| HftError::Parse(format!("Bybit recent fills: {error}")))?;
+            let (page, next_cursor) = parse_bybit_recent_fills_response(response)?;
+            for fill in page {
+                if let Some(existing) = seen_fills.get(&fill.fill_id) {
+                    if existing.order_id != fill.order_id
+                        || existing.symbol != fill.symbol
+                        || existing.side != fill.side
+                        || existing.price != fill.price
+                        || existing.quantity != fill.quantity
+                        || existing.fee != fill.fee
+                        || existing.timestamp != fill.timestamp
+                    {
+                        return Err(HftError::Parse(format!(
+                            "Bybit recent fills contain conflicting execId {}",
+                            fill.fill_id
+                        )));
+                    }
+                } else {
+                    seen_fills.insert(fill.fill_id.clone(), fill.clone());
+                    fills.push(fill);
+                }
+            }
+            if next_cursor.is_empty() {
+                return Ok(fills);
+            }
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(HftError::Exchange(
+                    "Bybit recent-fill pagination cursor is cyclic".to_string(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(HftError::Exchange(
+            "Bybit recent-fill pagination exceeded 100 pages".to_string(),
+        ))
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -1806,6 +2022,318 @@ mod tests {
 
         assert!(error.to_string().contains("requires API credentials"));
         assert!(!client.connected);
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_uses_private_unified_scope_without_connecting() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"12.5","locked":"2.5","usdValue":"12.5","spotBorrow":"0"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let balances = client.get_balance().await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "USDT");
+        assert_eq!(balances[0].total, Decimal::new(125, 1));
+        assert_eq!(balances[0].frozen, Decimal::new(25, 1));
+        assert_eq!(balances[0].available, Decimal::new(100, 1));
+        assert_eq!(balances[0].usd_value, Some(Decimal::new(125, 1)));
+        assert_eq!(
+            client.asset_inventory_capability(),
+            AssetInventoryCapability::AuthoritativeAssetInventory {
+                product_type: ProductType::Spot,
+            }
+        );
+        assert_eq!(
+            client.asset_inventory_from_balances(&balances).unwrap()[0],
+            AssetInventoryRecord {
+                asset: "USDT".to_string(),
+                available: Decimal::new(100, 1),
+                locked: Decimal::new(25, 1),
+                total: Decimal::new(125, 1),
+                usd_value: Some(Decimal::new(125, 1)),
+            }
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v5/account/wallet-balance?accountType=UNIFIED"));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_without_credentials_fails_before_network_io() {
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.credentials = BybitCredentials {
+            api_key: String::new(),
+            secret_key: String::new(),
+        };
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            HftError::Authentication(message) if message.contains("API credentials")
+        ));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_malformed_balances() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"12.5","locked":"bad","usdValue":"12.5","spotBorrow":"0"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("locked")));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_inconsistent_balances() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"1","locked":"2","usdValue":"1","spotBorrow":"0"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("negative amount")));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_unrepresented_spot_borrow() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"12.5","locked":"0","usdValue":"12.5","spotBorrow":"1"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("spotBorrow")));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_negative_valuation() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":"USDT","walletBalance":"0","locked":"0","usdValue":"-1","spotBorrow":"0"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("usdValue")));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_empty_inventory() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("one UNIFIED")));
+    }
+
+    #[tokio::test]
+    async fn wallet_snapshot_rejects_padded_asset_identity() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","coin":[{"coin":" USDT","walletBalance":"1","locked":"0","usdValue":"1","spotBorrow":"0"}]}]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.get_balance().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("asset")));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_page_through_deduplicates_and_keeps_spot_category() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execFee":"0.01","execTime":"1"},{"execId":"exec-2","orderId":"venue-2","symbol":"ETHUSDT","side":"Sell","execPrice":"200","execQty":"0.2","execFee":"","execTime":"2"}],"nextPageCursor":"132766%3A2%2C132766%3A2"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-2","orderId":"venue-2","symbol":"ETHUSDT","side":"Sell","execPrice":"200","execQty":"0.2","execFee":"","execTime":"2"},{"execId":"exec-3","orderId":"venue-3","symbol":"SOLUSDT","side":"Buy","execPrice":"50","execQty":"1","execFee":"0.02","execTime":"3"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let fills = client.list_recent_fills().await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(
+            fills
+                .iter()
+                .map(|fill| fill.fill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec-1", "exec-2", "exec-3"]
+        );
+        assert_eq!(fills[0].order_id, OrderId("venue-1".to_string()));
+        assert_eq!(fills[0].price, Price::from_f64(100.0).unwrap());
+        assert_eq!(fills[0].quantity, Quantity::from_f64(0.1).unwrap());
+        assert_eq!(fills[0].fee, Some(Decimal::new(1, 2)));
+        assert_eq!(fills[0].timestamp, 1_000);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v5/execution/list?category=spot&limit=100"));
+        assert!(requests[1].contains("cursor=132766%3A2%2C132766%3A2"));
+        assert!(!requests[1].contains("%253A"));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_without_credentials_fail_before_network_io() {
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.credentials = BybitCredentials {
+            api_key: String::new(),
+            secret_key: String::new(),
+        };
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            HftError::Authentication(message) if message.contains("API credentials")
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_missing_cursor() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("nextPageCursor")));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_missing_venue_identity() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":" ","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execTime":"1"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("execId")));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_cyclic_cursor() {
+        let page =
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor-1"}}"#
+                .to_string();
+        let (base_url, server) = bybit_rest_server(vec![page.clone(), page]).await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Exchange(message) if message.contains("cyclic")));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_conflicting_duplicate_exec_id() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execFee":"0.01","execTime":"1"}],"nextPageCursor":"cursor-2"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-2","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execFee":"0.01","execTime":"1"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(
+            matches!(error, HftError::Parse(message) if message.contains("conflicting execId"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_timestamp_overflow() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execTime":"18446744073709551615"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("overflows")));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_cursor_query_injection() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor&category=linear"}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("unsafe")));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spot_positions_are_explicitly_unsupported() {
+        let client = BybitExecutionClient::new(make_test_config(ExecutionMode::Testnet)).unwrap();
+
+        assert!(!client.supports_position_snapshot());
+        let error = client.get_positions().await.unwrap_err();
+
+        assert!(matches!(error, HftError::Config(message) if message.contains("wallet-balance")));
     }
 
     #[tokio::test]
