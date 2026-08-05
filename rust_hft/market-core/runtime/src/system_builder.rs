@@ -1078,11 +1078,18 @@ impl SystemRuntime {
 
             // Capture client count before move
             let client_count = execution_clients.len();
-            let account_to_client = self
-                .execution_client_accounts
-                .iter()
-                .enumerate()
-                .filter_map(|(index, account)| account.clone().map(|account| (account, index)))
+            let mut account_bindings =
+                std::collections::HashMap::<hft_core::AccountId, Vec<usize>>::new();
+            for (index, account) in self.execution_client_accounts.iter().enumerate() {
+                if let Some(account) = account.clone() {
+                    account_bindings.entry(account).or_default().push(index);
+                }
+            }
+            let account_to_client = account_bindings
+                .into_iter()
+                .filter_map(|(account, clients)| {
+                    (clients.len() == 1).then_some((account, clients[0]))
+                })
                 .collect::<std::collections::HashMap<_, _>>();
             let account_environments = self
                 .execution_client_accounts
@@ -1090,6 +1097,9 @@ impl SystemRuntime {
                 .enumerate()
                 .filter_map(|(client_idx, account)| {
                     let account = account.as_ref()?;
+                    if account_to_client.get(account) != Some(&client_idx) {
+                        return None;
+                    }
                     let client_venue = *self.execution_client_venues.get(client_idx)?;
                     let mut matching_venues = self
                         .config
@@ -1117,13 +1127,18 @@ impl SystemRuntime {
                 })
                 .collect::<std::collections::HashMap<_, _>>();
             let account_admissions = self.execution_account_admissions.clone();
-            let mut venue_to_client = self
-                .execution_client_venues
-                .iter()
-                .enumerate()
-                .map(|(client_idx, venue_id)| (*venue_id, client_idx))
+            let mut venue_bindings = std::collections::HashMap::<VenueId, Vec<usize>>::new();
+            for (client_idx, venue_id) in self.execution_client_venues.iter().enumerate() {
+                venue_bindings
+                    .entry(*venue_id)
+                    .or_default()
+                    .push(client_idx);
+            }
+            let mut venue_to_client = venue_bindings
+                .into_iter()
+                .filter_map(|(venue, clients)| (clients.len() == 1).then_some((venue, clients[0])))
                 .collect::<std::collections::HashMap<_, _>>();
-            if venue_to_client.is_empty() {
+            if self.execution_client_venues.is_empty() {
                 for (index, venue_config) in self.config.venues.iter().enumerate() {
                     if let Some(venue_id) = hft_core::VenueId::from_str(&venue_config.name) {
                         if index < execution_clients.len() {

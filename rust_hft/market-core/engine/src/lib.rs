@@ -917,7 +917,10 @@ impl Engine {
         let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
         lifecycle.timing.intent_emitted_mono_us = Some(monotonic_micros());
         self.apply_intent_execution_limits(&mut lifecycle);
-        let account_id = self.strategy_account_mapping.get(&intent.strategy_id).cloned();
+        let account_id = self
+            .strategy_account_mapping
+            .get(&intent.strategy_id)
+            .cloned();
         let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
         if let Some(account_id) = account_id {
             envelope = envelope.with_account_id(account_id);
@@ -1302,15 +1305,24 @@ impl Engine {
             ..
         } = event
         {
-            let Some(account_id) = event_account_id
-                .clone()
-                .or_else(|| self.order_account_map.get(order_id).cloned())
-            else {
-                warn!(
-                    order_id = %order_id.0,
-                    "ignoring OrderNew without a canonical account identity"
-                );
-                return Ok(());
+            let mapped_account_id = self.order_account_map.get(order_id).cloned();
+            let account_id = match (event_account_id.clone(), mapped_account_id) {
+                (Some(event_account_id), Some(mapped_account_id))
+                    if event_account_id != mapped_account_id =>
+                {
+                    return Err(HftError::Execution(format!(
+                        "order {} changed canonical account identity from {} to {}",
+                        order_id.0, mapped_account_id.0, event_account_id.0
+                    )));
+                }
+                (Some(account_id), _) | (None, Some(account_id)) => account_id,
+                (None, None) => {
+                    warn!(
+                        order_id = %order_id.0,
+                        "ignoring OrderNew without a canonical account identity"
+                    );
+                    return Ok(());
+                }
             };
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
             if let Some(om) = &mut self.order_manager {
@@ -1325,8 +1337,7 @@ impl Engine {
                     strategy_id: Some(strategy_id.clone()),
                 });
             }
-            self.order_account_map
-                .insert(order_id.clone(), account_id);
+            self.order_account_map.insert(order_id.clone(), account_id);
             if let Some(pm) = &mut self.portfolio_manager {
                 pm.register_order(order_id.clone(), symbol.clone(), *side);
             }
@@ -2705,6 +2716,36 @@ mod tests {
         assert!(broadcasts.try_recv().is_ok());
         assert!(broadcasts.try_recv().is_ok());
         assert!(broadcasts.try_recv().is_err());
+    }
+
+    #[test]
+    fn order_new_cannot_rebind_canonical_account_identity() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let order_id = hft_core::OrderId("account-bound-order".to_string());
+        let canonical = hft_core::AccountId("canonical-account".to_string());
+        engine
+            .order_account_map
+            .insert(order_id.clone(), canonical.clone());
+
+        let error = engine
+            .handle_execution_event(&ExecutionEvent::OrderNew {
+                order_id: order_id.clone(),
+                client_order_id: Some("client-1".to_string()),
+                account_id: Some(hft_core::AccountId("wrong-account".to_string())),
+                symbol: Symbol::new("BTCUSDT"),
+                side: hft_core::Side::Buy,
+                quantity: Quantity::from_f64(1.0).expect("valid quantity"),
+                requested_price: Some(Price::from_f64(100.0).expect("valid price")),
+                timestamp: 1,
+                venue: Some(VenueId::BYBIT),
+                strategy_id: "strategy-1".to_string(),
+            })
+            .expect_err("account identity changes must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("changed canonical account identity"));
+        assert_eq!(engine.order_account_map.get(&order_id), Some(&canonical));
     }
 
     #[test]

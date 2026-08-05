@@ -212,7 +212,6 @@ pub struct AccountBalance {
     pub usd_value: Option<rust_decimal::Decimal>,
 }
 
-<<<<<<< HEAD
 /// Typed asset-level inventory used for Spot reconciliation. This is deliberately not a
 /// `Position`: the venue's asset identity and available/locked amounts remain intact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

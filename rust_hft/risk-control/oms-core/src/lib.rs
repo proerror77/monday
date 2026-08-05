@@ -100,8 +100,15 @@ impl OmsCore {
             .get(&params.order_id)
             .and_then(|record| record.account_id.clone());
         let mut record = OrderRecord::new(params);
-        if record.account_id.is_none() {
-            record.account_id = prior_account_id;
+        if let Some(prior_account_id) = prior_account_id {
+            if record
+                .account_id
+                .as_ref()
+                .is_some_and(|account_id| account_id != &prior_account_id)
+            {
+                return;
+            }
+            record.account_id = Some(prior_account_id);
         }
         self.orders.insert(record.order_id.clone(), record);
     }
@@ -884,7 +891,42 @@ mod tests {
         assert_eq!(order.status, OrderStatus::PartiallyFilled);
         assert_eq!(order.venue, Some(hft_core::VenueId::BITGET));
         assert_eq!(order.strategy_id, Some("strat-a".into()));
-        assert_eq!(order.account_id, Some(AccountId("bitget-testnet".to_string())));
+        assert_eq!(
+            order.account_id,
+            Some(AccountId("bitget-testnet".to_string()))
+        );
+    }
+
+    #[test]
+    fn register_order_cannot_rebind_account_identity() {
+        let mut oms = OmsCore::new();
+        let order_id = OrderId("ACCOUNT-BOUND".to_string());
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: Some("client-1".to_string()),
+            account_id: Some(AccountId("canonical-account".to_string())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).expect("valid quantity"),
+            venue: Some(VenueId::BYBIT),
+            strategy_id: Some("strategy-1".to_string()),
+        });
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: Some("client-1".to_string()),
+            account_id: Some(AccountId("wrong-account".to_string())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).expect("valid quantity"),
+            venue: Some(VenueId::BYBIT),
+            strategy_id: Some("strategy-1".to_string()),
+        });
+
+        assert_eq!(
+            oms.get(&order_id)
+                .and_then(|order| order.account_id.clone()),
+            Some(AccountId("canonical-account".to_string()))
+        );
     }
 
     #[test]
