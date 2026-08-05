@@ -347,3 +347,12 @@ receipt. Registry retention or removal remains an ACR-owner action after that
 receipt. Each receipt is evidence only for the exact source revision and
 verified profile named by its image; later commits or different profiles require
 a newly published digest.
+
+Because the selector admits source-test publication only from `refs/heads/main`,
+the workflow-level `acr-publish-${{ github.ref }}` concurrency group with
+`cancel-in-progress: false` serializes its tag-absence probe, build,
+verification, push, and digest readback. A later dispatch cannot reach the same
+tag's push until the first has finished, at which point the absence probe fails
+closed. Personal Edition has no immutable-image-tag setting, so this publisher
+lock and its exact digest record are the CI-path protection; registry writer
+access remains a separate ACR-owner boundary.
