@@ -249,12 +249,16 @@ fn test_execution_intent_queue_full_rejects_new_intent() {
         .send_intent(account_id.clone(), test_intent())
         .is_ok());
     assert!(engine_queues
-        .send_intent(account_id, test_intent())
+        .send_intent(account_id.clone(), test_intent())
         .is_err());
 
     assert_eq!(engine_queues.stats().intents_sent, 3);
     assert_eq!(engine_queues.stats().intent_queue_full_count, 1);
-    assert_eq!(worker_queues.receive_intents().len(), 3);
+    let envelopes = worker_queues.receive_envelopes();
+    assert_eq!(envelopes.len(), 3);
+    assert!(envelopes
+        .iter()
+        .all(|envelope| envelope.account_id.as_ref() == Some(&account_id)));
 }
 
 #[test]

@@ -357,18 +357,19 @@ impl ExecutionWorker {
         if !admission.readback.capability.can_trade_crypto_spot {
             return Err("account capability does not permit crypto spot execution");
         }
-        if admission.readback.balances.is_empty()
-            || admission.readback.balances.iter().any(|balance| {
-                balance.asset.trim().is_empty()
-                    || balance.available < rust_decimal::Decimal::ZERO
-                    || balance.frozen < rust_decimal::Decimal::ZERO
-                    || balance.total < rust_decimal::Decimal::ZERO
-                    || balance
-                        .usd_value
-                        .is_none_or(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
-            })
-        {
+        if admission.readback.balances.is_empty() {
             return Err("account admission has no externally read-back assets");
+        }
+        if admission.readback.balances.iter().any(|balance| {
+            balance.asset.trim().is_empty()
+                || balance.available < rust_decimal::Decimal::ZERO
+                || balance.frozen < rust_decimal::Decimal::ZERO
+                || balance.total < rust_decimal::Decimal::ZERO
+                || balance
+                    .usd_value
+                    .is_none_or(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
+        }) {
+            return Err("account admission has malformed externally read-back assets");
         }
         if admission.max_order_notional <= rust_decimal::Decimal::ZERO {
             return Err("account order-notional limit is not positive");
@@ -4107,7 +4108,7 @@ mod tests {
                 "account kill switch is active",
                 "account order-notional limit exceeded",
                 "account admission has no externally read-back assets",
-                "account admission has no externally read-back assets",
+                "account admission has malformed externally read-back assets",
                 "account admission venue does not match selected execution client",
                 "account admission environment does not match execution client",
                 "account admission product scope does not match intent",

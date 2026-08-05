@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use hft_core::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 use ports::ExecutionEvent;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -106,6 +106,11 @@ impl OmsCore {
                 .as_ref()
                 .is_some_and(|account_id| account_id != &prior_account_id)
             {
+                warn!(
+                    order_id = %record.order_id.0,
+                    prior_account_id = %prior_account_id.0,
+                    "refused to rebind order to a different canonical account identity"
+                );
                 return;
             }
             record.account_id = Some(prior_account_id);
