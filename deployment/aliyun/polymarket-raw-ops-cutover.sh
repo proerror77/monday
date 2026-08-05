@@ -956,8 +956,8 @@ verify_contained_bootstrap_recovery() {
   local recovery=$1 candidate_sha=$2 source_revision=$3 baseline
   local active_state main_pid fragment drop_ins exec_argv restarts invocation binary_sha unit
   jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
-    .mode == "gamma_tagged_500"
-    and .candidate_probe.schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    .mode == "gamma_closed_200"
+    and .candidate_probe.schema == "monday.polymarket_gamma_closed_200_recovery_probe.v1"
     and .candidate_probe.candidate_sha256 == $candidate
     and .candidate_probe.source_revision == $source
     and (.candidate_probe.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
