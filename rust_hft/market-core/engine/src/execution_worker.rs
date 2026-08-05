@@ -759,7 +759,7 @@ impl ExecutionWorker {
             return;
         }
 
-        for envelope in intents.drain(..) {
+        for mut envelope in intents.drain(..) {
             self.drain_private_events_before_submission().await;
             if let Err(reason) = envelope.validate_pre_execution(now_micros(), None) {
                 let reject_event = ExecutionEvent::OrderReject {
@@ -771,12 +771,11 @@ impl ExecutionWorker {
                 self.stats.orders_failed += 1;
                 continue;
             }
-            let intent = &envelope.intent;
             if !self.accepting_intents {
                 self.reject_for_disabled_intake(&envelope).await;
                 continue;
             }
-            if intent.product_type != hft_core::ProductType::Spot {
+            if envelope.intent.product_type != hft_core::ProductType::Spot {
                 let reject_event = ExecutionEvent::OrderReject {
                     order_id: OrderId(envelope.client_order_id.clone()),
                     reason: "product requires a venue-specific account admission policy"
@@ -787,6 +786,61 @@ impl ExecutionWorker {
                 self.stats.orders_failed += 1;
                 continue;
             }
+            let simulated_client_idx = if envelope.account_id.is_none()
+                && self
+                    .execution_clients
+                    .iter()
+                    .all(|client| client.is_simulated_execution())
+            {
+                match self.select_execution_client(&envelope.intent) {
+                    Ok(client_idx) => match self.venue_for_client(client_idx) {
+                        Some(venue) => {
+                            if envelope
+                                .intent
+                                .target_venue
+                                .is_some_and(|target| target != venue)
+                            {
+                                let reject_event = ExecutionEvent::OrderReject {
+                                    order_id: OrderId(envelope.client_order_id.clone()),
+                                    reason: "simulated execution target venue does not match selected client"
+                                        .to_string(),
+                                    timestamp: now_micros(),
+                                };
+                                self.queues.send_event_reliable(reject_event).await;
+                                self.stats.orders_failed += 1;
+                                continue;
+                            }
+                            envelope.account_id =
+                                Some(AccountId(format!("simulated-venue:{}", venue.0)));
+                            Some(client_idx)
+                        }
+                        None => {
+                            let reject_event = ExecutionEvent::OrderReject {
+                                order_id: OrderId(envelope.client_order_id.clone()),
+                                reason: "simulated execution client lacks a unique venue identity"
+                                    .to_string(),
+                                timestamp: now_micros(),
+                            };
+                            self.queues.send_event_reliable(reject_event).await;
+                            self.stats.orders_failed += 1;
+                            continue;
+                        }
+                    },
+                    Err(reason) => {
+                        let reject_event = ExecutionEvent::OrderReject {
+                            order_id: OrderId(envelope.client_order_id.clone()),
+                            reason: format!("路由失敗: {reason}"),
+                            timestamp: now_micros(),
+                        };
+                        self.queues.send_event_reliable(reject_event).await;
+                        self.stats.orders_failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let intent = &envelope.intent;
             // Simulation bypasses external admission only; it still carries the canonical account
             // identity through the executable envelope and resulting lifecycle records.
             let account_id = match envelope.account_id.clone() {
@@ -859,7 +913,10 @@ impl ExecutionWorker {
                     self.stats.orders_failed += 1;
                     continue;
                 }
-                _ => match self.select_execution_client(intent) {
+                _ => match simulated_client_idx
+                    .map(Ok)
+                    .unwrap_or_else(|| self.select_execution_client(intent))
+                {
                     Ok(idx) => idx,
                     Err(reason) => {
                         warn!("客戶端選擇失敗: {}", reason);
@@ -2689,6 +2746,7 @@ mod tests {
     #[derive(Default)]
     struct MockExecutionState {
         placed: Vec<Symbol>,
+        placed_accounts: Vec<Option<AccountId>>,
         canceled: Vec<OrderId>,
         open_orders: Vec<OpenOrder>,
         balances: Vec<AccountBalance>,
@@ -2698,6 +2756,7 @@ mod tests {
         finite_stream: bool,
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
         modify_error: bool,
+        simulated: bool,
     }
 
     struct MockExecutionClient {
@@ -2730,6 +2789,18 @@ mod tests {
             }
         }
 
+        async fn place_order_envelope(
+            &mut self,
+            envelope: &OrderIntentEnvelope,
+        ) -> HftResult<OrderId> {
+            self.state
+                .lock()
+                .unwrap()
+                .placed_accounts
+                .push(envelope.account_id.clone());
+            self.place_order(envelope.intent.clone()).await
+        }
+
         async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
             self.state.lock().unwrap().canceled.push(order_id.clone());
             if self.cancel_error {
@@ -2760,6 +2831,10 @@ mod tests {
 
         fn execution_stream_may_complete(&self) -> bool {
             self.state.lock().unwrap().finite_stream
+        }
+
+        fn is_simulated_execution(&self) -> bool {
+            self.state.lock().unwrap().simulated
         }
 
         async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
@@ -3360,7 +3435,10 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         engine_queues
-            .send_intent(create_test_intent("BTCUSDT"))
+            .send_intent(
+                AccountId("replacement-test".to_string()),
+                create_test_intent("BTCUSDT"),
+            )
             .expect("queue intent before ambiguous replacement");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -4025,6 +4103,69 @@ mod tests {
                 ExecutionEvent::OrderReject { reason: mismatched, .. },
             ] if missing == "missing canonical account identity"
                 && mismatched == "account identity does not match selected execution client"
+        ));
+    }
+
+    #[tokio::test]
+    async fn simulated_execution_assigns_a_canonical_local_account_before_submission() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let mut intent = create_test_intent("SIMULATED");
+        intent.target_venue = Some(VenueId::MOCK);
+        engine_queues
+            .send_envelope(OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::default(),
+            ))
+            .expect("queue simulated intent");
+        let mut mismatched_intent = create_test_intent("MISMATCHED_SIMULATED");
+        mismatched_intent.target_venue = Some(VenueId::BYBIT);
+        engine_queues
+            .send_envelope(OrderIntentEnvelope::new(
+                mismatched_intent,
+                ports::OrderIntentLifecycle::default(),
+            ))
+            .expect("queue venue-mismatched simulated intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        let expected = AccountId("simulated-venue:99".to_string());
+        assert_eq!(
+            state.lock().unwrap().placed_accounts,
+            vec![Some(expected.clone())]
+        );
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ExecutionEvent::OrderNew {
+                    account_id: Some(account_id),
+                    venue: Some(VenueId::MOCK),
+                    ..
+                },
+                ExecutionEvent::OrderReject { reason, .. },
+            ] if account_id == &expected
+                && reason == "simulated execution target venue does not match selected client"
         ));
     }
 
