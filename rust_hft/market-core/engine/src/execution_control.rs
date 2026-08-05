@@ -1221,6 +1221,7 @@ mod tests {
             order: OrderRecord {
                 order_id: OrderId("local-only".to_string()),
                 client_order_id: None,
+                account_id: None,
                 symbol: Symbol::new("BTCUSDT"),
                 side: Side::Buy,
                 qty: Quantity::from_f64(1.0).unwrap(),
@@ -1269,6 +1270,7 @@ mod tests {
             order: OrderRecord {
                 order_id: order_id.clone(),
                 client_order_id: Some("client-42".to_string()),
+                account_id: Some(binance_account.clone()),
                 symbol: Symbol::new("BTCUSDT"),
                 side: Side::Buy,
                 qty: Quantity(Decimal::ONE),
@@ -1353,13 +1355,14 @@ mod tests {
         engine.set_order_manager(Box::new(OmsCore::new()));
         engine.set_strategy_account_mapping(HashMap::from([(
             "alpha".to_string(),
-            account_id.clone(),
+            AccountId("wrong-strategy-account".to_string()),
         )]));
         engine.import_oms_state(HashMap::from([(
             order_id.clone(),
             OrderRecord {
                 order_id: order_id.clone(),
                 client_order_id: Some("client-restored-42".to_string()),
+                account_id: Some(account_id.clone()),
                 symbol: Symbol::new("BTCUSDT"),
                 side: Side::Buy,
                 qty: Quantity(Decimal::ONE),
@@ -2053,6 +2056,7 @@ mod tests {
             order: OrderRecord {
                 order_id: OrderId("venue-order-1".to_string()),
                 client_order_id: None,
+                account_id: None,
                 symbol: Symbol::new("123"),
                 side: Side::Buy,
                 qty: Quantity(Decimal::from(3)),
@@ -2106,6 +2110,7 @@ mod tests {
             order: OrderRecord {
                 order_id: order_id.clone(),
                 client_order_id: None,
+                account_id: None,
                 symbol: symbol.clone(),
                 side: Side::Buy,
                 qty: Quantity(Decimal::from(3)),
@@ -2146,6 +2151,7 @@ mod tests {
             order: OrderRecord {
                 order_id: OrderId("unfilled-order".to_string()),
                 client_order_id: None,
+                account_id: None,
                 symbol: Symbol::new("123"),
                 side: Side::Buy,
                 qty: Quantity(Decimal::from(3)),

@@ -614,9 +614,8 @@ impl Engine {
         self.order_account_map
             .extend(state.iter().filter_map(|(order_id, record)| {
                 record
-                    .strategy_id
+                    .account_id
                     .as_ref()
-                    .and_then(|strategy_id| self.strategy_account_mapping.get(strategy_id))
                     .map(|account_id| (order_id.clone(), account_id.clone()))
             }));
         if let Some(om) = &mut self.order_manager {
@@ -918,7 +917,11 @@ impl Engine {
         let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
         lifecycle.timing.intent_emitted_mono_us = Some(monotonic_micros());
         self.apply_intent_execution_limits(&mut lifecycle);
-        let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+        let account_id = self.strategy_account_mapping.get(&intent.strategy_id).cloned();
+        let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+        if let Some(account_id) = account_id {
+            envelope = envelope.with_account_id(account_id);
+        }
         if let Some(queues) = &mut self.execution_queues {
             match queues.send_lifecycle_intent(envelope, now) {
                 Ok(()) => {
@@ -1295,14 +1298,26 @@ impl Engine {
             timestamp,
             venue,
             strategy_id,
+            account_id: event_account_id,
             ..
         } = event
         {
+            let Some(account_id) = event_account_id
+                .clone()
+                .or_else(|| self.order_account_map.get(order_id).cloned())
+            else {
+                warn!(
+                    order_id = %order_id.0,
+                    "ignoring OrderNew without a canonical account identity"
+                );
+                return Ok(());
+            };
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
             if let Some(om) = &mut self.order_manager {
                 om.register_order(ports::RegisterOrderParams {
                     order_id: order_id.clone(),
                     client_order_id: client_order_id.clone(),
+                    account_id: Some(account_id.clone()),
                     symbol: symbol.clone(),
                     side: *side,
                     qty: *quantity,
@@ -1310,11 +1325,8 @@ impl Engine {
                     strategy_id: Some(strategy_id.clone()),
                 });
             }
-            // 記錄訂單所屬帳戶（若有策略對應帳戶）
-            if let Some(account) = self.strategy_account_mapping.get(strategy_id) {
-                self.order_account_map
-                    .insert(order_id.clone(), account.clone());
-            }
+            self.order_account_map
+                .insert(order_id.clone(), account_id);
             if let Some(pm) = &mut self.portfolio_manager {
                 pm.register_order(order_id.clone(), symbol.clone(), *side);
             }
@@ -1582,7 +1594,15 @@ impl Engine {
                 intents_work_buf.extend(intents.into_iter().map(|intent| {
                     let mut lifecycle = ports::OrderIntentLifecycle::default();
                     lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
-                    ports::OrderIntentEnvelope::new(intent, lifecycle)
+                    let account_id = self
+                        .strategy_account_mapping
+                        .get(&intent.strategy_id)
+                        .cloned();
+                    let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+                    if let Some(account_id) = account_id {
+                        envelope = envelope.with_account_id(account_id);
+                    }
+                    envelope
                 }));
             }
 
