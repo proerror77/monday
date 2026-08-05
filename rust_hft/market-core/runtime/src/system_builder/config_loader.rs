@@ -585,6 +585,7 @@ fn convert_risk_config(risk: shared::RiskConfig) -> RiskConfig {
         strategy_overrides: overrides,
         tokenized_securities: TokenizedSecuritiesRiskConfig {
             allow_trading: risk.tokenized_securities.allow_trading,
+            evidence_max_age_us: risk.tokenized_securities.evidence_max_age_us,
             max_notional_per_symbol: risk.tokenized_securities.max_notional_per_symbol,
             max_asset_class_notional: risk.tokenized_securities.max_asset_class_notional,
             min_top_depth_usd: risk.tokenized_securities.min_top_depth_usd,

@@ -198,6 +198,14 @@ pub struct AccountFill {
 /// 帳戶視圖 (策略決策用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountView {
+    /// Account identity supplied by the runtime's account-snapshot publisher.
+    #[serde(default)]
+    pub account_id: Option<AccountId>,
+    /// Runtime-owned bStocks admission evidence keyed by venue, product, and symbol.
+    /// Strategy-supplied `OrderIntent` evidence is never an authorization source.
+    #[serde(default)]
+    pub tokenized_securities_attestations:
+        std::collections::HashMap<InstrumentKey, TokenizedSecuritiesRuntimeAttestation>,
     pub cash_balance: rust_decimal::Decimal,
     pub positions: std::collections::HashMap<Symbol, Position>,
     pub unrealized_pnl: rust_decimal::Decimal,
@@ -215,6 +223,8 @@ pub struct AccountView {
 impl Default for AccountView {
     fn default() -> Self {
         Self {
+            account_id: None,
+            tokenized_securities_attestations: std::collections::HashMap::new(),
             cash_balance: rust_decimal::Decimal::ZERO,
             positions: std::collections::HashMap::new(),
             unrealized_pnl: rust_decimal::Decimal::ZERO,
@@ -225,6 +235,31 @@ impl Default for AccountView {
             session_start_us: 0,
         }
     }
+}
+
+/// Runtime-owned bStocks admission evidence scoped to one account, product, and symbol.
+///
+/// The runtime account-snapshot publisher owns this record. It is intentionally separate from
+/// `OrderIntent::compliance_context`, which strategies can populate and therefore cannot grant
+/// trading authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenizedSecuritiesRuntimeAttestation {
+    pub account_id: AccountId,
+    pub venue: VenueId,
+    pub product_type: ProductType,
+    pub symbol: Symbol,
+    pub source_id: String,
+    pub observed_at: Timestamp,
+    pub jurisdiction: Option<String>,
+    pub account_eligible: bool,
+    pub account_capability: AccountCapability,
+    /// Gross notional for this symbol from the same reconciled account snapshot.
+    pub account_symbol_notional: rust_decimal::Decimal,
+    /// Gross tokenized-security notional from the same reconciled account snapshot.
+    pub account_asset_class_notional: rust_decimal::Decimal,
+    pub corporate_action_active: bool,
+    pub top_depth_usd: rust_decimal::Decimal,
+    pub spread_bps: rust_decimal::Decimal,
 }
 
 impl AccountView {

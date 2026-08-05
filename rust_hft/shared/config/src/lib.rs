@@ -202,6 +202,8 @@ pub struct TokenizedSecuritiesRiskConfig {
     #[serde(default)]
     pub allow_trading: bool,
     #[serde(default)]
+    pub evidence_max_age_us: u64,
+    #[serde(default)]
     pub max_notional_per_symbol: Decimal,
     #[serde(default)]
     pub max_asset_class_notional: Decimal,
