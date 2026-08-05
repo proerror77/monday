@@ -765,6 +765,21 @@ fn execution_account_inspection(
                 client_index: u32::try_from(client.client_index).unwrap_or(u32::MAX),
                 venue: client.venue.map(|venue| venue.to_string()),
                 account_id: client.account_id.map(|account| account.0),
+                asset_inventory_capability: client
+                    .asset_inventory_capability
+                    .map(|capability| match capability {
+                        ports::AssetInventoryCapability::PositionSnapshotRequired => {
+                            infra_ipc::ExecutionAssetInventoryCapability::PositionSnapshotRequired
+                        }
+                        ports::AssetInventoryCapability::AuthoritativeAssetInventory {
+                            product_type,
+                        } => infra_ipc::ExecutionAssetInventoryCapability::AuthoritativeAssetInventory {
+                            product_type: product_type.to_string(),
+                        },
+                        ports::AssetInventoryCapability::Unsupported => {
+                            infra_ipc::ExecutionAssetInventoryCapability::Unsupported
+                        }
+                    }),
                 open_orders: map_required_snapshot(client.open_orders, |order| {
                     infra_ipc::ExecutionOpenOrder {
                         order_id: order.order_id.0,
@@ -788,6 +803,15 @@ fn execution_account_inspection(
                         frozen: balance.frozen,
                         total: balance.total,
                         usd_value: balance.usd_value,
+                    }
+                }),
+                asset_inventory: map_optional_snapshot(client.asset_inventory, |record| {
+                    infra_ipc::ExecutionAssetInventory {
+                        asset: record.asset,
+                        available: record.available,
+                        locked: record.locked,
+                        total: record.total,
+                        usd_value: record.usd_value,
                     }
                 }),
                 positions: map_optional_snapshot(client.positions, |position| {
@@ -1031,6 +1055,7 @@ mod tests {
                 balances: None,
                 positions: None,
                 recent_fills: None,
+                ..Default::default()
             }],
         };
 
@@ -1082,6 +1107,7 @@ mod tests {
                         fee: Some(Decimal::new(1, 3)),
                         timestamp: 123_000,
                     }])),
+                    ..Default::default()
                 },
                 engine::execution_worker::ClientReconcileSnapshot {
                     client_index: 1,
@@ -1091,6 +1117,7 @@ mod tests {
                     balances: None,
                     positions: None,
                     recent_fills: Some(Err(HftError::Network("history unavailable".to_string()))),
+                    ..Default::default()
                 },
             ],
         };

@@ -10,11 +10,13 @@ use crate::execution_queues::WorkerQueues;
 use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
-use hft_core::{now_micros, AccountId, HftError, LatencyStage, OrderId, Price, Quantity};
+use hft_core::{
+    now_micros, AccountId, HftError, LatencyStage, OrderId, Price, ProductType, Quantity,
+};
 use hft_core::{Symbol, VenueId};
 use ports::{
-    AccountBalance, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent,
-    OrderIntentEnvelope,
+    AccountBalance, AssetInventoryCapability, AssetInventoryRecord, ExecutionClient,
+    ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -1847,6 +1849,26 @@ pub struct ClientReconcileSnapshot {
     pub balances: Option<Result<Vec<AccountBalance>, HftError>>,
     pub positions: Option<Result<Vec<ports::Position>, HftError>>,
     pub recent_fills: Option<Result<Vec<ports::AccountFill>, HftError>>,
+    /// Capability and raw asset inventory are carried together so Spot assets cannot be
+    /// mistaken for derivatives positions or accepted without an explicit venue declaration.
+    pub asset_inventory_capability: Option<AssetInventoryCapability>,
+    pub asset_inventory: Option<Result<Vec<AssetInventoryRecord>, HftError>>,
+}
+
+impl Default for ClientReconcileSnapshot {
+    fn default() -> Self {
+        Self {
+            client_index: 0,
+            venue: None,
+            account_id: None,
+            open_orders: Ok(Vec::new()),
+            balances: None,
+            positions: None,
+            recent_fills: None,
+            asset_inventory_capability: None,
+            asset_inventory: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1879,6 +1901,35 @@ impl WorkerReconcileSnapshot {
                         .recent_fills
                         .as_ref()
                         .is_none_or(|fills| fills.is_ok())
+            })
+    }
+
+    pub(crate) fn resolved_asset_inventory_capability(
+        client: &ClientReconcileSnapshot,
+    ) -> AssetInventoryCapability {
+        client
+            .asset_inventory_capability
+            .unwrap_or(AssetInventoryCapability::Unsupported)
+    }
+
+    pub fn account_holdings_complete(&self) -> bool {
+        !self.clients.is_empty()
+            && self.clients.iter().all(|client| {
+                match Self::resolved_asset_inventory_capability(client) {
+                    AssetInventoryCapability::PositionSnapshotRequired => client
+                        .positions
+                        .as_ref()
+                        .is_some_and(|result| result.is_ok()),
+                    AssetInventoryCapability::AuthoritativeAssetInventory {
+                        product_type: ProductType::Spot,
+                    } => client.asset_inventory.as_ref().is_some_and(|result| {
+                        result.as_ref().is_ok_and(|records| {
+                            records.iter().all(|record| record.validate().is_ok())
+                        })
+                    }),
+                    AssetInventoryCapability::AuthoritativeAssetInventory { .. }
+                    | AssetInventoryCapability::Unsupported => false,
+                }
             })
     }
 }
@@ -2090,13 +2141,38 @@ impl ExecutionWorker {
                 }
             }
 
+            let inventory_capability = client.asset_inventory_capability();
             let balances = if include_balances {
                 Some(client.get_balance().await)
             } else {
                 None
             };
-            let positions = if include_positions && client.supports_position_snapshot() {
+            let positions = if include_positions
+                && matches!(
+                    inventory_capability,
+                    AssetInventoryCapability::PositionSnapshotRequired
+                ) {
                 Some(client.get_positions().await)
+            } else {
+                None
+            };
+            let asset_inventory = if include_balances
+                && matches!(
+                    inventory_capability,
+                    AssetInventoryCapability::AuthoritativeAssetInventory {
+                        product_type: ProductType::Spot,
+                    }
+                ) {
+                Some(match balances.as_ref() {
+                    Some(Ok(balances)) => client.asset_inventory_from_balances(balances),
+                    Some(Err(_)) => Err(HftError::Execution(
+                        "authoritative asset inventory is unavailable because the balance snapshot failed"
+                            .to_string(),
+                    )),
+                    None => Err(HftError::Execution(
+                        "authoritative asset inventory requires a balance snapshot".to_string(),
+                    )),
+                })
             } else {
                 None
             };
@@ -2121,6 +2197,8 @@ impl ExecutionWorker {
                 balances,
                 positions,
                 recent_fills,
+                asset_inventory_capability: Some(inventory_capability),
+                asset_inventory,
             });
         }
 
@@ -2147,6 +2225,7 @@ mod tests {
             balances: None,
             positions: None,
             recent_fills: None,
+            ..Default::default()
         };
 
         let one_account = WorkerReconcileSnapshot {
@@ -2256,6 +2335,9 @@ mod tests {
         placed: Vec<Symbol>,
         canceled: Vec<OrderId>,
         open_orders: Vec<OpenOrder>,
+        balances: Vec<AccountBalance>,
+        balance_reads: usize,
+        spot_inventory: bool,
         healthy: Option<bool>,
         finite_stream: bool,
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
@@ -2323,6 +2405,22 @@ mod tests {
             } else {
                 Ok(self.state.lock().unwrap().open_orders.clone())
             }
+        }
+
+        fn asset_inventory_capability(&self) -> AssetInventoryCapability {
+            if self.state.lock().unwrap().spot_inventory {
+                AssetInventoryCapability::AuthoritativeAssetInventory {
+                    product_type: hft_core::ProductType::Spot,
+                }
+            } else {
+                AssetInventoryCapability::Unsupported
+            }
+        }
+
+        async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+            let mut state = self.state.lock().unwrap();
+            state.balance_reads += 1;
+            Ok(state.balances.clone())
         }
 
         async fn connect(&mut self) -> HftResult<()> {
@@ -2907,6 +3005,46 @@ mod tests {
         assert_eq!(snapshot.clients.len(), 1);
         assert!(snapshot.clients[0].open_orders.is_err());
         assert!(!snapshot.is_complete());
+    }
+
+    #[tokio::test]
+    async fn spot_inventory_reuses_the_authoritative_balance_snapshot() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            balances: vec![AccountBalance {
+                asset: "USDT".to_string(),
+                available: rust_decimal::Decimal::from(90),
+                frozen: rust_decimal::Decimal::from(10),
+                total: rust_decimal::Decimal::from(100),
+                usd_value: Some(rust_decimal::Decimal::from(100)),
+            }],
+            spot_inventory: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+
+        let snapshot = worker.collect_reconcile_snapshot(true, true, false).await;
+
+        assert_eq!(state.lock().unwrap().balance_reads, 1);
+        assert!(matches!(
+            snapshot.clients[0].asset_inventory.as_ref(),
+            Some(Ok(inventory))
+                if inventory.len() == 1
+                    && inventory[0].locked == rust_decimal::Decimal::from(10)
+        ));
     }
 
     #[tokio::test]

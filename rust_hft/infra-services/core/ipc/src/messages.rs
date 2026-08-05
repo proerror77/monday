@@ -193,10 +193,21 @@ pub struct ExecutionAccountSnapshot {
     pub client_index: u32,
     pub venue: Option<String>,
     pub account_id: Option<String>,
+    pub asset_inventory_capability: Option<ExecutionAssetInventoryCapability>,
     pub open_orders: AuthoritativeSnapshot<Vec<ExecutionOpenOrder>>,
     pub balances: AuthoritativeSnapshot<Vec<ExecutionBalance>>,
+    pub asset_inventory: AuthoritativeSnapshot<Vec<ExecutionAssetInventory>>,
     pub positions: AuthoritativeSnapshot<Vec<ExecutionPosition>>,
     pub recent_fills: AuthoritativeSnapshot<Vec<ExecutionFill>>,
+}
+
+/// Control-plane representation of the account-holdings contract. Wallet assets are not
+/// represented as derivatives positions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecutionAssetInventoryCapability {
+    PositionSnapshotRequired,
+    AuthoritativeAssetInventory { product_type: String },
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +231,15 @@ pub struct ExecutionBalance {
     pub asset: String,
     pub available: Decimal,
     pub frozen: Decimal,
+    pub total: Decimal,
+    pub usd_value: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionAssetInventory {
+    pub asset: String,
+    pub available: Decimal,
+    pub locked: Decimal,
     pub total: Decimal,
     pub usd_value: Option<Decimal>,
 }

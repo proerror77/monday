@@ -2,8 +2,11 @@ use crate::execution_worker::{
     CancelDispatchReport, CancelScope, CancelTarget, ControlCommand, WorkerReconcileSnapshot,
 };
 use crate::Engine;
-use hft_core::{AccountId, HftError, HftResult, OrderId, Quantity, Symbol, VenueId};
-use ports::{OrderReconciliationReport, OrderRecord, OrderStatus};
+use hft_core::{AccountId, HftError, HftResult, OrderId, ProductType, Quantity, Symbol, VenueId};
+use ports::{
+    AssetInventoryCapability, AssetInventoryRecord, OrderReconciliationReport, OrderRecord,
+    OrderStatus,
+};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,8 +18,32 @@ pub struct RuntimeReconciliationReport {
     pub worker_snapshot: WorkerReconcileSnapshot,
     pub order_report: OrderReconciliationReport,
     pub balance_report: Option<BalanceReconciliationReport>,
+    pub asset_inventory_report: Option<AssetInventoryReconciliationReport>,
     pub position_report: Option<PositionReconciliationReport>,
     pub fill_report: Option<FillReconciliationReport>,
+    pub complete: bool,
+    pub healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetInventoryAmountMismatch {
+    pub asset: String,
+    pub local_available: Decimal,
+    pub exchange_available: Decimal,
+    pub local_locked: Decimal,
+    pub exchange_locked: Decimal,
+    pub local_total: Decimal,
+    pub exchange_total: Decimal,
+    pub local_usd_value: Option<Decimal>,
+    pub exchange_usd_value: Option<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetInventoryReconciliationReport {
+    pub local_only: Vec<String>,
+    pub exchange_only: Vec<String>,
+    pub amount_mismatch: Vec<AssetInventoryAmountMismatch>,
+    pub client_errors: Vec<String>,
     pub complete: bool,
     pub healthy: bool,
 }
@@ -398,34 +425,43 @@ impl ExecutionControlHandle {
             let engine = self.engine.lock().await;
             engine.reconcile_open_orders(&worker_snapshot)
         };
-        let (balance_report, position_report, fill_report) = if include_balances {
-            let engine = self.engine.lock().await;
-            let account_view = engine.get_account_view();
-            let portfolio_state = engine.export_portfolio_state();
-            (
-                Some(reconcile_balances(
-                    &worker_snapshot,
-                    account_view.equity(),
-                    self.balance_tolerance_usd,
-                )),
-                reconcile_positions(&worker_snapshot, &account_view.positions),
-                Some(reconcile_recent_fills(
-                    &worker_snapshot,
-                    &portfolio_state.processed_fill_ids,
-                )),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (balance_report, asset_inventory_report, position_report, fill_report) =
+            if include_balances {
+                let engine = self.engine.lock().await;
+                let account_view = engine.get_account_view();
+                let portfolio_state = engine.export_portfolio_state();
+                let local_account_value =
+                    spot_inventory_account_value(&worker_snapshot, &account_view)
+                        .unwrap_or_else(|| account_view.equity());
+                (
+                    Some(reconcile_balances(
+                        &worker_snapshot,
+                        local_account_value,
+                        self.balance_tolerance_usd,
+                    )),
+                    reconcile_asset_inventory(&worker_snapshot, &account_view),
+                    reconcile_positions(&worker_snapshot, &account_view.positions),
+                    Some(reconcile_recent_fills(
+                        &worker_snapshot,
+                        &portfolio_state.processed_fill_ids,
+                    )),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let complete = worker_snapshot.is_complete()
             && (!include_balances
-                || worker_snapshot.clients.iter().all(|client| {
-                    client.positions.as_ref().is_some_and(Result::is_ok)
-                        && client.recent_fills.as_ref().is_some_and(Result::is_ok)
-                }))
+                || (worker_snapshot.account_holdings_complete()
+                    && worker_snapshot
+                        .clients
+                        .iter()
+                        .all(|client| client.recent_fills.as_ref().is_some_and(Result::is_ok))))
             && balance_report
                 .as_ref()
                 .is_none_or(|balances| balances.complete)
+            && asset_inventory_report
+                .as_ref()
+                .is_none_or(|inventory| inventory.complete)
             && position_report
                 .as_ref()
                 .is_none_or(|positions| positions.complete)
@@ -435,6 +471,9 @@ impl ExecutionControlHandle {
             && balance_report
                 .as_ref()
                 .is_none_or(|balances| balances.healthy)
+            && asset_inventory_report
+                .as_ref()
+                .is_none_or(|inventory| inventory.healthy)
             && position_report
                 .as_ref()
                 .is_none_or(|positions| positions.healthy)
@@ -444,6 +483,7 @@ impl ExecutionControlHandle {
             worker_snapshot,
             order_report,
             balance_report,
+            asset_inventory_report,
             position_report,
             fill_report,
             complete,
@@ -662,6 +702,7 @@ impl ExecutionControlHandle {
         let mut account_view = ports::AccountView {
             account_id: None,
             tokenized_securities_attestations: Default::default(),
+            asset_inventory: Default::default(),
             cash_balance,
             positions,
             unrealized_pnl,
@@ -861,6 +902,204 @@ fn reconcile_recent_fills(
     }
 }
 
+/// Returns the local account value for exactly one, identity-matched Spot wallet.
+///
+/// A Spot asset inventory is a complete wallet representation, so adding the legacy
+/// cash/derivatives value would double count it. Missing or malformed local inventory falls
+/// back to the legacy comparison, while `reconcile_asset_inventory` still denies completeness.
+fn spot_inventory_account_value(
+    snapshot: &WorkerReconcileSnapshot,
+    account_view: &ports::AccountView,
+) -> Option<Decimal> {
+    let [client] = snapshot.clients.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        WorkerReconcileSnapshot::resolved_asset_inventory_capability(client),
+        AssetInventoryCapability::AuthoritativeAssetInventory {
+            product_type: ProductType::Spot,
+        }
+    ) || account_view.account_id.is_none()
+        || client.account_id.as_ref() != account_view.account_id.as_ref()
+    {
+        return None;
+    }
+
+    account_view
+        .asset_inventory
+        .values()
+        .try_fold(Decimal::ZERO, |total, record| {
+            record.validate().ok()?;
+            Some(total + record.usd_value.unwrap_or(Decimal::ZERO))
+        })
+}
+
+fn reconcile_asset_inventory(
+    snapshot: &WorkerReconcileSnapshot,
+    account_view: &ports::AccountView,
+) -> Option<AssetInventoryReconciliationReport> {
+    let mut authoritative_clients = Vec::new();
+    let mut client_errors = std::collections::BTreeSet::new();
+    for client in &snapshot.clients {
+        match WorkerReconcileSnapshot::resolved_asset_inventory_capability(client) {
+            AssetInventoryCapability::AuthoritativeAssetInventory {
+                product_type: ProductType::Spot,
+            } => authoritative_clients.push(client),
+            AssetInventoryCapability::AuthoritativeAssetInventory { .. } => {
+                client_errors.insert(format!(
+                    "client={} declared asset inventory outside the Spot product scope",
+                    client.client_index
+                ));
+            }
+            AssetInventoryCapability::PositionSnapshotRequired => {}
+            AssetInventoryCapability::Unsupported => {
+                client_errors.insert(format!(
+                    "client={} has unsupported or unknown account-holdings capability",
+                    client.client_index
+                ));
+            }
+        }
+    }
+
+    if authoritative_clients.is_empty() && client_errors.is_empty() {
+        return None;
+    }
+    if authoritative_clients.len() > 1 {
+        client_errors.insert(
+            "local asset inventory cannot be scoped across multiple authoritative venue/account clients"
+                .to_string(),
+        );
+    }
+    if account_view.account_id.is_none() {
+        client_errors.insert("local asset inventory has no immutable account identity".to_string());
+    }
+
+    let mut exchange = BTreeMap::<String, AssetInventoryRecord>::new();
+    for client in authoritative_clients {
+        let venue = client
+            .venue
+            .map_or_else(|| "UNKNOWN".to_string(), |venue| venue.to_string());
+        let account = client
+            .account_id
+            .as_ref()
+            .map_or("UNKNOWN", |account| account.0.as_str());
+        if client.venue.is_none() || client.account_id.is_none() {
+            client_errors.insert(format!(
+                "client={} asset inventory is missing immutable venue/product/account mapping (venue={} account={})",
+                client.client_index, venue, account
+            ));
+        }
+        if client.account_id.as_ref() != account_view.account_id.as_ref() {
+            client_errors.insert(format!(
+                "client={} asset inventory account identity does not match the local account",
+                client.client_index
+            ));
+        }
+        let Some(result) = client.asset_inventory.as_ref() else {
+            client_errors.insert(format!(
+                "client={} did not return an authoritative asset inventory",
+                client.client_index
+            ));
+            continue;
+        };
+        let records = match result {
+            Ok(records) => records,
+            Err(error) => {
+                client_errors.insert(format!(
+                    "client={} asset inventory snapshot failed: {error}",
+                    client.client_index
+                ));
+                continue;
+            }
+        };
+        for record in records {
+            if let Err(error) = record.validate() {
+                client_errors.insert(format!(
+                    "client={} malformed asset inventory {}: {error}",
+                    client.client_index, record.asset
+                ));
+                continue;
+            }
+            if exchange
+                .insert(record.asset.clone(), record.clone())
+                .is_some()
+            {
+                client_errors.insert(format!(
+                    "duplicate authoritative asset inventory identity asset={} client={}",
+                    record.asset, client.client_index
+                ));
+            }
+        }
+    }
+
+    for (key, record) in &account_view.asset_inventory {
+        if key != &record.asset {
+            client_errors.insert(format!(
+                "local asset inventory key={} does not match asset identity {}",
+                key, record.asset
+            ));
+        }
+        if let Err(error) = record.validate() {
+            client_errors.insert(format!(
+                "local asset inventory {} is malformed: {error}",
+                key
+            ));
+        }
+    }
+
+    let local = account_view
+        .asset_inventory
+        .iter()
+        .map(|(asset, record)| (asset.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut local_only = Vec::new();
+    let mut exchange_only = Vec::new();
+    let mut amount_mismatch = Vec::new();
+    let mut assets = std::collections::BTreeSet::new();
+    assets.extend(local.keys().cloned());
+    assets.extend(exchange.keys().cloned());
+    for asset in assets {
+        match (local.get(&asset), exchange.get(&asset)) {
+            (Some(_), None) => local_only.push(asset),
+            (None, Some(_)) => exchange_only.push(asset),
+            (Some(local), Some(exchange))
+                if local.available != exchange.available
+                    || local.locked != exchange.locked
+                    || local.total != exchange.total
+                    || local.usd_value != exchange.usd_value =>
+            {
+                amount_mismatch.push(AssetInventoryAmountMismatch {
+                    asset,
+                    local_available: local.available,
+                    exchange_available: exchange.available,
+                    local_locked: local.locked,
+                    exchange_locked: exchange.locked,
+                    local_total: local.total,
+                    exchange_total: exchange.total,
+                    local_usd_value: local.usd_value,
+                    exchange_usd_value: exchange.usd_value,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    local_only.sort();
+    exchange_only.sort();
+    let client_errors = client_errors.into_iter().collect::<Vec<_>>();
+    let complete = client_errors.is_empty();
+    let healthy =
+        complete && local_only.is_empty() && exchange_only.is_empty() && amount_mismatch.is_empty();
+    Some(AssetInventoryReconciliationReport {
+        local_only,
+        exchange_only,
+        amount_mismatch,
+        client_errors,
+        complete,
+        healthy,
+    })
+}
+
 fn reconcile_positions(
     snapshot: &WorkerReconcileSnapshot,
     local_positions: &std::collections::HashMap<Symbol, ports::Position>,
@@ -885,6 +1124,15 @@ fn reconcile_positions(
             "client={} venue={} account={}",
             client.client_index, venue, account
         );
+        let capability = WorkerReconcileSnapshot::resolved_asset_inventory_capability(client);
+        if matches!(
+            capability,
+            AssetInventoryCapability::AuthoritativeAssetInventory {
+                product_type: ProductType::Spot,
+            }
+        ) {
+            continue;
+        }
         let venue_positions = by_venue.entry(client.venue).or_default();
         match &client.positions {
             None => {
@@ -1248,6 +1496,7 @@ mod tests {
                             balances: None,
                             positions: None,
                             recent_fills: None,
+                            ..Default::default()
                         }],
                     })
                     .expect("send reconciliation"),
@@ -1315,6 +1564,7 @@ mod tests {
                                     balances: None,
                                     positions: None,
                                     recent_fills: None,
+                                    ..Default::default()
                                 },
                                 crate::execution_worker::ClientReconcileSnapshot {
                                     client_index: 1,
@@ -1327,6 +1577,7 @@ mod tests {
                                     balances: None,
                                     positions: None,
                                     recent_fills: None,
+                                    ..Default::default()
                                 },
                             ],
                         })
@@ -1406,6 +1657,7 @@ mod tests {
                                 balances: None,
                                 positions: None,
                                 recent_fills: None,
+                                ..Default::default()
                             }],
                         })
                         .expect("send reconciliation"),
@@ -1449,6 +1701,7 @@ mod tests {
                                 balances: None,
                                 positions: None,
                                 recent_fills: None,
+                                ..Default::default()
                             }],
                         })
                         .expect("send reconciliation");
@@ -1492,6 +1745,7 @@ mod tests {
                             balances: None,
                             positions: None,
                             recent_fills: None,
+                            ..Default::default()
                         }],
                     })
                     .expect("send healthy snapshot"),
@@ -1554,6 +1808,7 @@ mod tests {
                             balances: None,
                             positions: None,
                             recent_fills: None,
+                            ..Default::default()
                         }],
                     })
                     .expect("send unhealthy snapshot"),
@@ -1599,6 +1854,137 @@ mod tests {
         }
     }
 
+    fn asset(asset: &str, available: i64, locked: i64) -> AssetInventoryRecord {
+        AssetInventoryRecord {
+            asset: asset.to_string(),
+            available: Decimal::from(available),
+            locked: Decimal::from(locked),
+            total: Decimal::from(available + locked),
+            usd_value: Some(Decimal::from(available + locked)),
+        }
+    }
+
+    fn spot_inventory_snapshot(
+        inventory: Vec<AssetInventoryRecord>,
+        venue: Option<VenueId>,
+        account_id: Option<&str>,
+    ) -> WorkerReconcileSnapshot {
+        WorkerReconcileSnapshot {
+            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                client_index: 0,
+                venue,
+                account_id: account_id.map(|value| AccountId(value.to_string())),
+                open_orders: Ok(Vec::new()),
+                balances: Some(Ok(Vec::new())),
+                positions: None,
+                recent_fills: Some(Ok(Vec::new())),
+                asset_inventory_capability: Some(
+                    AssetInventoryCapability::AuthoritativeAssetInventory {
+                        product_type: hft_core::ProductType::Spot,
+                    },
+                ),
+                asset_inventory: Some(Ok(inventory)),
+            }],
+        }
+    }
+
+    #[test]
+    fn spot_asset_inventory_reconciliation_accepts_complete_receipt() {
+        let account_id = AccountId("bybit-main".to_string());
+        let mut account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            ..Default::default()
+        };
+        account
+            .asset_inventory
+            .insert("USDT".to_string(), asset("USDT", 90, 10));
+        let snapshot = spot_inventory_snapshot(
+            vec![asset("USDT", 90, 10)],
+            Some(VenueId::BYBIT),
+            Some("bybit-main"),
+        );
+        let report = reconcile_asset_inventory(&snapshot, &account).expect("Spot inventory report");
+
+        assert!(report.complete);
+        assert!(report.healthy);
+        assert!(report.amount_mismatch.is_empty());
+        assert_eq!(account.equity(), Decimal::ZERO);
+        assert_eq!(
+            spot_inventory_account_value(&snapshot, &account),
+            Some(Decimal::from(100))
+        );
+    }
+
+    #[test]
+    fn spot_asset_inventory_reconciliation_detects_amount_mismatch() {
+        let mut account = ports::AccountView {
+            account_id: Some(AccountId("bybit-main".to_string())),
+            ..Default::default()
+        };
+        account
+            .asset_inventory
+            .insert("USDT".to_string(), asset("USDT", 90, 10));
+        let mut exchange = asset("USDT", 89, 11);
+        exchange.usd_value = Some(Decimal::from(101));
+        let report = reconcile_asset_inventory(
+            &spot_inventory_snapshot(vec![exchange], Some(VenueId::BYBIT), Some("bybit-main")),
+            &account,
+        )
+        .expect("Spot inventory report");
+
+        assert!(report.complete);
+        assert!(!report.healthy);
+        assert_eq!(report.amount_mismatch.len(), 1);
+        assert_eq!(
+            report.amount_mismatch[0].exchange_usd_value,
+            Some(Decimal::from(101))
+        );
+    }
+
+    #[test]
+    fn spot_asset_inventory_reconciliation_rejects_missing_immutable_mapping() {
+        let report = reconcile_asset_inventory(
+            &spot_inventory_snapshot(vec![asset("USDT", 1, 0)], None, Some("bybit-main")),
+            &ports::AccountView::default(),
+        )
+        .expect("Spot inventory report");
+
+        assert!(!report.complete);
+        assert!(!report.healthy);
+        assert!(report
+            .client_errors
+            .iter()
+            .any(|error| error.contains("immutable venue/product/account mapping")));
+        assert!(report
+            .client_errors
+            .iter()
+            .any(|error| error.contains("no immutable account identity")));
+    }
+
+    #[test]
+    fn unsupported_or_unknown_asset_inventory_is_never_complete() {
+        let snapshot = WorkerReconcileSnapshot {
+            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                client_index: 0,
+                venue: Some(VenueId::BYBIT),
+                account_id: Some(AccountId("bybit-main".to_string())),
+                open_orders: Ok(Vec::new()),
+                positions: Some(Ok(Vec::new())),
+                ..Default::default()
+            }],
+        };
+        let report = reconcile_asset_inventory(&snapshot, &ports::AccountView::default())
+            .expect("unsupported capability report");
+
+        assert!(matches!(
+            WorkerReconcileSnapshot::resolved_asset_inventory_capability(&snapshot.clients[0]),
+            AssetInventoryCapability::Unsupported
+        ));
+        assert!(!snapshot.account_holdings_complete());
+        assert!(!report.complete);
+        assert!(!report.healthy);
+    }
+
     async fn reconcile_with_balances(
         engine: Arc<Mutex<Engine>>,
         balances: Result<Vec<AccountBalance>, HftError>,
@@ -1627,6 +2013,10 @@ mod tests {
                                 balances: Some(balances),
                                 positions: Some(Ok(Vec::new())),
                                 recent_fills: Some(Ok(Vec::new())),
+                                asset_inventory_capability: Some(
+                                    AssetInventoryCapability::PositionSnapshotRequired,
+                                ),
+                                ..Default::default()
                             }],
                         })
                         .expect("send reconciliation");
@@ -1718,6 +2108,7 @@ mod tests {
                     fee: None,
                     timestamp: 1,
                 }])),
+                ..Default::default()
             }],
         };
 
@@ -1751,6 +2142,7 @@ mod tests {
                             balances: Some(Ok(Vec::new())),
                             positions: None,
                             recent_fills: None,
+                            ..Default::default()
                         }],
                     })
                     .expect("send reconciliation"),
@@ -1809,6 +2201,7 @@ mod tests {
                     },
                 ])),
                 recent_fills: None,
+                ..Default::default()
             }],
         };
 
@@ -1844,6 +2237,7 @@ mod tests {
                     balances: None,
                     positions: Some(Ok(Vec::new())),
                     recent_fills: None,
+                    ..Default::default()
                 },
                 crate::execution_worker::ClientReconcileSnapshot {
                     client_index: 1,
@@ -1853,6 +2247,7 @@ mod tests {
                     balances: None,
                     positions: None,
                     recent_fills: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -1892,6 +2287,7 @@ mod tests {
                     balances: None,
                     positions: Some(Ok(Vec::new())),
                     recent_fills: None,
+                    ..Default::default()
                 },
                 crate::execution_worker::ClientReconcileSnapshot {
                     client_index: 1,
@@ -1901,6 +2297,7 @@ mod tests {
                     balances: None,
                     positions: None,
                     recent_fills: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -1978,6 +2375,7 @@ mod tests {
                     fee: None,
                     timestamp: 1,
                 }])),
+                ..Default::default()
             }],
         }
     }
