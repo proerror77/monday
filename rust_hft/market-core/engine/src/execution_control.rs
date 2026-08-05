@@ -2,7 +2,7 @@ use crate::execution_worker::{
     CancelDispatchReport, CancelScope, CancelTarget, ControlCommand, WorkerReconcileSnapshot,
 };
 use crate::Engine;
-use hft_core::{AccountId, HftError, HftResult, OrderId, Quantity, Symbol, VenueId};
+use hft_core::{AccountId, HftError, HftResult, OrderId, ProductType, Quantity, Symbol, VenueId};
 use ports::{
     AssetInventoryCapability, AssetInventoryRecord, OrderReconciliationReport, OrderRecord,
     OrderStatus,
@@ -34,6 +34,8 @@ pub struct AssetInventoryAmountMismatch {
     pub exchange_locked: Decimal,
     pub local_total: Decimal,
     pub exchange_total: Decimal,
+    pub local_usd_value: Option<Decimal>,
+    pub exchange_usd_value: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,10 +430,15 @@ impl ExecutionControlHandle {
                 let engine = self.engine.lock().await;
                 let account_view = engine.get_account_view();
                 let portfolio_state = engine.export_portfolio_state();
+                let local_account_value = spot_inventory_account_value(
+                    &worker_snapshot,
+                    &account_view,
+                )
+                .unwrap_or_else(|| account_view.equity());
                 (
                     Some(reconcile_balances(
                         &worker_snapshot,
-                        account_view.equity(),
+                        local_account_value,
                         self.balance_tolerance_usd,
                     )),
                     reconcile_asset_inventory(&worker_snapshot, &account_view),
@@ -897,6 +904,38 @@ fn reconcile_recent_fills(
     }
 }
 
+/// Returns the local account value for exactly one, identity-matched Spot wallet.
+///
+/// A Spot asset inventory is a complete wallet representation, so adding the legacy
+/// cash/derivatives value would double count it. Missing or malformed local inventory falls
+/// back to the legacy comparison, while `reconcile_asset_inventory` still denies completeness.
+fn spot_inventory_account_value(
+    snapshot: &WorkerReconcileSnapshot,
+    account_view: &ports::AccountView,
+) -> Option<Decimal> {
+    let [client] = snapshot.clients.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        WorkerReconcileSnapshot::resolved_asset_inventory_capability(client),
+        AssetInventoryCapability::AuthoritativeAssetInventory {
+            product_type: ProductType::Spot,
+        }
+    ) || account_view.account_id.is_none()
+        || client.account_id.as_ref() != account_view.account_id.as_ref()
+    {
+        return None;
+    }
+
+    account_view
+        .asset_inventory
+        .values()
+        .try_fold(Decimal::ZERO, |total, record| {
+            record.validate().ok()?;
+            Some(total + record.usd_value.unwrap_or(Decimal::ZERO))
+        })
+}
+
 fn reconcile_asset_inventory(
     snapshot: &WorkerReconcileSnapshot,
     account_view: &ports::AccountView,
@@ -905,8 +944,16 @@ fn reconcile_asset_inventory(
     let mut client_errors = std::collections::BTreeSet::new();
     for client in &snapshot.clients {
         match WorkerReconcileSnapshot::resolved_asset_inventory_capability(client) {
-            AssetInventoryCapability::AuthoritativeAssetInventory { .. } => {
+            AssetInventoryCapability::AuthoritativeAssetInventory {
+                product_type: ProductType::Spot,
+            } => {
                 authoritative_clients.push(client)
+            }
+            AssetInventoryCapability::AuthoritativeAssetInventory { .. } => {
+                client_errors.insert(format!(
+                    "client={} declared asset inventory outside the Spot product scope",
+                    client.client_index
+                ));
             }
             AssetInventoryCapability::PositionSnapshotRequired => {}
             AssetInventoryCapability::Unsupported => {
@@ -923,9 +970,12 @@ fn reconcile_asset_inventory(
     }
     if authoritative_clients.len() > 1 {
         client_errors.insert(
-            "local asset inventory is not scoped to multiple authoritative venue/account clients"
+            "local asset inventory cannot be scoped across multiple authoritative venue/account clients"
                 .to_string(),
         );
+    }
+    if account_view.account_id.is_none() {
+        client_errors.insert("local asset inventory has no immutable account identity".to_string());
     }
 
     let mut exchange = BTreeMap::<String, AssetInventoryRecord>::new();
@@ -943,11 +993,7 @@ fn reconcile_asset_inventory(
                 client.client_index, venue, account
             ));
         }
-        if account_view
-            .account_id
-            .as_ref()
-            .is_some_and(|local| client.account_id.as_ref() != Some(local))
-        {
+        if client.account_id.as_ref() != account_view.account_id.as_ref() {
             client_errors.insert(format!(
                 "client={} asset inventory account identity does not match the local account",
                 client.client_index
@@ -1023,7 +1069,8 @@ fn reconcile_asset_inventory(
             (Some(local), Some(exchange))
                 if local.available != exchange.available
                     || local.locked != exchange.locked
-                    || local.total != exchange.total =>
+                    || local.total != exchange.total
+                    || local.usd_value != exchange.usd_value =>
             {
                 amount_mismatch.push(AssetInventoryAmountMismatch {
                     asset,
@@ -1033,6 +1080,8 @@ fn reconcile_asset_inventory(
                     exchange_locked: exchange.locked,
                     local_total: local.total,
                     exchange_total: exchange.total,
+                    local_usd_value: local.usd_value,
+                    exchange_usd_value: exchange.usd_value,
                 });
             }
             _ => {}
@@ -1082,7 +1131,9 @@ fn reconcile_positions(
         let capability = WorkerReconcileSnapshot::resolved_asset_inventory_capability(client);
         if matches!(
             capability,
-            AssetInventoryCapability::AuthoritativeAssetInventory { .. }
+            AssetInventoryCapability::AuthoritativeAssetInventory {
+                product_type: ProductType::Spot,
+            }
         ) {
             continue;
         }
@@ -1851,30 +1902,38 @@ mod tests {
         account
             .asset_inventory
             .insert("USDT".to_string(), asset("USDT", 90, 10));
-        let report = reconcile_asset_inventory(
-            &spot_inventory_snapshot(
-                vec![asset("USDT", 90, 10)],
-                Some(VenueId::BYBIT),
-                Some("bybit-main"),
-            ),
-            &account,
-        )
-        .expect("Spot inventory report");
+        let snapshot = spot_inventory_snapshot(
+            vec![asset("USDT", 90, 10)],
+            Some(VenueId::BYBIT),
+            Some("bybit-main"),
+        );
+        let report =
+            reconcile_asset_inventory(&snapshot, &account).expect("Spot inventory report");
 
         assert!(report.complete);
         assert!(report.healthy);
         assert!(report.amount_mismatch.is_empty());
+        assert_eq!(account.equity(), Decimal::ZERO);
+        assert_eq!(
+            spot_inventory_account_value(&snapshot, &account),
+            Some(Decimal::from(100))
+        );
     }
 
     #[test]
     fn spot_asset_inventory_reconciliation_detects_amount_mismatch() {
-        let mut account = ports::AccountView::default();
+        let mut account = ports::AccountView {
+            account_id: Some(AccountId("bybit-main".to_string())),
+            ..Default::default()
+        };
         account
             .asset_inventory
             .insert("USDT".to_string(), asset("USDT", 90, 10));
+        let mut exchange = asset("USDT", 89, 11);
+        exchange.usd_value = Some(Decimal::from(101));
         let report = reconcile_asset_inventory(
             &spot_inventory_snapshot(
-                vec![asset("USDT", 89, 11)],
+                vec![exchange],
                 Some(VenueId::BYBIT),
                 Some("bybit-main"),
             ),
@@ -1885,6 +1944,10 @@ mod tests {
         assert!(report.complete);
         assert!(!report.healthy);
         assert_eq!(report.amount_mismatch.len(), 1);
+        assert_eq!(
+            report.amount_mismatch[0].exchange_usd_value,
+            Some(Decimal::from(101))
+        );
     }
 
     #[test]
@@ -1901,23 +1964,31 @@ mod tests {
             .client_errors
             .iter()
             .any(|error| error.contains("immutable venue/product/account mapping")));
+        assert!(report
+            .client_errors
+            .iter()
+            .any(|error| error.contains("no immutable account identity")));
     }
 
     #[test]
-    fn unsupported_asset_inventory_is_never_complete() {
+    fn unsupported_or_unknown_asset_inventory_is_never_complete() {
         let snapshot = WorkerReconcileSnapshot {
             clients: vec![crate::execution_worker::ClientReconcileSnapshot {
                 client_index: 0,
                 venue: Some(VenueId::BYBIT),
                 account_id: Some(AccountId("bybit-main".to_string())),
                 open_orders: Ok(Vec::new()),
-                asset_inventory_capability: Some(AssetInventoryCapability::Unsupported),
+                positions: Some(Ok(Vec::new())),
                 ..Default::default()
             }],
         };
         let report = reconcile_asset_inventory(&snapshot, &ports::AccountView::default())
             .expect("unsupported capability report");
 
+        assert!(matches!(
+            WorkerReconcileSnapshot::resolved_asset_inventory_capability(&snapshot.clients[0]),
+            AssetInventoryCapability::Unsupported
+        ));
         assert!(!snapshot.account_holdings_complete());
         assert!(!report.complete);
         assert!(!report.healthy);
@@ -1951,6 +2022,9 @@ mod tests {
                                 balances: Some(balances),
                                 positions: Some(Ok(Vec::new())),
                                 recent_fills: Some(Ok(Vec::new())),
+                                asset_inventory_capability: Some(
+                                    AssetInventoryCapability::PositionSnapshotRequired,
+                                ),
                                 ..Default::default()
                             }],
                         })

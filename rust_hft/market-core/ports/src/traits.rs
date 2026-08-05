@@ -147,11 +147,16 @@ pub trait ExecutionClient: Send + Sync {
         }
     }
 
-    /// Fetches the authoritative asset-level inventory declared by the client capability.
-    async fn get_asset_inventory(&self) -> HftResult<Vec<AssetInventoryRecord>> {
-        self.get_balance()
-            .await?
-            .into_iter()
+    /// Converts one authoritative wallet snapshot into the declared asset-level inventory.
+    /// The worker passes the same snapshot used for balance reconciliation so a receipt never
+    /// combines two wallet reads.
+    fn asset_inventory_from_balances(
+        &self,
+        balances: &[AccountBalance],
+    ) -> HftResult<Vec<AssetInventoryRecord>> {
+        balances
+            .iter()
+            .cloned()
             .map(AssetInventoryRecord::try_from)
             .collect()
     }

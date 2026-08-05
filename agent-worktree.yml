@@ -2,7 +2,7 @@ owner: codex
 contract: bybit-spot-asset-inventory-707
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/bybit-spot-asset-inventory-707
 branch: codex/bybit-spot-asset-inventory-707
-base_sha: 4484dd4f62a829e1140cffa090fa67bdc11a8932
+base_sha: 007393fc7ffa927cfb5ea11a65726126dca36fa2
 scope:
   - rust_hft/market-core/ports/src/traits.rs
   - rust_hft/market-core/engine/src/execution_worker.rs
