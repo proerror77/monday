@@ -895,7 +895,10 @@ real_market_segment_preflight() {
       source_uuid=$candidate_uuid
     fi
   done
-  [[ -n $source_path && -f $source_path && ! -L $source_path ]] || return 1
+  if [[ -z $source_path || ! -f $source_path || -L $source_path ]]; then
+    printf 'real market preflight found no eligible closed market segment\n' >&2
+    return 1
+  fi
   source_file="$spool/$source_name"
   source_tmp="$source_file.tmp"
   for _ in 1 2 3; do
@@ -1564,7 +1567,7 @@ real_market_preflight_json=
 real_market_preflight_json=$(run_budgeted_real_market_preflight \
   "$MARKET_SPOOL" "$market_shadow_spool" "$market_preflight_download_dir" \
   "$evidence_dir") \
-  || die 'candidate rejected a real production closed market segment before shadow startup'
+  || die 'real production closed-market preflight failed before shadow startup'
 market_upload_json=$(jq -c '.upload_summary' <<<"$real_market_preflight_json") \
   || die 'real market preflight upload summary is invalid'
 market_uploaded_segments=$(jq -er '.uploaded_segments' <<<"$market_upload_json") \
