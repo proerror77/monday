@@ -381,6 +381,7 @@ impl ExecutionWorker {
                 || balance.available < rust_decimal::Decimal::ZERO
                 || balance.frozen < rust_decimal::Decimal::ZERO
                 || balance.total < rust_decimal::Decimal::ZERO
+                || balance.available + balance.frozen != balance.total
                 || balance
                     .usd_value
                     .is_some_and(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
@@ -4187,6 +4188,7 @@ mod tests {
         let limited = AccountId("limited-admission".to_string());
         let incomplete = AccountId("incomplete-admission".to_string());
         let malformed_asset = AccountId("malformed-asset-admission".to_string());
+        let inconsistent_asset = AccountId("inconsistent-asset-admission".to_string());
         let venue_mismatch = AccountId("venue-mismatch-admission".to_string());
         let environment_mismatch = AccountId("environment-mismatch-admission".to_string());
         let product_mismatch = AccountId("product-mismatch-admission".to_string());
@@ -4199,6 +4201,7 @@ mod tests {
             (&limited, "LIMITED"),
             (&incomplete, "INCOMPLETE"),
             (&malformed_asset, "MALFORMED_ASSET"),
+            (&inconsistent_asset, "INCONSISTENT_ASSET"),
             (&venue_mismatch, "VENUE_MISMATCH"),
             (&environment_mismatch, "ENVIRONMENT_MISMATCH"),
             (&product_mismatch, "PRODUCT_MISMATCH"),
@@ -4266,6 +4269,15 @@ mod tests {
             .balances[0]
             .usd_value = Some(-rust_decimal::Decimal::ONE);
 
+        bind_ready_spot_admission(&mut worker, inconsistent_asset.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&inconsistent_asset)
+            .expect("inconsistent-asset admission")
+            .readback
+            .balances[0]
+            .total = rust_decimal::Decimal::ONE;
+
         bind_ready_spot_admission(&mut worker, venue_mismatch.clone(), 0, VenueId::BYBIT);
         worker
             .account_admissions
@@ -4311,6 +4323,7 @@ mod tests {
                 "account kill switch is active",
                 "account order-notional limit exceeded",
                 "account admission has no externally read-back assets",
+                "account admission has malformed externally read-back assets",
                 "account admission has malformed externally read-back assets",
                 "account admission venue does not match selected execution client",
                 "account admission environment does not match execution client",
