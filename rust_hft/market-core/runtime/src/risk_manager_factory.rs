@@ -110,7 +110,6 @@ impl RiskManagerFactory {
         Box::new(TokenizedSecuritiesRiskManager::new(
             strategy_aware,
             system_risk_config.tokenized_securities.clone(),
-            system_risk_config.staleness_threshold_us,
         ))
     }
 
@@ -264,19 +263,16 @@ const BINANCE_BSTOCKS_EVIDENCE_SOURCE: &str = "licensed-reference-feed";
 pub struct TokenizedSecuritiesRiskManager {
     base_risk_manager: Box<dyn RiskManager>,
     config: TokenizedSecuritiesRiskConfig,
-    evidence_max_age_us: u64,
 }
 
 impl TokenizedSecuritiesRiskManager {
     pub fn new(
         base_risk_manager: Box<dyn RiskManager>,
         config: TokenizedSecuritiesRiskConfig,
-        evidence_max_age_us: u64,
     ) -> Self {
         Self {
             base_risk_manager,
             config,
-            evidence_max_age_us,
         }
     }
 
@@ -354,7 +350,8 @@ impl TokenizedSecuritiesRiskManager {
         if !self.config.freeze_on_corporate_action {
             return Err("corporate-action freeze is not enabled");
         }
-        if self.config.max_notional_per_symbol <= Decimal::ZERO
+        if self.config.evidence_max_age_us == 0
+            || self.config.max_notional_per_symbol <= Decimal::ZERO
             || self.config.max_asset_class_notional <= Decimal::ZERO
             || self.config.min_top_depth_usd <= Decimal::ZERO
             || self.config.max_spread_bps <= Decimal::ZERO
@@ -395,7 +392,7 @@ impl TokenizedSecuritiesRiskManager {
 
         let now = hft_core::now_micros();
         if attestation.observed_at > now
-            || now.saturating_sub(attestation.observed_at) > self.evidence_max_age_us
+            || now.saturating_sub(attestation.observed_at) > self.config.evidence_max_age_us
         {
             return Err("attestation is stale or future dated");
         }
@@ -403,17 +400,24 @@ impl TokenizedSecuritiesRiskManager {
         let jurisdiction = attestation
             .jurisdiction
             .as_deref()
-            .filter(|jurisdiction| !jurisdiction.trim().is_empty())
+            .map(str::trim)
+            .filter(|jurisdiction| !jurisdiction.is_empty())
             .ok_or("attestation jurisdiction is unknown")?;
         if self
             .config
             .restricted_jurisdictions
             .iter()
-            .any(|restricted| restricted.eq_ignore_ascii_case(jurisdiction))
+            .any(|restricted| restricted.trim().eq_ignore_ascii_case(jurisdiction))
         {
             return Err("attestation jurisdiction is restricted");
         }
-        if attestation.account_capability.jurisdiction.as_deref() != Some(jurisdiction) {
+        if attestation
+            .account_capability
+            .jurisdiction
+            .as_deref()
+            .map(str::trim)
+            != Some(jurisdiction)
+        {
             return Err("account jurisdiction does not match attestation");
         }
         let kyc_level = attestation
@@ -829,6 +833,7 @@ mod tests {
             strategy_overrides: HashMap::new(),
             tokenized_securities: TokenizedSecuritiesRiskConfig {
                 allow_trading: true,
+                evidence_max_age_us: 60_000_000,
                 max_notional_per_symbol: Decimal::from(1_000),
                 max_asset_class_notional: Decimal::from(2_000),
                 min_top_depth_usd: Decimal::from(10_000),
@@ -955,6 +960,27 @@ mod tests {
             "restricted jurisdiction"
         );
 
+        let mut padded_restricted_jurisdiction = valid_attestation.clone();
+        padded_restricted_jurisdiction.jurisdiction = Some(" US ".to_string());
+        padded_restricted_jurisdiction
+            .account_capability
+            .jurisdiction = Some(" US ".to_string());
+        assert!(
+            review(Some(padded_restricted_jurisdiction)).is_empty(),
+            "whitespace must not bypass restricted jurisdiction"
+        );
+
+        let mut padded_allowed_jurisdiction = valid_attestation.clone();
+        padded_allowed_jurisdiction.jurisdiction = Some(" AE ".to_string());
+        padded_allowed_jurisdiction.account_capability.jurisdiction = Some(" AE ".to_string());
+        let padded_allowed = review(Some(padded_allowed_jurisdiction));
+        assert_eq!(padded_allowed.len(), 1);
+        assert_eq!(
+            padded_allowed[0].compliance_context.jurisdiction.as_deref(),
+            Some("AE"),
+            "runtime context must emit the normalized jurisdiction"
+        );
+
         let mut unknown_jurisdiction = valid_attestation.clone();
         unknown_jurisdiction.jurisdiction = None;
         unknown_jurisdiction.account_capability.jurisdiction = None;
@@ -987,6 +1013,41 @@ mod tests {
         let mut wide_spread = valid_attestation.clone();
         wide_spread.spread_bps = Decimal::from(11);
         assert!(review(Some(wide_spread)).is_empty(), "wide spread");
+
+        let mut negative_symbol_exposure = valid_attestation.clone();
+        negative_symbol_exposure.account_symbol_notional = Decimal::from(-1);
+        assert!(
+            review(Some(negative_symbol_exposure)).is_empty(),
+            "negative symbol exposure"
+        );
+
+        let mut negative_asset_class_exposure = valid_attestation.clone();
+        negative_asset_class_exposure.account_asset_class_notional = Decimal::from(-1);
+        assert!(
+            review(Some(negative_asset_class_exposure)).is_empty(),
+            "negative asset-class exposure"
+        );
+
+        let mut unpriced_intent = intent.clone();
+        unpriced_intent.price = None;
+        let unpriced_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                valid_attestation.clone(),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
+                .review_with_venue_specs(
+                    vec![unpriced_intent],
+                    &unpriced_account,
+                    &specs,
+                )
+                .is_empty(),
+            "unpriced tokenized intent"
+        );
 
         let mut symbol_near_limit = valid_attestation.clone();
         symbol_near_limit.account_symbol_notional = Decimal::from(950);
@@ -1024,6 +1085,35 @@ mod tests {
             "cumulative batch notional must not exceed the symbol cap"
         );
 
+        let mut second_intent = intent.clone();
+        second_intent.symbol = Symbol::new("AAPLUSDT");
+        let second_key = InstrumentKey::tokenized_security_spot(
+            second_intent.symbol.clone(),
+            VenueId::BINANCE_TOKENIZED_SECURITIES,
+        );
+        let mut inconsistent_asset_class_attestation = valid_attestation.clone();
+        inconsistent_asset_class_attestation.symbol = second_intent.symbol.clone();
+        inconsistent_asset_class_attestation.account_asset_class_notional = Decimal::ONE;
+        let inconsistent_asset_class_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([
+                (attestation_key.clone(), valid_attestation.clone()),
+                (second_key, inconsistent_asset_class_attestation),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
+                .review_with_venue_specs(
+                    vec![intent.clone(), second_intent],
+                    &inconsistent_asset_class_account,
+                    &specs,
+                )
+                .len(),
+            1,
+            "batch attestation must agree on asset-class exposure"
+        );
+
         let non_tokenized = ports::OrderIntent::crypto_spot(
             Symbol::new("BTCUSDT"),
             Side::Buy,
@@ -1047,13 +1137,115 @@ mod tests {
             1
         );
 
-        drop(review);
+        let no_corporate_action_freeze = SystemRiskConfig {
+            tokenized_securities: TokenizedSecuritiesRiskConfig {
+                freeze_on_corporate_action: false,
+                ..risk_config.tokenized_securities.clone()
+            },
+            ..risk_config.clone()
+        };
+        let no_corporate_action_freeze_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                valid_attestation.clone(),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&no_corporate_action_freeze)
+                .review_with_venue_specs(
+                    vec![intent.clone()],
+                    &no_corporate_action_freeze_account,
+                    &specs,
+                )
+                .is_empty(),
+            "corporate-action freeze must be configured"
+        );
+
+        let unconfigured_limit = SystemRiskConfig {
+            tokenized_securities: TokenizedSecuritiesRiskConfig {
+                min_top_depth_usd: Decimal::ZERO,
+                ..risk_config.tokenized_securities.clone()
+            },
+            ..risk_config.clone()
+        };
+        let unconfigured_limit_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                valid_attestation.clone(),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&unconfigured_limit)
+                .review_with_venue_specs(
+                    vec![intent.clone()],
+                    &unconfigured_limit_account,
+                    &specs,
+                )
+                .is_empty(),
+            "all tokenized limits must be configured"
+        );
+
+        let unconfigured_evidence_age = SystemRiskConfig {
+            tokenized_securities: TokenizedSecuritiesRiskConfig {
+                evidence_max_age_us: 0,
+                ..risk_config.tokenized_securities.clone()
+            },
+            ..risk_config.clone()
+        };
+        let unconfigured_evidence_age_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                valid_attestation.clone(),
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&unconfigured_evidence_age)
+                .review_with_venue_specs(
+                    vec![intent.clone()],
+                    &unconfigured_evidence_age_account,
+                    &specs,
+                )
+                .is_empty(),
+            "attestation freshness limit must be configured"
+        );
+
+        let independent_evidence_age = SystemRiskConfig {
+            staleness_threshold_us: u64::MAX,
+            ..risk_config.clone()
+        };
+        let mut stale_with_fresh_market_data = valid_attestation.clone();
+        stale_with_fresh_market_data.observed_at = now.saturating_sub(60_000_001);
+        let stale_with_fresh_market_data_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                stale_with_fresh_market_data,
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            RiskManagerFactory::create_strategy_aware_risk_manager(&independent_evidence_age)
+                .review_with_venue_specs(
+                    vec![intent.clone()],
+                    &stale_with_fresh_market_data_account,
+                    &specs,
+                )
+                .is_empty(),
+            "market-data staleness must not extend attestation freshness"
+        );
+
         let disabled_config = SystemRiskConfig {
             tokenized_securities: TokenizedSecuritiesRiskConfig {
                 allow_trading: false,
                 ..risk_config.tokenized_securities.clone()
             },
-            ..risk_config
+            ..risk_config.clone()
         };
         let disabled_account = ports::AccountView {
             account_id: Some(account_id),
