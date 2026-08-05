@@ -730,6 +730,7 @@ jobs:
           test "$actual_source_revision" = "$SOURCE_REVISION"
           docker run --rm --network none --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=16g \
+            --tmpfs /tmp/monday-source-test-target:rw,exec,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=16g \
             "$IMAGE" "$TEST_PROFILE"
 
       - name: Push verified source-test image
