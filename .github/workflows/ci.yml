@@ -210,6 +210,7 @@ jobs:
         if: needs.scope.outputs.control == 'true'
         run: |
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
+          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
