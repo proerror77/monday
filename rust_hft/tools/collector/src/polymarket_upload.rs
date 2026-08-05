@@ -4396,7 +4396,7 @@ mod tests {
     }
 
     #[test]
-    fn new_remote_triplet_is_no_clobber_uploaded_then_read_back() {
+    fn new_remote_triplet_reads_data_and_manifest_before_publishing_success() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
         }
@@ -4408,9 +4408,25 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
+        let manifest_name = artifacts
+            .manifest
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let success_name = artifacts
+            .success
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let mut remote = BTreeMap::<String, Vec<u8>>::new();
         let mut uploads = 0;
         let mut downloads = 0;
+        let mut operations = Vec::new();
         let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
             let args = command
                 .get_args()
@@ -4423,6 +4439,7 @@ mod tests {
                     .get(name)
                     .ok_or_else(|| anyhow!("remote object not found"))?;
                 fs::write(&args[3], bytes)?;
+                operations.push(format!("read:{name}"));
             } else {
                 assert!(args.iter().any(|arg| arg == "--ignore-existing"));
                 let name = Path::new(&args[3])
@@ -4432,6 +4449,7 @@ mod tests {
                     .unwrap()
                     .to_owned();
                 remote.entry(name).or_insert(fs::read(&args[2])?);
+                operations.push(format!("upload:{name}"));
                 uploads += 1;
             }
             Ok(success_status())
@@ -4439,8 +4457,79 @@ mod tests {
 
         upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
 
+        assert_eq!(
+            operations,
+            vec![
+                format!("upload:{data_name}"),
+                format!("upload:{manifest_name}"),
+                format!("read:{data_name}"),
+                format!("read:{manifest_name}"),
+                format!("upload:{success_name}"),
+                format!("read:{success_name}"),
+            ]
+        );
         assert_eq!((uploads, downloads), (3, 4));
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn failed_data_readback_does_not_publish_success_marker() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
+        let success_name = artifacts
+            .success
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut remote = BTreeMap::<String, Vec<u8>>::new();
+        let mut success_published = false;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                if name == data_name {
+                    fs::write(&args[3], b"tampered")?;
+                } else {
+                    let bytes = remote
+                        .get(name)
+                        .ok_or_else(|| anyhow!("remote object not found"))?;
+                    fs::write(&args[3], bytes)?;
+                }
+            } else {
+                let name = Path::new(&args[3])
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                success_published |= name == success_name;
+                remote.entry(name).or_insert(fs::read(&args[2])?);
+            }
+            Ok(success_status())
+        };
+
+        assert!(upload_artifacts_with(&artifacts, &config, &mut runner).is_err());
+
+        assert!(!success_published);
+        assert!(source.exists());
+        assert!(artifacts.data.exists());
+        assert!(artifacts.manifest.exists());
+        assert!(artifacts.success.exists());
     }
 
     #[test]
