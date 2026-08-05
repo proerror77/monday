@@ -660,6 +660,8 @@ impl ExecutionControlHandle {
             .map(|position| position.unrealized_pnl)
             .sum::<Decimal>();
         let mut account_view = ports::AccountView {
+            account_id: None,
+            tokenized_securities_attestations: Default::default(),
             cash_balance,
             positions,
             unrealized_pnl,
