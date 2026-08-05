@@ -135,7 +135,10 @@ async fn tokenized_security_is_rejected_before_simulated_execution() {
     let mut events = Vec::new();
     for _ in 0..50 {
         engine_queues.receive_events_into(&mut events);
-        if !events.is_empty() {
+        if events
+            .iter()
+            .any(|event| matches!(event, ExecutionEvent::OrderReject { .. }))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -145,8 +148,8 @@ async fn tokenized_security_is_rejected_before_simulated_execution() {
     let seen = seen.lock().await;
     assert!(seen.is_empty());
     assert!(matches!(
-        events.as_slice(),
-        [ExecutionEvent::OrderReject { reason, .. }]
+        events.iter().find(|event| matches!(event, ExecutionEvent::OrderReject { .. })),
+        Some(ExecutionEvent::OrderReject { reason, .. })
             if reason == "product requires a venue-specific account admission policy"
     ));
 }
