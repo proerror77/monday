@@ -869,10 +869,12 @@ fn parse_bybit_price(value: &str, order_type: hft_core::OrderType) -> HftResult<
 }
 
 fn parse_bybit_timestamp(field: &str, value: &str) -> HftResult<u64> {
-    value
+    let ts_ms = value
         .parse::<u64>()
-        .map(|ts_ms| ts_ms * 1000)
-        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))
+        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))?;
+    ts_ms
+        .checked_mul(1000)
+        .ok_or_else(|| HftError::Parse(format!("Bybit {} timestamp overflows micros", field)))
 }
 
 fn parse_bybit_open_orders_response(
@@ -1526,14 +1528,21 @@ impl ExecutionClient for BybitExecutionClient {
         let mut fills = Vec::new();
         for _ in 0..100 {
             let query = {
-                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-                serializer
-                    .append_pair("category", "spot")
-                    .append_pair("limit", "100");
+                let mut query = "category=spot&limit=100".to_string();
                 if let Some(cursor) = &cursor {
-                    serializer.append_pair("cursor", cursor);
+                    if !cursor.is_ascii()
+                        || cursor
+                            .bytes()
+                            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'&' | b'#'))
+                    {
+                        return Err(HftError::Parse(
+                            "Bybit recent-fill cursor contains unsafe query characters".to_string(),
+                        ));
+                    }
+                    query.push_str("&cursor=");
+                    query.push_str(cursor);
                 }
-                serializer.finish()
+                query
             };
             let path = format!("/v5/execution/list?{query}");
             let headers = self
@@ -2170,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn recent_fills_page_through_deduplicates_and_keeps_spot_category() {
         let (base_url, server) = bybit_rest_server(vec![
-            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execFee":"0.01","execTime":"1"},{"execId":"exec-2","orderId":"venue-2","symbol":"ETHUSDT","side":"Sell","execPrice":"200","execQty":"0.2","execFee":"","execTime":"2"}],"nextPageCursor":"cursor-2"}}"#.to_string(),
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execFee":"0.01","execTime":"1"},{"execId":"exec-2","orderId":"venue-2","symbol":"ETHUSDT","side":"Sell","execPrice":"200","execQty":"0.2","execFee":"","execTime":"2"}],"nextPageCursor":"132766%3A2%2C132766%3A2"}}"#.to_string(),
             r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-2","orderId":"venue-2","symbol":"ETHUSDT","side":"Sell","execPrice":"200","execQty":"0.2","execFee":"","execTime":"2"},{"execId":"exec-3","orderId":"venue-3","symbol":"SOLUSDT","side":"Buy","execPrice":"50","execQty":"1","execFee":"0.02","execTime":"3"}],"nextPageCursor":""}}"#.to_string(),
         ])
         .await;
@@ -2195,7 +2204,8 @@ mod tests {
         assert_eq!(fills[0].timestamp, 1_000);
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v5/execution/list?category=spot&limit=100"));
-        assert!(requests[1].contains("cursor=cursor-2"));
+        assert!(requests[1].contains("cursor=132766%3A2%2C132766%3A2"));
+        assert!(!requests[1].contains("%253A"));
     }
 
     #[tokio::test]
@@ -2281,6 +2291,39 @@ mod tests {
         assert!(
             matches!(error, HftError::Parse(message) if message.contains("conflicting execId"))
         );
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_timestamp_overflow() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"execId":"exec-1","orderId":"venue-1","symbol":"BTCUSDT","side":"Buy","execPrice":"100","execQty":"0.1","execTime":"18446744073709551615"}],"nextPageCursor":""}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let _ = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("overflows")));
+    }
+
+    #[tokio::test]
+    async fn recent_fills_reject_cursor_query_injection() {
+        let (base_url, server) = bybit_rest_server(vec![
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[],"nextPageCursor":"cursor&category=linear"}}"#.to_string(),
+        ])
+        .await;
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.rest_base_url = base_url;
+        let client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.list_recent_fills().await.unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert!(matches!(error, HftError::Parse(message) if message.contains("unsafe")));
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
