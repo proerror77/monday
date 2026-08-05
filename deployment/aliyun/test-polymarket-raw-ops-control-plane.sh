@@ -144,12 +144,12 @@ chmod 0755 "$supervisor_baseline"
 supervisor_baseline_sha=$(sha256sum "$supervisor_baseline" | awk '{print $1}')
 supervisor_probe_root="$supervisor_root/data/monday/evidence/polymarket-candidate-probes/$supervisor_candidate_sha"
 mkdir -p "$supervisor_probe_root"
-supervisor_probe="$supervisor_probe_root/gamma-tagged-500.json"
+supervisor_probe="$supervisor_probe_root/gamma-closed-200.json"
 jq -n --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
   --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-  {schema:"monday.polymarket_gamma_tagged_500_recovery_probe.v1",
+  {schema:"monday.polymarket_gamma_closed_200_recovery_probe.v1",
    candidate_sha256:$candidate,source_revision:$source,observed_at:$observed_at,
-   gamma:{tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:500},
+   gamma:{tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:200},
           untagged_closed:{query:"closed=true",attempts:3,http_status:200}},
    candidate_once:{exit_status:0,duration_seconds:23,health_updated_at:$observed_at}}
 ' >"$supervisor_probe"
@@ -447,7 +447,7 @@ jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
 supervisor_recovery_request="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_recovery_gate_invocation/request.json"
 jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
   --arg baseline "$supervisor_baseline_sha" '
-  .recovery.mode == "gamma_tagged_500"
+  .recovery.mode == "gamma_closed_200"
   and .recovery.candidate_probe.candidate_sha256 == $candidate
   and .recovery.candidate_probe.source_revision == $source
   and .recovery.baseline.binary_sha256 == $baseline
@@ -4057,7 +4057,7 @@ jq '
   | .baseline_health_completion_file_identity = null
   | .legacy_runtime = null
   | .recovery = {
-      mode:"gamma_tagged_500",
+      mode:"gamma_closed_200",
       baseline:{
         active_state:"inactive",main_pid:0,
         exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
@@ -4067,12 +4067,12 @@ jq '
         binary_sha256:(if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
       },
       candidate_probe:{
-        schema:"monday.polymarket_gamma_tagged_500_recovery_probe.v1",
+        schema:"monday.polymarket_gamma_closed_200_recovery_probe.v1",
         candidate_sha256:.candidate_sha256,
         source_revision:.deployment_source_revision,sha256:("3" * 64),
         observed_at:"2026-07-15T00:00:01Z",
         gamma:{
-          tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:500},
+          tagged_closed:{query:"closed=true&tag_id=21",attempts:3,http_status:200},
           untagged_closed:{query:"closed=true",attempts:3,http_status:200}
         },
         candidate_once:{exit_status:0,duration_seconds:23,
@@ -4094,6 +4094,7 @@ while IFS='|' read -r name filter; do
 done <<'EOF'
 candidate_binding|.recovery.candidate_probe.candidate_sha256 = (if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
 source_binding|.recovery.candidate_probe.source_revision = (if .deployment_source_revision == ("0" * 40) then ("1" * 40) else ("0" * 40) end)
+tagged_status|.recovery.candidate_probe.gamma.tagged_closed.http_status = 500
 baseline_active|.recovery.baseline.active_state = "active"
 runtime_stability|.baseline_runtime_stability_required = true
 missing_recovery|.recovery = null

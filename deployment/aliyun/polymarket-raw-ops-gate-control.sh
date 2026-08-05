@@ -650,16 +650,16 @@ recovery_probe() {
   secure_control_file "$canonical"
   probe_json=$(jq -cS . "$canonical") || die 'recovery probe is not valid JSON'
   jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
-    .schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    .schema == "monday.polymarket_gamma_closed_200_recovery_probe.v1"
     and .candidate_sha256 == $candidate and .source_revision == $source
     and (.observed_at | type == "string"
       and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-    and .gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+    and .gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:200}
     and .gamma.untagged_closed == {query:"closed=true",attempts:3,http_status:200}
     and .candidate_once.exit_status == 0
     and (.candidate_once.duration_seconds | type == "number" and floor == . and . > 0 and . <= 180)
     and .candidate_once.health_updated_at == .observed_at
-  ' <<<"$probe_json" >/dev/null || die 'recovery probe does not prove the bounded Gamma fallback'
+  ' <<<"$probe_json" >/dev/null || die 'recovery probe does not prove the bounded Gamma health probe'
   observed=$(jq -er .observed_at <<<"$probe_json")
   observed=$(date -u -d "$observed" +%s) || die 'recovery probe timestamp is invalid'
   now=$(date -u +%s)
@@ -733,7 +733,7 @@ recover_gate() {
   baseline_json=$(recovery_baseline "$candidate_sha")
   verify_recovery_uploaders_stopped
   recovery_json=$(jq -cn --argjson baseline "$baseline_json" --argjson probe "$probe_json" \
-    '{mode:"gamma_tagged_500",baseline:$baseline,candidate_probe:$probe}')
+    '{mode:"gamma_closed_200",baseline:$baseline,candidate_probe:$probe}')
   start_gate "$candidate_path" "$candidate_sha" "$source_revision" "$recovery_json"
 }
 

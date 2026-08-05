@@ -62,15 +62,15 @@ def legacy_health_snapshot($allow_bounded_rate_limits):
   and (.overdue_unresolved_markets
     | type == "array" and all(.[]; type == "string" and length > 0));
 def contained_bootstrap_recovery($candidate; $source):
-  .mode == "gamma_tagged_500"
+  .mode == "gamma_closed_200"
   and (.candidate_probe.schema
-    == "monday.polymarket_gamma_tagged_500_recovery_probe.v1")
+    == "monday.polymarket_gamma_closed_200_recovery_probe.v1")
   and .candidate_probe.candidate_sha256 == $candidate
   and .candidate_probe.source_revision == $source
   and (.candidate_probe.sha256 | sha256)
   and (.candidate_probe.observed_at | utc_iso8601_unix | type == "number")
   and .candidate_probe.gamma.tagged_closed
-    == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+    == {query:"closed=true&tag_id=21",attempts:3,http_status:200}
   and .candidate_probe.gamma.untagged_closed
     == {query:"closed=true",attempts:3,http_status:200}
   and .candidate_probe.candidate_once.exit_status == 0

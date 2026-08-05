@@ -479,14 +479,14 @@ verify_baseline_identity() {
 verify_recovery_binding() {
   local recovery=$1 candidate=$2 source=$3
   jq -e --arg candidate "$candidate" --arg source "$source" '
-    .mode == "gamma_tagged_500"
-    and .candidate_probe.schema == "monday.polymarket_gamma_tagged_500_recovery_probe.v1"
+    .mode == "gamma_closed_200"
+    and .candidate_probe.schema == "monday.polymarket_gamma_closed_200_recovery_probe.v1"
     and .candidate_probe.candidate_sha256 == $candidate
     and .candidate_probe.source_revision == $source
     and (.candidate_probe.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and (.candidate_probe.observed_at | type == "string"
       and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-    and .candidate_probe.gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:500}
+    and .candidate_probe.gamma.tagged_closed == {query:"closed=true&tag_id=21",attempts:3,http_status:200}
     and .candidate_probe.gamma.untagged_closed == {query:"closed=true",attempts:3,http_status:200}
     and .candidate_probe.candidate_once.exit_status == 0
     and (.candidate_probe.candidate_once.duration_seconds | type == "number"
