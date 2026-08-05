@@ -1288,9 +1288,6 @@ impl Engine {
             debug!("忽略重放的成交/費用會計事件: {:?}", event);
             return Ok(());
         }
-        // 廣播執行事件（最佳努力）
-        let _ = self.broadcasters.exec_event_tx.send(event.clone());
-
         // 0. 先處理 OrderNew：註冊訂單元資料（供 Portfolio/OMS 使用）
         if let ExecutionEvent::OrderNew {
             order_id,
@@ -1353,6 +1350,9 @@ impl Engine {
                 "已註冊新訂單到 OMS/Portfolio"
             );
         }
+
+        // 廣播執行事件（最佳努力） only after OrderNew identity validation.
+        let _ = self.broadcasters.exec_event_tx.send(event.clone());
 
         // 1. 更新 OMS 狀態機
         let order_update = self
@@ -2721,6 +2721,7 @@ mod tests {
     #[test]
     fn order_new_cannot_rebind_canonical_account_identity() {
         let mut engine = Engine::new(EngineConfig::default());
+        let mut broadcasts = engine.subscribe_execution_events();
         let order_id = hft_core::OrderId("account-bound-order".to_string());
         let canonical = hft_core::AccountId("canonical-account".to_string());
         engine
@@ -2746,6 +2747,7 @@ mod tests {
             .to_string()
             .contains("changed canonical account identity"));
         assert_eq!(engine.order_account_map.get(&order_id), Some(&canonical));
+        assert!(broadcasts.try_recv().is_err());
     }
 
     #[test]

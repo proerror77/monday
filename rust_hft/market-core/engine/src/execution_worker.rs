@@ -363,7 +363,9 @@ impl ExecutionWorker {
                     || balance.available < rust_decimal::Decimal::ZERO
                     || balance.frozen < rust_decimal::Decimal::ZERO
                     || balance.total < rust_decimal::Decimal::ZERO
-                    || balance.usd_value.is_none()
+                    || balance
+                        .usd_value
+                        .is_none_or(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
             })
         {
             return Err("account admission has no externally read-back assets");
@@ -769,6 +771,16 @@ impl ExecutionWorker {
                     continue;
                 }
             };
+            if account_id.0.trim().is_empty() {
+                let reject_event = ExecutionEvent::OrderReject {
+                    order_id: OrderId(envelope.client_order_id.clone()),
+                    reason: "canonical account identity is empty".to_string(),
+                    timestamp: now_micros(),
+                };
+                self.queues.send_event_reliable(reject_event).await;
+                self.stats.orders_failed += 1;
+                continue;
+            }
             let bound_client_idx = self.account_to_client.get(&account_id).copied();
             let mut admission_validated = false;
             let client_idx = match bound_client_idx {
@@ -3970,6 +3982,7 @@ mod tests {
         let killed = AccountId("killed-admission".to_string());
         let limited = AccountId("limited-admission".to_string());
         let incomplete = AccountId("incomplete-admission".to_string());
+        let malformed_asset = AccountId("malformed-asset-admission".to_string());
         let venue_mismatch = AccountId("venue-mismatch-admission".to_string());
         let environment_mismatch = AccountId("environment-mismatch-admission".to_string());
         let product_mismatch = AccountId("product-mismatch-admission".to_string());
@@ -3981,6 +3994,7 @@ mod tests {
             (&killed, "KILLED"),
             (&limited, "LIMITED"),
             (&incomplete, "INCOMPLETE"),
+            (&malformed_asset, "MALFORMED_ASSET"),
             (&venue_mismatch, "VENUE_MISMATCH"),
             (&environment_mismatch, "ENVIRONMENT_MISMATCH"),
             (&product_mismatch, "PRODUCT_MISMATCH"),
@@ -4039,6 +4053,15 @@ mod tests {
             .balances
             .clear();
 
+        bind_ready_spot_admission(&mut worker, malformed_asset.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&malformed_asset)
+            .expect("malformed-asset admission")
+            .readback
+            .balances[0]
+            .usd_value = Some(-rust_decimal::Decimal::ONE);
+
         bind_ready_spot_admission(&mut worker, venue_mismatch.clone(), 0, VenueId::BYBIT);
         worker
             .account_admissions
@@ -4083,6 +4106,7 @@ mod tests {
                 "external account readback is not enabled",
                 "account kill switch is active",
                 "account order-notional limit exceeded",
+                "account admission has no externally read-back assets",
                 "account admission has no externally read-back assets",
                 "account admission venue does not match selected execution client",
                 "account admission environment does not match execution client",
