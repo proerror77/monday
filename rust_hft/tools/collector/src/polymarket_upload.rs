@@ -1981,6 +1981,7 @@ fn is_retryable_download_failure(error: &anyhow::Error) -> bool {
 fn download_remote_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
+    sources: &[&Path],
     budget_remaining: Duration,
     max_attempts: usize,
     runner: &mut F,
@@ -1995,7 +1996,7 @@ where
     let verify_dir = ExclusiveTempDir::create(parent, ".oss-verify")?;
     let download_started = std::time::Instant::now();
     let mut downloaded = BTreeMap::new();
-    for source in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
+    for &source in sources {
         let name = source
             .file_name()
             .and_then(|name| name.to_str())
@@ -2058,6 +2059,12 @@ fn verify_downloaded_artifacts(
     downloaded: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let expected_manifest: Value = serde_json::from_slice(&fs::read(&artifacts.manifest)?)?;
+    let expected_bytes = expected_manifest["bytes"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("manifest bytes must be an integer"))?;
+    let expected_sha = expected_manifest["sha256"]
+        .as_str()
+        .ok_or_else(|| anyhow!("manifest sha256 must be a string"))?;
     let data_name = artifacts
         .data
         .file_name()
@@ -2073,28 +2080,51 @@ fn verify_downloaded_artifacts(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap();
-    let remote_data = &downloaded[data_name];
-    let expected_bytes = expected_manifest["bytes"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("manifest bytes must be an integer"))?;
-    let expected_sha = expected_manifest["sha256"]
-        .as_str()
-        .ok_or_else(|| anyhow!("manifest sha256 must be a string"))?;
-    if fs::metadata(remote_data)?.len() != expected_bytes {
-        bail!("remote data size does not match manifest");
+    match (downloaded.get(data_name), downloaded.get(manifest_name)) {
+        (Some(remote_data), Some(remote_manifest)) => {
+            if fs::metadata(remote_data)?.len() != expected_bytes {
+                bail!("remote data size does not match manifest");
+            }
+            if sha256_file(remote_data)? != expected_sha {
+                bail!("remote data sha256 does not match manifest");
+            }
+            if fs::read(remote_manifest)? != fs::read(&artifacts.manifest)? {
+                bail!("remote manifest does not match local manifest");
+            }
+        }
+        (None, None) => {}
+        _ => bail!("remote data and manifest must be downloaded together"),
     }
-    if sha256_file(remote_data)? != expected_sha {
-        bail!("remote data sha256 does not match manifest");
-    }
-    if fs::read(&downloaded[manifest_name])? != fs::read(&artifacts.manifest)? {
-        bail!("remote manifest does not match local manifest");
-    }
-    if fs::read_to_string(&downloaded[success_name])?.trim() != expected_sha {
-        bail!("remote _SUCCESS does not match manifest");
+    if let Some(remote_success) = downloaded.get(success_name) {
+        if fs::read_to_string(remote_success)?.trim() != expected_sha {
+            bail!("remote _SUCCESS does not match manifest");
+        }
     }
     Ok(())
 }
 
+fn verify_remote_paths_with<F>(
+    artifacts: &Artifacts,
+    config: &UploadConfig,
+    sources: &[&Path],
+    budget_remaining: Duration,
+    runner: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let (_verify_dir, downloaded) = download_remote_artifacts_with(
+        artifacts,
+        config,
+        sources,
+        budget_remaining,
+        OSS_VERIFY_DOWNLOAD_ATTEMPTS,
+        runner,
+    )?;
+    verify_downloaded_artifacts(artifacts, &downloaded)
+}
+
+#[cfg(test)]
 fn verify_remote_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
@@ -2103,15 +2133,18 @@ fn verify_remote_artifacts_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    // Keep the temp dir alive until the content comparison has run.
-    let (_verify_dir, downloaded) = download_remote_artifacts_with(
+    let sources = [
+        artifacts.data.as_path(),
+        artifacts.manifest.as_path(),
+        artifacts.success.as_path(),
+    ];
+    verify_remote_paths_with(
         artifacts,
         config,
+        &sources,
         OSS_READBACK_MAX_WALL_CLOCK,
-        OSS_VERIFY_DOWNLOAD_ATTEMPTS,
         runner,
-    )?;
-    verify_downloaded_artifacts(artifacts, &downloaded)
+    )
 }
 
 fn remote_artifacts_exist_and_match_with<F>(
@@ -2122,8 +2155,19 @@ fn remote_artifacts_exist_and_match_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let Ok((_verify_dir, downloaded)) =
-        download_remote_artifacts_with(artifacts, config, Duration::MAX, 1, runner)
+    let sources = [
+        artifacts.data.as_path(),
+        artifacts.manifest.as_path(),
+        artifacts.success.as_path(),
+    ];
+    let Ok((_verify_dir, downloaded)) = download_remote_artifacts_with(
+        artifacts,
+        config,
+        &sources,
+        Duration::MAX,
+        1,
+        runner,
+    )
     else {
         return Ok(false);
     };
@@ -2161,6 +2205,31 @@ fn upload_artifacts(artifacts: &Artifacts, config: &UploadConfig) -> Result<Stri
     upload_artifacts_with(artifacts, config, &mut run_checked)
 }
 
+fn upload_artifact_with<F>(
+    artifacts: &Artifacts,
+    source: &Path,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+    let destination = format!("oss://{}/{}/{name}", config.bucket, artifacts.object_prefix);
+    let mut command = oss_upload_command(
+        source
+            .to_str()
+            .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
+        &destination,
+        config,
+    );
+    runner(&mut command, config.oss_timeout)?;
+    Ok(())
+}
+
 fn upload_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
@@ -2170,22 +2239,27 @@ where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
     if !remote_artifacts_exist_and_match_with(artifacts, config, runner)? {
-        for source in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
-            let name = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
-            let destination = format!("oss://{}/{}/{name}", config.bucket, artifacts.object_prefix);
-            let mut command = oss_upload_command(
-                source
-                    .to_str()
-                    .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
-                &destination,
-                config,
-            );
-            runner(&mut command, config.oss_timeout)?;
+        for source in [&artifacts.data, &artifacts.manifest] {
+            upload_artifact_with(artifacts, source, config, runner)?;
         }
-        verify_remote_artifacts_with(artifacts, config, runner)?;
+        let readback_started = std::time::Instant::now();
+        let data_and_manifest = [artifacts.data.as_path(), artifacts.manifest.as_path()];
+        verify_remote_paths_with(
+            artifacts,
+            config,
+            &data_and_manifest,
+            OSS_READBACK_MAX_WALL_CLOCK,
+            runner,
+        )?;
+        upload_artifact_with(artifacts, &artifacts.success, config, runner)?;
+        let remaining_readback = OSS_READBACK_MAX_WALL_CLOCK
+            .checked_sub(readback_started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining_readback.is_zero() {
+            bail!("remote _SUCCESS exceeded OSS readback wall-clock budget");
+        }
+        let success = [artifacts.success.as_path()];
+        verify_remote_paths_with(artifacts, config, &success, remaining_readback, runner)?;
     }
     remove_artifacts(artifacts)?;
     let data_name = artifacts
@@ -4502,7 +4576,7 @@ mod tests {
                 .collect::<Vec<_>>();
             if args[2].starts_with("oss://") {
                 let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
-                if name == data_name {
+                if name == data_name.as_str() {
                     fs::write(&args[3], b"tampered")?;
                 } else {
                     let bytes = remote
@@ -4517,7 +4591,7 @@ mod tests {
                     .to_str()
                     .unwrap()
                     .to_owned();
-                success_published |= name == success_name;
+                success_published |= name == success_name.as_str();
                 remote.entry(name).or_insert(fs::read(&args[2])?);
             }
             Ok(success_status())
@@ -4639,10 +4713,16 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let sources = [
+            artifacts.data.as_path(),
+            artifacts.manifest.as_path(),
+            artifacts.success.as_path(),
+        ];
         let mut attempts = 0;
         let error = match download_remote_artifacts_with(
             &artifacts,
             &config,
+            &sources,
             Duration::ZERO,
             1,
             &mut |_, _| {
