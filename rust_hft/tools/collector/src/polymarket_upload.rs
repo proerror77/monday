@@ -2230,6 +2230,13 @@ where
     Ok(())
 }
 
+fn remaining_success_readback_budget(readback_elapsed: Duration) -> Result<Duration> {
+    OSS_READBACK_MAX_WALL_CLOCK
+        .checked_sub(readback_elapsed)
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| anyhow!("remote _SUCCESS exceeded OSS readback wall-clock budget"))
+}
+
 fn upload_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
@@ -2251,15 +2258,11 @@ where
             OSS_READBACK_MAX_WALL_CLOCK,
             runner,
         )?;
+        let success_readback_budget =
+            remaining_success_readback_budget(readback_started.elapsed())?;
         upload_artifact_with(artifacts, &artifacts.success, config, runner)?;
-        let remaining_readback = OSS_READBACK_MAX_WALL_CLOCK
-            .checked_sub(readback_started.elapsed())
-            .unwrap_or(Duration::ZERO);
-        if remaining_readback.is_zero() {
-            bail!("remote _SUCCESS exceeded OSS readback wall-clock budget");
-        }
         let success = [artifacts.success.as_path()];
-        verify_remote_paths_with(artifacts, config, &success, remaining_readback, runner)?;
+        verify_remote_paths_with(artifacts, config, &success, success_readback_budget, runner)?;
     }
     remove_artifacts(artifacts)?;
     let data_name = artifacts
@@ -2802,6 +2805,15 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("max concurrent uploads must be between 1 and 4"));
+    }
+
+    #[test]
+    fn reserves_success_readback_budget_before_publishing_marker() {
+        assert_eq!(
+            remaining_success_readback_budget(Duration::from_secs(1)).unwrap(),
+            OSS_READBACK_MAX_WALL_CLOCK - Duration::from_secs(1)
+        );
+        assert!(remaining_success_readback_budget(OSS_READBACK_MAX_WALL_CLOCK).is_err());
     }
 
     fn command_args(command: &Command) -> Vec<String> {
