@@ -204,6 +204,7 @@ mod risk_manager_tests {
             positions,
             unrealized_pnl: Decimal::from(100),
             realized_pnl: Decimal::from(500),
+            ..Default::default()
         }
     }
 
