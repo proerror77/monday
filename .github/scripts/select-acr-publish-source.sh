@@ -12,6 +12,8 @@ smoke_conclusion=
 target=
 rebuild=false
 source_test_sha=
+source_test_profile=
+source_test_tag=
 current_sha=
 current_run_id=
 current_ref=
@@ -30,6 +32,7 @@ while (($#)); do
     --target) target=$2; shift 2 ;;
     --rebuild) rebuild=$2; shift 2 ;;
     --source-test-sha) source_test_sha=$2; shift 2 ;;
+    --source-test-profile) source_test_profile=$2; shift 2 ;;
     --current-sha) current_sha=$2; shift 2 ;;
     --current-run-id) current_run_id=$2; shift 2 ;;
     --current-ref) current_ref=$2; shift 2 ;;
@@ -80,8 +83,13 @@ case "$event" in
         printf 'source-test publication requires the current trusted main SHA\n' >&2
         exit 1
       }
+      case "$source_test_profile" in
+        binance-bstocks-attestation|bybit-spot) ;;
+        *) printf 'unsupported source-test profile: %s\n' "$source_test_profile" >&2; exit 1 ;;
+      esac
       research_mode=none
       source_sha=$source_test_sha
+      source_test_tag="source-test-${source_sha}-${source_test_profile}"
     else
       [[ -z $source_test_sha ]] || {
         printf 'source-test SHA is only valid for research-source-test\n' >&2
@@ -111,3 +119,8 @@ printf '%s\n' \
   "research_mode=$research_mode" \
   "source_sha=$source_sha" \
   "artifact_run_id=$artifact_run_id" >>"$output"
+if [[ $publish_target == research-source-test ]]; then
+  printf '%s\n' \
+    "source_test_profile=$source_test_profile" \
+    "source_test_tag=$source_test_tag" >>"$output"
+fi
