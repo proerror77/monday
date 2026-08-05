@@ -981,6 +981,9 @@ fn compiler_seal_rejects_cross_file_external_and_attribute_macro_gateway_impls()
             [workspace]
             members = ["gateway-macros", "application"]
             resolver = "2"
+
+            [patch.crates-io]
+            rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }
         "#,
     )
     .expect("write fixture workspace manifest");
