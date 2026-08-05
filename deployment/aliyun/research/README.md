@@ -323,3 +323,22 @@ cargo run --manifest-path rust_hft/Cargo.toml --release -p hft-backtest -- \
 The research image runs the same Rust binary directly and contains no Python
 runtime. The Docker BuildKit cache preserves Cargo registry, git, and target
 artifacts between image builds. ACK Jobs never run `cargo build` or `cargo run`.
+
+`k8s/source-test-job.example.yaml` is the separate, non-production exception
+for source validation. It uses only a digest-pinned `research-source-test`
+image built from the current exact `main` SHA by the trusted ACR workflow. Its
+entrypoint accepts only `binance-bstocks-attestation` and `bybit-spot`, each
+running a fixed `cargo test --offline --locked` command. It has no mounted
+Secret, ConfigMap, PVC, data input, or exchange credential; it cannot invoke
+an execution binary, and the private image pull uses the namespace `monday-acr`
+reference only. The template begins suspended, has a short terminal TTL, and
+proves neither application runtime nor Testnet/Live authority. It is independent
+of the suspended `monday-spot-cex-baseline-689`, which remains frozen pending
+separate governance reconciliation by its owner.
+
+The publisher accepts only the current `main` SHA, refuses to overwrite that tag, and
+records the immutable digest used by a Job; it creates neither a service nor a
+persistent build cache. The Job TTL cleans up its Pod and Job after the receipt.
+Registry retention or removal remains an ACR-owner action after that receipt.
+Each receipt is evidence only for the exact source revision named by its image;
+later commits require a newly published digest.

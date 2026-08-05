@@ -1,0 +1,77 @@
+# Non-production source-test contract. The controller must create a new Job
+# from this template after it independently verifies the source SHA, image
+# digest, and current `monday-acr` pull mapping. Clean up the exact Job after
+# its receipt. Do not resume, alter, or reuse monday-spot-cex-baseline-689.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-source-test-REPLACE_WITH_RUN_ID
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-source-test
+    app.kubernetes.io/part-of: monday
+    research.monday/contract: source-test-v1
+    research.monday/purpose: non-production-source-test
+  annotations:
+    research.monday/source-revision: REPLACE_WITH_40_HEX_SOURCE_SHA
+    research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-source-test@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+    research.monday/test-profile: REPLACE_WITH_APPROVED_PROFILE
+    research.monday/runtime-authority: none
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-source-test
+        app.kubernetes.io/part-of: monday
+        research.monday/contract: source-test-v1
+        research.monday/purpose: non-production-source-test
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: source-test
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-source-test@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          imagePullPolicy: Always
+          args:
+            - REPLACE_WITH_APPROVED_PROFILE
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Gi

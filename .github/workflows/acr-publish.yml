@@ -15,6 +15,7 @@ on:
         options:
           - all
           - research-runner
+          - research-source-test
           - hft-trading
           - binance-lob-archiver
           - polymarket-raw-ops
@@ -25,6 +26,19 @@ on:
         required: true
         default: false
         type: boolean
+      source_test_source_sha:
+        description: Exact source commit for a non-production Cargo source-test image
+        required: false
+        default: ""
+        type: string
+      source_test_profile:
+        description: Offline source-test profile to prove after publication
+        required: true
+        default: binance-bstocks-attestation
+        type: choice
+        options:
+          - binance-bstocks-attestation
+          - bybit-spot
 
 permissions:
   actions: read
@@ -79,8 +93,10 @@ jobs:
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
           PUBLISH_TARGET: ${{ inputs.target }}
           REBUILD_RESEARCH_RUNNER: ${{ inputs.rebuild_research_runner }}
+          SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}
           CURRENT_SHA: ${{ github.sha }}
           CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_REF: ${{ github.ref }}
         run: |
           .github/scripts/select-acr-publish-source.sh \
             --event "$EVENT_NAME" \
@@ -93,8 +109,10 @@ jobs:
             --smoke-conclusion "$SMOKE_CONCLUSION" \
             --target "$PUBLISH_TARGET" \
             --rebuild "$REBUILD_RESEARCH_RUNNER" \
+            --source-test-sha "$SOURCE_TEST_SOURCE_SHA" \
             --current-sha "$CURRENT_SHA" \
-            --current-run-id "$CURRENT_RUN_ID"
+            --current-run-id "$CURRENT_RUN_ID" \
+            --current-ref "$CURRENT_REF"
 
       - name: Select publish targets
         id: select
@@ -207,7 +225,7 @@ jobs:
 
   publish:
     needs: [selector, research-runner-binaries]
-    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none'
+    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -615,6 +633,128 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove ACR credentials
+        if: always()
+        env:
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+        run: |
+          docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
+          docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
+          rm -f -- "$docker_config_root/config.json"
+
+  publish-source-test:
+    needs: selector
+    if: needs.selector.outputs.publish_target == 'research-source-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted source-test image contract
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout exact source revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.selector.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          sparse-checkout: rust_hft
+          persist-credentials: false
+
+      - name: Remove source checkout metadata
+        run: rm -rf -- source/.git
+
+      - name: Validate source-test profile
+        env:
+          TEST_PROFILE: ${{ inputs.source_test_profile }}
+        run: |
+          case "$TEST_PROFILE" in
+            binance-bstocks-attestation|bybit-spot) ;;
+            *) echo "unsupported source-test profile: $TEST_PROFILE" >&2; exit 1 ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to ACR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ vars.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Refuse source-test tag overwrite
+        env:
+          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+        run: |
+          if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then
+            echo "source-test image tag already exists: $IMAGE_TAG" >&2
+            exit 1
+          fi
+          case "${probe_output,,}" in
+            *"manifest unknown"*|*"no such manifest"*) ;;
+            *) echo 'could not prove source-test image tag is absent' >&2; exit 1 ;;
+          esac
+
+      - name: Build source-test image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: rust_hft/deployment/docker/Dockerfile.source-test
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
+          tags: |
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
+            com.monday.image.purpose=non-production-source-test
+            com.monday.image.retention=single-ack-test
+
+      - name: Verify source-test image before publication
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          TEST_PROFILE: ${{ inputs.source_test_profile }}
+        run: |
+          set -euo pipefail
+          actual_source_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$IMAGE")
+          test "$actual_source_revision" = "$SOURCE_REVISION"
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16g \
+            "$IMAGE" "$TEST_PROFILE"
+
+      - name: Push verified source-test image
+        id: push
+        env:
+          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_TAG"
+          digest=$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r '.digest')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record immutable source-test image
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test@${{ steps.push.outputs.digest }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          TEST_PROFILE: ${{ inputs.source_test_profile }}
+        run: |
+          {
+            echo "research-source-test=$IMAGE"
+            echo "source_revision=$SOURCE_REVISION"
+            echo "verified_profile=$TEST_PROFILE"
+            echo "retention=single ACK source-test Job; no runtime deployment"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove ACR credentials
         if: always()

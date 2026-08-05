@@ -11,8 +11,10 @@ binaries_conclusion=
 smoke_conclusion=
 target=
 rebuild=false
+source_test_sha=
 current_sha=
 current_run_id=
+current_ref=
 output=${GITHUB_OUTPUT:-/dev/stdout}
 
 while (($#)); do
@@ -27,8 +29,10 @@ while (($#)); do
     --smoke-conclusion) smoke_conclusion=$2; shift 2 ;;
     --target) target=$2; shift 2 ;;
     --rebuild) rebuild=$2; shift 2 ;;
+    --source-test-sha) source_test_sha=$2; shift 2 ;;
     --current-sha) current_sha=$2; shift 2 ;;
     --current-run-id) current_run_id=$2; shift 2 ;;
+    --current-ref) current_ref=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -36,6 +40,10 @@ done
 
 case "$event" in
   workflow_run)
+    [[ -z $source_test_sha ]] || {
+      printf 'automated ACR publication does not accept a source-test SHA\n' >&2
+      exit 1
+    }
     [[ $conclusion == success && $source_event == push && $head_branch == main ]] || {
       printf 'automated ACR publication requires a successful main push run\n' >&2
       exit 1
@@ -52,20 +60,45 @@ case "$event" in
   workflow_dispatch)
     case "$target" in
       polymarket-raw-ops) target=binance-lob-archiver ;;
-      all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder) ;;
+      all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
       *) printf 'unsupported publish target: %s\n' "$target" >&2; exit 1 ;;
     esac
-    if [[ $target == all || $target == research-runner ]]; then
-      [[ $rebuild == true ]] || {
-        printf 'manual research publication requires rebuild_research_runner=true\n' >&2
+    if [[ $target == research-source-test ]]; then
+      [[ $rebuild == false ]] || {
+        printf 'source-test publication does not rebuild research-runner binaries\n' >&2
         exit 1
       }
-      research_mode=rebuild
-    else
+      [[ $current_ref == refs/heads/main ]] || {
+        printf 'source-test publication must dispatch the trusted main workflow\n' >&2
+        exit 1
+      }
+      [[ $source_test_sha =~ ^[0-9a-f]{40}$ ]] || {
+        printf 'source-test publication requires an exact 40-hex source SHA\n' >&2
+        exit 1
+      }
+      [[ $source_test_sha == "$current_sha" ]] || {
+        printf 'source-test publication requires the current trusted main SHA\n' >&2
+        exit 1
+      }
       research_mode=none
+      source_sha=$source_test_sha
+    else
+      [[ -z $source_test_sha ]] || {
+        printf 'source-test SHA is only valid for research-source-test\n' >&2
+        exit 1
+      }
+      if [[ $target == all || $target == research-runner ]]; then
+        [[ $rebuild == true ]] || {
+          printf 'manual research publication requires rebuild_research_runner=true\n' >&2
+          exit 1
+        }
+        research_mode=rebuild
+      else
+        research_mode=none
+      fi
+      source_sha=$current_sha
     fi
     publish_target=$target
-    source_sha=$current_sha
     artifact_run_id=$current_run_id
     ;;
   *) printf 'unsupported event: %s\n' "$event" >&2; exit 1 ;;

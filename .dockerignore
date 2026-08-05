@@ -26,3 +26,5 @@ config/.env.shared
 config/.env.unified
 rust_hft/config/secrets.yaml
 rust_hft/clickhouse_credentials.txt
+source/rust_hft/config/secrets.yaml
+source/rust_hft/clickhouse_credentials.txt
