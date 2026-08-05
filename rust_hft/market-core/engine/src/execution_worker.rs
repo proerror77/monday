@@ -219,6 +219,8 @@ pub struct ExecutionWorker {
     /// 订单 ID 到客户端索引的映射
     order_to_client: FxHashMap<OrderId, usize>,
     tracked_orders: FxHashMap<OrderId, TrackedOrder>,
+    /// Authoritative open orders returned by the latest complete reconciliation, scoped by account.
+    reconciled_open_order_ids: FxHashMap<AccountId, HashSet<OrderId>>,
     /// 轮询计数器（用于 RoundRobin 策略）
     round_robin_counter: AtomicUsize,
     /// 延遲監控器 - 追蹤 Worker 執行延遲
@@ -279,7 +281,21 @@ impl ExecutionWorker {
                 matched = Some(*venue);
             }
         }
-        matched
+        matched.or_else(|| {
+            let mut account_venues = HashSet::new();
+            for (account_id, bound_client_idx) in &self.account_to_client {
+                if *bound_client_idx == client_idx {
+                    if let Some(admission) = self.account_admissions.get(account_id) {
+                        account_venues.insert(admission.venue);
+                    }
+                }
+            }
+            if account_venues.len() == 1 {
+                account_venues.into_iter().next()
+            } else {
+                None
+            }
+        })
     }
 
     /// Refuse execution unless the runtime client binding and fresh external account proof agree.
@@ -367,7 +383,11 @@ impl ExecutionWorker {
                 || balance.total < rust_decimal::Decimal::ZERO
                 || balance
                     .usd_value
-                    .is_none_or(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
+                    .is_some_and(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
+                || (balance.usd_value.is_none()
+                    && (balance.available != rust_decimal::Decimal::ZERO
+                        || balance.frozen != rust_decimal::Decimal::ZERO
+                        || balance.total != rust_decimal::Decimal::ZERO))
         }) {
             return Err("account admission has malformed externally read-back assets");
         }
@@ -387,11 +407,17 @@ impl ExecutionWorker {
         if notional > admission.max_order_notional {
             return Err("account order-notional limit exceeded");
         }
-        let open_orders = self
+        let reconciled_order_ids = self
+            .reconciled_open_order_ids
+            .get(account_id)
+            .ok_or("account open-order reconciliation is incomplete")?;
+        let tracked_order_ids = self
             .tracked_orders
-            .values()
-            .filter(|order| order.account_id.as_ref() == Some(account_id))
-            .count();
+            .iter()
+            .filter(|(_, order)| order.account_id.as_ref() == Some(account_id))
+            .map(|(order_id, _)| order_id)
+            .filter(|order_id| !reconciled_order_ids.contains(*order_id));
+        let open_orders = reconciled_order_ids.len() + tracked_order_ids.count();
         if open_orders >= admission.max_open_orders {
             return Err("account open-order limit reached");
         }
@@ -458,6 +484,7 @@ impl ExecutionWorker {
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
+            reconciled_open_order_ids: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -505,6 +532,7 @@ impl ExecutionWorker {
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
+            reconciled_open_order_ids: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -759,6 +787,8 @@ impl ExecutionWorker {
                 self.stats.orders_failed += 1;
                 continue;
             }
+            // Simulation bypasses external admission only; it still carries the canonical account
+            // identity through the executable envelope and resulting lifecycle records.
             let account_id = match envelope.account_id.clone() {
                 Some(account_id) => account_id,
                 None => {
@@ -1623,6 +1653,9 @@ impl ExecutionWorker {
                     self.order_to_client.remove(order_id);
                     self.tracked_orders.remove(order_id);
                     self.execution_timelines.remove(order_id);
+                    for reconciled in self.reconciled_open_order_ids.values_mut() {
+                        reconciled.remove(order_id);
+                    }
                 }
             }
             ExecutionEvent::OrderCanceled { order_id, .. }
@@ -1632,6 +1665,9 @@ impl ExecutionWorker {
                 self.order_to_client.remove(order_id);
                 self.tracked_orders.remove(order_id);
                 self.execution_timelines.remove(order_id);
+                for reconciled in self.reconciled_open_order_ids.values_mut() {
+                    reconciled.remove(order_id);
+                }
             }
             _ => {}
         }
@@ -1793,6 +1829,7 @@ impl ExecutionWorker {
                         include_recent_fills,
                     )
                     .await;
+                self.update_reconciled_open_orders(&snapshot);
                 let _ = reply.send(snapshot);
             }
             ControlCommand::SetIntake { enabled, reply } => {
@@ -2349,6 +2386,7 @@ impl ExecutionWorker {
     async fn reconcile_open_orders(&mut self) -> bool {
         let snapshot = self.collect_reconcile_snapshot(false, false, false).await;
         let complete = snapshot.is_complete();
+        self.update_reconciled_open_orders(&snapshot);
         if !complete {
             warn!("對帳快照不完整；系統不得將未知狀態視為無未結訂單");
         }
@@ -2380,6 +2418,25 @@ impl ExecutionWorker {
             }
         }
         complete
+    }
+
+    fn update_reconciled_open_orders(&mut self, snapshot: &WorkerReconcileSnapshot) {
+        if !snapshot.is_complete() {
+            self.reconciled_open_order_ids.clear();
+            return;
+        }
+        let mut reconciled = FxHashMap::default();
+        for client in &snapshot.clients {
+            let (Some(account_id), Ok(open_orders)) = (&client.account_id, &client.open_orders)
+            else {
+                continue;
+            };
+            reconciled
+                .entry(account_id.clone())
+                .or_insert_with(HashSet::new)
+                .extend(open_orders.iter().map(|order| order.order_id.clone()));
+        }
+        self.reconciled_open_order_ids = reconciled;
     }
 
     async fn execution_clients_currently_healthy(&mut self) -> bool {
@@ -2428,7 +2485,15 @@ impl ExecutionWorker {
         include_recent_fills: bool,
     ) -> WorkerReconcileSnapshot {
         let mut clients = Vec::with_capacity(self.execution_clients.len());
-        for (idx, client) in self.execution_clients.iter_mut().enumerate() {
+        for idx in 0..self.execution_clients.len() {
+            let venue = self.venue_for_client(idx);
+            let account_id = self
+                .account_to_client
+                .iter()
+                .find_map(|(account_id, client_idx)| {
+                    (*client_idx == idx).then_some(account_id.clone())
+                });
+            let client = &mut self.execution_clients[idx];
             let open_orders = client.list_open_orders().await;
             #[cfg(feature = "metrics")]
             {
@@ -2480,16 +2545,8 @@ impl ExecutionWorker {
             };
             clients.push(ClientReconcileSnapshot {
                 client_index: idx,
-                venue: self
-                    .venue_to_client
-                    .iter()
-                    .find_map(|(venue, client_idx)| (*client_idx == idx).then_some(*venue)),
-                account_id: self
-                    .account_to_client
-                    .iter()
-                    .find_map(|(account_id, client_idx)| {
-                        (*client_idx == idx).then_some(account_id.clone())
-                    }),
+                venue,
+                account_id,
                 open_orders,
                 balances,
                 positions,
@@ -3038,9 +3095,14 @@ mod tests {
         worker
             .account_environments
             .insert(account_id.clone(), AccountExecutionEnvironment::Testnet);
+        worker.account_admissions.insert(
+            account_id.clone(),
+            ready_spot_admission(account_id.clone(), venue),
+        );
         worker
-            .account_admissions
-            .insert(account_id.clone(), ready_spot_admission(account_id, venue));
+            .reconciled_open_order_ids
+            .entry(account_id)
+            .or_default();
     }
 
     #[test]
@@ -4114,6 +4176,151 @@ mod tests {
                 "account admission product scope does not match intent",
             ]
         );
+    }
+
+    #[test]
+    fn account_admission_counts_reconciled_open_orders() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let account_id = AccountId("restored-account".to_string());
+        bind_ready_spot_admission(&mut worker, account_id.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&account_id)
+            .expect("account admission")
+            .max_open_orders = 1;
+        worker.update_reconciled_open_orders(&WorkerReconcileSnapshot {
+            clients: vec![ClientReconcileSnapshot {
+                client_index: 0,
+                venue: Some(VenueId::BYBIT),
+                account_id: Some(account_id.clone()),
+                open_orders: Ok(vec![OpenOrder {
+                    order_id: OrderId("restored-order".to_string()),
+                    client_order_id: Some("restored-client".to_string()),
+                    symbol: Symbol::new("BTCUSDT"),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    original_quantity: Quantity::from_f64(1.0).unwrap(),
+                    remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                    filled_quantity: Quantity::zero(),
+                    price: Some(Price::from_f64(100.0).unwrap()),
+                    status: ports::OrderStatus::Acknowledged,
+                    created_at: 1,
+                    updated_at: 1,
+                }]),
+                balances: None,
+                positions: None,
+                recent_fills: None,
+            }],
+        });
+
+        assert_eq!(
+            worker
+                .validate_account_admission(
+                    &account_id,
+                    &create_test_intent("BTCUSDT"),
+                    0,
+                    now_micros(),
+                )
+                .unwrap_err(),
+            "account open-order limit reached"
+        );
+    }
+
+    #[test]
+    fn same_venue_account_binding_keeps_each_client_venue_identity() {
+        let clients = vec![
+            Box::new(MockExecutionClient {
+                state: Arc::new(StdMutex::new(MockExecutionState::default())),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+            Box::new(MockExecutionClient {
+                state: Arc::new(StdMutex::new(MockExecutionState::default())),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+        ];
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            clients,
+            control_rx,
+        );
+        let first_account = AccountId("same-venue-first".to_string());
+        let second_account = AccountId("same-venue-second".to_string());
+        bind_ready_spot_admission(&mut worker, first_account.clone(), 0, VenueId::BYBIT);
+        bind_ready_spot_admission(&mut worker, second_account, 1, VenueId::BYBIT);
+
+        assert!(worker
+            .validate_account_admission(
+                &first_account,
+                &create_test_intent("BTCUSDT"),
+                0,
+                now_micros(),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_unvalued_balance_row_does_not_block_admission() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let account_id = AccountId("zero-balance-row".to_string());
+        bind_ready_spot_admission(&mut worker, account_id.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&account_id)
+            .expect("account admission")
+            .readback
+            .balances
+            .push(AccountBalance {
+                asset: "EMPTY".to_string(),
+                available: rust_decimal::Decimal::ZERO,
+                frozen: rust_decimal::Decimal::ZERO,
+                total: rust_decimal::Decimal::ZERO,
+                usd_value: None,
+            });
+
+        assert!(worker
+            .validate_account_admission(
+                &account_id,
+                &create_test_intent("BTCUSDT"),
+                0,
+                now_micros(),
+            )
+            .is_ok());
     }
 
     #[test]

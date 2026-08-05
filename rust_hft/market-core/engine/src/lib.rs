@@ -466,6 +466,17 @@ impl Engine {
         self.strategy_account_mapping = mapping.into_iter().collect();
     }
 
+    fn account_for_strategy(&self, strategy_id: &str) -> Option<hft_core::AccountId> {
+        self.strategy_account_mapping
+            .get(strategy_id)
+            .cloned()
+            .or_else(|| {
+                strategy_id
+                    .split_once(':')
+                    .and_then(|(base, _)| self.strategy_account_mapping.get(base).cloned())
+            })
+    }
+
     /// 處理市場事件給策略（測試用）：依賴策略的 venue_scope 與 runtime 的策略→場館映射
     #[cfg(test)]
     pub fn process_market_event_for_strategies(
@@ -917,10 +928,7 @@ impl Engine {
         let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
         lifecycle.timing.intent_emitted_mono_us = Some(monotonic_micros());
         self.apply_intent_execution_limits(&mut lifecycle);
-        let account_id = self
-            .strategy_account_mapping
-            .get(&intent.strategy_id)
-            .cloned();
+        let account_id = self.account_for_strategy(&intent.strategy_id);
         let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
         if let Some(account_id) = account_id {
             envelope = envelope.with_account_id(account_id);
@@ -1527,6 +1535,7 @@ impl Engine {
             };
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
+            let strategy_account_mapping = &self.strategy_account_mapping;
 
             for (strategy_idx, strategy) in self.strategies.iter_mut().enumerate() {
                 // 跳過已禁用的策略
@@ -1605,10 +1614,15 @@ impl Engine {
                 intents_work_buf.extend(intents.into_iter().map(|intent| {
                     let mut lifecycle = ports::OrderIntentLifecycle::default();
                     lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
-                    let account_id = self
-                        .strategy_account_mapping
+                    let account_id = strategy_account_mapping
                         .get(&intent.strategy_id)
-                        .cloned();
+                        .cloned()
+                        .or_else(|| {
+                            intent
+                                .strategy_id
+                                .split_once(':')
+                                .and_then(|(base, _)| strategy_account_mapping.get(base).cloned())
+                        });
                     let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
                     if let Some(account_id) = account_id {
                         envelope = envelope.with_account_id(account_id);
@@ -2748,6 +2762,21 @@ mod tests {
             .contains("changed canonical account identity"));
         assert_eq!(engine.order_account_map.get(&order_id), Some(&canonical));
         assert!(broadcasts.try_recv().is_err());
+    }
+
+    #[test]
+    fn strategy_account_mapping_falls_back_to_base_strategy_id() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let account_id = hft_core::AccountId("base-account".to_string());
+        engine.set_strategy_account_mapping(HashMap::from([(
+            "base".to_string(),
+            account_id.clone(),
+        )]));
+
+        assert_eq!(
+            engine.account_for_strategy("base:BTCUSDT"),
+            Some(account_id)
+        );
     }
 
     #[test]
