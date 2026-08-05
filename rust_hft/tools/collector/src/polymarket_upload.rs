@@ -1772,6 +1772,40 @@ fn split_tape_by_utc_hour(source: &Path, staging_dir: &Path) -> Result<Vec<PathB
     Ok(chunks)
 }
 
+fn manifest_utc_hour(manifest: &Value, field: &str) -> Result<String> {
+    let timestamp = manifest[field]
+        .as_str()
+        .ok_or_else(|| anyhow!("scan manifest requires {field}"))?;
+    Ok(DateTime::parse_from_rfc3339(timestamp)?
+        .with_timezone(&Utc)
+        .format("%Y%m%dT%H")
+        .to_string())
+}
+
+fn stage_validated_single_hour(
+    source: &Path,
+    staging_dir: &Path,
+    mut scan: ScanResult,
+) -> Result<Option<(PathBuf, ScanResult)>> {
+    let hour = manifest_utc_hour(&scan.manifest, "start_recorded_at")?;
+    if manifest_utc_hour(&scan.manifest, "end_recorded_at")? != hour {
+        return Ok(None);
+    }
+    ensure_identity(source, scan.identity)?;
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("source file name is not UTF-8"))?;
+    let chunk = staging_dir.join(format!("{stem}.{hour}.ndjson"));
+    fs::hard_link(source, &chunk)?;
+    if regular_identity(&chunk)? != scan.identity {
+        bail!("staged tape identity does not match validated source");
+    }
+    File::open(staging_dir)?.sync_all()?;
+    scan.manifest["source_file"] = json!(chunk.file_name().and_then(|name| name.to_str()));
+    Ok(Some((chunk, scan)))
+}
+
 fn append_name(path: &Path, suffix: &str) -> Result<PathBuf> {
     let name = path
         .file_name()
@@ -1826,6 +1860,14 @@ fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts,
         config.quote_depth_levels,
         config.quote_sample_ms,
     )?;
+    prepare_artifacts_from_scan(source, config, scan)
+}
+
+fn prepare_artifacts_from_scan(
+    source: &Path,
+    config: &UploadConfig,
+    scan: ScanResult,
+) -> Result<(Artifacts, Value)> {
     let data = append_name(source, ".zst")?;
     let (temporary_data, temporary_file) = exclusive_sibling(&data, ".tmp")?;
     let output = temporary_file.try_clone()?;
@@ -2352,17 +2394,35 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     let staging_root = spool_dir.join(".upload-staging");
     ensure_upload_staging_root(&staging_root)?;
     let staging = ExclusiveTempDir::create(&staging_root, "session")?;
-    let chunks = split_tape_by_utc_hour(source, staging.path())?;
-    ensure_identity(source, source_scan.identity)?;
+    let source_identity = source_scan.identity;
+    let chunks = match stage_validated_single_hour(source, staging.path(), source_scan)? {
+        Some(chunk) => vec![chunk],
+        None => {
+            let paths = split_tape_by_utc_hour(source, staging.path())?;
+            ensure_identity(source, source_identity)?;
+            paths
+                .into_iter()
+                .map(|chunk| {
+                    let scan = scan_tape_with_identity(
+                        &chunk,
+                        &config.dataset,
+                        config.quote_depth_levels,
+                        config.quote_sample_ms,
+                    )?;
+                    Ok((chunk, scan))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
     let mut uploaded = Vec::new();
-    for chunk in chunks {
-        let (artifacts, manifest) = prepare_artifacts(&chunk, config)?;
+    for (chunk, scan) in chunks {
+        let (artifacts, manifest) = prepare_artifacts_from_scan(&chunk, config, scan)?;
         uploaded.push(UploadedSegment {
             object: upload_artifacts(&artifacts, config)?,
             canonical_complete: canonical_complete_manifest(&manifest),
         });
     }
-    ensure_identity(source, source_scan.identity)?;
+    ensure_identity(source, source_identity)?;
     fs::remove_file(source)?;
     File::open(spool_dir)?.sync_all()?;
     Ok(uploaded)
@@ -4293,6 +4353,11 @@ mod tests {
         ));
         let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
         let staging = ExclusiveTempDir::create(root.path(), ".split").unwrap();
+        let source_scan =
+            scan_tape_with_identity(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        assert!(stage_validated_single_hour(&tape, staging.path(), source_scan)
+            .unwrap()
+            .is_none());
         let chunks = split_tape_by_utc_hour(&tape, staging.path()).unwrap();
         assert_eq!(chunks.len(), 2);
         let first = scan_tape(&chunks[0], "crypto_expiry", 1, 1_000).unwrap();
