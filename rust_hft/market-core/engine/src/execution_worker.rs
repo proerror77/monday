@@ -1922,13 +1922,11 @@ impl WorkerReconcileSnapshot {
                         .is_some_and(|result| result.is_ok()),
                     AssetInventoryCapability::AuthoritativeAssetInventory {
                         product_type: ProductType::Spot,
-                    } => {
-                        client.asset_inventory.as_ref().is_some_and(|result| {
-                            result.as_ref().is_ok_and(|records| {
-                                records.iter().all(|record| record.validate().is_ok())
-                            })
+                    } => client.asset_inventory.as_ref().is_some_and(|result| {
+                        result.as_ref().is_ok_and(|records| {
+                            records.iter().all(|record| record.validate().is_ok())
                         })
-                    }
+                    }),
                     AssetInventoryCapability::AuthoritativeAssetInventory { .. }
                     | AssetInventoryCapability::Unsupported => false,
                 }
@@ -2164,8 +2162,7 @@ impl ExecutionWorker {
                     AssetInventoryCapability::AuthoritativeAssetInventory {
                         product_type: ProductType::Spot,
                     }
-                )
-            {
+                ) {
                 Some(match balances.as_ref() {
                     Some(Ok(balances)) => client.asset_inventory_from_balances(balances),
                     Some(Err(_)) => Err(HftError::Execution(

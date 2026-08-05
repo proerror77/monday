@@ -430,11 +430,9 @@ impl ExecutionControlHandle {
                 let engine = self.engine.lock().await;
                 let account_view = engine.get_account_view();
                 let portfolio_state = engine.export_portfolio_state();
-                let local_account_value = spot_inventory_account_value(
-                    &worker_snapshot,
-                    &account_view,
-                )
-                .unwrap_or_else(|| account_view.equity());
+                let local_account_value =
+                    spot_inventory_account_value(&worker_snapshot, &account_view)
+                        .unwrap_or_else(|| account_view.equity());
                 (
                     Some(reconcile_balances(
                         &worker_snapshot,
@@ -946,9 +944,7 @@ fn reconcile_asset_inventory(
         match WorkerReconcileSnapshot::resolved_asset_inventory_capability(client) {
             AssetInventoryCapability::AuthoritativeAssetInventory {
                 product_type: ProductType::Spot,
-            } => {
-                authoritative_clients.push(client)
-            }
+            } => authoritative_clients.push(client),
             AssetInventoryCapability::AuthoritativeAssetInventory { .. } => {
                 client_errors.insert(format!(
                     "client={} declared asset inventory outside the Spot product scope",
@@ -1907,8 +1903,7 @@ mod tests {
             Some(VenueId::BYBIT),
             Some("bybit-main"),
         );
-        let report =
-            reconcile_asset_inventory(&snapshot, &account).expect("Spot inventory report");
+        let report = reconcile_asset_inventory(&snapshot, &account).expect("Spot inventory report");
 
         assert!(report.complete);
         assert!(report.healthy);
@@ -1932,11 +1927,7 @@ mod tests {
         let mut exchange = asset("USDT", 89, 11);
         exchange.usd_value = Some(Decimal::from(101));
         let report = reconcile_asset_inventory(
-            &spot_inventory_snapshot(
-                vec![exchange],
-                Some(VenueId::BYBIT),
-                Some("bybit-main"),
-            ),
+            &spot_inventory_snapshot(vec![exchange], Some(VenueId::BYBIT), Some("bybit-main")),
             &account,
         )
         .expect("Spot inventory report");
