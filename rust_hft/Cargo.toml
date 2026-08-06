@@ -108,10 +108,7 @@ members = [
     "tools/hyperliquid-demo",
     "tools/ws_test",
     "tools/harnessctl",
-    "tools/listing-monitor",
-
-    # Examples
-    "examples"
+    "tools/listing-monitor"
 ]
 
 # 預設只編譯核心元件與主要應用，可透過 `cargo build -p` 指定其他 crate。
