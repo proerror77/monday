@@ -9,7 +9,7 @@ name: Issue Lifecycle
 
 permissions:
   contents: read
-  issues: read
+  issues: write
   pull-requests: read
 
 jobs:
@@ -49,3 +49,34 @@ jobs:
           ruby .github/scripts/issue-lifecycle-audit.rb
           --repo "$GITHUB_REPOSITORY"
           --summary "$GITHUB_STEP_SUMMARY"
+          --violations-json "$RUNNER_TEMP/violations.json"
+      - name: Comment violations on issues
+        if: github.event_name != 'pull_request_target' && failure()
+        env:
+          VIOLATIONS_JSON: ${{ runner.temp }}/violations.json
+        run: |
+          if [[ ! -f "$VIOLATIONS_JSON" ]]; then
+            echo "No violations file; skipping issue comments" >&2
+            exit 0
+          fi
+          python3 - "$VIOLATIONS_JSON" "$GITHUB_REPOSITORY" <<'PY'
+          import json, subprocess, sys
+
+          violations, repo = json.load(open(sys.argv[1])), sys.argv[2]
+          marker = "This is an automated notice from the daily lifecycle audit."
+          for issue_number, reasons in violations.items():
+              existing = subprocess.run(
+                  ["gh", "issue", "view", str(issue_number), "--repo", repo,
+                   "--json", "comments", "-q", ".comments[].body"],
+                  capture_output=True, text=True,
+              ).stdout
+              if marker in existing:
+                  continue  # already flagged; avoid duplicate noise
+              body = "**Issue Lifecycle Audit** flagged this issue:\n\n" + \
+                     "\n".join(f"- {r}" for r in reasons) + \
+                     f"\n\n{marker}"
+              subprocess.run(
+                  ["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", body],
+                  check=False,
+              )
+          PY
