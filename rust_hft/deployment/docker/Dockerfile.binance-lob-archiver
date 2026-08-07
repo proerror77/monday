@@ -25,10 +25,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin binance-usdm-reference-artifact-verifier \
     --bin binance-usdm-reference-upload \
     --bin polymarket-raw-ops \
+    --bin bybit-options-archiver \
     && install -D -m 0755 /work/target/release/binance-lob-archiver \
        /out/bin/binance-lob-archiver \
     && install -D -m 0755 /work/target/release/polymarket-raw-ops \
        /out/bin/polymarket-raw-ops \
+    && install -D -m 0755 /work/target/release/bybit-options-archiver \
+       /out/bin/bybit-options-archiver \
     && install -D -m 0755 /work/target/release/binance-usdm-reference-collector \
        /out/bin/binance-usdm-reference-collector \
     && install -D -m 0755 /work/target/release/binance-usdm-reference-artifact-verifier \
@@ -69,6 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /out/bin/binance-lob-archiver /usr/local/bin/binance-lob-archiver
 COPY --from=builder /out/bin/polymarket-raw-ops /usr/local/bin/polymarket-raw-ops
+COPY --from=builder /out/bin/bybit-options-archiver /usr/local/bin/bybit-options-archiver
 COPY --from=builder /out/bin/binance-usdm-reference-collector /usr/local/bin/binance-usdm-reference-collector
 COPY --from=builder /out/bin/binance-usdm-reference-artifact-verifier /usr/local/bin/binance-usdm-reference-artifact-verifier
 COPY --from=builder /out/bin/binance-usdm-reference-upload /usr/local/bin/binance-usdm-reference-upload
