@@ -146,6 +146,11 @@ grep -Fq 'bybit-options-shadow-gate-policy.jq' "$shadow_gate"
 grep -Fq 'bybit-options-control-plane-lib.sh' "$shadow_gate"
 grep -Fq 'spool_drained:true' "$shadow_gate"
 grep -Fq 'upload_status:{failure_count:' "$shadow_gate"
+# The receipt jq program references $SHADOW_SPOOL in the service block; the
+# argument must actually be passed or the gate dies after a passing
+# observation window with "jq: $SHADOW_SPOOL is not defined".
+# shellcheck disable=SC2016 # literal contract assertion, $SHADOW_SPOOL must not expand
+grep -Fq -- '--arg SHADOW_SPOOL "$SHADOW_SPOOL"' "$shadow_gate"
 
 # Cutover contract: the candidate must clear a full shadow gate before the
 # production unit can be started, and the production env must stay fail-closed.
