@@ -799,6 +799,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
 sed -n \
   -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+  -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
   -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
   -e '/^run_before_deadline() {$/,/^}$/p' \
   -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE" \
@@ -1201,6 +1202,57 @@ jq -e '.status == "passed"
   and .upload_summary.canonical_uploaded_segments == 0' \
   --arg source "$good_uuid" \
   "$good_case/evidence/real-market-preflight.json" >/dev/null
+
+# Counterexample (issue #586): a tick-level segment much larger than the scan
+# window must not make the bounded SCAN exceed its budget. The upload path
+# legitimately scales with segment size, so this isolates the scan: a segment
+# at 2x the window must be scanned in bounded time because the quote counter
+# caps and the hour check samples head+tail.
+large_scan_tmp="$tmp_dir/large-scan"
+mkdir -p "$large_scan_tmp"
+large_segment="$large_scan_tmp/large.ndjson"
+{
+  for i in $(seq 1 "$((PREFLIGHT_SCAN_WINDOW_RECORDS * 2))"); do
+    if (( i % 2 == 0 )); then kind="quote"; else kind="event_discovered"; fi
+    printf '%s\n' \
+      "{\"sequence\":$i,\"recorded_at\":\"2026-01-01T00:00:00Z\",\"update\":{\"kind\":\"$kind\",\"token_id\":\"up\"}}"
+  done
+} >"$large_segment"
+large_bytes=$(wc -c <"$large_segment" | tr -d ' ')
+scan_start=$(date +%s)
+large_quotes=$(head -n "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$large_segment" \
+  | jq -c 'select(.update.kind == "quote")' \
+  | wc -l | tr -d ' ')
+large_hours=$(bash -c 'head -n "$1" "$2"; tail -n "$1" "$2"' _ \
+  "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$large_segment" \
+  | jq -r '.recorded_at | select(type=="string") | .[0:13]' \
+  | sort -u | wc -l | tr -d ' ')
+scan_end=$(date +%s)
+scan_elapsed=$((scan_end - scan_start))
+# The scan must be bounded: it reads at most PREFLIGHT_SCAN_WINDOW_RECORDS from
+# the head (and a head+tail window for hours), so a 2x-window segment scans in
+# ~the same time as a small one. No full-file linear scan of the segment.
+if (( scan_elapsed > 30 )); then
+  printf 'bounded scan took %ss for a %s-byte segment; must not scale with size\n' \
+    "$scan_elapsed" "$large_bytes" >&2
+  exit 1
+fi
+# The fixture alternates quote/event records, so the head window
+# (PREFLIGHT_SCAN_WINDOW_RECORDS) contains exactly half quotes. Assert the exact
+# count: a full-file scan of the 2x fixture would return WINDOW quotes, which
+# fails this check — proving the scan is bounded.
+expected_large_quotes=$((PREFLIGHT_SCAN_WINDOW_RECORDS / 2))
+(( large_quotes == expected_large_quotes )) || {
+  printf 'large-segment quote count %s, expected %s from the head window\n' \
+    "$large_quotes" "$expected_large_quotes" >&2
+  exit 1
+}
+[[ $large_hours -eq 1 ]] || {
+  printf 'large-segment hours %s was not 1\n' "$large_hours" >&2
+  exit 1
+}
+printf 'bounded scan OK: %s quotes in window, %s hour, %s bytes in %ss\n' \
+  "$large_quotes" "$large_hours" "$large_bytes" "$scan_elapsed"
 export PATH=$original_path
 
 # The live parity interval begins with the Rust shadow; settlement maturity is
@@ -2664,15 +2716,17 @@ exercise_bootstrap_snapshot() (
   die() { printf 'snapshot rejected: %s\n' "$*" >&2; exit 1; }
   # shellcheck source=/dev/null
   source "$snapshot_legacy_contract"
-  snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
-  # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
-  # sync (the test's sync() override is a no-op) so the digest check does not
-  # read a partially-flushed file under CI cache/IO pressure (#731 flake). Fail
-  # closed if sync itself fails, so the checksum check never runs on a
-  # potentially unflushed file.
-  command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
-  (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
-  jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+  (
+    snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
+    # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
+    # sync (the test's sync() override is a no-op) so the digest check does not
+    # read a partially-flushed file under CI cache/IO pressure (#731 flake). Fail
+    # closed if sync itself fails, so the checksum check never runs on a
+    # potentially unflushed file.
+    command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
+    (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
+    jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+  )
 )
 exercise_bootstrap_snapshot absent-control
 if exercise_bootstrap_snapshot copied-binary-drift true; then
@@ -3258,6 +3312,7 @@ jq \
       control_archive_sha256:$control_archive_sha,oss_config_sha256:$oss_config,
       dataset:"crypto_expiry_preflight_aaaaaaaaaaaa_run-1",
       source_quote_records:1,source_recorded_hours:1,
+      source_scan_bounded:true,
       source_content_sha256:$candidate,
       uploaded_content_sha256:$candidate,
       source_segment:{
