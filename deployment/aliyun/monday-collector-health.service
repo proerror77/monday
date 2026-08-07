@@ -1,0 +1,25 @@
+[Unit]
+Description=Run the Monday collector-host health check (read-only)
+# Deliberately NO ConditionPathIsMountPoint=/data and NO RequiresMountsFor=/data:
+# this monitor must DETECT and alert on a missing /data mount, not gate on it.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/monday/bin/monday-collector-health.sh --json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+StateDirectory=monday-collector-health
+UMask=0027
+Nice=10
+MemoryHigh=128M
+MemoryMax=256M
+TimeoutStartSec=120
