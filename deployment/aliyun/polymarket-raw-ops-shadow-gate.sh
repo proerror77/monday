@@ -29,9 +29,9 @@ readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
 # Tick-level segments (7.7-18GB) make a full-file preflight scan exceed the
 # budget. The scan is therefore bounded: a deterministic head/tail window
-# validates the segment and a capped counter reports quote presence (issue #586).
+# validates the segment and quote presence (issue #586). The window caps scanned
+# records so cost does not scale with tick volume.
 readonly PREFLIGHT_SCAN_WINDOW_RECORDS=200000
-readonly PREFLIGHT_QUOTE_COUNT_CAP=10000
 readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
@@ -928,14 +928,15 @@ real_market_segment_preflight() {
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  # Bounded scan (issue #586): count quotes only in a capped head window so the
-  # preflight cost does not scale with tick volume. source_quote_records is a
-  # lower-bound/sampled count, not the exact total; evidence carries
+  # Bounded scan (issue #586): count quotes only in a bounded head window so the
+  # preflight cost does not scale with tick volume. The input-side head caps the
+  # scanned records at PREFLIGHT_SCAN_WINDOW_RECORDS; jq reads the full window
+  # (no output truncation, so no SIGPIPE). source_quote_records is a
+  # window-bounded count, not the exact total; evidence carries
   # source_scan_bounded:true to keep the semantics honest.
   source_quote_records=$(run_before_deadline "$preflight_deadline" \
     head -n "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$source_tmp" \
     | jq -c 'select(.update.kind == "quote")' \
-    | head -n "$PREFLIGHT_QUOTE_COUNT_CAP" \
     | wc -l | tr -d ' ') || return 1
   [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
   # Bounded hour check: verify a deterministic head+tail window is a single
