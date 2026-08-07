@@ -1,0 +1,41 @@
+[Unit]
+Description=Monday Bybit Options quote archiver
+After=network-online.target
+Wants=network-online.target
+AssertPathIsMountPoint=/data
+
+[Service]
+Type=simple
+User=hftcollector
+WorkingDirectory=/opt/monday
+ExecStart=/opt/monday/releases/bybit-options-archiver/@BYBIT_OPTIONS_ARCHIVER_SHA256@/bybit-options-archiver
+Restart=always
+RestartSec=5
+RuntimeMaxSec=21600
+TimeoutStopSec=30
+# Fail-closed disk/spool guards (2026-08-07 governance).  MIN_FREE_GB and
+# BYBIT_OPTIONS_SPOOL_MAX_BYTES are the enforced floors; the binary bails out
+# (no new segments) when either is exceeded.
+Environment=BYBIT_OPTIONS_SPOOL_DIR=/data/monday/spool/bybit-options
+Environment=BYBIT_OPTIONS_SEGMENT_SECONDS=3600
+Environment=BYBIT_OPTIONS_MAX_SEGMENT_BYTES=4294967296
+Environment=BYBIT_OPTIONS_LOCAL_ZST_RETENTION_SECONDS=172800
+Environment=MIN_FREE_GB=20.0
+Environment=BYBIT_OPTIONS_SPOOL_MAX_BYTES=53687091200
+Environment=OSS_BUCKET=monday-lob-apne1-1045353359
+Environment=OSS_ENDPOINT=oss-ap-northeast-1-internal.aliyuncs.com
+Environment=OSS_REGION=ap-northeast-1
+Environment=ALIYUN_PROFILE=ecs-role
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/monday/spool/bybit-options
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=80%
+MemoryHigh=1G
+MemoryMax=1536M
+
+[Install]
+WantedBy=multi-user.target

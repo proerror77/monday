@@ -1,0 +1,230 @@
+name: Monitor Collector Host
+
+# Fallback alert channel for the Monday public-data collector host
+# (monday-trade-data-26, Aliyun Tokyo ap-northeast-1). The PRIMARY channel is
+# the Cloud Monitor disk alarm on the host; this scheduled workflow is the
+# second, repository-side channel. It runs the installed
+# /opt/monday/bin/monday-collector-health.sh on the host through Aliyun Cloud
+# Assistant and, when the snapshot reports ok:false, opens or appends a single
+# needs-triage GitHub issue (deduped by open-issue search).
+#
+# Prerequisite: ALIYUN_ACCESS_KEY_ID and ALIYUN_ACCESS_KEY_SECRET repository
+# secrets whose RAM policy is scoped to RunCommand/DescribeInvocationResults on
+# i-6we6afeqsvv8uo1ixmyo in ap-northeast-1 (no broader ECS or OSS grants).
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  INSTANCE_ID: i-6we6afeqsvv8uo1ixmyo
+  REGION_ID: ap-northeast-1
+  ISSUE_TITLE: '[collector-host] Durable monitor breach'
+
+# Serialize runs so two overlapping invocations cannot both see "no open issue"
+# and both create one. The monitor is schedule-driven; cancel-in-progress stays
+# false so a running check is never cancelled by the next tick.
+concurrency:
+  group: collector-host-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+
+      - name: Refresh origin/main
+        run: |
+          git fetch origin main
+          git checkout FETCH_HEAD
+
+      - name: Install Aliyun CLI and configure credentials
+        env:
+          # Pin to an immutable, SHA-verified release. The `latest` convenience
+          # URL can be silently repointed; the pinned archive is verified against
+          # the official release checksum before extraction.
+          ALIYUN_CLI_VERSION: 3.4.11
+          ALIYUN_CLI_SHA256: a7e3df497db14c10d4d7587795e9fa7849b0c51dfce02908b9de5a41fe717d5c
+        run: |
+          curl -fsSL -o /tmp/aliyun-cli.tgz \
+            "https://github.com/aliyun/aliyun-cli/releases/download/v${ALIYUN_CLI_VERSION}/aliyun-cli-linux-${ALIYUN_CLI_VERSION}-amd64.tgz"
+          printf '%s  %s\n' "$ALIYUN_CLI_SHA256" /tmp/aliyun-cli.tgz | sha256sum --check --strict -
+          tar -xzf /tmp/aliyun-cli.tgz -C /tmp
+          sudo install -m 0755 /tmp/aliyun /usr/local/bin/aliyun
+          aliyun version
+          mkdir -p "$HOME/.aliyun"
+          cat > "$HOME/.aliyun/config.json" <<EOF
+          {
+            "current": "default",
+            "profiles": [
+              {
+                "name": "default",
+                "mode": "AK",
+                "access_key_id": "${{ secrets.ALIYUN_ACCESS_KEY_ID }}",
+                "access_key_secret": "${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}",
+                "region_id": "${{ env.REGION_ID }}"
+              }
+            ]
+          }
+          EOF
+          chmod 600 "$HOME/.aliyun/config.json"
+
+      - name: Run collector health check via Cloud Assistant
+        id: health
+        run: |
+          set -euo pipefail
+          remote_script='#!/usr/bin/env bash\nset -euo pipefail\nexec /opt/monday/bin/monday-collector-health.sh --json'
+          content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
+          if ! run_json=$(aliyun ecs RunCommand \
+            --RegionId "${{ env.REGION_ID }}" \
+            --InstanceId.1 "${{ env.INSTANCE_ID }}" \
+            --Type RunShellScript \
+            --ContentEncoding Base64 \
+            --CommandContent "$content" \
+            --KeepCommand false \
+            --Name monday-collector-health \
+            --Timeout 90 2>&1); then
+            printf 'RunCommand failed: %s\n' "$run_json" >&2
+            {
+              echo "ok=unknown"
+              echo "invocation_failed=1"
+              echo "exit_code=runcommand-error"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId' 2>/dev/null || true)
+          if [ -z "$invoke_id" ]; then
+            printf 'RunCommand response had no InvokeId: %s\n' "$run_json" >&2
+            {
+              echo "ok=unknown"
+              echo "invocation_failed=1"
+              echo "exit_code=no-invoke-id"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "invoke_id=$invoke_id"
+
+          invocation_failed=0
+          health_json=""
+          exit_code=""
+          for _ in $(seq 1 30); do
+            result_json=$(aliyun ecs DescribeInvocationResults \
+              --RegionId "${{ env.REGION_ID }}" \
+              --InvokeId "$invoke_id" \
+              --InstanceId "${{ env.INSTANCE_ID }}" || true)
+            status=$(printf '%s' "$result_json" | jq -r '[.. | objects | .InvocationStatus? // empty][0] // empty')
+            exit_code=$(printf '%s' "$result_json" | jq -r '[.. | objects | .ExitCode? // empty][0] // empty')
+            case "$status" in
+              Success|Finished|Failed|Stopped|PartialFailed|Timeout)
+                # Decode the command Output for a health snapshot in every
+                # terminal state. The health script exits nonzero when it detects
+                # a breach, so a Failed/Stopped/PartialFailed/Timeout invocation
+                # may still carry a valid ok:false snapshot that must be surfaced
+                # as a breach, not treated as "the monitor could not run".
+                output=$(printf '%s' "$result_json" | jq -r '[.. | objects | .Output? // empty][0] // empty')
+                if [ -n "$output" ]; then
+                  health_json=$(printf '%s' "$output" | base64 --decode 2>/dev/null | grep -m1 '^{' || true)
+                fi
+                case "$status" in
+                  Failed|Stopped|PartialFailed|Timeout)
+                    {
+                      printf 'invocation reached terminal state: %s\n' "$status"
+                      printf '%s\n' "$result_json"
+                    } >&2
+                    ;;
+                esac
+                break
+                ;;
+            esac
+            sleep 5
+          done
+
+          # invocation_failed only when no health snapshot is available at all
+          # (e.g. the invocation never reached a terminal state, or it terminated
+          # without producing a decodable snapshot). A nonzero exit that still
+          # yields a decoded snapshot is a valid breach result, not a monitor
+          # failure; that path keeps invocation_failed=0 so the ok:false breach
+          # is surfaced. When no snapshot is produced, fail closed: the monitor
+          # could not verify the host, which must alert.
+          if [ -z "$health_json" ]; then
+            invocation_failed=1
+            if [ -z "$exit_code" ]; then
+              printf 'invocation did not reach a terminal state in time\n' >&2
+            else
+              printf 'no decodable health snapshot produced (exit %s)\n' "$exit_code" >&2
+            fi
+          fi
+
+          if [ -n "$health_json" ]; then
+            printf '%s\n' "$health_json" > /tmp/collector-health.json
+            ok=$(printf '%s\n' "$health_json" | jq -r '.ok')
+            echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=unknown" >> "$GITHUB_OUTPUT"
+          fi
+          echo "invocation_failed=$invocation_failed" >> "$GITHUB_OUTPUT"
+          echo "exit_code=${exit_code:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Open or append a needs-triage issue on breach
+        if: steps.health.outputs.invocation_failed == '0' && steps.health.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          breaches=$(jq -r '.breaches[]' /tmp/collector-health.json)
+          checked_at=$(jq -r '.checked_at' /tmp/collector-health.json)
+          {
+            printf 'Host: monday-trade-data-26 (Aliyun Tokyo ap-northeast-1, instance %s)\n' "${{ env.INSTANCE_ID }}"
+            printf 'Checked at: %s\n' "$checked_at"
+            printf 'Source revision: %s\n' "${{ github.sha }}"
+            printf 'Workflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'Primary alert channel is the Cloud Monitor disk alarm; this issue is the repository fallback and needs human triage.\n\n'
+            printf 'Breaches:\n'
+            printf '%s\n' "$breaches" | sed 's/^/- /'
+          } > /tmp/collector-health-issue.md
+
+          existing=$(gh issue list --state open --search 'in:title "Durable monitor breach"' \
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$existing" ]; then
+            created=$(gh issue create --title "${{ env.ISSUE_TITLE }}" \
+              --label bug --label needs-triage --body-file /tmp/collector-health-issue.md)
+            printf 'Created issue: %s\n' "$created"
+            gh issue view "$created" --json number,state,labels,title >/dev/null
+          else
+            gh issue comment "$existing" --body-file /tmp/collector-health-issue.md
+            printf 'Appended to existing issue: #%s\n' "$existing"
+          fi
+
+      - name: Open or append an issue when the monitor cannot run
+        if: steps.health.outputs.invocation_failed == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Host: monday-trade-data-26 (Aliyun Tokyo ap-northeast-1, instance %s)\n' "${{ env.INSTANCE_ID }}"
+            printf 'The Cloud Assistant health invocation did not return a JSON snapshot '
+            printf '(exit code "%s"), so the collector host monitor itself could not run.\n' "${{ steps.health.outputs.exit_code }}"
+            printf 'Source revision: %s\n' "${{ github.sha }}"
+            printf 'Workflow run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          } > /tmp/collector-health-issue.md
+
+          existing=$(gh issue list --state open --search 'in:title "Durable monitor breach"' \
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -z "$existing" ]; then
+            created=$(gh issue create --title "${{ env.ISSUE_TITLE }}" \
+              --label bug --label needs-triage --body-file /tmp/collector-health-issue.md)
+            printf 'Created issue: %s\n' "$created"
+          else
+            gh issue comment "$existing" --body-file /tmp/collector-health-issue.md
+            printf 'Appended to existing issue: #%s\n' "$existing"
+          fi

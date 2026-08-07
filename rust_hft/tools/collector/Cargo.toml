@@ -97,6 +97,10 @@ name = "binance-usdm-reference-artifact-verifier"
 path = "src/bin/binance-usdm-reference-artifact-verifier.rs"
 
 [[bin]]
+name = "bybit-options-archiver"
+path = "src/bin/bybit-options-archiver.rs"
+
+[[bin]]
 name = "binance-usdm-reference-upload"
 path = "src/bin/binance-usdm-reference-upload.rs"
 

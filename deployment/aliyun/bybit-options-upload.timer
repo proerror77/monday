@@ -1,0 +1,11 @@
+[Unit]
+Description=Upload Bybit Options quote segments to OSS
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=bybit-options-upload.service
+
+[Install]
+WantedBy=timers.target
