@@ -215,7 +215,7 @@ fn validate_mark_index_funding(row: &MarkIndexFundingObservation) -> Result<()> 
 
 fn validate_open_interest(row: &OpenInterestObservation) -> Result<()> {
     validate_symbol(&row.symbol)?;
-    validate_receive_clock(row.source_time_ms, row.received_at_ns)?;
+    validate_source_clock_not_future(row.source_time_ms, row.received_at_ns)?;
     if row.schema != REFERENCE_SCHEMA || row.source_endpoint != OPEN_INTEREST_ENDPOINT {
         bail!("open-interest source identity is invalid");
     }
@@ -245,7 +245,14 @@ impl ReferenceClockValidator {
         source_time_ms: u64,
         received_at_ns: u64,
     ) -> Result<()> {
-        validate_receive_clock(source_time_ms, received_at_ns)?;
+        match kind {
+            ReferenceKind::OpenInterest => {
+                validate_source_clock_not_future(source_time_ms, received_at_ns)?
+            }
+            ReferenceKind::Metadata | ReferenceKind::MarkIndexFunding => {
+                validate_receive_clock(source_time_ms, received_at_ns)?
+            }
+        }
         let key = (kind, symbol.to_owned());
         if self
             .clocks
@@ -386,7 +393,7 @@ pub fn open_interest_observation(
         bail!("openInterest response symbol does not match its request");
     }
     let source_time_ms = required_u64(raw, "time", "openInterest")?;
-    validate_receive_clock(source_time_ms, received_at_ns)?;
+    validate_source_clock_not_future(source_time_ms, received_at_ns)?;
     let open_interest = required_decimal(raw, "openInterest", "openInterest")?;
     if open_interest < Decimal::ZERO {
         bail!("open interest cannot be negative");
@@ -439,6 +446,20 @@ fn validate_receive_clock(source_time_ms: u64, received_at_ns: u64) -> Result<()
     }
     if received_at_ms > source_time_ms.saturating_add(MAX_SOURCE_DELAY_MS) {
         bail!("USD-M reference source clock is stale at receipt");
+    }
+    Ok(())
+}
+
+// The openInterest `time` field is the exchange's last-change timestamp for
+// that instrument, not a per-request clock: quiet instruments legitimately
+// lag minutes behind receipt (measured 97 of 569 active perpetuals beyond 25
+// seconds, worst ~10 minutes, on 2026-08-08). Only the lead direction (a
+// source timestamp from the future) stays fail-closed for open interest; the
+// lag direction is reported through ReferenceCoverage::stale_open_interest.
+fn validate_source_clock_not_future(source_time_ms: u64, received_at_ns: u64) -> Result<()> {
+    let received_at_ms = received_at_ns / 1_000_000;
+    if source_time_ms > received_at_ms.saturating_add(MAX_SOURCE_LEAD_MS) {
+        bail!("USD-M reference source clock leads received clock");
     }
     Ok(())
 }
@@ -678,6 +699,44 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("precedes its source-clock receipt"));
+    }
+
+    #[test]
+    fn open_interest_last_change_timestamps_are_evidence_not_a_liveness_clock() {
+        // The exchange openInterest `time` is a per-instrument last-change
+        // timestamp: a quiet instrument may legitimately lag minutes behind
+        // receipt without making the batch fail closed.
+        let mut stale_oi = open_interest();
+        stale_oi["time"] = json!(SOURCE_MS - 3_600_000);
+        let row = open_interest_observation(&stale_oi, "BTCUSDT", RECEIVED_NS).unwrap();
+        assert_eq!(row.source_time_ms, SOURCE_MS - 3_600_000);
+
+        let mut future_oi = open_interest();
+        future_oi["time"] = json!(SOURCE_MS + MAX_SOURCE_LEAD_MS + 60_000);
+        assert!(
+            open_interest_observation(&future_oi, "BTCUSDT", RECEIVED_NS)
+                .unwrap_err()
+                .to_string()
+                .contains("source clock leads received clock")
+        );
+
+        let contracts = active_perpetual_contracts(
+            &exchange_info(),
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap();
+        let expected = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let marks =
+            mark_index_funding_observations(&premium_index(), &expected, RECEIVED_NS).unwrap();
+        let batch =
+            CompleteReferenceBatch::new(contracts, marks, vec![row]).unwrap();
+        let coverage = batch.coverage(RECEIVED_NS + 200_000_000, 1_000).unwrap();
+        assert_eq!(coverage.open_interest_observations, 1);
+        assert_eq!(coverage.stale_open_interest, 1);
+        assert_eq!(coverage.stale_metadata, 0);
+        assert_eq!(coverage.stale_mark_index_funding, 0);
     }
 
     #[test]
