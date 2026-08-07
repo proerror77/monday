@@ -799,6 +799,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 preflight_verifier="$tmp_dir/real-market-preflight.sh"
 sed -n \
   -e '/^readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=/p' \
+  -e '/^readonly PREFLIGHT_SCAN_WINDOW_RECORDS=/p' \
+  -e '/^readonly PREFLIGHT_QUOTE_COUNT_CAP=/p' \
   -e '/^remaining_seconds_before_deadline() {$/,/^}$/p' \
   -e '/^run_before_deadline() {$/,/^}$/p' \
   -e '/^oss_download_with_retry() {$/,/^}$/p' "$GATE" \
@@ -1201,6 +1203,46 @@ jq -e '.status == "passed"
   and .upload_summary.canonical_uploaded_segments == 0' \
   --arg source "$good_uuid" \
   "$good_case/evidence/real-market-preflight.json" >/dev/null
+
+# Counterexample (issue #586): a tick-level segment much larger than the scan
+# window must not make the bounded scan exceed its budget. Construct a segment
+# with far more records than PREFLIGHT_SCAN_WINDOW_RECORDS and verify the quote
+# count is capped and hours still resolve.
+large_case="$preflight_root/large-case"
+mkdir -p "$large_case/source" "$large_case/spool" "$large_case/download" \
+  "$large_case/evidence"
+large_segment="$large_case/source/market-updates.20260101T070000000000.ndjson"
+{
+  for _ in $(seq 1 "$((PREFLIGHT_SCAN_WINDOW_RECORDS * 2))"); do
+    printf '%s\n' \
+      '{"sequence":0,"recorded_at":"2026-01-01T00:00:00Z","update":{"kind":"quote","token_id":"up"}}'
+  done
+} >"$large_segment"
+start_scan=$(date +%s)
+real_market_segment_preflight "$large_case/source" "$large_case/spool" \
+  "$large_case/download" "$large_case/evidence" || {
+  printf 'real-segment preflight rejected a large tick-level segment\n' >&2
+  exit 1
+}
+end_scan=$(date +%s)
+elapsed=$((end_scan - start_scan))
+# The bounded scan must not scale with segment size: the quote counter caps at
+# PREFLIGHT_QUOTE_COUNT_CAP and the hour check samples head+tail. A generous
+# ceiling proves no full-file linear scan of the 2x-window segment.
+if (( elapsed > 60 )); then
+  printf 'bounded preflight scan took %ss; must not scale with tick volume\n' \
+    "$elapsed" >&2
+  exit 1
+fi
+jq -e '.status == "passed"
+  and .source_scan_bounded == true
+  and (.source_quote_records <= '"$PREFLIGHT_QUOTE_COUNT_CAP"')
+  and .source_recorded_hours == 1' \
+  "$large_case/evidence/real-market-preflight.json" >/dev/null \
+  || {
+    printf 'large-segment preflight evidence did not reflect bounded scan\n' >&2
+    exit 1
+  }
 export PATH=$original_path
 
 # The live parity interval begins with the Rust shadow; settlement maturity is
