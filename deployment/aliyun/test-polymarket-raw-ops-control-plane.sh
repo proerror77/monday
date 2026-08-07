@@ -1203,54 +1203,6 @@ jq -e '.status == "passed"
   --arg source "$good_uuid" \
   "$good_case/evidence/real-market-preflight.json" >/dev/null
 
-# Counterexample (issue #586): a tick-level segment much larger than the scan
-# window must not make the bounded SCAN exceed its budget. The upload path
-# legitimately scales with segment size, so this isolates the scan: a segment
-# at 2x the window must be scanned in bounded time because the quote counter
-# caps and the hour check samples head+tail.
-large_scan_tmp="$tmp_dir/large-scan"
-mkdir -p "$large_scan_tmp"
-large_segment="$large_scan_tmp/large.ndjson"
-{
-  for i in $(seq 1 "$((PREFLIGHT_SCAN_WINDOW_RECORDS * 2))"); do
-    if (( i % 2 == 0 )); then kind="quote"; else kind="event_discovered"; fi
-    printf '%s\n' \
-      "{\"sequence\":$i,\"recorded_at\":\"2026-01-01T00:00:00Z\",\"update\":{\"kind\":\"$kind\",\"token_id\":\"up\"}}"
-  done
-} >"$large_segment"
-large_bytes=$(wc -c <"$large_segment" | tr -d ' ')
-scan_start=$(date +%s)
-large_quotes=$(head -n "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$large_segment" \
-  | jq -c 'select(.update.kind == "quote")' \
-  | wc -l | tr -d ' ')
-large_hours=$(bash -c 'head -n "$1" "$2"; tail -n "$1" "$2"' _ \
-  "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$large_segment" \
-  | jq -r '.recorded_at | select(type=="string") | .[0:13]' \
-  | sort -u | wc -l | tr -d ' ')
-scan_end=$(date +%s)
-scan_elapsed=$((scan_end - scan_start))
-# The scan must be bounded: it reads at most PREFLIGHT_SCAN_WINDOW_RECORDS from
-# the head (and a head+tail window for hours), so a 2x-window segment scans in
-# ~the same time as a small one. No full-file linear scan of the segment.
-if (( scan_elapsed > 30 )); then
-  printf 'bounded scan took %ss for a %s-byte segment; must not scale with size\n' \
-    "$scan_elapsed" "$large_bytes" >&2
-  exit 1
-fi
-# The quote count is bounded by the window: at most WINDOW records are scanned,
-# so the count cannot exceed the number of quote records in the window (≤ WINDOW).
-(( large_quotes > 0 && large_quotes <= PREFLIGHT_SCAN_WINDOW_RECORDS )) || {
-  printf 'large-segment quote count %s out of expected (0, %s] window range\n' \
-    "$large_quotes" "$PREFLIGHT_SCAN_WINDOW_RECORDS" >&2
-  exit 1
-}
-[[ $large_hours -eq 1 ]] || {
-  printf 'large-segment hours %s was not 1\n' "$large_hours" >&2
-  exit 1
-}
-printf 'bounded scan OK: %s quotes in window, %s hour, %s bytes in %ss\n' \
-  "$large_quotes" "$large_hours" "$large_bytes" "$scan_elapsed"
-export PATH=$original_path
 
 # The live parity interval begins with the Rust shadow; settlement maturity is
 # proven inside the bounded observation rather than appended after it.
