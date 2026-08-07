@@ -2713,15 +2713,17 @@ exercise_bootstrap_snapshot() (
   die() { printf 'snapshot rejected: %s\n' "$*" >&2; exit 1; }
   # shellcheck source=/dev/null
   source "$snapshot_legacy_contract"
-  snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
-  # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
-  # sync (the test's sync() override is a no-op) so the digest check does not
-  # read a partially-flushed file under CI cache/IO pressure (#731 flake). Fail
-  # closed if sync itself fails, so the checksum check never runs on a
-  # potentially unflushed file.
-  command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
-  (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
-  jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+  (
+    snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
+    # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
+    # sync (the test's sync() override is a no-op) so the digest check does not
+    # read a partially-flushed file under CI cache/IO pressure (#731 flake). Fail
+    # closed if sync itself fails, so the checksum check never runs on a
+    # potentially unflushed file.
+    command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
+    (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
+    jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
+  )
 )
 exercise_bootstrap_snapshot absent-control
 if exercise_bootstrap_snapshot copied-binary-drift true; then
@@ -3307,6 +3309,7 @@ jq \
       control_archive_sha256:$control_archive_sha,oss_config_sha256:$oss_config,
       dataset:"crypto_expiry_preflight_aaaaaaaaaaaa_run-1",
       source_quote_records:1,source_recorded_hours:1,
+      source_scan_bounded:true,
       source_content_sha256:$candidate,
       uploaded_content_sha256:$candidate,
       source_segment:{
