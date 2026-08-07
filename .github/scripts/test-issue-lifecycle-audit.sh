@@ -24,9 +24,9 @@ def pull_request(number, relationship, base = "main", commits = [], extra = "", 
     "commits" => commits }
 end
 
-def data(issues, pull_requests = [], automatic_close = true)
+def data(issues, pull_requests = [], automatic_close = true, closed_runtime = [])
   { "repo" => "example/repo", "default_branch" => "main", "automatic_linked_issue_closing" => automatic_close,
-    "issues" => issues, "pull_requests" => pull_requests }
+    "issues" => issues, "pull_requests" => pull_requests, "closed_runtime_issues" => closed_runtime }
 end
 
 base = issue(10, %w[enhancement ready-for-agent], issue_body, ["agent"])
@@ -179,7 +179,15 @@ cases = {
   ], [pull_request(31, "Closes #10", "main", [
     { "sha" => "closed", "message" => "Closed #52" }
   ])]),
-  "commit_list_incomplete" => data([base], [incomplete_commits])
+  "commit_list_incomplete" => data([base], [incomplete_commits]),
+  "double_close_same_issue" => data([base], [
+    pull_request(71, "Closes #10"),
+    pull_request(72, "Closes #10")
+  ]),
+  "closed_runtime_no_evidence" => data([], [], true, [
+    { "number" => 90, "title" => "Closed runtime", "body" => "no evidence",
+      "labels" => [{ "name" => "bug" }, { "name" => "runtime" }], "comments" => [] }
+  ])
 }
 File.write(ARGV.fetch(0), JSON.generate("cases" => cases))
 RUBY
@@ -232,6 +240,8 @@ mixed_literal_escaped_newline|Issue #60: body contains a literal escaped newline
 tracking_agent_queue|Issue #35: tracking issues cannot use ready-for-agent
 runtime_missing_control|Issue #36: runtime ready-for-agent is missing Runtime control: Candidate
 runtime_open_blocker|Issue #37: runtime ready-for-agent has open native blocker #99
+double_close_same_issue|Issue #10 is claimed closed by multiple open pull requests
+closed_runtime_no_evidence|Issue #90 (runtime, closed): missing completion/closure evidence
 active_missing_owner|Issue #40: active implementation requires exactly one assignee
 active_multiple_owners|Issue #41: active implementation requires exactly one assignee
 parent_mismatch|Issue #42: Parent summary references #456; native parent is #455

@@ -144,6 +144,157 @@ systemctl is-active polymarket-market-tape-upload-watchdog.timer
 journalctl -t polymarket-upload-watchdog -n 5
 ```
 
+## Durable monitoring
+
+The 2026-08-05/06 disk-full incident was silent because the only on-host
+monitor (`polymarket-market-tape-upload-watchdog.sh`) self-heals but never
+alerts a human: every governed collector stopped, uploads failed, and
+delay-gate trips accumulated with nobody notified. This host now has a durable,
+read-only health monitor with two alert channels: a Cloud Monitor disk alarm
+(primary) and a scheduled GitHub Actions workflow (fallback).
+
+### Health script contract
+
+`deployment/aliyun/monday-collector-health.sh` is a POSIX `sh`, read-only
+monitor. It never starts, stops, enables, or disables a unit and never modifies
+tape files or `upload-status.json`. It emits one JSON snapshot (or a human
+`ok:`/`breach:` summary) and exits nonzero when any breach is present. It logs
+to journald tag `monday-collector-health`. Run with `--json` for machine output
+and `--dry-run` to avoid reading or writing the persistent delta state.
+
+| Check | Breach condition |
+| --- | --- |
+| `/data` disk | free < 25% (warn) or < 10% (critical) via `df -Pk /data` |
+| Governed services | `binance-lob-archiver-production@spot/usdm` and `binance-usdm-reference-collector` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| Upload lanes | `polymarket-market-tape-upload.timer` and `polymarket-reference-upload.timer` active AND enabled; their oneshot services' last `Result==success` |
+| Watchdog | `polymarket-market-tape-upload-watchdog.timer` active AND enabled; the watchdog service's last `Result==success` |
+| Incident fill source | `bybit-options-archiver.service` and `polymarket-raw-ops-gate@.service` must stay disabled/masked/not-found |
+| `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
+| `upload-status.json` | `last_error_at`/`last_error` present, or a `failure_count` delta since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
+| Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
+| `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
+
+The persistent-service check deliberately does not breach on `NRestarts > 0`:
+both Binance archivers restart every six hours by design
+(`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
+or an `NRestarts` delta greater than one between consecutive five-minute polls.
+
+Test/override environment for fixtures and containers:
+`MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
+`MONDAY_COLLECTOR_STATE_DIR` (default `/var/lib/monday-collector-health`).
+`test-monday-collector-health.sh` is the self-contained contract test.
+
+### Install and timer deploy
+
+This is a governed runtime change with one named controller, following the same
+template as the upload watchdog above:
+
+- Controller: `CONTROLLER_NAME` (one named operator; no concurrent writers).
+- Target: host `monday-trade-data-26`, units
+  `monday-collector-health.service` and `monday-collector-health.timer`.
+- Source identity: this repository at commit `SOURCE_REVISION`, files
+  `deployment/aliyun/monday-collector-health.sh`,
+  `deployment/aliyun/monday-collector-health.service`, and
+  `deployment/aliyun/monday-collector-health.timer`.
+- Stop rules: abort if the installed files or the script do not match the
+  source, or if the post-install readback does not match; rollback rather than
+  retry in place.
+- Rollback:
+  `sudo systemctl disable --now monday-collector-health.timer`, then remove the
+  three installed files, `sudo rm -rf /var/lib/monday-collector-health`, and
+  `sudo systemctl daemon-reload`.
+
+```bash
+sudo install -m 0755 deployment/aliyun/monday-collector-health.sh \
+  /opt/monday/bin/monday-collector-health.sh
+sudo install -m 0644 deployment/aliyun/monday-collector-health.service \
+  deployment/aliyun/monday-collector-health.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monday-collector-health.timer
+```
+
+Post-install readback (required before the change is considered live):
+
+```bash
+systemctl is-active monday-collector-health.timer
+/opt/monday/bin/monday-collector-health.sh --json
+systemctl status monday-collector-health.service --no-pager -n 5
+```
+
+The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
+the mount check is to detect and alert when `/data` is missing.
+
+### Cloud Monitor disk alarm (PRIMARY)
+
+The on-host timer and the GitHub workflow cannot alert if the host is
+unreachable or the repository cannot run, so the primary alert must live in
+Aliyun Cloud Monitor on the ECS itself. Create a metric alarm for instance
+`i-6we6afeqsvv8uo1ixmyo` on the root-disk utilization metric with two
+threshold tiers (an alarm group is configured per tier):
+
+- warn: disk free < 25% — about 5.6 hours of runway at the 2026-08-05/06 fill
+  rate (~120-130 GiB/day) before the 10% threshold.
+- critical: disk free < 10% — collection failure territory.
+
+Representative alarm configuration (adjust `ContactGroups` and the webhook, and
+apply through the Cloud Monitor console so field names match the current API
+version):
+
+```json
+{
+  "ruleName": "monday-collector-disk-warn",
+  "instanceId": "i-6we6afeqsvv8uo1ixmyo",
+  "metricName": "DiskUtilization",
+  "statistics": "Average",
+  "period": 300,
+  "comparisonOperator": "GreaterThanThreshold",
+  "threshold": 75,
+  "evaluationCount": 1,
+  "contactGroups": ["monday-oncall"],
+  "notifyType": "warning",
+  "recoverNotify": true,
+  "level": "WARN"
+}
+```
+
+```json
+{
+  "ruleName": "monday-collector-disk-critical",
+  "instanceId": "i-6we6afeqsvv8uo1ixmyo",
+  "metricName": "DiskUtilization",
+  "statistics": "Average",
+  "period": 300,
+  "comparisonOperator": "GreaterThanThreshold",
+  "threshold": 90,
+  "evaluationCount": 1,
+  "contactGroups": ["monday-oncall"],
+  "notifyType": "critical",
+  "recoverNotify": true,
+  "level": "CRITICAL"
+}
+```
+
+The `monday-oncall` contact group must contain both an email address and a
+DingTalk webhook robot, and recovery notification must be enabled so a resolved
+incident is visible. Cloud Monitor is the PRIMARY channel because it fires even
+when every GitHub and repository path is down.
+
+### GitHub Actions workflow (fallback)
+
+`.github/workflows/monitor-collector-host.yml` runs every 15 minutes. It
+refreshes `origin/main`, invokes `/opt/monday/bin/monday-collector-health.sh
+--json` on the host through Cloud Assistant (the same RunShellScript/Base64
+invoke pattern as `invoke-rust-lob-operation.sh`), decodes the JSON, and when
+`ok:false` opens or appends a single `needs-triage` GitHub issue (deduped by
+open-issue search) following the `docs/agents/issue-tracker.md` lifecycle. It
+also opens an issue when the invocation itself cannot return a snapshot.
+
+Prerequisites: repository secrets `ALIYUN_ACCESS_KEY_ID` and
+`ALIYUN_ACCESS_KEY_SECRET` whose RAM policy is scoped to
+RunCommand/DescribeInvocationResults on `i-6we6afeqsvv8uo1ixmyo` in
+`ap-northeast-1` (no broader ECS or OSS grants). See the workflow header.
+
 The companion `polymarket-reference-collector.service` polls the official Gamma and
 Data APIs every 30 seconds. It writes complete Gamma market payloads (including
 volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
@@ -435,6 +586,88 @@ level, the host needs a resize rather than a further raise. It is calibration,
 not promotion evidence: the production gate still requires CPU accounting and
 peak memory to stay inside the systemd limits.
 
+## Bybit Options collector lane
+
+The `bybit-options-archiver` is the repo-governed Bybit v5 options market-data
+collector. It subscribes to the public Bybit v5 options public-trade and ticker
+WebSocket feeds, discovers the full option symbol catalog, and writes immutable
+hourly segments of canonical quote events under
+`/data/monday/spool/bybit-options/lake/raw/venue=bybit/market=option/dataset=options_quotes/...`
+(`.ndjson` while active, `.zst` after compression). The uploader publishes the
+compressed segments to
+`oss://monday-lob-apne1-1045353359/lake/raw/venue=bybit/market=option/...` under
+the `ecs-role` profile and verifies each object by readback before recycling the
+source segment.
+
+The lane was brought back after the 2026-08-05/06 Aliyun disk-full incident
+caused by the unmanaged Bybit options archiver. Three defects caused unbounded
+local growth and were fixed in this governed lane:
+
+1. **No spool cap and no low-disk gate.** `MIN_FREE_GB` (default `20.0`) and
+   `BYBIT_OPTIONS_SPOOL_MAX_BYTES` (default `53687091200`, 50 GiB) are enforced
+   by the writer before opening or rotating a segment and by the uploader before
+   compressing. Both bail out fail-closed, and `disk_free_gb`, `disk_warning`,
+   and `spool_warning` are surfaced in `health.json`.
+2. **Uploader never recycled the source segment.** The uploader now writes a
+   `.uploaded.json` marker only after verified OSS readback and then recycles
+   the raw `.ndjson`. The `.zst` is retained locally as a bounded fallback and
+   swept after `BYBIT_OPTIONS_LOCAL_ZST_RETENTION_SECONDS` (default 2 days).
+3. **Bare WS connect and fixed 2 s reconnect.** The WebSocket handshake now
+   carries a `monday-bybit-options-archiver/<rev>` User-Agent plus Origin and
+   app_id headers per Bybit v5 requirements, and reconnects use bounded
+   exponential backoff `(backoff*2).min(30)`, reset to 1 s on success.
+
+### Units and environment
+
+- `bybit-options-archiver.service` — the collector, `RuntimeMaxSec=21600`,
+  `AssertPathIsMountPoint=/data`,
+  `ReadWritePaths=/data/monday/spool/bybit-options`,
+  `CPUQuota=80%`, `MemoryHigh=1G`/`MemoryMax=1536M`.
+- `bybit-options-upload.service` — `--upload-only` oneshot uploader run by
+  `bybit-options-upload.timer` (5-minute cadence), same fail-closed env.
+- Governed env baked into both units: `MIN_FREE_GB=20.0`,
+  `BYBIT_OPTIONS_SPOOL_MAX_BYTES=53687091200`,
+  `BYBIT_OPTIONS_SPOOL_DIR=/data/monday/spool/bybit-options`,
+  `BYBIT_OPTIONS_LOCAL_ZST_RETENTION_SECONDS=172800`, and the OSS identity. The
+  deploy lane refuses a rendered unit that drops `MIN_FREE_GB` or the spool cap.
+
+### Promotion (staging -> shadow gate -> cutover)
+
+1. **Stage** a digest-addressed release with
+   `bybit-options-archiver-deploy.sh install <artifact-dir> <source-revision>`.
+   The script stages `/opt/monday/releases/bybit-options-archiver/<sha>/`
+   (binary + deployment bundle + `release.json`), renders the systemd units, and
+   points `/opt/monday/bin/bybit-options-archiver-shadow` at the candidate. It
+   never starts production.
+2. **Gate** the candidate for at least one hour with
+   `host-bybit-options-shadow-gate.sh <candidate-sha256>`. The shadow runs as a
+   transient `bybit-options-shadow.service` against the isolated
+   `/data/monday/spool/bybit-options-shadow`, settles to full-catalog health,
+   and is observed for the full duration against the runtime health policy
+   (`bybit-options-runtime-health-policy.jq`), monotonic freshness
+   (`bybit_options_observe_health_freshness`), zero restarts, and a fail-closed
+   drain. Passing evidence is append-only under
+   `/data/monday/evidence/bybit-options-shadow-gates/<sha>/<bundle>/runs/<id>/`
+   as `gate.json` plus single-line `PASSED.sha256`, validated by
+   `bybit-options-shadow-gate-policy.jq`.
+3. **Cut over** with `host-bybit-options-cutover.sh <candidate-sha256>`. The
+   cutover revalidates the release identity, the deployment bundle digest, and
+   exactly one immutable production-eligible `PASSED.sha256`, then stops the
+   previous release (or starts green-field), drains the canonical spool with the
+   candidate uploader, renders and installs the candidate units, clears stale
+   health, starts the collector, and requires fresh full-catalog health before
+   enabling the unit and the upload timer. Failure after the transition starts
+   restores the previous release (or disables and runtime-masks the lane) and
+   writes `cutover.json` evidence under
+   `/data/monday/evidence/bybit-options-cutovers/`.
+
+The lane is fail-closed: the collector and uploader stop writing when the spool
+mount drops below `MIN_FREE_GB` or pending raw bytes reach
+`BYBIT_OPTIONS_SPOOL_MAX_BYTES`, and no release can be promoted without a
+full-duration shadow gate and a verified deployment bundle. Do not run the
+unmanaged legacy binary, do not start `bybit-options-archiver.service` before
+its gate, and never delete a spool by hand.
+
 ## Backtesting storage boundary
 
 Use OSS raw segments as the immutable source of truth, not as the repeated query
@@ -654,6 +887,59 @@ under `/data/monday/evidence/cutovers/`.
 Rollback uses the same `ACTION=cutover` operation with a previously installed,
 previously gated artifact digest. There is no Python fallback and no manual
 symlink shortcut.
+
+### 4. Restore a stopped, already-gated production release
+
+If an already-gated, already-cutover release was later stopped and disabled (for
+example, during a disk-full incident), `ACTION=cutover` cannot bring it back:
+`host-rust-lob-cutover.sh` refuses an active==2/enabled==2 host with an
+"ambiguous production state" error and there is no governed restore path.
+`host-rust-lob-restore.sh` closes that gap. It is fail-closed: it never rewrites
+the production symlink and never touches the digest-addressed release or its
+deployment assets, so the restored runtime is byte-identical to the cutover
+artifact.
+
+Invoke it with the immutable artifact digest that is already on disk and already
+gated:
+
+```bash
+set -euo pipefail
+ACTION=restore \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+Before starting anything the host restore requires all of the following:
+
+1. `sha256($PRODUCTION_LINK)` matches `ARTIFACT_SHA256` and the link resolves to
+   `$RELEASE_ROOT/<sha256>/binance-lob-archiver`.
+2. Exactly one immutable passed shadow gate exists for that
+   `<sha256>/<deployment_bundle_sha256>` and it still satisfies the gate policy.
+3. No production unit is active (a running restore is refused, never preempted).
+4. The production symlink exists (a missing symlink is refused, never recreated).
+5. The canonical spool path is a direct directory tree under `/data` (no symlink
+   escapes) and the spot/usdm subdirectories exist.
+6. The canonical spool contains no segment artifacts, unless the operator forces
+   with `MONDAY_ALLOW_RESTORE_WITH_PENDING=1`.
+7. The installed production unit/env files match the gated deployment bundle
+   `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
+
+The restore then clears stale health, starts the production units while disabled,
+waits for fresh full-catalog health written after the restart with a new session
+and zero restarts, verifies each `/proc/<pid>/exe` still resolves to the
+candidate release, enables production for reboot, and re-verifies health. A
+unique recovery evidence directory is created under
+`/data/monday/evidence/recoveries/<ts>-<sha:0:12>-<pid>/` and holds the previous
+and post-restart health snapshots, a copy of the gated `gate.json` +
+`PASSED.sha256`, and immutable `recovery.json` + `verification.json`.
+
+If the restored units never reach verified health, the host restore performs a
+fail-closed rollback: it disables and stops production, applies the runtime
+transition mask to the production, upload, and legacy units, verifies the host
+is fail-closed, preserves rollback health evidence, and records
+`recovery.json` with `result: failed` and `rollback_result`. A failed restore
+never leaves production active, enabled, or unmasked.
 
 ### Upload cleanup and failure rules
 

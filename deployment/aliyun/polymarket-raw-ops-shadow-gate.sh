@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2034  # $1/$2 in bash -c are intentional; source_scan_bounded is used in jq evidence
 set -euo pipefail
 
 umask 027
@@ -26,6 +27,11 @@ readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true
 # budget plus 120 attempts) AND the upload time of the largest observed
 # segment (~150s for a 109MiB multipart object on this endpoint).
 readonly REAL_MARKET_PREFLIGHT_BUDGET_SECONDS=1200
+# Tick-level segments (7.7-18GB) make a full-file preflight scan exceed the
+# budget. The scan is therefore bounded: a deterministic head/tail window
+# validates the segment and quote presence (issue #586). The window caps scanned
+# records so cost does not scale with tick volume.
+readonly PREFLIGHT_SCAN_WINDOW_RECORDS=200000
 readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
@@ -922,16 +928,29 @@ real_market_segment_preflight() {
   preflight_dataset="crypto_expiry_preflight_${candidate_sha:0:12}_${run_id,,}"
   [[ $preflight_dataset =~ ^[a-z0-9_-]+$ ]] || return 1
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # Bounded scan (issue #586): count quotes only in a bounded head window so the
+  # preflight cost does not scale with tick volume. The input-side head caps the
+  # scanned records at PREFLIGHT_SCAN_WINDOW_RECORDS; jq reads the full window
+  # (no output truncation, so no SIGPIPE). source_quote_records is a
+  # window-bounded count, not the exact total; evidence carries
+  # source_scan_bounded:true to keep the semantics honest.
   source_quote_records=$(run_before_deadline "$preflight_deadline" \
-    jq -c 'select(.update.kind == "quote")' "$source_tmp" \
+    head -n "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$source_tmp" \
+    | jq -c 'select(.update.kind == "quote")' \
     | wc -l | tr -d ' ') || return 1
   [[ $source_quote_records =~ ^[0-9]+$ && $source_quote_records -gt 0 ]] || return 1
-  source_recorded_hours=$(run_before_deadline "$preflight_deadline" jq -r '
-    .recorded_at
-    | select(type == "string"
-      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
-    | .[0:13]' "$source_tmp" | sort -u | wc -l | tr -d ' ') || return 1
+  # Bounded hour check: verify a deterministic head+tail window is a single
+  # recorded hour. Full-file certainty is intentionally traded for bounded cost;
+  # source_recorded_hours_window:true marks this in evidence.
+  source_recorded_hours=$(run_before_deadline "$preflight_deadline" bash -c '
+    head -n "$1" "$2"; tail -n "$1" "$2"' _ "$PREFLIGHT_SCAN_WINDOW_RECORDS" "$source_tmp" \
+    | jq -r '
+      .recorded_at
+      | select(type == "string"
+        and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
+      | .[0:13]' | sort -u | wc -l | tr -d ' ') || return 1
   [[ $source_recorded_hours == 1 ]] || return 1
+  source_scan_bounded=true
   source_bytes=$(run_before_deadline "$preflight_deadline" \
     stat -c %s "$source_tmp") || return 1
   source_identity=$(run_before_deadline "$preflight_deadline" \
@@ -1026,6 +1045,7 @@ real_market_segment_preflight() {
         oss_config_sha256:$oss_config_sha256,dataset:$dataset,
         source_segment:$source_segment,source_quote_records:$source_quote_records,
         source_recorded_hours:$source_recorded_hours,
+        source_scan_bounded:true,
         source_content_sha256:$source_content_sha256,
         candidate_exit_code:$candidate_exit_code,
         candidate_stderr_sha256:$stderr_sha256}' >"$preflight_tmp"
@@ -1076,6 +1096,7 @@ real_market_segment_preflight() {
       oss_config_sha256:$oss_config_sha256,dataset:$dataset,
       source_quote_records:$source_quote_records,
       source_recorded_hours:$source_recorded_hours,
+      source_scan_bounded:true,
       source_content_sha256:$source_content_sha256,
       uploaded_content_sha256:$uploaded_content_sha256,
       source_segment:$source_segment,uploaded_triplet:$uploaded_triplet,

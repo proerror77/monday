@@ -82,6 +82,7 @@ assets=(
   binance-lob-archiver-rust-usdm.env
   host-rust-lob-shadow-gate.sh
   host-rust-lob-cutover.sh
+  host-rust-lob-restore.sh
   rust-lob-control-plane-lib.sh
   rust-lob-runtime-health-policy.jq
   rust-lob-shadow-gate-policy.jq

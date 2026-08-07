@@ -307,6 +307,61 @@ def audit_pull_request(pull_request, issues, default_branch, repo)
   violations
 end
 
+def cross_pr_double_close_violations(pull_requests)
+  closers_by_issue = {}
+  pull_requests.each do |pull_request|
+    relationship = visible_relationship(pull_request["body"])
+    next unless relationship && relationship["kind"] == "closes"
+
+    number = relationship["number"]
+    pr_number = pull_request.fetch("number")
+    (closers_by_issue[number] ||= []) << pr_number
+  end
+
+  closers_by_issue.each_with_object([]) do |(issue_number, pr_numbers), violations|
+    next unless pr_numbers.length > 1
+
+    violations << "Issue ##{issue_number} is claimed closed by multiple open pull requests: PR ##{pr_numbers.sort.join(", #")}; exactly one may use Closes"
+  end
+end
+
+EVIDENCE_SECTION_HEADINGS = [
+  "Completion evidence",
+  "Runtime closure evidence",
+  "Runtime control"
+].freeze
+
+def evidence_section_present?(body)
+  return false if body.nil? || body.empty?
+
+  markdown = visible_markdown(body)
+  EVIDENCE_SECTION_HEADINGS.any? do |heading|
+    markdown.match?(/^(?:[#]{1,6}[ \t]+)?#{Regexp.escape(heading)}[ \t]*$/m)
+  end
+end
+
+def comment_history_has_evidence?(comments)
+  # The issue API may return `comments` as an Integer count; hydrate_live_issue!
+  # replaces it with the comment array when available. Normalize both cases.
+  return false if comments.nil? || comments == 0 || (comments.is_a?(Array) && comments.empty?)
+
+  return false unless comments.is_a?(Array)
+
+  comments.any? do |comment|
+    body = comment.is_a?(Hash) ? comment["body"] : comment.to_s
+    evidence_section_present?(body) || body.to_s.include?("rollback identity") || body.to_s.include?("Named controller")
+  end
+end
+
+def audit_closed_runtime_evidence(closed_runtime_issues)
+  closed_runtime_issues.each_with_object([]) do |issue, violations|
+    number = issue.fetch("number")
+    next if evidence_section_present?(issue["body"]) || comment_history_has_evidence?(issue["comments"])
+
+    violations << "Issue ##{number} (runtime, closed): missing completion/closure evidence (Target, Named controller, rollback identity, stop rules, terminal result) in body or comment history"
+  end
+end
+
 def automatic_close_description(value, fixture)
   return "enabled (fixture)" if fixture && value == true
   return "disabled (fixture)" if fixture && value == false
@@ -321,6 +376,23 @@ def load_live(repo, pr_number)
   entries = github.paginate("repos/#{repo}/issues?state=open")
   issue_entries = entries.reject { |entry| entry.key?("pull_request") }
   pull_entries = entries.select { |entry| entry.key?("pull_request") }
+  closed_runtime_entries = []
+  unless pr_number
+    recent_closed = github.paginate("repos/#{repo}/issues?state=closed&sort=updated&direction=desc")
+    closed_issue_entries = recent_closed.reject { |entry| entry.key?("pull_request") }
+    closed_runtime_entries = closed_issue_entries.select do |entry|
+      names(entry["labels"]).include?("runtime")
+    end
+    closed_runtime_entries.each do |entry|
+      hydrate_live_issue!(github, repo, entry)
+      count = entry["comments"].to_i
+      entry["comments"] = if count.positive?
+                            github.paginate("repos/#{repo}/issues/#{entry.fetch("number")}/comments")
+                          else
+                            []
+                          end
+    end
+  end
   if pr_number
     pull_entries = pull_entries.select { |entry| entry["number"] == pr_number }
     raise "open PR ##{pr_number} was not returned by /issues" if pull_entries.empty?
@@ -352,7 +424,8 @@ def load_live(repo, pr_number)
     "automatic_linked_issue_closing" => nil,
     "issues" => known.values,
     "audited_issue_numbers" => audited_issue_numbers,
-    "pull_requests" => pull_requests
+    "pull_requests" => pull_requests,
+    "closed_runtime_issues" => closed_runtime_entries
   }
 end
 
@@ -425,6 +498,9 @@ begin
   data.fetch("pull_requests", []).each do |pull_request|
     violations.concat(audit_pull_request(pull_request, issues, data.fetch("default_branch"), data["repo"]))
   end
+
+  violations.concat(cross_pr_double_close_violations(data.fetch("pull_requests", [])))
+  violations.concat(audit_closed_runtime_evidence(data.fetch("closed_runtime_issues", [])))
 
   output = render(data, label, violations, fixture)
   File.open(options[:summary], "a") { |file| file.write(output) } if options[:summary]

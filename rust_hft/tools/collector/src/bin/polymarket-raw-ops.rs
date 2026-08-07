@@ -252,6 +252,11 @@ async fn run(cli: Cli) -> Result<()> {
                 trade_finalization_stable_polls,
                 per_market_delay: Duration::from_millis(per_market_delay_ms),
                 tape_max_bytes,
+                low_disk_floor_bytes: Some(env_u64(
+                    None,
+                    "OSS_LOW_DISK_FLOOR_BYTES",
+                    hft_collector::polymarket_upload::DEFAULT_LOW_DISK_FLOOR_BYTES,
+                )?),
             };
             run_reference(config, once).await
         }
@@ -279,6 +284,11 @@ async fn run(cli: Cli) -> Result<()> {
             let oss_part_size = env_or(None, "OSS_PART_SIZE", "32Mi");
             let max_concurrent_uploads =
                 upload_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENT_UPLOADS);
+            let low_disk_floor_bytes = Some(env_u64(
+                None,
+                "OSS_LOW_DISK_FLOOR_BYTES",
+                hft_collector::polymarket_upload::DEFAULT_LOW_DISK_FLOOR_BYTES,
+            )?);
             let config = UploadConfig {
                 spool_dir,
                 dataset,
@@ -298,6 +308,7 @@ async fn run(cli: Cli) -> Result<()> {
                 zstd_threads,
                 oss_parallel,
                 oss_part_size,
+                low_disk_floor_bytes,
             };
             println!(
                 "{}",
