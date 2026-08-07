@@ -2538,6 +2538,7 @@ impl ReferenceCollector {
         let mut trade_polls = 0_u64;
         let mut successful_trade_polls = 0_u64;
         let mut malformed_trade_reasons = BTreeMap::<String, u64>::new();
+        let mut duplicate_trade_rows = 0_u64;
         let mut next_state = self.state.clone();
         let discovered = self.discover_markets(now).await?;
         let mut targets = BTreeMap::<String, (Value, TargetMarket)>::new();
@@ -2761,6 +2762,14 @@ impl ReferenceCollector {
                             successful_trade_polls += 1;
                             let (snapshot, mut malformed) =
                                 parse_trade_snapshot(&condition_id, trades);
+                            // The data API paginates a live trade feed, so the
+                            // two offset pages routinely overlap and report the
+                            // same trade twice. A duplicate record id is
+                            // content-identical to the row already kept, so
+                            // deduplicate it and count it for visibility
+                            // instead of failing the market poll.
+                            duplicate_trade_rows = duplicate_trade_rows
+                                .saturating_add(malformed.remove("duplicate_record_id").unwrap_or(0));
                             if non_object_rows > 0 {
                                 *malformed.entry("non_object_trade".to_owned()).or_default() +=
                                     non_object_rows;
@@ -2941,6 +2950,7 @@ impl ReferenceCollector {
             "successful_trade_polls": successful_trade_polls,
             "malformed_trade_rows": malformed_trade_reasons.values().sum::<u64>(),
             "malformed_trade_reasons": malformed_trade_reasons,
+            "duplicate_trade_rows": duplicate_trade_rows,
             "truncated_trade_markets": truncated_markets,
             "non_object_trade_markets": non_object_trade_markets,
             "invalid_settlement_markets": invalid_settlement_markets,
