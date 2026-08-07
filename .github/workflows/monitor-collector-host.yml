@@ -79,17 +79,21 @@ jobs:
             --Name monday-collector-health \
             --Timeout 90 2>&1); then
             printf 'RunCommand failed: %s\n' "$run_json" >&2
-            echo "ok=unknown" >> "$GITHUB_OUTPUT"
-            echo "invocation_failed=1" >> "$GITHUB_OUTPUT"
-            echo "exit_code=runcommand-error" >> "$GITHUB_OUTPUT"
+            {
+              echo "ok=unknown"
+              echo "invocation_failed=1"
+              echo "exit_code=runcommand-error"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId' 2>/dev/null || true)
           if [ -z "$invoke_id" ]; then
             printf 'RunCommand response had no InvokeId: %s\n' "$run_json" >&2
-            echo "ok=unknown" >> "$GITHUB_OUTPUT"
-            echo "invocation_failed=1" >> "$GITHUB_OUTPUT"
-            echo "exit_code=no-invoke-id" >> "$GITHUB_OUTPUT"
+            {
+              echo "ok=unknown"
+              echo "invocation_failed=1"
+              echo "exit_code=no-invoke-id"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "invoke_id=$invoke_id"
@@ -114,8 +118,10 @@ jobs:
                 ;;
               Failed|Stopped|PartialFailed|Timeout)
                 invocation_failed=1
-                printf 'invocation reached terminal state: %s\n' "$status" >&2
-                printf '%s\n' "$result_json" >&2
+                {
+                  printf 'invocation reached terminal state: %s\n' "$status"
+                  printf '%s\n' "$result_json"
+                } >&2
                 break
                 ;;
             esac
