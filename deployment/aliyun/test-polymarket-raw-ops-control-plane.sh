@@ -2665,10 +2665,10 @@ exercise_bootstrap_snapshot() (
   # shellcheck source=/dev/null
   source "$snapshot_legacy_contract"
   snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
-  printf 'DEBUG case=%s baseline_sha=%s rollback_bin_sha=%s active_bin_sha=%s\n' \
-    "$case_name" "$baseline_sha" \
-    "$(sha256sum "$rollback/bin/polymarket-raw-ops" | awk '{print $1}')" \
-    "$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}')" >&2
+  # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
+  # sync (the test's sync() override is a no-op) so the digest check does not
+  # read a partially-flushed file under CI cache/IO pressure (#731 flake).
+  command sync >/dev/null 2>&1 || true
   (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
   jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
 )
