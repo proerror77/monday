@@ -76,6 +76,14 @@ const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(600);
 const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 30;
 pub const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_UPLOADS: usize = 4;
+// Fail-closed low-disk guard: a disk-full spool fails every upload attempt
+// with ENOSPC before any OSS PUT, leaving uploaded_segments at 0 and the
+// dataset prefix NoSuchKey. The uploader therefore refuses to stage or upload
+// when the spool filesystem has less than this absolute floor free, or less
+// than 2.5x the largest pending rotated tape (zstd output is ~tape size and
+// staging keeps a copy, so 2.5x leaves headroom for both plus the verify
+// download temp dir).
+pub const DEFAULT_LOW_DISK_FLOOR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(not(test))]
 const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(20);
 #[cfg(test)]
@@ -97,6 +105,11 @@ pub struct UploadConfig {
     pub zstd_threads: u64,
     pub oss_parallel: u64,
     pub oss_part_size: String,
+    /// Absolute low-disk floor override in bytes. `None` falls back to the
+    /// `OSS_LOW_DISK_FLOOR_BYTES` environment variable, then
+    /// [`DEFAULT_LOW_DISK_FLOOR_BYTES`]. The effective floor is always at
+    /// least 2.5x the largest pending rotated tape.
+    pub low_disk_floor_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -131,6 +144,9 @@ impl UploadConfig {
         }
         if self.oss_part_size.trim().is_empty() {
             bail!("oss part size must be non-empty");
+        }
+        if self.low_disk_floor_bytes == Some(0) {
+            bail!("low disk floor must be nonzero when configured");
         }
         Ok(())
     }
@@ -927,6 +943,64 @@ pub(crate) fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Available bytes on the filesystem hosting `path` (matches the reference
+/// collector's existing `fs4::available_space` health probe).
+pub(crate) fn available_disk_bytes(path: &Path) -> Result<u64> {
+    Ok(fs4::available_space(path)?)
+}
+
+/// Effective low-disk floor: the larger of the configured absolute floor
+/// (`configured_floor`, else env `OSS_LOW_DISK_FLOOR_BYTES`, else
+/// [`DEFAULT_LOW_DISK_FLOOR_BYTES`]) and 2.5x the largest pending rotated tape
+/// in `spool_dir`, so zstd staging (~tape size) plus the staging copy and the
+/// verify-download temp dir always fit without risking an ENOSPC mid-upload.
+pub(crate) fn low_disk_floor_bytes(spool_dir: &Path, configured_floor: Option<u64>) -> Result<u64> {
+    let base = match configured_floor {
+        Some(bytes) => bytes,
+        None => std::env::var("OSS_LOW_DISK_FLOOR_BYTES")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().with_context(|| {
+                    format!("OSS_LOW_DISK_FLOOR_BYTES must be an unsigned integer, got {raw:?}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_LOW_DISK_FLOOR_BYTES),
+    };
+    let largest_pending = discover_rotated_tapes(spool_dir)?
+        .into_iter()
+        .filter_map(|path| fs::metadata(&path).ok())
+        .map(|metadata| metadata.len())
+        .max()
+        .unwrap_or(0);
+    Ok(base.max(largest_pending.saturating_mul(5) / 2))
+}
+
+/// Fail-closed low-disk guard. Returns `Ok(true)` when the spool filesystem
+/// has too little free space to stage/upload safely, pushing one `low_disk`
+/// failure entry per pending source (deleting nothing) so
+/// [`finalize_upload_status`] surfaces it and the process exits nonzero.
+/// Returns `Ok(false)` when the spool has enough headroom. No staging temp
+/// files are created when the guard trips.
+fn record_low_disk_failures(config: &UploadConfig, failures: &mut Vec<Value>) -> Result<bool> {
+    let floor = low_disk_floor_bytes(&config.spool_dir, config.low_disk_floor_bytes)?;
+    let available = available_disk_bytes(&config.spool_dir)?;
+    if available >= floor {
+        return Ok(false);
+    }
+    for source in discover_rotated_tapes(&config.spool_dir)? {
+        failures.push(json!({
+            "source": source.file_name().and_then(|name| name.to_str()),
+            "error": format!(
+                "low disk: {available} bytes available < {floor} byte floor; \
+                 refusing to stage or upload",
+            ),
+            "reason": "low_disk",
+        }));
+    }
+    Ok(true)
 }
 
 /// Validate a closed tape and return the manifest body used by the uploader.
@@ -2190,11 +2264,25 @@ where
     )
 }
 
-fn remote_artifacts_exist_and_match_with<F>(
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteArtifactsState {
+    /// data + manifest + _SUCCESS are all present and byte-identical to the
+    /// local artifacts, so no upload is needed.
+    Matching,
+    /// At least one remote artifact is present but differs from local; the
+    /// listed file names must be uploaded WITHOUT `--ignore-existing` to repair
+    /// the stale/corrupt remote object before readback can pass.
+    Mismatched(Vec<String>),
+    /// One or more remote artifacts are missing (the pre-upload probe 404'd);
+    /// a normal `--ignore-existing` upload of the whole triplet is safe.
+    Missing,
+}
+
+fn remote_artifacts_state_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
     runner: &mut F,
-) -> Result<bool>
+) -> Result<RemoteArtifactsState>
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
@@ -2212,10 +2300,74 @@ where
         runner,
     )
     else {
-        return Ok(false);
+        return Ok(RemoteArtifactsState::Missing);
     };
-    verify_downloaded_paths(artifacts, &downloaded)?;
-    Ok(true)
+    let data_name = artifacts
+        .data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?
+        .to_owned();
+    let manifest_name = artifacts
+        .manifest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?
+        .to_owned();
+    let success_name = artifacts
+        .success
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?
+        .to_owned();
+    if verify_downloaded_paths(artifacts, &downloaded).is_ok() {
+        return Ok(RemoteArtifactsState::Matching);
+    }
+    // verify_downloaded_paths failed, so at least one present object is stale
+    // or corrupt. Pinpoint which keys must be force-overwritten.
+    let expected_manifest: Value = serde_json::from_slice(&fs::read(&artifacts.manifest)?)?;
+    let expected_bytes = expected_manifest["bytes"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("manifest bytes must be an integer"))?;
+    let expected_sha = expected_manifest["sha256"]
+        .as_str()
+        .ok_or_else(|| anyhow!("manifest sha256 must be a string"))?;
+    let mut force = Vec::new();
+    if let Some(remote_data) = downloaded.get(&data_name) {
+        let data_matches = fs::metadata(remote_data)
+            .map(|meta| meta.len() == expected_bytes)
+            .ok()
+            == Some(true)
+            && sha256_file(remote_data)
+                .map(|sha| sha == expected_sha)
+                .ok()
+                == Some(true);
+        if !data_matches {
+            force.push(data_name.clone());
+        }
+    }
+    if let Some(remote_manifest) = downloaded.get(&manifest_name) {
+        let manifest_matches =
+            fs::read(remote_manifest).ok() == fs::read(&artifacts.manifest).ok();
+        if !manifest_matches {
+            force.push(manifest_name.clone());
+        }
+    }
+    if let Some(remote_success) = downloaded.get(&success_name) {
+        let success_matches = fs::read_to_string(remote_success)
+            .map(|content| content.trim() == expected_sha)
+            .ok()
+            == Some(true);
+        if !success_matches {
+            force.push(success_name.clone());
+        }
+    }
+    if force.is_empty() {
+        // verify failed for an unexpected reason; force the whole triplet so
+        // readback can still converge.
+        force.extend([data_name, manifest_name, success_name]);
+    }
+    Ok(RemoteArtifactsState::Mismatched(force))
 }
 
 fn remove_regular(path: &Path) -> Result<()> {
@@ -2252,6 +2404,7 @@ fn upload_artifact_with<F>(
     artifacts: &Artifacts,
     source: &Path,
     config: &UploadConfig,
+    force: bool,
     runner: &mut F,
 ) -> Result<()>
 where
@@ -2262,13 +2415,26 @@ where
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
     let destination = format!("oss://{}/{}/{name}", config.bucket, artifacts.object_prefix);
-    let mut command = oss_upload_command(
-        source
-            .to_str()
-            .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
-        &destination,
-        config,
-    );
+    // `force` drops `--ignore-existing` so a stale/corrupt remote object with
+    // matching presence but mismatched bytes/sha is repaired rather than
+    // silently skipped, letting readback converge.
+    let mut command = if force {
+        oss_copy_command(
+            source
+                .to_str()
+                .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
+            &destination,
+            config,
+        )
+    } else {
+        oss_upload_command(
+            source
+                .to_str()
+                .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
+            &destination,
+            config,
+        )
+    };
     runner(&mut command, config.oss_timeout)?;
     Ok(())
 }
@@ -2288,9 +2454,23 @@ fn upload_artifacts_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    if !remote_artifacts_exist_and_match_with(artifacts, config, runner)? {
+    let state = remote_artifacts_state_with(artifacts, config, runner)?;
+    if state != RemoteArtifactsState::Matching {
+        let force_keys: BTreeSet<String> = match state {
+            RemoteArtifactsState::Mismatched(keys) => keys.into_iter().collect(),
+            _ => BTreeSet::new(),
+        };
+        let success_name = artifacts
+            .success
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
         for source in [&artifacts.data, &artifacts.manifest] {
-            upload_artifact_with(artifacts, source, config, runner)?;
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+            upload_artifact_with(artifacts, source, config, force_keys.contains(name), runner)?;
         }
         let readback_started = std::time::Instant::now();
         let data_and_manifest = [artifacts.data.as_path(), artifacts.manifest.as_path()];
@@ -2303,7 +2483,13 @@ where
         )?;
         let success_readback_budget =
             remaining_success_readback_budget(readback_started.elapsed())?;
-        upload_artifact_with(artifacts, &artifacts.success, config, runner)?;
+        upload_artifact_with(
+            artifacts,
+            &artifacts.success,
+            config,
+            force_keys.contains(success_name),
+            runner,
+        )?;
         let success = [artifacts.success.as_path()];
         verify_remote_paths_with(artifacts, config, &success, success_readback_budget, runner)?;
     }
@@ -2418,6 +2604,11 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     let mut uploaded = Vec::new();
     for (chunk, scan) in chunks {
         let (artifacts, manifest) = prepare_artifacts_from_scan(&chunk, config, scan)?;
+        // upload_artifacts only returns Ok after data+manifest+_SUCCESS were all
+        // PUT and read back byte-identical. Any failure propagates here and
+        // aborts before the source deletion below, so the source rotated tape is
+        // never removed unless EVERY chunk's readback passed. The caller records
+        // the failure (source still present) in upload-status.json failed_segments.
         uploaded.push(UploadedSegment {
             object: upload_artifacts(&artifacts, config)?,
             canonical_complete: canonical_complete_manifest(&manifest),
@@ -2466,38 +2657,41 @@ where
     let mut status = read_status(&config.spool_dir.join("upload-status.json"))?;
     let archive = Arc::new(archive);
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
-    let sources = discover_rotated_tapes(&config.spool_dir)?;
-    let mut tasks = Vec::with_capacity(sources.len());
-    for source in sources {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let archive = archive.clone();
-        let config = config.clone();
-        let task_source = source.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let result = archive(&task_source, &config);
-            drop(permit);
-            result
-        });
-        tasks.push((source, task));
-    }
-
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
-    for (source, task) in tasks {
-        match task.await {
-            Ok(result) => record_upload_result(
-                &source,
-                result,
-                &mut status,
-                &mut failures,
-                &mut uploaded_segments,
-                &mut canonical_uploaded_segments,
-            ),
-            Err(error) => failures.push(json!({
-                "source": source.file_name().and_then(|name| name.to_str()),
-                "error": format!("async upload task failed: {error}"),
-            })),
+    // Fail closed before any zstd/ossutil child or staging temp file exists.
+    if !record_low_disk_failures(config, &mut failures)? {
+        let sources = discover_rotated_tapes(&config.spool_dir)?;
+        let mut tasks = Vec::with_capacity(sources.len());
+        for source in sources {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let archive = archive.clone();
+            let config = config.clone();
+            let task_source = source.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let result = archive(&task_source, &config);
+                drop(permit);
+                result
+            });
+            tasks.push((source, task));
+        }
+
+        for (source, task) in tasks {
+            match task.await {
+                Ok(result) => record_upload_result(
+                    &source,
+                    result,
+                    &mut status,
+                    &mut failures,
+                    &mut uploaded_segments,
+                    &mut canonical_uploaded_segments,
+                ),
+                Err(error) => failures.push(json!({
+                    "source": source.file_name().and_then(|name| name.to_str()),
+                    "error": format!("async upload task failed: {error}"),
+                })),
+            }
         }
     }
     finalize_upload_status(
@@ -2564,6 +2758,7 @@ fn finalize_upload_status(
     );
     status.insert("pending_segments".to_owned(), json!(pending));
     status.insert("failed_segments".to_owned(), Value::Array(failures.clone()));
+    status.insert("failure_count".to_owned(), json!(failures.len()));
     status.insert(
         "last_error_at".to_owned(),
         if failures.is_empty() {
@@ -2607,15 +2802,19 @@ where
     let mut failures = Vec::new();
     let mut uploaded_segments = 0_usize;
     let mut canonical_uploaded_segments = 0_usize;
-    for source in discover_rotated_tapes(&config.spool_dir)? {
-        record_upload_result(
-            &source,
-            archive(&source, config),
-            &mut status,
-            &mut failures,
-            &mut uploaded_segments,
-            &mut canonical_uploaded_segments,
-        );
+    // Fail closed before any zstd/ossutil child or staging temp file exists:
+    // a disk-full spool would otherwise ENOSPC every upload with 0 segments.
+    if !record_low_disk_failures(config, &mut failures)? {
+        for source in discover_rotated_tapes(&config.spool_dir)? {
+            record_upload_result(
+                &source,
+                archive(&source, config),
+                &mut status,
+                &mut failures,
+                &mut uploaded_segments,
+                &mut canonical_uploaded_segments,
+            );
+        }
     }
     finalize_upload_status(
         &config.spool_dir,
@@ -2847,6 +3046,7 @@ mod tests {
             zstd_threads: 0,
             oss_parallel: 8,
             oss_part_size: "32Mi".to_owned(),
+            low_disk_floor_bytes: None,
         }
     }
 
@@ -4963,7 +5163,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_existing_remote_is_refused_before_upload() {
+    fn mismatched_existing_remote_triggers_force_overwrite_without_ignore_existing() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
         }
@@ -4975,6 +5175,18 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
+        let manifest_name = artifacts.manifest.file_name().unwrap().to_str().unwrap().to_owned();
+        let success_name = artifacts
+            .success
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // Remote data+_SUCCESS are correct; the remote manifest is stale, so
+        // `--ignore-existing` alone would silently keep the corrupt object and
+        // readback would fail forever.
         let mut remote = [&artifacts.data, &artifacts.manifest, &artifacts.success]
             .into_iter()
             .map(|path| {
@@ -4984,9 +5196,9 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let manifest_name = artifacts.manifest.file_name().unwrap().to_str().unwrap();
-        remote.insert(manifest_name.to_owned(), b"tampered".to_vec());
-        let mut uploads = 0;
+        remote.insert(manifest_name.clone(), b"tampered".to_vec());
+        let mut manifest_upload_args = None;
+        let mut upload_names = Vec::new();
         let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
             let args = command
                 .get_args()
@@ -4996,21 +5208,185 @@ mod tests {
                 let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
                 fs::write(&args[3], &remote[name])?;
             } else {
-                uploads += 1;
+                let name = Path::new(&args[3])
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                upload_names.push(name.clone());
+                if name == manifest_name {
+                    manifest_upload_args = Some(args.clone());
+                    // Repair the remote with the authoritative local bytes so the
+                    // post-upload readback converges.
+                    remote.insert(name, fs::read(&args[2])?);
+                } else {
+                    remote.entry(name).or_insert(fs::read(&args[2])?);
+                }
             }
             Ok(success_status())
         };
 
-        assert!(upload_artifacts_with(&artifacts, &config, &mut runner).is_err());
-        assert_eq!(uploads, 0);
-        for local in [
-            &source,
-            &artifacts.data,
-            &artifacts.manifest,
-            &artifacts.success,
-        ] {
-            assert!(local.exists(), "mismatch deleted {}", local.display());
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        // The mismatched manifest must be force-overwritten without
+        // --ignore-existing; the matching data/_SUCCESS keep the no-clobber flag.
+        let manifest_args = manifest_upload_args.expect("manifest must be re-uploaded");
+        assert!(
+            !manifest_args.iter().any(|arg| arg == "--ignore-existing"),
+            "mismatched manifest must not use --ignore-existing: {manifest_args:?}"
+        );
+        assert!(
+            upload_names.contains(&data_name) && upload_names.contains(&success_name),
+            "matching data/success must still be uploaded with no-clobber: {upload_names:?}"
+        );
+        assert!(!source.exists(), "verified source must be removed");
+    }
+
+    #[test]
+    fn stale_success_marker_is_force_overwritten_without_ignore_existing() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
         }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let success_name = artifacts
+            .success
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut remote = [&artifacts.data, &artifacts.manifest, &artifacts.success]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        remote.insert(success_name.clone(), b"stale-marker".to_vec());
+        let mut success_upload_args = None;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                fs::write(&args[3], &remote[name])?;
+            } else {
+                let name = Path::new(&args[3])
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                if name == success_name {
+                    success_upload_args = Some(args.clone());
+                    remote.insert(name, fs::read(&args[2])?);
+                } else {
+                    remote.entry(name).or_insert(fs::read(&args[2])?);
+                }
+            }
+            Ok(success_status())
+        };
+
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        let success_args = success_upload_args.expect("_SUCCESS must be re-uploaded");
+        assert!(
+            !success_args.iter().any(|arg| arg == "--ignore-existing"),
+            "stale _SUCCESS must not use --ignore-existing: {success_args:?}"
+        );
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn low_disk_guard_bails_before_staging_and_preserves_source() {
+        let root = TestDir::new();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let mut config = config(root.path());
+        // Force the floor above any real free space so the guard trips before
+        // any zstd/ossutil child or staging temp file can exist.
+        config.low_disk_floor_bytes = Some(u64::MAX);
+
+        let error = upload_pending(&config).unwrap_err();
+
+        assert!(error.to_string().contains("failed"));
+        assert!(source.exists(), "low-disk bail must preserve the source tape");
+        assert!(
+            !root.path().join(".upload-staging").exists(),
+            "no staging temp files may exist when the low-disk guard trips"
+        );
+        let status: Value = serde_json::from_slice(
+            &fs::read(root.path().join("upload-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["uploaded_segments"], 0);
+        assert_eq!(status["failure_count"], 1);
+        assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
+        assert_eq!(status["failed_segments"][0]["reason"], "low_disk");
+        assert!(
+            status["last_error"]
+                .to_string()
+                .contains("low disk: "),
+            "status last_error must surface the low-disk reason: {}",
+            status["last_error"]
+        );
+    }
+
+    #[test]
+    fn low_disk_guard_is_nonzero_when_configured() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.low_disk_floor_bytes = Some(0);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("low disk floor must be nonzero"));
+    }
+
+    #[test]
+    fn readback_failure_keeps_source_and_increments_failure_count() {
+        let root = TestDir::new();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+        let result = upload_pending_with(&config, |_source, _config| {
+            bail!("readback failed: remote data size does not match manifest")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            source.exists(),
+            "readback failure must preserve the source tape"
+        );
+        let status: Value = serde_json::from_slice(
+            &fs::read(root.path().join("upload-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["failure_count"], 1);
+        assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
+        assert!(status["failed_segments"][0]["error"]
+            .to_string()
+            .contains("readback failed"));
+        assert!(status["last_error"].to_string().contains("readback failed"));
     }
 
     #[test]
