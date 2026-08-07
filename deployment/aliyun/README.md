@@ -435,6 +435,88 @@ level, the host needs a resize rather than a further raise. It is calibration,
 not promotion evidence: the production gate still requires CPU accounting and
 peak memory to stay inside the systemd limits.
 
+## Bybit Options collector lane
+
+The `bybit-options-archiver` is the repo-governed Bybit v5 options market-data
+collector. It subscribes to the public Bybit v5 options public-trade and ticker
+WebSocket feeds, discovers the full option symbol catalog, and writes immutable
+hourly segments of canonical quote events under
+`/data/monday/spool/bybit-options/lake/raw/venue=bybit/market=option/dataset=options_quotes/...`
+(`.ndjson` while active, `.zst` after compression). The uploader publishes the
+compressed segments to
+`oss://monday-lob-apne1-1045353359/lake/raw/venue=bybit/market=option/...` under
+the `ecs-role` profile and verifies each object by readback before recycling the
+source segment.
+
+The lane was brought back after the 2026-08-05/06 Aliyun disk-full incident
+caused by the unmanaged Bybit options archiver. Three defects caused unbounded
+local growth and were fixed in this governed lane:
+
+1. **No spool cap and no low-disk gate.** `MIN_FREE_GB` (default `20.0`) and
+   `BYBIT_OPTIONS_SPOOL_MAX_BYTES` (default `53687091200`, 50 GiB) are enforced
+   by the writer before opening or rotating a segment and by the uploader before
+   compressing. Both bail out fail-closed, and `disk_free_gb`, `disk_warning`,
+   and `spool_warning` are surfaced in `health.json`.
+2. **Uploader never recycled the source segment.** The uploader now writes a
+   `.uploaded.json` marker only after verified OSS readback and then recycles
+   the raw `.ndjson`. The `.zst` is retained locally as a bounded fallback and
+   swept after `BYBIT_OPTIONS_LOCAL_ZST_RETENTION_SECONDS` (default 2 days).
+3. **Bare WS connect and fixed 2 s reconnect.** The WebSocket handshake now
+   carries a `monday-bybit-options-archiver/<rev>` User-Agent plus Origin and
+   app_id headers per Bybit v5 requirements, and reconnects use bounded
+   exponential backoff `(backoff*2).min(30)`, reset to 1 s on success.
+
+### Units and environment
+
+- `bybit-options-archiver.service` — the collector, `RuntimeMaxSec=21600`,
+  `AssertPathIsMountPoint=/data`,
+  `ReadWritePaths=/data/monday/spool/bybit-options`,
+  `CPUQuota=80%`, `MemoryHigh=1G`/`MemoryMax=1536M`.
+- `bybit-options-upload.service` — `--upload-only` oneshot uploader run by
+  `bybit-options-upload.timer` (5-minute cadence), same fail-closed env.
+- Governed env baked into both units: `MIN_FREE_GB=20.0`,
+  `BYBIT_OPTIONS_SPOOL_MAX_BYTES=53687091200`,
+  `BYBIT_OPTIONS_SPOOL_DIR=/data/monday/spool/bybit-options`,
+  `BYBIT_OPTIONS_LOCAL_ZST_RETENTION_SECONDS=172800`, and the OSS identity. The
+  deploy lane refuses a rendered unit that drops `MIN_FREE_GB` or the spool cap.
+
+### Promotion (staging -> shadow gate -> cutover)
+
+1. **Stage** a digest-addressed release with
+   `bybit-options-archiver-deploy.sh install <artifact-dir> <source-revision>`.
+   The script stages `/opt/monday/releases/bybit-options-archiver/<sha>/`
+   (binary + deployment bundle + `release.json`), renders the systemd units, and
+   points `/opt/monday/bin/bybit-options-archiver-shadow` at the candidate. It
+   never starts production.
+2. **Gate** the candidate for at least one hour with
+   `host-bybit-options-shadow-gate.sh <candidate-sha256>`. The shadow runs as a
+   transient `bybit-options-shadow.service` against the isolated
+   `/data/monday/spool/bybit-options-shadow`, settles to full-catalog health,
+   and is observed for the full duration against the runtime health policy
+   (`bybit-options-runtime-health-policy.jq`), monotonic freshness
+   (`bybit_options_observe_health_freshness`), zero restarts, and a fail-closed
+   drain. Passing evidence is append-only under
+   `/data/monday/evidence/bybit-options-shadow-gates/<sha>/<bundle>/runs/<id>/`
+   as `gate.json` plus single-line `PASSED.sha256`, validated by
+   `bybit-options-shadow-gate-policy.jq`.
+3. **Cut over** with `host-bybit-options-cutover.sh <candidate-sha256>`. The
+   cutover revalidates the release identity, the deployment bundle digest, and
+   exactly one immutable production-eligible `PASSED.sha256`, then stops the
+   previous release (or starts green-field), drains the canonical spool with the
+   candidate uploader, renders and installs the candidate units, clears stale
+   health, starts the collector, and requires fresh full-catalog health before
+   enabling the unit and the upload timer. Failure after the transition starts
+   restores the previous release (or disables and runtime-masks the lane) and
+   writes `cutover.json` evidence under
+   `/data/monday/evidence/bybit-options-cutovers/`.
+
+The lane is fail-closed: the collector and uploader stop writing when the spool
+mount drops below `MIN_FREE_GB` or pending raw bytes reach
+`BYBIT_OPTIONS_SPOOL_MAX_BYTES`, and no release can be promoted without a
+full-duration shadow gate and a verified deployment bundle. Do not run the
+unmanaged legacy binary, do not start `bybit-options-archiver.service` before
+its gate, and never delete a spool by hand.
+
 ## Backtesting storage boundary
 
 Use OSS raw segments as the immutable source of truth, not as the repeated query
