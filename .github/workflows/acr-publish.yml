@@ -488,11 +488,13 @@ jobs:
           trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
           docker cp "$container_id:/usr/local/bin/binance-lob-archiver" artifact/binance-lob-archiver
           docker cp "$container_id:/usr/local/bin/polymarket-raw-ops" artifact/polymarket-raw-ops
+          docker cp "$container_id:/usr/local/bin/bybit-options-archiver" artifact/bybit-options-archiver
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-collector" artifact/binance-usdm-reference-collector
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-artifact-verifier" artifact/binance-usdm-reference-artifact-verifier
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-upload" artifact/binance-usdm-reference-upload
           chmod 0755 artifact/binance-lob-archiver
           chmod 0755 artifact/polymarket-raw-ops
+          chmod 0755 artifact/bybit-options-archiver
           chmod 0755 artifact/binance-usdm-reference-collector
           chmod 0755 artifact/binance-usdm-reference-artifact-verifier
           chmod 0755 artifact/binance-usdm-reference-upload
@@ -500,10 +502,13 @@ jobs:
             | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
           artifact/polymarket-raw-ops --version \
             | grep -Fqx 'polymarket-raw-ops ${{ needs.selector.outputs.source_sha }}'
+          artifact/bybit-options-archiver --version \
+            | grep -Fqx 'bybit-options-archiver ${{ needs.selector.outputs.source_sha }}'
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
             sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
+            sha256sum bybit-options-archiver | tee bybit-options-archiver.sha256
             sha256sum binance-usdm-reference-collector \
               | tee binance-usdm-reference-collector.sha256
             sha256sum binance-usdm-reference-artifact-verifier \

@@ -18,6 +18,18 @@ awk '/^name = "bybit-options-archiver"$/{found=1} found && /^path = "src\/bin\/b
     exit 1
   }
 
+# The canonical ACR image and publish workflow must carry the bybit binary
+# alongside the other collector bins.
+dockerfile="$repo_root/rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
+acr_workflow="$repo_root/.github/workflows/acr-publish.yml"
+grep -F -- '--bin bybit-options-archiver' "$dockerfile" >/dev/null
+grep -F -- '/out/bin/bybit-options-archiver' "$dockerfile" >/dev/null
+grep -F -- '/usr/local/bin/bybit-options-archiver' "$dockerfile" >/dev/null
+grep -F -- 'artifact/bybit-options-archiver' "$acr_workflow" >/dev/null
+grep -F -- 'bybit-options-archiver.sha256' "$acr_workflow" >/dev/null
+grep -F -- 'bybit-options-archiver ${{ needs.selector.outputs.source_sha }}' \
+  "$acr_workflow" >/dev/null
+
 # Defect 1: fail-closed disk/spool gates must be wired into Config and the
 # writer loop, and surfaced into health.json.
 grep -Fq 'min_free_gb' "$bin_source"
