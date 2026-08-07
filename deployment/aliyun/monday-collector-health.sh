@@ -249,8 +249,8 @@ check_binance_health() {
   gaps=0
   hwarn=false
   hstatus=unknown
-  if [ ! -f "$health_file" ]; then
-    record_breach "$label: health.json missing ($health_file)"
+  if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
+    record_breach "$label: health.json missing or a symbolic link ($health_file)"
     age=999999
   elif ! updated_ns=$(jq -r '.updated_at_ns // 0' "$health_file" 2>/dev/null); then
     record_breach "$label: health.json unparseable ($health_file)"
@@ -318,12 +318,20 @@ check_upload() {
 
 check_delay_gate() {
   # Journald delay-gate trips (the fail-closed reconnect path) in the last 15m.
+  # Capture journalctl's own exit status separately: a successful no-match query
+  # is trips=0, but a failed query means the delay-gate evidence could not be
+  # inspected and must itself be reported as a breach so the monitor cannot
+  # emit ok:true without inspectable delay-gate evidence.
   unit=$1
   label=$2
-  trips=$(journalctl -u "$unit" --since "$DELAY_GATE_WINDOW" --no-pager 2>/dev/null \
+  journal_out=$(journalctl -u "$unit" --since "$DELAY_GATE_WINDOW" --no-pager 2>/dev/null)
+  journal_rc=$?
+  trips=$(printf '%s\n' "$journal_out" \
     | grep -c 'source-to-receive delay exceeds the governed limit' || true)
   case "$trips" in (*[!0-9]*|'') trips=0 ;; esac
-  if [ "$trips" -gt 0 ]; then
+  if [ "$journal_rc" -ne 0 ]; then
+    record_breach "$label: journald query failed (exit $journal_rc)"
+  elif [ "$trips" -gt 0 ]; then
     record_breach "$label: $trips delay-gate trip(s) in last 15 minutes"
   fi
   dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t}')
@@ -333,13 +341,25 @@ check_delay_gate() {
 
 write_state() {
   [ "$DRY_RUN" -eq 1 ] && return 0
-  mkdir -p "$STATE_DIR" 2>/dev/null || { log err "state directory unavailable: $STATE_DIR"; return 0; }
+  # A state-persistence failure means the next poll can lose restart/upload
+  # deltas while the monitor reports healthy, so record it as a breach rather
+  # than only logging.
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    record_breach "state: state directory unavailable: $STATE_DIR"
+    return 0
+  fi
   tmp="$STATE_FILE.$$"
-  : > "$tmp" || { log err "cannot create state file $tmp"; return 0; }
+  if ! : > "$tmp" 2>/dev/null; then
+    record_breach "state: cannot create state file $tmp"
+    return 0
+  fi
   for entry in $state_lines; do
     printf '%s\n' "$entry" >> "$tmp"
   done
-  mv "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  if ! mv "$tmp" "$STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    record_breach "state: cannot persist state file $STATE_FILE"
+  fi
 }
 
 NOW_SEC=$(date +%s)

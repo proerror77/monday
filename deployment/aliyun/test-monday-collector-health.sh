@@ -66,8 +66,9 @@ run_health() {
     STUB_DF_AVAIL_KIB="${STUB_DF_AVAIL_KIB:-$DF_AVAIL_HEALTHY}" \
     STUB_MOUNTED="${STUB_MOUNTED:-1}" \
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
+    STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
-    MONDAY_COLLECTOR_STATE_DIR="$state_dir" \
+    MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
     PATH="$stub_dir:$PATH" \
     "$health_script" "$@" >"$out_file" 2>"$err_file"
   rc=$?
@@ -82,6 +83,8 @@ reset_env() {
   STUB_DF_AVAIL_KIB=$DF_AVAIL_HEALTHY
   STUB_MOUNTED=1
   STUB_JOURNAL_TRIPS=0
+  STUB_JOURNAL_FAIL=0
+  unset MONDAY_COLLECTOR_STATE_DIR
 }
 
 reset_state() {
@@ -91,6 +94,13 @@ reset_state() {
 
 write_scenario() {
   cat > "$scenario"
+}
+
+rewrite_scenario() {
+  # Apply a sed expression to the scenario fixture through an explicit temp file
+  # and atomic rename. sed -i has no portable form (BSD requires a backup suffix,
+  # GNU does not), so scenario rewrites never depend on a platform-specific -i.
+  sed "$1" "$scenario" > "$scenario.$$" && mv "$scenario.$$" "$scenario"
 }
 
 make_spools() {
@@ -110,6 +120,9 @@ write_health() {
   status=$5
   now_ns=$(( $(date +%s) * 1000000000 ))
   updated_ns=$(( now_ns - age * 1000000000 ))
+  # Drop any symlink left by the health-symlink scenario first: cat > would
+  # follow the link and write through it, leaving the symlink in place.
+  rm -f "$spool_root/binance-lob/$market/health.json"
   cat > "$spool_root/binance-lob/$market/health.json" <<EOF
 {"updated_at_ns": $updated_ns, "sequence_gaps": $gaps, "disk_warning": $dw, "status": "$status", "market": "$market"}
 EOF
@@ -210,6 +223,10 @@ EOF
 
 cat > "$stub_dir/journalctl" <<'EOF'
 #!/bin/sh
+if [ "${STUB_JOURNAL_FAIL:-0}" = "1" ]; then
+  printf 'journalctl: cannot access the journal\n' >&2
+  exit 1
+fi
 i=0
 count="${STUB_JOURNAL_TRIPS:-0}"
 while [ "$i" -lt "$count" ]; do
@@ -277,8 +294,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-sed -i '' 's|^binance-lob-archiver-production@spot.service	active|binance-lob-archiver-production@spot.service	inactive|' "$scenario" 2>/dev/null \
-  || sed -i 's|^binance-lob-archiver-production@spot.service	active|binance-lob-archiver-production@spot.service	inactive|' "$scenario"
+rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active|binance-lob-archiver-production@spot.service	inactive|'
 run_health
 expect "unit inactive: exit 1" "$(rc_is 1; echo $?)"
 expect "unit inactive: breach message" "$(grep_out 'not active'; echo $?)"
@@ -290,8 +306,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-sed -i '' 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled|polymarket-market-tape-upload-watchdog.timer	active	disabled|' "$scenario" 2>/dev/null \
-  || sed -i 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled|polymarket-market-tape-upload-watchdog.timer	active	disabled|' "$scenario"
+rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled|polymarket-market-tape-upload-watchdog.timer	active	disabled|'
 run_health
 expect "timer not enabled: exit 1" "$(rc_is 1; echo $?)"
 expect "timer not enabled: breach message" "$(grep_out 'timer not enabled'; echo $?)"
@@ -303,8 +318,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-sed -i '' 's|^binance-lob-archiver-production@usdm.service	active	enabled	success|binance-lob-archiver-production@usdm.service	active	enabled	exit-code|' "$scenario" 2>/dev/null \
-  || sed -i 's|^binance-lob-archiver-production@usdm.service	active	enabled	success|binance-lob-archiver-production@usdm.service	active	enabled	exit-code|' "$scenario"
+rewrite_scenario 's|^binance-lob-archiver-production@usdm.service	active	enabled	success|binance-lob-archiver-production@usdm.service	active	enabled	exit-code|'
 run_health
 expect "unit result failure: exit 1" "$(rc_is 1; echo $?)"
 expect "unit result failure: breach message" "$(grep_out "Result='exit-code'"; echo $?)"
@@ -318,8 +332,7 @@ healthy_scenario
 healthy_fixtures
 run_health
 expect "restart delta: baseline healthy" "$(rc_is 0; echo $?)"
-sed -i '' 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|' "$scenario" 2>/dev/null \
-  || sed -i 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|' "$scenario"
+rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|'
 run_health
 expect "restart delta: exit 1" "$(rc_is 1; echo $?)"
 expect "restart delta: breach message" "$(grep_out 'restart rate high'; echo $?)"
@@ -361,6 +374,19 @@ expect "health missing: exit 1" "$(rc_is 1; echo $?)"
 expect "health missing: breach message" "$(grep_out 'health.json missing'; echo $?)"
 
 # ---------------------------------------------------------------------------
+# 10b. Health.json is a symbolic link
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/binance-lob/spot/health.json"
+ln -s /dev/null "$spool_root/binance-lob/spot/health.json"
+run_health
+expect "health symlink: exit 1" "$(rc_is 1; echo $?)"
+expect "health symlink: breach message" "$(grep_out 'health.json missing or a symbolic link'; echo $?)"
+
+# ---------------------------------------------------------------------------
 # 11. Upload error present
 # ---------------------------------------------------------------------------
 reset_env
@@ -400,6 +426,32 @@ expect "delay gate: exit 1" "$(rc_is 1; echo $?)"
 expect "delay gate: breach message" "$(grep_out 'delay-gate trip'; echo $?)"
 
 # ---------------------------------------------------------------------------
+# 13b. Delay-gate evidence uninspectable (journalctl failure)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_JOURNAL_FAIL=1
+run_health
+expect "delay gate journald fail: exit 1" "$(rc_is 1; echo $?)"
+expect "delay gate journald fail: breach message" "$(grep_out 'journald query failed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 13c. State persistence failure is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+# Make the state directory uncreatable so write_state must record a breach.
+: > "$test_root/blocked"
+MONDAY_COLLECTOR_STATE_DIR="$test_root/blocked/state"
+run_health
+expect "state persist fail: exit 1" "$(rc_is 1; echo $?)"
+expect "state persist fail: breach message" "$(grep_out 'state: state directory unavailable'; echo $?)"
+
+# ---------------------------------------------------------------------------
 # 14. /data unmounted
 # ---------------------------------------------------------------------------
 reset_env
@@ -418,8 +470,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-sed -i '' 's|^bybit-options-archiver.service	-	disabled|bybit-options-archiver.service	-	enabled|' "$scenario" 2>/dev/null \
-  || sed -i 's|^bybit-options-archiver.service	-	disabled|bybit-options-archiver.service	-	enabled|' "$scenario"
+rewrite_scenario 's|^bybit-options-archiver.service	-	disabled|bybit-options-archiver.service	-	enabled|'
 run_health
 expect "bybit enabled: exit 1" "$(rc_is 1; echo $?)"
 expect "bybit enabled: breach message" "$(grep_out 'bybit-options-archiver: expected disabled'; echo $?)"
@@ -431,8 +482,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-sed -i '' 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	indirect|' "$scenario" 2>/dev/null \
-  || sed -i 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	indirect|' "$scenario"
+rewrite_scenario 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	indirect|'
 run_health
 expect "poly gate indirect: exit 1" "$(rc_is 1; echo $?)"
 expect "poly gate indirect: breach message" "$(grep_out 'polymarket-raw-ops-gate: expected disabled'; echo $?)"
