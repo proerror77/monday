@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: ACTION=gate|cutover INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
+    'Usage: ACTION=gate|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
@@ -15,7 +15,7 @@ for command in aliyun base64 jq seq sleep tr; do
   fi
 done
 
-: "${ACTION:?set ACTION to gate or cutover}"
+: "${ACTION:?set ACTION to gate, cutover, or restore}"
 : "${INSTANCE_ID:?set INSTANCE_ID}"
 : "${ARTIFACT_SHA256:?set ARTIFACT_SHA256}"
 
@@ -45,6 +45,11 @@ case "$ACTION" in
     host_script=host-rust-lob-cutover.sh
     timeout_seconds=3600
     command_name=monday-rust-lob-cutover
+    ;;
+  restore)
+    host_script=host-rust-lob-restore.sh
+    timeout_seconds=3600
+    command_name=monday-rust-lob-restore
     ;;
   *)
     usage >&2

@@ -655,6 +655,59 @@ Rollback uses the same `ACTION=cutover` operation with a previously installed,
 previously gated artifact digest. There is no Python fallback and no manual
 symlink shortcut.
 
+### 4. Restore a stopped, already-gated production release
+
+If an already-gated, already-cutover release was later stopped and disabled (for
+example, during a disk-full incident), `ACTION=cutover` cannot bring it back:
+`host-rust-lob-cutover.sh` refuses an active==2/enabled==2 host with an
+"ambiguous production state" error and there is no governed restore path.
+`host-rust-lob-restore.sh` closes that gap. It is fail-closed: it never rewrites
+the production symlink and never touches the digest-addressed release or its
+deployment assets, so the restored runtime is byte-identical to the cutover
+artifact.
+
+Invoke it with the immutable artifact digest that is already on disk and already
+gated:
+
+```bash
+set -euo pipefail
+ACTION=restore \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+Before starting anything the host restore requires all of the following:
+
+1. `sha256($PRODUCTION_LINK)` matches `ARTIFACT_SHA256` and the link resolves to
+   `$RELEASE_ROOT/<sha256>/binance-lob-archiver`.
+2. Exactly one immutable passed shadow gate exists for that
+   `<sha256>/<deployment_bundle_sha256>` and it still satisfies the gate policy.
+3. No production unit is active (a running restore is refused, never preempted).
+4. The production symlink exists (a missing symlink is refused, never recreated).
+5. The canonical spool path is a direct directory tree under `/data` (no symlink
+   escapes) and the spot/usdm subdirectories exist.
+6. The canonical spool contains no segment artifacts, unless the operator forces
+   with `MONDAY_ALLOW_RESTORE_WITH_PENDING=1`.
+7. The installed production unit/env files match the gated deployment bundle
+   `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
+
+The restore then clears stale health, starts the production units while disabled,
+waits for fresh full-catalog health written after the restart with a new session
+and zero restarts, verifies each `/proc/<pid>/exe` still resolves to the
+candidate release, enables production for reboot, and re-verifies health. A
+unique recovery evidence directory is created under
+`/data/monday/evidence/recoveries/<ts>-<sha:0:12>-<pid>/` and holds the previous
+and post-restart health snapshots, a copy of the gated `gate.json` +
+`PASSED.sha256`, and immutable `recovery.json` + `verification.json`.
+
+If the restored units never reach verified health, the host restore performs a
+fail-closed rollback: it disables and stops production, applies the runtime
+transition mask to the production, upload, and legacy units, verifies the host
+is fail-closed, preserves rollback health evidence, and records
+`recovery.json` with `result: failed` and `rollback_result`. A failed restore
+never leaves production active, enabled, or unmasked.
+
 ### Upload cleanup and failure rules
 
 After all three OSS objects upload successfully, the Rust collector atomically
