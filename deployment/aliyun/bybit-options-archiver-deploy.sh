@@ -16,8 +16,8 @@ set -euo pipefail
 # /etc/systemd/system/bybit-options-*.service.  This guarantees a running
 # production unit can never be silently repointed at an ungated candidate.
 
-readonly SCRIPT_DIR
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
+readonly SCRIPT_DIR
 readonly RELEASE_ROOT=/opt/monday/releases/bybit-options-archiver
 readonly STATE_FILE=/opt/monday/state/bybit-options-archiver-deploy.json
 readonly UNIT=bybit-options-archiver.service
