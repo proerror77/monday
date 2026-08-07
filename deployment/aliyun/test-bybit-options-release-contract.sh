@@ -91,6 +91,17 @@ grep -Fq 'does NOT touch systemd' "$script_dir/bybit-options-archiver-deploy.sh"
 grep -Fq 'only writer of' "$script_dir/bybit-options-archiver-deploy.sh"
 grep -Fq 'host-bybit-options-cutover.sh' "$script_dir/bybit-options-archiver-deploy.sh"
 
+# The deploy script must survive shell startup: a no-argument invocation must
+# reach its usage contract (exit 2), not die on a shell error first.
+usage_rc=0
+usage_output=$("$script_dir/bybit-options-archiver-deploy.sh" 2>&1) || usage_rc=$?
+[[ $usage_rc == 2 ]] || {
+  printf 'deploy script no-arg invocation must exit 2 (usage), got %s: %s\n' \
+    "$usage_rc" "$usage_output" >&2
+  exit 1
+}
+grep -Fq 'install <artifact-dir> <source-revision>' <<<"$usage_output"
+
 # Host gate + cutover must exist and be executable.
 for script in \
   "$script_dir/host-bybit-options-shadow-gate.sh" \
