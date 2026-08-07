@@ -401,6 +401,7 @@ jq -n \
   --argjson disk_free_gb "$disk_free_gb" \
   --argjson upload_failure_count "$upload_failure_count" \
   --argjson last_upload_success_at "$last_upload_success_at" \
+  --arg SHADOW_SPOOL "$SHADOW_SPOOL" \
   '{schema:$schema,run_id:$run_id,created_at:$created_at,completed_at:$completed_at,
     candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
