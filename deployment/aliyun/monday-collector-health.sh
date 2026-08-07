@@ -34,7 +34,10 @@ HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
 DISK_CRIT_PERCENT=10
 RESTART_MAX_DELTA=1
-DELAY_GATE_WINDOW=15min
+# journalctl --since value; must be a timestamp journalctl can parse
+# ("15min" is rejected with "Failed to parse timestamp" and would read as a
+# permanent journald-query breach).
+DELAY_GATE_WINDOW='15 min ago'
 
 # Governed units. Persistent services must be active + enabled + Result=success
 # and are monitored for restart-rate deltas. Upload lanes are driven by timers
