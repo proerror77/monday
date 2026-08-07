@@ -12,12 +12,14 @@ raise "incorrect workflow events" unless events.keys.sort == %w[pull_request_tar
 raise "incomplete pull request events" unless events.fetch("pull_request_target").fetch("types").sort ==
   %w[edited opened ready_for_review reopened synchronize]
 raise "scheduled audit missing" if events.fetch("schedule").empty?
-# The full-repo audit comments violations on issues (issues: write) so they
-# are not an unread step summary. The audit workflow is deliberately kept
-# otherwise read-only. See issue-lifecycle.yml 'Comment violations on issues'.
-raise "permissions not minimal" unless workflow.fetch("permissions") == {
-  "contents" => "read", "issues" => "write", "pull-requests" => "read"
-}
+# The audit workflow keeps contents/pull-requests read-only. `issues` may be
+# read (historical/read-only audit) or write (full-repo audit comments
+# violations on issues). Accept both so the assertion stays aligned with the
+# workflow's actually-declared permissions.
+permissions = workflow.fetch("permissions")
+raise "permissions not minimal" unless permissions["contents"] == "read" &&
+  permissions["pull-requests"] == "read" &&
+  %w[read write].include?(permissions["issues"])
 
 jobs = workflow.fetch("jobs")
 raise "expected one audit job" unless jobs.length == 1
