@@ -445,14 +445,24 @@ fn validate_receive_clock(source_time_ms: u64, received_at_ns: u64) -> Result<()
 
 fn validate_symbol(symbol: &str) -> Result<()> {
     if symbol.is_empty()
-        || symbol.len() > 32
-        || !symbol
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        || symbol.chars().count() > 32
+        || !symbol.chars().all(|ch| {
+            ch.is_ascii_uppercase()
+                || ch.is_ascii_digit()
+                || ch == '_'
+                || is_cjk_unified_ideograph(ch)
+        })
     {
         bail!("invalid USD-M symbol identity");
     }
     Ok(())
+}
+
+// Binance lists perpetual contracts whose symbol carries a CJK base-asset
+// name (for example 币安人生USDT); the fail-closed identity gate must accept
+// exactly those ideographs without widening to arbitrary Unicode.
+fn is_cjk_unified_ideograph(ch: char) -> bool {
+    ('\u{3400}'..='\u{4DBF}').contains(&ch) || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
 }
 
 fn required_string<'a>(raw: &'a Value, field: &str, endpoint: &str) -> Result<&'a str> {
@@ -707,5 +717,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("source time regressed"));
+    }
+
+    #[test]
+    fn symbol_identity_accepts_cjk_contract_names_and_rejects_malformed() {
+        for valid in [
+            "BTCUSDT",
+            "ETHUSDT_250926",
+            "币安人生USDT",
+            "我踏马来了USDT",
+            "龙虾USDT",
+        ] {
+            assert!(validate_symbol(valid).is_ok(), "{valid} must be accepted");
+        }
+        for invalid in [
+            "",
+            "btcusdt",
+            "BTC/USDT",
+            "BTC USDT",
+            "BTC-USDT",
+            "BTC.USDT",
+            "BTCUSDT\u{200B}",
+        ] {
+            assert!(
+                validate_symbol(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        assert!(validate_symbol(&"A".repeat(33)).is_err());
+        assert!(validate_symbol(&"币".repeat(33)).is_err());
+        assert!(validate_symbol(&"币".repeat(32)).is_ok());
     }
 }

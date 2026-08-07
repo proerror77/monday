@@ -6,12 +6,6 @@
 
 The current system is a Rust-first bounded Loop Engineer research/control plane plus a separately owned deterministic Rust trading runtime.
 
-- Research: `rust_hft/alpha-harness/*`
-- Prediction-market research and operator module: `rust_hft/prediction-markets`
-- Data acquisition: `rust_hft/tools/collector`
-- Runtime: `rust_hft/apps/live`
-- Risk, OMS, and execution: `rust_hft/risk-control` and `rust_hft/execution-gateway`
-
 Monday is one multi-venue trading system. Polymarket, Binance, OKX, and other
 exchanges are venue Adapters at the existing market-data and execution seams;
 they are not separate product authorities. `ploy-*` crate and binary names are
@@ -34,21 +28,6 @@ Read [README.md](README.md), [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md
 - Keep dataset, candidate, evaluation, approval, policy, feedback, and deployment evidence content-addressed or append-only.
 - Keep private signing keys and LLM credentials out of DuckDB and logs.
 - Live-small activation remains fail-closed until every order path consumes envelope order-size and slippage limits.
-
-## Focused Validation
-
-Run from `rust_hft/`:
-
-```bash
-cargo test -p alpha-domain --locked
-cargo test -p alpha-store --locked
-cargo test -p alpha-engine --locked
-cargo test -p alpha-harness --locked
-cargo test -p hft-live --no-default-features --test deployment_envelope --locked
-cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
-```
-
-Do not compile the entire workspace for ordinary changes. Run `cargo metadata --locked --no-deps` after workspace graph changes.
 
 ## Agent skills
 
