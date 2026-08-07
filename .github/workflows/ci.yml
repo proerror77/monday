@@ -436,6 +436,7 @@ jobs:
           shellcheck ../deployment/aliyun/*.sh
           ../deployment/aliyun/test-rust-lob-control-plane.sh
           ../deployment/aliyun/test-rust-lob-release-adoption.sh
+          ../deployment/aliyun/test-rust-lob-restore.sh
           ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh
 
