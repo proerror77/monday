@@ -18,7 +18,7 @@ services:
     environment:
       CLICKHOUSE_DB: hft
       CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
@@ -90,8 +90,8 @@ services:
 
   collector:
     build:
-      context: ../rust_hft
-      dockerfile: ../deploy/Dockerfile.hft
+      context: ..
+      dockerfile: deploy/Dockerfile.hft
       args:
         - TARGET=collector
     container_name: hft-collector
@@ -121,8 +121,8 @@ services:
 
   trader:
     build:
-      context: ../rust_hft
-      dockerfile: ../deploy/Dockerfile.hft
+      context: ..
+      dockerfile: deploy/Dockerfile.hft
       args:
         - TARGET=live
     container_name: hft-trader
@@ -170,8 +170,8 @@ services:
 
   paper-trader:
     build:
-      context: ../rust_hft
-      dockerfile: ../deploy/Dockerfile.hft
+      context: ..
+      dockerfile: deploy/Dockerfile.hft
       args:
         - TARGET=paper
     container_name: hft-paper
