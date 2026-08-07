@@ -2,13 +2,6 @@
 
 This file defines common patterns that all commands should follow to maintain consistency and simplicity.
 
-## Core Principles
-
-1. **Fail Fast** - Check critical prerequisites, then proceed
-2. **Trust the System** - Don't over-validate things that rarely fail
-3. **Clear Errors** - When something fails, say exactly what and how to fix it
-4. **Minimal Output** - Show what matters, skip decoration
-
 ## Standard Validations
 
 ### Minimal Preflight
@@ -144,31 +137,6 @@ Failed: auth.test.js (syntax error - line 42)
 "This will delete 10 files. Continue? (yes/no)"
 ```
 
-## Quick Reference
-
-### Essential Tools Only
-- Read/List operations: `Read, LS`
-- File creation: `Read, Write, LS`
-- GitHub operations: Add `Bash`
-- Complex analysis: Add `Task` (sparingly)
-
-### Status Indicators
-- ✅ Success (use sparingly)
-- ❌ Error (always with solution)
-- ⚠️ Warning (only if action needed)
-- No emoji for normal output
-
-### Exit Strategies
-- Success: Brief confirmation
-- Failure: Clear error + exact fix
-- Partial: Show what worked, what didn't
-
 ## Remember
-
-**Simple is not simplistic** - We still handle errors properly, we just don't try to prevent every possible edge case. We trust that:
-- The file system usually works
-- GitHub CLI is usually authenticated  
-- Git repositories are usually valid
-- Users know what they're doing
 
 Focus on the happy path, fail gracefully when things go wrong.

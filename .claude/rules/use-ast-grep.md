@@ -10,41 +10,6 @@ Use `ast-grep` (if installed) instead of plain regex or text search when:
 - **Cross-language searches** are necessary (e.g., working with both Ruby and TypeScript in a monorepo)
 - **Semantic code understanding** is important (e.g., finding patterns based on code structure, not just text)
 
-## AST-Grep Command Patterns
-
-### Basic Search Template:
-```sh
-ast-grep --pattern '$PATTERN' --lang $LANGUAGE $PATH
-```
-
-### Common Use Cases
-
-- **Find function calls:**
-  `ast-grep --pattern 'functionName($$$)' --lang javascript .`
-- **Find class definitions:**
-  `ast-grep --pattern 'class $NAME { $$$ }' --lang typescript .`
-- **Find variable assignments:**
-  `ast-grep --pattern '$VAR = $$$' --lang ruby .`
-- **Find import statements:**
-  `ast-grep --pattern 'import { $$$ } from "$MODULE"' --lang javascript .`
-- **Find method calls on objects:**
-  `ast-grep --pattern '$OBJ.$METHOD($$$)' --lang typescript .`
-- **Find React hooks:**
-  `ast-grep --pattern 'const [$STATE, $SETTER] = useState($$$)' --lang typescript .`
-- **Find Ruby class definitions:**
-  `ast-grep --pattern 'class $NAME < $$$; $$$; end' --lang ruby .`
-
-## Pattern Syntax Reference
-
-- `$VAR` — matches any single node and captures it
-- `$$$` — matches zero or more nodes (wildcard)
-- `$$` — matches one or more nodes
-- Literal code — matches exactly as written
-
-## Supported Languages
-
-- Rust, JavaScript, TypeScript, HTML, CSS, YAML, and JSON
-
 ## Integration Workflow
 
 ### Before using ast-grep:
@@ -77,23 +42,7 @@ When asked to "find all Ruby service objects that call `perform`":
 - **read_file** for examining specific files found by ast-grep
 - **edit_file** for making precise, context-aware code changes
 
-### Advanced Usage
-- **JSON output for programmatic processing:**
-  `ast-grep --pattern '$PATTERN' --lang $LANG $PATH --json`
-- **Replace patterns:**
-  `ast-grep --pattern '$OLD_PATTERN' --rewrite '$NEW_PATTERN' --lang $LANG $PATH`
-- **Interactive mode:**
-  `ast-grep --pattern '$PATTERN' --lang $LANG $PATH --interactive`
-
-## Key Benefits Over Regex
-
-1. **Language-aware** — understands syntax and semantics
-2. **Structural matching** — finds patterns regardless of formatting
-3. **Cross-language** — works consistently across different languages
-4. **Precise refactoring** — makes structural changes safely
-5. **Context-aware** — understands code hierarchy and scope
-
-## Decision Matrix: When to Use Each Tool
+### Decision Matrix: When to Use Each Tool
 
 | Task Type                | Tool Choice          | Reason                        |
 |--------------------------|----------------------|-------------------------------|
