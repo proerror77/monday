@@ -454,7 +454,6 @@ parser = OptionParser.new do |parser|
   parser.on("--fixture FILE", "Read a fixture matrix instead of GitHub") { |value| options[:fixture] = value }
   parser.on("--case NAME", "Audit one named fixture case") { |value| options[:case] = value }
   parser.on("--summary FILE", "Append Markdown output to FILE") { |value| options[:summary] = value }
-  parser.on("--violations-json FILE", "Write per-issue violation mapping as JSON to FILE") { |value| options[:violations_json] = value }
 end
 
 begin
@@ -501,16 +500,6 @@ begin
 
   output = render(data, label, violations, fixture)
   File.open(options[:summary], "a") { |file| file.write(output) } if options[:summary]
-  if options[:violations_json]
-    per_issue = {}
-    violations.each do |violation|
-      issue_number = violation[/^Issue #(\d+)/, 1] || violation[/^PR #(\d+)/, 1]
-      next unless issue_number
-
-      (per_issue[issue_number.to_i] ||= []) << violation
-    end
-    File.write(options[:violations_json], JSON.generate(per_issue))
-  end
   puts output
   exit(violations.empty? ? 0 : 1)
 rescue StandardError => error
