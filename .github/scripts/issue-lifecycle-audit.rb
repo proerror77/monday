@@ -335,13 +335,17 @@ def evidence_section_present?(body)
   return false if body.nil? || body.empty?
 
   markdown = visible_markdown(body)
-  EVIDENCE_SECTION_HEADINGS.any? { |heading| markdown.match?(/^#{Regexp.escape(heading)}\s*$/m) }
+  EVIDENCE_SECTION_HEADINGS.any? do |heading|
+    markdown.match?(/^(?:[#]{1,6}[ \t]+)?#{Regexp.escape(heading)}[ \t]*$/m)
+  end
 end
 
 def comment_history_has_evidence?(comments)
-  # GitHub's issue API exposes `comments` as an Integer count; a full
-  # comment fetch is done via hydrate_live_issue! when available.
-  return false if comments.nil? || comments == 0 || comments.empty?
+  # The issue API may return `comments` as an Integer count; hydrate_live_issue!
+  # replaces it with the comment array when available. Normalize both cases.
+  return false if comments.nil? || comments == 0 || (comments.is_a?(Array) && comments.empty?)
+
+  return false unless comments.is_a?(Array)
 
   comments.any? do |comment|
     body = comment.is_a?(Hash) ? comment["body"] : comment.to_s
