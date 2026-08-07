@@ -2714,6 +2714,12 @@ exercise_bootstrap_snapshot() (
   # shellcheck source=/dev/null
   source "$snapshot_legacy_contract"
   snapshot_legacy "$rollback" rust_bootstrap "$ACTIVE_BINARY" "$baseline_sha" "$candidate_sha"
+  # The snapshot_legacy copies ACTIVE_BINARY into the rollback dir; force a real
+  # sync (the test's sync() override is a no-op) so the digest check does not
+  # read a partially-flushed file under CI cache/IO pressure (#731 flake). Fail
+  # closed if sync itself fails, so the checksum check never runs on a
+  # potentially unflushed file.
+  command sync >/dev/null 2>&1 || die 'filesystem sync failed before snapshot digest check'
   (cd "$rollback" && sha256sum --check --strict manifest.sha256 >/dev/null)
   jq -e '.control_dir_present == false' "$rollback/state.json" >/dev/null
 )
