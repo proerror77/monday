@@ -137,7 +137,10 @@ secure_regular_file() {
 }
 
 env_value_from_unit() {
-  local file=$1 key=$2 prefix="Environment=$key=" line value count=0
+  local file=$1
+  local key=$2
+  local prefix="Environment=$key="
+  local line value count=0
   while IFS= read -r line; do
     if [[ $line == "$prefix"* ]]; then
       value=${line#"$prefix"}
@@ -258,7 +261,8 @@ require_empty_segment_spool() {
 }
 
 run_candidate_drain() {
-  local deployment=$1 unit_template="$1/bybit-options-archiver.service" key value
+  local unit_template="$1/bybit-options-archiver.service"
+  local key value
   local -a env_args
   canonical_spool_paths_safe || return 1
   env_args=()

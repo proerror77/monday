@@ -132,7 +132,9 @@ fi
 # Host script contract: the shadow service must run under the fixed unit name
 # the gate policy requires, against the isolated shadow spool, with the
 # fail-closed disk/spool env baked in.
+# shellcheck disable=SC2016 # literal contract assertion, $shadow_unit must not expand
 grep -Fq -- '--unit="$shadow_unit"' "$shadow_gate"
+# shellcheck disable=SC2016 # literal contract assertion, $shadow_unit must not expand
 grep -Fq 'shadow_unit="bybit-options-shadow"' "$shadow_gate"
 grep -Fq 'shadow_unit_full="bybit-options-shadow.service"' "$shadow_gate"
 grep -Fq 'SHADOW_SPOOL=/data/monday/spool/bybit-options-shadow' "$shadow_gate"

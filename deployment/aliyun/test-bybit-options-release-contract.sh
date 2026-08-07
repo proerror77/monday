@@ -70,6 +70,7 @@ grep -Fq 'Unit=bybit-options-upload.service' "$timer"
 # The deploy lane must reject a release whose units drop the governed env.
 grep -Fq 'REQUIRED_ENV_KEYS=(MIN_FREE_GB BYBIT_OPTIONS_SPOOL_MAX_BYTES)' \
   "$script_dir/bybit-options-archiver-deploy.sh"
+# shellcheck disable=SC2016 # literal contract assertion, $key must not expand
 grep -Fq 'Environment=$key=' "$script_dir/bybit-options-archiver-deploy.sh"
 grep -Fq 'DEPLOYMENT_BUNDLE.sha256' "$script_dir/bybit-options-archiver-deploy.sh"
 grep -Fq 'release.json' "$script_dir/bybit-options-archiver-deploy.sh"

@@ -260,7 +260,6 @@ systemd-run --quiet --unit="$shadow_unit" \
   -- "$candidate_binary" \
   || die 'failed to start the shadow service'
 
-gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gate_started_epoch=$(date +%s)
 gate_started_ms=$((gate_started_epoch * 1000))
 

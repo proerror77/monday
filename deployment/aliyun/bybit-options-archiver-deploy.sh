@@ -16,7 +16,8 @@ set -euo pipefail
 # /etc/systemd/system/bybit-options-*.service.  This guarantees a running
 # production unit can never be silently repointed at an ungated candidate.
 
-readonly SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
+readonly SCRIPT_DIR
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 readonly RELEASE_ROOT=/opt/monday/releases/bybit-options-archiver
 readonly STATE_FILE=/opt/monday/state/bybit-options-archiver-deploy.json
 readonly UNIT=bybit-options-archiver.service
@@ -82,7 +83,8 @@ validate_rendered_unit() {
 }
 
 verify_bundle() {
-  local sha=$1 bundle="$RELEASE_ROOT/$sha/deployment"
+  local sha=$1
+  local bundle="$RELEASE_ROOT/$sha/deployment"
   [[ -d $bundle && ! -L $bundle ]] || die "deployment bundle missing: $bundle"
   ( cd "$bundle" && sha256sum --check --strict DEPLOYMENT_BUNDLE.sha256 ) \
     || die 'deployment bundle failed its own digest check'
@@ -100,7 +102,9 @@ verify_bundle() {
 }
 
 verify_release() {
-  local sha=$1 source=$2 binary="$RELEASE_ROOT/$sha/bybit-options-archiver"
+  local sha=$1
+  local source=$2
+  local binary="$RELEASE_ROOT/$sha/bybit-options-archiver"
   [[ $sha =~ ^[a-f0-9]{64}$ && $source =~ ^[a-f0-9]{40}$ ]] || die 'invalid release identity'
   [[ -x $binary && ! -L $binary ]] || die "release binary missing: $binary"
   [[ $(sha256sum "$binary" | awk '{print $1}') == "$sha" ]] || die 'release binary digest drifted'
@@ -115,7 +119,8 @@ verify_release() {
 }
 
 verify_staging() {
-  local sha=$1 binary="$RELEASE_ROOT/$sha/bybit-options-archiver"
+  local sha=$1
+  local binary="$RELEASE_ROOT/$sha/bybit-options-archiver"
   [[ -L $SHADOW_LINK && $(readlink -f "$SHADOW_LINK") == "$binary" ]] \
     || die 'shadow symlink does not point at the staged release'
   printf '%s  %s\n' "$sha" "$SHADOW_LINK" | sha256sum --check --strict >/dev/null
