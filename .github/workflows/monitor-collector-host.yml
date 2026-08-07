@@ -26,6 +26,13 @@ env:
   REGION_ID: ap-northeast-1
   ISSUE_TITLE: '[collector-host] Durable monitor breach'
 
+# Serialize runs so two overlapping invocations cannot both see "no open issue"
+# and both create one. The monitor is schedule-driven; cancel-in-progress stays
+# false so a running check is never cancelled by the next tick.
+concurrency:
+  group: collector-host-monitor
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -41,8 +48,16 @@ jobs:
           git checkout FETCH_HEAD
 
       - name: Install Aliyun CLI and configure credentials
+        env:
+          # Pin to an immutable, SHA-verified release. The `latest` convenience
+          # URL can be silently repointed; the pinned archive is verified against
+          # the official release checksum before extraction.
+          ALIYUN_CLI_VERSION: 3.4.11
+          ALIYUN_CLI_SHA256: a7e3df497db14c10d4d7587795e9fa7849b0c51dfce02908b9de5a41fe717d5c
         run: |
-          curl -sSL -o /tmp/aliyun-cli.tgz https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz
+          curl -fsSL -o /tmp/aliyun-cli.tgz \
+            "https://github.com/aliyun/aliyun-cli/releases/download/v${ALIYUN_CLI_VERSION}/aliyun-cli-linux-${ALIYUN_CLI_VERSION}-amd64.tgz"
+          printf '%s  %s\n' "$ALIYUN_CLI_SHA256" /tmp/aliyun-cli.tgz | sha256sum --check --strict -
           tar -xzf /tmp/aliyun-cli.tgz -C /tmp
           sudo install -m 0755 /tmp/aliyun /usr/local/bin/aliyun
           aliyun version
@@ -109,28 +124,44 @@ jobs:
             status=$(printf '%s' "$result_json" | jq -r '[.. | objects | .InvocationStatus? // empty][0] // empty')
             exit_code=$(printf '%s' "$result_json" | jq -r '[.. | objects | .ExitCode? // empty][0] // empty')
             case "$status" in
-              Success|Finished)
+              Success|Finished|Failed|Stopped|PartialFailed|Timeout)
+                # Decode the command Output for a health snapshot in every
+                # terminal state. The health script exits nonzero when it detects
+                # a breach, so a Failed/Stopped/PartialFailed/Timeout invocation
+                # may still carry a valid ok:false snapshot that must be surfaced
+                # as a breach, not treated as "the monitor could not run".
                 output=$(printf '%s' "$result_json" | jq -r '[.. | objects | .Output? // empty][0] // empty')
                 if [ -n "$output" ]; then
                   health_json=$(printf '%s' "$output" | base64 --decode 2>/dev/null | grep -m1 '^{' || true)
                 fi
-                break
-                ;;
-              Failed|Stopped|PartialFailed|Timeout)
-                invocation_failed=1
-                {
-                  printf 'invocation reached terminal state: %s\n' "$status"
-                  printf '%s\n' "$result_json"
-                } >&2
+                case "$status" in
+                  Failed|Stopped|PartialFailed|Timeout)
+                    {
+                      printf 'invocation reached terminal state: %s\n' "$status"
+                      printf '%s\n' "$result_json"
+                    } >&2
+                    ;;
+                esac
                 break
                 ;;
             esac
             sleep 5
           done
 
-          if [ -z "$health_json" ] && [ -z "$exit_code" ]; then
+          # invocation_failed only when no health snapshot is available at all
+          # (e.g. the invocation never reached a terminal state, or it terminated
+          # without producing a decodable snapshot). A nonzero exit that still
+          # yields a decoded snapshot is a valid breach result, not a monitor
+          # failure; that path keeps invocation_failed=0 so the ok:false breach
+          # is surfaced. When no snapshot is produced, fail closed: the monitor
+          # could not verify the host, which must alert.
+          if [ -z "$health_json" ]; then
             invocation_failed=1
-            printf 'invocation did not reach a terminal state in time\n' >&2
+            if [ -z "$exit_code" ]; then
+              printf 'invocation did not reach a terminal state in time\n' >&2
+            else
+              printf 'no decodable health snapshot produced (exit %s)\n' "$exit_code" >&2
+            fi
           fi
 
           if [ -n "$health_json" ]; then
