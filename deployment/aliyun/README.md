@@ -144,6 +144,157 @@ systemctl is-active polymarket-market-tape-upload-watchdog.timer
 journalctl -t polymarket-upload-watchdog -n 5
 ```
 
+## Durable monitoring
+
+The 2026-08-05/06 disk-full incident was silent because the only on-host
+monitor (`polymarket-market-tape-upload-watchdog.sh`) self-heals but never
+alerts a human: every governed collector stopped, uploads failed, and
+delay-gate trips accumulated with nobody notified. This host now has a durable,
+read-only health monitor with two alert channels: a Cloud Monitor disk alarm
+(primary) and a scheduled GitHub Actions workflow (fallback).
+
+### Health script contract
+
+`deployment/aliyun/monday-collector-health.sh` is a POSIX `sh`, read-only
+monitor. It never starts, stops, enables, or disables a unit and never modifies
+tape files or `upload-status.json`. It emits one JSON snapshot (or a human
+`ok:`/`breach:` summary) and exits nonzero when any breach is present. It logs
+to journald tag `monday-collector-health`. Run with `--json` for machine output
+and `--dry-run` to avoid reading or writing the persistent delta state.
+
+| Check | Breach condition |
+| --- | --- |
+| `/data` disk | free < 25% (warn) or < 10% (critical) via `df -Pk /data` |
+| Governed services | `binance-lob-archiver-production@spot/usdm` and `binance-usdm-reference-collector` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| Upload lanes | `polymarket-market-tape-upload.timer` and `polymarket-reference-upload.timer` active AND enabled; their oneshot services' last `Result==success` |
+| Watchdog | `polymarket-market-tape-upload-watchdog.timer` active AND enabled; the watchdog service's last `Result==success` |
+| Incident fill source | `bybit-options-archiver.service` and `polymarket-raw-ops-gate@.service` must stay disabled/masked/not-found |
+| `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
+| `upload-status.json` | `last_error_at`/`last_error` present, or a `failure_count` delta since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
+| Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
+| `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
+
+The persistent-service check deliberately does not breach on `NRestarts > 0`:
+both Binance archivers restart every six hours by design
+(`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
+or an `NRestarts` delta greater than one between consecutive five-minute polls.
+
+Test/override environment for fixtures and containers:
+`MONDAY_COLLECTOR_SPOOL_ROOT` (default `/data/monday/spool`) and
+`MONDAY_COLLECTOR_STATE_DIR` (default `/var/lib/monday-collector-health`).
+`test-monday-collector-health.sh` is the self-contained contract test.
+
+### Install and timer deploy
+
+This is a governed runtime change with one named controller, following the same
+template as the upload watchdog above:
+
+- Controller: `CONTROLLER_NAME` (one named operator; no concurrent writers).
+- Target: host `monday-trade-data-26`, units
+  `monday-collector-health.service` and `monday-collector-health.timer`.
+- Source identity: this repository at commit `SOURCE_REVISION`, files
+  `deployment/aliyun/monday-collector-health.sh`,
+  `deployment/aliyun/monday-collector-health.service`, and
+  `deployment/aliyun/monday-collector-health.timer`.
+- Stop rules: abort if the installed files or the script do not match the
+  source, or if the post-install readback does not match; rollback rather than
+  retry in place.
+- Rollback:
+  `sudo systemctl disable --now monday-collector-health.timer`, then remove the
+  three installed files, `sudo rm -rf /var/lib/monday-collector-health`, and
+  `sudo systemctl daemon-reload`.
+
+```bash
+sudo install -m 0755 deployment/aliyun/monday-collector-health.sh \
+  /opt/monday/bin/monday-collector-health.sh
+sudo install -m 0644 deployment/aliyun/monday-collector-health.service \
+  deployment/aliyun/monday-collector-health.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monday-collector-health.timer
+```
+
+Post-install readback (required before the change is considered live):
+
+```bash
+systemctl is-active monday-collector-health.timer
+/opt/monday/bin/monday-collector-health.sh --json
+systemctl status monday-collector-health.service --no-pager -n 5
+```
+
+The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
+the mount check is to detect and alert when `/data` is missing.
+
+### Cloud Monitor disk alarm (PRIMARY)
+
+The on-host timer and the GitHub workflow cannot alert if the host is
+unreachable or the repository cannot run, so the primary alert must live in
+Aliyun Cloud Monitor on the ECS itself. Create a metric alarm for instance
+`i-6we6afeqsvv8uo1ixmyo` on the root-disk utilization metric with two
+threshold tiers (an alarm group is configured per tier):
+
+- warn: disk free < 25% — about 5.6 hours of runway at the 2026-08-05/06 fill
+  rate (~120-130 GiB/day) before the 10% threshold.
+- critical: disk free < 10% — collection failure territory.
+
+Representative alarm configuration (adjust `ContactGroups` and the webhook, and
+apply through the Cloud Monitor console so field names match the current API
+version):
+
+```json
+{
+  "ruleName": "monday-collector-disk-warn",
+  "instanceId": "i-6we6afeqsvv8uo1ixmyo",
+  "metricName": "DiskUtilization",
+  "statistics": "Average",
+  "period": 300,
+  "comparisonOperator": "GreaterThanThreshold",
+  "threshold": 75,
+  "evaluationCount": 1,
+  "contactGroups": ["monday-oncall"],
+  "notifyType": "warning",
+  "recoverNotify": true,
+  "level": "WARN"
+}
+```
+
+```json
+{
+  "ruleName": "monday-collector-disk-critical",
+  "instanceId": "i-6we6afeqsvv8uo1ixmyo",
+  "metricName": "DiskUtilization",
+  "statistics": "Average",
+  "period": 300,
+  "comparisonOperator": "GreaterThanThreshold",
+  "threshold": 90,
+  "evaluationCount": 1,
+  "contactGroups": ["monday-oncall"],
+  "notifyType": "critical",
+  "recoverNotify": true,
+  "level": "CRITICAL"
+}
+```
+
+The `monday-oncall` contact group must contain both an email address and a
+DingTalk webhook robot, and recovery notification must be enabled so a resolved
+incident is visible. Cloud Monitor is the PRIMARY channel because it fires even
+when every GitHub and repository path is down.
+
+### GitHub Actions workflow (fallback)
+
+`.github/workflows/monitor-collector-host.yml` runs every 15 minutes. It
+refreshes `origin/main`, invokes `/opt/monday/bin/monday-collector-health.sh
+--json` on the host through Cloud Assistant (the same RunShellScript/Base64
+invoke pattern as `invoke-rust-lob-operation.sh`), decodes the JSON, and when
+`ok:false` opens or appends a single `needs-triage` GitHub issue (deduped by
+open-issue search) following the `docs/agents/issue-tracker.md` lifecycle. It
+also opens an issue when the invocation itself cannot return a snapshot.
+
+Prerequisites: repository secrets `ALIYUN_ACCESS_KEY_ID` and
+`ALIYUN_ACCESS_KEY_SECRET` whose RAM policy is scoped to
+RunCommand/DescribeInvocationResults on `i-6we6afeqsvv8uo1ixmyo` in
+`ap-northeast-1` (no broader ECS or OSS grants). See the workflow header.
+
 The companion `polymarket-reference-collector.service` polls the official Gamma and
 Data APIs every 30 seconds. It writes complete Gamma market payloads (including
 volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
