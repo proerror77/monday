@@ -1,7 +1,8 @@
 //! Fail-closed Polymarket reference collection and raw tape archival.
 
 use crate::polymarket_upload::{
-    ensure_canonical_directory, trade_record_ids_sha256, validate_reference_tape_for_recovery,
+    available_disk_bytes, discover_rotated_tapes, ensure_canonical_directory,
+    trade_record_ids_sha256, validate_reference_tape_for_recovery, DEFAULT_LOW_DISK_FLOOR_BYTES,
     TRADE_COMPLETION_BASIS, TRADE_COMPLETION_KIND,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -141,6 +142,53 @@ fn completeness_error(message: impl Into<String>) -> anyhow::Error {
     DataCompletenessError(message.into()).into()
 }
 
+#[derive(Debug)]
+struct LowDiskError(String);
+
+impl std::fmt::Display for LowDiskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LowDiskError {}
+
+fn low_disk_error(message: impl Into<String>) -> anyhow::Error {
+    LowDiskError(message.into()).into()
+}
+
+/// Effective low-disk floor for the reference collector: the larger of the
+/// configured absolute floor (env `OSS_LOW_DISK_FLOOR_BYTES`, else
+/// [`DEFAULT_LOW_DISK_FLOOR_BYTES`]) and 2.5x the largest relevant tape (the
+/// active tape plus the largest rotated tape), so a cycle that writes or
+/// rotates never hits an unhandled ENOSPC mid-write.
+fn reference_low_disk_floor_bytes(config: &ReferenceConfig) -> Result<u64> {
+    let configured = match config.low_disk_floor_bytes {
+        Some(bytes) => bytes,
+        None => std::env::var("OSS_LOW_DISK_FLOOR_BYTES")
+            .ok()
+            .map(|raw| {
+                raw.parse::<u64>().with_context(|| {
+                    format!("OSS_LOW_DISK_FLOOR_BYTES must be an unsigned integer, got {raw:?}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_LOW_DISK_FLOOR_BYTES),
+    };
+    let active_bytes = fs::metadata(config.spool_dir.join(ACTIVE_TAPE))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let largest = active_bytes.max(
+        discover_rotated_tapes(&config.spool_dir)?
+            .into_iter()
+            .filter_map(|path| fs::metadata(&path).ok())
+            .map(|metadata| metadata.len())
+            .max()
+            .unwrap_or(0),
+    );
+    Ok(configured.max(largest.saturating_mul(5) / 2))
+}
+
 fn retryable_http_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
@@ -197,6 +245,11 @@ pub struct ReferenceConfig {
     pub trade_finalization_stable_polls: u64,
     pub per_market_delay: Duration,
     pub tape_max_bytes: u64,
+    /// Absolute low-disk floor override in bytes. `None` falls back to the
+    /// `OSS_LOW_DISK_FLOOR_BYTES` environment variable, then
+    /// [`DEFAULT_LOW_DISK_FLOOR_BYTES`]. The effective floor is always at
+    /// least 2.5x the largest relevant tape (active plus rotated).
+    pub low_disk_floor_bytes: Option<u64>,
 }
 
 impl Default for ReferenceConfig {
@@ -220,6 +273,7 @@ impl Default for ReferenceConfig {
             trade_finalization_stable_polls: 3,
             per_market_delay: MIN_TRADE_REQUEST_SPACING,
             tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
+            low_disk_floor_bytes: None,
         }
     }
 }
@@ -270,6 +324,9 @@ impl ReferenceConfig {
         }
         if self.tape_max_bytes != 0 && self.tape_max_bytes < MIN_TAPE_MAX_BYTES {
             bail!("tape size cap must be 0 (disabled) or at least {MIN_TAPE_MAX_BYTES} bytes");
+        }
+        if self.low_disk_floor_bytes == Some(0) {
+            bail!("low disk floor must be nonzero when configured");
         }
         if self.settlement_lookback_secs < MIN_SETTLEMENT_LOOKBACK_SECS {
             bail!("settlement lookback must cover at least {MIN_SETTLEMENT_LOOKBACK_SECS} seconds");
@@ -2256,6 +2313,23 @@ impl ReferenceCollector {
         (self.clock)()
     }
 
+    /// Fail-closed low-disk probe. Returns the (floor, available) tuple on
+    /// success, or a typed [`LowDiskError`] when the spool filesystem has less
+    /// than the floor free. Called at the top of every collection cycle so the
+    /// collector rotates/finalizes cleanly (via `run_reference`'s close path)
+    /// instead of crashing mid-write on an unhandled ENOSPC.
+    fn probe_disk(&self) -> Result<(u64, u64)> {
+        let floor = reference_low_disk_floor_bytes(&self.config)?;
+        let available = available_disk_bytes(&self.config.spool_dir)?;
+        if available < floor {
+            return Err(low_disk_error(format!(
+                "low disk: {available} bytes available < {floor} byte floor; \
+                 stopping collection to avoid ENOSPC"
+            )));
+        }
+        Ok((floor, available))
+    }
+
     async fn get_json(&self, url: &str, params: &[(String, String)]) -> Result<Value> {
         self.get_json_with_request_spacing(url, params, false).await
     }
@@ -2453,6 +2527,7 @@ impl ReferenceCollector {
 
     async fn collect_once(&mut self) -> Result<Value> {
         let cycle_started = Instant::now();
+        let (disk_floor, free_disk_bytes) = self.probe_disk()?;
         let now = self.now();
         let retrieved_at = iso_z(now);
         let mut updates = PendingUpdates::new(&self.config.spool_dir)?;
@@ -2874,8 +2949,18 @@ impl ReferenceCollector {
             "stale_settlement_markets": stale_settlement_markets,
             "overdue_unresolved_markets": overdue_unresolved_markets,
             "active_tape_bytes": fs::metadata(&self.writer.active).map(|value| value.len()).unwrap_or_default(),
-            "free_disk_bytes": fs4::available_space(&self.config.spool_dir)?,
+            "free_disk_bytes": free_disk_bytes,
         });
+        let health = {
+            let mut health = health;
+            let disk_low = free_disk_bytes < disk_floor;
+            if let Some(object) = health.as_object_mut() {
+                object.insert("disk_floor_bytes".to_owned(), json!(disk_floor));
+                object.insert("disk_warning".to_owned(), json!(disk_low));
+                object.insert("low_disk".to_owned(), json!(disk_low));
+            }
+            health
+        };
         atomic_write_json(&self.health_path, &health)?;
 
         if !missing_target_symbols.is_empty() {
@@ -2971,8 +3056,11 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
             Err(error) => {
                 eprintln!("Polymarket reference poll failed: {error:#}");
                 if error.downcast_ref::<DataCompletenessError>().is_some()
+                    || error.downcast_ref::<LowDiskError>().is_some()
                     || collector.last_success.elapsed() > stale_after
                 {
+                    // Close/rotate the active tape cleanly so no open-file data
+                    // is lost, then stop (systemd restarts with backoff).
                     collector.writer.close()?;
                     return Err(error);
                 }
@@ -4015,6 +4103,55 @@ mod tests {
         };
         let error = insufficient_request_spacing.validate().unwrap_err();
         assert!(error.to_string().contains("request spacing"));
+    }
+
+    #[test]
+    fn low_disk_probe_returns_typed_error_when_below_floor() {
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            low_disk_floor_bytes: Some(u64::MAX),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let error = collector.probe_disk().unwrap_err();
+        assert!(
+            error.downcast_ref::<LowDiskError>().is_some(),
+            "low disk must surface as a typed LowDiskError: {error}"
+        );
+        assert!(error.to_string().contains("low disk"));
+    }
+
+    #[test]
+    fn low_disk_probe_passes_when_floor_is_satisfied() {
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            low_disk_floor_bytes: Some(1),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let (floor, available) = collector.probe_disk().unwrap();
+        assert_eq!(floor, 1);
+        assert!(available >= 1);
+    }
+
+    #[test]
+    fn reference_low_disk_floor_is_at_least_2_5x_the_largest_tape() {
+        let temp = TestDir::new();
+        fs::write(temp.path().join(ACTIVE_TAPE), b"0123456789").unwrap();
+        fs::write(
+            temp.path().join("market-updates.20260715T010000.ndjson"),
+            b"012345678901234567890",
+        )
+        .unwrap();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            low_disk_floor_bytes: Some(1),
+            ..ReferenceConfig::default()
+        };
+        // largest = 21 bytes -> 2.5x = 52.5 -> 52; floor must cover it.
+        assert_eq!(reference_low_disk_floor_bytes(&config).unwrap(), 52);
     }
 
     #[test]
