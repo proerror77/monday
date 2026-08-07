@@ -1237,11 +1237,14 @@ if (( scan_elapsed > 30 )); then
     "$scan_elapsed" "$large_bytes" >&2
   exit 1
 fi
-# The quote count is bounded by the window: at most WINDOW records are scanned,
-# so the count cannot exceed the number of quote records in the window (≤ WINDOW).
-(( large_quotes > 0 && large_quotes <= PREFLIGHT_SCAN_WINDOW_RECORDS )) || {
-  printf 'large-segment quote count %s out of expected (0, %s] window range\n' \
-    "$large_quotes" "$PREFLIGHT_SCAN_WINDOW_RECORDS" >&2
+# The fixture alternates quote/event records, so the head window
+# (PREFLIGHT_SCAN_WINDOW_RECORDS) contains exactly half quotes. Assert the exact
+# count: a full-file scan of the 2x fixture would return WINDOW quotes, which
+# fails this check — proving the scan is bounded.
+expected_large_quotes=$((PREFLIGHT_SCAN_WINDOW_RECORDS / 2))
+(( large_quotes == expected_large_quotes )) || {
+  printf 'large-segment quote count %s, expected %s from the head window\n' \
+    "$large_quotes" "$expected_large_quotes" >&2
   exit 1
 }
 [[ $large_hours -eq 1 ]] || {
