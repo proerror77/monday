@@ -45,10 +45,7 @@ raise "proposed workflow is not safely validated" unless
   proposal_run.include?("gh api") && proposal_run.include?("$PR_HEAD_REPOSITORY") &&
   proposal_run.include?("$PR_HEAD_SHA") &&
   proposal_run.include?('ruby .github/scripts/test-issue-lifecycle-workflow.rb "$RUNNER_TEMP/issue-lifecycle.yml"')
-raise "unexpected runnable workflow step" unless steps.count { |step| step["run"] } == 5
-comment_step = steps.find { |step| step["name"] == "Comment violations on issues" }
-raise "violation comment step must run only on full-repo audit" unless
-  comment_step&.fetch("if") == "github.event_name != 'pull_request_target' && failure()"
+raise "unexpected runnable workflow step" unless steps.count { |step| step["run"] } == 4
 
 audit_steps = steps.select { |step| step["run"]&.include?("issue-lifecycle-audit.rb") }
 raise "expected only PR and repository audits" unless audit_steps.length == 2
