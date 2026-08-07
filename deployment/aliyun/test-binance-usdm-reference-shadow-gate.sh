@@ -86,7 +86,15 @@ reject '.service.invocation_id_end=("0"*32)' replaced-invocation
 reject 'del(.service.invocation_id_start)' missing-invocation
 reject '.health.api_error_count=1' api-error
 reject '.health.total_artifact_errors=1' artifact-error
-reject '.artifacts[1].coverage.stale_open_interest=1' stale-oi
+# stale_open_interest is evidence-only (exchange OI last-change timestamps
+# legitimately lag for quiet instruments), so a positive count must be
+# accepted, while stale metadata/mark clocks stay fail-closed.
+jq '.artifacts[1].coverage.stale_open_interest=7' "$tmp_dir/gate.json" \
+  >"$tmp_dir/stale-oi-accepted.json"
+gate "$tmp_dir/stale-oi-accepted.json"
+reject '.artifacts[1].coverage.stale_open_interest=-1' negative-stale-oi
+reject '.artifacts[1].coverage.stale_metadata=1' stale-metadata
+reject '.artifacts[1].coverage.stale_mark_index_funding=1' stale-mark
 reject '.artifacts[1].coverage.active_contracts=399
   | .artifacts[1].coverage.metadata_observations=399
   | .artifacts[1].coverage.mark_index_funding_observations=399

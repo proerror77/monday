@@ -69,13 +69,17 @@ impl From<ReferenceCoverage> for ArtifactCoverage {
 
 impl ArtifactCoverage {
     fn is_complete(&self) -> bool {
+        // stale_open_interest is deliberately evidence-only: the exchange's
+        // openInterest `time` is a per-instrument last-change timestamp that
+        // legitimately lags for quiet instruments, so completeness is proven
+        // by full per-contract coverage, real-time clocks (metadata/mark), and
+        // zero API errors. The count stays published for readback.
         self.active_contracts > 0
             && self.active_contracts == self.metadata_observations
             && self.active_contracts == self.mark_index_funding_observations
             && self.active_contracts == self.open_interest_observations
             && self.stale_metadata == 0
             && self.stale_mark_index_funding == 0
-            && self.stale_open_interest == 0
             && self.api_error_count == 0
     }
 }
@@ -692,6 +696,39 @@ mod tests {
         let published =
             publish_reference_batch(&config, OFFICIAL_USDM_SOURCE_ORIGIN, &sample_batch()).unwrap();
         assert!(published.success_path.is_file());
+    }
+
+    #[test]
+    fn stale_open_interest_is_published_as_evidence_not_rejected() {
+        let temp = tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let batch = CompleteReferenceBatch::new(
+            sample_batch().contracts().to_vec(),
+            sample_batch().mark_index_funding().to_vec(),
+            vec![OpenInterestObservation {
+                schema: REFERENCE_SCHEMA.to_owned(),
+                symbol: "BTCUSDT".to_owned(),
+                open_interest: Decimal::new(12345, 3),
+                source_time_ms: SOURCE_MS - 3_600_000,
+                received_at_ns: RECEIVED_NS + 50,
+                source_endpoint: OPEN_INTEREST_ENDPOINT.to_owned(),
+            }],
+        )
+        .unwrap();
+        let published =
+            publish_reference_batch(&config(root), OFFICIAL_USDM_SOURCE_ORIGIN, &batch).unwrap();
+        let manifest: ReferenceManifest =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.coverage.open_interest_observations, 1);
+        assert_eq!(manifest.coverage.stale_open_interest, 1);
+        assert_eq!(manifest.coverage.stale_metadata, 0);
+        assert_eq!(manifest.coverage.stale_mark_index_funding, 0);
+        verify_reference_artifact(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .unwrap();
     }
 
     #[test]

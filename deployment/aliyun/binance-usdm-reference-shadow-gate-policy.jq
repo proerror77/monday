@@ -21,7 +21,11 @@ def complete_coverage:
   and .open_interest_observations == .active_contracts
   and .stale_metadata == 0
   and .stale_mark_index_funding == 0
-  and .stale_open_interest == 0
+  # stale_open_interest is evidence-only: the exchange openInterest `time`
+  # is a per-instrument last-change timestamp that legitimately lags for
+  # quiet instruments; the count must be present and non-negative.
+  and (.stale_open_interest | type) == "number"
+  and .stale_open_interest >= 0
   and .api_error_count == 0;
 
 def canonical_artifact:
