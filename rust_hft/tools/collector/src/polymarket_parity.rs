@@ -34,7 +34,20 @@ const SETTLEMENT_MATURITY_LAG_SECONDS: i64 = 600;
 // Trade APIs are eventually consistent and the two collectors poll on
 // independent schedules. Keep the full retrieval cutoff, but compare only
 // trades whose event time is mature enough to have appeared in both lanes.
-const TRADE_MATURITY_LAG_SECONDS: i64 = 600;
+// The comparison window for trades must end early enough that every market
+// contributing a window trade can complete the collector's deferred trade
+// emission before the parity read: settlement availability (~60s) plus the
+// 1800-second finalization lag plus three stable polls (~160s), i.e. about
+// 2100 seconds after close, with margin. 600 seconds was calibrated for the
+// pre-#680 continuous-emission lane and made exact trade parity unreachable
+// for finalization-based collectors (issue #756). This is the default bound
+// into ShadowParityConfig; production callers must not override it, while
+// unit fixtures pass the legacy 600-second value so their small epoch scales
+// stay valid.
+#[cfg(not(test))]
+pub const DEFAULT_TRADE_MATURITY_LAG_SECONDS: i64 = 2400;
+#[cfg(test)]
+pub const DEFAULT_TRADE_MATURITY_LAG_SECONDS: i64 = 600;
 // A rotated tape's name stamp is its rotation wall time, so every row in it
 // was recorded no later than the stamp. Comparison rows cannot be arbitrarily
 // old: trades and settlements are admitted only near the window, and metadata
@@ -77,6 +90,7 @@ pub struct ShadowParityConfig {
     pub ended_at_unix: i64,
     pub output: PathBuf,
     pub allow_empty_legacy: bool,
+    pub trade_maturity_lag_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,8 +1023,10 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
     if config.ended_at_unix <= config.started_at_unix {
         bail!("parity window end must be after its start");
     }
-    let trade_event_window_end =
-        nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+    let trade_event_window_end = nonnegative_epoch_sub(
+        config.ended_at_unix,
+        config.trade_maturity_lag_seconds,
+    );
     if trade_event_window_end <= config.started_at_unix {
         bail!("trade maturity window end must be after its start");
     }
@@ -1205,7 +1221,7 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
             "rust_duplicate_trade_ids": rust_duplicates,
             "trade_shared_values_match": trade_shared_values_match,
             "trade_shared_value_mismatch_ids": trade_shared_value_mismatch_ids,
-            "trade_maturity_lag_seconds": TRADE_MATURITY_LAG_SECONDS,
+            "trade_maturity_lag_seconds": config.trade_maturity_lag_seconds,
             "trade_event_window_started_at_unix": config.started_at_unix,
             "trade_event_window_ended_at_unix": trade_event_window_end,
             "legacy_trade_metadata_context_match": legacy_trade_metadata_context_match,
@@ -1520,6 +1536,7 @@ mod tests {
             ended_at_unix: 1000,
             output: root.path().join("parity.json"),
             allow_empty_legacy: false,
+            trade_maturity_lag_seconds: DEFAULT_TRADE_MATURITY_LAG_SECONDS,
         };
         (root, config)
     }
@@ -1618,7 +1635,7 @@ mod tests {
         let (_root, config) = fixture();
         let evidence = compare(&config).unwrap();
         let trade_event_window_end =
-            nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+            nonnegative_epoch_sub(config.ended_at_unix, config.trade_maturity_lag_seconds);
         let (rust_rows, _, _) = load_rows(
             &config.rust_spool,
             config.started_at_unix,
@@ -1665,7 +1682,7 @@ mod tests {
         );
 
         let trade_event_window_end =
-            nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+            nonnegative_epoch_sub(config.ended_at_unix, config.trade_maturity_lag_seconds);
         let (legacy_rows, _, _) = load_rows(
             &config.legacy_spool,
             config.started_at_unix,

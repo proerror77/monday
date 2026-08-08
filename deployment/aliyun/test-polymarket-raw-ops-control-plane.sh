@@ -3382,13 +3382,13 @@ late_trade=$(jq -c \
     | .post_cutoff_only = true
     | .trade.postCutoffOnly = true' <<<"$trade")
 jq -cn --argjson sequence "$sequence" --argjson update "$late_trade" \
-  '{sequence:$sequence,recorded_at:"1970-01-01T00:16:41Z",update:$update}' \
+  '{sequence:$sequence,recorded_at:"1970-01-01T00:51:41Z",update:$update}' \
   >>"$legacy_tape"
 
 parity="$tmp_dir/parity.json"
 "$VERIFY" verify-shadow-parity \
   --legacy-spool "$legacy" --rust-spool "$rust" --started-at-unix 100 \
-  --ended-at-unix 1000 \
+  --ended-at-unix 3000 \
   --output "$parity"
 jq -e '.passed == true and .checks.metadata_parity == true
   and .comparison_mode == "legacy_overlap"
@@ -3406,6 +3406,7 @@ mkdir "$legacy_empty"
 : >"$legacy_empty/market-updates.ndjson"
 rust_self_parity="$tmp_dir/rust-self-parity.json"
 "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy_empty" --rust-spool "$rust" \
   --started-at-unix 100 --ended-at-unix 1000 \
   --output "$rust_self_parity" --allow-empty-legacy
@@ -3426,6 +3427,7 @@ jq -c 'select(.update.kind != "market_settlement")' \
 mv "$rust_self_missing_settlement/market-updates.rewritten" \
   "$rust_self_missing_settlement/market-updates.19700101T000400000000.ndjson"
 if "$VERIFY" verify-shadow-parity --legacy-spool "$legacy_empty" \
+  --trade-maturity-lag-seconds 600 \
   --rust-spool "$rust_self_missing_settlement" --started-at-unix 100 \
   --ended-at-unix 1000 --output "$tmp_dir/bad-rust-self-parity.json" \
   --allow-empty-legacy 2>/dev/null; then
@@ -3447,6 +3449,7 @@ jq -cn --argjson update "$trade" \
   '{sequence:0,recorded_at:"1970-01-01T00:03:21Z",update:$update}' \
   >"$rust_bad/market-updates.ndjson"
 if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy" --rust-spool "$rust_bad" --started-at-unix 100 \
   --ended-at-unix 1000 \
   --output "$tmp_dir/bad-parity.json" 2>/dev/null; then
@@ -3467,6 +3470,7 @@ jq -c '
 mv "$rust_bad_metadata/market-updates.rewritten" \
   "$rust_bad_metadata/market-updates.19700101T000400000000.ndjson"
 if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy" --rust-spool "$rust_bad_metadata" \
   --started-at-unix 100 --ended-at-unix 1000 \
   --output "$tmp_dir/bad-metadata-parity.json" 2>/dev/null; then
@@ -3535,7 +3539,7 @@ jq \
     duration_seconds:3600,
     started_at:"1970-01-01T00:01:40Z",
     parity_window_started_at_unix:100,
-    parity_window_ended_at_unix:1000,
+    parity_window_ended_at_unix:3000,
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
@@ -3550,16 +3554,16 @@ jq \
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_completion_snapshot:{
-      updated_at:"1970-01-01T00:16:40.654321Z",
-      last_success_at:"1970-01-01T00:16:40.654321Z",
+      updated_at:"1970-01-01T00:50:00.654321Z",
+      last_success_at:"1970-01-01T00:50:00.654321Z",
       target_markets:14,api_errors:[],malformed_trade_rows:0,
       truncated_trade_markets:[],stale_trade_markets:[],
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_start_success_unix:100,
-    baseline_health_cutoff_unix:1000,
+    baseline_health_cutoff_unix:3000,
     baseline_health_start_written_at_unix:100,
-    baseline_health_completion_written_at_unix:1301,
+    baseline_health_completion_written_at_unix:3100,
     baseline_health_start_file_identity:"1:10",
     baseline_health_completion_file_identity:"1:11",
     legacy_runtime:{
@@ -3685,11 +3689,11 @@ fi
 jq '.started_at = "1970-01-01T00:46:40Z"
   | .completed_at = "1970-01-01T01:46:40Z"
   | .parity_window_started_at_unix = 2800
-  | .parity_window_ended_at_unix = 3700
+  | .parity_window_ended_at_unix = 6400
   | .metrics.trade_event_window_started_at_unix = 2800
-  | .metrics.trade_event_window_ended_at_unix = 3100
+  | .metrics.trade_event_window_ended_at_unix = 4000
   | .metrics.settlement_event_window_started_at_unix = 1900
-  | .metrics.settlement_event_window_ended_at_unix = 3100' \
+  | .metrics.settlement_event_window_ended_at_unix = 5800' \
   "$tmp_dir/expedited-legacy-gate.json" \
   >"$tmp_dir/start-health-age-boundary-gate.json"
 jq -e -f "$POLICY" "$tmp_dir/start-health-age-boundary-gate.json" >/dev/null || {
@@ -3697,13 +3701,13 @@ jq -e -f "$POLICY" "$tmp_dir/start-health-age-boundary-gate.json" >/dev/null || 
   exit 1
 }
 jq '.started_at = "1970-01-01T00:46:41Z"
-  | .completed_at = "1970-01-01T01:01:41Z"
+  | .completed_at = "1970-01-01T01:46:41Z"
   | .parity_window_started_at_unix = 2801
-  | .parity_window_ended_at_unix = 3701
+  | .parity_window_ended_at_unix = 6401
   | .metrics.trade_event_window_started_at_unix = 2801
-  | .metrics.trade_event_window_ended_at_unix = 3101
+  | .metrics.trade_event_window_ended_at_unix = 4001
   | .metrics.settlement_event_window_started_at_unix = 1901
-  | .metrics.settlement_event_window_ended_at_unix = 3101' \
+  | .metrics.settlement_event_window_ended_at_unix = 5801' \
   "$tmp_dir/start-health-age-boundary-gate.json" \
   >"$tmp_dir/stale-start-health-gate.json"
 if jq -e -f "$POLICY" "$tmp_dir/stale-start-health-gate.json" >/dev/null; then
@@ -3991,7 +3995,7 @@ for memory_counter_path in \
     exit 1
   fi
 done
-jq '.metrics.trade_maturity_lag_seconds = 599' \
+jq '.metrics.trade_maturity_lag_seconds = 2399' \
   "$tmp_dir/gate.json" >"$tmp_dir/short-trade-maturity.json"
 if jq -e -f "$POLICY" "$tmp_dir/short-trade-maturity.json" >/dev/null; then
   printf 'gate policy accepted a shortened trade maturity lag\n' >&2

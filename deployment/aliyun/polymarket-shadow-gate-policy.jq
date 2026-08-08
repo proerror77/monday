@@ -389,7 +389,7 @@ and (.metrics.trade_shared_value_mismatch_ids | type == "array" and length == 0)
 and .metrics.trade_metadata_shared_values_match == true
 and (.metrics.trade_metadata_shared_value_mismatch_market_ids
   | type == "array" and length == 0)
-and .metrics.trade_maturity_lag_seconds == 600
+and .metrics.trade_maturity_lag_seconds == 2400
 and .metrics.trade_event_window_started_at_unix == .parity_window_started_at_unix
 and (.metrics.trade_event_window_ended_at_unix ==
   nonnegative_sub(.parity_window_ended_at_unix;
