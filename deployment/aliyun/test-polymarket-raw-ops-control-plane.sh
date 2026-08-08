@@ -688,7 +688,7 @@ for failed_uploader in \
 done
 set_supervisor_state baseline-active inactive
 
-# A fresh probe admits once; its binding remains valid through the 900-second Gate.
+# A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
 sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE" >"$recovery_binding_contract"
 sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
@@ -3382,13 +3382,13 @@ late_trade=$(jq -c \
     | .post_cutoff_only = true
     | .trade.postCutoffOnly = true' <<<"$trade")
 jq -cn --argjson sequence "$sequence" --argjson update "$late_trade" \
-  '{sequence:$sequence,recorded_at:"1970-01-01T00:16:41Z",update:$update}' \
+  '{sequence:$sequence,recorded_at:"1970-01-01T00:51:41Z",update:$update}' \
   >>"$legacy_tape"
 
 parity="$tmp_dir/parity.json"
 "$VERIFY" verify-shadow-parity \
   --legacy-spool "$legacy" --rust-spool "$rust" --started-at-unix 100 \
-  --ended-at-unix 1000 \
+  --ended-at-unix 3000 \
   --output "$parity"
 jq -e '.passed == true and .checks.metadata_parity == true
   and .comparison_mode == "legacy_overlap"
@@ -3406,6 +3406,7 @@ mkdir "$legacy_empty"
 : >"$legacy_empty/market-updates.ndjson"
 rust_self_parity="$tmp_dir/rust-self-parity.json"
 "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy_empty" --rust-spool "$rust" \
   --started-at-unix 100 --ended-at-unix 1000 \
   --output "$rust_self_parity" --allow-empty-legacy
@@ -3426,6 +3427,7 @@ jq -c 'select(.update.kind != "market_settlement")' \
 mv "$rust_self_missing_settlement/market-updates.rewritten" \
   "$rust_self_missing_settlement/market-updates.19700101T000400000000.ndjson"
 if "$VERIFY" verify-shadow-parity --legacy-spool "$legacy_empty" \
+  --trade-maturity-lag-seconds 600 \
   --rust-spool "$rust_self_missing_settlement" --started-at-unix 100 \
   --ended-at-unix 1000 --output "$tmp_dir/bad-rust-self-parity.json" \
   --allow-empty-legacy 2>/dev/null; then
@@ -3447,6 +3449,7 @@ jq -cn --argjson update "$trade" \
   '{sequence:0,recorded_at:"1970-01-01T00:03:21Z",update:$update}' \
   >"$rust_bad/market-updates.ndjson"
 if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy" --rust-spool "$rust_bad" --started-at-unix 100 \
   --ended-at-unix 1000 \
   --output "$tmp_dir/bad-parity.json" 2>/dev/null; then
@@ -3467,6 +3470,7 @@ jq -c '
 mv "$rust_bad_metadata/market-updates.rewritten" \
   "$rust_bad_metadata/market-updates.19700101T000400000000.ndjson"
 if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
   --legacy-spool "$legacy" --rust-spool "$rust_bad_metadata" \
   --started-at-unix 100 --ended-at-unix 1000 \
   --output "$tmp_dir/bad-metadata-parity.json" 2>/dev/null; then
@@ -3532,10 +3536,10 @@ jq \
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
     },
-    duration_seconds:900,
+    duration_seconds:3600,
     started_at:"1970-01-01T00:01:40Z",
     parity_window_started_at_unix:100,
-    parity_window_ended_at_unix:1000,
+    parity_window_ended_at_unix:3000,
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
@@ -3550,16 +3554,16 @@ jq \
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_completion_snapshot:{
-      updated_at:"1970-01-01T00:16:40.654321Z",
-      last_success_at:"1970-01-01T00:16:40.654321Z",
+      updated_at:"1970-01-01T00:50:00.654321Z",
+      last_success_at:"1970-01-01T00:50:00.654321Z",
       target_markets:14,api_errors:[],malformed_trade_rows:0,
       truncated_trade_markets:[],stale_trade_markets:[],
       stale_settlement_markets:[],overdue_unresolved_markets:[]
     },
     baseline_health_start_success_unix:100,
-    baseline_health_cutoff_unix:1000,
+    baseline_health_cutoff_unix:3000,
     baseline_health_start_written_at_unix:100,
-    baseline_health_completion_written_at_unix:1301,
+    baseline_health_completion_written_at_unix:3100,
     baseline_health_start_file_identity:"1:10",
     baseline_health_completion_file_identity:"1:11",
     legacy_runtime:{
@@ -3683,13 +3687,13 @@ if jq -e -f "$POLICY" \
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:46:40Z"
-  | .completed_at = "1970-01-01T01:01:40Z"
+  | .completed_at = "1970-01-01T01:46:40Z"
   | .parity_window_started_at_unix = 2800
-  | .parity_window_ended_at_unix = 3700
+  | .parity_window_ended_at_unix = 6400
   | .metrics.trade_event_window_started_at_unix = 2800
-  | .metrics.trade_event_window_ended_at_unix = 3100
+  | .metrics.trade_event_window_ended_at_unix = 4000
   | .metrics.settlement_event_window_started_at_unix = 1900
-  | .metrics.settlement_event_window_ended_at_unix = 3100' \
+  | .metrics.settlement_event_window_ended_at_unix = 5800' \
   "$tmp_dir/expedited-legacy-gate.json" \
   >"$tmp_dir/start-health-age-boundary-gate.json"
 jq -e -f "$POLICY" "$tmp_dir/start-health-age-boundary-gate.json" >/dev/null || {
@@ -3697,13 +3701,13 @@ jq -e -f "$POLICY" "$tmp_dir/start-health-age-boundary-gate.json" >/dev/null || 
   exit 1
 }
 jq '.started_at = "1970-01-01T00:46:41Z"
-  | .completed_at = "1970-01-01T01:01:41Z"
+  | .completed_at = "1970-01-01T01:46:41Z"
   | .parity_window_started_at_unix = 2801
-  | .parity_window_ended_at_unix = 3701
+  | .parity_window_ended_at_unix = 6401
   | .metrics.trade_event_window_started_at_unix = 2801
-  | .metrics.trade_event_window_ended_at_unix = 3101
+  | .metrics.trade_event_window_ended_at_unix = 4001
   | .metrics.settlement_event_window_started_at_unix = 1901
-  | .metrics.settlement_event_window_ended_at_unix = 3101' \
+  | .metrics.settlement_event_window_ended_at_unix = 5801' \
   "$tmp_dir/start-health-age-boundary-gate.json" \
   >"$tmp_dir/stale-start-health-gate.json"
 if jq -e -f "$POLICY" "$tmp_dir/stale-start-health-gate.json" >/dev/null; then
@@ -3991,7 +3995,7 @@ for memory_counter_path in \
     exit 1
   fi
 done
-jq '.metrics.trade_maturity_lag_seconds = 599' \
+jq '.metrics.trade_maturity_lag_seconds = 2399' \
   "$tmp_dir/gate.json" >"$tmp_dir/short-trade-maturity.json"
 if jq -e -f "$POLICY" "$tmp_dir/short-trade-maturity.json" >/dev/null; then
   printf 'gate policy accepted a shortened trade maturity lag\n' >&2
@@ -4089,17 +4093,17 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 899' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 3599' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than 15 minutes total\n' >&2
+  printf 'gate policy accepted a shadow shorter than one hour total\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 901' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
+jq '.duration_seconds = 3601' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
 if ! jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
   printf 'gate policy rejected one second of elapsed-time rounding\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 902' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
 if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
   printf 'gate policy accepted more than one second of elapsed-time rounding\n' >&2
   exit 1
@@ -4113,7 +4117,7 @@ fi
 jq '.completed_at = "1970-01-01T00:16:39Z"' \
   "$tmp_dir/expedited-legacy-gate.json" >"$tmp_dir/unelapsed-gate.json"
 if jq -e -f "$POLICY" "$tmp_dir/unelapsed-gate.json" >/dev/null; then
-  printf 'gate policy accepted 900 seconds without 900 elapsed wall-clock seconds\n' >&2
+  printf 'gate policy accepted 3600 seconds without 3600 elapsed wall-clock seconds\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -4613,7 +4617,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 7620 ]] || {
+  [[ $required -eq 10320 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
@@ -5023,10 +5027,10 @@ for mutation in \
   fi
 done
 
-grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
+grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
 grep -Fq 'readonly MINIMUM_GATE_SECONDS=$REQUIRED_DURATION_SECONDS' "$GATE"
-grep -Fq 'production gate duration must be exactly 900 seconds' "$GATE"
+grep -Fq 'production gate duration must be exactly 3600 seconds' "$GATE"
 grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
 grep -Fxq 'readonly LEGACY_HEALTH_START_REQUIRED=false' "$GATE"
 grep -Fq 'readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true' "$GATE"

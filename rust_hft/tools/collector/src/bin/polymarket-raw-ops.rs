@@ -4,7 +4,9 @@ use hft_collector::polymarket_evidence_artifact::{
     publish_polymarket_evidence, PolymarketEvidenceArtifactConfig,
     PolymarketProducerQualificationConfig,
 };
-use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
+use hft_collector::polymarket_parity::{
+    verify_shadow_parity, ShadowParityConfig, DEFAULT_TRADE_MATURITY_LAG_SECONDS,
+};
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
@@ -122,6 +124,8 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         allow_empty_legacy: bool,
+        #[arg(long)]
+        trade_maturity_lag_seconds: Option<i64>,
     },
     /// Fail closed unless staged market/reference segments are research-safe.
     ValidateResearchSegments {
@@ -323,7 +327,10 @@ async fn run(cli: Cli) -> Result<()> {
             ended_at_unix,
             output,
             allow_empty_legacy,
+            trade_maturity_lag_seconds,
         } => {
+            let trade_maturity_lag_seconds = trade_maturity_lag_seconds
+                .unwrap_or(DEFAULT_TRADE_MATURITY_LAG_SECONDS);
             let config = ShadowParityConfig {
                 legacy_spool,
                 rust_spool,
@@ -331,6 +338,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ended_at_unix,
                 output,
                 allow_empty_legacy,
+                trade_maturity_lag_seconds,
             };
             if !verify_shadow_parity(&config)? {
                 bail!("byte/field/dedupe/settlement/rotation parity failed");
