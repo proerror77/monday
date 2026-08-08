@@ -51,8 +51,12 @@ POLY_REF_UPLOAD_TIMER=polymarket-reference-upload.timer
 POLY_REF_UPLOAD_SERVICE=polymarket-reference-upload.service
 WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
 WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
-# Incident fill source; must stay DISABLED (unmanaged).
+# Governed production lanes since the 2026-08-08 cutovers.
 BYBIT_ARCHIVER=bybit-options-archiver.service
+BYBIT_UPLOAD_TIMER=bybit-options-upload.timer
+BYBIT_UPLOAD_SERVICE=bybit-options-upload.service
+USDM_REF_UPLOAD_TIMER=binance-usdm-reference-upload.timer
+USDM_REF_UPLOAD_SERVICE=binance-usdm-reference-upload.service
 POLY_RAW_OPS_GATE='polymarket-raw-ops-gate@.service'
 
 JSON_MODE=0
@@ -374,6 +378,7 @@ check_disk
 check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
 check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
 check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
+check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
 
 check_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
 check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
@@ -381,8 +386,11 @@ check_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
 check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
 check_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
 check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
+check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
+check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
+check_timer "$USDM_REF_UPLOAD_TIMER" "binance-usdm-reference-upload.timer"
+check_oneshot_result "$USDM_REF_UPLOAD_SERVICE" "binance-usdm-reference-upload.service"
 
-check_disabled_unit "$BYBIT_ARCHIVER" "bybit-options-archiver"
 check_disabled_unit "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
@@ -391,6 +399,7 @@ check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance
 check_upload "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_upload "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
 check_upload "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-reference"
+check_upload "bybit-options-upload" "$SPOOL_ROOT/bybit-options"
 check_upload "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket"
 check_upload "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference"
 
