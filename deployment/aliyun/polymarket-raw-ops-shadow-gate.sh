@@ -6,7 +6,12 @@ umask 027
 export LC_ALL=C
 export TZ=UTC
 
-readonly REQUIRED_DURATION_SECONDS=900
+# The observation must outlast the collector's trade finalization pipeline:
+# a market's trades are only emitted after settlement plus a 1800-second
+# finalization lag plus stable polls, so a 900-second observation always
+# yielded an empty shadow trade set (issue #756). 3600 seconds lets markets
+# closing early in the observation finalize before the parity cutoff.
+readonly REQUIRED_DURATION_SECONDS=3600
 # The verifier subtracts a 600-second trade maturity lag and requires a
 # non-empty event window, so 601 seconds of the observation are retained.
 readonly PARITY_TAIL_SECONDS=601
@@ -85,7 +90,7 @@ usage() {
   printf '%s\n' \
     'Usage: polymarket-raw-ops-shadow-gate.sh <candidate-binary> <sha256> <source-revision>' \
     '' \
-    'A production-eligible gate observes for 900 seconds total, including a 601-second parity interval.'
+    'A production-eligible gate observes for 3600 seconds total, including a 601-second parity interval.'
 }
 
 valid_parity_window() {
@@ -1451,7 +1456,7 @@ verify_legacy_state_handoff_preflight "$baseline_mode" "$LEGACY_STATE" \
 gate_seconds=${MONDAY_POLYMARKET_GATE_SECONDS:-$MINIMUM_GATE_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'
 ((gate_seconds <= MINIMUM_GATE_SECONDS)) \
-  || die 'production gate duration must be exactly 900 seconds'
+  || die 'production gate duration must be exactly 3600 seconds'
 test_only=false
 if ((gate_seconds < MINIMUM_GATE_SECONDS)); then
   [[ ${MONDAY_ALLOW_SHORT_GATE_FOR_TESTS:-0} == 1 ]] \

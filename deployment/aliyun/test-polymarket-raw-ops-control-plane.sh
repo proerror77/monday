@@ -688,7 +688,7 @@ for failed_uploader in \
 done
 set_supervisor_state baseline-active inactive
 
-# A fresh probe admits once; its binding remains valid through the 900-second Gate.
+# A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
 sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE" >"$recovery_binding_contract"
 sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
@@ -3532,7 +3532,7 @@ jq \
       upload_summary:{uploaded_segments:1,canonical_uploaded_segments:1,
         pending_segments:0,failed_segments:[],last_error:null}
     },
-    duration_seconds:900,
+    duration_seconds:3600,
     started_at:"1970-01-01T00:01:40Z",
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
@@ -4089,17 +4089,17 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 899' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 3599' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than 15 minutes total\n' >&2
+  printf 'gate policy accepted a shadow shorter than one hour total\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 901' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
+jq '.duration_seconds = 3601' "$tmp_dir/gate.json" >"$tmp_dir/long.json"
 if ! jq -e -f "$POLICY" "$tmp_dir/long.json" >/dev/null; then
   printf 'gate policy rejected one second of elapsed-time rounding\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 902' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
+jq '.duration_seconds = 3602' "$tmp_dir/gate.json" >"$tmp_dir/too-long.json"
 if jq -e -f "$POLICY" "$tmp_dir/too-long.json" >/dev/null; then
   printf 'gate policy accepted more than one second of elapsed-time rounding\n' >&2
   exit 1
@@ -4113,7 +4113,7 @@ fi
 jq '.completed_at = "1970-01-01T00:16:39Z"' \
   "$tmp_dir/expedited-legacy-gate.json" >"$tmp_dir/unelapsed-gate.json"
 if jq -e -f "$POLICY" "$tmp_dir/unelapsed-gate.json" >/dev/null; then
-  printf 'gate policy accepted 900 seconds without 900 elapsed wall-clock seconds\n' >&2
+  printf 'gate policy accepted 3600 seconds without 3600 elapsed wall-clock seconds\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -5023,10 +5023,10 @@ for mutation in \
   fi
 done
 
-grep -Fq 'readonly REQUIRED_DURATION_SECONDS=900' "$GATE"
+grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
 grep -Fq 'readonly MINIMUM_GATE_SECONDS=$REQUIRED_DURATION_SECONDS' "$GATE"
-grep -Fq 'production gate duration must be exactly 900 seconds' "$GATE"
+grep -Fq 'production gate duration must be exactly 3600 seconds' "$GATE"
 grep -Fq 'readonly LEGACY_HEALTH_COMPLETION_REQUIRED=false' "$GATE"
 grep -Fxq 'readonly LEGACY_HEALTH_START_REQUIRED=false' "$GATE"
 grep -Fq 'readonly LEGACY_RUNTIME_STABILITY_REQUIRED=true' "$GATE"
