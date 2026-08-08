@@ -434,8 +434,9 @@ jq -e \
   -f "$shadow_gate_policy" "$gate_json" >/dev/null \
   || die 'shadow gate evidence did not satisfy the gate policy'
 
-printf '%s  %s\n' "$candidate_sha" "$candidate_binary" \
-  | sha256sum --strict >"$marker_tmp"
+# The cutover verifies this marker with sha256sum --check --strict inside the
+# evidence directory, so it must be the gate.json checksum entry itself.
+(cd "$evidence_dir" && sha256sum gate.json) >"$marker_tmp"
 chmod 0440 "$marker_tmp"
 mv -f "$marker_tmp" "$passed_marker"
 gate_finished=true
