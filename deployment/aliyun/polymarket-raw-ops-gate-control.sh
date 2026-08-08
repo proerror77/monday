@@ -38,6 +38,7 @@ usage() {
 }
 
 test_mode=false
+control_lock_held=false
 root_prefix=
 if [[ ${MONDAY_ALLOW_POLYMARKET_GATE_CONTROL_TEST_MODE:-0} == 1 ]]; then
   [[ -n ${MONDAY_POLYMARKET_GATE_CONTROL_TEST_ROOT:-} ]] \
@@ -670,13 +671,10 @@ recovery_probe() {
   jq -c --arg sha "$probe_sha" '. + {sha256:$sha}' <<<"$probe_json"
 }
 
-recovery_baseline() {
-  local candidate_sha=$1 active_state main_pid fragment drop_ins exec_argv
-  local restarts invocation binary_sha
-  active_state=$(systemctl_value "$COLLECTOR_UNIT" ActiveState) \
-    || die 'cannot read contained baseline state'
-  [[ $active_state == inactive ]] \
-    || die 'recovery requires the direct bootstrap baseline to be stopped'
+read_baseline_identity() {
+  # Runs in the caller's scope: proves containment (MainPID == 0) and the
+  # exact baseline identity, assigning main_pid, fragment, drop_ins,
+  # exec_argv, and binary_sha.
   main_pid=$(systemctl_value "$COLLECTOR_UNIT" MainPID) \
     || die 'cannot read contained baseline MainPID'
   [[ $main_pid == 0 ]] || die 'recovery baseline still has a managed process'
@@ -691,13 +689,6 @@ recovery_baseline() {
     || die 'cannot read contained baseline ExecStart'
   [[ $exec_argv == "$RUST_PRODUCTION_EXEC" ]] \
     || die 'recovery baseline ExecStart is not the direct Rust bootstrap'
-  restarts=$(systemctl_value "$COLLECTOR_UNIT" NRestarts) \
-    || die 'cannot read contained baseline restart counter'
-  [[ $restarts =~ ^[0-9]+$ ]] \
-    || die 'contained baseline restart counter is invalid'
-  invocation=$(systemctl_value "$COLLECTOR_UNIT" InvocationID) \
-    || die 'cannot read contained baseline invocation ID'
-  valid_invocation "$invocation" || die 'contained baseline invocation ID is invalid'
   [[ -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY && -x $RUST_ACTIVE_BINARY ]] \
     || die 'recovery baseline is not the direct executable'
   secure_control_file "$RUST_ACTIVE_BINARY"
@@ -705,6 +696,38 @@ recovery_baseline() {
   valid_candidate "$binary_sha" || die 'contained baseline digest is invalid'
   [[ $candidate_sha != "$binary_sha" ]] \
     || die 'candidate digest matches the contained bootstrap baseline'
+}
+
+recovery_baseline() {
+  local candidate_sha=$1 active_state main_pid fragment drop_ins exec_argv
+  local restarts invocation binary_sha
+  active_state=$(systemctl_value "$COLLECTOR_UNIT" ActiveState) \
+    || die 'cannot read contained baseline state'
+  case "$active_state" in
+    inactive|failed) ;;
+    *)
+      die 'recovery requires the direct bootstrap baseline to be stopped'
+      ;;
+  esac
+  read_baseline_identity
+  if [[ $active_state == failed ]]; then
+    systemctl reset-failed "$COLLECTOR_UNIT" \
+      || die 'governed reset-failed refused the contained baseline'
+    [[ -z ${RECOVERY_RESET_LOG:-} ]] \
+      || printf '%s\n' "$COLLECTOR_UNIT" >>"$RECOVERY_RESET_LOG"
+    active_state=$(systemctl_value "$COLLECTOR_UNIT" ActiveState) \
+      || die 'cannot read contained baseline state after reset-failed'
+    [[ $active_state == inactive ]] \
+      || die 'contained baseline is not inactive after reset-failed'
+    read_baseline_identity
+  fi
+  restarts=$(systemctl_value "$COLLECTOR_UNIT" NRestarts) \
+    || die 'cannot read contained baseline restart counter'
+  [[ $restarts =~ ^[0-9]+$ ]] \
+    || die 'contained baseline restart counter is invalid'
+  invocation=$(systemctl_value "$COLLECTOR_UNIT" InvocationID) \
+    || die 'cannot read contained baseline invocation ID'
+  valid_invocation "$invocation" || die 'contained baseline invocation ID is invalid'
   jq -cn --arg active_state "$active_state" --arg exec_start "$exec_argv" \
     --arg fragment_path "$fragment" --arg invocation_id "$invocation" \
     --arg binary_path "$RUST_ACTIVE_BINARY_PATH" --arg binary_sha256 "$binary_sha" \
@@ -715,23 +738,120 @@ recovery_baseline() {
 }
 
 verify_recovery_uploaders_stopped() {
-  local unit active_state
+  local unit active_state main_pid
   for unit in "${RECOVERY_UPLOAD_UNITS[@]}"; do
     active_state=$(systemctl_value "$unit" ActiveState) \
       || die "cannot read recovery uploader state: $unit"
-    [[ $active_state == inactive ]] \
-      || die "recovery requires inactive uploader/timer: $unit"
+    case "$active_state" in
+      inactive) ;;
+      failed)
+        main_pid=$(systemctl_value "$unit" MainPID) \
+          || die "cannot read recovery uploader MainPID: $unit"
+        [[ $main_pid == 0 ]] \
+          || die "recovery uploader still has a managed process: $unit"
+        systemctl reset-failed "$unit" \
+          || die "governed reset-failed refused the recovery uploader: $unit"
+        active_state=$(systemctl_value "$unit" ActiveState) \
+          || die "cannot read recovery uploader state after reset-failed: $unit"
+        [[ $active_state == inactive ]] \
+          || die "recovery uploader is not inactive after reset-failed: $unit"
+        [[ -z ${RECOVERY_RESET_LOG:-} ]] \
+          || printf '%s\n' "$unit" >>"$RECOVERY_RESET_LOG"
+        ;;
+      *)
+        die "recovery requires inactive uploader/timer: $unit"
+        ;;
+    esac
   done
+}
+
+write_recovery_admission() {
+  local candidate_sha=$1 source_revision=$2 result=$3 reason=$4
+  local probe_json=$5 baseline_json=$6 reset_log=$7
+  local dir temporary record record_sha reset_units
+  dir="$GATE_EVIDENCE_ROOT/$candidate_sha"
+  install -d -m 0750 "$dir" || return 1
+  if [[ -s $reset_log ]]; then
+    reset_units=$(jq -cnR '[inputs]' <"$reset_log") || return 1
+  else
+    reset_units='[]'
+  fi
+  temporary="$dir/.recovery-admission.json.tmp.$$"
+  jq -cn --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg result "$result" --arg reason "$reason" \
+    --arg candidate "$candidate_sha" --arg source "$source_revision" \
+    --argjson probe "$probe_json" --argjson baseline "$baseline_json" \
+    --argjson reset_failed_units "$reset_units" '
+    {schema:"monday.polymarket_gate_recovery_admission.v1",
+      observed_at:$observed_at,result:$result,
+      refusal_reason:(if $reason == "" then null else $reason end),
+      candidate_sha256:$candidate,source_revision:$source,
+      baseline:$baseline,candidate_probe:$probe,
+      reset_failed_units:$reset_failed_units}' >"$temporary" || return 1
+  chmod 0444 "$temporary" || return 1
+  # Each invocation publishes a distinct content-addressed record; an
+  # existing record is never replaced.
+  record_sha=$(sha256sum "$temporary" | awk '{print $1}') || return 1
+  valid_candidate "$record_sha" || return 1
+  record="$dir/recovery-admission-$record_sha.json"
+  if [[ -e $record || -L $record ]]; then
+    rm -f -- "$temporary"
+  else
+    ln "$temporary" "$record" || { rm -f -- "$temporary"; return 1; }
+    rm -f -- "$temporary"
+  fi
+  sync_file "$record"
+  sync_dir "$dir"
+}
+
+recover_admission_refused() {
+  local candidate_sha=$1 source_revision=$2 probe_json=$3 baseline_json=$4
+  local reset_log=$5 stderr_file=$6 reason
+  reason=$(sed -n 's/^Polymarket Gate control failed: //p' "$stderr_file")
+  [[ -n $reason ]] || reason='recovery admission failed without a recorded reason'
+  write_recovery_admission "$candidate_sha" "$source_revision" refused "$reason" \
+    "$probe_json" "$baseline_json" "$reset_log" \
+    || printf 'Polymarket Gate control: refused admission left no evidence under %s\n' \
+      "$GATE_EVIDENCE_ROOT/$candidate_sha" >&2
+  rm -f -- "$stderr_file" "$reset_log"
+  die "$reason"
 }
 
 recover_gate() {
   local candidate_path=$1 candidate_sha=$2 source_revision=$3 probe=$4
-  local probe_json baseline_json recovery_json
+  local probe_json=null baseline_json=null recovery_json
+  local admission_stderr reset_log
   candidate_sha=$(printf '%s' "$candidate_sha" | tr '[:upper:]' '[:lower:]')
   source_revision=$(printf '%s' "$source_revision" | tr '[:upper:]' '[:lower:]')
-  probe_json=$(recovery_probe "$candidate_sha" "$source_revision" "$probe")
-  baseline_json=$(recovery_baseline "$candidate_sha")
-  verify_recovery_uploaders_stopped
+  valid_candidate "$candidate_sha" || die 'candidate SHA-256 is invalid'
+  valid_source "$source_revision" || die 'source revision is invalid'
+  install -d -m 0755 "$RUN_ROOT"
+  secure_root_directory "$RUN_ROOT" || die 'Gate runtime directory is insecure'
+  exec 9>"$CONTROL_LOCK"
+  flock -x 9 || die 'cannot take the Gate control lock'
+  control_lock_held=true
+  admission_stderr="$RUN_ROOT/.recover-admission.stderr.$$"
+  reset_log="$RUN_ROOT/.recover-reset-failed.$$"
+  : >"$admission_stderr"
+  : >"$reset_log"
+  RECOVERY_RESET_LOG=$reset_log
+  if ! probe_json=$(recovery_probe "$candidate_sha" "$source_revision" "$probe" \
+      2>"$admission_stderr"); then
+    recover_admission_refused "$candidate_sha" "$source_revision" \
+      null null "$reset_log" "$admission_stderr"
+  fi
+  if ! baseline_json=$(recovery_baseline "$candidate_sha" 2>"$admission_stderr"); then
+    recover_admission_refused "$candidate_sha" "$source_revision" \
+      "$probe_json" null "$reset_log" "$admission_stderr"
+  fi
+  if ! ( verify_recovery_uploaders_stopped ) 2>"$admission_stderr"; then
+    recover_admission_refused "$candidate_sha" "$source_revision" \
+      "$probe_json" "$baseline_json" "$reset_log" "$admission_stderr"
+  fi
+  write_recovery_admission "$candidate_sha" "$source_revision" admitted '' \
+    "$probe_json" "$baseline_json" "$reset_log" \
+    || die 'recovery admission evidence could not be written'
+  rm -f -- "$admission_stderr" "$reset_log"
   recovery_json=$(jq -cn --argjson baseline "$baseline_json" --argjson probe "$probe_json" \
     '{mode:"gamma_closed_200",baseline:$baseline,candidate_probe:$probe}')
   start_gate "$candidate_path" "$candidate_sha" "$source_revision" "$recovery_json"
@@ -761,8 +881,14 @@ start_gate() {
   install -d -m 0750 "$RECEIPT_ROOT"
   secure_root_directory "$RUN_ROOT" || die 'Gate runtime directory is insecure'
   secure_root_directory "$RECEIPT_ROOT" || die 'Gate receipt root is insecure'
-  exec 9>"$CONTROL_LOCK"
-  flock -x 9
+  if [[ ${control_lock_held:-false} == true ]]; then
+    # recover admission already holds the Gate control lock on fd 9; keep the
+    # same lock continuously through Gate start instead of releasing it.
+    :
+  else
+    exec 9>"$CONTROL_LOCK"
+    flock -x 9 || die 'cannot take the Gate control lock'
+  fi
   cmp -s "$UNIT_ASSET" "$INSTALLED_UNIT" \
     || die 'installed Gate unit differs from the controller bundle'
   unit=$(unit_for "$candidate_sha")
