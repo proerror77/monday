@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 policy="$script_dir/binance-usdm-reference-shadow-gate-policy.jq"
 service="$script_dir/binance-usdm-reference-collector-shadow@.service"
+shadow_gate="$script_dir/binance-usdm-reference-shadow-gate.sh"
 workflow="$script_dir/../../.github/workflows/acr-publish.yml"
 candidate=$(printf 'a%.0s' {1..64})
 bundle=$(printf 'b%.0s' {1..64})
@@ -105,6 +106,15 @@ reject '.artifacts[2].success_sha256=("9"*64)' bad-success
 reject '.artifacts[1].canonical_readback=false' no-readback
 reject '.artifacts[1].observed_at_ns=1700000200000000000' discontinuous
 reject '.artifacts[0].source_endpoints[3]="https://example.com/openInterest"' wrong-endpoint
+
+# The full-hour artifacts array (~110 entries) exceeds MAX_ARG_STRLEN, so the
+# gate must pass it to jq through a file instead of an inline --argjson.
+# shellcheck disable=SC2016 # literal contract assertion, variables must not expand
+grep -Fq -- '--slurpfile artifacts "$artifacts_file"' "$shadow_gate"
+if grep -Fq -- '--argjson artifacts' "$shadow_gate"; then
+  printf 'artifacts must not be passed inline via --argjson\n' >&2
+  exit 1
+fi
 
 grep -Fq 'ExecStart=/opt/monday/releases/binance-usdm-reference-collector/%i/binance-usdm-reference-collector' "$service"
 grep -Fq -- '--output-root /data/monday/spool/binance-usdm-reference-shadow/%i' "$service"
