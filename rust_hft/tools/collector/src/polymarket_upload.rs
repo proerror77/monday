@@ -1115,6 +1115,7 @@ fn scan_tape_with_identity_at(
     let mut market_ids = BTreeSet::new();
     let mut condition_ids = BTreeSet::new();
     let mut record_ids = BTreeSet::new();
+    let mut duplicate_trade_rows = 0_u64;
     let mut record_id_versions = BTreeSet::new();
     let mut metadata_contexts = BTreeSet::new();
     let mut metadata_identities = BTreeMap::new();
@@ -1328,8 +1329,14 @@ fn scan_tape_with_identity_at(
             }
             "polymarket_trade" => {
                 let record_id = validate_canonical_trade(update, line_number)?;
+                // A record id is a SHA-256 over the full trade identity, so a
+                // repeated row is content-identical to the one already kept.
+                // Crash recovery legitimately re-emits already-recorded
+                // trades when a market re-finalizes (the 2026-08-08 incident
+                // produced hundreds per tape), so deduplicate and count for
+                // evidence instead of refusing the whole segment.
                 if !record_ids.insert(record_id) {
-                    bail!("line {line_number}: duplicate polymarket_trade record_id");
+                    duplicate_trade_rows += 1;
                 }
                 record_id_versions.insert("v2".to_owned());
                 dependent_reference_contexts.insert(reference_context(update, line_number)?);
@@ -1756,6 +1763,10 @@ fn scan_tape_with_identity_at(
         .as_object_mut()
         .expect("manifest is an object")
         .insert("trade_completions".to_owned(), json!(trade_completions));
+    manifest
+        .as_object_mut()
+        .expect("manifest is an object")
+        .insert("duplicate_trade_rows".to_owned(), json!(duplicate_trade_rows));
     manifest
         .as_object_mut()
         .expect("manifest is an object")
@@ -4491,7 +4502,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_trade_record_ids() {
+    fn duplicate_trade_record_ids_are_deduplicated_into_evidence() {
         let root = TestDir::new();
         let update = valid_v2_trade_update();
         let tape = write_tape(
@@ -4503,10 +4514,10 @@ mod tests {
             ],
         );
 
-        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate polymarket_trade record_id"));
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["duplicate_trade_rows"], json!(1));
+        assert_eq!(manifest["event_types"]["polymarket_trade"], json!(2));
+        assert_eq!(manifest["events"], json!(2));
     }
 
     #[test]

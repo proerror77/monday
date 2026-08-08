@@ -107,6 +107,7 @@ make_spools() {
   mkdir -p "$spool_root/binance-lob/spot" \
            "$spool_root/binance-lob/usdm" \
            "$spool_root/binance-usdm-reference" \
+           "$spool_root/bybit-options" \
            "$spool_root/polymarket" \
            "$spool_root/polymarket-reference"
 }
@@ -142,6 +143,7 @@ healthy_fixtures() {
   write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0
   write_upload "$spool_root/binance-lob/usdm/upload-status.json" null null 0
   write_upload "$spool_root/binance-usdm-reference/upload-status.json" null null 0
+  write_upload "$spool_root/bybit-options/upload-status.json" null null 0
   write_upload "$spool_root/polymarket/upload-status.json" null null 0
   write_upload "$spool_root/polymarket-reference/upload-status.json" null null 0
 }
@@ -151,13 +153,17 @@ healthy_scenario() {
 binance-lob-archiver-production@spot.service	active	enabled	success	4
 binance-lob-archiver-production@usdm.service	active	enabled	success	4
 binance-usdm-reference-collector.service	active	enabled	success	12
+bybit-options-archiver.service	active	enabled	success	1
 polymarket-market-tape-upload.timer	active	enabled	-	-
 polymarket-market-tape-upload.service	-	-	success	-
 polymarket-reference-upload.timer	active	enabled	-	-
 polymarket-reference-upload.service	-	-	success	-
 polymarket-market-tape-upload-watchdog.timer	active	enabled	-	-
 polymarket-market-tape-upload-watchdog.service	-	-	success	-
-bybit-options-archiver.service	-	disabled	-	-
+bybit-options-upload.timer	active	enabled	-	-
+bybit-options-upload.service	-	-	success	-
+binance-usdm-reference-upload.timer	active	enabled	-	-
+binance-usdm-reference-upload.service	-	-	success	-
 polymarket-raw-ops-gate@.service	-	disabled	-	-
 EOF
 }
@@ -464,16 +470,16 @@ expect "mount: exit 1" "$(rc_is 1; echo $?)"
 expect "mount: breach message" "$(grep_out '/data is not mounted'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 15. bybit-options-archiver enabled
+# 15. bybit-options-archiver inactive (governed production lane must run)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-rewrite_scenario 's|^bybit-options-archiver.service	-	disabled|bybit-options-archiver.service	-	enabled|'
+rewrite_scenario 's|^bybit-options-archiver.service	active	enabled|bybit-options-archiver.service	inactive	enabled|'
 run_health
-expect "bybit enabled: exit 1" "$(rc_is 1; echo $?)"
-expect "bybit enabled: breach message" "$(grep_out 'bybit-options-archiver: expected disabled'; echo $?)"
+expect "bybit inactive: exit 1" "$(rc_is 1; echo $?)"
+expect "bybit inactive: breach message" "$(grep_out 'bybit-options-archiver: not active'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 16. polymarket-raw-ops-gate indirect (an instance enabled)
@@ -517,7 +523,8 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and (.checks.disk.free_percent | type) == "number"
   and .checks.mount.data_mounted == true
   and .checks.units["binance-lob-archiver-production@spot.service"].active == true
-  and .checks.units["bybit-options-archiver.service"].is_enabled == "disabled"
+  and .checks.units["bybit-options-archiver.service"].active == true
+  and .checks.units["bybit-options-archiver.service"].enabled == true
   and (.checks.health["binance-lob-archiver-production@spot"].age_seconds | type) == "number"
   and .checks.health["binance-lob-archiver-production@spot"].status == "synced"
   and (.checks.uploads["binance-lob-archiver-production@spot"].failure_count | type) == "number"
