@@ -389,19 +389,24 @@ mkdir -- "$evidence_dir" || die 'gate evidence run already exists'
 gate_json="$evidence_dir/gate.json"
 production_eligible=true
 [[ $test_mode == false ]] || production_eligible=false
+# The artifacts array exceeds MAX_ARG_STRLEN (128 KiB) for a full 3600-second
+# observation (~110 artifacts), so it must reach jq through a file, not an
+# inline --argjson argument.
+artifacts_file="$temp_dir/.artifacts.json"
+printf '%s\n' "$artifacts" >"$artifacts_file"
 jq -S -n --arg schema "$GATE_SCHEMA" --arg candidate "$candidate_sha" \
   --arg bundle "$manifest_sha" --arg source "$source_revision" \
   --arg unit "$unit" --arg invocation "$start_invocation" \
   --argjson duration "$gate_seconds" --argjson eligible "$production_eligible" \
-  --argjson health "$health_evidence" --argjson artifacts "$artifacts" \
+  --argjson health "$health_evidence" --slurpfile artifacts "$artifacts_file" \
   --argjson max_gap "$max_gap_ns" '
   {schema:$schema,candidate_sha256:$candidate,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     passed:$eligible,production_eligible:$eligible,duration_seconds:$duration,
     service:{unit:$unit,active:true,restart_count:0,binary_sha256:$candidate,
       invocation_id_start:$invocation,invocation_id_end:$invocation},
-    health:$health,artifact_count:($artifacts|length),max_artifact_gap_ns:$max_gap,
-    artifacts:$artifacts}
+    health:$health,artifact_count:($artifacts[0]|length),max_artifact_gap_ns:$max_gap,
+    artifacts:$artifacts[0]}
 ' >"$gate_json"
 chmod 0640 "$gate_json"
 
