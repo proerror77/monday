@@ -163,7 +163,12 @@ printf '2\n' >"$supervisor_state/baseline-restarts"
 printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
 printf '%s\n' '/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200' \
   >"$supervisor_state/baseline-exec"
-printf 'inactive\n' >"$supervisor_state/uploader-active"
+for uploader_unit in \
+  polymarket-reference-upload.service polymarket-reference-upload.timer \
+  polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
+  printf 'inactive\n' >"$supervisor_state/uploader-active-$uploader_unit"
+  printf '0\n' >"$supervisor_state/uploader-main-pid-$uploader_unit"
+done
 : >"$supervisor_calls"
 : >"$supervisor_gate_calls"
 
@@ -173,13 +178,7 @@ set -euo pipefail
 
 read_state() { tr -d '\n' <"$FAKE_SYSTEMCTL_STATE/$1"; }
 write_state() { printf '%s\n' "$2" >"$FAKE_SYSTEMCTL_STATE/$1"; }
-uploader_state_file() {
-  if [[ -f $FAKE_SYSTEMCTL_STATE/uploader-active-$1 ]]; then
-    printf 'uploader-active-%s\n' "$1"
-  else
-    printf 'uploader-active\n'
-  fi
-}
+uploader_state_file() { printf 'uploader-active-%s\n' "$1"; }
 
 printf '%s\n' "$*" >>"$FAKE_SYSTEMCTL_CALLS"
 case "${1:-}" in
@@ -264,6 +263,11 @@ case "${1:-}" in
           [[ $(read_state shadow) == active ]] && printf '5252\n' || printf '0\n'
         elif [[ $unit == polymarket-reference-collector.service ]]; then
           read_state baseline-main-pid
+        elif [[ $unit == polymarket-reference-upload.service \
+          || $unit == polymarket-reference-upload.timer \
+          || $unit == polymarket-market-tape-upload.service \
+          || $unit == polymarket-market-tape-upload.timer ]]; then
+          read_state "uploader-main-pid-$unit"
         else
           [[ $(read_state active) == active ]] && printf '4242\n' || printf '0\n'
         fi
@@ -470,12 +474,24 @@ gate_control install >/dev/null
 
 # A recovery admission is not a generic gate bypass: it starts only with the
 # stopped direct bootstrap identity, a fresh exact candidate probe, and every
-# uploader/timer contained.
+# uploader/timer contained. Every invocation publishes a distinct
+# content-addressed admission record that is never replaced.
+admission_record_dir="$supervisor_root/data/monday/evidence/polymarket-shadow-gates/$supervisor_candidate_sha"
+admission_records_matching() {
+  # Prints each per-invocation admission record matching the given jq filter;
+  # all arguments pass through to jq -e.
+  local file
+  for file in "$admission_record_dir"/recovery-admission-*.json; do
+    [[ -e $file && ! -L $file ]] || continue
+    if jq -e "$@" "$file" >/dev/null 2>&1; then
+      printf '%s\n' "$file"
+    fi
+  done
+}
 supervisor_recovery_gate_invocation=$(printf '9%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_recovery_gate_invocation"
 set_supervisor_state active inactive
 set_supervisor_state baseline-active inactive
-set_supervisor_state uploader-active inactive
 gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe" >"$supervisor_tmp/recover-start.json"
 jq -e --arg invocation "$supervisor_recovery_gate_invocation" '
@@ -491,8 +507,8 @@ jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_sour
   and .recovery.baseline.active_state == "inactive"
   and .recovery.baseline.main_pid == 0
 ' "$supervisor_recovery_request" >/dev/null
-supervisor_admission_record="$supervisor_root/data/monday/evidence/polymarket-shadow-gates/$supervisor_candidate_sha/recovery-admission.json"
-jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
+[[ $(admission_records_matching \
+  --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" \
   --arg baseline "$supervisor_baseline_sha" '
   .schema == "monday.polymarket_gate_recovery_admission.v1"
   and .result == "admitted"
@@ -504,7 +520,7 @@ jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_sour
   and .baseline.main_pid == 0
   and (.candidate_probe.sha256 | test("^[a-f0-9]{64}$"))
   and .reset_failed_units == []
-' "$supervisor_admission_record" >/dev/null
+' | grep -c .) -eq 1 ]]
 if grep -Fq 'reset-failed' "$supervisor_calls"; then
   printf 'inactive recovery admission triggered reset-failed\n' >&2
   exit 1
@@ -516,10 +532,10 @@ set_supervisor_state baseline-active active
 reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe"
 set_supervisor_state baseline-active inactive
-set_supervisor_state uploader-active active
+set_supervisor_state uploader-active-polymarket-reference-upload.service active
 reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe"
-set_supervisor_state uploader-active inactive
+set_supervisor_state uploader-active-polymarket-reference-upload.service inactive
 set_supervisor_state baseline-exec '/opt/monday/bin/not-polymarket-raw-ops collect-reference'
 reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe"
@@ -543,17 +559,32 @@ if [[ -n $recovery_mutations ]]; then
 fi
 
 # A refused recovery admission leaves durable evidence with exact identities
-# and the refusal reason.
+# and the refusal reason. Per-invocation records are content-addressed and
+# never replaced: a second refusal for the same candidate leaves the first
+# record available and unchanged.
 set_supervisor_state baseline-active active
 reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe"
-jq -e --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" '
+first_refusal_record=$(admission_records_matching \
+  --arg candidate "$supervisor_candidate_sha" --arg source "$supervisor_source" '
   .result == "refused"
   and (.refusal_reason | test("baseline to be stopped"))
   and .candidate_sha256 == $candidate
   and .source_revision == $source
   and .baseline == null
-' "$supervisor_admission_record" >/dev/null
+' | sort | sed -n '$p')
+[[ -n $first_refusal_record ]]
+first_refusal_sha=$(sha256sum "$first_refusal_record" | awk '{print $1}')
+set_supervisor_state baseline-active inactive
+set_supervisor_state uploader-active-polymarket-reference-upload.service active
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+set_supervisor_state uploader-active-polymarket-reference-upload.service inactive
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("inactive uploader/timer"))' \
+  | grep -c .) -ge 1 ]]
+[[ -f $first_refusal_record && ! -L $first_refusal_record ]]
+[[ $(sha256sum "$first_refusal_record" | awk '{print $1}') == "$first_refusal_sha" ]]
 
 # Activating and deactivating baselines remain refused; only inactive or a
 # contained failed state can be admitted.
@@ -570,12 +601,42 @@ set_supervisor_state baseline-active failed
 reject env "${gate_control_env[@]}" FAKE_RESET_FAILED_STUCK=1 \
   "$supervisor_control" recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe"
-jq -e '.result == "refused" and (.refusal_reason | test("after reset-failed"))' \
-  "$supervisor_admission_record" >/dev/null
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("after reset-failed"))' \
+  | grep -c .) -ge 1 ]]
+
+# Containment is proven before any governed reset: a failed baseline or
+# uploader with a managed process is refused and no reset-failed is issued.
+: >"$supervisor_calls"
+set_supervisor_state baseline-active failed
+set_supervisor_state baseline-main-pid 4242
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+if grep -Fq 'reset-failed' "$supervisor_calls"; then
+  printf 'recovery reset a baseline that still has a managed process\n' >&2
+  exit 1
+fi
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("managed process"))' \
+  | grep -c .) -ge 1 ]]
+set_supervisor_state baseline-active inactive
+set_supervisor_state baseline-main-pid 0
+printf 'failed\n' >"$supervisor_state/uploader-active-polymarket-market-tape-upload.timer"
+printf '4242\n' >"$supervisor_state/uploader-main-pid-polymarket-market-tape-upload.timer"
+: >"$supervisor_calls"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+if grep -Fq 'reset-failed' "$supervisor_calls"; then
+  printf 'recovery reset an uploader that still has a managed process\n' >&2
+  exit 1
+fi
+set_supervisor_state uploader-active-polymarket-market-tape-upload.timer inactive
+set_supervisor_state uploader-main-pid-polymarket-market-tape-upload.timer 0
 
 # A failed baseline is contained: admission performs a governed reset-failed
 # inside the control lock and records the post-reset snapshot.
 : >"$supervisor_calls"
+set_supervisor_state baseline-active failed
 set_supervisor_state baseline-restarts 5
 supervisor_failed_baseline_invocation=$(printf 'd%.0s' {1..32})
 set_supervisor_state invocation "$supervisor_failed_baseline_invocation"
@@ -589,13 +650,13 @@ jq -e '
   and .recovery.baseline.main_pid == 0
   and .recovery.baseline.restarts == 0
 ' "$failed_baseline_request" >/dev/null
-jq -e --arg baseline "$supervisor_baseline_sha" '
+[[ $(admission_records_matching --arg baseline "$supervisor_baseline_sha" '
   .result == "admitted"
   and .baseline.binary_sha256 == $baseline
   and .baseline.active_state == "inactive"
   and .baseline.main_pid == 0
   and (.reset_failed_units | index("polymarket-reference-collector.service") != null)
-' "$supervisor_admission_record" >/dev/null
+' | grep -c .) -eq 1 ]]
 gate_control cancel "$supervisor_candidate_sha" \
   "$supervisor_failed_baseline_invocation" >/dev/null
 set_supervisor_state baseline-active inactive
@@ -617,15 +678,14 @@ for failed_uploader in \
   gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
     "$supervisor_source" "$supervisor_probe" >/dev/null
   grep -Fqx "reset-failed $failed_uploader" "$supervisor_calls"
-  jq -e --arg unit "$failed_uploader" '
+  [[ $(admission_records_matching --arg unit "$failed_uploader" '
     .result == "admitted"
     and (.reset_failed_units | index($unit) != null)
-  ' "$supervisor_admission_record" >/dev/null
+  ' | grep -c .) -eq 1 ]]
   gate_control cancel "$supervisor_candidate_sha" \
     "$supervisor_failed_uploader_invocation" >/dev/null
-  rm "$supervisor_state/uploader-active-$failed_uploader"
+  set_supervisor_state "uploader-active-$failed_uploader" inactive
 done
-set_supervisor_state uploader-active inactive
 set_supervisor_state baseline-active inactive
 
 # A fresh probe admits once; its binding remains valid through the 900-second Gate.
