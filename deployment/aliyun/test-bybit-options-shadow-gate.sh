@@ -154,6 +154,7 @@ grep -Fq -- '--arg SHADOW_SPOOL "$SHADOW_SPOOL"' "$shadow_gate"
 # The PASSED marker must be the gate.json checksum entry the cutover verifies
 # with sha256sum --check --strict, and sha256sum --strict is invalid without
 # --check anywhere in the script.
+# shellcheck disable=SC2016 # literal contract assertion, variables must not expand
 grep -Fq '(cd "$evidence_dir" && sha256sum gate.json) >"$marker_tmp"' "$shadow_gate"
 if grep 'sha256sum' "$shadow_gate" | grep -F -- '--strict' | grep -vF -- '--check' | grep -q .; then
   printf 'sha256sum --strict without --check must not appear\n' >&2
