@@ -280,6 +280,27 @@ DingTalk webhook robot, and recovery notification must be enabled so a resolved
 incident is visible. Cloud Monitor is the PRIMARY channel because it fires even
 when every GitHub and repository path is down.
 
+Live alarm identity (created 2026-08-08 via `PutResourceMetricRule`,
+readback-verified with `DescribeMetricRuleList`; both rules enabled,
+`AlertState: OK`, recovery notification on):
+
+- `monday-collector-disk-warn` — `acs_ecs_dashboard/diskusage_utilization`,
+  instance `i-6we6afeqsvv8uo1ixmyo`, Average > 75% for 3 consecutive 60s
+  periods, Warn level, contact group `云账号报警联系人`.
+- `monday-collector-disk-critical` — same metric and scope, Average > 90% for
+  3 consecutive 60s periods, Critical level, same contact group.
+
+Deviation from the representative JSON above: period 300 is not a supported
+alarm period for `diskusage_utilization` (the metric supports 15/60/900), so
+the live rules evaluate 60s × 3 consecutive periods.
+
+Open gaps: (1) the CloudMonitor guest agent does not report
+`diskusage_utilization` for this instance (zero datapoints in the 7 days before
+2026-08-08), so the alarms cannot fire until the agent is installed on the
+host; (2) the `monday-oncall` contact group with email + DingTalk webhook does
+not exist yet — the rules currently notify only `云账号报警联系人` and have no
+webhook.
+
 ### GitHub Actions workflow (fallback)
 
 `.github/workflows/monitor-collector-host.yml` runs every 15 minutes. It
