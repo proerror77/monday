@@ -3683,7 +3683,7 @@ if jq -e -f "$POLICY" \
   exit 1
 fi
 jq '.started_at = "1970-01-01T00:46:40Z"
-  | .completed_at = "1970-01-01T01:01:40Z"
+  | .completed_at = "1970-01-01T01:46:40Z"
   | .parity_window_started_at_unix = 2800
   | .parity_window_ended_at_unix = 3700
   | .metrics.trade_event_window_started_at_unix = 2800
@@ -4613,7 +4613,7 @@ grep -Fq 'upload timeout values remain bound into OSS configuration evidence' "$
     + PARITY_CUTOFF_LAG_SECONDS \
     + zstd_timeout_seconds + oss_copy_timeout_seconds \
     + LEGACY_RUNTIME_RESERVE_SECONDS))
-  [[ $required -eq 7620 ]] || {
+  [[ $required -eq 10320 ]] || {
     printf 'Gate runtime budget does not cover bounded post-gate uploads\n' >&2
     exit 1
   }
