@@ -151,6 +151,15 @@ grep -Fq 'upload_status:{failure_count:' "$shadow_gate"
 # observation window with "jq: $SHADOW_SPOOL is not defined".
 # shellcheck disable=SC2016 # literal contract assertion, $SHADOW_SPOOL must not expand
 grep -Fq -- '--arg SHADOW_SPOOL "$SHADOW_SPOOL"' "$shadow_gate"
+# The PASSED marker must be the gate.json checksum entry the cutover verifies
+# with sha256sum --check --strict, and sha256sum --strict is invalid without
+# --check anywhere in the script.
+# shellcheck disable=SC2016 # literal contract assertion, variables must not expand
+grep -Fq '(cd "$evidence_dir" && sha256sum gate.json) >"$marker_tmp"' "$shadow_gate"
+if grep 'sha256sum' "$shadow_gate" | grep -F -- '--strict' | grep -vF -- '--check' | grep -q .; then
+  printf 'sha256sum --strict without --check must not appear\n' >&2
+  exit 1
+fi
 
 # Cutover contract: the candidate must clear a full shadow gate before the
 # production unit can be started, and the production env must stay fail-closed.
