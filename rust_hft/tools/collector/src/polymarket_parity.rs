@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -35,6 +35,15 @@ const SETTLEMENT_MATURITY_LAG_SECONDS: i64 = 600;
 // independent schedules. Keep the full retrieval cutoff, but compare only
 // trades whose event time is mature enough to have appeared in both lanes.
 const TRADE_MATURITY_LAG_SECONDS: i64 = 600;
+// A rotated tape's name stamp is its rotation wall time, so every row in it
+// was recorded no later than the stamp. Comparison rows cannot be arbitrarily
+// old: trades and settlements are admitted only near the window, and metadata
+// enters the projection at most 900 s before the window start while the
+// collectors only fetch markets ending within their discovery horizon
+// (end_date_max = retrieval + 30 minutes). One hour covers those bounds with
+// margin; closed tapes rotated earlier cannot hold comparison rows and are
+// never parsed, so read cost tracks the window, not spool retention.
+const TAPE_WINDOW_LOOKBACK_SECONDS: i64 = 3600;
 const METADATA_CONTRACT_FIELDS: [&str; 17] = [
     "id",
     "conditionId",
@@ -76,24 +85,33 @@ struct TapeRow {
     update: Value,
 }
 
+/// Append-only tape identity sampled before a read pass. Growth after the
+/// snapshot is safe: the reader caps itself at the snapshot size, so rows
+/// appended concurrently are excluded from the pass by construction instead
+/// of aborting it. Replacement, truncation, and indirection keep failing
+/// closed through the device/inode and shrink checks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct FileFingerprint {
+struct TapeSnapshot {
     device: u64,
     inode: u64,
     bytes: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
 }
 
-impl FileFingerprint {
+impl TapeSnapshot {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             bytes: metadata.len(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
         }
+    }
+
+    /// The tape may only grow under the same identity; a rename, replacement,
+    /// or truncation invalidates the snapshot.
+    fn holds_for(&self, metadata: &fs::Metadata) -> bool {
+        self.device == metadata.dev()
+            && self.inode == metadata.ino()
+            && self.bytes <= metadata.len()
     }
 }
 
@@ -159,7 +177,25 @@ fn strict_rotation_name(name: &str) -> bool {
     }
 }
 
-fn tape_paths(spool: &Path) -> Result<Vec<PathBuf>> {
+fn rotation_epoch(name: &str) -> Option<i64> {
+    let middle = name
+        .strip_prefix("market-updates.")?
+        .strip_suffix(".ndjson")?;
+    let stamp = middle.split('.').next()?;
+    let format = match stamp.len() {
+        15 => "%Y%m%dT%H%M%S",
+        21 => "%Y%m%dT%H%M%S%6f",
+        _ => return None,
+    };
+    Some(
+        NaiveDateTime::parse_from_str(stamp, format)
+            .ok()?
+            .and_utc()
+            .timestamp(),
+    )
+}
+
+fn tape_paths(spool: &Path, started_at: i64) -> Result<Vec<PathBuf>> {
     ensure_direct_directory(spool)?;
     let mut paths = Vec::new();
     for entry in fs::read_dir(spool)? {
@@ -175,6 +211,13 @@ fn tape_paths(spool: &Path) -> Result<Vec<PathBuf>> {
                     "tape is not a direct regular file: {}",
                     entry.path().display()
                 );
+            }
+            if name != ACTIVE_TAPE {
+                let rotated_at = rotation_epoch(name)
+                    .expect("strict rotation names carry a parseable timestamp");
+                if rotated_at < started_at.saturating_sub(TAPE_WINDOW_LOOKBACK_SECONDS) {
+                    continue;
+                }
             }
             paths.push(entry.path());
         } else if name.starts_with("market-updates.") && name.ends_with(".ndjson") {
@@ -233,25 +276,37 @@ fn parse_tape_row(
     })
 }
 
+/// Stream the snapshot prefix of an append-only tape. Returns `Ok(None)`
+/// when the tape's identity moved or shrank mid-read so the caller can retry,
+/// and `Ok(Some(snapshot))` after visiting every complete row below the
+/// snapshot size. Appends after the snapshot are excluded by the read cap, so
+/// a live baseline lane can keep writing during verification; an in-flight
+/// partial final row is ignored on the live active tape but stays fail-closed
+/// on closed tapes, which are final by contract.
 fn stream_stable_rows(
     path: &Path,
-    expected_fingerprint: Option<FileFingerprint>,
+    expected_snapshot: Option<TapeSnapshot>,
     mut visit: impl FnMut(TapeRow) -> Result<()>,
-) -> Result<Option<FileFingerprint>> {
+) -> Result<Option<TapeSnapshot>> {
     let before = fs::symlink_metadata(path)?;
     if before.file_type().is_symlink() || !before.is_file() {
         bail!("tape is not a direct regular file: {}", path.display());
     }
-    let fingerprint = FileFingerprint::from_metadata(&before);
-    if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+    let snapshot = TapeSnapshot::from_metadata(&before);
+    if expected_snapshot.is_some_and(|expected| {
+        expected.device != snapshot.device
+            || expected.inode != snapshot.inode
+            || expected.bytes > snapshot.bytes
+    }) {
         return Ok(None);
     }
     let file = File::open(path)?;
-    if FileFingerprint::from_metadata(&file.metadata()?) != fingerprint {
+    if !snapshot.holds_for(&file.metadata()?) {
         return Ok(None);
     }
 
-    let mut reader = BufReader::new(file);
+    let active = path.file_name().and_then(|name| name.to_str()) == Some(ACTIVE_TAPE);
+    let mut reader = BufReader::new(file).take(snapshot.bytes);
     let mut raw = Vec::new();
     let mut line_number = 0_usize;
     let mut expected_sequence = 0_u64;
@@ -263,29 +318,35 @@ fn stream_stable_rows(
         }
         line_number += 1;
         if raw.last() != Some(&b'\n') {
+            // The snapshot can cut through an in-flight append on the live
+            // active tape; the incomplete tail is excluded from this pass and
+            // covered by a later verification once the writer finishes it.
+            if active {
+                break;
+            }
             return Ok(None);
         }
         raw.pop();
         let row = match parse_tape_row(&raw, path, line_number, &mut expected_sequence) {
             Ok(row) => row,
             Err(error) => {
-                if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+                if !snapshot.holds_for(&reader.get_ref().get_ref().metadata()?) {
                     return Ok(None);
                 }
                 return Err(error);
             }
         };
         if let Err(error) = visit(row) {
-            if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+            if !snapshot.holds_for(&reader.get_ref().get_ref().metadata()?) {
                 return Ok(None);
             }
             return Err(error);
         }
     }
-    if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+    if !snapshot.holds_for(&reader.get_ref().get_ref().metadata()?) {
         return Ok(None);
     }
-    Ok(Some(fingerprint))
+    Ok(Some(snapshot))
 }
 
 fn retain_primary_row(
@@ -350,25 +411,25 @@ fn load_rows(
 ) -> Result<(Vec<TapeRow>, usize, bool)> {
     let mut last_reason = "spool changed while reading parity window".to_owned();
     for _ in 0..5 {
-        let paths = tape_paths(spool)?;
+        let paths = tape_paths(spool, started_at)?;
         let mut rows = Vec::new();
-        let mut fingerprints = Vec::with_capacity(paths.len());
+        let mut snapshots = Vec::with_capacity(paths.len());
         let mut retry = false;
         for path in &paths {
-            let fingerprint = stream_stable_rows(path, None, |row| {
+            let snapshot = stream_stable_rows(path, None, |row| {
                 if retain_primary_row(&row, started_at, ended_at, trade_event_window_end)? {
                     rows.push(row);
                 }
                 Ok(())
             })?;
-            let Some(fingerprint) = fingerprint else {
+            let Some(snapshot) = snapshot else {
                 last_reason = format!("{} changed during first pass", path.display());
                 retry = true;
                 break;
             };
-            fingerprints.push(fingerprint);
+            snapshots.push(snapshot);
         }
-        if retry || tape_paths(spool)? != paths {
+        if retry || tape_paths(spool, started_at)? != paths {
             last_reason = "spool changed while enumerating tapes".to_owned();
             thread::sleep(Duration::from_millis(20));
             continue;
@@ -381,8 +442,8 @@ fn load_rows(
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         let mut trade_metadata = BTreeMap::<String, TapeRow>::new();
-        for (path, fingerprint) in paths.iter().zip(fingerprints.iter().copied()) {
-            let stable = stream_stable_rows(path, Some(fingerprint), |row| {
+        for (path, snapshot) in paths.iter().zip(snapshots.iter().copied()) {
+            let stable = stream_stable_rows(path, Some(snapshot), |row| {
                 if row.recorded_at <= ended_at && row.update["kind"] == "market_metadata" {
                     let market_id = row
                         .update
@@ -403,7 +464,7 @@ fn load_rows(
                 break;
             }
         }
-        if retry || tape_paths(spool)? != paths {
+        if retry || tape_paths(spool, started_at)? != paths {
             thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -1252,6 +1313,8 @@ pub fn verify_shadow_parity(config: &ShadowParityConfig) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     struct TestDir {
         _temp: tempfile::TempDir,
@@ -2237,5 +2300,206 @@ mod tests {
         assert!(!verify_shadow_parity(&config).unwrap());
         let evidence: Value = serde_json::from_slice(&fs::read(&config.output).unwrap()).unwrap();
         assert_eq!(evidence["passed"], false);
+    }
+
+    #[test]
+    fn concurrent_appends_to_the_live_legacy_tape_do_not_block_parity() {
+        let (_root, config) = fixture();
+        // A large in-lookback segment widens each read pass well beyond the
+        // writer's inter-append interval. The rows are trade-completion
+        // proofs: admitted to the tape, excluded from the comparison window,
+        // so they exercise read stability without touching parity semantics.
+        let bulk = (0..50_000)
+            .map(|_| {
+                json!({
+                    "kind": "polymarket_trade_collection_complete",
+                    "condition_id": "0xbulk",
+                    "market_id": "market-bulk",
+                    "completeness_basis": "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1",
+                    "malformed_trade_rows": 0,
+                    "finalization_lag_secs": 1800,
+                    "market_window_secs": 900
+                })
+            })
+            .collect::<Vec<_>>();
+        write_tape(
+            &config
+                .legacy_spool
+                .join("market-updates.19700101T000300000000.ndjson"),
+            &bulk,
+            "1970-01-01T00:03:20Z",
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let appended = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let path = config.legacy_spool.join(ACTIVE_TAPE);
+            let stop = Arc::clone(&stop);
+            let appended = Arc::clone(&appended);
+            thread::spawn(move || {
+                let completion = json!({
+                    "kind": "polymarket_trade_collection_complete",
+                    "condition_id": "0xconcurrent",
+                    "market_id": "market-concurrent",
+                    "completeness_basis": "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1",
+                    "malformed_trade_rows": 0,
+                    "finalization_lag_secs": 1800,
+                    "market_window_secs": 900
+                });
+                while !stop.load(Ordering::Relaxed) {
+                    append_tape(&path, &completion, "1970-01-01T00:03:21Z");
+                    appended.fetch_add(1, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        // Let the writer reach a sustained high append rate before the
+        // verifier starts reading the live spool.
+        thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let appended_before = appended.load(Ordering::Relaxed);
+
+        let evidence = compare(&config).unwrap();
+
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let appended_during = appended.load(Ordering::Relaxed) - appended_before;
+        assert!(appended_during > 0);
+        let rate = appended_during as f64 / elapsed.as_secs_f64();
+        assert!(rate >= 100.0, "append rate {rate:.0} rows/s during compare");
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["metrics"]["legacy_trade_count"], 1);
+    }
+
+    #[test]
+    fn closed_segments_outside_the_window_lookback_are_never_parsed() {
+        let (_root, config) = fixture();
+        // A retained segment rotated long before the comparison window. Its
+        // content is unparseable garbage: any read of it is a hard error, so
+        // a passing comparison proves the read scope is bounded by the
+        // window rather than by total spool retention.
+        let garbage = config
+            .legacy_spool
+            .join("market-updates.19691231T200000000000.ndjson");
+        let mut output = File::create(&garbage).unwrap();
+        output.write_all(b"{not json}\n{\"sequence\":7}\n").unwrap();
+        output.sync_all().unwrap();
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["metrics"]["legacy_trade_count"], 1);
+    }
+
+    #[test]
+    fn appends_after_the_snapshot_are_excluded_not_retried() {
+        let root = TestDir::new();
+        let path = root.path().join(ACTIVE_TAPE);
+        write_tape(&path, &fixture_rows(), "1970-01-01T00:03:20Z");
+        let snapshot = stream_stable_rows(&path, None, |_| Ok(()))
+            .unwrap()
+            .expect("a static tape is stable");
+        let mut count = 0_usize;
+        let reread = stream_stable_rows(
+            &path,
+            Some(snapshot),
+            |_| {
+                count += 1;
+                if count == 1 {
+                    // Lands after this pass's snapshot: growth under the same
+                    // identity must neither abort the pass nor be read by it.
+                    append_tape(
+                        &path,
+                        &trade("appended-after-snapshot"),
+                        "1970-01-01T00:03:21Z",
+                    );
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
+        .expect("growth after the snapshot is tolerated");
+        assert_eq!(reread.device, snapshot.device);
+        assert_eq!(reread.inode, snapshot.inode);
+        assert!(reread.bytes >= snapshot.bytes);
+        assert_eq!(count, fixture_rows().len());
+    }
+
+    #[test]
+    fn mid_read_truncation_is_retried_instead_of_compared() {
+        let root = TestDir::new();
+        let path = root.path().join(ACTIVE_TAPE);
+        write_tape(&path, &fixture_rows(), "1970-01-01T00:03:20Z");
+        let truncating = OpenOptions::new().write(true).open(&path).unwrap();
+        let result = stream_stable_rows(&path, None, |row| {
+            if row.update["kind"] == "market_metadata" {
+                truncating.set_len(4).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn replaced_tape_identity_between_passes_fails_closed() {
+        let root = TestDir::new();
+        let path = root.path().join(ACTIVE_TAPE);
+        write_tape(&path, &fixture_rows(), "1970-01-01T00:03:20Z");
+        let snapshot = stream_stable_rows(&path, None, |_| Ok(()))
+            .unwrap()
+            .expect("a static tape is stable");
+        // Rotation/replacement publishes the same name with a new inode.
+        let replacement = root.path().join("replacement.ndjson");
+        write_tape(&replacement, &fixture_rows(), "1970-01-01T00:03:21Z");
+        fs::rename(&replacement, &path).unwrap();
+        let result = stream_stable_rows(&path, Some(snapshot), |_| Ok(())).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn an_in_flight_append_tail_is_ignored_on_the_active_tape() {
+        let root = TestDir::new();
+        let path = root.path().join(ACTIVE_TAPE);
+        write_tape(&path, &fixture_rows(), "1970-01-01T00:03:20Z");
+        let mut output = OpenOptions::new().append(true).open(&path).unwrap();
+        output
+            .write_all(b"{\"sequence\":9,\"recorded_at\"")
+            .unwrap();
+        output.sync_all().unwrap();
+        let mut count = 0_usize;
+        let result = stream_stable_rows(
+            &path,
+            None,
+            |_| {
+                count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(result.is_some());
+        assert_eq!(count, fixture_rows().len());
+    }
+
+    #[test]
+    fn a_partial_trailing_row_on_a_closed_tape_fails_closed() {
+        let root = TestDir::new();
+        let path = root
+            .path()
+            .join("market-updates.19700101T000400000000.ndjson");
+        write_tape(&path, &fixture_rows(), "1970-01-01T00:03:20Z");
+        let mut output = OpenOptions::new().append(true).open(&path).unwrap();
+        output.write_all(b"{\"sequence\":9").unwrap();
+        output.sync_all().unwrap();
+        let result = stream_stable_rows(&path, None, |_| Ok(())).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn symlinked_tape_still_fails_closed() {
+        let (_root, config) = fixture();
+        let link = config.legacy_spool.join(ACTIVE_TAPE);
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(config.rust_spool.join(ACTIVE_TAPE), &link).unwrap();
+        assert!(compare(&config).is_err());
     }
 }
