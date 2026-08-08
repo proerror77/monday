@@ -7,7 +7,7 @@ use engine::{
 };
 use futures::stream;
 use hft_core::{
-    AssetClass, ComplianceContext, HftResult, OrderId, OrderType, Price, ProductType, Quantity,
+    AccountId, ComplianceContext, HftResult, OrderId, OrderType, Price, Quantity,
     RegulatoryProfile, Side, Symbol, TimeInForce, VenueId,
 };
 use ports::{BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent};
@@ -59,6 +59,10 @@ impl ExecutionClient for RecordingExecutionClient {
         true
     }
 
+    fn is_simulated_execution(&self) -> bool {
+        true
+    }
+
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         Ok(Vec::new())
     }
@@ -106,7 +110,7 @@ fn tokenized_security_intent() -> OrderIntent {
 }
 
 #[tokio::test]
-async fn tokenized_security_order_reaches_paper_execution_events() {
+async fn tokenized_security_is_rejected_before_simulated_execution() {
     let (mut engine_queues, worker_queues) = create_execution_queues(ExecutionQueueConfig {
         intent_queue_capacity: 8,
         event_queue_capacity: 8,
@@ -122,13 +126,19 @@ async fn tokenized_security_order_reaches_paper_execution_events() {
 
     let handle = spawn_execution_worker(worker_config, worker_queues, vec![Box::new(client)]);
     engine_queues
-        .send_intent(tokenized_security_intent())
+        .send_intent(
+            AccountId("bstocks-unbound-test".to_string()),
+            tokenized_security_intent(),
+        )
         .expect("intent enters execution queue");
 
     let mut events = Vec::new();
     for _ in 0..50 {
         engine_queues.receive_events_into(&mut events);
-        if events.len() >= 3 {
+        if events
+            .iter()
+            .any(|event| matches!(event, ExecutionEvent::OrderReject { .. }))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -136,28 +146,10 @@ async fn tokenized_security_order_reaches_paper_execution_events() {
     handle.abort();
 
     let seen = seen.lock().await;
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].asset_class, AssetClass::TokenizedSecurity);
-    assert_eq!(seen[0].product_type, ProductType::TokenizedSecuritySpot);
-
-    assert!(events.iter().any(|event| matches!(
-        event,
-        ExecutionEvent::OrderNew {
-            order_id,
-            symbol,
-            strategy_id,
-            ..
-        } if order_id.0 == "paper-tsla-1"
-            && symbol.as_str() == "TSLABUSDT"
-            && strategy_id == "bstocks-paper-e2e"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        ExecutionEvent::OrderAck { order_id, .. } if order_id.0 == "paper-tsla-1"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        ExecutionEvent::Fill { order_id, fill_id, .. }
-            if order_id.0 == "paper-tsla-1" && fill_id == "fill-1"
-    )));
+    assert!(seen.is_empty());
+    assert!(matches!(
+        events.iter().find(|event| matches!(event, ExecutionEvent::OrderReject { .. })),
+        Some(ExecutionEvent::OrderReject { reason, .. })
+            if reason == "product requires a venue-specific account admission policy"
+    ));
 }

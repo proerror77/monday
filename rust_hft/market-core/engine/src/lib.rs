@@ -466,6 +466,17 @@ impl Engine {
         self.strategy_account_mapping = mapping.into_iter().collect();
     }
 
+    fn account_for_strategy(&self, strategy_id: &str) -> Option<hft_core::AccountId> {
+        self.strategy_account_mapping
+            .get(strategy_id)
+            .cloned()
+            .or_else(|| {
+                strategy_id
+                    .split_once(':')
+                    .and_then(|(base, _)| self.strategy_account_mapping.get(base).cloned())
+            })
+    }
+
     /// 處理市場事件給策略（測試用）：依賴策略的 venue_scope 與 runtime 的策略→場館映射
     #[cfg(test)]
     pub fn process_market_event_for_strategies(
@@ -614,9 +625,8 @@ impl Engine {
         self.order_account_map
             .extend(state.iter().filter_map(|(order_id, record)| {
                 record
-                    .strategy_id
+                    .account_id
                     .as_ref()
-                    .and_then(|strategy_id| self.strategy_account_mapping.get(strategy_id))
                     .map(|account_id| (order_id.clone(), account_id.clone()))
             }));
         if let Some(om) = &mut self.order_manager {
@@ -918,7 +928,11 @@ impl Engine {
         let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
         lifecycle.timing.intent_emitted_mono_us = Some(monotonic_micros());
         self.apply_intent_execution_limits(&mut lifecycle);
-        let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+        let account_id = self.account_for_strategy(&intent.strategy_id);
+        let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+        if let Some(account_id) = account_id {
+            envelope = envelope.with_account_id(account_id);
+        }
         if let Some(queues) = &mut self.execution_queues {
             match queues.send_lifecycle_intent(envelope, now) {
                 Ok(()) => {
@@ -1282,9 +1296,6 @@ impl Engine {
             debug!("忽略重放的成交/費用會計事件: {:?}", event);
             return Ok(());
         }
-        // 廣播執行事件（最佳努力）
-        let _ = self.broadcasters.exec_event_tx.send(event.clone());
-
         // 0. 先處理 OrderNew：註冊訂單元資料（供 Portfolio/OMS 使用）
         if let ExecutionEvent::OrderNew {
             order_id,
@@ -1295,14 +1306,35 @@ impl Engine {
             timestamp,
             venue,
             strategy_id,
+            account_id: event_account_id,
             ..
         } = event
         {
+            let mapped_account_id = self.order_account_map.get(order_id).cloned();
+            let account_id = match (event_account_id.clone(), mapped_account_id) {
+                (Some(event_account_id), Some(mapped_account_id))
+                    if event_account_id != mapped_account_id =>
+                {
+                    return Err(HftError::Execution(format!(
+                        "order {} changed canonical account identity from {} to {}",
+                        order_id.0, mapped_account_id.0, event_account_id.0
+                    )));
+                }
+                (Some(account_id), _) | (None, Some(account_id)) => account_id,
+                (None, None) => {
+                    warn!(
+                        order_id = %order_id.0,
+                        "ignoring OrderNew without a canonical account identity"
+                    );
+                    return Ok(());
+                }
+            };
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
             if let Some(om) = &mut self.order_manager {
                 om.register_order(ports::RegisterOrderParams {
                     order_id: order_id.clone(),
                     client_order_id: client_order_id.clone(),
+                    account_id: Some(account_id.clone()),
                     symbol: symbol.clone(),
                     side: *side,
                     qty: *quantity,
@@ -1310,11 +1342,7 @@ impl Engine {
                     strategy_id: Some(strategy_id.clone()),
                 });
             }
-            // 記錄訂單所屬帳戶（若有策略對應帳戶）
-            if let Some(account) = self.strategy_account_mapping.get(strategy_id) {
-                self.order_account_map
-                    .insert(order_id.clone(), account.clone());
-            }
+            self.order_account_map.insert(order_id.clone(), account_id);
             if let Some(pm) = &mut self.portfolio_manager {
                 pm.register_order(order_id.clone(), symbol.clone(), *side);
             }
@@ -1330,6 +1358,9 @@ impl Engine {
                 "已註冊新訂單到 OMS/Portfolio"
             );
         }
+
+        // 廣播執行事件（最佳努力） only after OrderNew identity validation.
+        let _ = self.broadcasters.exec_event_tx.send(event.clone());
 
         // 1. 更新 OMS 狀態機
         let order_update = self
@@ -1504,6 +1535,7 @@ impl Engine {
             };
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
+            let strategy_account_mapping = &self.strategy_account_mapping;
 
             for (strategy_idx, strategy) in self.strategies.iter_mut().enumerate() {
                 // 跳過已禁用的策略
@@ -1582,7 +1614,20 @@ impl Engine {
                 intents_work_buf.extend(intents.into_iter().map(|intent| {
                     let mut lifecycle = ports::OrderIntentLifecycle::default();
                     lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
-                    ports::OrderIntentEnvelope::new(intent, lifecycle)
+                    let account_id = strategy_account_mapping
+                        .get(&intent.strategy_id)
+                        .cloned()
+                        .or_else(|| {
+                            intent
+                                .strategy_id
+                                .split_once(':')
+                                .and_then(|(base, _)| strategy_account_mapping.get(base).cloned())
+                        });
+                    let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+                    if let Some(account_id) = account_id {
+                        envelope = envelope.with_account_id(account_id);
+                    }
+                    envelope
                 }));
             }
 
@@ -2685,6 +2730,53 @@ mod tests {
         assert!(broadcasts.try_recv().is_ok());
         assert!(broadcasts.try_recv().is_ok());
         assert!(broadcasts.try_recv().is_err());
+    }
+
+    #[test]
+    fn order_new_cannot_rebind_canonical_account_identity() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let mut broadcasts = engine.subscribe_execution_events();
+        let order_id = hft_core::OrderId("account-bound-order".to_string());
+        let canonical = hft_core::AccountId("canonical-account".to_string());
+        engine
+            .order_account_map
+            .insert(order_id.clone(), canonical.clone());
+
+        let error = engine
+            .handle_execution_event(&ExecutionEvent::OrderNew {
+                order_id: order_id.clone(),
+                client_order_id: Some("client-1".to_string()),
+                account_id: Some(hft_core::AccountId("wrong-account".to_string())),
+                symbol: Symbol::new("BTCUSDT"),
+                side: hft_core::Side::Buy,
+                quantity: Quantity::from_f64(1.0).expect("valid quantity"),
+                requested_price: Some(Price::from_f64(100.0).expect("valid price")),
+                timestamp: 1,
+                venue: Some(VenueId::BYBIT),
+                strategy_id: "strategy-1".to_string(),
+            })
+            .expect_err("account identity changes must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("changed canonical account identity"));
+        assert_eq!(engine.order_account_map.get(&order_id), Some(&canonical));
+        assert!(broadcasts.try_recv().is_err());
+    }
+
+    #[test]
+    fn strategy_account_mapping_falls_back_to_base_strategy_id() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let account_id = hft_core::AccountId("base-account".to_string());
+        engine.set_strategy_account_mapping(HashMap::from([(
+            "base".to_string(),
+            account_id.clone(),
+        )]));
+
+        assert_eq!(
+            engine.account_for_strategy("base:BTCUSDT"),
+            Some(account_id)
+        );
     }
 
     #[test]
