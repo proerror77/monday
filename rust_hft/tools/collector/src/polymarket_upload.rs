@@ -1333,8 +1333,9 @@ fn scan_tape_with_identity_at(
                 // repeated row is content-identical to the one already kept.
                 // Crash recovery legitimately re-emits already-recorded
                 // trades when a market re-finalizes (the 2026-08-08 incident
-                // produced hundreds per tape), so deduplicate and count for
-                // evidence instead of refusing the whole segment.
+                // produced hundreds per tape), so deduplicate and count them
+                // in the canonical quality.duplicate_record_ids evidence field
+                // instead of refusing the whole segment.
                 if !record_ids.insert(record_id) {
                     duplicate_trade_rows += 1;
                 }
@@ -1707,7 +1708,7 @@ fn scan_tape_with_identity_at(
         "max_bid_levels": max_bid_levels,
         "max_ask_levels": max_ask_levels,
         "contextless_quotes": contextless_quotes,
-        "duplicate_record_ids": 0,
+        "duplicate_record_ids": duplicate_trade_rows,
     });
     let mut manifest = json!({
         "schema": "monday.polymarket.raw.v1",
@@ -1763,10 +1764,6 @@ fn scan_tape_with_identity_at(
         .as_object_mut()
         .expect("manifest is an object")
         .insert("trade_completions".to_owned(), json!(trade_completions));
-    manifest
-        .as_object_mut()
-        .expect("manifest is an object")
-        .insert("duplicate_trade_rows".to_owned(), json!(duplicate_trade_rows));
     manifest
         .as_object_mut()
         .expect("manifest is an object")
@@ -4515,7 +4512,7 @@ mod tests {
         );
 
         let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
-        assert_eq!(manifest["duplicate_trade_rows"], json!(1));
+        assert_eq!(manifest["quality"]["duplicate_record_ids"], json!(1));
         assert_eq!(manifest["event_types"]["polymarket_trade"], json!(2));
         assert_eq!(manifest["events"], json!(2));
     }
