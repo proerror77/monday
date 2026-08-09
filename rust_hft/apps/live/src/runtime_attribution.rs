@@ -36,6 +36,7 @@ struct OrderMetadata {
     symbol: String,
     side: Side,
     requested_price: Option<Decimal>,
+    arrival_price: Option<Decimal>,
     timing: OrderTiming,
     seen_fill_ids: HashSet<String>,
 }
@@ -344,6 +345,7 @@ fn execution_attribution(
             venue,
             strategy_id,
             requested_price,
+            arrival_price,
             ..
         } => {
             state.orders.remove(&order_id.0);
@@ -367,6 +369,7 @@ fn execution_attribution(
                     symbol: symbol.to_string(),
                     side: *side,
                     requested_price: requested_price.map(|price| price.0),
+                    arrival_price: arrival_price.map(|price| price.0),
                     timing: OrderTiming::default(),
                     seen_fill_ids: HashSet::new(),
                 },
@@ -448,6 +451,27 @@ fn execution_attribution(
                         (signed * 10_000.0).max(0.0),
                     );
                 }
+            }
+            if let Some(arrival_price) = metadata.arrival_price {
+                let arrival = finite_metric("arrival_price", arrival_price.to_f64())?;
+                let fill = finite_metric("fill_price", price.to_f64())?;
+                if arrival > 0.0 && fill > 0.0 {
+                    let signed = match metadata.side {
+                        Side::Buy => fill / arrival - 1.0,
+                        Side::Sell => 1.0 - fill / arrival,
+                    };
+                    metrics.insert(
+                        "arrival_slippage_bps".to_string(),
+                        (signed * 10_000.0).max(0.0),
+                    );
+                }
+            }
+            metrics.insert(
+                "evidence_available_at_us".to_string(),
+                Utc::now().timestamp_micros().max(0) as f64,
+            );
+            if metadata.venue.eq_ignore_ascii_case("binance") {
+                metrics.insert("instrument_market_spot".to_string(), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -921,6 +945,7 @@ fn inferred_pre_submission_reject(
         symbol,
         side: Side::Buy,
         requested_price: None,
+        arrival_price: None,
         timing: OrderTiming::default(),
         seen_fill_ids: HashSet::new(),
     })
@@ -1141,6 +1166,7 @@ mod tests {
             side,
             quantity: Quantity::from_f64(1.0).unwrap(),
             requested_price: Some(Price::from_f64(100.0).unwrap()),
+            arrival_price: Some(Price::from_f64(100.0).unwrap()),
             timestamp: NOW_US,
             venue,
             strategy_id: strategy_id.to_string(),
@@ -1261,6 +1287,8 @@ mod tests {
         assert_eq!(fill.metrics["write_to_private_report_us"], 40.0);
         assert_eq!(fill.metrics["intent_to_private_report_us"], 75.0);
         assert!((fill.metrics["realized_slippage_bps"] - 100.0).abs() < 1e-9);
+        assert!((fill.metrics["arrival_slippage_bps"] - 100.0).abs() < 1e-9);
+        assert!(fill.metrics["evidence_available_at_us"] > NOW_US as f64);
 
         execution_attribution(
             &activation,

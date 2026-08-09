@@ -11,7 +11,8 @@ use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{
-    now_micros, AccountId, HftError, LatencyStage, OrderId, Price, ProductType, Quantity,
+    now_micros, AccountId, HftError, LatencyStage, OrderId, OrderType, Price, ProductType,
+    Quantity, TimeInForce,
 };
 use hft_core::{Symbol, VenueId};
 use ports::{
@@ -1025,6 +1026,10 @@ impl ExecutionWorker {
                         },
                     );
 
+                    let arrival_price = (matches!(envelope.intent.order_type, OrderType::Market)
+                        || matches!(envelope.intent.time_in_force, TimeInForce::IOC))
+                    .then_some(envelope.intent.price)
+                    .flatten();
                     let OrderIntent {
                         symbol,
                         side,
@@ -1047,6 +1052,7 @@ impl ExecutionWorker {
                         side,
                         quantity,
                         requested_price: price,
+                        arrival_price,
                         timestamp: now_micros(),
                         venue: venue_for_client,
                         strategy_id,
@@ -1117,6 +1123,10 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
+                                arrival_price: (matches!(intent.order_type, OrderType::Market)
+                                    || matches!(intent.time_in_force, TimeInForce::IOC))
+                                .then_some(intent.price)
+                                .flatten(),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),
@@ -4694,6 +4704,7 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         let mut first = create_test_intent("BTCUSDT");
+        first.order_type = OrderType::Limit;
         first.strategy_id = "binance".to_string();
         first.target_venue = Some(VenueId::BINANCE);
         let mut second = create_test_intent("ETHUSDT");
@@ -4771,8 +4782,10 @@ mod tests {
             events.as_slice(),
             [ExecutionEvent::OrderNew {
                 account_id: Some(account_id),
+                arrival_price: Some(arrival_price),
                 ..
             }] if account_id == &AccountId("binance-main".to_string())
+                && *arrival_price == Price::from_f64(100.0).unwrap()
         ));
 
         worker
