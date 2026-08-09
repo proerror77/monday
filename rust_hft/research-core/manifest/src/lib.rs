@@ -382,7 +382,7 @@ fn snapshot_sha256<T: Serialize>(snapshot: &T) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Historical CEX replay dataset. Kept for read-only evidence decoding; it has no V1 writer API.
+/// Historical CEX replay dataset. Existing writers are removed with the V2 consumer rollout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV1 {
@@ -395,6 +395,23 @@ pub struct CexReplayDatasetManifestV1 {
 }
 
 impl CexReplayDatasetManifestV1 {
+    pub fn new(
+        feature_manifest_id: impl Into<String>,
+        snapshot: CexReplaySnapshotV1,
+    ) -> Result<Self, ManifestError> {
+        let snapshot_sha256 = snapshot.sha256();
+        let manifest = Self {
+            dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
+            schema_version: CEX_REPLAY_DATASET_SCHEMA_V1.to_string(),
+            manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
+            feature_manifest_id: feature_manifest_id.into(),
+            snapshot,
+            snapshot_sha256,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     pub fn validate(&self) -> Result<(), ManifestError> {
         let invalid = ManifestError::InvalidCexReplayDataset;
         self.snapshot.validate()?;
