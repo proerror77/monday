@@ -73,6 +73,9 @@ pub fn verify_runtime_latency_evidence(
     {
         bail!("runtime feedback deployment, market, symbol, and account are required");
     }
+    if market == "usdm" {
+        bail!("USD-M runtime latency evidence is unavailable without a derivatives execution path");
+    }
 
     let mut observations = Vec::new();
     let mut signed_events = Vec::new();
@@ -117,13 +120,8 @@ pub fn verify_runtime_latency_evidence(
                 .get(&format!("instrument_market_{market}"))
                 .copied()
                 != Some(1.0)
-            || !event.venue.as_deref().is_some_and(|value| match market {
-                "spot" => {
-                    value.eq_ignore_ascii_case("binance")
-                        || value.eq_ignore_ascii_case("binance_spot")
-                }
-                "usdm" => value.eq_ignore_ascii_case("binance_futures"),
-                _ => false,
+            || !event.venue.as_deref().is_some_and(|value| {
+                value.eq_ignore_ascii_case("binance") || value.eq_ignore_ascii_case("binance_spot")
             })
             || !event
                 .symbol
@@ -353,6 +351,25 @@ mod tests {
             &keys_sha,
             "deployment-1",
             "spot",
+            "BTCUSDT",
+            "binance-main",
+            DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_usdm_without_a_derivatives_execution_path() {
+        let (_directory, log, log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
+        assert!(verify_runtime_latency_evidence(
+            &log,
+            &log_sha,
+            &keys,
+            &keys_sha,
+            "deployment-1",
+            "usdm",
             "BTCUSDT",
             "binance-main",
             DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
