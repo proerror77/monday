@@ -89,13 +89,9 @@ fn execute_mission_inner(
     if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
         bail!("mission dataset id does not match the supplied manifest");
     }
-    let rows = manifest.load_rows(
-        args.dataset.validation.fee_bps,
-        args.dataset.validation.funding_bps,
-        args.dataset.validation.latency_bps,
-    )?;
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
+    let rows = manifest.load_rows(&protocol.costs)?;
     let evaluation_protocol_hash = protocol.content_hash()?;
     let dataset = prepare_dataset(rows, &protocol)?;
     let research_context = dataset.engine_context();

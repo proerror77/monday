@@ -753,6 +753,7 @@ mod tests {
                         label: signal,
                         fee_bps: 0.0,
                         funding_bps: 0.0,
+                        pit_funding: false,
                         latency_bps: 0.0,
                     }
                 })

@@ -1,10 +1,22 @@
-owner: codex-root
-contract: lob-pit-trade-features
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-trade-features
-branch: codex/lob-pit-trade-features
-base_sha: a15880c940f5047ce76ca1485a48239698eb6821
+owner: codex
+contract: cex-research-evaluator-v2
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-evaluator-v2
+branch: codex/cex-research-evaluator-v2
+base_sha: 02968ad2fba0ab4ac46927904046009fc0f33ed7
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
-dependency: PR #781 merged as a15880c940f5047ce76ca1485a48239698eb6821
+  - rust_hft/Cargo.lock
+  - rust_hft/alpha-harness/app/src/data_mission.rs
+  - rust_hft/alpha-harness/app/src/governance.rs
+  - rust_hft/alpha-harness/app/src/mission.rs
+  - rust_hft/alpha-harness/app/src/mission_runner.rs
+  - rust_hft/alpha-harness/engine/src/evaluation.rs
+  - rust_hft/alpha-harness/engine/src/formula_evaluator.rs
+  - rust_hft/alpha-harness/engine/src/engines/mod.rs
+  - rust_hft/alpha-harness/engine/src/engines/mcts.rs
+  - rust_hft/alpha-harness/engine/src/lib.rs
+  - rust_hft/alpha-harness/onnx-evaluator/src/lib.rs
+  - rust_hft/research-core/manifest/Cargo.toml
+  - rust_hft/research-core/manifest/src/lib.rs
+dependency: PR #781 and PR #783 merged into 02968ad2fba0ab4ac46927904046009fc0f33ed7
 no_external_runtime_mutation: true

@@ -1012,6 +1012,7 @@ mod tests {
                     label: direction * index as f64 * 0.01,
                     fee_bps: 1.0,
                     funding_bps: 0.1,
+                    pit_funding: false,
                     latency_bps: 0.2,
                 }
             })
@@ -1063,6 +1064,7 @@ mod tests {
                     label: signal * 0.01,
                     fee_bps: 0.0,
                     funding_bps: 0.0,
+                    pit_funding: false,
                     latency_bps: 0.0,
                 }
             })
