@@ -1,0 +1,139 @@
+name: One-shot Polymarket Tape Seal Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Restricted benchmark contract
+        required: true
+        type: choice
+        options:
+          - polymarket-seal-v1
+      exact_main_sha:
+        description: Exact current main SHA to benchmark
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-shot-polymarket-tape-seal-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Synthetic 4 GiB full-scan versus seal
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BENCHMARK_ROOT: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}
+      BENCHMARK_LOG: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/benchmark.log
+      CARGO_TARGET_DIR: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/target
+      TMPDIR: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/tmp
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - name: Fail closed unless selection and exact main identity match
+        env:
+          BENCHMARK_SELECTION: ${{ inputs.benchmark }}
+          EXPECTED_MAIN_SHA: ${{ inputs.exact_main_sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$BENCHMARK_SELECTION" = polymarket-seal-v1
+          test "$DISPATCH_REF" = refs/heads/main
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$DISPATCH_SHA" = "$EXPECTED_MAIN_SHA"
+
+      - name: Prepare bounded temporary workspace
+        run: |
+          set -euo pipefail
+          expected_prefix="${RUNNER_TEMP}/monday-market-tape-seal-"
+          [[ "$BENCHMARK_ROOT" == "$expected_prefix"* ]]
+          test ! -e "$BENCHMARK_ROOT"
+          mkdir -p "$TMPDIR" "$CARGO_TARGET_DIR"
+
+      - name: Checkout exact trusted main
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/main
+          fetch-depth: 1
+
+      - name: Verify checked-out identity
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.exact_main_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_SHA"
+          test "$(git rev-parse refs/heads/main)" = "$EXPECTED_MAIN_SHA"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install existing Linux build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
+
+      - name: Compile the exact benchmark test without running it
+        working-directory: rust_hft
+        run: |
+          set -euo pipefail
+          cargo test -p hft-collector --lib --features collector-binance --release --locked \
+            synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases \
+            --no-run
+
+      - name: Require bounded runner disk headroom
+        run: |
+          set -euo pipefail
+          min_free_bytes=$((6 * 1024 * 1024 * 1024))
+          available_bytes=$(df --output=avail -B1 "$RUNNER_TEMP" | tail -1 | tr -d ' ')
+          [[ "$available_bytes" =~ ^[0-9]+$ ]]
+          (( available_bytes >= min_free_bytes ))
+          printf 'BENCHMARK_PREFLIGHT available_bytes=%s min_free_bytes=%s\n' \
+            "$available_bytes" "$min_free_bytes"
+
+      - name: Run exactly one bounded synthetic benchmark
+        id: benchmark
+        working-directory: rust_hft
+        run: |
+          set -euo pipefail
+          test_name='polymarket_upload::tests::synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases'
+          set +e
+          cargo test -p hft-collector --lib --features collector-binance --release --locked \
+            "$test_name" -- --ignored --exact --nocapture 2>&1 | tee "$BENCHMARK_LOG"
+          cargo_status=${PIPESTATUS[0]}
+          set -e
+          test "$cargo_status" -eq 0
+          selected_tests=$(grep -Fxc "test $test_name ... ok" "$BENCHMARK_LOG" || true)
+          test "$selected_tests" -eq 1
+          test "$(grep -Ec 'UPLOAD_PHASE phase=benchmark_fixture_generate .*wall_ms=[0-9]+ .*self_cpu_ms=[0-9]+ .*child_cpu_ms=[0-9]+' "$BENCHMARK_LOG" || true)" -eq 1
+          test "$(grep -Ec 'UPLOAD_PHASE phase=benchmark_fixture_sha256 .*wall_ms=[0-9]+ .*self_cpu_ms=[0-9]+ .*child_cpu_ms=[0-9]+' "$BENCHMARK_LOG" || true)" -eq 1
+          test "$(grep -Ec 'UPLOAD_PHASE phase=benchmark_full_scan .*wall_ms=[0-9]+ .*self_cpu_ms=[0-9]+ .*child_cpu_ms=[0-9]+' "$BENCHMARK_LOG" || true)" -eq 1
+          test "$(grep -Ec 'UPLOAD_PHASE phase=benchmark_seal_lookup .*wall_ms=[0-9]+ .*self_cpu_ms=[0-9]+ .*child_cpu_ms=[0-9]+' "$BENCHMARK_LOG" || true)" -eq 1
+          test "$(grep -Ec 'IMMUTABLE_FIXTURE_BENCH source_bytes=[0-9]+ full_scan_ms=[0-9]+ seal_lookup_ms=[0-9]+ manifest_equivalent=true fixture_sha256=[0-9a-f]{64}' "$BENCHMARK_LOG" || true)" -eq 1
+          test "$(grep -Fxc 'IMMUTABLE_FIXTURE_CLEANUP removed=true' "$BENCHMARK_LOG" || true)" -eq 1
+
+      - name: Publish redacted benchmark evidence
+        if: ${{ steps.benchmark.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          {
+            printf '## Polymarket tape seal benchmark\n\n'
+            printf 'Exact main: `%s`\n\n' '${{ github.sha }}'
+            printf '```text\n'
+            grep -E 'UPLOAD_PHASE phase=benchmark_|IMMUTABLE_FIXTURE_(BENCH|CLEANUP)' "$BENCHMARK_LOG"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove all benchmark data
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          expected_prefix="${RUNNER_TEMP}/monday-market-tape-seal-"
+          [[ "$BENCHMARK_ROOT" == "$expected_prefix"* ]]
+          test "$BENCHMARK_ROOT" != "$RUNNER_TEMP"
+          rm -rf -- "$BENCHMARK_ROOT"
+          test ! -e "$BENCHMARK_ROOT"
+          printf 'BENCHMARK_CLEANUP verified=true\n'
+          printf '\nCleanup: verified\n' >> "$GITHUB_STEP_SUMMARY"
