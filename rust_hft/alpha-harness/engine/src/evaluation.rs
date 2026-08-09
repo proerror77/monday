@@ -466,14 +466,14 @@ mod tests {
             EvaluationError::ProtocolMismatch
         );
 
-        let mut rows = rows(50);
-        rows[0].funding_bps = 0.0;
+        let mut funding_rows = rows(50);
+        funding_rows[0].funding_bps = 0.0;
         assert_eq!(
-            prepare_dataset(rows.clone(), &protocol()).unwrap_err(),
+            prepare_dataset(funding_rows.clone(), &protocol()).unwrap_err(),
             EvaluationError::ProtocolMismatch
         );
-        rows[0].pit_funding = true;
-        prepare_dataset(rows, &protocol()).unwrap();
+        funding_rows[0].pit_funding = true;
+        prepare_dataset(funding_rows, &protocol()).unwrap();
     }
 
     #[test]
