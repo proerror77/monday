@@ -2,7 +2,7 @@ owner: codex-root
 contract: cex-fee-runtime-account-binding
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/fee-account-binding
 branch: codex/fee-account-binding
-base_sha: 02968ad2fba0ab4ac46927904046009fc0f33ed7
+base_sha: fd3afe63e5cd8919a8e1f68e23020aada29655c1
 allowed_files:
   - agent-worktree.yml
   - rust_hft/research-core/manifest/src/lib.rs
@@ -12,5 +12,5 @@ allowed_files:
   - deployment/aliyun/test-trading-ecs-host-contract.sh
   - deployment/aliyun/TRADING_ECS_HOST.md
   - rust_hft/deployment/docker/Dockerfile.trading
-dependency: none
+dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1
 no_external_runtime_mutation: true
