@@ -8,5 +8,7 @@ allowed_files:
   - rust_hft/research-core/manifest/src/lib.rs
   - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
   - rust_hft/tools/collector/src/binance_fee_artifact.rs
+  - deployment/aliyun/trading-ecs-runtime.sh
+  - deployment/aliyun/test-trading-ecs-host-contract.sh
 dependency: none
 no_external_runtime_mutation: true

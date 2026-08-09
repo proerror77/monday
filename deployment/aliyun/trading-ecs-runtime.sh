@@ -302,6 +302,7 @@ validate_runtime_secrets() {
   local runtime_env=$secret_root/runtime.env
   local feedback_key=$secret_root/feedback-signing-key.hex
   local fs_type runtime_env_fs feedback_key_fs api_prefixes secret_prefixes grpc_token
+  local binance_account_json binance_api_key binance_secret
   local expected_uid runtime_uid runtime_gid
   local runtime_ids
   expected_uid=${EXPECTED_ROOT_UID:-$EXPECTED_ROOT_UID_DEFAULT}
@@ -335,10 +336,14 @@ validate_runtime_secrets() {
   grep -Eq '^HFT_GRPC_AUTH_TOKEN=.+$' "$runtime_env" || return 1
   grep -Eq '^HFT_SECRET_[A-Z0-9_]+_API_KEY=.+$' "$runtime_env" || return 1
   grep -Eq '^HFT_SECRET_[A-Z0-9_]+_SECRET=.+$' "$runtime_env" || return 1
+  grep -Eq '^HFT_SECRET_BINANCE_ACCOUNT_JSON=.+$' "$runtime_env" || return 1
+  grep -Eq '^HFT_SECRET_BINANCE_API_KEY=.+$' "$runtime_env" || return 1
+  grep -Eq '^HFT_SECRET_BINANCE_SECRET=.+$' "$runtime_env" || return 1
   if ! awk -F= '
     !/^[A-Z_][A-Z0-9_]*=.+$/ { exit 1 }
     seen[$1]++ { exit 1 }
     $1 == "HFT_GRPC_AUTH_TOKEN" { grpc++; next }
+    $1 == "HFT_SECRET_BINANCE_ACCOUNT_JSON" { next }
     $1 ~ /^HFT_SECRET_[A-Z0-9][A-Z0-9_]*_(API_KEY|SECRET)$/ { next }
     { exit 1 }
     END { if (grpc != 1) exit 1 }
@@ -350,6 +355,17 @@ validate_runtime_secrets() {
   secret_prefixes=$(sed -n 's/^HFT_SECRET_\([A-Z0-9_]*\)_SECRET=.*/\1/p' \
     "$runtime_env" | LC_ALL=C sort -u) || return 1
   [[ -n $api_prefixes && $api_prefixes == "$secret_prefixes" ]] || return 1
+  binance_account_json=$(sed -n 's/^HFT_SECRET_BINANCE_ACCOUNT_JSON=//p' \
+    "$runtime_env") || return 1
+  jq -e '
+    type == "object"
+    and (keys | sort) == ["api_key", "runtime_account_id", "secret"]
+    and all(.runtime_account_id, .api_key, .secret; type == "string" and test("[^[:space:]]"))
+  ' <<<"$binance_account_json" >/dev/null || return 1
+  binance_api_key=$(sed -n 's/^HFT_SECRET_BINANCE_API_KEY=//p' "$runtime_env") || return 1
+  binance_secret=$(sed -n 's/^HFT_SECRET_BINANCE_SECRET=//p' "$runtime_env") || return 1
+  [[ $(jq -er .api_key <<<"$binance_account_json") == "$binance_api_key" \
+    && $(jq -er .secret <<<"$binance_account_json") == "$binance_secret" ]] || return 1
   if grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=$|^[[:space:]]|[[:space:]]$' "$runtime_env"; then
     return 1
   fi
