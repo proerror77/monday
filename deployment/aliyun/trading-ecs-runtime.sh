@@ -372,10 +372,16 @@ validate_runtime_secrets() {
 
 validate_runtime_account_binding() {
   local activation_dir=$1 secret_root=${SECRET_ROOT:-$SECRET_ROOT_DEFAULT}
-  local binance_account_json runtime_account_id
+  local binance_account_json policy_venue runtime_account_id
+  policy_venue=$(jq -er '.venue | ascii_downcase' \
+    "$activation_dir/deployment/policy.json") || return 1
+  case $policy_venue in
+    binance|binance_spot|binance_futures) ;;
+    *) return 0 ;;
+  esac
   binance_account_json=$(sed -n 's/^HFT_SECRET_BINANCE_ACCOUNT_JSON=//p' \
     "$secret_root/runtime.env") || return 1
-  [[ -z $binance_account_json ]] && return 0
+  [[ -n $binance_account_json ]] || return 1
   runtime_account_id=$(jq -er '.runtime_account_id' <<<"$binance_account_json") || return 1
   jq -e --arg runtime_account_id "$runtime_account_id" \
     '.account_id == $runtime_account_id' \
@@ -479,7 +485,7 @@ run_container() {
     --mount "type=bind,src=$secret_root/feedback-signing-key.hex,dst=/run/secrets/hft/feedback-signing-key.hex,readonly" \
     --entrypoint /bin/sh \
     "$HFT_TRADING_IMAGE" \
-    -euc 'while IFS= read -r secret; do export "$secret"; done < /run/secrets/hft/runtime.env; unset secret; if [ -n "${HFT_SECRET_BINANCE_ACCOUNT_JSON:-}" ]; then export HFT_SECRET_BINANCE_API_KEY=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .api_key) HFT_SECRET_BINANCE_SECRET=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .secret); unset HFT_SECRET_BINANCE_ACCOUNT_JSON; fi; exec /usr/local/bin/hft-live "$@"' \
+    -euc 'while IFS= read -r secret; do export "$secret"; done < /run/secrets/hft/runtime.env; unset secret; policy_venue=$(jq -er ".venue | ascii_downcase" /activation/deployment/policy.json); case "$policy_venue" in binance|binance_spot|binance_futures) runtime_account_id=$(printf %s "${HFT_SECRET_BINANCE_ACCOUNT_JSON:?}" | jq -er .runtime_account_id); policy_account_id=$(jq -er .account_id /activation/deployment/policy.json); [ "$runtime_account_id" = "$policy_account_id" ];; esac; if [ -n "${HFT_SECRET_BINANCE_ACCOUNT_JSON:-}" ]; then export HFT_SECRET_BINANCE_API_KEY=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .api_key) HFT_SECRET_BINANCE_SECRET=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .secret); unset HFT_SECRET_BINANCE_ACCOUNT_JSON; fi; unset policy_venue runtime_account_id policy_account_id; exec /usr/local/bin/hft-live "$@"' \
     hft-live \
     --config /activation/config/system.yaml \
     --deployment-envelope /activation/deployment/envelope.json \
