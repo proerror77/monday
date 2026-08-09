@@ -4943,6 +4943,7 @@ dependencies = [
  "once_cell",
  "ordered-float 4.6.0",
  "parquet",
+ "polymarket-tape-contract",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rust_decimal",
@@ -8018,6 +8019,17 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "polymarket-tape-contract"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "plotters"

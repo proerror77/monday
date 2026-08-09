@@ -40,6 +40,7 @@ engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
+polymarket-tape-contract = { path = "../../shared/polymarket-tape" }
 
 # CLI 參數解析
 clap = { version = "4", features = ["derive"] }

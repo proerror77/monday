@@ -2,7 +2,7 @@ owner: codex
 contract: binance-fee-snapshot-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-snapshot-v2
 branch: codex/binance-fee-snapshot-v2
-base_sha: 7d79deb392e3bc11063e09387aff5733fa9f8a44
+base_sha: 8b93efcc52bd7a26ae01eb5f3d12903d870e027d
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
@@ -10,5 +10,5 @@ allowed_files:
   - rust_hft/tools/collector/src/lib.rs
   - rust_hft/tools/collector/src/binance_fee_artifact.rs
   - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
-dependency: codex/binance-usdm-reference-v3-upgrade
+dependency: none
 no_external_runtime_mutation: true

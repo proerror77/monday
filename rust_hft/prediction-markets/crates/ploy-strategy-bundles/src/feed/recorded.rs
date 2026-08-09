@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::traits::{Feed, MarketUpdate};
+use polymarket_tape_contract::{
+    tape_seal_path, MarketTapeManifestBuilder, PolymarketTapeSeal, TapeFileIdentity,
+    POLYMARKET_MARKET_TAPE_DATASET, POLYMARKET_MARKET_TAPE_QUOTE_DEPTH_LEVELS,
+    POLYMARKET_MARKET_TAPE_QUOTE_SAMPLE_MS, POLYMARKET_TAPE_SEAL_SCHEMA,
+};
 
 const FLUSH_EVERY_RECORDS: usize = 256;
 // Snapshot lifecycle state for ordinary updates only once the writer is this
@@ -154,6 +159,68 @@ struct MarketUpdateLogWriter {
     rotate_seconds: Option<u64>,
     rotation_bucket: Option<i64>,
     rotation_retry_after: Option<DateTime<Utc>>,
+    seal_policy: Option<TapeSealPolicy>,
+    seal_builder: Option<MarketTapeManifestBuilder>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TapeSealPolicy;
+
+fn write_tape_seal(
+    source: &Path,
+    builder: MarketTapeManifestBuilder,
+    _policy: TapeSealPolicy,
+) -> io::Result<PathBuf> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other("rotated tape must be a regular file"));
+    }
+    let source_file = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::other("rotated tape name is not UTF-8"))?;
+    let manifest = builder
+        .finish(
+            POLYMARKET_MARKET_TAPE_DATASET,
+            POLYMARKET_MARKET_TAPE_QUOTE_DEPTH_LEVELS,
+            POLYMARKET_MARKET_TAPE_QUOTE_SAMPLE_MS,
+            source_file,
+            metadata.len(),
+        )
+        .map_err(io::Error::other)?;
+    let seal = PolymarketTapeSeal {
+        schema: POLYMARKET_TAPE_SEAL_SCHEMA.to_owned(),
+        source_file: source_file.to_owned(),
+        source_identity: TapeFileIdentity::from_metadata(&metadata),
+        manifest,
+    };
+    let final_path = tape_seal_path(source).map_err(io::Error::other)?;
+    let temporary = final_path.with_file_name(format!(
+        ".{}.{}.tmp",
+        final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("market-updates.ndjson.seal.json"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, &seal).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &final_path)?;
+        if let Some(parent) = final_path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| final_path)
 }
 
 fn polymarket_tradeable_price(price: Decimal) -> bool {
@@ -208,10 +275,20 @@ fn quote_collection_result(update: &MarketUpdate) -> Option<(&'static str, &'sta
 }
 
 impl MarketUpdateLogWriter {
+    #[cfg(test)]
     fn create_with_limits(
         path: impl AsRef<Path>,
         limits: RecordingLimits,
         rotate_seconds: Option<u64>,
+    ) -> io::Result<Self> {
+        Self::create_with_policy(path, limits, rotate_seconds, None)
+    }
+
+    fn create_with_policy(
+        path: impl AsRef<Path>,
+        limits: RecordingLimits,
+        rotate_seconds: Option<u64>,
+        seal_policy: Option<TapeSealPolicy>,
     ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -248,6 +325,8 @@ impl MarketUpdateLogWriter {
             rotate_seconds,
             rotation_bucket: rotation_bucket(rotate_seconds),
             rotation_retry_after: None,
+            seal_policy,
+            seal_builder: seal_policy.map(|_| MarketTapeManifestBuilder::new()),
         })
     }
 
@@ -270,9 +349,10 @@ impl MarketUpdateLogWriter {
             update.insert("request_status".to_owned(), request_status.into());
             update.insert("collection_result".to_owned(), collection_result.into());
         }
+        let recorded_at = Utc::now();
         let record = serde_json::json!({
             "sequence": self.next_sequence,
-            "recorded_at": Utc::now(),
+            "recorded_at": recorded_at,
             "update": serialized_update,
         });
         let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
@@ -291,6 +371,17 @@ impl MarketUpdateLogWriter {
         self.writer.write_all(&line)?;
         self.bytes_written += u64::try_from(line.len()).unwrap_or(u64::MAX);
         self.pending_records += 1;
+        if let Some(mut builder) = self.seal_builder.take() {
+            if let Err(error) = builder.observe(&record, recorded_at) {
+                warn!(
+                    path = %self.path.display(),
+                    error = %error,
+                    "Incremental tape validation failed; closed tape will use uploader full-scan fallback",
+                );
+            } else {
+                self.seal_builder = Some(builder);
+            }
+        }
 
         let is_lifecycle = matches!(
             update,
@@ -376,6 +467,21 @@ impl MarketUpdateLogWriter {
         self.bytes_written = 0;
         self.rotation_bucket = rotation_bucket(self.rotate_seconds);
         self.rotation_retry_after = None;
+        if let (Some(builder), Some(policy)) = (self.seal_builder.take(), self.seal_policy) {
+            match write_tape_seal(&rotated, builder, policy) {
+                Ok(seal) => info!(
+                    source = %rotated.display(),
+                    seal = %seal.display(),
+                    "Sealed rotated market-update tape",
+                ),
+                Err(error) => warn!(
+                    source = %rotated.display(),
+                    error = %error,
+                    "Could not seal rotated tape; uploader will use full-scan fallback",
+                ),
+            }
+        }
+        self.seal_builder = self.seal_policy.map(|_| MarketTapeManifestBuilder::new());
         info!(
             active = %self.path.display(),
             rotated = %rotated.display(),
@@ -434,12 +540,18 @@ impl<F> RecordingFeed<F> {
         path: impl AsRef<Path>,
         policy: RecordingPolicy,
     ) -> io::Result<Self> {
+        let path = path.as_ref();
+        let seal_policy = (path.file_name().and_then(|value| value.to_str())
+            == Some("market-updates.ndjson")
+            && policy.event_scoped_quotes)
+            .then_some(TapeSealPolicy);
         Ok(Self {
             inner,
-            writer: Some(MarketUpdateLogWriter::create_with_limits(
+            writer: Some(MarketUpdateLogWriter::create_with_policy(
                 path,
                 policy.limits,
                 policy.rotate_seconds,
+                seal_policy,
             )?),
             policy,
             last_quote_recorded_at: HashMap::new(),
@@ -1708,6 +1820,56 @@ mod tests {
 
         let _ = fs::remove_file(rotated);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_named_writer_seals_rotated_tape_identity() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/ploy-market-tape-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("market-updates.ndjson");
+        let now = Utc::now();
+        let mut writer = MarketUpdateLogWriter::create_with_policy(
+            &path,
+            RecordingLimits::default(),
+            None,
+            Some(TapeSealPolicy),
+        )
+        .unwrap();
+        writer
+            .append(&MarketUpdate::EventDiscovered {
+                event_id: "evt-seal".into(),
+                symbol: "BTCUSDT".into(),
+                up_token: "up-seal".into(),
+                down_token: "down-seal".into(),
+                end_time: now + Duration::minutes(5),
+                window_secs: 300,
+                price_to_beat: Some(dec!(100000)),
+                resolved_up_won: None,
+            })
+            .unwrap();
+        let rotated = writer.rotate().unwrap().unwrap();
+        drop(writer);
+
+        let seal_path = tape_seal_path(&rotated).unwrap();
+        let seal: PolymarketTapeSeal =
+            serde_json::from_slice(&fs::read(&seal_path).unwrap()).unwrap();
+        let metadata = fs::metadata(&rotated).unwrap();
+        assert_eq!(seal.schema, POLYMARKET_TAPE_SEAL_SCHEMA);
+        assert_eq!(
+            seal.source_identity,
+            TapeFileIdentity::from_metadata(&metadata)
+        );
+        assert_eq!(seal.manifest["source_bytes"], metadata.len());
+        assert_eq!(seal.manifest["start_sequence"], 0);
+        assert_eq!(seal.manifest["end_sequence"], 0);
+
+        let _ = fs::remove_file(seal_path);
+        let _ = fs::remove_file(rotated);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(root);
     }
 
     #[test]
