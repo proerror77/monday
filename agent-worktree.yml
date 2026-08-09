@@ -6,4 +6,4 @@ base_sha: e2a66fcd72ffb50e0af1b6c0e7481c243bbea9f9
 scope:
   - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
 dependency: none
-no_external_runtime_mutation: false
+no_external_runtime_mutation: true

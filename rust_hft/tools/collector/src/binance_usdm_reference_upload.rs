@@ -736,11 +736,11 @@ mod tests {
     fn empty_batch_directory_does_not_block_complete_batches() {
         let root = TestDir::new();
         let bucket = TestDir::new();
-        let published = publish_batch(root.path(), RECEIVED_NS + 100);
+        let published = publish_batch(root.path(), RECEIVED_NS + 200);
         let empty = batch_dir(&published)
             .parent()
             .unwrap()
-            .join(format!("batch={}", RECEIVED_NS + 200));
+            .join(format!("batch={}", RECEIVED_NS + 100));
         fs::create_dir(&empty).unwrap();
 
         let mut oss = FakeOss::default();
