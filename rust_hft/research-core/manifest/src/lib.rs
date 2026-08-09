@@ -62,6 +62,22 @@ pub struct CexReplaySnapshotV1 {
     pub top_depth: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexArtifactTripletV2 {
+    pub data_sha256: String,
+    pub manifest_sha256: String,
+    pub success_sha256: String,
+}
+
+impl CexArtifactTripletV2 {
+    fn valid(&self) -> bool {
+        valid_sha256(&self.data_sha256)
+            && valid_sha256(&self.manifest_sha256)
+            && valid_sha256(&self.success_sha256)
+    }
+}
+
 impl CexReplaySnapshotV1 {
     pub fn validate(&self) -> Result<(), ManifestError> {
         validate_snapshot_core(
@@ -100,27 +116,35 @@ pub struct CexInstrumentRulesV2 {
     pub min_notional: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence_sha256: String,
+    pub evidence: CexArtifactTripletV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFeeScheduleV2 {
-    pub maker_fee_bps: String,
-    pub taker_fee_bps: String,
+    pub maker_buy_fee_bps: String,
+    pub maker_sell_fee_bps: String,
+    pub taker_buy_fee_bps: String,
+    pub taker_sell_fee_bps: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence_sha256: String,
+    pub evidence: CexArtifactTripletV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexPitSeriesEvidenceV2 {
+    pub evidence: CexArtifactTripletV2,
+    pub first_available_at: DateTime<Utc>,
+    pub last_available_at: DateTime<Utc>,
+    pub observations: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexDerivativesReferenceV2 {
-    pub artifact_sha256: String,
-    pub first_available_at: DateTime<Utc>,
-    pub last_available_at: DateTime<Utc>,
-    pub funding_observations: u64,
-    pub open_interest_observations: u64,
+    pub funding: CexPitSeriesEvidenceV2,
+    pub open_interest: CexPitSeriesEvidenceV2,
     pub evaluation_funding_bps_per_bucket: String,
 }
 
@@ -128,7 +152,7 @@ pub struct CexDerivativesReferenceV2 {
 #[serde(deny_unknown_fields)]
 pub struct CexLatencyCostV2 {
     pub method: String,
-    pub evidence_sha256: String,
+    pub evidence: CexArtifactTripletV2,
     pub first_observed_at: DateTime<Utc>,
     pub last_observed_at: DateTime<Utc>,
     pub available_at: DateTime<Utc>,
@@ -196,13 +220,15 @@ impl CexReplaySnapshotV2 {
         if !positive_decimal(&self.instrument_rules.tick_size)
             || !positive_decimal(&self.instrument_rules.step_size)
             || !positive_decimal(&self.instrument_rules.min_notional)
-            || !valid_sha256(&self.instrument_rules.evidence_sha256)
+            || !self.instrument_rules.evidence.valid()
             || self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.available_at > self.instrument_rules.valid_through
             || self.instrument_rules.valid_through < self.last_event_time
-            || !nonnegative_decimal(&self.fee_schedule.maker_fee_bps)
-            || !nonnegative_decimal(&self.fee_schedule.taker_fee_bps)
-            || !valid_sha256(&self.fee_schedule.evidence_sha256)
+            || !nonnegative_decimal(&self.fee_schedule.maker_buy_fee_bps)
+            || !nonnegative_decimal(&self.fee_schedule.maker_sell_fee_bps)
+            || !nonnegative_decimal(&self.fee_schedule.taker_buy_fee_bps)
+            || !nonnegative_decimal(&self.fee_schedule.taker_sell_fee_bps)
+            || !self.fee_schedule.evidence.valid()
             || self.fee_schedule.available_at > self.first_event_time
             || self.fee_schedule.available_at > self.fee_schedule.valid_through
             || self.fee_schedule.valid_through < self.last_event_time
@@ -211,18 +237,20 @@ impl CexReplaySnapshotV2 {
         }
         match (&self.instrument_type[..], &self.derivatives_reference) {
             ("usdm", Some(reference))
-                if valid_sha256(&reference.artifact_sha256)
-                    && reference.first_available_at <= reference.last_available_at
-                    && reference.first_available_at <= self.first_event_time
-                    && reference.last_available_at >= self.last_event_time
-                    && reference.funding_observations > 0
-                    && reference.open_interest_observations > 0
-                    && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
+                if pit_series_covers(
+                    &reference.funding,
+                    self.first_event_time,
+                    self.last_event_time,
+                ) && pit_series_covers(
+                    &reference.open_interest,
+                    self.first_event_time,
+                    self.last_event_time,
+                ) && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
             ("spot", None) => {}
             _ => return Err(invalid("derivatives reference evidence is invalid")),
         }
         if self.latency_cost.method != "verified_order_lifecycle_realized_slippage"
-            || !valid_sha256(&self.latency_cost.evidence_sha256)
+            || !self.latency_cost.evidence.valid()
             || self.latency_cost.first_observed_at > self.latency_cost.last_observed_at
             || self.latency_cost.last_observed_at > self.first_event_time
             || self.latency_cost.available_at < self.latency_cost.last_observed_at
@@ -242,6 +270,18 @@ impl CexReplaySnapshotV2 {
     pub fn sha256(&self) -> String {
         snapshot_sha256(self)
     }
+}
+
+fn pit_series_covers(
+    evidence: &CexPitSeriesEvidenceV2,
+    first_event_time: DateTime<Utc>,
+    last_event_time: DateTime<Utc>,
+) -> bool {
+    evidence.evidence.valid()
+        && evidence.observations > 0
+        && evidence.first_available_at <= first_event_time
+        && evidence.first_available_at <= evidence.last_available_at
+        && evidence.last_available_at >= last_event_time
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -640,6 +680,14 @@ impl HarnessManifest {
 mod tests {
     use super::*;
 
+    fn triplet(byte: char) -> CexArtifactTripletV2 {
+        CexArtifactTripletV2 {
+            data_sha256: byte.to_string().repeat(64),
+            manifest_sha256: byte.to_string().repeat(64),
+            success_sha256: byte.to_string().repeat(64),
+        }
+    }
+
     fn cex_snapshot() -> CexReplaySnapshotV2 {
         CexReplaySnapshotV2 {
             schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
@@ -681,34 +729,47 @@ mod tests {
                 valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence_sha256: "4".repeat(64),
+                evidence: triplet('4'),
             },
             fee_schedule: CexFeeScheduleV2 {
-                maker_fee_bps: "2".to_string(),
-                taker_fee_bps: "5".to_string(),
+                maker_buy_fee_bps: "2".to_string(),
+                maker_sell_fee_bps: "2".to_string(),
+                taker_buy_fee_bps: "5".to_string(),
+                taker_sell_fee_bps: "5".to_string(),
                 available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                     .unwrap()
                     .with_timezone(&Utc),
                 valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence_sha256: "5".repeat(64),
+                evidence: triplet('5'),
             },
             derivatives_reference: Some(CexDerivativesReferenceV2 {
-                artifact_sha256: "6".repeat(64),
-                first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                funding_observations: 1,
-                open_interest_observations: 1,
+                funding: CexPitSeriesEvidenceV2 {
+                    evidence: triplet('6'),
+                    first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    observations: 1,
+                },
+                open_interest: CexPitSeriesEvidenceV2 {
+                    evidence: triplet('7'),
+                    first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    observations: 1,
+                },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
             latency_cost: CexLatencyCostV2 {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
-                evidence_sha256: "7".repeat(64),
+                evidence: triplet('8'),
                 first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
@@ -784,6 +845,24 @@ mod tests {
 
         assert_ne!(manifest.manifest_id, different.manifest_id);
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_stale_open_interest_tail() {
+        let mut snapshot = cex_snapshot();
+        snapshot
+            .derivatives_reference
+            .as_mut()
+            .unwrap()
+            .open_interest
+            .last_available_at = DateTime::parse_from_rfc3339("2026-07-14T00:00:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
     }
 
     #[test]

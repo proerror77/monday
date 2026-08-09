@@ -1,10 +1,10 @@
 owner: codex
-contract: binance-reference-429-retry
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-reference-429-retry
-branch: codex/binance-reference-429-retry
-base_sha: 8b5410e2ef363a2e729e69e0b6c97170181c7480
+contract: cex-research-contract-v2
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-contract-v2
+branch: codex/cex-research-contract-v2
+base_sha: 32e01918a88355f0708bbacd9ae6d4d5eb32aa13
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/tools/collector/src/binance_usdm_reference_collector.rs
+  - rust_hft/research-core/manifest/src/lib.rs
 dependency: none
 no_external_runtime_mutation: true
