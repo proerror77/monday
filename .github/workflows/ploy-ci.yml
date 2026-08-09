@@ -150,6 +150,10 @@ jobs:
           fi
           "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"
 
+      - name: Test collector host monitor workflow contract
+        working-directory: .
+        run: .github/scripts/test-monitor-collector-host.sh
+
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 

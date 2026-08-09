@@ -82,7 +82,10 @@ jobs:
         id: health
         run: |
           set -euo pipefail
-          remote_script='#!/usr/bin/env bash\nset -euo pipefail\nexec /opt/monday/bin/monday-collector-health.sh --json'
+          remote_script=$(printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            'exec /opt/monday/bin/monday-collector-health.sh --json')
           content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
           if ! run_json=$(aliyun ecs RunCommand \
             --RegionId "${{ env.REGION_ID }}" \
@@ -166,8 +169,13 @@ jobs:
 
           if [ -n "$health_json" ]; then
             printf '%s\n' "$health_json" > /tmp/collector-health.json
-            ok=$(printf '%s\n' "$health_json" | jq -r '.ok')
-            echo "ok=$ok" >> "$GITHUB_OUTPUT"
+            if ok=$(printf '%s\n' "$health_json" | jq -er 'if (.ok | type) == "boolean" then (.ok | tostring) else error(".ok must be boolean") end'); then
+              echo "ok=$ok" >> "$GITHUB_OUTPUT"
+            else
+              printf 'health snapshot has missing or non-boolean .ok\n' >&2
+              invocation_failed=1
+              echo "ok=unknown" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "ok=unknown" >> "$GITHUB_OUTPUT"
           fi
@@ -228,3 +236,7 @@ jobs:
             gh issue comment "$existing" --body-file /tmp/collector-health-issue.md
             printf 'Appended to existing issue: #%s\n' "$existing"
           fi
+
+      - name: Fail unhealthy monitor run
+        if: always() && steps.health.outputs.ok != 'true'
+        run: exit 1
