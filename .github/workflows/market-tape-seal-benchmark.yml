@@ -27,10 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      BENCHMARK_ROOT: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}
-      BENCHMARK_LOG: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/benchmark.log
-      CARGO_TARGET_DIR: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/target
-      TMPDIR: ${{ runner.temp }}/monday-market-tape-seal-${{ github.run_id }}-${{ github.run_attempt }}/tmp
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
@@ -51,9 +47,19 @@ jobs:
         run: |
           set -euo pipefail
           expected_prefix="${RUNNER_TEMP}/monday-market-tape-seal-"
-          [[ "$BENCHMARK_ROOT" == "$expected_prefix"* ]]
-          test ! -e "$BENCHMARK_ROOT"
-          mkdir -p "$TMPDIR" "$CARGO_TARGET_DIR"
+          benchmark_root="${expected_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          benchmark_log="${benchmark_root}/benchmark.log"
+          cargo_target_dir="${benchmark_root}/target"
+          benchmark_tmpdir="${benchmark_root}/tmp"
+          [[ "$benchmark_root" == "$expected_prefix"* ]]
+          test ! -e "$benchmark_root"
+          {
+            printf 'BENCHMARK_ROOT=%s\n' "$benchmark_root"
+            printf 'BENCHMARK_LOG=%s\n' "$benchmark_log"
+            printf 'CARGO_TARGET_DIR=%s\n' "$cargo_target_dir"
+            printf 'TMPDIR=%s\n' "$benchmark_tmpdir"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$benchmark_tmpdir" "$cargo_target_dir"
 
       - name: Checkout exact trusted main
         uses: actions/checkout@v4
@@ -119,11 +125,13 @@ jobs:
 
       - name: Publish redacted benchmark evidence
         if: ${{ steps.benchmark.outcome == 'success' }}
+        env:
+          EXACT_MAIN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           {
             printf '## Polymarket tape seal benchmark\n\n'
-            printf 'Exact main: `%s`\n\n' '${{ github.sha }}'
+            printf 'Exact main: `%s`\n\n' "$EXACT_MAIN_SHA"
             printf '```text\n'
             grep -E 'UPLOAD_PHASE phase=benchmark_|IMMUTABLE_FIXTURE_(BENCH|CLEANUP)' "$BENCHMARK_LOG"
             printf '```\n'
@@ -134,9 +142,10 @@ jobs:
         run: |
           set -euo pipefail
           expected_prefix="${RUNNER_TEMP}/monday-market-tape-seal-"
-          [[ "$BENCHMARK_ROOT" == "$expected_prefix"* ]]
-          test "$BENCHMARK_ROOT" != "$RUNNER_TEMP"
-          rm -rf -- "$BENCHMARK_ROOT"
-          test ! -e "$BENCHMARK_ROOT"
+          benchmark_root="${BENCHMARK_ROOT:-${expected_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          [[ "$benchmark_root" == "$expected_prefix"* ]]
+          test "$benchmark_root" != "$RUNNER_TEMP"
+          rm -rf -- "$benchmark_root"
+          test ! -e "$benchmark_root"
           printf 'BENCHMARK_CLEANUP verified=true\n'
           printf '\nCleanup: verified\n' >> "$GITHUB_STEP_SUMMARY"
