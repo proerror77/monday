@@ -2,7 +2,7 @@ owner: codex
 contract: account-oms-admission-710
 worktree: /Users/proerror/.codex/worktrees/cfad/monday
 branch: codex/account-oms-admission-710-owner
-base_sha: 4e1165c3c1f8cdeb9c3a715308472a0ee1e82fa9
+base_sha: 2297430bbc0831fcb1b970149a4a7cb81f903734
 allowed_files:
   - rust_hft/apps/live/src/runtime_attribution.rs
   - rust_hft/execution-gateway/adapters/adapter-backpack/src/lib.rs

@@ -742,6 +742,17 @@ impl ExecutionWorker {
         Ok(())
     }
 
+    async fn reject_intent(&mut self, client_order_id: &str, reason: impl Into<String>) {
+        self.queues
+            .send_event_reliable(ExecutionEvent::OrderReject {
+                order_id: OrderId(client_order_id.to_string()),
+                reason: reason.into(),
+                timestamp: now_micros(),
+            })
+            .await;
+        self.stats.orders_failed += 1;
+    }
+
     /// Process lifecycle-qualified intents. A placement is submitted once; ambiguous failures latch
     /// intake until reconciliation/restart instead of risking a duplicate live order.
     async fn process_order_intents(&mut self, intents: &mut Vec<OrderIntentEnvelope>) {
@@ -749,13 +760,8 @@ impl ExecutionWorker {
 
         if self.execution_clients.is_empty() {
             for envelope in intents.drain(..) {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id),
-                    reason: "没有可用的执行客户端".to_string(),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(&envelope.client_order_id, "没有可用的执行客户端")
+                    .await;
             }
             return;
         }
@@ -763,13 +769,11 @@ impl ExecutionWorker {
         for mut envelope in intents.drain(..) {
             self.drain_private_events_before_submission().await;
             if let Err(reason) = envelope.validate_pre_execution(now_micros(), None) {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id.clone()),
-                    reason: format!("execution lifecycle gate rejected intent: {reason:?}"),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    format!("execution lifecycle gate rejected intent: {reason:?}"),
+                )
+                .await;
                 continue;
             }
             if !self.accepting_intents {
@@ -777,14 +781,11 @@ impl ExecutionWorker {
                 continue;
             }
             if envelope.intent.product_type != hft_core::ProductType::Spot {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id.clone()),
-                    reason: "product requires a venue-specific account admission policy"
-                        .to_string(),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    "product requires a venue-specific account admission policy",
+                )
+                .await;
                 continue;
             }
             let simulated_client_idx = if envelope.account_id.is_none()
@@ -801,14 +802,11 @@ impl ExecutionWorker {
                                 .target_venue
                                 .is_some_and(|target| target != venue)
                             {
-                                let reject_event = ExecutionEvent::OrderReject {
-                                    order_id: OrderId(envelope.client_order_id.clone()),
-                                    reason: "simulated execution target venue does not match selected client"
-                                        .to_string(),
-                                    timestamp: now_micros(),
-                                };
-                                self.queues.send_event_reliable(reject_event).await;
-                                self.stats.orders_failed += 1;
+                                self.reject_intent(
+                                    &envelope.client_order_id,
+                                    "simulated execution target venue does not match selected client",
+                                )
+                                .await;
                                 continue;
                             }
                             envelope.account_id =
@@ -816,25 +814,20 @@ impl ExecutionWorker {
                             Some(client_idx)
                         }
                         None => {
-                            let reject_event = ExecutionEvent::OrderReject {
-                                order_id: OrderId(envelope.client_order_id.clone()),
-                                reason: "simulated execution client lacks a unique venue identity"
-                                    .to_string(),
-                                timestamp: now_micros(),
-                            };
-                            self.queues.send_event_reliable(reject_event).await;
-                            self.stats.orders_failed += 1;
+                            self.reject_intent(
+                                &envelope.client_order_id,
+                                "simulated execution client lacks a unique venue identity",
+                            )
+                            .await;
                             continue;
                         }
                     },
                     Err(reason) => {
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: format!("路由失敗: {reason}"),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            format!("路由失敗: {reason}"),
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -847,24 +840,20 @@ impl ExecutionWorker {
             let account_id = match envelope.account_id.clone() {
                 Some(account_id) => account_id,
                 None => {
-                    let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(envelope.client_order_id.clone()),
-                        reason: "missing canonical account identity".to_string(),
-                        timestamp: now_micros(),
-                    };
-                    self.queues.send_event_reliable(reject_event).await;
-                    self.stats.orders_failed += 1;
+                    self.reject_intent(
+                        &envelope.client_order_id,
+                        "missing canonical account identity",
+                    )
+                    .await;
                     continue;
                 }
             };
             if account_id.0.trim().is_empty() {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id.clone()),
-                    reason: "canonical account identity is empty".to_string(),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    "canonical account identity is empty",
+                )
+                .await;
                 continue;
             }
             let bound_client_idx = self.account_to_client.get(&account_id).copied();
@@ -888,13 +877,7 @@ impl ExecutionWorker {
                             reason,
                             "account admission rejected execution intent"
                         );
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: reason.to_string(),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(&envelope.client_order_id, reason).await;
                         continue;
                     }
                     admission_validated = true;
@@ -905,13 +888,11 @@ impl ExecutionWorker {
                     .iter()
                     .any(|client| !client.is_simulated_execution()) =>
                 {
-                    let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(envelope.client_order_id.clone()),
-                        reason: "account identity is not bound to an execution client".to_string(),
-                        timestamp: now_micros(),
-                    };
-                    self.queues.send_event_reliable(reject_event).await;
-                    self.stats.orders_failed += 1;
+                    self.reject_intent(
+                        &envelope.client_order_id,
+                        "account identity is not bound to an execution client",
+                    )
+                    .await;
                     continue;
                 }
                 _ => match simulated_client_idx
@@ -921,13 +902,11 @@ impl ExecutionWorker {
                     Ok(idx) => idx,
                     Err(reason) => {
                         warn!("客戶端選擇失敗: {}", reason);
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: format!("路由失敗: {}", reason),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            format!("路由失敗: {}", reason),
+                        )
+                        .await;
                         continue;
                     }
                 },
@@ -944,14 +923,11 @@ impl ExecutionWorker {
                             expected_client_idx = *expected_client_idx,
                             "account identity does not match selected execution client"
                         );
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: "account identity does not match selected execution client"
-                                .to_string(),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            "account identity does not match selected execution client",
+                        )
+                        .await;
                         continue;
                     }
                     None => {
@@ -959,14 +935,11 @@ impl ExecutionWorker {
                             account_id = %account_id.0,
                             "account identity is not bound to an execution client"
                         );
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: "account identity is not bound to an execution client"
-                                .to_string(),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            "account identity is not bound to an execution client",
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -983,13 +956,7 @@ impl ExecutionWorker {
                             reason,
                             "account admission rejected execution intent"
                         );
-                        let reject_event = ExecutionEvent::OrderReject {
-                            order_id: OrderId(envelope.client_order_id.clone()),
-                            reason: reason.to_string(),
-                            timestamp: now_micros(),
-                        };
-                        self.queues.send_event_reliable(reject_event).await;
-                        self.stats.orders_failed += 1;
+                        self.reject_intent(&envelope.client_order_id, reason).await;
                         continue;
                     }
                 }
@@ -4192,6 +4159,12 @@ mod tests {
         let venue_mismatch = AccountId("venue-mismatch-admission".to_string());
         let environment_mismatch = AccountId("environment-mismatch-admission".to_string());
         let product_mismatch = AccountId("product-mismatch-admission".to_string());
+        let intent_venue_mismatch = AccountId("intent-venue-mismatch-admission".to_string());
+        let blank_credential = AccountId("blank-credential-admission".to_string());
+        let incomplete_evidence = AccountId("incomplete-evidence-admission".to_string());
+        let no_spot_capability = AccountId("no-spot-capability-admission".to_string());
+        let zero_open_orders = AccountId("zero-open-orders-admission".to_string());
+        let unpriced = AccountId("unpriced-admission".to_string());
         let ready = AccountId("ready-admission".to_string());
         for (account_id, symbol) in [
             (&missing, "MISSING"),
@@ -4205,10 +4178,22 @@ mod tests {
             (&venue_mismatch, "VENUE_MISMATCH"),
             (&environment_mismatch, "ENVIRONMENT_MISMATCH"),
             (&product_mismatch, "PRODUCT_MISMATCH"),
+            (&intent_venue_mismatch, "INTENT_VENUE_MISMATCH"),
+            (&blank_credential, "BLANK_CREDENTIAL"),
+            (&incomplete_evidence, "INCOMPLETE_EVIDENCE"),
+            (&no_spot_capability, "NO_SPOT_CAPABILITY"),
+            (&zero_open_orders, "ZERO_OPEN_ORDERS"),
+            (&unpriced, "UNPRICED"),
             (&ready, "READY"),
         ] {
+            let mut intent = create_test_intent(symbol);
+            if symbol == "INTENT_VENUE_MISMATCH" {
+                intent.target_venue = Some(VenueId::BINANCE);
+            } else if symbol == "UNPRICED" {
+                intent.price = None;
+            }
             engine_queues
-                .send_intent(account_id.clone(), create_test_intent(symbol))
+                .send_intent(account_id.clone(), intent)
                 .expect("queue account-gated intent");
         }
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -4299,6 +4284,46 @@ mod tests {
             .expect("product-mismatch admission")
             .product_type = ProductType::TokenizedSecuritySpot;
 
+        bind_ready_spot_admission(
+            &mut worker,
+            intent_venue_mismatch.clone(),
+            0,
+            VenueId::BYBIT,
+        );
+
+        bind_ready_spot_admission(&mut worker, blank_credential.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&blank_credential)
+            .expect("blank-credential admission")
+            .credential_reference = "   ".to_string();
+
+        bind_ready_spot_admission(&mut worker, incomplete_evidence.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&incomplete_evidence)
+            .expect("incomplete-evidence admission")
+            .readback
+            .evidence_digest = String::new();
+
+        bind_ready_spot_admission(&mut worker, no_spot_capability.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&no_spot_capability)
+            .expect("no-spot-capability admission")
+            .readback
+            .capability
+            .can_trade_crypto_spot = false;
+
+        bind_ready_spot_admission(&mut worker, zero_open_orders.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&zero_open_orders)
+            .expect("zero-open-orders admission")
+            .max_open_orders = 0;
+
+        bind_ready_spot_admission(&mut worker, unpriced.clone(), 0, VenueId::BYBIT);
+
         bind_ready_spot_admission(&mut worker, ready, 0, VenueId::BYBIT);
         let mut queued = worker.queues.receive_envelopes();
 
@@ -4328,6 +4353,12 @@ mod tests {
                 "account admission venue does not match selected execution client",
                 "account admission environment does not match execution client",
                 "account admission product scope does not match intent",
+                "intent venue does not match selected execution client",
+                "account admission has no credential reference",
+                "account admission has incomplete external evidence",
+                "account capability does not permit crypto spot execution",
+                "account open-order limit is not positive",
+                "account notional limit requires a priced intent",
             ]
         );
     }
