@@ -4,6 +4,10 @@ Description=Upload Bybit Options quote segments to OSS
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=5min
+# Segments finalize on the hour; sweep them shortly after each rotation.
+# Without this calendar entry the timer fired exactly once per boot and the
+# production spool accumulated tens of GiB of finalized segments (2026-08-09).
+OnCalendar=*-*-* *:23:00
 Persistent=true
 Unit=bybit-options-upload.service
 
