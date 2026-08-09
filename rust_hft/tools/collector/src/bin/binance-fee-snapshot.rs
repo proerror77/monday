@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use hft_collector::binance_fee_artifact::{
-    publish_fee_snapshot, BinanceFeeSnapshot, BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
+    publish_fee_snapshot, valid_binance_symbol, BinanceFeeSnapshot, BinanceInstrumentRules,
+    SideFeeBps, FEE_SCHEMA,
 };
 use integration::signing::{BinanceCredentials, BinanceSigner};
 use rust_decimal::Decimal;
@@ -54,7 +55,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let symbol = args.symbol.trim().to_ascii_uppercase();
-    if symbol.is_empty() || !args.output_root.is_absolute() {
+    if !valid_binance_symbol(&symbol) || !args.output_root.is_absolute() {
         bail!("symbol and absolute output root are required");
     }
     let credentials = BinanceCredentials::new(
@@ -133,7 +134,10 @@ async fn main() -> Result<()> {
 }
 
 fn required_env(name: &str) -> Result<String> {
-    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
+    let value = std::env::var_os(name)
+        .with_context(|| format!("{name} is required"))?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))?;
     if value.trim().is_empty() {
         bail!("{name} is empty");
     }
@@ -211,7 +215,7 @@ fn parse_spot_rules(payload: &Value, symbol: &str) -> Result<BinanceInstrumentRu
     };
     let price = filter("PRICE_FILTER")?;
     let lot = filter("LOT_SIZE")?;
-    let notional = filter("NOTIONAL").or_else(|_| filter("MIN_NOTIONAL"))?;
+    let notional = filter("NOTIONAL")?;
     Ok(BinanceInstrumentRules {
         tick_size: decimal_field(price, "tickSize")?.normalize().to_string(),
         step_size: decimal_field(lot, "stepSize")?.normalize().to_string(),
@@ -225,9 +229,9 @@ fn decimal_field(value: &Value, field: &str) -> Result<Decimal> {
     Decimal::from_str(
         value[field]
             .as_str()
-            .with_context(|| format!("Binance fee response is missing {field}"))?,
+            .with_context(|| format!("Binance response is missing {field}"))?,
     )
-    .with_context(|| format!("Binance fee response has invalid {field}"))
+    .with_context(|| format!("Binance response has invalid {field}"))
 }
 
 fn to_bps(rate: Decimal) -> String {
@@ -288,6 +292,19 @@ mod tests {
     fn signed_requests_cannot_target_an_overridden_host_or_symbol() {
         let args = "binance-fee-snapshot --market spot --symbol BTCUSDT --output-root /tmp/fees --api-base https://example.com";
         assert!(Args::try_parse_from(args.split_whitespace()).is_err());
+        assert!(!valid_binance_symbol("BTCUSDT&symbol=ETHUSDT"));
         assert!(validate_response_symbol(&json!({"symbol":"ETHUSDT"}), "BTCUSDT").is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_min_notional_filter() {
+        let payload = json!({"symbols":[{
+            "symbol":"BTCUSDT", "status":"TRADING", "filters":[
+                {"filterType":"PRICE_FILTER", "tickSize":"0.01"},
+                {"filterType":"LOT_SIZE", "stepSize":"0.00001"},
+                {"filterType":"MIN_NOTIONAL", "minNotional":"5"}
+            ]
+        }]});
+        assert!(parse_spot_rules(&payload, "BTCUSDT").is_err());
     }
 }

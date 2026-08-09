@@ -45,12 +45,7 @@ impl BinanceFeeSnapshot {
         if self.schema != FEE_SCHEMA
             || self.venue != "binance"
             || !matches!(self.market.as_str(), "spot" | "usdm")
-            || self.symbol.is_empty()
-            || self.symbol.len() > 32
-            || !self
-                .symbol
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || !valid_binance_symbol(&self.symbol)
             || self.received_at < self.requested_at
             || !valid_digest(&self.account_fingerprint)
             || !self.maker_fee_bps.valid()
@@ -325,10 +320,24 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+pub fn valid_binance_symbol(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn path_c_string(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("path contains a NUL byte: {}", path.display()))
+}
+
 #[cfg(target_os = "linux")]
 fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let target = CString::new(target.as_os_str().as_bytes())?;
+    let source = path_c_string(source)?;
+    let target = path_c_string(target)?;
+    // SAFETY: both C strings are NUL-terminated and live for the call.
     if unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
@@ -346,8 +355,9 @@ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let target = CString::new(target.as_os_str().as_bytes())?;
+    let source = path_c_string(source)?;
+    let target = path_c_string(target)?;
+    // SAFETY: both C strings are NUL-terminated and live for the call.
     if unsafe {
         libc::renameatx_np(
             libc::AT_FDCWD,
