@@ -39,8 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
-alpha-domain = { path = "../../alpha-harness/domain" }
-ed25519-dalek = { workspace = true }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
 polymarket-tape-contract = { path = "../../shared/polymarket-tape" }
 

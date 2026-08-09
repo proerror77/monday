@@ -13,7 +13,6 @@ pub mod polymarket_research_import;
 pub mod polymarket_research_normalize;
 pub mod polymarket_research_select;
 pub mod polymarket_upload;
-pub mod runtime_latency_evidence;
 pub mod source_catalog;
 
 pub use feature_matrix::{
