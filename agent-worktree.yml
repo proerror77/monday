@@ -1,10 +1,12 @@
 owner: codex-root
-contract: lob-pit-trade-features
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-trade-features
-branch: codex/lob-pit-trade-features
-base_sha: a15880c940f5047ce76ca1485a48239698eb6821
+contract: cex-fee-runtime-account-binding
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/fee-account-binding
+branch: codex/fee-account-binding
+base_sha: 02968ad2fba0ab4ac46927904046009fc0f33ed7
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
-dependency: PR #781 merged as a15880c940f5047ce76ca1485a48239698eb6821
+  - rust_hft/research-core/manifest/src/lib.rs
+  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+  - rust_hft/tools/collector/src/binance_fee_artifact.rs
+dependency: none
 no_external_runtime_mutation: true

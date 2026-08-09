@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use hft_collector::binance_fee_artifact::{
-    publish_fee_snapshot, valid_binance_symbol, BinanceFeeSnapshot, BinanceInstrumentRules,
-    SideFeeBps, FEE_SCHEMA,
+    publish_fee_snapshot, valid_binance_symbol, valid_runtime_account_id, BinanceFeeSnapshot,
+    BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
 };
 use integration::signing::{BinanceCredentials, BinanceSigner};
 use rust_decimal::Decimal;
@@ -48,6 +48,8 @@ struct Args {
     #[arg(long)]
     symbol: String,
     #[arg(long)]
+    account_id: String,
+    #[arg(long)]
     output_root: PathBuf,
 }
 
@@ -55,8 +57,11 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let symbol = args.symbol.trim().to_ascii_uppercase();
-    if !valid_binance_symbol(&symbol) || !args.output_root.is_absolute() {
-        bail!("symbol and absolute output root are required");
+    if !valid_binance_symbol(&symbol)
+        || !valid_runtime_account_id(&args.account_id)
+        || !args.output_root.is_absolute()
+    {
+        bail!("symbol, account id, and absolute output root are required");
     }
     let credentials = BinanceCredentials::new(
         required_env("HFT_SECRET_BINANCE_API_KEY")?,
@@ -107,6 +112,7 @@ async fn main() -> Result<()> {
             venue: "binance".to_string(),
             market: args.market.name().to_string(),
             symbol,
+            runtime_account_id: args.account_id,
             account_fingerprint,
             maker_fee_bps,
             taker_fee_bps,

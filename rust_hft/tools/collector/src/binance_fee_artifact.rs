@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const FEE_SCHEMA: &str = "binance.fee-snapshot.v1";
+pub const FEE_SCHEMA: &str = "binance.fee-snapshot.v2";
 const DATA_NAME: &str = "fee.json";
 const MANIFEST_NAME: &str = "fee.json.manifest.json";
 const SUCCESS_NAME: &str = "fee.json._SUCCESS";
@@ -29,6 +29,7 @@ pub struct BinanceFeeSnapshot {
     pub venue: String,
     pub market: String,
     pub symbol: String,
+    pub runtime_account_id: String,
     pub account_fingerprint: String,
     pub maker_fee_bps: SideFeeBps,
     pub taker_fee_bps: SideFeeBps,
@@ -46,6 +47,7 @@ impl BinanceFeeSnapshot {
             || self.venue != "binance"
             || !matches!(self.market.as_str(), "spot" | "usdm")
             || !valid_binance_symbol(&self.symbol)
+            || !valid_runtime_account_id(&self.runtime_account_id)
             || self.received_at < self.requested_at
             || !valid_digest(&self.account_fingerprint)
             || !self.maker_fee_bps.valid()
@@ -115,6 +117,14 @@ fn nonnegative_decimal(value: &str) -> bool {
         .is_ok_and(|value| value >= rust_decimal::Decimal::ZERO)
 }
 
+pub fn valid_runtime_account_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishedFeeArtifact {
     pub data_path: PathBuf,
@@ -132,6 +142,7 @@ struct FeeManifest {
     venue: String,
     market: String,
     symbol: String,
+    runtime_account_id: String,
     account_fingerprint: String,
     file: String,
     bytes: u64,
@@ -173,11 +184,12 @@ pub fn publish_fee_snapshot(
     let manifest_path = staging.path().join(MANIFEST_NAME);
     let success_path = staging.path().join(SUCCESS_NAME);
     let manifest = FeeManifest {
-        schema: "binance.fee-artifact-manifest.v1".to_string(),
+        schema: "binance.fee-artifact-manifest.v2".to_string(),
         data_schema: FEE_SCHEMA.to_string(),
         venue: "binance".to_string(),
         market: snapshot.market.clone(),
         symbol: snapshot.symbol.clone(),
+        runtime_account_id: snapshot.runtime_account_id.clone(),
         account_fingerprint: snapshot.account_fingerprint.clone(),
         file: DATA_NAME.to_string(),
         bytes: data.len() as u64,
@@ -234,11 +246,12 @@ pub fn verify_fee_artifact(
     let manifest: FeeManifest = serde_json::from_slice(&manifest_bytes)?;
     let snapshot: BinanceFeeSnapshot = serde_json::from_slice(&data)?;
     snapshot.validate()?;
-    if manifest.schema != "binance.fee-artifact-manifest.v1"
+    if manifest.schema != "binance.fee-artifact-manifest.v2"
         || manifest.data_schema != FEE_SCHEMA
         || manifest.venue != snapshot.venue
         || manifest.market != snapshot.market
         || manifest.symbol != snapshot.symbol
+        || manifest.runtime_account_id != snapshot.runtime_account_id
         || manifest.account_fingerprint != snapshot.account_fingerprint
         || manifest.file != DATA_NAME
         || manifest.bytes != data.len() as u64
@@ -394,6 +407,7 @@ mod tests {
                 venue: "binance".to_string(),
                 market: "spot".to_string(),
                 symbol: "BTCUSDT".to_string(),
+                runtime_account_id: "binance-primary".to_string(),
                 account_fingerprint: "a".repeat(64),
                 maker_fee_bps: SideFeeBps {
                     buy: "10".to_string(),
