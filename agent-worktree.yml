@@ -2,12 +2,12 @@ owner: codex-root
 contract: runtime-latency-verifier
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-latency-evidence
 branch: codex/runtime-latency-evidence
-base_sha: 58494e6124996b6f73d33ed7ba84cbf01ddc77c5
+base_sha: afc533b87af9e5e961a93e17dba5a5d7815dac38
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
   - rust_hft/tools/collector/Cargo.toml
   - rust_hft/tools/collector/src/lib.rs
   - rust_hft/tools/collector/src/runtime_latency_evidence.rs
-dependency: PR #787 at 58494e6124996b6f73d33ed7ba84cbf01ddc77c5
+dependency: PR #787 at afc533b87af9e5e961a93e17dba5a5d7815dac38
 no_external_runtime_mutation: true

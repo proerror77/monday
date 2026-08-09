@@ -109,6 +109,10 @@ name = "binance-usdm-reference-upload"
 path = "src/bin/binance-usdm-reference-upload.rs"
 
 [[bin]]
+name = "binance-fee-snapshot-upload"
+path = "src/bin/binance-fee-snapshot-upload.rs"
+
+[[bin]]
 name = "binance-fee-snapshot"
 path = "src/bin/binance-fee-snapshot.rs"
 
