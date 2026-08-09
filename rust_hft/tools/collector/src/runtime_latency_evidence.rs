@@ -29,6 +29,7 @@ pub fn verify_runtime_latency_evidence(
     trusted_keys_sha256: &str,
     deployment_id: &str,
     symbol: &str,
+    account_fingerprint: &str,
     available_before: DateTime<Utc>,
 ) -> Result<VerifiedRuntimeLatencyEvidence> {
     let feedback_bytes = read_sha256_anchored(feedback_log, feedback_log_sha256, "feedback log")?;
@@ -54,8 +55,14 @@ pub fn verify_runtime_latency_evidence(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    if deployment_id.trim().is_empty() || symbol.trim().is_empty() {
-        bail!("runtime feedback deployment and symbol are required");
+    if deployment_id.trim().is_empty()
+        || symbol.trim().is_empty()
+        || account_fingerprint.len() != 64
+        || !account_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("runtime feedback deployment, symbol, and account fingerprint are required");
     }
 
     let mut observations = Vec::new();
@@ -77,6 +84,7 @@ pub fn verify_runtime_latency_evidence(
             || event.kind != AttributionKind::Fill
             || event.outcome != AttributionOutcome::Healthy
             || event.deployment_id != deployment_id
+            || event.account_id.as_deref() != Some(account_fingerprint)
             || event.venue.as_deref() != Some("binance")
             || !event
                 .symbol
@@ -195,7 +203,7 @@ mod tests {
             kind: AttributionKind::Fill,
             strategy_id: None,
             order_id: Some("order-1".to_string()),
-            account_id: Some("account-1".to_string()),
+            account_id: Some("a".repeat(64)),
             venue: Some("binance".to_string()),
             symbol: Some("BTCUSDT".to_string()),
             metrics: BTreeMap::from([
@@ -228,6 +236,7 @@ mod tests {
             &keys_sha,
             "deployment-1",
             "BTCUSDT",
+            &"a".repeat(64),
             DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -249,6 +258,7 @@ mod tests {
             &keys_sha,
             "deployment-1",
             "BTCUSDT",
+            &"a".repeat(64),
             DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                 .unwrap()
                 .with_timezone(&Utc),
