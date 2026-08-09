@@ -458,11 +458,11 @@ mod tests {
 
     #[test]
     fn dataset_rejects_costs_that_do_not_match_the_bound_protocol() {
-        let mut rows = rows(50);
-        rows[0].fee_bps = 2.0;
+        let mut fee_rows = rows(50);
+        fee_rows[0].fee_bps = 2.0;
 
         assert_eq!(
-            prepare_dataset(rows, &protocol()).unwrap_err(),
+            prepare_dataset(fee_rows, &protocol()).unwrap_err(),
             EvaluationError::ProtocolMismatch
         );
 
