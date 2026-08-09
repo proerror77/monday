@@ -1,4 +1,4 @@
-use alpha_domain::{
+use crate::{
     verify_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
     SignedRuntimeAttributionEvent,
 };
@@ -15,6 +15,7 @@ use std::{
 
 const MAX_FEEDBACK_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SELECTED_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRUSTED_KEYS_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedRuntimeLatencyEvidence {
@@ -110,6 +111,13 @@ pub fn verify_runtime_latency_evidence(
             verify_runtime_attribution_event(&signed, &trusted_keys).with_context(|| {
                 format!("runtime feedback line {line_number} failed signature verification")
             })?;
+        let canonical = serde_json::to_vec(&signed)?;
+        if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
+            if previous != canonical {
+                bail!("runtime feedback contains conflicting duplicate event IDs");
+            }
+            continue;
+        }
         if event.mode != AttributionMode::LiveSmall
             || event.kind != AttributionKind::Fill
             || event.outcome != AttributionOutcome::Healthy
@@ -146,13 +154,6 @@ pub fn verify_runtime_latency_evidence(
         };
         if !arrival_slippage_bps.is_finite() || arrival_slippage_bps < 0.0 {
             bail!("runtime feedback arrival slippage is invalid");
-        }
-        let canonical = serde_json::to_vec(&signed)?;
-        if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
-            if previous != canonical {
-                bail!("runtime feedback contains conflicting duplicate event IDs");
-            }
-            continue;
         }
         observations.push((
             event.observed_at,
@@ -213,8 +214,24 @@ pub fn verify_runtime_latency_evidence(
 
 fn read_sha256_anchored(path: &Path, expected: &str, label: &str) -> Result<Vec<u8>> {
     let expected = expected_sha256(expected, label)?;
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {label}"))?;
-    if hex::encode(Sha256::digest(&bytes)) != expected {
+    let mut source = File::open(path).with_context(|| format!("failed to read {label}"))?;
+    let mut bytes = Vec::new();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {label}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAX_TRUSTED_KEYS_BYTES {
+            bail!("{label} exceeds the size limit");
+        }
+        digest.update(&buffer[..read]);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    if hex::encode(digest.finalize()) != expected {
         bail!("{label} bytes do not match the trusted digest anchor");
     }
     Ok(bytes)
@@ -253,7 +270,7 @@ fn percentile<T: Copy>(sorted: &[T], percentile: usize) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::{
+    use crate::{
         sign_runtime_attribution_event, RuntimeAttributionEvent, SignedRuntimeAttributionEvent,
     };
     use ed25519_dalek::SigningKey;
@@ -361,6 +378,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_trusted_key_input() {
+        let (_directory, log, log_sha, keys, _keys_sha) = write_fixture(AttributionMode::LiveSmall);
+        let bytes = vec![b' '; MAX_TRUSTED_KEYS_BYTES + 1];
+        std::fs::write(&keys, &bytes).unwrap();
+
+        let error = verify_runtime_latency_evidence(
+            &log,
+            &log_sha,
+            &keys,
+            &hex::encode(Sha256::digest(&bytes)),
+            "deployment-1",
+            "spot",
+            "BTCUSDT",
+            "binance-main",
+            DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
     fn rejects_usdm_without_a_derivatives_execution_path() {
         let (_directory, log, log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
         assert!(verify_runtime_latency_evidence(
@@ -405,6 +446,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(evidence.observations, 1);
+    }
+
+    #[test]
+    fn rejects_conflicting_event_even_when_one_record_is_filtered_out() {
+        let (_directory, log, _log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
+        let signed: SignedRuntimeAttributionEvent =
+            serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+        let mut filtered = signed.event.clone();
+        filtered.deployment_id = "other-deployment".to_string();
+        let filtered =
+            sign_runtime_attribution_event(filtered, "key-1", &SigningKey::from_bytes(&[7_u8; 32]))
+                .unwrap();
+        let mut bytes = serde_json::to_vec(&filtered).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&std::fs::read(&log).unwrap());
+        std::fs::write(&log, &bytes).unwrap();
+
+        assert!(verify_runtime_latency_evidence(
+            &log,
+            &hex::encode(Sha256::digest(&bytes)),
+            &keys,
+            &keys_sha,
+            "deployment-1",
+            "spot",
+            "BTCUSDT",
+            "binance-main",
+            DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .is_err());
     }
 
     #[test]

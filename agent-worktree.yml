@@ -6,8 +6,10 @@ base_sha: 0bd446df30d7068b696d8033159b9e070983df73
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
+  - rust_hft/alpha-harness/domain/Cargo.toml
+  - rust_hft/alpha-harness/domain/src/lib.rs
+  - rust_hft/alpha-harness/domain/src/runtime_latency_evidence.rs
   - rust_hft/tools/collector/Cargo.toml
   - rust_hft/tools/collector/src/lib.rs
-  - rust_hft/tools/collector/src/runtime_latency_evidence.rs
 dependency: PR #787 merged into 0bd446df30d7068b696d8033159b9e070983df73
 no_external_runtime_mutation: true
