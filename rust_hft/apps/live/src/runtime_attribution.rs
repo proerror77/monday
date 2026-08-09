@@ -438,7 +438,7 @@ fn execution_attribution(
             if let Some(requested_price) = metadata.requested_price {
                 let requested = finite_metric("requested_price", requested_price.to_f64())?;
                 let fill = finite_metric("fill_price", price.to_f64())?;
-                if requested > 0.0 {
+                if requested > 0.0 && fill > 0.0 {
                     let signed = match metadata.side {
                         Side::Buy => fill / requested - 1.0,
                         Side::Sell => requested / fill - 1.0,
