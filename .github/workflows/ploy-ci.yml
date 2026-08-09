@@ -154,6 +154,10 @@ jobs:
         working-directory: .
         run: .github/scripts/test-monitor-collector-host.sh
 
+      - name: Test one-shot market tape seal benchmark contract
+        working-directory: .
+        run: .github/scripts/test-market-tape-seal-benchmark.sh
+
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 
