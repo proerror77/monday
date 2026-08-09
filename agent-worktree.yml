@@ -2,7 +2,7 @@ owner: codex
 contract: cex-research-evaluator-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-evaluator-v2
 branch: codex/cex-research-evaluator-v2
-base_sha: e5f335e918fa1130bc196900e529ef3992e48275
+base_sha: a15880c940f5047ce76ca1485a48239698eb6821
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
@@ -14,5 +14,5 @@ allowed_files:
   - rust_hft/alpha-harness/engine/src/formula_evaluator.rs
   - rust_hft/research-core/manifest/Cargo.toml
   - rust_hft/research-core/manifest/src/lib.rs
-dependency: PR #781
+dependency: PR #781 merged as a15880c940f5047ce76ca1485a48239698eb6821
 no_external_runtime_mutation: true
