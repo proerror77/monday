@@ -629,14 +629,25 @@ struct ArtifactBytes<'a> {
     success: &'a [u8],
 }
 
-fn recording_semantics() -> RecordingSemantics {
-    RecordingSemantics {
+fn recording_semantics(inputs: &ResearchSegmentValidationReport) -> Result<RecordingSemantics> {
+    let sample_ms = inputs.market.recording_policy["quote_sample_ms"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("validated market quote_sample_ms is missing"))?;
+    let replay_scope = match sample_ms {
+        0 => "complete_full_depth_normalized_hour_segment",
+        1_000 => "complete_full_depth_sampled_normalized_hour_segment",
+        _ => bail!("validated market quote_sample_ms is unsupported"),
+    };
+    if inputs.market.replay_scope != replay_scope {
+        bail!("validated market replay scope does not match its sampling policy");
+    }
+    Ok(RecordingSemantics {
         orderbook: OrderBookSemantics {
             level: "L2",
             depth: "full visible depth as received",
-            quote_sample_ms: 1_000,
+            quote_sample_ms: sample_ms,
             venue_depth_complete: true,
-            temporal_updates_complete: false,
+            temporal_updates_complete: sample_ms == 0,
             l3_order_ids_available: false,
             queue_position_modeled: false,
             endogenous_impact_modeled: false,
@@ -646,7 +657,7 @@ fn recording_semantics() -> RecordingSemantics {
         references: "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)",
         settlement: "gamma_api_closed_market closed-market evidence joined by exact market_id",
         availability_clock: "point-in-time rows expose the latest validated recorded or retrieved clock as available_at",
-    }
+    })
 }
 
 fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
@@ -692,8 +703,13 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
 }
 
 fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u8>> {
+    let recording_semantics = recording_semantics(&report.validated_inputs)?;
     let manifest = PolymarketEvidenceManifest {
-        schema: "monday.polymarket.evidence_artifact.v3",
+        schema: if recording_semantics.orderbook.quote_sample_ms == 0 {
+            "monday.polymarket.evidence_artifact.v4"
+        } else {
+            "monday.polymarket.evidence_artifact.v3"
+        },
         file,
         format: "ndjson",
         content_sha256: &report.content_sha256,
@@ -709,7 +725,7 @@ fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u
         event_selection: report.event_selection,
         evidence_scope: "immutable collector evidence only; not an execution authorization or evaluator label artifact",
         content_digest_semantics: CONTENT_DIGEST_SEMANTICS,
-        recording_semantics: recording_semantics(),
+        recording_semantics,
         trust_boundary: report.trust_boundary,
         validated_inputs: &report.validated_inputs,
     };
@@ -748,10 +764,14 @@ fn candidate_manifest_bytes(
     report: &PolymarketCandidateEvidenceReport,
     file: &str,
 ) -> Result<Vec<u8>> {
-    let mut semantics = recording_semantics();
+    let mut semantics = recording_semantics(&report.validated_inputs)?;
     semantics.trades = "canonical v2 records when present; a collector completion proof is verified when present but may be absent";
     let manifest = serde_json::json!({
-        "schema": "monday.polymarket.candidate_evidence_artifact.v1",
+        "schema": if semantics.orderbook.quote_sample_ms == 0 {
+            "monday.polymarket.candidate_evidence_artifact.v2"
+        } else {
+            "monday.polymarket.candidate_evidence_artifact.v1"
+        },
         "file": file,
         "format": "ndjson",
         "content_sha256": report.content_sha256,
@@ -1299,9 +1319,8 @@ fn publish_polymarket_evidence_with(
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
-    use crate::polymarket_research_import::{
-        ResearchSegmentValidationReport, SegmentIdentity, TradeCompletionIdentity,
-    };
+    use crate::polymarket_research_import::TradeCompletionIdentity;
+    use crate::polymarket_research_import::{ResearchSegmentValidationReport, SegmentIdentity};
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -1356,9 +1375,9 @@ mod tests {
             configuration_sha256: "5".repeat(64),
         }
     }
-    #[cfg(target_os = "linux")]
     fn candidate_evidence(market_id: &str) -> NormalizedPolymarketCandidateEvidence {
         fn segment(dataset: &str) -> SegmentIdentity {
+            let is_reference = dataset == "crypto_expiry_reference";
             SegmentIdentity {
                 schema: "monday.polymarket.raw.v1".into(),
                 venue: "polymarket".into(),
@@ -1375,8 +1394,17 @@ mod tests {
                 start_recorded_at: "2026-07-17T05:30:00Z".into(),
                 end_recorded_at: "2026-07-17T05:35:00Z".into(),
                 source_file: format!("{dataset}.ndjson"),
-                replay_scope: "fixture".into(),
-                recording_policy: serde_json::json!({}),
+                replay_scope: if is_reference {
+                    "complete_reference_hour_segment"
+                } else {
+                    "complete_full_depth_sampled_normalized_hour_segment"
+                }
+                .into(),
+                recording_policy: serde_json::json!({
+                    "quote_sample_ms": if is_reference { 0 } else { 1_000 },
+                    "quote_depth_levels": 0,
+                    "event_scoped_quotes": true,
+                }),
                 record_id_versions: serde_json::json!([]),
                 event_types: BTreeMap::new(),
                 trade_completions: BTreeMap::new(),
@@ -1415,6 +1443,64 @@ mod tests {
             },
             ndjson,
         }
+    }
+
+    #[test]
+    fn versioned_manifests_bind_tick_level_recording_semantics() {
+        let mut candidate = candidate_evidence("market-1");
+        candidate.report.validated_inputs.market.recording_policy["quote_sample_ms"] =
+            serde_json::json!(0);
+        candidate.report.validated_inputs.market.replay_scope =
+            "complete_full_depth_normalized_hour_segment".into();
+        let candidate_manifest: serde_json::Value = serde_json::from_slice(
+            &candidate_manifest_bytes(&candidate.report, "candidate.ndjson").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_manifest["schema"],
+            "monday.polymarket.candidate_evidence_artifact.v2"
+        );
+        assert_eq!(
+            candidate_manifest["recording_semantics"]["orderbook"]["quote_sample_ms"],
+            0
+        );
+        assert_eq!(
+            candidate_manifest["recording_semantics"]["orderbook"]["temporal_updates_complete"],
+            true
+        );
+
+        let evidence = PolymarketEvidenceReport {
+            schema: "monday.polymarket.normalized_evidence.v2",
+            content_sha256: "0".repeat(64),
+            content_bytes: 5,
+            rows: 5,
+            events: 1,
+            surface_counts: SURFACES
+                .into_iter()
+                .map(|surface| (surface.to_owned(), 1))
+                .collect(),
+            event_start_gte: "2026-07-17T05:30:00Z".into(),
+            event_start_lt: "2026-07-17T05:35:00Z".into(),
+            market_ids: vec!["market-1".into()],
+            symbols: vec!["BTCUSDT".into()],
+            window_secs: 300,
+            event_selection: EXPLICIT_MARKET_ID_SELECTION,
+            trust_boundary: "fixture",
+            validated_inputs: candidate.report.validated_inputs,
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes(&evidence, "evidence.ndjson").unwrap()).unwrap();
+        assert_eq!(manifest["schema"], "monday.polymarket.evidence_artifact.v4");
+
+        let mut mismatched = candidate_evidence("market-1");
+        mismatched.report.validated_inputs.market.recording_policy["quote_sample_ms"] =
+            serde_json::json!(0);
+        assert!(
+            candidate_manifest_bytes(&mismatched.report, "mismatch.ndjson")
+                .unwrap_err()
+                .to_string()
+                .contains("replay scope")
+        );
     }
     fn assert_classification(
         event: PolymarketEventQualificationInput,
@@ -1654,8 +1740,17 @@ mod tests {
                 start_recorded_at: "2026-07-17T05:00:00Z".into(),
                 end_recorded_at: "2026-07-17T05:00:01Z".into(),
                 source_file: format!("{dataset}.ndjson"),
-                replay_scope: "fixture".into(),
-                recording_policy: serde_json::json!({}),
+                replay_scope: if is_reference {
+                    "complete_reference_hour_segment"
+                } else {
+                    "complete_full_depth_sampled_normalized_hour_segment"
+                }
+                .into(),
+                recording_policy: serde_json::json!({
+                    "quote_sample_ms": if is_reference { 0 } else { 1_000 },
+                    "quote_depth_levels": 0,
+                    "event_scoped_quotes": true,
+                }),
                 record_id_versions: if is_reference {
                     serde_json::json!(["v2"])
                 } else {
@@ -1826,7 +1921,10 @@ mod tests {
 
     #[test]
     fn manifest_semantics_disclose_content_digest_and_recording_limits() {
-        let semantics = serde_json::to_value(recording_semantics()).unwrap();
+        let evidence = candidate_evidence("market-1");
+        let semantics =
+            serde_json::to_value(recording_semantics(&evidence.report.validated_inputs).unwrap())
+                .unwrap();
         let orderbook = &semantics["orderbook"];
         assert_eq!(orderbook["level"], "L2");
         assert_eq!(orderbook["quote_sample_ms"], 1_000);

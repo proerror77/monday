@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 const MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v2";
 const EXPLICIT_MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v3";
+const TICK_EXPLICIT_MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v4";
 const INPUT_SCHEMA: &str = "monday.polymarket.research_segment_validation.v1";
 const INPUT_SCHEMA_V2: &str = "monday.polymarket.research_segment_validation.v2";
 const ROW_SCHEMA: &str = "monday.polymarket.evidence_row.v1";
@@ -33,6 +34,7 @@ const EXPLICIT_EVENT_SELECTION: &str =
 const EVIDENCE_SCOPE: &str =
     "immutable collector evidence only; not an execution authorization or evaluator label artifact";
 const CANDIDATE_MANIFEST_SCHEMA: &str = "monday.polymarket.candidate_evidence_artifact.v1";
+const TICK_CANDIDATE_MANIFEST_SCHEMA: &str = "monday.polymarket.candidate_evidence_artifact.v2";
 const CANDIDATE_EVIDENCE_SCOPE: &str =
     "untrusted producer candidate only; not Ready, execution authorization, or evaluator labels";
 const CANDIDATE_TRUST_BOUNDARY: &str =
@@ -268,6 +270,28 @@ struct OrderBookSemantics {
     queue_position_modeled: bool,
     endogenous_impact_modeled: bool,
     capacity_modeled: bool,
+}
+
+#[derive(Clone, Copy)]
+enum MarketTapeContract {
+    Sampled,
+    Tick,
+}
+
+impl MarketTapeContract {
+    fn quote_sample_ms(self) -> u64 {
+        match self {
+            Self::Sampled => 1_000,
+            Self::Tick => 0,
+        }
+    }
+
+    fn replay_scope(self) -> &'static str {
+        match self {
+            Self::Sampled => "complete_full_depth_sampled_normalized_hour_segment",
+            Self::Tick => "complete_full_depth_normalized_hour_segment",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -731,6 +755,11 @@ fn validate_candidate_manifest(
     success: &[u8],
 ) -> Result<()> {
     let orderbook = &manifest.recording_semantics.orderbook;
+    let tape_contract = match manifest.schema.as_str() {
+        CANDIDATE_MANIFEST_SCHEMA => MarketTapeContract::Sampled,
+        TICK_CANDIDATE_MANIFEST_SCHEMA => MarketTapeContract::Tick,
+        _ => bail!("unsupported immutable candidate evidence manifest contract"),
+    };
     let keys = manifest
         .surface_counts
         .keys()
@@ -747,8 +776,7 @@ fn validate_candidate_manifest(
         .contract_rows
         .checked_add(surface_rows)
         .ok_or_else(|| anyhow!("candidate evidence row count overflow"))?;
-    if manifest.schema != CANDIDATE_MANIFEST_SCHEMA
-        || manifest.format != "ndjson"
+    if manifest.format != "ndjson"
         || manifest.window_secs != 300
         || manifest.event_selection != EXPLICIT_EVENT_SELECTION
         || manifest.evidence_scope != CANDIDATE_EVIDENCE_SCOPE
@@ -760,9 +788,9 @@ fn validate_candidate_manifest(
         || manifest.recording_semantics.availability_clock != AVAILABILITY_SEMANTICS
         || orderbook.level != "L2"
         || orderbook.depth != "full visible depth as received"
-        || orderbook.quote_sample_ms != 1_000
+        || orderbook.quote_sample_ms != tape_contract.quote_sample_ms()
         || !orderbook.venue_depth_complete
-        || orderbook.temporal_updates_complete
+        || orderbook.temporal_updates_complete != matches!(tape_contract, MarketTapeContract::Tick)
         || orderbook.l3_order_ids_available
         || orderbook.queue_position_modeled
         || orderbook.endogenous_impact_modeled
@@ -785,6 +813,7 @@ fn validate_candidate_manifest(
     {
         bail!("unsupported immutable candidate evidence manifest contract");
     }
+    validate_inputs(&manifest.validated_inputs, true, tape_contract, false)?;
     parse_digest(&manifest.content_sha256, "content_sha256")?;
     let lower = parse_time(&manifest.event_start_gte, "event_start_gte")?;
     let upper = parse_time(&manifest.event_start_lt, "event_start_lt")?;
@@ -854,17 +883,22 @@ fn validate_manifest(
     success: &[u8],
 ) -> Result<Option<ExplicitSelection>> {
     let orderbook = &manifest.recording_semantics.orderbook;
-    let explicit_selection = match manifest.schema.as_str() {
+    let (explicit_selection, tape_contract) = match manifest.schema.as_str() {
         MANIFEST_SCHEMA
             if manifest.market_ids.is_empty()
                 && manifest.symbols == SYMBOLS.map(str::to_owned)
                 && manifest.event_selection == EVENT_SELECTION =>
         {
-            None
+            (None, MarketTapeContract::Sampled)
         }
-        EXPLICIT_MANIFEST_SCHEMA if manifest.event_selection == EXPLICIT_EVENT_SELECTION => {
-            Some(validate_explicit_selection(manifest)?)
-        }
+        EXPLICIT_MANIFEST_SCHEMA if manifest.event_selection == EXPLICIT_EVENT_SELECTION => (
+            Some(validate_explicit_selection(manifest)?),
+            MarketTapeContract::Sampled,
+        ),
+        TICK_EXPLICIT_MANIFEST_SCHEMA if manifest.event_selection == EXPLICIT_EVENT_SELECTION => (
+            Some(validate_explicit_selection(manifest)?),
+            MarketTapeContract::Tick,
+        ),
         _ => bail!("unsupported immutable evidence manifest contract"),
     };
     if manifest.format != "ndjson"
@@ -874,9 +908,9 @@ fn validate_manifest(
         || manifest.trust_boundary != TRUST_BOUNDARY
         || orderbook.level != "L2"
         || orderbook.depth != "full visible depth as received"
-        || orderbook.quote_sample_ms != 1_000
+        || orderbook.quote_sample_ms != tape_contract.quote_sample_ms()
         || !orderbook.venue_depth_complete
-        || orderbook.temporal_updates_complete
+        || orderbook.temporal_updates_complete != matches!(tape_contract, MarketTapeContract::Tick)
         || orderbook.l3_order_ids_available
         || orderbook.queue_position_modeled
         || orderbook.endogenous_impact_modeled
@@ -888,7 +922,12 @@ fn validate_manifest(
     {
         bail!("unsupported immutable evidence manifest contract");
     }
-    validate_inputs(&manifest.validated_inputs, explicit_selection.is_some())?;
+    validate_inputs(
+        &manifest.validated_inputs,
+        explicit_selection.is_some(),
+        tape_contract,
+        true,
+    )?;
     parse_digest(&manifest.content_sha256, "content_sha256")?;
     let lower = parse_time(&manifest.event_start_gte, "event_start_gte")?;
     let upper = parse_time(&manifest.event_start_lt, "event_start_lt")?;
@@ -964,13 +1003,18 @@ fn validate_explicit_selection(manifest: &EvidenceManifest) -> Result<ExplicitSe
     })
 }
 
-fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result<()> {
+fn validate_inputs(
+    inputs: &ValidatedInputs,
+    explicit_selection: bool,
+    tape_contract: MarketTapeContract,
+    require_reference_completions: bool,
+) -> Result<()> {
     match inputs {
         ValidatedInputs::V1(inputs) => {
             if inputs.schema != INPUT_SCHEMA {
                 bail!("unsupported validated input contract");
             }
-            validate_segment(&inputs.market, "crypto_expiry")?;
+            validate_segment(&inputs.market, "crypto_expiry", tape_contract)?;
             validate_v2_event_types(
                 &inputs.market,
                 &[
@@ -978,13 +1022,16 @@ fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result
                     "event_expired",
                     "quote",
                     "reference_price",
+                    "spot_price",
+                    "agg_trade",
+                    "l2",
                 ],
             )?;
             if inputs.reference.record_id_versions != ["v2"] {
                 bail!("validated reference input must contain v2 trades");
             }
-            validate_segment(&inputs.reference, "crypto_expiry_reference")?;
-            validate_reference_event_identity(&inputs.reference)?;
+            validate_segment(&inputs.reference, "crypto_expiry_reference", tape_contract)?;
+            validate_reference_event_identity(&inputs.reference, require_reference_completions)?;
             if ["market_metadata", "polymarket_trade", "market_settlement"]
                 .iter()
                 .any(|kind| {
@@ -1008,7 +1055,7 @@ fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result
             {
                 bail!("unsupported validated input contract");
             }
-            validate_segment(&inputs.market, "crypto_expiry")?;
+            validate_segment(&inputs.market, "crypto_expiry", tape_contract)?;
             let market_event_types = if explicit_selection {
                 &[
                     "event_discovered",
@@ -1016,6 +1063,9 @@ fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result
                     "quote",
                     "quote_collection_failure",
                     "reference_price",
+                    "spot_price",
+                    "agg_trade",
+                    "l2",
                 ][..]
             } else {
                 &[
@@ -1023,13 +1073,16 @@ fn validate_inputs(inputs: &ValidatedInputs, explicit_selection: bool) -> Result
                     "event_expired",
                     "quote",
                     "reference_price",
+                    "spot_price",
+                    "agg_trade",
+                    "l2",
                 ][..]
             };
             validate_v2_event_types(&inputs.market, market_event_types)?;
             let mut reference_event_types = BTreeMap::<String, u64>::new();
             for reference in &inputs.references {
-                validate_segment(reference, "crypto_expiry_reference")?;
-                validate_reference_event_identity(reference)?;
+                validate_segment(reference, "crypto_expiry_reference", tape_contract)?;
+                validate_reference_event_identity(reference, require_reference_completions)?;
                 for (kind, count) in &reference.event_types {
                     let total = reference_event_types.entry(kind.clone()).or_default();
                     *total = total
@@ -1125,7 +1178,10 @@ fn is_completion_only_reference(reference: &SegmentIdentity) -> bool {
         })
 }
 
-fn validate_reference_event_identity(reference: &SegmentIdentity) -> Result<()> {
+fn validate_reference_event_identity(
+    reference: &SegmentIdentity,
+    require_trade_completions: bool,
+) -> Result<()> {
     validate_v2_event_types(
         reference,
         &[
@@ -1141,13 +1197,14 @@ fn validate_reference_event_identity(reference: &SegmentIdentity) -> Result<()> 
         .copied()
         .unwrap_or_default()
         > 0;
+    let completion_markers = reference
+        .event_types
+        .get("polymarket_trade_collection_complete")
+        .copied()
+        .unwrap_or_default();
     if has_trades != (reference.record_id_versions == ["v2"])
-        || reference
-            .event_types
-            .get("polymarket_trade_collection_complete")
-            .copied()
-            .unwrap_or_default()
-            != u64::try_from(reference.trade_completions.len())?
+        || ((require_trade_completions || !reference.trade_completions.is_empty())
+            && completion_markers != u64::try_from(reference.trade_completions.len())?)
     {
         bail!("validated reference trade identity is inconsistent");
     }
@@ -1172,9 +1229,16 @@ fn validate_v2_event_types(segment: &SegmentIdentity, allowed: &[&str]) -> Resul
     Ok(())
 }
 
-fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
+fn validate_segment(
+    segment: &SegmentIdentity,
+    dataset: &str,
+    tape_contract: MarketTapeContract,
+) -> Result<()> {
     let (quote_sample_ms, replay_scope) = match dataset {
-        "crypto_expiry" => (1_000, "complete_full_depth_sampled_normalized_hour_segment"),
+        "crypto_expiry" => (
+            tape_contract.quote_sample_ms(),
+            tape_contract.replay_scope(),
+        ),
         "crypto_expiry_reference" => (0, "complete_reference_hour_segment"),
         _ => unreachable!("validated input dataset is fixed by the manifest contract"),
     };
@@ -1539,6 +1603,29 @@ pub(super) mod tests {
         );
     }
 
+    fn rewrite_tick_level_mixed_contract(triplet: &PolymarketEvidenceTriplet, schema: &str) {
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["schema"] = json!(schema);
+        if schema == "monday.polymarket.evidence_artifact.v4" {
+            manifest["market_ids"] = json!(["market-1"]);
+            manifest["symbols"] = json!(["BTCUSDT"]);
+            manifest["event_selection"] = json!(EXPLICIT_EVENT_SELECTION);
+        }
+        manifest["recording_semantics"]["orderbook"]["quote_sample_ms"] = json!(0);
+        manifest["recording_semantics"]["orderbook"]["temporal_updates_complete"] = json!(true);
+        let market = &mut manifest["validated_inputs"]["market"];
+        market["recording_policy"]["quote_sample_ms"] = json!(0);
+        market["replay_scope"] = json!("complete_full_depth_normalized_hour_segment");
+        market["event_types"] = json!({"quote":2,"spot_price":1,"agg_trade":1,"l2":1});
+        market["events"] = json!(5);
+        market["end_sequence"] = json!(5);
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+    }
+
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
         let rows = SURFACES.map(|surface| {
@@ -1670,10 +1757,63 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn seals_tick_level_v4_mixed_reference_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        rewrite_tick_level_mixed_contract(&triplet, "monday.polymarket.evidence_artifact.v4");
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
     fn seals_authenticated_candidate_triplet_with_missing_surfaces() {
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_candidate_triplet(&temp);
         assert!(seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn seals_tick_level_v2_mixed_reference_candidate_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_candidate_triplet(&temp);
+        rewrite_tick_level_mixed_contract(
+            &triplet,
+            "monday.polymarket.candidate_evidence_artifact.v2",
+        );
+
+        assert!(seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn tick_level_contract_rejects_unknown_kinds_and_semantic_mismatches() {
+        let unknown_temp = tempfile::tempdir().unwrap();
+        let unknown = write_triplet(&unknown_temp);
+        rewrite_tick_level_mixed_contract(&unknown, "monday.polymarket.evidence_artifact.v4");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&unknown.manifest).unwrap()).unwrap();
+        manifest["validated_inputs"]["market"]["event_types"]["unknown"] = json!(1);
+        manifest["validated_inputs"]["market"]["events"] = json!(6);
+        manifest["validated_inputs"]["market"]["end_sequence"] = json!(6);
+        rewrite_read_only(
+            &unknown.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        assert!(seal_polymarket_evidence_triplet(&unknown, &trust(&unknown))
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported event type"));
+
+        let mismatch_temp = tempfile::tempdir().unwrap();
+        let mismatch = write_triplet(&mismatch_temp);
+        rewrite_tick_level_mixed_contract(&mismatch, "monday.polymarket.evidence_artifact.v4");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&mismatch.manifest).unwrap()).unwrap();
+        manifest["recording_semantics"]["orderbook"]["temporal_updates_complete"] = json!(false);
+        rewrite_read_only(
+            &mismatch.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        assert!(seal_polymarket_evidence_triplet(&mismatch, &trust(&mismatch)).is_err());
     }
 
     #[test]

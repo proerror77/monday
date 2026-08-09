@@ -85,18 +85,24 @@ struct ValidatedArtifact {
 
 type FileIdentity = (u64, u64, u64);
 
-const MARKET_EVENT_TYPES: [&str; 4] = [
+const MARKET_EVENT_TYPES: [&str; 7] = [
+    "agg_trade",
     "event_discovered",
     "event_expired",
+    "l2",
     "quote",
     "reference_price",
+    "spot_price",
 ];
-const EVENT_LOCAL_MARKET_EVENT_TYPES: [&str; 5] = [
+const EVENT_LOCAL_MARKET_EVENT_TYPES: [&str; 8] = [
+    "agg_trade",
     "event_discovered",
     "event_expired",
+    "l2",
     "quote",
     "quote_collection_failure",
     "reference_price",
+    "spot_price",
 ];
 const REFERENCE_EVENT_TYPES: [&str; 4] = [
     "market_metadata",
@@ -718,7 +724,10 @@ fn validate_market_policy(
             .and_then(Value::as_bool)
             != Some(true)
         || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
-        || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(1_000)
+        || !matches!(
+            manifest["recording_policy"]["quote_sample_ms"].as_u64(),
+            Some(0 | 1_000)
+        )
         || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
         || !has_only_event_types(manifest, allowed_event_types)
         || (require_evidence_surfaces
@@ -1087,7 +1096,12 @@ mod tests {
         rows
     }
 
-    fn triplet(root: &Path, dataset: &str, rows: &[Value]) -> ArtifactTriplet {
+    fn triplet_with_sample(
+        root: &Path,
+        dataset: &str,
+        rows: &[Value],
+        sample_ms: u64,
+    ) -> ArtifactTriplet {
         let raw_name = format!("market-updates.{dataset}.ndjson");
         let raw = root.join(&raw_name);
         let mut file = File::create(&raw).unwrap();
@@ -1096,7 +1110,6 @@ mod tests {
             file.write_all(b"\n").unwrap();
         }
         file.sync_all().unwrap();
-        let sample_ms = if dataset == "crypto_expiry" { 1_000 } else { 0 };
         let mut manifest = scan_tape(&raw, dataset, 0, sample_ms).unwrap();
         let compressed = root.join(format!("{raw_name}.zst"));
         let output = File::create(&compressed).unwrap();
@@ -1143,6 +1156,15 @@ mod tests {
             manifest: manifest_path,
             success,
         }
+    }
+
+    fn triplet(root: &Path, dataset: &str, rows: &[Value]) -> ArtifactTriplet {
+        triplet_with_sample(
+            root,
+            dataset,
+            rows,
+            if dataset == "crypto_expiry" { 1_000 } else { 0 },
+        )
     }
 
     fn fixture_rows(
@@ -1312,6 +1334,68 @@ mod tests {
         assert_eq!(first.market.recording_policy["quote_sample_ms"], 1_000);
         assert_eq!(first.references[0].record_id_versions, json!(["v2"]));
         assert_eq!(first.references[0].recording_policy["quote_sample_ms"], 0);
+    }
+
+    #[test]
+    fn validates_tick_level_market_with_binance_reference_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut rows = market_rows();
+        for update in [
+            json!({"kind":"spot_price","symbol":"BTCUSDT","price":"65000.25","ts":"2026-07-17T05:01:00Z"}),
+            json!({"kind":"agg_trade","symbol":"BTCUSDT","agg_trade_id":987,"price":"65000.25","quantity":"1.25","is_buyer_maker":true,"ts":"2026-07-17T05:01:01Z"}),
+            json!({"kind":"l2","symbol":"BTCUSDT","obi":0.25,"spread_bps":10,"ts":"2026-07-17T05:01:02Z"}),
+        ] {
+            rows.push(row(rows.len() as u64, update));
+        }
+        let config = ResearchSegmentValidationConfig {
+            market: triplet_with_sample(&root, "crypto_expiry", &rows, 0),
+            references: vec![triplet(
+                &root,
+                "crypto_expiry_reference",
+                &reference_rows(true),
+            )],
+        };
+
+        let report = validate_research_segments(&config).unwrap();
+
+        assert_eq!(
+            report.schema,
+            "monday.polymarket.research_segment_validation.v2"
+        );
+        assert_eq!(report.market.schema, "monday.polymarket.raw.v1");
+        assert_eq!(report.market.recording_policy["quote_sample_ms"], 0);
+        assert_eq!(
+            report.market.replay_scope,
+            "complete_full_depth_normalized_hour_segment"
+        );
+        for kind in ["spot_price", "agg_trade", "l2"] {
+            assert_eq!(report.market.event_types[kind], 1);
+        }
+    }
+
+    #[test]
+    fn tick_level_binance_rows_do_not_replace_polymarket_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut rows = market_rows()
+            .into_iter()
+            .filter(|row| row["update"]["kind"] != "reference_price")
+            .collect::<Vec<_>>();
+        rows.push(row(
+            rows.len() as u64,
+            json!({"kind":"spot_price","symbol":"BTCUSDT","price":"65000.25","ts":"2026-07-17T05:01:00Z"}),
+        ));
+        let config = ResearchSegmentValidationConfig {
+            market: triplet_with_sample(&root, "crypto_expiry", &rows, 0),
+            references: vec![triplet(
+                &root,
+                "crypto_expiry_reference",
+                &reference_rows(true),
+            )],
+        };
+
+        rejects(&config, "primary market segment");
     }
 
     #[test]
