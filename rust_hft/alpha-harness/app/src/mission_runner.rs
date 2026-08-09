@@ -17,8 +17,7 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_research_manifest::{
     CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2, ManifestId,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
 };
 use reqwest::{
     blocking::Client,
@@ -381,11 +380,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     data_mission::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
     let baseline_dataset_manifest =
         data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
-    let baseline_rows = baseline_dataset_manifest.load_rows(
-        evaluation_protocol.costs.fee_bps,
-        evaluation_protocol.costs.funding_bps,
-        evaluation_protocol.costs.latency_bps,
-    )?;
+    let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
     let baseline_context = baseline_dataset.engine_context();
     let baseline_run = evaluate_cex_baselines(
@@ -452,7 +447,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("materialization manifest is invalid JSON")?;
-    match value.get("schema_version").and_then(serde_json::Value::as_str) {
+    match value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+    {
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
             serde_json::from_value(value).context("V3 materialization manifest is invalid")
         }
@@ -785,27 +783,8 @@ fn validate_materialization(
     {
         bail!("evaluation label horizon or frequency does not match the materialization");
     }
-    let fee_bps = if validation.cross_spread {
-        &materialization.snapshot.fee_schedule.taker_fee_bps
-    } else {
-        &materialization.snapshot.fee_schedule.maker_fee_bps
-    }
-    .parse::<f64>()
-    .context("snapshot fee evidence is not numeric")?;
-    let funding_bps = materialization
-        .snapshot
-        .derivatives_reference
-        .as_ref()
-        .map(|reference| reference.evaluation_funding_bps_per_bucket.parse::<f64>())
-        .transpose()
-        .context("snapshot funding evidence is not numeric")?
-        .unwrap_or(0.0);
-    let latency_bps = materialization
-        .snapshot
-        .latency_cost
-        .p95_cost_bps
-        .parse::<f64>()
-        .context("snapshot execution latency evidence is not numeric")?;
+    let (fee_bps, funding_bps, latency_bps) =
+        data_mission::cex_snapshot_costs(&materialization.snapshot, validation.cross_spread)?;
     if validation.rebate_bps != 0.0
         || validation.fee_bps.to_bits() != fee_bps.to_bits()
         || validation.funding_bps.to_bits() != funding_bps.to_bits()
@@ -993,6 +972,14 @@ mod tests {
         CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
         CexResearchVenueV1, EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
+
+    fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
+        hft_research_manifest::CexArtifactTripletV2 {
+            data_sha256: byte.to_string().repeat(64),
+            manifest_sha256: byte.to_string().repeat(64),
+            success_sha256: byte.to_string().repeat(64),
+        }
+    }
     use chrono::{Duration as ChronoDuration, Utc};
     use hft_collector::{DataModality, PointInTimeFeatureRow};
     use std::{
@@ -1382,6 +1369,20 @@ mod tests {
             .work_dir
             .join("results/sealed-evaluations.jsonl")
             .exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_optimistic_costs_below_snapshot_evidence() {
+        let mut fixture = fixture("optimistic-snapshot-costs");
+        fixture.mission.spec.evaluation_protocol.costs.fee_bps = 0.0;
+        write_mission(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("evaluation costs do not match the verified CEX replay snapshot"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -2240,26 +2241,35 @@ mod tests {
                 min_notional: "5".to_string(),
                 available_at: first_event_time - ChronoDuration::seconds(1),
                 valid_through: last_event_time,
-                evidence_sha256: "4".repeat(64),
+                evidence: cex_triplet('4'),
             },
             fee_schedule: hft_research_manifest::CexFeeScheduleV2 {
-                maker_fee_bps: "2".to_string(),
-                taker_fee_bps: "5".to_string(),
+                maker_buy_fee_bps: "2".to_string(),
+                maker_sell_fee_bps: "2".to_string(),
+                taker_buy_fee_bps: "5".to_string(),
+                taker_sell_fee_bps: "5".to_string(),
                 available_at: first_event_time - ChronoDuration::seconds(1),
                 valid_through: last_event_time,
-                evidence_sha256: "5".repeat(64),
+                evidence: cex_triplet('5'),
             },
             derivatives_reference: Some(hft_research_manifest::CexDerivativesReferenceV2 {
-                artifact_sha256: "6".repeat(64),
-                first_available_at: first_event_time - ChronoDuration::seconds(1),
-                last_available_at: last_event_time,
-                funding_observations: 160,
-                open_interest_observations: 160,
+                funding: hft_research_manifest::CexPitSeriesEvidenceV2 {
+                    evidence: cex_triplet('6'),
+                    first_available_at: first_event_time - ChronoDuration::seconds(1),
+                    last_available_at: last_event_time,
+                    observations: 160,
+                },
+                open_interest: hft_research_manifest::CexPitSeriesEvidenceV2 {
+                    evidence: cex_triplet('7'),
+                    first_available_at: first_event_time - ChronoDuration::seconds(1),
+                    last_available_at: last_event_time,
+                    observations: 160,
+                },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
             latency_cost: hft_research_manifest::CexLatencyCostV2 {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
-                evidence_sha256: "7".repeat(64),
+                evidence: cex_triplet('8'),
                 first_observed_at: first_event_time - ChronoDuration::seconds(2),
                 last_observed_at: first_event_time - ChronoDuration::seconds(1),
                 available_at: first_event_time - ChronoDuration::seconds(1),
@@ -2514,7 +2524,9 @@ mod tests {
 
         let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
 
-        assert!(error.to_string().contains("historical V2 materialization is read-only"));
+        assert!(error
+            .to_string()
+            .contains("historical V2 materialization is read-only"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

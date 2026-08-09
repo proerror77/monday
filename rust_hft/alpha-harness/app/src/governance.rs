@@ -192,14 +192,7 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     }
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
-    let dataset = prepare_dataset(
-        manifest.load_rows(
-            args.dataset.validation.fee_bps,
-            args.dataset.validation.funding_bps,
-            args.dataset.validation.latency_bps,
-        )?,
-        &protocol,
-    )?;
+    let dataset = prepare_dataset(manifest.load_rows(&protocol.costs)?, &protocol)?;
     let evaluation = OnnxEvaluator::for_mission(&mission)
         .map_err(anyhow::Error::msg)?
         .evaluate(&model, &model_path, &dataset.engine_context())
@@ -368,11 +361,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         return Ok(existing);
     }
 
-    let rows = manifest.load_rows(
-        args.dataset.validation.fee_bps,
-        args.dataset.validation.funding_bps,
-        args.dataset.validation.latency_bps,
-    )?;
+    let rows = manifest.load_rows(&requested_protocol.costs)?;
     let dataset = prepare_dataset(rows, &requested_protocol)?;
     let proposal = EngineProposal {
         candidate_id: candidate.candidate_id.clone(),

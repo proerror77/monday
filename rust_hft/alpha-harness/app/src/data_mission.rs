@@ -1,4 +1,4 @@
-use alpha_domain::EvaluationLabelSpecV1;
+use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1};
 use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
@@ -232,20 +232,30 @@ impl RegisteredResearchDataset {
         }
     }
 
-    pub fn load_rows(
-        &self,
-        fee_bps: f64,
-        funding_bps: f64,
-        latency_bps: f64,
-    ) -> anyhow::Result<Vec<ResearchRow>> {
+    pub fn load_rows(&self, costs: &EvaluationCostsV1) -> anyhow::Result<Vec<ResearchRow>> {
         match self {
-            Self::Ohlcv(manifest) => {
-                load_research_rows(manifest, fee_bps, funding_bps, latency_bps)
-            }
-            Self::FeatureMatrix(manifest) => {
-                load_feature_research_rows(manifest, fee_bps, funding_bps, latency_bps)
-            }
-            Self::CexReplay { features, .. } => {
+            Self::Ohlcv(manifest) => load_research_rows(
+                manifest,
+                costs.fee_bps,
+                costs.funding_bps,
+                costs.latency_bps,
+            ),
+            Self::FeatureMatrix(manifest) => load_feature_research_rows(
+                manifest,
+                costs.fee_bps,
+                costs.funding_bps,
+                costs.latency_bps,
+            ),
+            Self::CexReplay {
+                admission: CexReplayAdmission::V1(_),
+                ..
+            } => bail!("historical V1 CEX replay evidence is read-only and cannot execute"),
+            Self::CexReplay {
+                admission: CexReplayAdmission::V2(manifest),
+                features,
+            } => {
+                let (fee_bps, funding_bps, latency_bps) =
+                    cex_snapshot_costs(&manifest.snapshot, costs.cross_spread)?;
                 load_feature_research_rows(features, fee_bps, funding_bps, latency_bps)
             }
         }
@@ -275,6 +285,39 @@ impl RegisteredResearchDataset {
             }
         }
     }
+}
+
+pub fn cex_snapshot_costs(
+    snapshot: &CexReplaySnapshotV2,
+    cross_spread: bool,
+) -> anyhow::Result<(f64, f64, f64)> {
+    snapshot.validate()?;
+    let fees = &snapshot.fee_schedule;
+    let (buy, sell) = if cross_spread {
+        (&fees.taker_buy_fee_bps, &fees.taker_sell_fee_bps)
+    } else {
+        (&fees.maker_buy_fee_bps, &fees.maker_sell_fee_bps)
+    };
+    let fee_bps = buy
+        .parse::<f64>()
+        .context("snapshot buy fee evidence is not numeric")?
+        .max(
+            sell.parse::<f64>()
+                .context("snapshot sell fee evidence is not numeric")?,
+        );
+    let funding_bps = snapshot
+        .derivatives_reference
+        .as_ref()
+        .map(|reference| reference.evaluation_funding_bps_per_bucket.parse::<f64>())
+        .transpose()
+        .context("snapshot funding evidence is not numeric")?
+        .unwrap_or(0.0);
+    let latency_bps = snapshot
+        .latency_cost
+        .p95_cost_bps
+        .parse::<f64>()
+        .context("snapshot execution latency evidence is not numeric")?;
+    Ok((fee_bps, funding_bps, latency_bps))
 }
 
 #[cfg(test)]
@@ -837,7 +880,19 @@ mod tests {
                 observation_frequency_millis: 60_000,
             }
         );
-        let loaded = registered.load_rows(1.0, 0.0, 0.5).unwrap();
+        let loaded = registered
+            .load_rows(&EvaluationCostsV1 {
+                fee_bps: 1.0,
+                rebate_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
+            })
+            .unwrap();
 
         assert_eq!(loaded[0].available_time, rows[0].label_available_time);
         assert_eq!(loaded[0].features["lob_imbalance"], 0.0);
