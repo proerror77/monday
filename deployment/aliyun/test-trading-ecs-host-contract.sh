@@ -556,6 +556,14 @@ chmod 0440 "$secret_root/feedback-signing-key.hex"
   SECRET_ROOT=$secret_root
   findmnt() { printf '%s\n' tmpfs; }
   validate_runtime_secrets
+  binding_activation=$tmp_dir/binding-activation
+  mkdir -p "$binding_activation/deployment"
+  printf '%s\n' '{"account_id":"wrong-account"}' \
+    >"$binding_activation/deployment/policy.json"
+  ! validate_runtime_account_binding "$binding_activation"
+  printf '%s\n' '{"account_id":"binance_main"}' \
+    >"$binding_activation/deployment/policy.json"
+  validate_runtime_account_binding "$binding_activation"
   chmod 0640 "$secret_root/runtime.env"
   sed -i.bak \
     's/example_token_with_at_least_32_chars/short_token/' \

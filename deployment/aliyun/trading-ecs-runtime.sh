@@ -370,6 +370,18 @@ validate_runtime_secrets() {
     && ! $grpc_token =~ [[:space:]]$ ]] || return 1
 }
 
+validate_runtime_account_binding() {
+  local activation_dir=$1 secret_root=${SECRET_ROOT:-$SECRET_ROOT_DEFAULT}
+  local binance_account_json runtime_account_id
+  binance_account_json=$(sed -n 's/^HFT_SECRET_BINANCE_ACCOUNT_JSON=//p' \
+    "$secret_root/runtime.env") || return 1
+  [[ -z $binance_account_json ]] && return 0
+  runtime_account_id=$(jq -er '.runtime_account_id' <<<"$binance_account_json") || return 1
+  jq -e --arg runtime_account_id "$runtime_account_id" \
+    '.account_id == $runtime_account_id' \
+    "$activation_dir/deployment/policy.json" >/dev/null
+}
+
 load_current() {
   local current_file=${HFT_CURRENT_FILE:-$CURRENT_FILE_DEFAULT}
   secure_regular_file "$current_file" 0600 || die "invalid current release file"
@@ -423,6 +435,8 @@ preflight() {
   [[ $activation_sha == "$HFT_ACTIVATION_SHA256" ]] || die "activation identity mismatch"
   validate_paper_shadow_authority "$HFT_ACTIVATION_DIR" || die "activation is not fail-closed Paper/Shadow"
   validate_runtime_secrets || die "RAM-role injected tmpfs secrets are absent or unsafe"
+  validate_runtime_account_binding "$HFT_ACTIVATION_DIR" \
+    || die "Binance credential account does not match activation account"
   docker image inspect "$HFT_TRADING_IMAGE" --format '{{json .RepoDigests}}' \
     | jq -e --arg image "$HFT_TRADING_IMAGE" 'index($image) != null' >/dev/null \
     || die "digest-pinned image is not staged locally"
