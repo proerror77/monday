@@ -8,9 +8,13 @@ name: Monitor Collector Host
 # Assistant and, when the snapshot reports ok:false, opens or appends a single
 # needs-triage GitHub issue (deduped by open-issue search).
 #
-# Prerequisite: ALIYUN_ACCESS_KEY_ID and ALIYUN_ACCESS_KEY_SECRET repository
-# secrets whose RAM policy is scoped to RunCommand/DescribeInvocationResults on
-# i-6we6afeqsvv8uo1ixmyo in ap-northeast-1 (no broader ECS or OSS grants).
+# Prerequisite: ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN and
+# ALIYUN_COLLECTOR_MONITOR_ROLE_ARN repository variables. The provider trust and
+# role policy must limit this workflow to RunCommand/DescribeInvocationResults
+# on i-6we6afeqsvv8uo1ixmyo in ap-northeast-1 (no broader ECS or OSS grants).
+# OIDC issuer: https://token.actions.githubusercontent.com
+# OIDC audience: sts.aliyuncs.com
+# OIDC subject: repo:proerror77/monday:ref:refs/heads/main
 
 on:
   schedule:
@@ -19,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   issues: write
 
 env:
@@ -35,6 +40,7 @@ concurrency:
 
 jobs:
   check:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -47,7 +53,7 @@ jobs:
           git fetch origin main
           git checkout FETCH_HEAD
 
-      - name: Install Aliyun CLI and configure credentials
+      - name: Install Aliyun CLI
         env:
           # Pin to an immutable, SHA-verified release. The `latest` convenience
           # URL can be silently repointed; the pinned archive is verified against
@@ -61,22 +67,20 @@ jobs:
           tar -xzf /tmp/aliyun-cli.tgz -C /tmp
           sudo install -m 0755 /tmp/aliyun /usr/local/bin/aliyun
           aliyun version
-          mkdir -p "$HOME/.aliyun"
-          cat > "$HOME/.aliyun/config.json" <<EOF
-          {
-            "current": "default",
-            "profiles": [
-              {
-                "name": "default",
-                "mode": "AK",
-                "access_key_id": "${{ secrets.ALIYUN_ACCESS_KEY_ID }}",
-                "access_key_secret": "${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}",
-                "region_id": "${{ env.REGION_ID }}"
-              }
-            ]
-          }
-          EOF
-          chmod 600 "$HOME/.aliyun/config.json"
+
+      - name: Configure temporary Aliyun credentials through GitHub OIDC
+        id: aliyun-auth
+        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1.1.0
+        with:
+          oidc-provider-arn: ${{ vars.ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN }}
+          role-to-assume: ${{ vars.ALIYUN_COLLECTOR_MONITOR_ROLE_ARN }}
+          role-session-name: collector-monitor-${{ github.run_id }}
+          audience: sts.aliyuncs.com
+
+      - name: Record OIDC authentication failure
+        if: always() && steps.aliyun-auth.outcome == 'failure'
+        run: |
+          printf '%s\n' 'Aliyun OIDC credential exchange failed before the collector health check.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run collector health check via Cloud Assistant
         id: health
