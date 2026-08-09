@@ -2,7 +2,7 @@ owner: codex
 contract: binance-usdm-reference-v3-schema
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-upgrade
 branch: codex/binance-usdm-reference-v3-upgrade
-base_sha: 7f9dab1fbd2a6a9543e816514b0f74c23d383a2f
+base_sha: 1d94b43a42ca9abfa2783e84c416a4595952204d
 allowed_files:
   - agent-worktree.yml
   - rust_hft/data-pipelines/core/src/binance_usdm_reference.rs
