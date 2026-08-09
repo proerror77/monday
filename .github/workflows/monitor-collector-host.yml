@@ -133,7 +133,12 @@ jobs:
                 # as a breach, not treated as "the monitor could not run".
                 output=$(printf '%s' "$result_json" | jq -r '[.. | objects | .Output? // empty][0] // empty')
                 if [ -n "$output" ]; then
-                  health_json=$(printf '%s' "$output" | base64 --decode 2>/dev/null | grep -m1 '^{' || true)
+                  if decoded_health=$(printf '%s' "$output" | base64 --decode 2>/dev/null) &&
+                    health_json=$(printf '%s' "$decoded_health" | jq -cse 'if length == 1 and (.[0] | type) == "object" then .[0] else error("expected exactly one object") end' 2>/dev/null); then
+                    :
+                  else
+                    health_json=""
+                  fi
                 fi
                 case "$status" in
                   Failed|Stopped|PartialFailed|Timeout)
