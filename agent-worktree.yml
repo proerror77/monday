@@ -2,7 +2,7 @@ owner: codex
 contract: cex-research-contract-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-contract-v2
 branch: codex/cex-research-contract-v2
-base_sha: 32e01918a88355f0708bbacd9ae6d4d5eb32aa13
+base_sha: c1a2b934926602014cdf81401bc0f79af3d34e30
 allowed_files:
   - agent-worktree.yml
   - rust_hft/research-core/manifest/src/lib.rs
