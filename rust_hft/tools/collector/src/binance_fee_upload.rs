@@ -5,6 +5,7 @@ use crate::binance_usdm_reference_upload::{
 use crate::lob_archiver::sha256_file;
 use crate::polymarket_upload::{atomic_json, ensure_canonical_directory, read_status, utc_now};
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{Datelike, Timelike};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -172,8 +173,24 @@ fn fee_batch(output_root: &Path, dir: &Path) -> Result<FeeBatch> {
         .context("fee batch partition is not UTF-8")?
         .to_string();
     let components = object_prefix.split('/').collect::<Vec<_>>();
+    let received = snapshot.received_at;
     if components.get(2).copied() != Some(&format!("venue=binance_{}", snapshot.market))
         || components.get(4).copied() != Some(&format!("account={}", snapshot.account_fingerprint))
+        || components.get(5).copied()
+            != Some(&format!(
+                "date={:04}-{:02}-{:02}",
+                received.year(),
+                received.month(),
+                received.day()
+            ))
+        || components.get(6).copied() != Some(&format!("hour={:02}", received.hour()))
+        || components.get(7).copied()
+            != Some(&format!(
+                "batch={}",
+                received
+                    .timestamp_nanos_opt()
+                    .context("fee timestamp is out of range")?
+            ))
     {
         bail!("fee batch partition does not match the authenticated artifact");
     }
@@ -215,10 +232,23 @@ where
     ensure_canonical_directory(&config.output_root)?;
     let status_path = config.output_root.join("upload-status.json");
     let mut status = read_status(&status_path)?;
+    let batches = match discover_batches(&config.output_root) {
+        Ok(batches) => batches,
+        Err(error) => {
+            let now = utc_now();
+            status.insert("updated_at".to_string(), json!(now));
+            status.insert("pending_batches".to_string(), Value::Null);
+            status.insert("discovery_failed".to_string(), json!(true));
+            status.insert("last_error_at".to_string(), json!(now));
+            status.insert("last_error".to_string(), json!(error.to_string()));
+            atomic_json(&status_path, &Value::Object(status))?;
+            return Err(error);
+        }
+    };
     let mut failures = Vec::new();
     let mut uploaded_batches = 0;
     let mut retried_batches = 0;
-    for batch in discover_batches(&config.output_root)? {
+    for batch in batches {
         let object = format!(
             "oss://{}/{}/{DATA_NAME}",
             config.bucket, batch.triplet.object_prefix
@@ -232,6 +262,15 @@ where
                 }
                 status.insert("last_success_at".to_string(), json!(utc_now()));
                 status.insert("last_uploaded_object".to_string(), json!(object));
+                status.insert(
+                    "last_uploaded_triplet".to_string(),
+                    json!({
+                        "object_prefix": batch.triplet.object_prefix.clone(),
+                        "data_sha256": batch.data_sha256.clone(),
+                        "manifest_sha256": batch.manifest_sha256.clone(),
+                        "success_sha256": batch.data_sha256.clone(),
+                    }),
+                );
             }
             Err(error) => failures.push(json!({
                 "batch": batch.triplet.dir.file_name().and_then(|name| name.to_str()),
@@ -239,13 +278,18 @@ where
             })),
         }
     }
+    let (pending_batches, discovery_failed) = match discover_batches(&config.output_root) {
+        Ok(pending) => (json!(pending.len()), false),
+        Err(error) => {
+            failures.push(json!({"batch": Value::Null, "error": error.to_string()}));
+            (Value::Null, true)
+        }
+    };
     status.insert("updated_at".to_string(), json!(utc_now()));
+    status.insert("discovery_failed".to_string(), json!(discovery_failed));
     status.insert("uploaded_batches".to_string(), json!(uploaded_batches));
     status.insert("retried_batches".to_string(), json!(retried_batches));
-    status.insert(
-        "pending_batches".to_string(),
-        json!(discover_batches(&config.output_root)?.len()),
-    );
+    status.insert("pending_batches".to_string(), pending_batches);
     status.insert("failed_batches".to_string(), Value::Array(failures.clone()));
     status.insert(
         "last_error_at".to_string(),
@@ -420,5 +464,57 @@ mod tests {
         assert_eq!(summary.uploaded_batches, 1);
         assert_eq!(remote.borrow().len(), 3);
         assert!(!published.data_path.exists());
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            status["last_uploaded_triplet"]["data_sha256"],
+            published.data_sha256
+        );
+        assert_eq!(
+            status["last_uploaded_triplet"]["manifest_sha256"],
+            published.manifest_sha256
+        );
+    }
+
+    #[test]
+    fn rejects_a_verified_triplet_in_the_wrong_time_partition() {
+        let root = tempfile::tempdir().unwrap();
+        let published = snapshot(root.path());
+        let original = published.data_path.parent().unwrap();
+        let moved = root.path().join(format!(
+            "lake/raw/venue=binance_usdm/dataset=fee/account={}/date=2099-01-01/hour=00/batch=1",
+            "a".repeat(64)
+        ));
+        fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        fs::rename(original, &moved).unwrap();
+
+        let error = fee_batch(root.path(), &moved).err().unwrap();
+        assert!(error.to_string().contains("partition"));
+    }
+
+    #[test]
+    fn discovery_failure_is_persisted() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("lake/unexpected")).unwrap();
+        let config = ReferenceUploadConfig {
+            output_root: root.path().to_path_buf(),
+            bucket: "bucket".to_string(),
+            endpoint: "endpoint".to_string(),
+            region: "region".to_string(),
+            profile: "profile".to_string(),
+            oss_timeout: Duration::from_secs(1),
+        };
+
+        assert!(upload_pending_with(&config, |_, _| unreachable!()).is_err());
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["discovery_failed"], true);
+        assert!(status["pending_batches"].is_null());
+        assert!(status["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected"));
     }
 }
