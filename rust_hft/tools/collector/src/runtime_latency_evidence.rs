@@ -6,7 +6,15 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufRead, BufReader, Read},
+    path::Path,
+};
+
+const MAX_FEEDBACK_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SELECTED_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedRuntimeLatencyEvidence {
@@ -35,7 +43,7 @@ pub fn verify_runtime_latency_evidence(
     account_id: &str,
     available_before: DateTime<Utc>,
 ) -> Result<VerifiedRuntimeLatencyEvidence> {
-    let feedback_bytes = read_sha256_anchored(feedback_log, feedback_log_sha256, "feedback log")?;
+    let expected_feedback_sha256 = expected_sha256(feedback_log_sha256, "feedback log")?;
     let key_bytes = read_sha256_anchored(
         trusted_keys_path,
         trusted_keys_sha256,
@@ -69,18 +77,35 @@ pub fn verify_runtime_latency_evidence(
     let mut observations = Vec::new();
     let mut signed_events = Vec::new();
     let mut event_digests = BTreeMap::new();
-    for (index, line) in feedback_bytes.split(|byte| *byte == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
+    let mut feedback =
+        BufReader::new(File::open(feedback_log).context("failed to open runtime feedback log")?);
+    let mut feedback_hasher = Sha256::new();
+    let mut line = Vec::new();
+    let mut line_number = 0_usize;
+    loop {
+        line.clear();
+        let mut limited = (&mut feedback).take((MAX_FEEDBACK_LINE_BYTES + 1) as u64);
+        let bytes_read = limited
+            .read_until(b'\n', &mut line)
+            .context("failed to read runtime feedback log")?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        if bytes_read > MAX_FEEDBACK_LINE_BYTES {
+            bail!("runtime feedback line {line_number} exceeds the size limit");
+        }
+        feedback_hasher.update(&line);
+        let record = line.strip_suffix(b"\n").unwrap_or(&line);
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let signed: SignedRuntimeAttributionEvent = serde_json::from_slice(line)
-            .with_context(|| format!("runtime feedback line {} is invalid JSON", index + 1))?;
+        let signed: SignedRuntimeAttributionEvent = serde_json::from_slice(record)
+            .with_context(|| format!("runtime feedback line {line_number} is invalid JSON"))?;
         let event =
             verify_runtime_attribution_event(&signed, &trusted_keys).with_context(|| {
-                format!(
-                    "runtime feedback line {} failed signature verification",
-                    index + 1
-                )
+                format!("runtime feedback line {line_number} failed signature verification")
             })?;
         let canonical = serde_json::to_vec(&signed)?;
         if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
@@ -137,8 +162,18 @@ pub fn verify_runtime_latency_evidence(
             metric_u64(&event.metrics, "intent_to_private_report_us")?,
             arrival_slippage_bps,
         ));
-        signed_events.extend_from_slice(line);
+        let selected_bytes = signed_events
+            .len()
+            .checked_add(record.len() + 1)
+            .context("selected runtime evidence size overflows")?;
+        if selected_bytes > MAX_SELECTED_EVIDENCE_BYTES {
+            bail!("selected runtime evidence exceeds the size limit");
+        }
+        signed_events.extend_from_slice(record);
         signed_events.push(b'\n');
+    }
+    if hex::encode(feedback_hasher.finalize()) != expected_feedback_sha256 {
+        bail!("feedback log bytes do not match the trusted digest anchor");
     }
     if observations.is_empty() {
         bail!("no verified pre-snapshot live order lifecycle observations match");
@@ -179,15 +214,20 @@ pub fn verify_runtime_latency_evidence(
 }
 
 fn read_sha256_anchored(path: &Path, expected: &str, label: &str) -> Result<Vec<u8>> {
-    let expected = expected.trim().to_ascii_lowercase();
-    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("{label} SHA-256 is invalid");
-    }
+    let expected = expected_sha256(expected, label)?;
     let bytes = std::fs::read(path).with_context(|| format!("failed to read {label}"))?;
     if hex::encode(Sha256::digest(&bytes)) != expected {
         bail!("{label} bytes do not match the trusted digest anchor");
     }
     Ok(bytes)
+}
+
+fn expected_sha256(expected: &str, label: &str) -> Result<String> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} SHA-256 is invalid");
+    }
+    Ok(expected)
 }
 
 fn metric_u64(metrics: &BTreeMap<String, f64>, name: &str) -> Result<u64> {
