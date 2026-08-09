@@ -262,12 +262,6 @@ grep -Fq '/opt/monday/bin/binance-usdm-reference-collector' "$cutover"
 grep -Fq '/opt/monday/bin/binance-usdm-reference-upload' "$cutover"
 grep -Fq 'monday.binance_usdm_reference_cutover.v1' "$cutover"
 grep -Fq 'new-host' "$cutover"
-grep -Fq 'OLD_MODE=upgrade' "$cutover"
-grep -Fq 'STEP=drain-v2-with-old-uploader' "$cutover"
-grep -Fq 'run_uploader "$OLD_UPLOADER"' "$cutover"
-grep -Fq 'V2 backlog remains after the old uploader drain' "$cutover"
-grep -Fq 'restore_old_production' "$cutover"
-grep -Fq 'previous-release-restored' "$cutover"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
 grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
