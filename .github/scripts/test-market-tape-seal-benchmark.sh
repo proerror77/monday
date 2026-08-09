@@ -18,6 +18,10 @@ grep -Fqx '      exact_main_sha:' <<<"$trigger_block"
 grep -Fqx '  contents: read' "$workflow"
 grep -Fqx '    runs-on: ubuntu-latest' "$workflow"
 grep -Fqx '    timeout-minutes: 45' "$workflow"
+grep -A2 -F '      - name: Compile the exact benchmark test without running it' "$workflow" \
+  | grep -Fqx '        timeout-minutes: 12'
+grep -A3 -F '      - name: Run exactly one bounded synthetic benchmark' "$workflow" \
+  | grep -Fqx '        timeout-minutes: 25'
 grep -Fqx '          test "$BENCHMARK_SELECTION" = polymarket-seal-v1' "$workflow"
 grep -Fqx '          test "$DISPATCH_REF" = refs/heads/main' "$workflow"
 grep -Fqx '          test "$DISPATCH_SHA" = "$EXPECTED_MAIN_SHA"' "$workflow"

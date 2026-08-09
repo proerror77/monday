@@ -76,6 +76,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
 
       - name: Compile the exact benchmark test without running it
+        timeout-minutes: 12
         working-directory: rust_hft
         run: |
           set -euo pipefail
@@ -95,6 +96,7 @@ jobs:
 
       - name: Run exactly one bounded synthetic benchmark
         id: benchmark
+        timeout-minutes: 25
         working-directory: rust_hft
         run: |
           set -euo pipefail
