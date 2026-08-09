@@ -3349,37 +3349,113 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE pointing at an immutable closed tape and its seal"]
+    #[ignore = "requires MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE pointing at an immutable 3.7-4.3 GiB closed tape and its seal"]
     fn immutable_fixture_reports_full_scan_and_seal_lookup_phases() {
         let fixture = PathBuf::from(
             std::env::var("MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE")
                 .expect("immutable fixture path is required"),
         );
+        benchmark_immutable_fixture(&fixture);
+    }
+
+    #[test]
+    #[ignore = "one-shot GitHub-hosted 4 GiB benchmark"]
+    fn synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases() {
+        const TARGET_FIXTURE_BYTES: u64 = 4 * GIB;
+        const PADDING_BYTES: usize = 64 * 1024;
+
+        let root = TestDir::new();
+        let root_path = root.path().to_path_buf();
+        let fixture = root
+            .path()
+            .join("market-updates.20260715T020000.ndjson");
+        let validation_time = DateTime::parse_from_rfc3339("2026-07-15T01:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let padding = "x".repeat(PADDING_BYTES);
+        let mut builder = MarketTapeManifestBuilder::new();
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&fixture).unwrap());
+        let mut source_bytes = 0_u64;
+        let mut sequence = 0_u64;
+        {
+            let _phase = PhaseAttribution::new("benchmark_fixture_generate");
+            while source_bytes < TARGET_FIXTURE_BYTES {
+                let row = record(
+                    sequence,
+                    "2026-07-15T01:00:00Z",
+                    json!({
+                        "kind": "reference_price",
+                        "symbol": "BTCUSDT",
+                        "source": "synthetic-benchmark",
+                        "asset_class": "crypto",
+                        "price": "100",
+                        "full_accuracy_value": null,
+                        "is_carried_forward": false,
+                        "ts": "2026-07-15T01:00:00Z",
+                        "benchmark_padding": padding.as_str(),
+                    }),
+                );
+                builder.observe(&row, validation_time).unwrap();
+                let mut encoded = serde_json::to_vec(&row).unwrap();
+                encoded.push(b'\n');
+                let encoded_bytes = u64::try_from(encoded.len()).unwrap();
+                assert!(
+                    source_bytes.saturating_add(encoded_bytes) <= MAX_FIXTURE_BYTES,
+                    "deterministic fixture exceeded the hard size ceiling"
+                );
+                writer.write_all(&encoded).unwrap();
+                source_bytes += encoded_bytes;
+                sequence += 1;
+            }
+            writer.flush().unwrap();
+            writer.get_ref().sync_all().unwrap();
+        }
+        assert!((MIN_FIXTURE_BYTES..=MAX_FIXTURE_BYTES).contains(&source_bytes));
+        let source_file = fixture.file_name().unwrap().to_str().unwrap();
+        let manifest = builder
+            .finish("crypto_expiry", 0, 0, source_file, source_bytes)
+            .unwrap();
+        write_seal(&fixture, manifest);
+
+        benchmark_immutable_fixture(&fixture);
+
+        drop(root);
+        assert!(!root_path.exists());
+        eprintln!("IMMUTABLE_FIXTURE_CLEANUP removed=true");
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIN_FIXTURE_BYTES: u64 = 37 * GIB / 10;
+    const MAX_FIXTURE_BYTES: u64 = 43 * GIB / 10;
+
+    fn benchmark_immutable_fixture(fixture: &Path) {
         let root = fixture.parent().expect("fixture has a parent");
         let mut config = config(root);
         config.dataset = "crypto_expiry".to_owned();
         config.quote_depth_levels = 0;
         config.quote_sample_ms = 0;
 
-        const GIB: u64 = 1024 * 1024 * 1024;
-        const MIN_FIXTURE_BYTES: u64 = 37 * GIB / 10;
-        const MAX_FIXTURE_BYTES: u64 = 43 * GIB / 10;
-        let fixture_identity = regular_identity(&fixture).unwrap();
+        let fixture_identity = regular_identity(fixture).unwrap();
         assert!(
             (MIN_FIXTURE_BYTES..=MAX_FIXTURE_BYTES).contains(&fixture_identity.bytes),
             "fixture must be between 3.7 and 4.3 GiB"
         );
 
+        let fixture_sha256 = {
+            let _phase = PhaseAttribution::new("benchmark_fixture_sha256");
+            sha256_file(fixture).unwrap()
+        };
+
         let full_started = std::time::Instant::now();
         let full = {
             let _phase = PhaseAttribution::new("benchmark_full_scan");
-            scan_tape_with_identity(&fixture, "crypto_expiry", 0, 0).unwrap()
+            scan_tape_with_identity(fixture, "crypto_expiry", 0, 0).unwrap()
         };
         let full_elapsed = full_started.elapsed();
         let seal_started = std::time::Instant::now();
         let sealed = {
             let _phase = PhaseAttribution::new("benchmark_seal_lookup");
-            matching_tape_seal(&fixture, &config).unwrap().unwrap()
+            matching_tape_seal(fixture, &config).unwrap().unwrap()
         };
         let seal_elapsed = seal_started.elapsed();
 
@@ -3387,10 +3463,11 @@ mod tests {
         assert_eq!(sealed.identity, full.identity);
         assert_eq!(sealed.manifest, full.manifest);
         eprintln!(
-            "IMMUTABLE_FIXTURE_BENCH source_bytes={} full_scan_ms={} seal_lookup_ms={}",
+            "IMMUTABLE_FIXTURE_BENCH source_bytes={} full_scan_ms={} seal_lookup_ms={} manifest_equivalent=true fixture_sha256={}",
             full.identity.bytes,
             full_elapsed.as_millis(),
             seal_elapsed.as_millis(),
+            fixture_sha256,
         );
     }
 
