@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedRuntimeLatencyEvidence {
+    pub account_id: String,
     pub signed_events: Vec<u8>,
     pub first_observed_at: DateTime<Utc>,
     pub last_observed_at: DateTime<Utc>,
@@ -145,6 +146,7 @@ pub fn verify_runtime_latency_evidence(
     latencies.sort_unstable();
     costs.sort_by(f64::total_cmp);
     Ok(VerifiedRuntimeLatencyEvidence {
+        account_id: account_id.to_string(),
         signed_events,
         first_observed_at: observations.first().unwrap().0,
         last_observed_at: observations.last().unwrap().0,
@@ -278,6 +280,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(evidence.observations, 1);
+        assert_eq!(evidence.account_id, "binance-main");
         assert_eq!(evidence.p99_ns, 75_000);
         assert_eq!(evidence.p95_cost_bps, "1.25");
     }
