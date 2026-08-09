@@ -195,6 +195,11 @@ pub struct CexReplaySnapshotV2 {
 
 impl CexReplaySnapshotV2 {
     pub fn validate(&self) -> Result<(), ManifestError> {
+        if !valid_cex_symbol(&self.symbol) {
+            return Err(ManifestError::InvalidCexReplaySnapshot(
+                "symbol is not canonical",
+            ));
+        }
         let mut required = BTreeSet::from([
             CEX_MODALITY_LOB.to_string(),
             CEX_MODALITY_AGGREGATE_TRADE.to_string(),
@@ -305,6 +310,7 @@ fn pit_series_covers(
         .and_then(|span| u64::try_from(span).ok());
     valid_evidence_set(&evidence.evidence)
         && evidence.observations > 0
+        && usize::try_from(evidence.observations).ok() == Some(evidence.evidence.len())
         && evidence.max_gap_ns <= CEX_DERIVATIVES_MAX_GAP_NS
         && evidence.first_available_at <= first_event_time
         && evidence.first_available_at <= evidence.last_available_at
@@ -513,7 +519,19 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 fn valid_evidence_set(evidence: &[CexArtifactTripletV2]) -> bool {
-    !evidence.is_empty() && evidence.iter().all(CexArtifactTripletV2::valid)
+    !evidence.is_empty()
+        && evidence.iter().all(CexArtifactTripletV2::valid)
+        && evidence
+            .iter()
+            .enumerate()
+            .all(|(index, item)| !evidence[..index].contains(item))
+}
+
+fn valid_cex_symbol(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn positive_decimal(value: &str) -> bool {
@@ -815,7 +833,7 @@ mod tests {
             },
             derivatives_reference: Some(CexDerivativesReferenceV2 {
                 funding: CexPitSeriesEvidenceV2 {
-                    evidence: vec![triplet('6')],
+                    evidence: vec![triplet('6'), triplet('a')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
@@ -826,7 +844,7 @@ mod tests {
                     max_gap_ns: 3_000_000_000,
                 },
                 open_interest: CexPitSeriesEvidenceV2 {
-                    evidence: vec![triplet('7')],
+                    evidence: vec![triplet('7'), triplet('b')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
@@ -969,6 +987,29 @@ mod tests {
         snapshot.fee_schedule.evidence[0].success_sha256 = "9".repeat(64);
 
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_noncanonical_symbol() {
+        let mut snapshot = cex_snapshot();
+        snapshot.symbol = "BTC-USDT".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("symbol is not canonical")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_duplicate_series_evidence() {
+        let mut snapshot = cex_snapshot();
+        let funding = &mut snapshot.derivatives_reference.as_mut().unwrap().funding;
+        funding.evidence[1] = funding.evidence[0].clone();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
     }
 
     #[test]
