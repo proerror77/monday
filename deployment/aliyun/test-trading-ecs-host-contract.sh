@@ -558,10 +558,21 @@ chmod 0440 "$secret_root/feedback-signing-key.hex"
   validate_runtime_secrets
   binding_activation=$tmp_dir/binding-activation
   mkdir -p "$binding_activation/deployment"
-  printf '%s\n' '{"account_id":"wrong-account"}' \
+  printf '%s\n' '{"account_id":"wrong-account","venue":"binance"}' \
     >"$binding_activation/deployment/policy.json"
   ! validate_runtime_account_binding "$binding_activation"
-  printf '%s\n' '{"account_id":"binance_main"}' \
+  printf '%s\n' '{"account_id":"binance_main","venue":"binance"}' \
+    >"$binding_activation/deployment/policy.json"
+  validate_runtime_account_binding "$binding_activation"
+  missing_bundle_root=$tmp_dir/missing-binance-bundle
+  mkdir "$missing_bundle_root"
+  grep -v '^HFT_SECRET_BINANCE_ACCOUNT_JSON=' "$secret_root/runtime.env" \
+    >"$missing_bundle_root/runtime.env"
+  (
+    SECRET_ROOT=$missing_bundle_root
+    ! validate_runtime_account_binding "$binding_activation"
+  )
+  printf '%s\n' '{"account_id":"other-account","venue":"bitget"}' \
     >"$binding_activation/deployment/policy.json"
   validate_runtime_account_binding "$binding_activation"
   chmod 0640 "$secret_root/runtime.env"
@@ -1255,6 +1266,8 @@ grep -Fq -- '--stop-signal SIGINT' "$RUNTIME"
 grep -Fq -- '--stop-timeout 60' "$RUNTIME"
 grep -Fq -- '--ulimit core=0:0' "$RUNTIME"
 grep -Fq -- '--entrypoint /bin/sh' "$RUNTIME"
+grep -Fq 'policy_account_id=$(jq -er .account_id /activation/deployment/policy.json)' "$RUNTIME"
+grep -Fq '[ "$runtime_account_id" = "$policy_account_id" ]' "$RUNTIME"
 grep -Fq '/run/secrets/hft/runtime.env' "$RUNTIME"
 if grep -Fq -- '--env-file' "$RUNTIME"; then
   printf 'Docker daemon metadata must not contain runtime secret values\n' >&2
