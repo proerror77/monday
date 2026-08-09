@@ -2,11 +2,12 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use hft_collector::binance_fee_artifact::{
-    publish_fee_snapshot, BinanceFeeSnapshot, BinanceInstrumentRules, FEE_SCHEMA,
+    publish_fee_snapshot, BinanceFeeSnapshot, BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
 };
 use integration::signing::{BinanceCredentials, BinanceSigner};
 use rust_decimal::Decimal;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -60,14 +61,9 @@ async fn main() -> Result<()> {
         required_env("HFT_SECRET_BINANCE_API_KEY")?,
         required_env("HFT_SECRET_BINANCE_SECRET")?,
     );
+    let account_fingerprint = hex::encode(Sha256::digest(credentials.api_key.as_bytes()));
     let signer = BinanceSigner::new(credentials);
-    let mut params = HashMap::from([
-        ("symbol".to_string(), symbol.clone()),
-        ("recvWindow".to_string(), "5000".to_string()),
-    ]);
-    let query = signer.sign_request(&mut params);
     let base = args.market.default_base();
-    let requested_at = Utc::now();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -85,6 +81,12 @@ async fn main() -> Result<()> {
         }
         Market::Usdm => None,
     };
+    let mut params = HashMap::from([
+        ("symbol".to_string(), symbol.clone()),
+        ("recvWindow".to_string(), "5000".to_string()),
+    ]);
+    let query = signer.sign_request(&mut params);
+    let requested_at = Utc::now();
     let mut request = client.get(format!("{base}{}?{query}", args.market.endpoint()));
     for (name, value) in signer.generate_headers() {
         request = request.header(name, value);
@@ -104,6 +106,7 @@ async fn main() -> Result<()> {
             venue: "binance".to_string(),
             market: args.market.name().to_string(),
             symbol,
+            account_fingerprint,
             maker_fee_bps,
             taker_fee_bps,
             calculation,
@@ -144,30 +147,44 @@ fn validate_response_symbol(payload: &Value, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_fees(market: Market, payload: &Value) -> Result<(String, String, String)> {
+fn parse_fees(market: Market, payload: &Value) -> Result<(SideFeeBps, SideFeeBps, String)> {
     match market {
-        Market::Spot => {
-            let maker = spot_rate(payload, "maker")?;
-            let taker = spot_rate(payload, "taker")?;
+        Market::Spot => Ok((
+            SideFeeBps {
+                buy: to_bps(spot_rate(payload, "maker", "buyer")?),
+                sell: to_bps(spot_rate(payload, "maker", "seller")?),
+            },
+            SideFeeBps {
+                buy: to_bps(spot_rate(payload, "taker", "buyer")?),
+                sell: to_bps(spot_rate(payload, "taker", "seller")?),
+            },
+            "liquidity_plus_side_standard_special_tax_without_asset_discount".to_string(),
+        )),
+        Market::Usdm => {
+            let maker = to_bps(decimal_field(payload, "makerCommissionRate")?);
+            let taker = to_bps(decimal_field(payload, "takerCommissionRate")?);
             Ok((
-                to_bps(maker),
-                to_bps(taker),
-                "standard_plus_special_plus_tax_without_asset_discount".to_string(),
+                SideFeeBps {
+                    buy: maker.clone(),
+                    sell: maker,
+                },
+                SideFeeBps {
+                    buy: taker.clone(),
+                    sell: taker,
+                },
+                "account_commission_rate".to_string(),
             ))
         }
-        Market::Usdm => Ok((
-            to_bps(decimal_field(payload, "makerCommissionRate")?),
-            to_bps(decimal_field(payload, "takerCommissionRate")?),
-            "account_commission_rate".to_string(),
-        )),
     }
 }
 
-fn spot_rate(payload: &Value, side: &str) -> Result<Decimal> {
+fn spot_rate(payload: &Value, liquidity: &str, side: &str) -> Result<Decimal> {
     ["standardCommission", "specialCommission", "taxCommission"]
         .into_iter()
         .try_fold(Decimal::ZERO, |total, group| {
-            Ok(total + decimal_field(&payload[group], side)?)
+            Ok(total
+                + decimal_field(&payload[group], liquidity)?
+                + decimal_field(&payload[group], side)?)
         })
 }
 
@@ -225,14 +242,16 @@ mod tests {
     #[test]
     fn parses_spot_all_in_rates_without_assuming_discount_balance() {
         let payload = json!({
-            "standardCommission": {"maker":"0.001", "taker":"0.001"},
-            "specialCommission": {"maker":"0.0001", "taker":"0.0002"},
-            "taxCommission": {"maker":"0.00001", "taker":"0.00002"},
+            "standardCommission": {"maker":"0.001", "taker":"0.001", "buyer":"0.0003", "seller":"0.0004"},
+            "specialCommission": {"maker":"0.0001", "taker":"0.0002", "buyer":"0.00003", "seller":"0.00004"},
+            "taxCommission": {"maker":"0.00001", "taker":"0.00002", "buyer":"0.000003", "seller":"0.000004"},
             "discount": {"enabledForAccount":true, "enabledForSymbol":true, "discount":"0.25"}
         });
         let (maker, taker, method) = parse_fees(Market::Spot, &payload).unwrap();
-        assert_eq!(maker, "11.1");
-        assert_eq!(taker, "12.2");
+        assert_eq!(maker.buy, "14.43");
+        assert_eq!(maker.sell, "15.54");
+        assert_eq!(taker.buy, "15.53");
+        assert_eq!(taker.sell, "16.64");
         assert!(method.contains("without_asset_discount"));
     }
 
@@ -240,8 +259,10 @@ mod tests {
     fn parses_usdm_account_rates() {
         let payload = json!({"makerCommissionRate":"0.0002", "takerCommissionRate":"0.0005"});
         let (maker, taker, _) = parse_fees(Market::Usdm, &payload).unwrap();
-        assert_eq!(maker, "2");
-        assert_eq!(taker, "5");
+        assert_eq!(
+            (maker.buy, maker.sell, taker.buy, taker.sell),
+            ("2".into(), "2".into(), "5".into(), "5".into())
+        );
     }
 
     #[test]
@@ -265,18 +286,8 @@ mod tests {
 
     #[test]
     fn signed_requests_cannot_target_an_overridden_host_or_symbol() {
-        assert!(Args::try_parse_from([
-            "binance-fee-snapshot",
-            "--market",
-            "spot",
-            "--symbol",
-            "BTCUSDT",
-            "--output-root",
-            "/tmp/fees",
-            "--api-base",
-            "https://example.com",
-        ])
-        .is_err());
+        let args = "binance-fee-snapshot --market spot --symbol BTCUSDT --output-root /tmp/fees --api-base https://example.com";
+        assert!(Args::try_parse_from(args.split_whitespace()).is_err());
         assert!(validate_response_symbol(&json!({"symbol":"ETHUSDT"}), "BTCUSDT").is_err());
     }
 }

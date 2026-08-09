@@ -29,8 +29,9 @@ pub struct BinanceFeeSnapshot {
     pub venue: String,
     pub market: String,
     pub symbol: String,
-    pub maker_fee_bps: String,
-    pub taker_fee_bps: String,
+    pub account_fingerprint: String,
+    pub maker_fee_bps: SideFeeBps,
+    pub taker_fee_bps: SideFeeBps,
     pub calculation: String,
     pub source_endpoint: String,
     pub instrument_rules: Option<BinanceInstrumentRules>,
@@ -51,11 +52,13 @@ impl BinanceFeeSnapshot {
                 .bytes()
                 .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
             || self.received_at < self.requested_at
-            || !nonnegative_decimal(&self.maker_fee_bps)
-            || !nonnegative_decimal(&self.taker_fee_bps)
+            || !valid_digest(&self.account_fingerprint)
+            || !self.maker_fee_bps.valid()
+            || !self.taker_fee_bps.valid()
             || match self.market.as_str() {
                 "spot" => {
-                    self.calculation != "standard_plus_special_plus_tax_without_asset_discount"
+                    self.calculation
+                        != "liquidity_plus_side_standard_special_tax_without_asset_discount"
                         || self.source_endpoint != "/api/v3/account/commission"
                         || self.rules_source_endpoint.as_deref() != Some("/api/v3/exchangeInfo")
                         || self
@@ -75,6 +78,19 @@ impl BinanceFeeSnapshot {
             bail!("Binance fee snapshot is invalid");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SideFeeBps {
+    pub buy: String,
+    pub sell: String,
+}
+
+impl SideFeeBps {
+    fn valid(&self) -> bool {
+        nonnegative_decimal(&self.buy) && nonnegative_decimal(&self.sell)
     }
 }
 
@@ -121,6 +137,7 @@ struct FeeManifest {
     venue: String,
     market: String,
     symbol: String,
+    account_fingerprint: String,
     file: String,
     bytes: u64,
     sha256: String,
@@ -136,8 +153,9 @@ pub fn publish_fee_snapshot(
     let data_sha256 = hex::encode(Sha256::digest(&data));
     let received = snapshot.received_at;
     let dir = root.join(format!(
-        "lake/raw/venue=binance_{}/dataset=fee/date={:04}-{:02}-{:02}/hour={:02}/batch={}",
+        "lake/raw/venue=binance_{}/dataset=fee/account={}/date={:04}-{:02}-{:02}/hour={:02}/batch={}",
         snapshot.market,
+        snapshot.account_fingerprint,
         received.year(),
         received.month(),
         received.day(),
@@ -165,6 +183,7 @@ pub fn publish_fee_snapshot(
         venue: "binance".to_string(),
         market: snapshot.market.clone(),
         symbol: snapshot.symbol.clone(),
+        account_fingerprint: snapshot.account_fingerprint.clone(),
         file: DATA_NAME.to_string(),
         bytes: data.len() as u64,
         sha256: data_sha256.clone(),
@@ -186,6 +205,7 @@ pub fn publish_fee_snapshot(
         &published.data_sha256,
         &published.manifest_sha256,
     )?;
+    fs::File::open(staging.path())?.sync_all()?;
     rename_noreplace(staging.path(), &dir)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(PublishedFeeArtifact {
@@ -224,6 +244,7 @@ pub fn verify_fee_artifact(
         || manifest.venue != snapshot.venue
         || manifest.market != snapshot.market
         || manifest.symbol != snapshot.symbol
+        || manifest.account_fingerprint != snapshot.account_fingerprint
         || manifest.file != DATA_NAME
         || manifest.bytes != data.len() as u64
         || manifest.sha256 != data_sha256
@@ -291,14 +312,17 @@ fn read_bound_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
 }
 
 fn validate_digest(value: &str, label: &str) -> Result<()> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !valid_digest(value) {
         bail!("{label} SHA-256 must be lowercase hexadecimal");
     }
     Ok(())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(target_os = "linux")]
@@ -360,9 +384,17 @@ mod tests {
                 venue: "binance".to_string(),
                 market: "spot".to_string(),
                 symbol: "BTCUSDT".to_string(),
-                maker_fee_bps: "10".to_string(),
-                taker_fee_bps: "10".to_string(),
-                calculation: "standard_plus_special_plus_tax_without_asset_discount".to_string(),
+                account_fingerprint: "a".repeat(64),
+                maker_fee_bps: SideFeeBps {
+                    buy: "10".to_string(),
+                    sell: "10".to_string(),
+                },
+                taker_fee_bps: SideFeeBps {
+                    buy: "10".to_string(),
+                    sell: "10".to_string(),
+                },
+                calculation: "liquidity_plus_side_standard_special_tax_without_asset_discount"
+                    .to_string(),
                 source_endpoint: "/api/v3/account/commission".to_string(),
                 instrument_rules: Some(BinanceInstrumentRules {
                     tick_size: "0.01".to_string(),
