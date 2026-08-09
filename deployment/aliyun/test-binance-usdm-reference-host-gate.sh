@@ -170,7 +170,7 @@ SYSTEMCTL
   chmod 0755 "$fake_bin/systemctl"
   ln -s "$release/binance-usdm-reference-collector" "$root/proc/4242/exe"
   printf '%s\0' "$release/binance-usdm-reference-collector" --output-root "$spool" \
-    --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 \
+    --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 2 \
     --max-staleness-ms 30000 >"$root/proc/4242/cmdline"
 }
 
@@ -368,7 +368,7 @@ grep -Fq 'runtime /old/collector false' "$rollback_trace"
 grep -Fq 'runtime /old/collector true' "$rollback_trace"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
-grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
+grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 2 --max-staleness-ms 30000' \
   "$production_collector"
 grep -Fxq 'ReadWritePaths=/data/monday/spool/binance-usdm-reference' "$production_collector"
 grep -Fxq 'WantedBy=multi-user.target' "$production_collector"

@@ -10,7 +10,7 @@ Type=simple
 User=hftcollector
 Group=hftcollector
 Environment=RUST_LOG=info
-ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000
+ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 2 --max-staleness-ms 30000
 Restart=on-failure
 RestartSec=5
 RuntimeMaxSec=7500

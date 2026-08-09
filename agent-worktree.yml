@@ -1,14 +1,14 @@
-owner: codex
-contract: binance-fee-snapshot-v2
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-snapshot-v2
-branch: codex/binance-fee-snapshot-v2
-base_sha: 32e01918a88355f0708bbacd9ae6d4d5eb32aa13
+owner: codex-root
+contract: binance-reference-rate-budget
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-reference-rate-budget
+branch: codex/binance-reference-rate-budget
+base_sha: c1a2b934926602014cdf81401bc0f79af3d34e30
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/Cargo.lock
-  - rust_hft/tools/collector/Cargo.toml
-  - rust_hft/tools/collector/src/lib.rs
-  - rust_hft/tools/collector/src/binance_fee_artifact.rs
-  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+  - deployment/aliyun/binance-usdm-reference-collector-shadow@.service
+  - deployment/aliyun/binance-usdm-reference-collector.service
+  - deployment/aliyun/binance-usdm-reference-cutover.sh
+  - deployment/aliyun/binance-usdm-reference-shadow-gate.sh
+  - deployment/aliyun/test-binance-usdm-reference-host-gate.sh
 dependency: none
 no_external_runtime_mutation: true

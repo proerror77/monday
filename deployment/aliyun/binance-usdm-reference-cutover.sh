@@ -180,7 +180,7 @@ validate_deployment() {
   grep -Fxq 'ConditionPathIsMountPoint=/data' \
     "$directory/binance-usdm-reference-collector.service" \
     || fail 'candidate collector unit does not assert the /data mount'
-  grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
+  grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 2 --max-staleness-ms 30000' \
     "$directory/binance-usdm-reference-collector.service" \
     || fail 'candidate collector unit has the wrong executable or arguments'
   grep -Fxq 'ReadWritePaths=/data/monday/spool/binance-usdm-reference' \

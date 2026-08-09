@@ -238,7 +238,7 @@ verify_process() {
     || return 1
   [[ -f $proc_root/$pid/cmdline && ! -L $proc_root/$pid/cmdline ]] || return 1
   expected=$(printf '%s\n' "$collector" --output-root "$spool" --interval-seconds 30 \
-    --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000)
+    --request-timeout-seconds 10 --oi-concurrency 2 --max-staleness-ms 30000)
   actual=$(tr '\0' '\n' <"$proc_root/$pid/cmdline")
   [[ $actual == "$expected" ]]
 }
