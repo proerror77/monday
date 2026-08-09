@@ -8,10 +8,11 @@ name: Monitor Collector Host
 # Assistant and, when the snapshot reports ok:false, opens or appends a single
 # needs-triage GitHub issue (deduped by open-issue search).
 #
-# Prerequisite: ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN and
-# ALIYUN_COLLECTOR_MONITOR_ROLE_ARN repository variables. The provider trust and
-# role policy must limit this workflow to RunCommand/DescribeInvocationResults
-# on i-6we6afeqsvv8uo1ixmyo in ap-northeast-1 (no broader ECS or OSS grants).
+# Prerequisite: ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN,
+# ALIYUN_COLLECTOR_MONITOR_ROLE_ARN, and ALIYUN_COLLECTOR_MONITOR_COMMAND_ID
+# repository variables. The provider trust and role policy must limit this
+# workflow to InvokeCommand/DescribeInvocationResults on the configured command
+# and i-6we6afeqsvv8uo1ixmyo in ap-northeast-1 (no broader ECS or OSS grants).
 # OIDC issuer: https://token.actions.githubusercontent.com
 # OIDC audience: sts.aliyuncs.com
 # OIDC subject: repo:proerror77/monday:ref:refs/heads/main
@@ -29,6 +30,7 @@ permissions:
 env:
   INSTANCE_ID: i-6we6afeqsvv8uo1ixmyo
   REGION_ID: ap-northeast-1
+  COMMAND_ID: ${{ vars.ALIYUN_COLLECTOR_MONITOR_COMMAND_ID }}
   ISSUE_TITLE: '[collector-host] Durable monitor breach'
 
 # Serialize runs so two overlapping invocations cannot both see "no open issue"
@@ -75,6 +77,7 @@ jobs:
           oidc-provider-arn: ${{ vars.ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN }}
           role-to-assume: ${{ vars.ALIYUN_COLLECTOR_MONITOR_ROLE_ARN }}
           role-session-name: collector-monitor-${{ github.run_id }}
+          role-session-expiration: 900
           audience: sts.aliyuncs.com
 
       - name: Record OIDC authentication failure
@@ -86,31 +89,21 @@ jobs:
         id: health
         run: |
           set -euo pipefail
-          remote_script=$(printf '%s\n' \
-            '#!/usr/bin/env bash' \
-            'set -euo pipefail' \
-            'exec /opt/monday/bin/monday-collector-health.sh --json')
-          content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
-          if ! run_json=$(aliyun ecs RunCommand \
+          if ! run_json=$(aliyun ecs InvokeCommand \
             --RegionId "${{ env.REGION_ID }}" \
             --InstanceId.1 "${{ env.INSTANCE_ID }}" \
-            --Type RunShellScript \
-            --ContentEncoding Base64 \
-            --CommandContent "$content" \
-            --KeepCommand false \
-            --Name monday-collector-health \
-            --Timeout 90 2>&1); then
-            printf 'RunCommand failed: %s\n' "$run_json" >&2
+            --CommandId "$COMMAND_ID" 2>&1); then
+            printf 'InvokeCommand failed: %s\n' "$run_json" >&2
             {
               echo "ok=unknown"
               echo "invocation_failed=1"
-              echo "exit_code=runcommand-error"
+              echo "exit_code=invokecommand-error"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           invoke_id=$(printf '%s' "$run_json" | jq -er '.InvokeId' 2>/dev/null || true)
           if [ -z "$invoke_id" ]; then
-            printf 'RunCommand response had no InvokeId: %s\n' "$run_json" >&2
+            printf 'InvokeCommand response had no InvokeId: %s\n' "$run_json" >&2
             {
               echo "ok=unknown"
               echo "invocation_failed=1"
@@ -127,6 +120,7 @@ jobs:
             result_json=$(aliyun ecs DescribeInvocationResults \
               --RegionId "${{ env.REGION_ID }}" \
               --InvokeId "$invoke_id" \
+              --CommandId "$COMMAND_ID" \
               --InstanceId "${{ env.INSTANCE_ID }}" || true)
             status=$(printf '%s' "$result_json" | jq -r '[.. | objects | .InvocationStatus? // empty][0] // empty')
             exit_code=$(printf '%s' "$result_json" | jq -r '[.. | objects | .ExitCode? // empty][0] // empty')

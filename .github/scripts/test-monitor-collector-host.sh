@@ -23,6 +23,10 @@ grep -Fqx '        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d9
 }
 grep -Fqx '          oidc-provider-arn: ${{ vars.ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN }}' "$workflow" || oidc_contract_failed=1
 grep -Fqx '          role-to-assume: ${{ vars.ALIYUN_COLLECTOR_MONITOR_ROLE_ARN }}' "$workflow" || oidc_contract_failed=1
+grep -Fqx '          role-session-expiration: 900' "$workflow" || {
+  printf 'collector monitor OIDC session is not fixed at 900 seconds\n' >&2
+  oidc_contract_failed=1
+}
 grep -Fqx '          audience: sts.aliyuncs.com' "$workflow" || oidc_contract_failed=1
 grep -Fqx '        id: aliyun-auth' "$workflow" || oidc_contract_failed=1
 grep -Fqx '      - name: Record OIDC authentication failure' "$workflow" || oidc_contract_failed=1
@@ -32,18 +36,29 @@ if grep -Eqi '(ALIYUN|ALIBABA_CLOUD|ALIBABACLOUD)_ACCESS_KEY_(ID|SECRET)|ALICLOU
   printf 'collector monitor still depends on long-term Aliyun AccessKeys\n' >&2
   oidc_contract_failed=1
 fi
-test "$oidc_contract_failed" -eq 0
-
-remote_assignment=$(sed -n '/^          remote_script=/,/^          content=/p' "$workflow" | sed '$d;s/^          //')
-expected_remote_assignment=$(printf '%s\n' \
-  "remote_script=\$(printf '%s\\n' \\" \
-  "  '#!/usr/bin/env bash' \\" \
-  "  'set -euo pipefail' \\" \
-  "  'exec /opt/monday/bin/monday-collector-health.sh --json')")
-if [ "$remote_assignment" != "$expected_remote_assignment" ]; then
-  printf 'remote script is not assembled from three newline-delimited lines\n' >&2
-  exit 1
+command_contract_failed=0
+grep -Fqx '  COMMAND_ID: ${{ vars.ALIYUN_COLLECTOR_MONITOR_COMMAND_ID }}' "$workflow" || {
+  printf 'collector monitor does not bind a fixed Cloud Assistant CommandId\n' >&2
+  command_contract_failed=1
+}
+grep -Fqx $'          if ! run_json=$(aliyun ecs InvokeCommand \\' "$workflow" || {
+  printf 'collector monitor does not invoke the fixed Cloud Assistant command\n' >&2
+  command_contract_failed=1
+}
+grep -Fqx $'            --RegionId "${{ env.REGION_ID }}" \\' "$workflow" || command_contract_failed=1
+grep -Fqx $'            --InstanceId.1 "${{ env.INSTANCE_ID }}" \\' "$workflow" || command_contract_failed=1
+grep -Fqx '            --CommandId "$COMMAND_ID" 2>&1); then' "$workflow" || command_contract_failed=1
+grep -Fqx $'              --CommandId "$COMMAND_ID" \\' "$workflow" || command_contract_failed=1
+if grep -Fq '${{ env.COMMAND_ID }}' "$workflow"; then
+  printf 'collector monitor interpolates CommandId into the shell program\n' >&2
+  command_contract_failed=1
 fi
+if grep -Eq 'RunCommand|CommandContent|ContentEncoding|KeepCommand|remote_script' "$workflow"; then
+  printf 'collector monitor still exposes dynamic Cloud Assistant command execution\n' >&2
+  command_contract_failed=1
+fi
+test "$oidc_contract_failed" -eq 0
+test "$command_contract_failed" -eq 0
 
 health_validation=$(sed -n \
   '/^          if \[ -n "\$health_json" \]; then$/,/^          echo "invocation_failed=/p' \
