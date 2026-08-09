@@ -324,9 +324,12 @@ check_upload() {
     record_breach "$label: upload last_error=$err_msg"
   fi
   prior=$(read_prior "failure_count|$label")
-  if [ "$DRY_RUN" -eq 0 ] && [ -n "$prior" ]; then
+  if [ "$DRY_RUN" -eq 0 ]; then
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
-    if [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
+    if [ -z "$prior" ] && [ "$label" = "binance-fee-upload" ] && [ "$failure_count" -gt 0 ]; then
+      failure_delta=1
+      record_breach "$label: initial upload failure_count=$failure_count"
+    elif [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
       failure_delta=1
       record_breach "$label: upload failure_count increased $prior -> $failure_count"
     fi
