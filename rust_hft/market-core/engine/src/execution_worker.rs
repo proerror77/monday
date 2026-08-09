@@ -43,6 +43,10 @@ type IndexedExecutionStream =
 
 const STREAM_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+fn arrival_price(envelope: &OrderIntentEnvelope) -> Option<Price> {
+    envelope.lifecycle.arrival_price
+}
+
 /// 客户端选择策略
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ClientSelectionStrategy {
@@ -1025,6 +1029,7 @@ impl ExecutionWorker {
                         },
                     );
 
+                    let arrival_price = arrival_price(&envelope);
                     let OrderIntent {
                         symbol,
                         side,
@@ -1047,6 +1052,7 @@ impl ExecutionWorker {
                         side,
                         quantity,
                         requested_price: price,
+                        arrival_price,
                         timestamp: now_micros(),
                         venue: venue_for_client,
                         strategy_id,
@@ -1117,6 +1123,7 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
+                                arrival_price: arrival_price(&envelope),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),
@@ -3144,6 +3151,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arrival_price_requires_engine_quote_provenance() {
+        let intent = create_test_intent("BTCUSDT");
+        let mut envelope = OrderIntentEnvelope::new(intent.clone(), Default::default());
+        assert_eq!(arrival_price(&envelope), None);
+
+        envelope.lifecycle.arrival_price = intent.price;
+        assert_eq!(arrival_price(&envelope), intent.price);
+    }
+
     fn ready_spot_admission(account_id: AccountId, venue: VenueId) -> AccountExecutionAdmission {
         AccountExecutionAdmission {
             account_id,
@@ -4694,6 +4711,7 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         let mut first = create_test_intent("BTCUSDT");
+        first.order_type = OrderType::Limit;
         first.strategy_id = "binance".to_string();
         first.target_venue = Some(VenueId::BINANCE);
         let mut second = create_test_intent("ETHUSDT");
@@ -4771,8 +4789,10 @@ mod tests {
             events.as_slice(),
             [ExecutionEvent::OrderNew {
                 account_id: Some(account_id),
+                arrival_price: Some(arrival_price),
                 ..
             }] if account_id == &AccountId("binance-main".to_string())
+                && *arrival_price == Price::from_f64(100.0).unwrap()
         ));
 
         worker

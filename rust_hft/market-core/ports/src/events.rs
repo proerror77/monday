@@ -411,6 +411,9 @@ pub struct OrderIntentLifecycle {
     pub reduce_only: bool,
     #[serde(skip, default)]
     pub timing: ExecutionTiming,
+    /// Executable quote captured by the engine immediately before risk review.
+    #[serde(skip, default)]
+    pub arrival_price: Option<Price>,
 }
 
 impl Default for OrderIntentLifecycle {
@@ -426,6 +429,7 @@ impl Default for OrderIntentLifecycle {
             max_order_quantity: None,
             reduce_only: false,
             timing: ExecutionTiming::default(),
+            arrival_price: None,
         }
     }
 }
@@ -658,6 +662,9 @@ pub enum ExecutionEvent {
         quantity: Quantity,
         /// 原始意圖中的價格（Market 單通常為 None，會在引擎層補全）
         requested_price: Option<Price>,
+        /// Executable quote captured when a marketable intent entered execution.
+        #[serde(default)]
+        arrival_price: Option<Price>,
         timestamp: Timestamp,
         /// 目標交易場（若可推斷，由執行路由器或 worker 填充）
         #[serde(default)]

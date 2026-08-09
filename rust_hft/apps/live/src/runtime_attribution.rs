@@ -36,6 +36,7 @@ struct OrderMetadata {
     symbol: String,
     side: Side,
     requested_price: Option<Decimal>,
+    arrival_price: Option<Decimal>,
     timing: OrderTiming,
     seen_fill_ids: HashSet<String>,
 }
@@ -57,6 +58,7 @@ struct StrategyTarget {
 #[derive(Debug)]
 struct AttributionState {
     orders: HashMap<String, OrderMetadata>,
+    invalid_order_ids: HashSet<String>,
     targets: BTreeMap<String, StrategyTarget>,
     ledgers: BTreeMap<String, StrategyLedger>,
     valuation_started: bool,
@@ -211,6 +213,7 @@ impl AttributionState {
             .collect();
         Ok(Self {
             orders: HashMap::new(),
+            invalid_order_ids: HashSet::new(),
             targets,
             ledgers,
             valuation_started: false,
@@ -344,19 +347,40 @@ fn execution_attribution(
             venue,
             strategy_id,
             requested_price,
+            arrival_price,
             ..
         } => {
-            state.orders.remove(&order_id.0);
-            let Some(venue) = venue.as_ref().map(ToString::to_string) else {
+            if state.invalid_order_ids.contains(&order_id.0) {
                 return Ok(None);
-            };
-            let Some(expected_strategy_id) = expected_strategy_id(activation, symbol.as_str())
-            else {
-                return Ok(None);
-            };
-            if strategy_id != &expected_strategy_id
-                || !venue.eq_ignore_ascii_case(&activation.venue)
+            }
+            let previous = state.orders.remove(&order_id.0);
+            let candidate_venue = venue.as_ref().map(ToString::to_string);
+            let expected_strategy_id = expected_strategy_id(activation, symbol.as_str());
+            if candidate_venue
+                .as_ref()
+                .is_none_or(|venue| !venue.eq_ignore_ascii_case(&activation.venue))
+                || expected_strategy_id
+                    .as_ref()
+                    .is_none_or(|expected| strategy_id != expected)
             {
+                if previous.is_some() {
+                    state.invalid_order_ids.insert(order_id.0.clone());
+                }
+                return Ok(None);
+            }
+            let venue = candidate_venue.unwrap();
+            if previous.as_ref().is_some_and(|order| {
+                order.strategy_id != *strategy_id
+                    || !order.venue.eq_ignore_ascii_case(&venue)
+                    || order.symbol != symbol.as_str()
+                    || order.side != *side
+                    || order.requested_price != requested_price.map(|price| price.0)
+                    || matches!(
+                        (order.arrival_price, arrival_price.map(|price| price.0)),
+                        (Some(previous), Some(current)) if previous != current
+                    )
+            }) {
+                state.invalid_order_ids.insert(order_id.0.clone());
                 return Ok(None);
             }
             state.orders.insert(
@@ -367,8 +391,16 @@ fn execution_attribution(
                     symbol: symbol.to_string(),
                     side: *side,
                     requested_price: requested_price.map(|price| price.0),
-                    timing: OrderTiming::default(),
-                    seen_fill_ids: HashSet::new(),
+                    arrival_price: arrival_price
+                        .map(|price| price.0)
+                        .or_else(|| previous.as_ref().and_then(|order| order.arrival_price)),
+                    timing: previous
+                        .as_ref()
+                        .map(|order| order.timing.clone())
+                        .unwrap_or_default(),
+                    seen_fill_ids: previous
+                        .map(|order| order.seen_fill_ids)
+                        .unwrap_or_default(),
                 },
             );
             Ok(None)
@@ -448,6 +480,29 @@ fn execution_attribution(
                         (signed * 10_000.0).max(0.0),
                     );
                 }
+            }
+            if let Some(arrival_price) = metadata.arrival_price {
+                let arrival = finite_metric("arrival_price", arrival_price.to_f64())?;
+                let fill = finite_metric("fill_price", price.to_f64())?;
+                if arrival > 0.0 && fill > 0.0 {
+                    let signed = match metadata.side {
+                        Side::Buy => fill / arrival - 1.0,
+                        Side::Sell => 1.0 - fill / arrival,
+                    };
+                    metrics.insert(
+                        "arrival_slippage_bps".to_string(),
+                        (signed * 10_000.0).max(0.0),
+                    );
+                }
+            }
+            metrics.insert(
+                "evidence_available_at_us".to_string(),
+                Utc::now().timestamp_micros().max(0) as f64,
+            );
+            if metadata.venue.eq_ignore_ascii_case("binance")
+                || metadata.venue.eq_ignore_ascii_case("binance_spot")
+            {
+                metrics.insert("instrument_market_spot".to_string(), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -921,6 +976,7 @@ fn inferred_pre_submission_reject(
         symbol,
         side: Side::Buy,
         requested_price: None,
+        arrival_price: None,
         timing: OrderTiming::default(),
         seen_fill_ids: HashSet::new(),
     })
@@ -1141,6 +1197,7 @@ mod tests {
             side,
             quantity: Quantity::from_f64(1.0).unwrap(),
             requested_price: Some(Price::from_f64(100.0).unwrap()),
+            arrival_price: Some(Price::from_f64(100.0).unwrap()),
             timestamp: NOW_US,
             venue,
             strategy_id: strategy_id.to_string(),
@@ -1237,6 +1294,11 @@ mod tests {
             },
         )
         .unwrap();
+        let mut duplicate = order_new("fill-order");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut duplicate {
+            *arrival_price = None;
+        }
+        execution_attribution(&activation, &mut state, &duplicate).unwrap();
         let fill = execution_attribution(
             &activation,
             &mut state,
@@ -1261,6 +1323,8 @@ mod tests {
         assert_eq!(fill.metrics["write_to_private_report_us"], 40.0);
         assert_eq!(fill.metrics["intent_to_private_report_us"], 75.0);
         assert!((fill.metrics["realized_slippage_bps"] - 100.0).abs() < 1e-9);
+        assert!((fill.metrics["arrival_slippage_bps"] - 100.0).abs() < 1e-9);
+        assert!(fill.metrics["evidence_available_at_us"] > NOW_US as f64);
 
         execution_attribution(
             &activation,
@@ -1328,6 +1392,35 @@ mod tests {
         assert_eq!(cancel.outcome, AttributionOutcome::Healthy);
         assert!(!state.orders.contains_key("reject-order"));
         assert!(!state.orders.contains_key("cancel-order"));
+    }
+
+    #[test]
+    fn conflicting_duplicate_order_invalidates_prior_metadata() {
+        let activation = activation();
+        let mut state = AttributionState::new(&activation).unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
+
+        let mut conflicting = order_new("reused-order");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut conflicting {
+            *arrival_price = Some(Price::from_f64(101.0).unwrap());
+        }
+        execution_attribution(&activation, &mut state, &conflicting).unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
+
+        let fill = execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::Fill {
+                order_id: OrderId("reused-order".to_string()),
+                price: Price::from_f64(101.0).unwrap(),
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                timestamp: NOW_US + 1,
+                fill_id: "fill-after-reuse".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(fill.is_none());
+        assert!(state.invalid_order_ids.contains("reused-order"));
     }
 
     #[test]
