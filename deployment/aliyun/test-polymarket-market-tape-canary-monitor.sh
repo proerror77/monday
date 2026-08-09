@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 # Loading the monitor exposes its pure sampling and stop-rule functions without
 # starting an observation or touching systemd.
-# shellcheck source=polymarket-market-tape-canary-monitor.sh
+# shellcheck disable=SC1091 # Resolved from this checkout at runtime.
 source "$monitor"
 
 rollback_now() {
