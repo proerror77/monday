@@ -118,7 +118,7 @@ pub struct CexInstrumentRulesV2 {
     pub min_notional: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,13 +130,13 @@ pub struct CexFeeScheduleV2 {
     pub taker_sell_fee_bps: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexPitSeriesEvidenceV2 {
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
     pub first_available_at: DateTime<Utc>,
     pub last_available_at: DateTime<Utc>,
     pub observations: u64,
@@ -223,7 +223,7 @@ impl CexReplaySnapshotV2 {
         if !positive_decimal(&self.instrument_rules.tick_size)
             || !positive_decimal(&self.instrument_rules.step_size)
             || !positive_decimal(&self.instrument_rules.min_notional)
-            || !self.instrument_rules.evidence.valid()
+            || !valid_evidence_set(&self.instrument_rules.evidence)
             || self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.available_at > self.instrument_rules.valid_through
             || self.instrument_rules.valid_through < self.last_event_time
@@ -231,7 +231,7 @@ impl CexReplaySnapshotV2 {
             || !nonnegative_decimal(&self.fee_schedule.maker_sell_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.taker_buy_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.taker_sell_fee_bps)
-            || !self.fee_schedule.evidence.valid()
+            || !valid_evidence_set(&self.fee_schedule.evidence)
             || self.fee_schedule.available_at > self.first_event_time
             || self.fee_schedule.available_at > self.fee_schedule.valid_through
             || self.fee_schedule.valid_through < self.last_event_time
@@ -282,7 +282,7 @@ fn pit_series_covers(
     first_event_time: DateTime<Utc>,
     last_event_time: DateTime<Utc>,
 ) -> bool {
-    evidence.evidence.valid()
+    valid_evidence_set(&evidence.evidence)
         && evidence.observations > 0
         && evidence.max_gap_ns <= CEX_DERIVATIVES_MAX_GAP_NS
         && evidence.first_available_at <= first_event_time
@@ -483,6 +483,10 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         && value == value.to_ascii_lowercase()
+}
+
+fn valid_evidence_set(evidence: &[CexArtifactTripletV2]) -> bool {
+    !evidence.is_empty() && evidence.iter().all(CexArtifactTripletV2::valid)
 }
 
 fn positive_decimal(value: &str) -> bool {
@@ -762,7 +766,7 @@ mod tests {
                 valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence: triplet('4'),
+                evidence: vec![triplet('4')],
             },
             fee_schedule: CexFeeScheduleV2 {
                 maker_buy_fee_bps: "2".to_string(),
@@ -775,11 +779,11 @@ mod tests {
                 valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence: triplet('5'),
+                evidence: vec![triplet('5')],
             },
             derivatives_reference: Some(CexDerivativesReferenceV2 {
                 funding: CexPitSeriesEvidenceV2 {
-                    evidence: triplet('6'),
+                    evidence: vec![triplet('6')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
@@ -790,7 +794,7 @@ mod tests {
                     max_gap_ns: 3_000_000_000,
                 },
                 open_interest: CexPitSeriesEvidenceV2 {
-                    evidence: triplet('7'),
+                    evidence: vec![triplet('7')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
@@ -913,6 +917,17 @@ mod tests {
         assert_eq!(
             snapshot.validate().unwrap_err(),
             ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_empty_evidence_set() {
+        let mut snapshot = cex_snapshot();
+        snapshot.fee_schedule.evidence.clear();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("PIT rules or fee evidence is invalid")
         );
     }
 
