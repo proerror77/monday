@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 # Loading the monitor exposes its pure sampling and stop-rule functions without
 # starting an observation or touching systemd.
-# shellcheck disable=SC1091 # Resolved from this checkout at runtime.
+# shellcheck disable=SC1090 # Resolved from this checkout at runtime.
 source "$monitor"
 
 rollback_now() {
