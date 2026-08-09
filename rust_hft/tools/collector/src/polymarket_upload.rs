@@ -3,6 +3,10 @@
 use crate::lob_archiver::{command_status_with_timeout, sha256_file, write_success_marker};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use polymarket_tape_contract::{
+    complete_market_tape_manifest_shape, tape_seal_path, PolymarketTapeSeal, TapeFileIdentity,
+    POLYMARKET_TAPE_SEAL_SCHEMA,
+};
 use rand::random;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -15,6 +19,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -188,6 +193,88 @@ struct ScanResult {
     identity: FileIdentity,
 }
 
+const MAX_TAPE_SEAL_BYTES: u64 = 16 * 1024 * 1024;
+static ACTIVE_ARCHIVES: AtomicUsize = AtomicUsize::new(0);
+
+struct ArchiveActivity;
+
+impl ArchiveActivity {
+    fn enter() -> Self {
+        ACTIVE_ARCHIVES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ArchiveActivity {
+    fn drop(&mut self) {
+        ACTIVE_ARCHIVES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CpuUsage {
+    self_micros: i128,
+    child_micros: i128,
+}
+
+fn timeval_micros(value: libc::timeval) -> i128 {
+    i128::from(value.tv_sec) * 1_000_000 + i128::from(value.tv_usec)
+}
+
+fn rusage_micros(who: libc::c_int) -> i128 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the supplied rusage on success.
+    let status = unsafe { libc::getrusage(who, usage.as_mut_ptr()) };
+    if status != 0 {
+        return 0;
+    }
+    // SAFETY: the successful call above initialized the value.
+    let usage = unsafe { usage.assume_init() };
+    timeval_micros(usage.ru_utime) + timeval_micros(usage.ru_stime)
+}
+
+fn cpu_usage() -> CpuUsage {
+    CpuUsage {
+        // Archive jobs run in blocking worker threads. Thread-local CPU avoids
+        // charging another concurrently archived tape to this phase.
+        self_micros: rusage_micros(libc::RUSAGE_THREAD),
+        // Child usage is process-wide on Linux. active_archives is emitted so
+        // consumers can distinguish the exact single-archive case from an
+        // overlapping diagnostic sample.
+        child_micros: rusage_micros(libc::RUSAGE_CHILDREN),
+    }
+}
+
+struct PhaseAttribution {
+    phase: &'static str,
+    started: std::time::Instant,
+    cpu_started: CpuUsage,
+}
+
+impl PhaseAttribution {
+    fn new(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+            cpu_started: cpu_usage(),
+        }
+    }
+}
+
+impl Drop for PhaseAttribution {
+    fn drop(&mut self) {
+        let cpu_ended = cpu_usage();
+        eprintln!(
+            "UPLOAD_PHASE phase={} wall_ms={} self_cpu_ms={} child_cpu_ms={} active_archives={}",
+            self.phase,
+            self.started.elapsed().as_millis(),
+            (cpu_ended.self_micros - self.cpu_started.self_micros).max(0) / 1_000,
+            (cpu_ended.child_micros - self.cpu_started.child_micros).max(0) / 1_000,
+            ACTIVE_ARCHIVES.load(Ordering::Relaxed),
+        );
+    }
+}
+
 #[derive(Debug)]
 struct UploadedSegment {
     object: String,
@@ -295,6 +382,56 @@ fn ensure_identity(path: &Path, expected: FileIdentity) -> Result<()> {
     Ok(())
 }
 
+fn matching_tape_seal(source: &Path, config: &UploadConfig) -> Result<Option<ScanResult>> {
+    let identity = regular_identity(source)?;
+    let seal_path = tape_seal_path(source)?;
+    match fs::symlink_metadata(&seal_path) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= MAX_TAPE_SEAL_BYTES =>
+        {
+            // Safe to read below: bounded, regular, and not a symlink.
+        }
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    }
+    let bytes = match fs::read(&seal_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let seal = match serde_json::from_slice::<PolymarketTapeSeal>(&bytes) {
+        Ok(seal) => seal,
+        Err(_) => return Ok(None),
+    };
+    let source_file = source.file_name().and_then(|name| name.to_str());
+    let manifest_policy = &seal.manifest["recording_policy"];
+    let matches = seal.schema == POLYMARKET_TAPE_SEAL_SCHEMA
+        && complete_market_tape_manifest_shape(&seal.manifest)
+        && Some(seal.source_file.as_str()) == source_file
+        && seal.source_identity == TapeFileIdentity::from_metadata(&fs::metadata(source)?)
+        && seal.manifest["schema"].as_str() == Some("monday.polymarket.raw.v1")
+        && seal.manifest["dataset"].as_str() == Some(config.dataset.as_str())
+        && seal.manifest["source_file"].as_str() == Some(seal.source_file.as_str())
+        && seal.manifest["source_bytes"].as_u64() == Some(identity.bytes)
+        && seal.manifest["source_session_closed"].as_bool() == Some(true)
+        && manifest_policy["quote_depth_levels"].as_u64()
+            == u64::try_from(config.quote_depth_levels).ok()
+        && manifest_policy["quote_sample_ms"].as_u64() == Some(config.quote_sample_ms)
+        && manifest_policy["event_scoped_quotes"].as_bool() == Some(true)
+        && seal.manifest["date"].as_str().is_some()
+        && seal.manifest["hour"].as_str().is_some();
+    if !matches {
+        return Ok(None);
+    }
+    ensure_identity(source, identity)?;
+    Ok(Some(ScanResult {
+        manifest: seal.manifest,
+        identity,
+    }))
+}
+
 fn parse_timestamp(
     value: Option<&Value>,
     field: &str,
@@ -324,6 +461,7 @@ fn decimal_or_none(
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string());
     Decimal::from_str(&text)
+        .or_else(|_| Decimal::from_scientific(&text))
         .map(Some)
         .map_err(|_| anyhow!("line {line_number}: {field} must be numeric"))
 }
@@ -937,6 +1075,11 @@ pub(crate) fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
         if strict_rotation_name(name) {
             regular_identity(&entry.path())?;
             paths.push(entry.path());
+        } else if name
+            .strip_suffix(".seal.json")
+            .is_some_and(strict_rotation_name)
+        {
+            continue;
         } else if name != "market-updates.ndjson" && name.starts_with("market-updates.") {
             bail!("invalid rotated tape name: {name}");
         }
@@ -1956,7 +2099,11 @@ fn prepare_artifacts_from_scan(
     let output = temporary_file.try_clone()?;
     let mut command = zstd_command(source, config);
     command.stdout(Stdio::from(output));
-    match command_status_with_timeout(&mut command, config.zstd_timeout) {
+    let zstd_result = {
+        let _phase = PhaseAttribution::new("zstd");
+        command_status_with_timeout(&mut command, config.zstd_timeout)
+    };
+    match zstd_result {
         Ok(status) if status.success() => {}
         Ok(status) => {
             let _ = fs::remove_file(&temporary_data);
@@ -1973,7 +2120,10 @@ fn prepare_artifacts_from_scan(
         return Err(error);
     }
     fs::rename(&temporary_data, &data)?;
-    let digest = sha256_file(&data)?;
+    let digest = {
+        let _phase = PhaseAttribution::new("local_sha256");
+        sha256_file(&data)?
+    };
     let mut metadata = scan
         .manifest
         .as_object()
@@ -2299,14 +2449,8 @@ where
         artifacts.manifest.as_path(),
         artifacts.success.as_path(),
     ];
-    let Ok((_verify_dir, downloaded)) = download_remote_artifacts_with(
-        artifacts,
-        config,
-        &sources,
-        Duration::MAX,
-        1,
-        runner,
-    )
+    let Ok((_verify_dir, downloaded)) =
+        download_remote_artifacts_with(artifacts, config, &sources, Duration::MAX, 1, runner)
     else {
         return Ok(RemoteArtifactsState::Missing);
     };
@@ -2346,17 +2490,13 @@ where
             .map(|meta| meta.len() == expected_bytes)
             .ok()
             == Some(true)
-            && sha256_file(remote_data)
-                .map(|sha| sha == expected_sha)
-                .ok()
-                == Some(true);
+            && sha256_file(remote_data).map(|sha| sha == expected_sha).ok() == Some(true);
         if !data_matches {
             force.push(data_name.clone());
         }
     }
     if let Some(remote_manifest) = downloaded.get(&manifest_name) {
-        let manifest_matches =
-            fs::read(remote_manifest).ok() == fs::read(&artifacts.manifest).ok();
+        let manifest_matches = fs::read(remote_manifest).ok() == fs::read(&artifacts.manifest).ok();
         if !manifest_matches {
             force.push(manifest_name.clone());
         }
@@ -2462,7 +2602,10 @@ fn upload_artifacts_with<F>(
 where
     F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
 {
-    let state = remote_artifacts_state_with(artifacts, config, runner)?;
+    let state = {
+        let _phase = PhaseAttribution::new("readback_preflight");
+        remote_artifacts_state_with(artifacts, config, runner)?
+    };
     if state != RemoteArtifactsState::Matching {
         let force_keys: BTreeSet<String> = match state {
             RemoteArtifactsState::Mismatched(keys) => keys.into_iter().collect(),
@@ -2473,33 +2616,45 @@ where
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
-        for source in [&artifacts.data, &artifacts.manifest] {
-            let name = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
-            upload_artifact_with(artifacts, source, config, force_keys.contains(name), runner)?;
+        {
+            let _phase = PhaseAttribution::new("put_data_manifest");
+            for source in [&artifacts.data, &artifacts.manifest] {
+                let name = source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+                upload_artifact_with(artifacts, source, config, force_keys.contains(name), runner)?;
+            }
         }
         let readback_started = std::time::Instant::now();
         let data_and_manifest = [artifacts.data.as_path(), artifacts.manifest.as_path()];
-        verify_remote_paths_with(
-            artifacts,
-            config,
-            &data_and_manifest,
-            OSS_READBACK_MAX_WALL_CLOCK,
-            runner,
-        )?;
+        {
+            let _phase = PhaseAttribution::new("readback_data_manifest");
+            verify_remote_paths_with(
+                artifacts,
+                config,
+                &data_and_manifest,
+                OSS_READBACK_MAX_WALL_CLOCK,
+                runner,
+            )?;
+        }
         let success_readback_budget =
             remaining_success_readback_budget(readback_started.elapsed())?;
-        upload_artifact_with(
-            artifacts,
-            &artifacts.success,
-            config,
-            force_keys.contains(success_name),
-            runner,
-        )?;
+        {
+            let _phase = PhaseAttribution::new("put_success");
+            upload_artifact_with(
+                artifacts,
+                &artifacts.success,
+                config,
+                force_keys.contains(success_name),
+                runner,
+            )?;
+        }
         let success = [artifacts.success.as_path()];
-        verify_remote_paths_with(artifacts, config, &success, success_readback_budget, runner)?;
+        {
+            let _phase = PhaseAttribution::new("readback_success");
+            verify_remote_paths_with(artifacts, config, &success, success_readback_budget, runner)?;
+        }
     }
     remove_artifacts(artifacts)?;
     let data_name = artifacts
@@ -2571,12 +2726,23 @@ fn ensure_upload_staging_root(path: &Path) -> Result<()> {
 }
 
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
-    let source_scan = scan_tape_with_identity(
-        source,
-        &config.dataset,
-        config.quote_depth_levels,
-        config.quote_sample_ms,
-    )?;
+    let _archive_activity = ArchiveActivity::enter();
+    let source_scan = {
+        let _seal_phase = PhaseAttribution::new("seal_lookup");
+        matching_tape_seal(source, config)?
+    };
+    let source_scan = match source_scan {
+        Some(scan) => scan,
+        None => {
+            let _phase = PhaseAttribution::new("scan");
+            scan_tape_with_identity(
+                source,
+                &config.dataset,
+                config.quote_depth_levels,
+                config.quote_sample_ms,
+            )?
+        }
+    };
     if source_scan.manifest["start_sequence"].as_u64() != Some(0) {
         bail!(
             "closed source tape must start at sequence 0; actual={}",
@@ -2593,17 +2759,23 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     let chunks = match stage_validated_single_hour(source, staging.path(), source_scan)? {
         Some(chunk) => vec![chunk],
         None => {
-            let paths = split_tape_by_utc_hour(source, staging.path())?;
+            let paths = {
+                let _phase = PhaseAttribution::new("split_multi_hour");
+                split_tape_by_utc_hour(source, staging.path())?
+            };
             ensure_identity(source, source_identity)?;
             paths
                 .into_iter()
                 .map(|chunk| {
-                    let scan = scan_tape_with_identity(
-                        &chunk,
-                        &config.dataset,
-                        config.quote_depth_levels,
-                        config.quote_sample_ms,
-                    )?;
+                    let scan = {
+                        let _phase = PhaseAttribution::new("scan_multi_hour_chunk");
+                        scan_tape_with_identity(
+                            &chunk,
+                            &config.dataset,
+                            config.quote_depth_levels,
+                            config.quote_sample_ms,
+                        )?
+                    };
                     Ok((chunk, scan))
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -2623,6 +2795,13 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
         });
     }
     ensure_identity(source, source_identity)?;
+    if let Ok(seal) = tape_seal_path(source) {
+        if fs::symlink_metadata(&seal).is_ok_and(|metadata| {
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+        }) {
+            fs::remove_file(seal)?;
+        }
+    }
     fs::remove_file(source)?;
     File::open(spool_dir)?.sync_all()?;
     Ok(uploaded)
@@ -2836,6 +3015,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_tape_contract::MarketTapeManifestBuilder;
     use serde_json::json;
     use std::os::unix::fs::symlink;
     use std::process::ExitStatus;
@@ -3038,6 +3218,182 @@ mod tests {
         path
     }
 
+    fn write_seal(tape: &Path, manifest: Value) {
+        let source_file = tape.file_name().unwrap().to_str().unwrap().to_owned();
+        let seal = PolymarketTapeSeal {
+            schema: POLYMARKET_TAPE_SEAL_SCHEMA.to_owned(),
+            source_file,
+            source_identity: TapeFileIdentity::from_metadata(&fs::metadata(tape).unwrap()),
+            manifest,
+        };
+        atomic_json(
+            &tape_seal_path(tape).unwrap(),
+            &serde_json::to_value(seal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn incremental_seal_manifest_is_byte_equivalent_to_full_scan() {
+        let root = TestDir::new();
+        let mut rows = sample_rows();
+        rows.push(record(
+            3,
+            "2026-07-15T01:00:03.000000000Z",
+            json!({
+                "kind": "spot_price", "symbol": "BTCUSDT", "price": 1e-9,
+                "ts": "2026-07-15T01:00:03Z",
+            }),
+        ));
+        let tape = write_tape(root.path(), "market-updates.20260715T010300.ndjson", &rows);
+        let validation_time = DateTime::parse_from_rfc3339("2026-07-15T01:03:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let full =
+            scan_tape_with_identity_at(&tape, "crypto_expiry", 0, 0, validation_time).unwrap();
+        let mut incremental = MarketTapeManifestBuilder::new();
+        for row in &rows {
+            incremental.observe(row, validation_time).unwrap();
+        }
+        let source_file = tape.file_name().unwrap().to_str().unwrap();
+        let sealed = incremental
+            .finish(
+                "crypto_expiry",
+                0,
+                0,
+                source_file,
+                fs::metadata(&tape).unwrap().len(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&sealed).unwrap(),
+            serde_json::to_vec(&full.manifest).unwrap()
+        );
+    }
+
+    #[test]
+    fn matching_seal_reuses_manifest_without_changing_source_identity() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010300.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+        let scan = scan_tape_with_identity(
+            &tape,
+            &config.dataset,
+            config.quote_depth_levels,
+            config.quote_sample_ms,
+        )
+        .unwrap();
+        write_seal(&tape, scan.manifest.clone());
+
+        let reused = matching_tape_seal(&tape, &config).unwrap().unwrap();
+
+        assert_eq!(reused.identity, scan.identity);
+        assert_eq!(reused.manifest, scan.manifest);
+    }
+
+    #[test]
+    fn missing_corrupt_or_mismatched_seal_falls_back_to_full_scan() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010300.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+        assert!(matching_tape_seal(&tape, &config).unwrap().is_none());
+
+        fs::write(tape_seal_path(&tape).unwrap(), b"not-json\n").unwrap();
+        assert!(matching_tape_seal(&tape, &config).unwrap().is_none());
+
+        let scan = scan_tape_with_identity(
+            &tape,
+            &config.dataset,
+            config.quote_depth_levels,
+            config.quote_sample_ms,
+        )
+        .unwrap();
+        let mut missing_partition = scan.manifest.clone();
+        missing_partition.as_object_mut().unwrap().remove("date");
+        write_seal(&tape, missing_partition);
+        assert!(matching_tape_seal(&tape, &config).unwrap().is_none());
+
+        for field in [
+            "start_recorded_at",
+            "end_recorded_at",
+            "event_types",
+            "quality",
+        ] {
+            let mut incomplete = scan.manifest.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            write_seal(&tape, incomplete);
+            assert!(
+                matching_tape_seal(&tape, &config).unwrap().is_none(),
+                "missing {field} must fall back to the full scan"
+            );
+        }
+
+        write_seal(&tape, scan.manifest);
+        OpenOptions::new()
+            .append(true)
+            .open(&tape)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(matching_tape_seal(&tape, &config).unwrap().is_none());
+        assert!(scan_tape(&tape, "crypto_expiry", 0, 0).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE pointing at an immutable closed tape and its seal"]
+    fn immutable_fixture_reports_full_scan_and_seal_lookup_phases() {
+        let fixture = PathBuf::from(
+            std::env::var("MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE")
+                .expect("immutable fixture path is required"),
+        );
+        let root = fixture.parent().expect("fixture has a parent");
+        let mut config = config(root);
+        config.dataset = "crypto_expiry".to_owned();
+        config.quote_depth_levels = 0;
+        config.quote_sample_ms = 0;
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIN_FIXTURE_BYTES: u64 = 37 * GIB / 10;
+        const MAX_FIXTURE_BYTES: u64 = 43 * GIB / 10;
+        let fixture_identity = regular_identity(&fixture).unwrap();
+        assert!(
+            (MIN_FIXTURE_BYTES..=MAX_FIXTURE_BYTES).contains(&fixture_identity.bytes),
+            "fixture must be between 3.7 and 4.3 GiB"
+        );
+
+        let full_started = std::time::Instant::now();
+        let full = {
+            let _phase = PhaseAttribution::new("benchmark_full_scan");
+            scan_tape_with_identity(&fixture, "crypto_expiry", 0, 0).unwrap()
+        };
+        let full_elapsed = full_started.elapsed();
+        let seal_started = std::time::Instant::now();
+        let sealed = {
+            let _phase = PhaseAttribution::new("benchmark_seal_lookup");
+            matching_tape_seal(&fixture, &config).unwrap().unwrap()
+        };
+        let seal_elapsed = seal_started.elapsed();
+
+        assert_eq!(full.identity, fixture_identity);
+        assert_eq!(sealed.identity, full.identity);
+        assert_eq!(sealed.manifest, full.manifest);
+        eprintln!(
+            "IMMUTABLE_FIXTURE_BENCH source_bytes={} full_scan_ms={} seal_lookup_ms={}",
+            full.identity.bytes,
+            full_elapsed.as_millis(),
+            seal_elapsed.as_millis(),
+        );
+    }
+
     fn config(root: &Path) -> UploadConfig {
         UploadConfig {
             spool_dir: root.to_path_buf(),
@@ -3115,12 +3471,8 @@ mod tests {
         let config = config(root.path());
         let args = command_args(&oss_copy_command("src", "dst", &config));
         assert_eq!(&args[..4], ["ossutil", "cp", "src", "dst"]);
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--parallel", "8"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--part-size", "32Mi"]));
+        assert!(args.windows(2).any(|pair| pair == ["--parallel", "8"]));
+        assert!(args.windows(2).any(|pair| pair == ["--part-size", "32Mi"]));
     }
 
     #[test]
@@ -3130,12 +3482,8 @@ mod tests {
         config.oss_parallel = 12;
         config.oss_part_size = "64Mi".to_owned();
         let args = command_args(&oss_copy_command("src", "dst", &config));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--parallel", "12"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--part-size", "64Mi"]));
+        assert!(args.windows(2).any(|pair| pair == ["--parallel", "12"]));
+        assert!(args.windows(2).any(|pair| pair == ["--part-size", "64Mi"]));
     }
 
     #[test]
@@ -3144,12 +3492,8 @@ mod tests {
         let config = config(root.path());
         let args = command_args(&oss_upload_command("src", "dst", &config));
         assert!(args.iter().any(|arg| arg == "--ignore-existing"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--parallel", "8"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--part-size", "32Mi"]));
+        assert!(args.windows(2).any(|pair| pair == ["--parallel", "8"]));
+        assert!(args.windows(2).any(|pair| pair == ["--part-size", "32Mi"]));
     }
 
     #[test]
@@ -4593,12 +4937,24 @@ mod tests {
             json!({"kind": "event_expired", "event_id": "event-1", "end_time": null}),
         ));
         let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+        let config = config(root.path());
         let staging = ExclusiveTempDir::create(root.path(), ".split").unwrap();
-        let source_scan =
-            scan_tape_with_identity(&tape, "crypto_expiry", 1, 1_000).unwrap();
-        assert!(stage_validated_single_hour(&tape, staging.path(), source_scan)
+        let source_scan = scan_tape_with_identity(
+            &tape,
+            &config.dataset,
+            config.quote_depth_levels,
+            config.quote_sample_ms,
+        )
+        .unwrap();
+        write_seal(&tape, source_scan.manifest.clone());
+        let source_scan = matching_tape_seal(&tape, &config)
             .unwrap()
-            .is_none());
+            .expect("matching multi-hour seal is selected");
+        assert!(
+            stage_validated_single_hour(&tape, staging.path(), source_scan)
+                .unwrap()
+                .is_none()
+        );
         let chunks = split_tape_by_utc_hour(&tape, staging.path()).unwrap();
         assert_eq!(chunks.len(), 2);
         let first = scan_tape(&chunks[0], "crypto_expiry", 1, 1_000).unwrap();
@@ -4631,7 +4987,18 @@ mod tests {
             "market-updates.20260715T010000.ndjson",
             &sample_rows(),
         );
-        let scan = scan_tape_with_identity(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        let config = config(root.path());
+        let scan = scan_tape_with_identity(
+            &tape,
+            &config.dataset,
+            config.quote_depth_levels,
+            config.quote_sample_ms,
+        )
+        .unwrap();
+        write_seal(&tape, scan.manifest.clone());
+        let scan = matching_tape_seal(&tape, &config)
+            .unwrap()
+            .expect("matching single-hour seal is selected");
         let source_identity = scan.identity;
         let staging = ExclusiveTempDir::create(root.path(), ".split").unwrap();
 
@@ -4824,7 +5191,13 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
-        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
+        let data_name = artifacts
+            .data
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let manifest_name = artifacts
             .manifest
             .file_name()
@@ -4901,7 +5274,13 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
-        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
+        let data_name = artifacts
+            .data
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let success_name = artifacts
             .success
             .file_name()
@@ -5215,8 +5594,20 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
-        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap().to_owned();
-        let manifest_name = artifacts.manifest.file_name().unwrap().to_str().unwrap().to_owned();
+        let data_name = artifacts
+            .data
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let manifest_name = artifacts
+            .manifest
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let success_name = artifacts
             .success
             .file_name()
@@ -5365,23 +5756,23 @@ mod tests {
         let error = upload_pending(&config).unwrap_err();
 
         assert!(error.to_string().contains("failed"));
-        assert!(source.exists(), "low-disk bail must preserve the source tape");
+        assert!(
+            source.exists(),
+            "low-disk bail must preserve the source tape"
+        );
         assert!(
             !root.path().join(".upload-staging").exists(),
             "no staging temp files may exist when the low-disk guard trips"
         );
-        let status: Value = serde_json::from_slice(
-            &fs::read(root.path().join("upload-status.json")).unwrap(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
         assert_eq!(status["uploaded_segments"], 0);
         assert_eq!(status["failure_count"], 1);
         assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
         assert_eq!(status["failed_segments"][0]["reason"], "low_disk");
         assert!(
-            status["last_error"]
-                .to_string()
-                .contains("low disk: "),
+            status["last_error"].to_string().contains("low disk: "),
             "status last_error must surface the low-disk reason: {}",
             status["last_error"]
         );
@@ -5417,10 +5808,9 @@ mod tests {
             source.exists(),
             "readback failure must preserve the source tape"
         );
-        let status: Value = serde_json::from_slice(
-            &fs::read(root.path().join("upload-status.json")).unwrap(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
         assert_eq!(status["failure_count"], 1);
         assert_eq!(status["failed_segments"].as_array().unwrap().len(), 1);
         assert!(status["failed_segments"][0]["error"]
@@ -5462,6 +5852,19 @@ mod tests {
         fs::remove_file(&linked).unwrap();
         assert_eq!(discover_rotated_tapes(root.path()).unwrap(), vec![valid]);
         assert_eq!(fs::read(target).unwrap(), b"victim");
+    }
+
+    #[test]
+    fn strict_discovery_ignores_an_adjacent_seal_sidecar() {
+        let root = TestDir::new();
+        let valid = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        fs::write(tape_seal_path(&valid).unwrap(), b"{}\n").unwrap();
+
+        assert_eq!(discover_rotated_tapes(root.path()).unwrap(), vec![valid]);
     }
 
     #[cfg(unix)]

@@ -16,6 +16,7 @@ duckdb = { version = "1.1", features = ["chrono"], optional = true }
 async-trait.workspace = true
 chrono.workspace = true
 ploy-market-contracts.workspace = true
+polymarket-tape-contract = { path = "../../../shared/polymarket-tape" }
 ploy-operator-contracts.workspace = true
 ploy-trading.workspace = true
 rust_decimal.workspace = true
