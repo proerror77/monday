@@ -581,6 +581,16 @@ expect "fee status missing: exit 1" "$(rc_is 1; echo $?)"
 expect "fee status missing: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing'; echo $?)"
 
 # ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{not json\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "fee status malformed: exit 1" "$(rc_is 1; echo $?)"
+expect "fee status malformed: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 if [ "$fail_count" -gt 0 ]; then
   printf 'details:\n'

@@ -8,6 +8,7 @@ allowed_files:
   - .github/workflows/ci.yml
   - .github/workflows/acr-publish.yml
   - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+  - rust_hft/tools/collector/src/binance_fee_upload.rs
   - deployment/aliyun/binance-fee-snapshot-spot.service
   - deployment/aliyun/binance-fee-snapshot-spot.timer
   - deployment/aliyun/binance-fee-snapshot-usdm.service

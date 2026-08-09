@@ -302,9 +302,19 @@ check_upload() {
   failure_count=0
   failure_delta=0
   if [ -f "$upload_file" ]; then
-    err_at=$(jq -r '(.last_error_at // null)' "$upload_file" 2>/dev/null || printf 'null')
-    err_msg=$(jq -r '(.last_error // null)' "$upload_file" 2>/dev/null || printf 'null')
-    failure_count=$(jq -r '(.failure_count // 0)' "$upload_file" 2>/dev/null || printf '0')
+    if upload_json=$(jq -ce '
+      if type == "object"
+        and ((.failure_count // 0) | type == "number")
+        and ((.failure_count // 0) | floor == .)
+        and ((.failure_count // 0) >= 0)
+      then . else error("invalid upload status") end
+    ' "$upload_file" 2>/dev/null); then
+      err_at=$(printf '%s' "$upload_json" | jq -r '(.last_error_at // null)')
+      err_msg=$(printf '%s' "$upload_json" | jq -r '(.last_error // null)')
+      failure_count=$(printf '%s' "$upload_json" | jq -r '(.failure_count // 0)')
+    else
+      record_breach "$label: upload-status.json is malformed"
+    fi
   fi
   case "$failure_count" in (*[!0-9]*|'') failure_count=0 ;; esac
   if [ -n "$err_at" ] && [ "$err_at" != "null" ]; then
