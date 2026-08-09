@@ -245,6 +245,7 @@ impl RegisteredResearchDataset {
                 costs.fee_bps,
                 costs.funding_bps,
                 costs.latency_bps,
+                false,
             ),
             Self::CexReplay {
                 admission: CexReplayAdmission::V1(_),
@@ -254,9 +255,12 @@ impl RegisteredResearchDataset {
                 admission: CexReplayAdmission::V2(manifest),
                 features,
             } => {
+                if costs.rebate_bps != 0.0 {
+                    bail!("V2 CEX replay evidence does not support mission-supplied rebates");
+                }
                 let (fee_bps, funding_bps, latency_bps) =
                     cex_snapshot_costs(&manifest.snapshot, costs.cross_spread)?;
-                load_feature_research_rows(features, fee_bps, funding_bps, latency_bps)
+                load_feature_research_rows(features, fee_bps, funding_bps, latency_bps, true)
             }
         }
     }
@@ -473,6 +477,32 @@ pub fn read_registered_research_dataset(
     Ok(dataset)
 }
 
+pub fn require_promotable_research_dataset(
+    store: &AlphaStore,
+    manifest_id: &str,
+) -> anyhow::Result<()> {
+    let revision = store
+        .get_registry_revision(manifest_id)
+        .context("promotion dataset manifest is not registered")?;
+    if revision.registry_kind != "dataset" || revision.revision_id != manifest_id {
+        bail!("promotion dataset manifest does not match its registered revision");
+    }
+    if revision
+        .payload
+        .get("dataset_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(CEX_REPLAY_DATASET_KIND)
+        && revision
+            .payload
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(CEX_REPLAY_DATASET_SCHEMA_V2)
+    {
+        bail!("historical V1 CEX replay evidence is read-only and cannot be promoted");
+    }
+    Ok(())
+}
+
 pub fn load_research_rows(
     manifest: &DatasetManifest,
     fee_bps: f64,
@@ -559,6 +589,7 @@ fn load_feature_research_rows(
     fee_bps: f64,
     funding_bps: f64,
     latency_bps: f64,
+    use_pit_funding: bool,
 ) -> anyhow::Result<Vec<ResearchRow>> {
     if [fee_bps, funding_bps, latency_bps]
         .iter()
@@ -570,10 +601,9 @@ fn load_feature_research_rows(
         .map_err(anyhow::Error::msg)?
         .into_iter()
         .map(|row| {
-            let row_funding_bps = row
-                .features
-                .get("funding_cost_bps")
-                .copied()
+            let row_funding_bps = use_pit_funding
+                .then(|| row.features.get("funding_cost_bps").copied())
+                .flatten()
                 .unwrap_or(funding_bps);
             if !row_funding_bps.is_finite()
                 || row_funding_bps < 0.0
@@ -761,6 +791,26 @@ mod tests {
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn historical_cex_replay_dataset_cannot_be_promoted() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: "cex-v1".to_string(),
+                registry_kind: "dataset".to_string(),
+                asset_id: "BTCUSDT".to_string(),
+                parent_revision_id: None,
+                payload: serde_json::json!({
+                    "dataset_kind": CEX_REPLAY_DATASET_KIND,
+                    "schema_version": CEX_REPLAY_DATASET_SCHEMA_V1,
+                }),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+
+        assert!(require_promotable_research_dataset(&store, "cex-v1").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_json_atomic_rejects_a_stale_output_symlink() {
@@ -848,6 +898,7 @@ mod tests {
                     ]),
                     modalities: BTreeSet::from([DataModality::Lob, DataModality::OnChain]),
                     features: BTreeMap::from([
+                        ("funding_cost_bps".to_string(), 0.0),
                         ("lob_imbalance".to_string(), index as f64),
                         ("onchain_flow".to_string(), index as f64 * 2.0),
                     ]),
@@ -884,7 +935,7 @@ mod tests {
             .load_rows(&EvaluationCostsV1 {
                 fee_bps: 1.0,
                 rebate_bps: 0.0,
-                funding_bps: 0.0,
+                funding_bps: 2.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,
                 cross_spread: false,
@@ -897,6 +948,7 @@ mod tests {
         assert_eq!(loaded[0].available_time, rows[0].label_available_time);
         assert_eq!(loaded[0].features["lob_imbalance"], 0.0);
         assert_eq!(loaded[0].features["onchain_flow"], 0.0);
+        assert_eq!(loaded[0].funding_bps, 2.0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

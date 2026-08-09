@@ -463,6 +463,10 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let model_root = args.model_root.clone();
     let mut store = AlphaStore::open(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
+    data_mission::require_promotable_research_dataset(
+        &store,
+        &lineage.mission.dataset_manifest_id,
+    )?;
     let candidate = lineage
         .candidates
         .iter()
