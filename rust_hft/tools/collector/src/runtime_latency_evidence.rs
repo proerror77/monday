@@ -28,8 +28,9 @@ pub fn verify_runtime_latency_evidence(
     trusted_keys_path: &Path,
     trusted_keys_sha256: &str,
     deployment_id: &str,
+    market: &str,
     symbol: &str,
-    account_fingerprint: &str,
+    account_id: &str,
     available_before: DateTime<Utc>,
 ) -> Result<VerifiedRuntimeLatencyEvidence> {
     let feedback_bytes = read_sha256_anchored(feedback_log, feedback_log_sha256, "feedback log")?;
@@ -56,17 +57,16 @@ pub fn verify_runtime_latency_evidence(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     if deployment_id.trim().is_empty()
+        || market != "spot"
         || symbol.trim().is_empty()
-        || account_fingerprint.len() != 64
-        || !account_fingerprint
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+        || account_id.trim().is_empty()
     {
-        bail!("runtime feedback deployment, symbol, and account fingerprint are required");
+        bail!("verified runtime latency evidence currently supports Binance Spot only");
     }
 
     let mut observations = Vec::new();
     let mut signed_events = Vec::new();
+    let mut event_digests = BTreeMap::new();
     for (index, line) in feedback_bytes.split(|byte| *byte == b'\n').enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -80,24 +80,41 @@ pub fn verify_runtime_latency_evidence(
                     index + 1
                 )
             })?;
+        let digest = Sha256::digest(line).to_vec();
+        if let Some(previous) = event_digests.insert(event.event_id.clone(), digest.clone()) {
+            if previous != digest {
+                bail!("runtime feedback contains conflicting duplicate event IDs");
+            }
+            continue;
+        }
         if event.mode != AttributionMode::LiveSmall
             || event.kind != AttributionKind::Fill
             || event.outcome != AttributionOutcome::Healthy
             || event.deployment_id != deployment_id
-            || event.account_id.as_deref() != Some(account_fingerprint)
-            || event.venue.as_deref() != Some("binance")
+            || event.account_id.as_deref() != Some(account_id)
+            || !event
+                .venue
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("binance"))
             || !event
                 .symbol
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
-            || event.observed_at > available_before
         {
             continue;
         }
+        let available_at_us = metric_u64(&event.metrics, "evidence_available_at_us")?;
+        let available_at = DateTime::from_timestamp_micros(
+            i64::try_from(available_at_us).context("evidence availability exceeds i64")?,
+        )
+        .context("runtime feedback evidence availability is invalid")?;
+        if available_at > available_before {
+            continue;
+        }
         observations.push((
-            event.observed_at,
+            available_at,
             metric_u64(&event.metrics, "intent_to_private_report_us")?,
-            metric_nonnegative(&event.metrics, "realized_slippage_bps")?,
+            metric_nonnegative(&event.metrics, "arrival_slippage_bps")?,
         ));
         signed_events.extend_from_slice(line);
         signed_events.push(b'\n');
@@ -201,14 +218,18 @@ mod tests {
             mode,
             outcome: AttributionOutcome::Healthy,
             kind: AttributionKind::Fill,
-            strategy_id: None,
+            strategy_id: Some("strategy-1".to_string()),
             order_id: Some("order-1".to_string()),
-            account_id: Some("a".repeat(64)),
+            account_id: Some("binance-main".to_string()),
             venue: Some("binance".to_string()),
             symbol: Some("BTCUSDT".to_string()),
             metrics: BTreeMap::from([
                 ("intent_to_private_report_us".to_string(), 75.0),
-                ("realized_slippage_bps".to_string(), 1.25),
+                ("arrival_slippage_bps".to_string(), 1.25),
+                (
+                    "evidence_available_at_us".to_string(),
+                    1_783_987_200_000_000.0,
+                ),
             ]),
             reason: None,
             observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
@@ -235,8 +256,9 @@ mod tests {
             &keys,
             &keys_sha,
             "deployment-1",
+            "spot",
             "BTCUSDT",
-            &"a".repeat(64),
+            "binance-main",
             DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -257,12 +279,37 @@ mod tests {
             &keys,
             &keys_sha,
             "deployment-1",
+            "spot",
             "BTCUSDT",
-            &"a".repeat(64),
+            "binance-main",
             DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                 .unwrap()
                 .with_timezone(&Utc),
         )
         .is_err());
+    }
+
+    #[test]
+    fn duplicate_signed_events_do_not_reweight_costs() {
+        let (_directory, log, _log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
+        let line = std::fs::read(&log).unwrap();
+        let bytes = [line.as_slice(), line.as_slice()].concat();
+        std::fs::write(&log, &bytes).unwrap();
+        let evidence = verify_runtime_latency_evidence(
+            &log,
+            &hex::encode(Sha256::digest(&bytes)),
+            &keys,
+            &keys_sha,
+            "deployment-1",
+            "spot",
+            "BTCUSDT",
+            "binance-main",
+            DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
+
+        assert_eq!(evidence.observations, 1);
     }
 }

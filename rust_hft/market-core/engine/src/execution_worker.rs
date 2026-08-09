@@ -11,7 +11,7 @@ use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{
-    now_micros, AccountId, HftError, LatencyStage, OrderId, Price, ProductType, Quantity,
+    now_micros, AccountId, HftError, LatencyStage, OrderId, OrderType, Price, ProductType, Quantity,
 };
 use hft_core::{Symbol, VenueId};
 use ports::{
@@ -1025,6 +1025,9 @@ impl ExecutionWorker {
                         },
                     );
 
+                    let arrival_price = matches!(envelope.intent.order_type, OrderType::Market)
+                        .then_some(envelope.intent.price)
+                        .flatten();
                     let OrderIntent {
                         symbol,
                         side,
@@ -1047,6 +1050,7 @@ impl ExecutionWorker {
                         side,
                         quantity,
                         requested_price: price,
+                        arrival_price,
                         timestamp: now_micros(),
                         venue: venue_for_client,
                         strategy_id,
@@ -1117,6 +1121,9 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
+                                arrival_price: matches!(intent.order_type, OrderType::Market)
+                                    .then_some(intent.price)
+                                    .flatten(),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),

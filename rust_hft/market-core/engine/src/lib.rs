@@ -2762,6 +2762,7 @@ mod tests {
                 side: hft_core::Side::Buy,
                 quantity: Quantity::from_f64(1.0).expect("valid quantity"),
                 requested_price: Some(Price::from_f64(100.0).expect("valid price")),
+                arrival_price: None,
                 timestamp: 1,
                 venue: Some(VenueId::BYBIT),
                 strategy_id: "strategy-1".to_string(),
