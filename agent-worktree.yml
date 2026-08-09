@@ -1,12 +1,10 @@
 owner: codex
-contract: execution-lifecycle-costs-v2
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/execution-lifecycle-costs-v2
-branch: codex/execution-lifecycle-costs-v2
-base_sha: 7686febcf953b08bbf9c3760ac58289c68555c88
+contract: binance-reference-429-retry
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-reference-429-retry
+branch: codex/binance-reference-429-retry
+base_sha: 8b5410e2ef363a2e729e69e0b6c97170181c7480
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/market-core/ports/src/events.rs
-  - rust_hft/market-core/engine/src/execution_worker.rs
-  - rust_hft/apps/live/src/runtime_attribution.rs
+  - rust_hft/tools/collector/src/binance_usdm_reference_collector.rs
 dependency: none
 no_external_runtime_mutation: true
