@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use clap::Parser;
 use hft_collector::binance_usdm_reference_artifact::{
-    verify_reference_artifact, PublishedReferenceArtifact,
+    verify_reference_artifact_read_only, PublishedReferenceArtifact,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ struct VerificationOutput {
     metadata_observations: usize,
     mark_index_funding_observations: usize,
     open_interest_observations: usize,
+    historical_read_only: bool,
     content_rows_verified: bool,
 }
 
@@ -56,15 +57,20 @@ fn verify(args: Args) -> Result<VerificationOutput> {
         data_sha256: args.data_sha256.clone(),
         manifest_sha256: args.manifest_sha256.clone(),
     };
-    let batch = verify_reference_artifact(&published, &args.data_sha256, &args.manifest_sha256)?;
+    let counts = verify_reference_artifact_read_only(
+        &published,
+        &args.data_sha256,
+        &args.manifest_sha256,
+    )?;
     Ok(VerificationOutput {
         schema: OUTPUT_SCHEMA,
         data_path: args.data_path,
         data_sha256: args.data_sha256,
         manifest_sha256: args.manifest_sha256,
-        metadata_observations: batch.contracts().len(),
-        mark_index_funding_observations: batch.mark_index_funding().len(),
-        open_interest_observations: batch.open_interest().len(),
+        metadata_observations: counts.metadata,
+        mark_index_funding_observations: counts.mark_index_funding,
+        open_interest_observations: counts.open_interest,
+        historical_read_only: counts.historical_read_only,
         content_rows_verified: true,
     })
 }
@@ -88,6 +94,7 @@ mod tests {
     };
     use hft_collector::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
     use rust_decimal::Decimal;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
@@ -167,6 +174,41 @@ mod tests {
         }
     }
 
+    fn rewrite_as_historical_v2(published: &mut PublishedReferenceArtifact) {
+        let mut data = Vec::new();
+        for line in fs::read(&published.data_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            row["observation"]["schema"] = serde_json::json!("binance.usdm_reference.v2");
+            if row["kind"] == "metadata" {
+                let observation = row["observation"].as_object_mut().unwrap();
+                observation.remove("tick_size");
+                observation.remove("step_size");
+                observation.remove("min_notional");
+            }
+            serde_json::to_writer(&mut data, &row).unwrap();
+            data.push(b'\n');
+        }
+        fs::write(&published.data_path, &data).unwrap();
+        published.data_sha256 = hex::encode(Sha256::digest(&data));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        manifest["data_schema"] = serde_json::json!("binance.usdm_reference.v2");
+        manifest["bytes"] = serde_json::json!(data.len());
+        manifest["sha256"] = serde_json::json!(published.data_sha256);
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        fs::write(&published.manifest_path, &manifest_bytes).unwrap();
+        published.manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+        fs::write(
+            &published.success_path,
+            format!("{}\n", published.data_sha256),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn verifies_canonical_triplet_and_reports_content_counts() {
         let (_temp, published) = fixture();
@@ -175,6 +217,21 @@ mod tests {
         assert_eq!(output.metadata_observations, 1);
         assert_eq!(output.mark_index_funding_observations, 1);
         assert_eq!(output.open_interest_observations, 1);
+        assert!(output.content_rows_verified);
+        assert!(!output.historical_read_only);
+    }
+
+    #[test]
+    fn historical_v2_triplet_remains_decodable_but_is_marked_read_only() {
+        let (_temp, mut published) = fixture();
+        rewrite_as_historical_v2(&mut published);
+
+        let output = verify(args(&published)).unwrap();
+
+        assert_eq!(output.metadata_observations, 1);
+        assert_eq!(output.mark_index_funding_observations, 1);
+        assert_eq!(output.open_interest_observations, 1);
+        assert!(output.historical_read_only);
         assert!(output.content_rows_verified);
     }
 

@@ -12,6 +12,7 @@ use data::binance_usdm_reference::{
 use rand::random;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
@@ -26,6 +27,7 @@ const DATA_NAME: &str = "reference.ndjson";
 const MAX_DATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SUCCESS_BYTES: u64 = 65;
+const HISTORICAL_REFERENCE_SCHEMA_V2: &str = "binance.usdm_reference.v2";
 #[derive(Debug, Clone)]
 pub struct ReferenceArtifactConfig {
     pub output_root: PathBuf,
@@ -39,6 +41,13 @@ pub struct PublishedReferenceArtifact {
     pub success_path: PathBuf,
     pub data_sha256: String,
     pub manifest_sha256: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedReferenceCounts {
+    pub metadata: usize,
+    pub mark_index_funding: usize,
+    pub open_interest: usize,
+    pub historical_read_only: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ArtifactCoverage {
@@ -173,6 +182,97 @@ pub fn verify_reference_artifact(
         bail!("reference manifest does not match complete artifact contents");
     }
     Ok(batch)
+}
+
+pub fn verify_reference_artifact_read_only(
+    published: &PublishedReferenceArtifact,
+    expected_data_sha256: &str,
+    expected_manifest_sha256: &str,
+) -> Result<VerifiedReferenceCounts> {
+    validate_digest(expected_data_sha256, "expected data")?;
+    validate_digest(expected_manifest_sha256, "expected manifest")?;
+    validate_artifact_paths(published)?;
+    let data = read_bound_file(&published.data_path, MAX_DATA_BYTES)?;
+    let manifest_bytes = read_bound_file(&published.manifest_path, MAX_MANIFEST_BYTES)?;
+    let success = read_bound_file(&published.success_path, MAX_SUCCESS_BYTES)?;
+    if digest(&data) != expected_data_sha256
+        || digest(&manifest_bytes) != expected_manifest_sha256
+        || success != format!("{expected_data_sha256}\n").as_bytes()
+    {
+        bail!("reference artifact digest trust anchor does not match");
+    }
+    let manifest: ReferenceManifest =
+        serde_json::from_slice(&manifest_bytes).context("parse reference manifest")?;
+    if manifest.data_schema == REFERENCE_SCHEMA {
+        let batch = verify_reference_artifact(
+            published,
+            expected_data_sha256,
+            expected_manifest_sha256,
+        )?;
+        return Ok(VerifiedReferenceCounts {
+            metadata: batch.contracts().len(),
+            mark_index_funding: batch.mark_index_funding().len(),
+            open_interest: batch.open_interest().len(),
+            historical_read_only: false,
+        });
+    }
+    validate_manifest_identity_for_schema(
+        &manifest,
+        expected_data_sha256,
+        data.len() as u64,
+        HISTORICAL_REFERENCE_SCHEMA_V2,
+    )?;
+    validate_partition_path(&published.data_path, &manifest)?;
+    let mut metadata = BTreeSet::new();
+    let mut funding = BTreeSet::new();
+    let mut open_interest = BTreeSet::new();
+    for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_slice(line)
+            .with_context(|| format!("parse historical reference row {}", index + 1))?;
+        let kind = row.get("kind").and_then(serde_json::Value::as_str);
+        let observation = row.get("observation").context("historical row has no observation")?;
+        if observation.get("schema").and_then(serde_json::Value::as_str)
+            != Some(HISTORICAL_REFERENCE_SCHEMA_V2)
+        {
+            bail!("historical reference row schema is invalid");
+        }
+        let symbol = observation
+            .get("symbol")
+            .and_then(serde_json::Value::as_str)
+            .filter(|symbol| !symbol.is_empty())
+            .context("historical reference row symbol is invalid")?
+            .to_string();
+        let inserted = match kind {
+            Some("metadata") => metadata.insert(symbol),
+            Some("mark_index_funding") => funding.insert(symbol),
+            Some("open_interest") => open_interest.insert(symbol),
+            _ => bail!("historical reference row kind is invalid"),
+        };
+        if !inserted {
+            bail!("historical reference artifact has duplicate rows");
+        }
+    }
+    if metadata.is_empty()
+        || metadata != funding
+        || metadata != open_interest
+        || manifest.rows != (metadata.len() + funding.len() + open_interest.len()) as u64
+        || manifest.coverage.active_contracts != metadata.len() as u64
+        || manifest.coverage.metadata_observations != metadata.len() as u64
+        || manifest.coverage.mark_index_funding_observations != funding.len() as u64
+        || manifest.coverage.open_interest_observations != open_interest.len() as u64
+        || !manifest.coverage.is_complete()
+    {
+        bail!("historical reference manifest does not match complete artifact contents");
+    }
+    Ok(VerifiedReferenceCounts {
+        metadata: metadata.len(),
+        mark_index_funding: funding.len(),
+        open_interest: open_interest.len(),
+        historical_read_only: true,
+    })
 }
 
 fn publish_reference_batch_inner(
@@ -430,10 +530,24 @@ fn validate_manifest_identity(
     expected_data_sha256: &str,
     data_bytes: u64,
 ) -> Result<()> {
+    validate_manifest_identity_for_schema(
+        manifest,
+        expected_data_sha256,
+        data_bytes,
+        REFERENCE_SCHEMA,
+    )
+}
+
+fn validate_manifest_identity_for_schema(
+    manifest: &ReferenceManifest,
+    expected_data_sha256: &str,
+    data_bytes: u64,
+    expected_schema: &str,
+) -> Result<()> {
     if manifest.schema != MANIFEST_SCHEMA
         || manifest.venue != VENUE
         || manifest.dataset != DATASET
-        || manifest.data_schema != REFERENCE_SCHEMA
+        || manifest.data_schema != expected_schema
         || manifest.format != "ndjson"
         || manifest.source_origin != OFFICIAL_USDM_SOURCE_ORIGIN
         || manifest.source_endpoints != source_endpoints()
