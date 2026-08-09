@@ -60,8 +60,12 @@ fi
 test "$oidc_contract_failed" -eq 0
 test "$command_contract_failed" -eq 0
 
-grep -Fqx '                  health_json=$(printf '\''%s'\'' "$output" | base64 --decode 2>/dev/null | jq -ce '\''select(type == "object")'\'' 2>/dev/null || true)' "$workflow" || {
-  printf 'collector monitor does not parse the complete multiline health JSON\n' >&2
+grep -Fqx '                  if decoded_health=$(printf '\''%s'\'' "$output" | base64 --decode 2>/dev/null) &&' "$workflow" || {
+  printf 'collector monitor does not require a complete Base64 health payload\n' >&2
+  exit 1
+}
+grep -Fqx '                    health_json=$(printf '\''%s'\'' "$decoded_health" | jq -cse '\''if length == 1 and (.[0] | type) == "object" then .[0] else error("expected exactly one object") end'\'' 2>/dev/null); then' "$workflow" || {
+  printf 'collector monitor does not require exactly one complete health object\n' >&2
   exit 1
 }
 if grep -Fq "grep -m1 '^{'" "$workflow"; then
@@ -70,13 +74,17 @@ if grep -Fq "grep -m1 '^{'" "$workflow"; then
 fi
 
 decode_health_output() {
-  printf '%s' "$1" | base64 --decode 2>/dev/null | jq -ce 'select(type == "object")' 2>/dev/null || true
+  local decoded_output
+  decoded_output=$(printf '%s' "$1" | base64 --decode 2>/dev/null) || return 1
+  printf '%s' "$decoded_output" | jq -cse \
+    'if length == 1 and (.[0] | type) == "object" then .[0] else error("expected exactly one object") end' \
+    2>/dev/null
 }
 
 classify_health_output() {
   local encoded_output=$1
   local health_json invocation_failed ok
-  health_json=$(decode_health_output "$encoded_output")
+  health_json=$(decode_health_output "$encoded_output" || true)
   invocation_failed=0
   ok=unknown
   if [ -z "$health_json" ]; then
@@ -92,12 +100,18 @@ classify_health_output() {
 
 healthy_output=$(printf '%s\n' '{' '  "ok": true,' '  "breaches": []' '}' | base64 | tr -d '\n')
 unhealthy_output=$(printf '%s\n' '{' '  "ok": false,' '  "breaches": ["disk warning"]' '}' | base64 | tr -d '\n')
+invalid_base64_suffix="${healthy_output}!"
+trailing_garbage=$(printf '%s\n' '{"ok":true}' 'garbage' | base64 | tr -d '\n')
+multiple_objects=$(printf '%s\n' '{"ok":true}' '{"ok":false}' | base64 | tr -d '\n')
 test "$(classify_health_output "$healthy_output")" = 'true 0'
 test "$(classify_health_output "$unhealthy_output")" = 'false 0'
 
 for invalid_output in \
   '' \
   'not-base64' \
+  "$invalid_base64_suffix" \
+  "$trailing_garbage" \
+  "$multiple_objects" \
   "$(printf '%s' 'not-json' | base64 | tr -d '\n')" \
   "$(printf '%s' '{"ok":' | base64 | tr -d '\n')"; do
   test "$(classify_health_output "$invalid_output")" = 'unknown 1'
