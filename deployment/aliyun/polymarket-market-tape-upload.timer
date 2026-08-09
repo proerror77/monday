@@ -2,8 +2,7 @@
 Description=Retry closed Monday Polymarket tape uploads every five minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnCalendar=*-*-* *:05,10,15,20,25,30,35,40,45,50,55:00 UTC
 Persistent=true
 Unit=polymarket-market-tape-upload.service
 
