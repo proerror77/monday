@@ -175,6 +175,7 @@ mod tests {
             label: 1.0,
             fee_bps: 0.0,
             funding_bps: 0.0,
+            pit_funding: false,
             latency_bps: 0.0,
         };
         let signals = infer_signals(&model(), &[row], |input| {
@@ -203,6 +204,7 @@ mod tests {
                     label: signal * 0.01,
                     fee_bps: 0.0,
                     funding_bps: 0.0,
+                    pit_funding: false,
                     latency_bps: 0.0,
                 }
             })

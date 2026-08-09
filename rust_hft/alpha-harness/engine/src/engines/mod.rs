@@ -28,6 +28,7 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
             label: index as f64,
             fee_bps: 0.0,
             funding_bps: 0.0,
+            pit_funding: false,
             latency_bps: 0.0,
         })
         .collect();

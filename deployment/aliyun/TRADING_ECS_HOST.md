@@ -53,8 +53,11 @@ or primary GID. The secret root
 is root:`mondayhft` mode `0750`, and both `runtime.env` and the feedback key are
 root:`mondayhft` mode `0440`. The feedback key contains one 32-byte Ed25519 key
 encoded as 64 lowercase hex characters. The runtime environment must contain a
-gRPC token of at least 32 characters with no edge whitespace plus a venue
-API-key/secret pair, matching the Rust gRPC server's own validation. The wrapper rejects
+gRPC token of at least 32 characters with no edge whitespace plus either paired
+venue API-key/secret entries or one `HFT_SECRET_BINANCE_ACCOUNT_JSON` object
+containing exactly `runtime_account_id`, `api_key`, and `secret`. The wrapper
+derives the legacy Binance process variables inside the container and never
+stores a second Binance credential copy. It rejects
 missing, empty, persistent, path-traversing, overly broad, or malformed secret
 inputs before Docker starts. The filesystem is checked separately for the root
 and each file, so a disk-backed file bind-mounted below a tmpfs directory is not

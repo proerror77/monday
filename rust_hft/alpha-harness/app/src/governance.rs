@@ -192,14 +192,7 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     }
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
-    let dataset = prepare_dataset(
-        manifest.load_rows(
-            args.dataset.validation.fee_bps,
-            args.dataset.validation.funding_bps,
-            args.dataset.validation.latency_bps,
-        )?,
-        &protocol,
-    )?;
+    let dataset = prepare_dataset(manifest.load_rows(&protocol.costs)?, &protocol)?;
     let evaluation = OnnxEvaluator::for_mission(&mission)
         .map_err(anyhow::Error::msg)?
         .evaluate(&model, &model_path, &dataset.engine_context())
@@ -368,11 +361,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         return Ok(existing);
     }
 
-    let rows = manifest.load_rows(
-        args.dataset.validation.fee_bps,
-        args.dataset.validation.funding_bps,
-        args.dataset.validation.latency_bps,
-    )?;
+    let rows = manifest.load_rows(&requested_protocol.costs)?;
     let dataset = prepare_dataset(rows, &requested_protocol)?;
     let proposal = EngineProposal {
         candidate_id: candidate.candidate_id.clone(),
@@ -474,6 +463,10 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let model_root = args.model_root.clone();
     let mut store = AlphaStore::open(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
+    data_mission::require_promotable_research_dataset(
+        &store,
+        lineage.mission.dataset_manifest_id.as_str(),
+    )?;
     let candidate = lineage
         .candidates
         .iter()
@@ -928,7 +921,8 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
             .with_context(|| format!("failed to read envelope {}", args.envelope.display()))?,
     )?;
     let mut store = AlphaStore::open(args.db)?;
-    store.validate_deployment_binding(&envelope)?;
+    let (_, bundle) = store.validate_deployment_binding(&envelope)?;
+    data_mission::require_promotable_research_dataset(&store, bundle.dataset_manifest_id.as_str())?;
     enforce_deployment_approvals(&store, &envelope, Utc::now())?;
     let key_hex = std::fs::read_to_string(&args.signing_key)
         .with_context(|| format!("failed to read signing key {}", args.signing_key.display()))?;
@@ -1509,6 +1503,7 @@ mod tests {
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
                 fee_bps: 0.0,
                 funding_bps: 0.0,
+                pit_funding: false,
                 latency_bps: 0.0,
             })
             .collect::<Vec<_>>();

@@ -11,8 +11,7 @@ use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{
-    now_micros, AccountId, HftError, LatencyStage, OrderId, OrderType, Price, ProductType,
-    Quantity, TimeInForce,
+    now_micros, AccountId, HftError, LatencyStage, OrderId, Price, ProductType, Quantity,
 };
 use hft_core::{Symbol, VenueId};
 use ports::{
@@ -43,6 +42,10 @@ type IndexedExecutionStream =
     Pin<Box<dyn futures::Stream<Item = IndexedExecutionStreamItem> + Send>>;
 
 const STREAM_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+fn arrival_price(envelope: &OrderIntentEnvelope) -> Option<Price> {
+    envelope.lifecycle.arrival_price
+}
 
 /// 客户端选择策略
 #[derive(Debug, Clone, Copy, Default)]
@@ -1026,10 +1029,7 @@ impl ExecutionWorker {
                         },
                     );
 
-                    let arrival_price = (matches!(envelope.intent.order_type, OrderType::Market)
-                        || matches!(envelope.intent.time_in_force, TimeInForce::IOC))
-                    .then_some(envelope.intent.price)
-                    .flatten();
+                    let arrival_price = arrival_price(&envelope);
                     let OrderIntent {
                         symbol,
                         side,
@@ -1123,10 +1123,7 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
-                                arrival_price: (matches!(intent.order_type, OrderType::Market)
-                                    || matches!(intent.time_in_force, TimeInForce::IOC))
-                                .then_some(intent.price)
-                                .flatten(),
+                                arrival_price: arrival_price(&envelope),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),
@@ -3152,6 +3149,16 @@ mod tests {
             strategy_id: "test".to_string(),
             target_venue: None,
         }
+    }
+
+    #[test]
+    fn arrival_price_requires_engine_quote_provenance() {
+        let intent = create_test_intent("BTCUSDT");
+        let mut envelope = OrderIntentEnvelope::new(intent.clone(), Default::default());
+        assert_eq!(arrival_price(&envelope), None);
+
+        envelope.lifecycle.arrival_price = intent.price;
+        assert_eq!(arrival_price(&envelope), intent.price);
     }
 
     fn ready_spot_admission(account_id: AccountId, venue: VenueId) -> AccountExecutionAdmission {

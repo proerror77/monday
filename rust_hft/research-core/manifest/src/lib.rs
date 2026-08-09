@@ -125,6 +125,7 @@ pub struct CexInstrumentRulesV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFeeScheduleV2 {
+    pub runtime_account_id: String,
     pub account_fingerprint: String,
     pub maker_buy_fee_bps: String,
     pub maker_sell_fee_bps: String,
@@ -159,6 +160,7 @@ pub struct CexLatencyCostV2 {
     pub method: String,
     pub venue: String,
     pub symbol: String,
+    pub runtime_account_id: String,
     pub account_fingerprint: String,
     pub evidence: CexArtifactTripletV2,
     pub first_observed_at: DateTime<Utc>,
@@ -244,6 +246,7 @@ impl CexReplaySnapshotV2 {
             || self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.available_at > self.instrument_rules.valid_through
             || self.instrument_rules.valid_through < label_available_through
+            || !valid_runtime_account_id(&self.fee_schedule.runtime_account_id)
             || !valid_sha256(&self.fee_schedule.account_fingerprint)
             || !nonnegative_decimal(&self.fee_schedule.maker_buy_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.maker_sell_fee_bps)
@@ -273,6 +276,7 @@ impl CexReplaySnapshotV2 {
         if self.latency_cost.method != "verified_order_lifecycle_realized_slippage"
             || self.latency_cost.venue != self.venue
             || self.latency_cost.symbol != self.symbol
+            || self.latency_cost.runtime_account_id != self.fee_schedule.runtime_account_id
             || self.latency_cost.account_fingerprint != self.fee_schedule.account_fingerprint
             || !self.latency_cost.evidence.valid()
             || self.latency_cost.first_observed_at > self.latency_cost.last_observed_at
@@ -427,7 +431,7 @@ fn snapshot_sha256<T: Serialize>(snapshot: &T) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Historical CEX replay dataset. Existing writers are removed with the V2 consumer rollout.
+/// Historical CEX replay dataset. Kept for read-only evidence decoding; new writers use V2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV1 {
@@ -440,23 +444,6 @@ pub struct CexReplayDatasetManifestV1 {
 }
 
 impl CexReplayDatasetManifestV1 {
-    pub fn new(
-        feature_manifest_id: impl Into<String>,
-        snapshot: CexReplaySnapshotV1,
-    ) -> Result<Self, ManifestError> {
-        let snapshot_sha256 = snapshot.sha256();
-        let manifest = Self {
-            dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
-            schema_version: CEX_REPLAY_DATASET_SCHEMA_V1.to_string(),
-            manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
-            feature_manifest_id: feature_manifest_id.into(),
-            snapshot,
-            snapshot_sha256,
-        };
-        manifest.validate()?;
-        Ok(manifest)
-    }
-
     pub fn validate(&self) -> Result<(), ManifestError> {
         let invalid = ManifestError::InvalidCexReplayDataset;
         self.snapshot.validate()?;
@@ -538,6 +525,10 @@ fn valid_cex_symbol(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_runtime_account_id(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 fn positive_decimal(value: &str) -> bool {
@@ -824,6 +815,7 @@ mod tests {
                 evidence: vec![triplet('4')],
             },
             fee_schedule: CexFeeScheduleV2 {
+                runtime_account_id: "desk/main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 maker_buy_fee_bps: "2".to_string(),
                 maker_sell_fee_bps: "2".to_string(),
@@ -866,6 +858,7 @@ mod tests {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
                 venue: "binance".to_string(),
                 symbol: "BTCUSDT".to_string(),
+                runtime_account_id: "desk/main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 evidence: triplet('8'),
                 first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
@@ -1060,6 +1053,17 @@ mod tests {
     fn cex_replay_snapshot_rejects_latency_cost_from_another_scope() {
         let mut snapshot = cex_snapshot();
         snapshot.latency_cost.symbol = "ETHUSDT".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_latency_cost_from_another_account() {
+        let mut snapshot = cex_snapshot();
+        snapshot.latency_cost.runtime_account_id = "binance-secondary".to_string();
 
         assert_eq!(
             snapshot.validate().unwrap_err(),

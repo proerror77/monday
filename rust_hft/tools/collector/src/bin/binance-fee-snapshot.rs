@@ -2,11 +2,12 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use hft_collector::binance_fee_artifact::{
-    publish_fee_snapshot, valid_binance_symbol, BinanceFeeSnapshot, BinanceInstrumentRules,
-    SideFeeBps, FEE_SCHEMA,
+    publish_fee_snapshot, valid_binance_symbol, valid_runtime_account_id, BinanceFeeSnapshot,
+    BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
 };
 use integration::signing::{BinanceCredentials, BinanceSigner};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
@@ -51,6 +52,14 @@ struct Args {
     output_root: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinanceAccountSecret {
+    runtime_account_id: String,
+    api_key: String,
+    secret: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -58,10 +67,9 @@ async fn main() -> Result<()> {
     if !valid_binance_symbol(&symbol) || !args.output_root.is_absolute() {
         bail!("symbol and absolute output root are required");
     }
-    let credentials = BinanceCredentials::new(
-        required_env("HFT_SECRET_BINANCE_API_KEY")?,
-        required_env("HFT_SECRET_BINANCE_SECRET")?,
-    );
+    let account_secret = parse_account_secret(&required_env("HFT_SECRET_BINANCE_ACCOUNT_JSON")?)?;
+    let runtime_account_id = account_secret.runtime_account_id;
+    let credentials = BinanceCredentials::new(account_secret.api_key, account_secret.secret);
     let account_fingerprint = hex::encode(Sha256::digest(credentials.api_key.as_bytes()));
     let signer = BinanceSigner::new(credentials);
     let base = args.market.default_base();
@@ -107,6 +115,7 @@ async fn main() -> Result<()> {
             venue: "binance".to_string(),
             market: args.market.name().to_string(),
             symbol,
+            runtime_account_id,
             account_fingerprint,
             maker_fee_bps,
             taker_fee_bps,
@@ -142,6 +151,18 @@ fn required_env(name: &str) -> Result<String> {
         bail!("{name} is empty");
     }
     Ok(value)
+}
+
+fn parse_account_secret(value: &str) -> Result<BinanceAccountSecret> {
+    let secret: BinanceAccountSecret =
+        serde_json::from_str(value).context("Binance account secret is invalid JSON")?;
+    if !valid_runtime_account_id(&secret.runtime_account_id)
+        || secret.api_key.trim().is_empty()
+        || secret.secret.trim().is_empty()
+    {
+        bail!("Binance account secret is incomplete");
+    }
+    Ok(secret)
 }
 
 fn validate_response_symbol(payload: &Value, expected: &str) -> Result<()> {
@@ -294,6 +315,20 @@ mod tests {
         assert!(Args::try_parse_from(args.split_whitespace()).is_err());
         assert!(!valid_binance_symbol("BTCUSDT&symbol=ETHUSDT"));
         assert!(validate_response_symbol(&json!({"symbol":"ETHUSDT"}), "BTCUSDT").is_err());
+    }
+
+    #[test]
+    fn account_scope_and_credentials_are_one_secret() {
+        let secret = parse_account_secret(
+            r#"{"runtime_account_id":"desk/main","api_key":"key","secret":"secret"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(secret.runtime_account_id, "desk/main");
+        assert!(parse_account_secret(
+            r#"{"runtime_account_id":"desk/main","api_key":"key","secret":""}"#
+        )
+        .is_err());
     }
 
     #[test]

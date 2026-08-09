@@ -58,6 +58,7 @@ struct StrategyTarget {
 #[derive(Debug)]
 struct AttributionState {
     orders: HashMap<String, OrderMetadata>,
+    invalid_order_ids: HashSet<String>,
     targets: BTreeMap<String, StrategyTarget>,
     ledgers: BTreeMap<String, StrategyLedger>,
     valuation_started: bool,
@@ -212,6 +213,7 @@ impl AttributionState {
             .collect();
         Ok(Self {
             orders: HashMap::new(),
+            invalid_order_ids: HashSet::new(),
             targets,
             ledgers,
             valuation_started: false,
@@ -348,17 +350,37 @@ fn execution_attribution(
             arrival_price,
             ..
         } => {
-            state.orders.remove(&order_id.0);
-            let Some(venue) = venue.as_ref().map(ToString::to_string) else {
+            if state.invalid_order_ids.contains(&order_id.0) {
                 return Ok(None);
-            };
-            let Some(expected_strategy_id) = expected_strategy_id(activation, symbol.as_str())
-            else {
-                return Ok(None);
-            };
-            if strategy_id != &expected_strategy_id
-                || !venue.eq_ignore_ascii_case(&activation.venue)
+            }
+            let previous = state.orders.remove(&order_id.0);
+            let candidate_venue = venue.as_ref().map(ToString::to_string);
+            let expected_strategy_id = expected_strategy_id(activation, symbol.as_str());
+            if candidate_venue
+                .as_ref()
+                .is_none_or(|venue| !venue.eq_ignore_ascii_case(&activation.venue))
+                || expected_strategy_id
+                    .as_ref()
+                    .is_none_or(|expected| strategy_id != expected)
             {
+                if previous.is_some() {
+                    state.invalid_order_ids.insert(order_id.0.clone());
+                }
+                return Ok(None);
+            }
+            let venue = candidate_venue.unwrap();
+            if previous.as_ref().is_some_and(|order| {
+                order.strategy_id != *strategy_id
+                    || !order.venue.eq_ignore_ascii_case(&venue)
+                    || order.symbol != symbol.as_str()
+                    || order.side != *side
+                    || order.requested_price != requested_price.map(|price| price.0)
+                    || matches!(
+                        (order.arrival_price, arrival_price.map(|price| price.0)),
+                        (Some(previous), Some(current)) if previous != current
+                    )
+            }) {
+                state.invalid_order_ids.insert(order_id.0.clone());
                 return Ok(None);
             }
             state.orders.insert(
@@ -369,9 +391,16 @@ fn execution_attribution(
                     symbol: symbol.to_string(),
                     side: *side,
                     requested_price: requested_price.map(|price| price.0),
-                    arrival_price: arrival_price.map(|price| price.0),
-                    timing: OrderTiming::default(),
-                    seen_fill_ids: HashSet::new(),
+                    arrival_price: arrival_price
+                        .map(|price| price.0)
+                        .or_else(|| previous.as_ref().and_then(|order| order.arrival_price)),
+                    timing: previous
+                        .as_ref()
+                        .map(|order| order.timing.clone())
+                        .unwrap_or_default(),
+                    seen_fill_ids: previous
+                        .map(|order| order.seen_fill_ids)
+                        .unwrap_or_default(),
                 },
             );
             Ok(None)
@@ -474,8 +503,6 @@ fn execution_attribution(
                 || metadata.venue.eq_ignore_ascii_case("binance_spot")
             {
                 metrics.insert("instrument_market_spot".to_string(), 1.0);
-            } else if metadata.venue.eq_ignore_ascii_case("binance_futures") {
-                metrics.insert("instrument_market_usdm".to_string(), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -1267,6 +1294,11 @@ mod tests {
             },
         )
         .unwrap();
+        let mut duplicate = order_new("fill-order");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut duplicate {
+            *arrival_price = None;
+        }
+        execution_attribution(&activation, &mut state, &duplicate).unwrap();
         let fill = execution_attribution(
             &activation,
             &mut state,
@@ -1363,39 +1395,32 @@ mod tests {
     }
 
     #[test]
-    fn binance_futures_fill_carries_usdm_market_identity() {
-        let mut activation = activation();
-        activation.venue = "BINANCE_FUTURES".to_string();
+    fn conflicting_duplicate_order_invalidates_prior_metadata() {
+        let activation = activation();
         let mut state = AttributionState::new(&activation).unwrap();
-        execution_attribution(
-            &activation,
-            &mut state,
-            &order_new_for(
-                "futures-order",
-                "BTCUSDT",
-                Side::Buy,
-                "bundle-1:BTCUSDT",
-                Some(VenueId::BINANCE_FUTURES),
-            ),
-        )
-        .unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
+
+        let mut conflicting = order_new("reused-order");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut conflicting {
+            *arrival_price = Some(Price::from_f64(101.0).unwrap());
+        }
+        execution_attribution(&activation, &mut state, &conflicting).unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
 
         let fill = execution_attribution(
             &activation,
             &mut state,
             &ExecutionEvent::Fill {
-                order_id: OrderId("futures-order".to_string()),
+                order_id: OrderId("reused-order".to_string()),
                 price: Price::from_f64(101.0).unwrap(),
                 quantity: Quantity::from_f64(0.5).unwrap(),
                 timestamp: NOW_US + 1,
-                fill_id: "futures-fill-1".to_string(),
+                fill_id: "fill-after-reuse".to_string(),
             },
         )
-        .unwrap()
         .unwrap();
-
-        assert_eq!(fill.metrics["instrument_market_usdm"], 1.0);
-        assert!(!fill.metrics.contains_key("instrument_market_spot"));
+        assert!(fill.is_none());
+        assert!(state.invalid_order_ids.contains("reused-order"));
     }
 
     #[test]

@@ -243,7 +243,8 @@ impl FormulaEvaluator {
         }
         if rows.iter().any(|row| {
             row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
-                || row.funding_bps.to_bits() != protocol.costs.funding_bps.to_bits()
+                || row.funding_bps < 0.0
+                || row.funding_bps > protocol.costs.funding_bps
                 || row.latency_bps.to_bits() != protocol.costs.latency_bps.to_bits()
         }) {
             return Err("dataset costs do not match the evaluation protocol".to_string());
@@ -788,6 +789,7 @@ mod tests {
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
                 fee_bps,
                 funding_bps: 0.0,
+                pit_funding: false,
                 latency_bps: 0.0,
             })
             .collect()
