@@ -3349,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE pointing at an immutable closed tape and its seal"]
+    #[ignore = "requires MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE pointing at an immutable 3.7-4.3 GiB closed tape and its seal"]
     fn immutable_fixture_reports_full_scan_and_seal_lookup_phases() {
         let fixture = PathBuf::from(
             std::env::var("MONDAY_POLYMARKET_TAPE_BENCH_FIXTURE")

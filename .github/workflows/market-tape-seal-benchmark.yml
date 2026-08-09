@@ -60,6 +60,7 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Verify checked-out identity
         env:

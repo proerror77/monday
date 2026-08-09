@@ -26,6 +26,7 @@ grep -Fqx '          test "$BENCHMARK_SELECTION" = polymarket-seal-v1' "$workflo
 grep -Fqx '          test "$DISPATCH_REF" = refs/heads/main' "$workflow"
 grep -Fqx '          test "$DISPATCH_SHA" = "$EXPECTED_MAIN_SHA"' "$workflow"
 grep -Fqx '          ref: refs/heads/main' "$workflow"
+grep -Fqx '          persist-credentials: false' "$workflow"
 grep -Fqx '          test "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_SHA"' "$workflow"
 grep -Fqx '          min_free_bytes=$((6 * 1024 * 1024 * 1024))' "$workflow"
 grep -Fq 'synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases' "$workflow"
@@ -47,7 +48,9 @@ grep -Fq 'source_bytes.saturating_add(encoded_bytes) <= MAX_FIXTURE_BYTES' "$har
 grep -Fq 'assert_eq!(sealed.manifest, full.manifest);' "$harness"
 grep -Fq 'IMMUTABLE_FIXTURE_CLEANUP removed=true' "$harness"
 
-if grep -Eqi 'secrets[.]|ossutil|aliyun|acr|kubectl|kubeconfig|access[_-]?key|credentials|ssh |docker (build|push)|curl ' "$workflow"; then
+workflow_without_safe_checkout=$(sed '/^          persist-credentials: false$/d' "$workflow")
+if grep -Eqi 'secrets[.]|ossutil|aliyun|acr|kubectl|kubeconfig|access[_-]?key|credentials|ssh |docker (build|push)|curl ' \
+  <<<"$workflow_without_safe_checkout"; then
   printf 'one-shot benchmark must not use credentials, cloud, images, or production connections\n' >&2
   exit 1
 fi
