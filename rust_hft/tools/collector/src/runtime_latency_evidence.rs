@@ -99,10 +99,14 @@ pub fn verify_runtime_latency_evidence(
                 .get(&format!("instrument_market_{market}"))
                 .copied()
                 != Some(1.0)
-            || !event
-                .venue
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("binance"))
+            || !event.venue.as_deref().is_some_and(|value| match market {
+                "spot" => {
+                    value.eq_ignore_ascii_case("binance")
+                        || value.eq_ignore_ascii_case("binance_spot")
+                }
+                "usdm" => value.eq_ignore_ascii_case("binance_futures"),
+                _ => false,
+            })
             || !event
                 .symbol
                 .as_deref()
