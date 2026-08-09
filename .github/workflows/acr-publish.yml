@@ -577,6 +577,23 @@ jobs:
               -czf ../../artifact/binance-usdm-reference-production-control.tar.gz \
               "${reference_production_assets[@]}"
           )
+          fee_production_assets=(
+            binance-fee-snapshot-spot.service
+            binance-fee-snapshot-spot.timer
+            binance-fee-snapshot-usdm.service
+            binance-fee-snapshot-usdm.timer
+            binance-fee-upload.service
+            binance-fee-upload.timer
+            binance-fee-upload.env
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${fee_production_assets[@]}" \
+              > ../../artifact/binance-fee-production-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf ../../artifact/binance-fee-production-control.tar.gz \
+              "${fee_production_assets[@]}"
+          )
           (
             cd artifact
             candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
@@ -617,6 +634,31 @@ jobs:
             printf '%s  %s\n' "$reference_production_control_archive_sha" \
               binance-usdm-reference-production-control.tar.gz \
               > binance-usdm-reference-production-control.tar.gz.sha256
+            fee_candidate_sha=$(awk 'NR == 1 {print $1}' binance-fee-snapshot.sha256)
+            fee_uploader_sha=$(awk 'NR == 1 {print $1}' binance-fee-snapshot-upload.sha256)
+            fee_control_manifest_sha=$(sha256sum \
+              binance-fee-production-control-assets.sha256 | awk '{print $1}')
+            fee_control_archive_sha=$(sha256sum \
+              binance-fee-production-control.tar.gz | awk '{print $1}')
+            printf '%s  %s\n' "$fee_control_archive_sha" \
+              binance-fee-production-control.tar.gz \
+              > binance-fee-production-control.tar.gz.sha256
+            jq -S -n \
+              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg candidate_sha256 "$fee_candidate_sha" \
+              --arg uploader_sha256 "$fee_uploader_sha" \
+              --arg control_manifest_sha256 "$fee_control_manifest_sha" \
+              --arg control_archive_sha256 "$fee_control_archive_sha" \
+              '{schema:"monday.binance_fee_release.v1",
+                source_revision:$source_revision,
+                candidate:{file:"binance-fee-snapshot",sha256:$candidate_sha256},
+                uploader:{file:"binance-fee-snapshot-upload",sha256:$uploader_sha256},
+                control_manifest:{file:"binance-fee-production-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"binance-fee-production-control.tar.gz",
+                  sha256:$control_archive_sha256}}' \
+              > binance-fee-release.json
+            sha256sum binance-fee-release.json > binance-fee-release.json.sha256
             jq -S -n \
               --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$candidate_sha" \

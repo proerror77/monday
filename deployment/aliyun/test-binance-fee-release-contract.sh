@@ -10,6 +10,7 @@ usdm_timer="$script_dir/binance-fee-snapshot-usdm.timer"
 upload_service="$script_dir/binance-fee-upload.service"
 upload_timer="$script_dir/binance-fee-upload.timer"
 upload_env="$script_dir/binance-fee-upload.env"
+acr_workflow="$script_dir/../../.github/workflows/acr-publish.yml"
 
 grep -Fq 'account_secret_file: PathBuf' "$producer"
 if grep -Fq 'HFT_SECRET_BINANCE_ACCOUNT_JSON' "$producer"; then
@@ -43,5 +44,9 @@ grep -Fxq 'OSS_BUCKET=monday-lob-apne1-1045353359' "$upload_env"
 grep -Fxq 'OSS_ENDPOINT=oss-ap-northeast-1-internal.aliyuncs.com' "$upload_env"
 grep -Fxq 'OSS_REGION=ap-northeast-1' "$upload_env"
 grep -Fxq 'ALIYUN_PROFILE=ecs-role' "$upload_env"
+grep -Fq 'binance-fee-production-control-assets.sha256' "$acr_workflow"
+grep -Fq 'binance-fee-production-control.tar.gz' "$acr_workflow"
+grep -Fq 'monday.binance_fee_release.v1' "$acr_workflow"
+grep -Fq 'binance-fee-release.json.sha256' "$acr_workflow"
 
 printf '%s\n' 'Binance fee release contract tests passed'
