@@ -4,8 +4,8 @@ use crate::execution_worker::{
 use crate::Engine;
 use hft_core::{AccountId, HftError, HftResult, OrderId, ProductType, Quantity, Symbol, VenueId};
 use ports::{
-    AssetInventoryCapability, AssetInventoryRecord, OrderReconciliationReport, OrderRecord,
-    OrderStatus,
+    AccountReadbackState, AssetInventoryCapability, AssetInventoryRecord,
+    OrderReconciliationReport, OrderRecord, OrderStatus,
 };
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
@@ -427,24 +427,63 @@ impl ExecutionControlHandle {
         };
         let (balance_report, asset_inventory_report, position_report, fill_report) =
             if include_balances {
-                let engine = self.engine.lock().await;
-                let account_view = engine.get_account_view();
+                let mut engine = self.engine.lock().await;
+                let account_view = engine.get_account_view().as_ref().clone();
+                let mut candidate_account_view = account_view.clone();
+                let (inventory_candidate_ready, inventory_write_error) =
+                    match apply_bybit_spot_admission_backed_inventory(
+                        &worker_snapshot,
+                        &mut candidate_account_view,
+                        hft_core::now_micros(),
+                    ) {
+                        Ok(true) => (true, None),
+                        Ok(false) => (false, None),
+                        Err(error) => (false, Some(error)),
+                    };
                 let portfolio_state = engine.export_portfolio_state();
                 let local_account_value =
-                    spot_inventory_account_value(&worker_snapshot, &account_view)
-                        .unwrap_or_else(|| account_view.equity());
+                    spot_inventory_account_value(&worker_snapshot, &candidate_account_view)
+                        .unwrap_or_else(|| candidate_account_view.equity());
+                let balance_report = Some(reconcile_balances(
+                    &worker_snapshot,
+                    local_account_value,
+                    self.balance_tolerance_usd,
+                ));
+                let mut asset_inventory_report =
+                    reconcile_asset_inventory(&worker_snapshot, &candidate_account_view);
+                if let Some(error) = inventory_write_error {
+                    let report = asset_inventory_report.get_or_insert_with(|| {
+                        AssetInventoryReconciliationReport {
+                            local_only: Vec::new(),
+                            exchange_only: Vec::new(),
+                            amount_mismatch: Vec::new(),
+                            client_errors: Vec::new(),
+                            complete: false,
+                            healthy: false,
+                        }
+                    });
+                    report.client_errors.push(error);
+                    report.complete = false;
+                    report.healthy = false;
+                }
+                if inventory_candidate_ready
+                    && asset_inventory_report
+                        .as_ref()
+                        .is_some_and(|report| report.complete && report.healthy)
+                {
+                    engine.publish_account_readback(candidate_account_view);
+                }
+                let position_report =
+                    reconcile_positions(&worker_snapshot, &account_view.positions);
+                let fill_report = Some(reconcile_recent_fills(
+                    &worker_snapshot,
+                    &portfolio_state.processed_fill_ids,
+                ));
                 (
-                    Some(reconcile_balances(
-                        &worker_snapshot,
-                        local_account_value,
-                        self.balance_tolerance_usd,
-                    )),
-                    reconcile_asset_inventory(&worker_snapshot, &account_view),
-                    reconcile_positions(&worker_snapshot, &account_view.positions),
-                    Some(reconcile_recent_fills(
-                        &worker_snapshot,
-                        &portfolio_state.processed_fill_ids,
-                    )),
+                    balance_report,
+                    asset_inventory_report,
+                    position_report,
+                    fill_report,
                 )
             } else {
                 (None, None, None, None)
@@ -934,6 +973,131 @@ fn spot_inventory_account_value(
         })
 }
 
+/// Materialize local Bybit Spot inventory only from the unified runtime admission record. The
+/// reconciliation snapshot remains the independent venue readback used to compare that state.
+fn apply_bybit_spot_admission_backed_inventory(
+    snapshot: &WorkerReconcileSnapshot,
+    account_view: &mut ports::AccountView,
+    now_us: u64,
+) -> Result<bool, String> {
+    let mut authoritative_clients = snapshot.clients.iter().filter(|client| {
+        client.venue == Some(VenueId::BYBIT)
+            && matches!(
+                WorkerReconcileSnapshot::resolved_asset_inventory_capability(client),
+                AssetInventoryCapability::AuthoritativeAssetInventory {
+                    product_type: ProductType::Spot,
+                }
+            )
+    });
+    let Some(client) = authoritative_clients.next() else {
+        return Ok(false);
+    };
+    if authoritative_clients.next().is_some() {
+        return Err(
+            "local asset inventory cannot be written from multiple authoritative Spot clients"
+                .to_string(),
+        );
+    }
+
+    let account_id = client.account_id.as_ref().ok_or_else(|| {
+        "authoritative Spot inventory has no canonical account identity".to_string()
+    })?;
+    if snapshot.account_id().as_ref() != Some(account_id) {
+        return Err(
+            "authoritative Bybit Spot inventory has no single canonical account scope".to_string(),
+        );
+    }
+    let venue = client.venue.ok_or_else(|| {
+        "authoritative Spot inventory has no canonical venue identity".to_string()
+    })?;
+    let environment = client
+        .account_environment
+        .ok_or_else(|| "authoritative Spot inventory has no canonical environment".to_string())?;
+    let admission = client.account_admission.as_ref().ok_or_else(|| {
+        "authoritative Spot inventory has no runtime account admission evidence".to_string()
+    })?;
+
+    if admission.account_id != *account_id {
+        return Err(
+            "account admission identity does not match authoritative Spot inventory".to_string(),
+        );
+    }
+    if admission.venue != venue {
+        return Err(
+            "account admission venue does not match authoritative Spot inventory".to_string(),
+        );
+    }
+    if admission.product_type != ProductType::Spot {
+        return Err(
+            "account admission product does not match authoritative Spot inventory".to_string(),
+        );
+    }
+    if admission.environment != environment {
+        return Err(
+            "account admission environment does not match authoritative Spot inventory".to_string(),
+        );
+    }
+    if account_view
+        .account_id
+        .as_ref()
+        .is_some_and(|existing| existing != account_id)
+    {
+        return Err(
+            "authoritative Spot inventory would rebind the local account identity".to_string(),
+        );
+    }
+    if !admission.ready || admission.kill_switch_active {
+        return Err(
+            "account admission is not ready to publish authoritative Spot inventory".to_string(),
+        );
+    }
+    if admission.credential_reference.trim().is_empty() {
+        return Err("account admission has no opaque credential reference".to_string());
+    }
+    if admission.readback.state != AccountReadbackState::Enabled {
+        return Err("account admission readback is not enabled".to_string());
+    }
+    if admission
+        .readback
+        .regional_compliance_attestation_id
+        .trim()
+        .is_empty()
+        || admission.readback.receipt_id.trim().is_empty()
+        || admission.readback.evidence_digest.trim().is_empty()
+    {
+        return Err("account admission has incomplete readback evidence".to_string());
+    }
+    if admission.readback.validated_at == 0
+        || admission.readback.validated_at > now_us
+        || admission.readback.valid_until < admission.readback.validated_at
+        || now_us > admission.readback.valid_until
+    {
+        return Err("account admission readback is stale or invalid".to_string());
+    }
+    if !admission.readback.capability.can_trade_crypto_spot {
+        return Err("account admission capability does not permit crypto Spot".to_string());
+    }
+    if admission.max_order_notional <= Decimal::ZERO || admission.max_open_orders == 0 {
+        return Err("account admission limits are not positive".to_string());
+    }
+    if admission.readback.balances.is_empty() {
+        return Err("account admission has no authoritative Spot assets".to_string());
+    }
+
+    let mut inventory = std::collections::HashMap::new();
+    for balance in &admission.readback.balances {
+        let record = AssetInventoryRecord::try_from(balance.clone())
+            .map_err(|error| format!("account admission asset inventory is malformed: {error}"))?;
+        if inventory.insert(record.asset.clone(), record).is_some() {
+            return Err("account admission has duplicate authoritative Spot assets".to_string());
+        }
+    }
+
+    account_view.account_id = Some(account_id.clone());
+    account_view.asset_inventory = inventory;
+    Ok(true)
+}
+
 fn reconcile_asset_inventory(
     snapshot: &WorkerReconcileSnapshot,
     account_view: &ports::AccountView,
@@ -1298,11 +1462,12 @@ fn is_open(status: OrderStatus) -> bool {
 mod tests {
     use super::*;
     use crate::{EngineConfig, TradingMode};
-    use hft_core::{Price, Quantity, Side};
+    use hft_core::{AccountCapability, Price, Quantity, Side};
     use oms_core::OmsCore;
     use ports::{
-        AccountBalance, ExecutionEvent, OrderManager, OrderUpdate, PortfolioManager,
-        RegisterOrderParams,
+        AccountBalance, AccountExecutionAdmission, AccountExecutionEnvironment,
+        AccountExternalReadback, AccountReadbackState, ExecutionEvent, OrderManager, OrderUpdate,
+        PortfolioManager, RegisterOrderParams,
     };
     use rust_decimal::Decimal;
     use std::collections::HashMap;
@@ -1877,6 +2042,8 @@ mod tests {
                 client_index: 0,
                 venue,
                 account_id: account_id.map(|value| AccountId(value.to_string())),
+                account_environment: None,
+                account_admission: None,
                 open_orders: Ok(Vec::new()),
                 balances: Some(Ok(Vec::new())),
                 positions: None,
@@ -1986,6 +2153,327 @@ mod tests {
         assert!(!snapshot.account_holdings_complete());
         assert!(!report.complete);
         assert!(!report.healthy);
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_admission_bound_spot_inventory_without_positions() {
+        let account_id = AccountId("bybit-testnet".to_string());
+        let balances = vec![AccountBalance {
+            asset: "USDT".to_string(),
+            available: Decimal::from(90),
+            frozen: Decimal::from(10),
+            total: Decimal::from(100),
+            usd_value: Some(Decimal::from(100)),
+        }];
+        let admission = AccountExecutionAdmission {
+            account_id: account_id.clone(),
+            venue: VenueId::BYBIT,
+            product_type: ProductType::Spot,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref://bybit-testnet".to_string(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances: balances.clone(),
+                capability: AccountCapability::default(),
+                regional_compliance_attestation_id: "bybit-spot-eligibility".to_string(),
+                receipt_id: "receipt-1".to_string(),
+                evidence_digest: "digest-1".to_string(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: Decimal::ONE,
+            max_open_orders: 1,
+            kill_switch_active: false,
+            ready: true,
+        };
+        let inventory = vec![asset("USDT", 90, 10)];
+        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let engine_readback = Arc::clone(&engine);
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)
+            .with_balance_tolerance_usd(Decimal::ONE);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("reconcile command") {
+                ControlCommand::Reconcile { reply, .. } => reply
+                    .send(WorkerReconcileSnapshot {
+                        clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                            client_index: 0,
+                            venue: Some(VenueId::BYBIT),
+                            account_id: Some(account_id),
+                            account_environment: Some(AccountExecutionEnvironment::Testnet),
+                            account_admission: Some(admission),
+                            open_orders: Ok(Vec::new()),
+                            balances: Some(Ok(balances)),
+                            positions: None,
+                            recent_fills: Some(Ok(Vec::new())),
+                            asset_inventory_capability: Some(
+                                AssetInventoryCapability::AuthoritativeAssetInventory {
+                                    product_type: ProductType::Spot,
+                                },
+                            ),
+                            asset_inventory: Some(Ok(inventory)),
+                        }],
+                    })
+                    .expect("send reconciliation"),
+                _ => panic!("unexpected command"),
+            }
+        });
+
+        let report = control.reconcile(true).await.expect("reconcile");
+        worker.await.expect("worker task");
+        let account = engine_readback.lock().await.get_account_view();
+
+        assert!(report.complete);
+        assert!(report.healthy);
+        assert_eq!(
+            account.account_id,
+            Some(AccountId("bybit-testnet".to_string()))
+        );
+        assert_eq!(
+            account.asset_inventory.get("USDT"),
+            Some(&asset("USDT", 90, 10))
+        );
+        assert!(account.positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_publish_admission_inventory_when_adapter_mismatches() {
+        let account_id = AccountId("bybit-testnet".to_string());
+        let balances = vec![AccountBalance {
+            asset: "USDT".to_string(),
+            available: Decimal::from(90),
+            frozen: Decimal::from(10),
+            total: Decimal::from(100),
+            usd_value: Some(Decimal::from(100)),
+        }];
+        let admission = AccountExecutionAdmission {
+            account_id: account_id.clone(),
+            venue: VenueId::BYBIT,
+            product_type: ProductType::Spot,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref://bybit-testnet".to_string(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances: balances.clone(),
+                capability: AccountCapability::default(),
+                regional_compliance_attestation_id: "bybit-spot-eligibility".to_string(),
+                receipt_id: "receipt-1".to_string(),
+                evidence_digest: "digest-1".to_string(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: Decimal::ONE,
+            max_open_orders: 1,
+            kill_switch_active: false,
+            ready: true,
+        };
+        let mut existing_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            ..Default::default()
+        };
+        existing_account
+            .asset_inventory
+            .insert("USDC".to_string(), asset("USDC", 4, 0));
+        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        engine
+            .lock()
+            .await
+            .publish_account_readback(existing_account.clone());
+        let engine_readback = Arc::clone(&engine);
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)
+            .with_balance_tolerance_usd(Decimal::ONE);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("reconcile command") {
+                ControlCommand::Reconcile { reply, .. } => reply
+                    .send(WorkerReconcileSnapshot {
+                        clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                            client_index: 0,
+                            venue: Some(VenueId::BYBIT),
+                            account_id: Some(account_id),
+                            account_environment: Some(AccountExecutionEnvironment::Testnet),
+                            account_admission: Some(admission),
+                            open_orders: Ok(Vec::new()),
+                            balances: Some(Ok(balances)),
+                            positions: None,
+                            recent_fills: Some(Ok(Vec::new())),
+                            asset_inventory_capability: Some(
+                                AssetInventoryCapability::AuthoritativeAssetInventory {
+                                    product_type: ProductType::Spot,
+                                },
+                            ),
+                            asset_inventory: Some(Ok(vec![asset("USDT", 89, 11)])),
+                        }],
+                    })
+                    .expect("send reconciliation"),
+                _ => panic!("unexpected command"),
+            }
+        });
+
+        let report = control.reconcile(true).await.expect("reconcile");
+        worker.await.expect("worker task");
+        let account = engine_readback.lock().await.get_account_view();
+
+        assert!(!report.healthy);
+        assert_eq!(account.account_id, existing_account.account_id);
+        assert_eq!(account.asset_inventory, existing_account.asset_inventory);
+        assert_eq!(
+            report
+                .asset_inventory_report
+                .expect("asset inventory report")
+                .amount_mismatch
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bybit_spot_admission_inventory_rejects_mixed_account_scope() {
+        let account_id = AccountId("bybit-testnet".to_string());
+        let balances = vec![AccountBalance {
+            asset: "USDT".to_string(),
+            available: Decimal::from(90),
+            frozen: Decimal::from(10),
+            total: Decimal::from(100),
+            usd_value: Some(Decimal::from(100)),
+        }];
+        let admission = AccountExecutionAdmission {
+            account_id: account_id.clone(),
+            venue: VenueId::BYBIT,
+            product_type: ProductType::Spot,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref://bybit-testnet".to_string(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances,
+                capability: AccountCapability::default(),
+                regional_compliance_attestation_id: "bybit-spot-eligibility".to_string(),
+                receipt_id: "receipt-1".to_string(),
+                evidence_digest: "digest-1".to_string(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: Decimal::ONE,
+            max_open_orders: 1,
+            kill_switch_active: false,
+            ready: true,
+        };
+        let snapshot = WorkerReconcileSnapshot {
+            clients: vec![
+                crate::execution_worker::ClientReconcileSnapshot {
+                    client_index: 0,
+                    venue: Some(VenueId::BYBIT),
+                    account_id: Some(account_id.clone()),
+                    account_environment: Some(AccountExecutionEnvironment::Testnet),
+                    account_admission: Some(admission),
+                    asset_inventory_capability: Some(
+                        AssetInventoryCapability::AuthoritativeAssetInventory {
+                            product_type: ProductType::Spot,
+                        },
+                    ),
+                    ..Default::default()
+                },
+                crate::execution_worker::ClientReconcileSnapshot {
+                    client_index: 1,
+                    venue: Some(VenueId::BINANCE),
+                    account_id: Some(AccountId("other-account".to_string())),
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut account = ports::AccountView {
+            account_id: Some(account_id),
+            ..Default::default()
+        };
+        account
+            .asset_inventory
+            .insert("USDC".to_string(), asset("USDC", 4, 0));
+        let original_inventory = account.asset_inventory.clone();
+
+        let error = apply_bybit_spot_admission_backed_inventory(&snapshot, &mut account, 1)
+            .expect_err("mixed account scope must fail closed");
+
+        assert!(error.contains("single canonical account scope"));
+        assert_eq!(account.asset_inventory, original_inventory);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_spot_inventory_with_mismatched_admission_identity() {
+        let client_account_id = AccountId("bybit-testnet".to_string());
+        let balances = vec![AccountBalance {
+            asset: "USDT".to_string(),
+            available: Decimal::from(90),
+            frozen: Decimal::from(10),
+            total: Decimal::from(100),
+            usd_value: Some(Decimal::from(100)),
+        }];
+        let admission = AccountExecutionAdmission {
+            account_id: AccountId("other-account".to_string()),
+            venue: VenueId::BYBIT,
+            product_type: ProductType::Spot,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref://bybit-testnet".to_string(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances: balances.clone(),
+                capability: AccountCapability::default(),
+                regional_compliance_attestation_id: "bybit-spot-eligibility".to_string(),
+                receipt_id: "receipt-1".to_string(),
+                evidence_digest: "digest-1".to_string(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: Decimal::ONE,
+            max_open_orders: 1,
+            kill_switch_active: false,
+            ready: true,
+        };
+        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let engine_readback = Arc::clone(&engine);
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)
+            .with_balance_tolerance_usd(Decimal::ONE);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("reconcile command") {
+                ControlCommand::Reconcile { reply, .. } => reply
+                    .send(WorkerReconcileSnapshot {
+                        clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                            client_index: 0,
+                            venue: Some(VenueId::BYBIT),
+                            account_id: Some(client_account_id),
+                            account_environment: Some(AccountExecutionEnvironment::Testnet),
+                            account_admission: Some(admission),
+                            open_orders: Ok(Vec::new()),
+                            balances: Some(Ok(balances)),
+                            positions: None,
+                            recent_fills: Some(Ok(Vec::new())),
+                            asset_inventory_capability: Some(
+                                AssetInventoryCapability::AuthoritativeAssetInventory {
+                                    product_type: ProductType::Spot,
+                                },
+                            ),
+                            asset_inventory: Some(Ok(vec![asset("USDT", 90, 10)])),
+                        }],
+                    })
+                    .expect("send reconciliation"),
+                _ => panic!("unexpected command"),
+            }
+        });
+
+        let report = control.reconcile(true).await.expect("reconcile");
+        worker.await.expect("worker task");
+        let account = engine_readback.lock().await.get_account_view();
+
+        assert!(!report.complete);
+        assert!(!report.healthy);
+        assert!(account.account_id.is_none());
+        assert!(account.asset_inventory.is_empty());
+        assert!(report
+            .asset_inventory_report
+            .expect("asset inventory report")
+            .client_errors
+            .iter()
+            .any(|error| error.contains("admission identity")));
     }
 
     async fn reconcile_with_balances(

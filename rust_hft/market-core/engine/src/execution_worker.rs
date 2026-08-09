@@ -2184,6 +2184,10 @@ pub struct ClientReconcileSnapshot {
     pub client_index: usize,
     pub venue: Option<VenueId>,
     pub account_id: Option<AccountId>,
+    /// Runtime account environment bound to this client by the unified admission contract.
+    pub account_environment: Option<AccountExecutionEnvironment>,
+    /// Opaque, runtime-owned account admission evidence. This is never supplied by an adapter.
+    pub account_admission: Option<AccountExecutionAdmission>,
     pub open_orders: Result<Vec<OpenOrder>, HftError>,
     pub balances: Option<Result<Vec<AccountBalance>, HftError>>,
     pub positions: Option<Result<Vec<ports::Position>, HftError>>,
@@ -2200,6 +2204,8 @@ impl Default for ClientReconcileSnapshot {
             client_index: 0,
             venue: None,
             account_id: None,
+            account_environment: None,
+            account_admission: None,
             open_orders: Ok(Vec::new()),
             balances: None,
             positions: None,
@@ -2512,12 +2518,24 @@ impl ExecutionWorker {
         let mut clients = Vec::with_capacity(self.execution_clients.len());
         for idx in 0..self.execution_clients.len() {
             let venue = self.venue_for_client(idx);
-            let account_id = self
-                .account_to_client
-                .iter()
-                .find_map(|(account_id, client_idx)| {
-                    (*client_idx == idx).then_some(account_id.clone())
-                });
+            let mut bound_accounts =
+                self.account_to_client
+                    .iter()
+                    .filter_map(|(account_id, client_idx)| {
+                        (*client_idx == idx).then_some(account_id.clone())
+                    });
+            let account_id = match (bound_accounts.next(), bound_accounts.next()) {
+                (Some(account_id), None) => Some(account_id),
+                _ => None,
+            };
+            let account_environment = account_id
+                .as_ref()
+                .and_then(|account_id| self.account_environments.get(account_id))
+                .copied();
+            let account_admission = account_id
+                .as_ref()
+                .and_then(|account_id| self.account_admissions.get(account_id))
+                .cloned();
             let client = &mut self.execution_clients[idx];
             let open_orders = client.list_open_orders().await;
             #[cfg(feature = "metrics")]
@@ -2572,6 +2590,8 @@ impl ExecutionWorker {
                 client_index: idx,
                 venue,
                 account_id,
+                account_environment,
+                account_admission,
                 open_orders,
                 balances,
                 positions,
