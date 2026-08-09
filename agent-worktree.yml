@@ -2,7 +2,7 @@ owner: codex-root
 contract: runtime-latency-evidence
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-latency-evidence
 branch: codex/runtime-latency-evidence
-base_sha: a9b9184db02858e4cfbd7a0feab9af3da18276c8
+base_sha: 6eb45169086334fae4065bfd613be49d2c634179
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
