@@ -3046,11 +3046,20 @@ where
 pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     let poll_interval = config.poll_interval;
     let stale_after = config.stale_after;
-    let (_spool_lock, mut collector) =
+    let (_spool_lock, collector) =
         initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
             let spool_lock = ReferenceSpoolLock::acquire(&config.spool_dir)?;
             Ok((spool_lock, ReferenceCollector::new(config)?))
         })?;
+    run_reference_collector(collector, poll_interval, stale_after, once).await
+}
+
+async fn run_reference_collector(
+    mut collector: ReferenceCollector,
+    poll_interval: Duration,
+    stale_after: Duration,
+    once: bool,
+) -> Result<()> {
     if once {
         println!(
             "{}",
@@ -3065,10 +3074,10 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
             Ok(health) => println!("{}", serde_json::to_string(&health)?),
             Err(error) => {
                 eprintln!("Polymarket reference poll failed: {error:#}");
-                if error.downcast_ref::<DataCompletenessError>().is_some()
-                    || error.downcast_ref::<LowDiskError>().is_some()
-                    || collector.last_success.elapsed() > stale_after
-                {
+                if poll_error_requires_process_exit(
+                    &error,
+                    collector.last_success.elapsed() > stale_after,
+                ) {
                     // Close/rotate the active tape cleanly so no open-file data
                     // is lost, then stop (systemd restarts with backoff).
                     collector.writer.close()?;
@@ -3078,6 +3087,17 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
         }
         tokio::time::sleep(poll_interval.saturating_sub(started.elapsed())).await;
     }
+}
+
+fn poll_error_requires_process_exit(error: &anyhow::Error, source_is_stale: bool) -> bool {
+    error.downcast_ref::<DataCompletenessError>().is_some()
+        || error.downcast_ref::<LowDiskError>().is_some()
+        || (source_is_stale
+            && !error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                error.is_timeout()
+                    || error.is_connect()
+                    || error.status().is_some_and(retryable_http_status)
+            }))
 }
 
 #[cfg(test)]
@@ -3136,6 +3156,155 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .unwrap()
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn retryable_gamma_failure_stays_degraded_without_process_identity_churn() {
+        const RETRYABLE_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let now = Utc::now();
+        let market = serde_json::to_vec(&market(
+            "Bitcoin Up or Down - 5 minutes",
+            &iso_z(now),
+            &iso_z(now + TimeDelta::minutes(5)),
+        ))
+        .unwrap();
+        let (successful_cycle_tx, successful_cycle_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (served_tx, served_rx) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let mut successful_cycle_tx = Some(successful_cycle_tx);
+            for request_index in 0..(2 + HTTP_GET_ATTEMPTS) {
+                let (mut connection, _) = listener.accept().unwrap();
+                read_http_request_path(&mut connection);
+                if request_index == 0 {
+                    write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        market.len()
+                    )
+                    .unwrap();
+                    connection.write_all(&market).unwrap();
+                } else if request_index == 1 {
+                    connection
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                        .unwrap();
+                } else {
+                    if request_index == 2 {
+                        successful_cycle_tx.take().unwrap().send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                    }
+                    connection.write_all(RETRYABLE_500).unwrap();
+                }
+            }
+            served_tx.send(()).unwrap();
+        });
+        let temp = TestDir::new();
+        let poll_interval = Duration::from_millis(1);
+        let stale_after = Duration::from_nanos(1);
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            market_ids: BTreeSet::from(["market-1".to_owned()]),
+            poll_interval,
+            stale_after,
+            low_disk_floor_bytes: Some(1),
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let mut daemon = Box::pin(run_reference_collector(
+            collector,
+            poll_interval,
+            stale_after,
+            false,
+        ));
+        tokio::select! {
+            result = &mut daemon => panic!("collector exited before the successful cycle completed: {result:?}"),
+            completed = tokio::time::timeout(Duration::from_secs(2), successful_cycle_rx) => {
+                completed
+                    .expect("collector did not complete the successful cycle")
+                    .unwrap();
+            }
+        }
+        let health_after_success = fs::read(temp.path().join("health.json")).unwrap();
+        continue_tx.send(()).unwrap();
+        tokio::select! {
+            result = &mut daemon => panic!("collector exited before the failed cycle completed: {result:?}"),
+            served = tokio::time::timeout(Duration::from_secs(2), served_rx) => {
+                served
+                    .expect("collector did not complete the successful and failed cycles")
+                    .unwrap();
+            }
+        }
+        tokio::select! {
+            result = &mut daemon => panic!("retryable Gamma failures exited the daemon loop: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        server.join().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join(ACTIVE_TAPE))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "failed cycles must not append tape records"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("health.json")).unwrap(),
+            health_after_success,
+            "failed cycles must not publish fresh health"
+        );
+        assert!(poll_error_requires_process_exit(
+            &completeness_error("invalid venue payload"),
+            false,
+        ));
+        assert!(poll_error_requires_process_exit(
+            &low_disk_error("low disk"),
+            false,
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_invalid_gamma_json_requires_process_exit() {
+        const INVALID_JSON: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..HTTP_GET_ATTEMPTS {
+                let (mut connection, _) = listener.accept().unwrap();
+                read_http_request_path(&mut connection);
+                connection.write_all(INVALID_JSON).unwrap();
+            }
+        });
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            stale_after: Duration::from_nanos(1),
+            low_disk_floor_bytes: Some(1),
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        collector.endpoints.gamma_markets = format!("http://{address}/markets/keyset");
+
+        let error = collector.collect_once().await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(poll_error_requires_process_exit(
+            &error,
+            collector.last_success.elapsed() > collector.config.stale_after,
+        ));
     }
 
     #[test]
