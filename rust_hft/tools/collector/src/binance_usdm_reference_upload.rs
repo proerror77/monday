@@ -144,7 +144,9 @@ fn discover_batches(output_root: &Path) -> Result<Vec<ReferenceBatch>> {
                 for date in list_named_directories(&dataset, strict_date)? {
                     for hour in list_named_directories(&date, strict_hour)? {
                         for batch in list_named_directories(&hour, strict_batch)? {
-                            batches.push(reference_batch(output_root, &batch)?);
+                            if let Some(batch) = reference_batch(output_root, &batch)? {
+                                batches.push(batch);
+                            }
                         }
                     }
                 }
@@ -154,13 +156,10 @@ fn discover_batches(output_root: &Path) -> Result<Vec<ReferenceBatch>> {
     Ok(batches)
 }
 
-fn reference_batch(output_root: &Path, dir: &Path) -> Result<ReferenceBatch> {
+fn reference_batch(output_root: &Path, dir: &Path) -> Result<Option<ReferenceBatch>> {
     let data = dir.join(DATA_NAME);
     let manifest = dir.join(MANIFEST_NAME);
     let success = dir.join(SUCCESS_NAME);
-    for path in [&data, &manifest, &success] {
-        direct_regular_file(path)?;
-    }
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         names.push(
@@ -171,11 +170,22 @@ fn reference_batch(output_root: &Path, dir: &Path) -> Result<ReferenceBatch> {
         );
     }
     names.sort();
+    if names.is_empty() {
+        fs::remove_dir(dir)
+            .with_context(|| format!("remove empty reference batch {}", dir.display()))?;
+        if let Some(parent) = dir.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        return Ok(None);
+    }
     if names != [DATA_NAME, SUCCESS_NAME, MANIFEST_NAME] {
         bail!(
             "reference batch must contain exactly the data/manifest/_SUCCESS triplet: {}",
             dir.display()
         );
+    }
+    for path in [&data, &manifest, &success] {
+        direct_regular_file(path)?;
     }
     let relative = dir
         .strip_prefix(output_root)
@@ -210,11 +220,11 @@ fn reference_batch(output_root: &Path, dir: &Path) -> Result<ReferenceBatch> {
     };
     verify_reference_artifact(&published, &data_sha256, &manifest_sha256)
         .context("local reference artifact failed canonical readback")?;
-    Ok(ReferenceBatch {
+    Ok(Some(ReferenceBatch {
         dir: dir.to_path_buf(),
         object_prefix,
         published,
-    })
+    }))
 }
 
 fn utc_partition_components(object_prefix: &str) -> Result<String> {
@@ -720,6 +730,47 @@ mod tests {
                 retried_batches: 0,
             }
         );
+    }
+
+    #[test]
+    fn empty_batch_directory_does_not_block_complete_batches() {
+        let root = TestDir::new();
+        let bucket = TestDir::new();
+        let published = publish_batch(root.path(), RECEIVED_NS + 100);
+        let empty = batch_dir(&published)
+            .parent()
+            .unwrap()
+            .join(format!("batch={}", RECEIVED_NS + 200));
+        fs::create_dir(&empty).unwrap();
+
+        let mut oss = FakeOss::default();
+        let summary = upload_pending_with(&config(root.path()), &mut |command, timeout| {
+            oss.run(bucket.path(), command, timeout)
+        })
+        .unwrap();
+
+        assert_eq!(summary.uploaded_batches, 1);
+        assert!(!batch_dir(&published).exists());
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn partial_batch_directory_remains_fail_closed() {
+        let root = TestDir::new();
+        let published = publish_batch(root.path(), RECEIVED_NS + 100);
+        fs::remove_file(&published.success_path).unwrap();
+
+        let error = upload_pending_with(&config(root.path()), &mut |_, _| {
+            panic!("partial batches must fail before OSS access")
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("exactly the data/manifest/_SUCCESS triplet"));
+        assert!(published.data_path.is_file());
+        assert!(published.manifest_path.is_file());
+        assert!(batch_dir(&published).is_dir());
     }
 
     #[test]

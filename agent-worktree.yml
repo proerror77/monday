@@ -1,22 +1,9 @@
 owner: codex
-contract: account-oms-admission-710
-worktree: /Users/proerror/.codex/worktrees/cfad/monday
-branch: codex/account-oms-admission-710-owner
-base_sha: 1e74bf409ba1d0c3186e44dad51829127481ca13
-allowed_files:
-  - rust_hft/apps/live/src/runtime_attribution.rs
-  - rust_hft/execution-gateway/adapters/adapter-backpack/src/lib.rs
-  - rust_hft/market-core/engine/src/execution_control.rs
-  - rust_hft/market-core/engine/src/execution_queues.rs
-  - rust_hft/market-core/engine/src/execution_worker.rs
-  - rust_hft/market-core/engine/src/lib.rs
-  - rust_hft/market-core/engine/tests/backpressure_safety_test.rs
-  - rust_hft/market-core/engine/tests/tokenized_security_execution_e2e.rs
-  - rust_hft/market-core/ports/src/events.rs
-  - rust_hft/market-core/ports/src/traits.rs
-  - rust_hft/market-core/runtime/src/system_builder.rs
-  - rust_hft/market-core/runtime/src/system_builder/runtime_management.rs
-  - rust_hft/market-core/runtime/src/system_builder/simulated_execution.rs
-  - rust_hft/risk-control/oms-core/src/lib.rs
-dependency: bybit-spot-account-fills-709
-no_external_runtime_mutation: true
+contract: usdm-reference-empty-batch-recovery
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/usdm-reference-empty-batch
+branch: codex/usdm-reference-empty-batch
+base_sha: e2a66fcd72ffb50e0af1b6c0e7481c243bbea9f9
+scope:
+  - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
+dependency: none
+no_external_runtime_mutation: false
