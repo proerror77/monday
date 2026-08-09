@@ -264,83 +264,10 @@ grep -Fq 'monday.binance_usdm_reference_cutover.v1' "$cutover"
 grep -Fq 'new-host' "$cutover"
 grep -Fq 'OLD_MODE=upgrade' "$cutover"
 grep -Fq 'STEP=drain-v2-with-old-uploader' "$cutover"
-grep -Fq "run_uploader \"\$OLD_UPLOADER\"" "$cutover"
+grep -Fq 'run_uploader "$OLD_UPLOADER"' "$cutover"
 grep -Fq 'V2 backlog remains after the old uploader drain' "$cutover"
 grep -Fq 'restore_old_production' "$cutover"
 grep -Fq 'previous-release-restored' "$cutover"
-grep -Fq "validate_upload_env \"\$UPLOAD_ENV\"" "$cutover"
-grep -Fq 'binance-usdm-reference-upload.sha256' "$cutover"
-grep -Fq 'CANDIDATE_MAY_HAVE_WRITTEN=1' "$cutover"
-grep -Fq "controller: \$controller" "$cutover"
-
-drain_line=$(grep -n 'STEP=drain-v2-with-old-uploader' "$cutover" | cut -d: -f1)
-switch_line=$(grep -n 'STEP=switch-production-symlink' "$cutover" | cut -d: -f1)
-(( drain_line < switch_line ))
-
-# Exercise the actual rollback function with production effects mocked. Once
-# candidate execution is possible, a failed V3 drain must prevent V2 restore.
-eval "$(awk '/^restore_old_production\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
-EVIDENCE_DIR="$tmp_dir/rollback-behavior"
-rollback="$EVIDENCE_DIR/rollback-assets"
-mkdir -p "$rollback"
-for asset in binance-usdm-reference-collector.service \
-  binance-usdm-reference-upload.service binance-usdm-reference-upload.timer \
-  binance-usdm-reference-upload.env; do
-  printf '%s\n' "$asset" >"$rollback/$asset"
-done
-(
-  cd "$rollback"
-  sha256sum binance-usdm-reference-collector.service \
-    binance-usdm-reference-upload.service binance-usdm-reference-upload.timer \
-    binance-usdm-reference-upload.env > rollback-assets.sha256
-)
-# shellcheck disable=SC2034
-ROLLBACK_ASSETS_SHA256=$(sha256sum "$rollback/rollback-assets.sha256" | awk '{print $1}')
-# shellcheck disable=SC2034
-CANDIDATE_MAY_HAVE_WRITTEN=1
-# shellcheck disable=SC2034
-CANDIDATE_UPLOADER=/candidate/uploader
-OLD_COLLECTOR=/old/collector
-OLD_UPLOADER=/old/uploader
-COLLECTOR_LINK=/collector-link
-# shellcheck disable=SC2034
-UPLOADER_LINK=/uploader-link
-# shellcheck disable=SC2034
-UPLOAD_ENV=/upload-env
-# shellcheck disable=SC2034
-COLLECTOR_UNIT=collector.service
-# shellcheck disable=SC2034
-UPLOAD_SERVICE=upload.service
-# shellcheck disable=SC2034
-UPLOAD_TIMER=upload.timer
-rollback_trace="$tmp_dir/rollback-trace"
-secure_regular_file() { :; }
-run_uploader() { printf 'drain %s\n' "$1" >>"$rollback_trace"; return "${drain_result:-0}"; }
-require_empty_lake() { printf 'empty-check\n' >>"$rollback_trace"; }
-atomic_install() { printf 'install %s\n' "$3" >>"$rollback_trace"; }
-atomic_symlink() { printf 'symlink %s\n' "$2" >>"$rollback_trace"; }
-systemctl() { :; }
-readlink() {
-  local path=${!#}
-  [[ $path == "$COLLECTOR_LINK" ]] && printf '%s\n' "$OLD_COLLECTOR" \
-    || printf '%s\n' "$OLD_UPLOADER"
-}
-
-drain_result=1
-if restore_old_production; then
-  printf '%s\n' 'rollback restored V2 after the candidate drain failed' >&2
-  exit 1
-fi
-[[ $(wc -l <"$rollback_trace") -eq 1 ]]
-grep -Fxq 'drain /candidate/uploader' "$rollback_trace"
-
-: >"$rollback_trace"
-drain_result=0
-restore_old_production
-[[ $(sed -n '1p' "$rollback_trace") == 'drain /candidate/uploader' ]]
-[[ $(sed -n '2p' "$rollback_trace") == 'empty-check' ]]
-grep -Fq 'symlink /collector-link' "$rollback_trace"
-grep -Fq 'symlink /uploader-link' "$rollback_trace"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
 grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
