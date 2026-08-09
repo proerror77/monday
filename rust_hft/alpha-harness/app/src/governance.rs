@@ -921,7 +921,8 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
             .with_context(|| format!("failed to read envelope {}", args.envelope.display()))?,
     )?;
     let mut store = AlphaStore::open(args.db)?;
-    store.validate_deployment_binding(&envelope)?;
+    let (_, bundle) = store.validate_deployment_binding(&envelope)?;
+    data_mission::require_promotable_research_dataset(&store, &bundle.dataset_manifest_id)?;
     enforce_deployment_approvals(&store, &envelope, Utc::now())?;
     let key_hex = std::fs::read_to_string(&args.signing_key)
         .with_context(|| format!("failed to read signing key {}", args.signing_key.display()))?;
@@ -1116,6 +1117,7 @@ mod tests {
                 fee_bps: 0.0,
                 rebate_bps: 0.0,
                 funding_bps: 0.0,
+                pit_funding: false,
                 latency_bps: 0.0,
                 slippage_bps: 0.0,
                 cross_spread: false,

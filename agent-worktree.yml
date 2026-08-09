@@ -12,6 +12,10 @@ allowed_files:
   - rust_hft/alpha-harness/app/src/mission_runner.rs
   - rust_hft/alpha-harness/engine/src/evaluation.rs
   - rust_hft/alpha-harness/engine/src/formula_evaluator.rs
+  - rust_hft/alpha-harness/engine/src/engines/mod.rs
+  - rust_hft/alpha-harness/engine/src/engines/mcts.rs
+  - rust_hft/alpha-harness/engine/src/lib.rs
+  - rust_hft/alpha-harness/onnx-evaluator/src/lib.rs
   - rust_hft/research-core/manifest/Cargo.toml
   - rust_hft/research-core/manifest/src/lib.rs
 dependency: PR #781 merged as a15880c940f5047ce76ca1485a48239698eb6821

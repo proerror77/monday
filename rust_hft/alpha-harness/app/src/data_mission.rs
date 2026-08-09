@@ -578,6 +578,7 @@ pub fn load_research_rows(
             label,
             fee_bps,
             funding_bps,
+            pit_funding: false,
             latency_bps,
         });
     }
@@ -619,6 +620,7 @@ fn load_feature_research_rows(
                 label: row.label,
                 fee_bps,
                 funding_bps: row_funding_bps,
+                pit_funding: use_pit_funding,
                 latency_bps,
             })
         })

@@ -35,6 +35,8 @@ pub struct ResearchRow {
     pub label: f64,
     pub fee_bps: f64,
     pub funding_bps: f64,
+    #[serde(default)]
+    pub pit_funding: bool,
     pub latency_bps: f64,
 }
 
@@ -191,8 +193,11 @@ pub fn prepare_dataset(
     }
     if rows.iter().any(|row| {
         row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
-            || row.funding_bps < 0.0
-            || row.funding_bps > protocol.costs.funding_bps
+            || if row.pit_funding {
+                row.funding_bps < 0.0 || row.funding_bps > protocol.costs.funding_bps
+            } else {
+                row.funding_bps.to_bits() != protocol.costs.funding_bps.to_bits()
+            }
             || row.latency_bps.to_bits() != protocol.costs.latency_bps.to_bits()
     }) {
         return Err(EvaluationError::ProtocolMismatch);
@@ -311,6 +316,7 @@ mod tests {
                 label: index as f64 * 0.01,
                 fee_bps: 1.0,
                 funding_bps: 0.1,
+                pit_funding: false,
                 latency_bps: 0.2,
             })
             .collect()
@@ -459,6 +465,15 @@ mod tests {
             prepare_dataset(rows, &protocol()).unwrap_err(),
             EvaluationError::ProtocolMismatch
         );
+
+        let mut rows = rows(50);
+        rows[0].funding_bps = 0.0;
+        assert_eq!(
+            prepare_dataset(rows.clone(), &protocol()).unwrap_err(),
+            EvaluationError::ProtocolMismatch
+        );
+        rows[0].pit_funding = true;
+        prepare_dataset(rows, &protocol()).unwrap();
     }
 
     #[test]

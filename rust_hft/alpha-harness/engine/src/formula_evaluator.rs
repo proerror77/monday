@@ -789,6 +789,7 @@ mod tests {
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
                 fee_bps,
                 funding_bps: 0.0,
+                pit_funding: false,
                 latency_bps: 0.0,
             })
             .collect()
