@@ -1652,7 +1652,7 @@ fn scan_tape_with_identity_at(
                 .as_u64()
                 .unwrap_or_default(),
         );
-        if expected != Some(&actual) {
+        if expected.is_some_and(|expected| expected != &actual) {
             bail!("event-local trade completion identity contradicts market metadata");
         }
     }
@@ -4043,6 +4043,30 @@ mod tests {
         assert_eq!(completion["completion_sequence"], 3);
         assert_eq!(completion["condition_id"], "0xcondition");
         assert_eq!(manifest["event_types"][TRADE_COMPLETION_KIND], 1);
+    }
+
+    #[test]
+    fn completion_without_segment_metadata_is_not_complete_or_canonical() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(
+                0,
+                "2026-07-15T03:10:00Z",
+                valid_trade_completion_update(),
+            )],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["segment_complete"], false);
+        assert_eq!(manifest["reference_context_complete"], false);
+        assert_eq!(
+            manifest["replay_scope"],
+            "reference_hour_segment_requires_market_metadata_context"
+        );
     }
 
     #[test]
