@@ -333,11 +333,8 @@ mod tests {
 
     #[test]
     fn missing_credential_file_fails_before_any_request() {
-        let missing = std::env::temp_dir().join(format!(
-            "monday-binance-fee-missing-credential-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&missing);
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.json");
         assert!(read_account_secret(&missing).is_err());
     }
 
