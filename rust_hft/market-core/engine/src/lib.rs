@@ -1662,15 +1662,17 @@ impl Engine {
                 let latest_market_view = self.get_market_view();
                 let before_pricing = intents_work_buf.len();
                 intents_work_buf.retain_mut(|envelope| {
+                    if !matches!(envelope.intent.order_type, OrderType::Market) {
+                        return true;
+                    }
                     let accepted = Self::enrich_market_intent_price(
                         &mut envelope.intent,
                         l2_book,
                         &latest_market_view,
                     );
-                    envelope.lifecycle.arrival_price = accepted
-                        .then_some(envelope.intent.price)
-                        .flatten()
-                        .filter(|_| matches!(envelope.intent.order_type, OrderType::Market));
+                    if accepted {
+                        envelope.lifecycle.arrival_price = envelope.intent.price;
+                    }
                     accepted
                 });
                 let rejected = before_pricing.saturating_sub(intents_work_buf.len());
