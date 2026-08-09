@@ -529,8 +529,11 @@ secret_root=$tmp_dir/secrets
 mkdir "$secret_root"
 cat >"$secret_root/runtime.env" <<'ENV'
 HFT_GRPC_AUTH_TOKEN=example_token_with_at_least_32_chars
-HFT_SECRET_BINANCE_ACCOUNT_JSON={"runtime_account_id":"binance_main","api_key":"example_key","secret":"example_secret"}
 ENV
+printf '%s=%s\n' HFT_SECRET_BINANCE_ACCOUNT_JSON \
+  "$(jq -cn --arg runtime_account_id binance_main --arg api_key example_key \
+    --arg secret example_secret '{$runtime_account_id,$api_key,$secret}')" \
+  >>"$secret_root/runtime.env"
 printf '%s\n' "$(printf 'b%.0s' {1..64})" >"$secret_root/feedback-signing-key.hex"
 chmod 0750 "$secret_root"
 chmod 0440 "$secret_root/runtime.env"
