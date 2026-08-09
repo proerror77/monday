@@ -260,6 +260,12 @@ impl RegisteredResearchDataset {
                 }
                 let (fee_bps, funding_bps, latency_bps) =
                     cex_snapshot_costs(&manifest.snapshot, costs.cross_spread)?;
+                if costs.fee_bps.to_bits() != fee_bps.to_bits()
+                    || costs.funding_bps.to_bits() != funding_bps.to_bits()
+                    || costs.latency_bps.to_bits() != latency_bps.to_bits()
+                {
+                    bail!("evaluation costs do not match the verified CEX replay snapshot");
+                }
                 load_feature_research_rows(features, fee_bps, funding_bps, latency_bps, true)
             }
         }
