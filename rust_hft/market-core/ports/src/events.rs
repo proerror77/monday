@@ -724,6 +724,15 @@ pub enum ExecutionEvent {
         kind: PrivateOrderEventKind,
         received_mono_us: u64,
     },
+    /// Completed local order-lifecycle spans emitted after private-stream timing is joined to the
+    /// original intent and userspace write. Diagnostic only; it is not an order-state transition.
+    OrderLifecycleTiming {
+        order_id: OrderId,
+        observed_at: Timestamp,
+        write_to_private_ack_us: Option<u64>,
+        write_to_private_report_us: Option<u64>,
+        intent_to_private_report_us: Option<u64>,
+    },
     /// 連線狀態
     ConnectionStatus {
         connected: bool,

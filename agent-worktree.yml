@@ -2,7 +2,7 @@ owner: codex
 contract: binance-fee-snapshot-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-snapshot-v2
 branch: codex/binance-fee-snapshot-v2
-base_sha: 2e927fcda973d1a64851ed38ed84224daf58acfe
+base_sha: 8b5410e2ef363a2e729e69e0b6c97170181c7480
 allowed_files:
   - agent-worktree.yml
   - rust_hft/Cargo.lock
