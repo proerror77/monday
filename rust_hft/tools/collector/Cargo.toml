@@ -108,6 +108,10 @@ path = "src/bin/binance-usdm-reference-upload.rs"
 name = "binance-replay-parquet-cache-warmer"
 path = "src/bin/binance-replay-parquet-cache-warmer.rs"
 
+[[bin]]
+name = "clickhouse-analytics-materializer"
+path = "src/bin/clickhouse-analytics-materializer.rs"
+
 [lib]
 name = "hft_collector"
 path = "src/lib.rs"
