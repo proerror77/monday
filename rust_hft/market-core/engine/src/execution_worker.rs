@@ -11,7 +11,7 @@ use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{
-    now_micros, AccountId, HftError, LatencyStage, OrderId, OrderType, Price, ProductType, Quantity,
+    now_micros, AccountId, HftError, LatencyStage, OrderId, Price, ProductType, Quantity,
 };
 use hft_core::{Symbol, VenueId};
 use ports::{
@@ -43,10 +43,8 @@ type IndexedExecutionStream =
 
 const STREAM_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-fn arrival_price(intent: &OrderIntent) -> Option<Price> {
-    matches!(intent.order_type, OrderType::Market)
-        .then_some(intent.price)
-        .flatten()
+fn arrival_price(envelope: &OrderIntentEnvelope) -> Option<Price> {
+    envelope.lifecycle.arrival_price
 }
 
 /// 客户端选择策略
@@ -1031,7 +1029,7 @@ impl ExecutionWorker {
                         },
                     );
 
-                    let arrival_price = arrival_price(&envelope.intent);
+                    let arrival_price = arrival_price(&envelope);
                     let OrderIntent {
                         symbol,
                         side,
@@ -1125,7 +1123,7 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
-                                arrival_price: arrival_price(intent),
+                                arrival_price: arrival_price(&envelope),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),
@@ -3154,13 +3152,13 @@ mod tests {
     }
 
     #[test]
-    fn arrival_price_excludes_ioc_protection_limit() {
-        let mut intent = create_test_intent("BTCUSDT");
-        intent.order_type = OrderType::Limit;
-        assert_eq!(arrival_price(&intent), None);
+    fn arrival_price_requires_engine_quote_provenance() {
+        let intent = create_test_intent("BTCUSDT");
+        let mut envelope = OrderIntentEnvelope::new(intent.clone(), Default::default());
+        assert_eq!(arrival_price(&envelope), None);
 
-        intent.order_type = OrderType::Market;
-        assert_eq!(arrival_price(&intent), intent.price);
+        envelope.lifecycle.arrival_price = intent.price;
+        assert_eq!(arrival_price(&envelope), intent.price);
     }
 
     fn ready_spot_admission(account_id: AccountId, venue: VenueId) -> AccountExecutionAdmission {

@@ -348,6 +348,7 @@ fn execution_attribution(
             arrival_price,
             ..
         } => {
+            let previous = state.orders.remove(&order_id.0);
             let Some(venue) = venue.as_ref().map(ToString::to_string) else {
                 return Ok(None);
             };
@@ -360,7 +361,15 @@ fn execution_attribution(
             {
                 return Ok(None);
             }
-            let previous = state.orders.remove(&order_id.0);
+            if previous.as_ref().is_some_and(|order| {
+                order.strategy_id != *strategy_id
+                    || !order.venue.eq_ignore_ascii_case(&venue)
+                    || order.symbol != symbol.as_str()
+                    || order.side != *side
+                    || order.requested_price != requested_price.map(|price| price.0)
+            }) {
+                return Ok(None);
+            }
             state.orders.insert(
                 order_id.0.clone(),
                 OrderMetadata {
@@ -481,8 +490,6 @@ fn execution_attribution(
                 || metadata.venue.eq_ignore_ascii_case("binance_spot")
             {
                 metrics.insert("instrument_market_spot".to_string(), 1.0);
-            } else if metadata.venue.eq_ignore_ascii_case("binance_futures") {
-                metrics.insert("instrument_market_usdm".to_string(), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -1375,39 +1382,30 @@ mod tests {
     }
 
     #[test]
-    fn binance_futures_fill_carries_usdm_market_identity() {
-        let mut activation = activation();
-        activation.venue = "BINANCE_FUTURES".to_string();
+    fn conflicting_duplicate_order_invalidates_prior_metadata() {
+        let activation = activation();
         let mut state = AttributionState::new(&activation).unwrap();
-        execution_attribution(
-            &activation,
-            &mut state,
-            &order_new_for(
-                "futures-order",
-                "BTCUSDT",
-                Side::Buy,
-                "bundle-1:BTCUSDT",
-                Some(VenueId::BINANCE_FUTURES),
-            ),
-        )
-        .unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
+
+        let mut conflicting = order_new("reused-order");
+        if let ExecutionEvent::OrderNew { symbol, .. } = &mut conflicting {
+            *symbol = Symbol::new("ETHUSDT");
+        }
+        execution_attribution(&activation, &mut state, &conflicting).unwrap();
 
         let fill = execution_attribution(
             &activation,
             &mut state,
             &ExecutionEvent::Fill {
-                order_id: OrderId("futures-order".to_string()),
+                order_id: OrderId("reused-order".to_string()),
                 price: Price::from_f64(101.0).unwrap(),
                 quantity: Quantity::from_f64(0.5).unwrap(),
                 timestamp: NOW_US + 1,
-                fill_id: "futures-fill-1".to_string(),
+                fill_id: "fill-after-reuse".to_string(),
             },
         )
-        .unwrap()
         .unwrap();
-
-        assert_eq!(fill.metrics["instrument_market_usdm"], 1.0);
-        assert!(!fill.metrics.contains_key("instrument_market_spot"));
+        assert!(fill.is_none());
     }
 
     #[test]

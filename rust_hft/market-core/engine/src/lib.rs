@@ -1655,18 +1655,23 @@ impl Engine {
 
             // Risk must see an executable reference price for every market intent. Use the
             // event-sequenced book first; fail closed if no valid quote can be resolved.
-            if intents_work_buf.iter().any(|envelope| {
-                matches!(envelope.intent.order_type, OrderType::Market)
-                    && envelope.intent.price.is_none()
-            }) {
+            if intents_work_buf
+                .iter()
+                .any(|envelope| matches!(envelope.intent.order_type, OrderType::Market))
+            {
                 let latest_market_view = self.get_market_view();
                 let before_pricing = intents_work_buf.len();
                 intents_work_buf.retain_mut(|envelope| {
-                    Self::enrich_market_intent_price(
+                    let accepted = Self::enrich_market_intent_price(
                         &mut envelope.intent,
                         l2_book,
                         &latest_market_view,
-                    )
+                    );
+                    envelope.lifecycle.arrival_price = accepted
+                        .then_some(envelope.intent.price)
+                        .flatten()
+                        .filter(|_| matches!(envelope.intent.order_type, OrderType::Market));
+                    accepted
                 });
                 let rejected = before_pricing.saturating_sub(intents_work_buf.len());
                 if rejected > 0 {
@@ -2026,7 +2031,7 @@ impl Engine {
         event_book: Option<ports::L2BookView<'_>>,
         latest_market_view: &MarketView,
     ) -> bool {
-        if !matches!(intent.order_type, OrderType::Market) || intent.price.is_some() {
+        if !matches!(intent.order_type, OrderType::Market) {
             return true;
         }
 

@@ -411,6 +411,9 @@ pub struct OrderIntentLifecycle {
     pub reduce_only: bool,
     #[serde(skip, default)]
     pub timing: ExecutionTiming,
+    /// Executable quote captured by the engine immediately before risk review.
+    #[serde(skip, default)]
+    pub arrival_price: Option<Price>,
 }
 
 impl Default for OrderIntentLifecycle {
@@ -426,6 +429,7 @@ impl Default for OrderIntentLifecycle {
             max_order_quantity: None,
             reduce_only: false,
             timing: ExecutionTiming::default(),
+            arrival_price: None,
         }
     }
 }
