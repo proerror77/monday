@@ -19,7 +19,7 @@ artifact=$(jq -cn \
   --arg data "$data_sha" --arg manifest "$manifest_sha" \
   '{canonical_readback:true,dataset:"reference",venue:"binance_usdm",
     manifest_schema:"binance.usdm_reference_manifest.v1",
-    data_schema:"binance.usdm_reference.v2",
+    data_schema:"binance.usdm_reference.v3",
     source_origin:"https://fapi.binance.com",
     max_staleness_ms:30000,
     source_endpoints:["https://fapi.binance.com/fapi/v1/time",

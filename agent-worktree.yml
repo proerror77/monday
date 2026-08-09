@@ -1,9 +1,15 @@
 owner: codex
-contract: usdm-reference-empty-batch-recovery
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/usdm-reference-empty-batch
-branch: codex/usdm-reference-empty-batch
-base_sha: e2a66fcd72ffb50e0af1b6c0e7481c243bbea9f9
+contract: binance-usdm-reference-v3-schema
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-upgrade
+branch: codex/binance-usdm-reference-v3-upgrade
+base_sha: 1d94b43a42ca9abfa2783e84c416a4595952204d
 allowed_files:
+  - agent-worktree.yml
+  - rust_hft/data-pipelines/core/src/binance_usdm_reference.rs
+  - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
+  - rust_hft/tools/collector/src/binance_usdm_reference_collector.rs
   - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
+  - rust_hft/tools/collector/src/bin/binance-usdm-reference-collector.rs
+  - rust_hft/tools/collector/src/bin/binance-usdm-reference-artifact-verifier.rs
 dependency: none
 no_external_runtime_mutation: true

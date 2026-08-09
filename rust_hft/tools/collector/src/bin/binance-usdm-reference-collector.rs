@@ -359,7 +359,11 @@ mod tests {
                     "symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL",
                     "deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,
                     "status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT",
-                    "marginAsset":"USDT"
+                    "marginAsset":"USDT","filters":[
+                        {"filterType":"PRICE_FILTER","tickSize":"0.10"},
+                        {"filterType":"LOT_SIZE","stepSize":"0.001"},
+                        {"filterType":"MIN_NOTIONAL","notional":"5"}
+                    ]
                 }]}),
                 RECEIVED_NS - 50,
             ))
