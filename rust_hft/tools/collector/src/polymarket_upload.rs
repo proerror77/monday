@@ -3435,7 +3435,7 @@ mod tests {
         config.quote_depth_levels = 0;
         config.quote_sample_ms = 0;
 
-        let fixture_identity = regular_identity(&fixture).unwrap();
+        let fixture_identity = regular_identity(fixture).unwrap();
         assert!(
             (MIN_FIXTURE_BYTES..=MAX_FIXTURE_BYTES).contains(&fixture_identity.bytes),
             "fixture must be between 3.7 and 4.3 GiB"
@@ -3449,13 +3449,13 @@ mod tests {
         let full_started = std::time::Instant::now();
         let full = {
             let _phase = PhaseAttribution::new("benchmark_full_scan");
-            scan_tape_with_identity(&fixture, "crypto_expiry", 0, 0).unwrap()
+            scan_tape_with_identity(fixture, "crypto_expiry", 0, 0).unwrap()
         };
         let full_elapsed = full_started.elapsed();
         let seal_started = std::time::Instant::now();
         let sealed = {
             let _phase = PhaseAttribution::new("benchmark_seal_lookup");
-            matching_tape_seal(&fixture, &config).unwrap().unwrap()
+            matching_tape_seal(fixture, &config).unwrap().unwrap()
         };
         let seal_elapsed = seal_started.elapsed();
 
