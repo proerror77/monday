@@ -77,6 +77,7 @@ impl CexArtifactTripletV2 {
         valid_sha256(&self.data_sha256)
             && valid_sha256(&self.manifest_sha256)
             && valid_sha256(&self.success_sha256)
+            && self.success_sha256 == self.data_sha256
     }
 }
 
@@ -118,25 +119,26 @@ pub struct CexInstrumentRulesV2 {
     pub min_notional: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFeeScheduleV2 {
+    pub account_fingerprint: String,
     pub maker_buy_fee_bps: String,
     pub maker_sell_fee_bps: String,
     pub taker_buy_fee_bps: String,
     pub taker_sell_fee_bps: String,
     pub available_at: DateTime<Utc>,
     pub valid_through: DateTime<Utc>,
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexPitSeriesEvidenceV2 {
-    pub evidence: CexArtifactTripletV2,
+    pub evidence: Vec<CexArtifactTripletV2>,
     pub first_available_at: DateTime<Utc>,
     pub last_available_at: DateTime<Utc>,
     pub observations: u64,
@@ -193,6 +195,11 @@ pub struct CexReplaySnapshotV2 {
 
 impl CexReplaySnapshotV2 {
     pub fn validate(&self) -> Result<(), ManifestError> {
+        if !valid_cex_symbol(&self.symbol) {
+            return Err(ManifestError::InvalidCexReplaySnapshot(
+                "symbol is not canonical",
+            ));
+        }
         let mut required = BTreeSet::from([
             CEX_MODALITY_LOB.to_string(),
             CEX_MODALITY_AGGREGATE_TRADE.to_string(),
@@ -220,21 +227,29 @@ impl CexReplaySnapshotV2 {
             self.top_depth,
         )?;
         let invalid = ManifestError::InvalidCexReplaySnapshot;
+        let label_available_through = u64::try_from(self.label_horizon_buckets)
+            .ok()
+            .and_then(|horizon| self.bucket_ms.checked_mul(horizon))
+            .and_then(|offset| i64::try_from(offset).ok())
+            .and_then(chrono::TimeDelta::try_milliseconds)
+            .and_then(|offset| self.last_event_time.checked_add_signed(offset))
+            .ok_or_else(|| invalid("label availability time overflows"))?;
         if !positive_decimal(&self.instrument_rules.tick_size)
             || !positive_decimal(&self.instrument_rules.step_size)
             || !positive_decimal(&self.instrument_rules.min_notional)
-            || !self.instrument_rules.evidence.valid()
+            || !valid_evidence_set(&self.instrument_rules.evidence)
             || self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.available_at > self.instrument_rules.valid_through
-            || self.instrument_rules.valid_through < self.last_event_time
+            || self.instrument_rules.valid_through < label_available_through
+            || !valid_sha256(&self.fee_schedule.account_fingerprint)
             || !nonnegative_decimal(&self.fee_schedule.maker_buy_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.maker_sell_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.taker_buy_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.taker_sell_fee_bps)
-            || !self.fee_schedule.evidence.valid()
+            || !valid_evidence_set(&self.fee_schedule.evidence)
             || self.fee_schedule.available_at > self.first_event_time
             || self.fee_schedule.available_at > self.fee_schedule.valid_through
-            || self.fee_schedule.valid_through < self.last_event_time
+            || self.fee_schedule.valid_through < label_available_through
         {
             return Err(invalid("PIT rules or fee evidence is invalid"));
         }
@@ -266,6 +281,12 @@ impl CexReplaySnapshotV2 {
                 &self.latency_cost.p95_cost_bps,
                 &self.latency_cost.p99_cost_bps,
             ])
+            || (self.latency_cost.observations == 1
+                && (self.latency_cost.p50_ns != self.latency_cost.p99_ns
+                    || !equal_decimals(
+                        &self.latency_cost.p50_cost_bps,
+                        &self.latency_cost.p99_cost_bps,
+                    )))
         {
             return Err(invalid("measured latency cost evidence is invalid"));
         }
@@ -282,12 +303,24 @@ fn pit_series_covers(
     first_event_time: DateTime<Utc>,
     last_event_time: DateTime<Utc>,
 ) -> bool {
-    evidence.evidence.valid()
+    let span_ns = evidence
+        .last_available_at
+        .signed_duration_since(evidence.first_available_at)
+        .num_nanoseconds()
+        .and_then(|span| u64::try_from(span).ok());
+    valid_evidence_set(&evidence.evidence)
         && evidence.observations > 0
+        && usize::try_from(evidence.observations).ok() == Some(evidence.evidence.len())
         && evidence.max_gap_ns <= CEX_DERIVATIVES_MAX_GAP_NS
         && evidence.first_available_at <= first_event_time
         && evidence.first_available_at <= evidence.last_available_at
         && evidence.last_available_at >= last_event_time
+        && span_ns.is_some_and(|span| {
+            evidence
+                .max_gap_ns
+                .checked_mul(evidence.observations - 1)
+                .is_some_and(|covered| span <= covered)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -468,6 +501,22 @@ fn valid_sha256(value: &str) -> bool {
         && value == value.to_ascii_lowercase()
 }
 
+fn valid_evidence_set(evidence: &[CexArtifactTripletV2]) -> bool {
+    !evidence.is_empty()
+        && evidence.iter().all(CexArtifactTripletV2::valid)
+        && evidence
+            .iter()
+            .enumerate()
+            .all(|(index, item)| !evidence[..index].contains(item))
+}
+
+fn valid_cex_symbol(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn positive_decimal(value: &str) -> bool {
     value
         .parse::<Decimal>()
@@ -488,6 +537,10 @@ fn ordered_nonnegative_decimals(values: [&str; 3]) -> bool {
             && p50 >= Decimal::ZERO
             && p50 <= p95
             && p95 <= p99)
+}
+
+fn equal_decimals(left: &str, right: &str) -> bool {
+    left.parse::<Decimal>().ok() == right.parse::<Decimal>().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -742,12 +795,13 @@ mod tests {
                 available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:09Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence: triplet('4'),
+                evidence: vec![triplet('4')],
             },
             fee_schedule: CexFeeScheduleV2 {
+                account_fingerprint: "9".repeat(64),
                 maker_buy_fee_bps: "2".to_string(),
                 maker_sell_fee_bps: "2".to_string(),
                 taker_buy_fee_bps: "5".to_string(),
@@ -755,32 +809,32 @@ mod tests {
                 available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:09Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                evidence: triplet('5'),
+                evidence: vec![triplet('5')],
             },
             derivatives_reference: Some(CexDerivativesReferenceV2 {
                 funding: CexPitSeriesEvidenceV2 {
-                    evidence: triplet('6'),
+                    evidence: vec![triplet('6'), triplet('a')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
                     last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    observations: 1,
+                    observations: 2,
                     max_gap_ns: 3_000_000_000,
                 },
                 open_interest: CexPitSeriesEvidenceV2 {
-                    evidence: triplet('7'),
+                    evidence: vec![triplet('7'), triplet('b')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
                     last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    observations: 1,
+                    observations: 2,
                     max_gap_ns: 3_000_000_000,
                 },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
@@ -900,9 +954,85 @@ mod tests {
     }
 
     #[test]
+    fn cex_replay_snapshot_rejects_empty_evidence_set() {
+        let mut snapshot = cex_snapshot();
+        snapshot.fee_schedule.evidence.clear();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("PIT rules or fee evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_unbound_success_marker() {
+        let mut snapshot = cex_snapshot();
+        snapshot.fee_schedule.evidence[0].success_sha256 = "9".repeat(64);
+
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_noncanonical_symbol() {
+        let mut snapshot = cex_snapshot();
+        snapshot.symbol = "BTC-USDT".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("symbol is not canonical")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_duplicate_series_evidence() {
+        let mut snapshot = cex_snapshot();
+        let funding = &mut snapshot.derivatives_reference.as_mut().unwrap().funding;
+        funding.evidence[1] = funding.evidence[0].clone();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_fee_expiry_before_last_label() {
+        let mut snapshot = cex_snapshot();
+        snapshot.fee_schedule.valid_through = snapshot.last_event_time;
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("PIT rules or fee evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_impossible_series_coverage() {
+        let mut snapshot = cex_snapshot();
+        let funding = &mut snapshot.derivatives_reference.as_mut().unwrap().funding;
+        funding.observations = 1;
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
+    }
+
+    #[test]
     fn cex_replay_snapshot_rejects_nonmonotonic_latency_cost() {
         let mut snapshot = cex_snapshot();
         snapshot.latency_cost.p50_cost_bps = "0.21".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_divergent_single_observation_percentiles() {
+        let mut snapshot = cex_snapshot();
+        snapshot.latency_cost.observations = 1;
 
         assert_eq!(
             snapshot.validate().unwrap_err(),
