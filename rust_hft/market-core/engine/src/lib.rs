@@ -668,6 +668,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Publish an externally read-back account view through the engine's canonical snapshot.
+    /// The caller must validate the account scope and evidence before invoking this writer.
+    pub(crate) fn publish_account_readback(&mut self, account_view: AccountView) {
+        if let Some(portfolio_manager) = &mut self.portfolio_manager {
+            let mut state = portfolio_manager.export_state();
+            state.account_view = account_view.clone();
+            portfolio_manager.import_state(state);
+        }
+        self.account_snapshots.store(Arc::new(account_view));
+    }
+
     /// 獲取所有階段的延遲統計數據
     pub fn get_latency_stats(
         &self,
