@@ -30,7 +30,7 @@ write_artifact() {
   manifest="$data.manifest.json"
   jq -S -n --arg data_sha "$data_sha" --argjson observed "$observed_ns" '
     {schema:"binance.usdm_reference_manifest.v1",venue:"binance_usdm",
-      dataset:"reference",data_schema:"binance.usdm_reference.v2",format:"ndjson",
+      dataset:"reference",data_schema:"binance.usdm_reference.v3",format:"ndjson",
       source_origin:"https://fapi.binance.com",
       source_endpoints:["https://fapi.binance.com/fapi/v1/time",
         "https://fapi.binance.com/fapi/v1/exchangeInfo",
@@ -274,10 +274,26 @@ grep -Fq "OLD_UPLOADER_RELEASE_SHA256=\${BASH_REMATCH[1]}" "$cutover"
 grep -Fq "OLD_UPLOADER_SHA256 == \"\$OLD_UPLOADER_RELEASE_SHA256\"" "$cutover"
 grep -Fq 'CANDIDATE_MAY_HAVE_WRITTEN=1' "$cutover"
 grep -Fq "controller: \$controller" "$cutover"
+grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true" "$cutover"
+grep -Fq "systemctl disable \"\$COLLECTOR_UNIT\" \"\$UPLOAD_TIMER\"" "$cutover"
+grep -Fq "! systemctl is-active --quiet \"\$UPLOAD_SERVICE\"" "$cutover"
+grep -Fq 'quarantine_reference_staging' "$cutover"
 
 drain_line=$(grep -n 'STEP=drain-v2-with-old-uploader' "$cutover" | cut -d: -f1)
 switch_line=$(grep -n 'STEP=switch-production-symlink' "$cutover" | cut -d: -f1)
 (( drain_line < switch_line ))
+
+# Preserve an interrupted V2 staging directory outside the canonical lake.
+eval "$(awk '/^quarantine_reference_staging\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
+CANONICAL_SPOOL="$tmp_dir/staging-behavior/spool"
+EVIDENCE_DIR="$tmp_dir/staging-behavior/evidence"
+staging="$CANONICAL_SPOOL/lake/raw/venue=binance_usdm/dataset=reference/date=2033-05-18/hour=03/.reference-staging.fixture"
+mkdir -p "$staging" "$EVIDENCE_DIR"
+printf 'partial\n' >"$staging/reference.ndjson"
+quarantine_reference_staging
+[[ ! -e $staging ]]
+grep -Fxq 'partial' "$EVIDENCE_DIR/quarantined-v2-staging/staging-1/reference.ndjson"
+grep -Fq "$staging" "$EVIDENCE_DIR/quarantined-v2-staging/paths.tsv"
 
 # Exercise the actual rollback function with production effects mocked. Once
 # candidate execution is possible, a failed V3 drain must prevent V2 restore.
@@ -315,6 +331,8 @@ COLLECTOR_UNIT=collector.service
 UPLOAD_SERVICE=upload.service
 # shellcheck disable=SC2034
 UPLOAD_TIMER=upload.timer
+# shellcheck disable=SC2034
+HEALTH_TIMEOUT_SECONDS=1
 rollback_trace="$tmp_dir/rollback-trace"
 secure_regular_file() { :; }
 run_uploader() { printf 'drain %s\n' "$1" >>"$rollback_trace"; return "${drain_result:-0}"; }
@@ -322,6 +340,8 @@ require_empty_lake() { printf 'empty-check\n' >>"$rollback_trace"; }
 atomic_install() { printf 'install %s\n' "$3" >>"$rollback_trace"; }
 atomic_symlink() { printf 'symlink %s\n' "$2" >>"$rollback_trace"; }
 systemctl() { :; }
+health_ready_for_release() { printf 'health-readback\n' >>"$rollback_trace"; }
+runtime_matches_collector() { printf 'runtime %s %s\n' "$1" "$2" >>"$rollback_trace"; }
 readlink() {
   local path=${!#}
   [[ $path == "$COLLECTOR_LINK" ]] && printf '%s\n' "$OLD_COLLECTOR" \
@@ -343,6 +363,9 @@ restore_old_production
 [[ $(sed -n '2p' "$rollback_trace") == 'empty-check' ]]
 grep -Fq 'symlink /collector-link' "$rollback_trace"
 grep -Fq 'symlink /uploader-link' "$rollback_trace"
+grep -Fq 'health-readback' "$rollback_trace"
+grep -Fq 'runtime /old/collector false' "$rollback_trace"
+grep -Fq 'runtime /old/collector true' "$rollback_trace"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
 grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \

@@ -257,6 +257,22 @@ require_empty_lake() {
   fi
 }
 
+quarantine_reference_staging() {
+  local quarantine="$EVIDENCE_DIR/quarantined-v2-staging" path target count=0
+  [[ -d $CANONICAL_SPOOL/lake ]] || return 0
+  while IFS= read -r -d '' path; do
+    [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]] || return 1
+    ((count += 1))
+    if (( count == 1 )); then
+      install -d -m 0750 "$quarantine" || return 1
+    fi
+    target="$quarantine/staging-$count"
+    mv -- "$path" "$target" || return 1
+    printf '%s\t%s\n' "$path" "$target" >>"$quarantine/paths.tsv" || return 1
+  done < <(find "$CANONICAL_SPOOL/lake" -name '.reference-staging.*' \
+    \( -type d -o -type l \) -print0)
+}
+
 run_uploader() {
   local uploader=$1 key value
   local -a env_args
@@ -305,7 +321,7 @@ stage_rollback_assets() {
 }
 
 restore_old_production() {
-  local rollback="$EVIDENCE_DIR/rollback-assets"
+  local rollback="$EVIDENCE_DIR/rollback-assets" restore_started_ns deadline
   secure_regular_file "$rollback/rollback-assets.sha256"
   [[ $(sha256sum "$rollback/rollback-assets.sha256" | awk '{print $1}') \
     == "$ROLLBACK_ASSETS_SHA256" ]] || return 1
@@ -327,13 +343,23 @@ restore_old_production() {
   systemctl unmask --runtime "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" "$UPLOAD_TIMER" >/dev/null \
     || return 1
   systemctl reset-failed "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
+  restore_started_ns=$(date +%s%N) || return 1
   systemctl start "$COLLECTOR_UNIT" || return 1
   systemctl enable "$COLLECTOR_UNIT" >/dev/null || return 1
-  systemctl enable --now "$UPLOAD_TIMER" >/dev/null || return 1
-  systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
-  systemctl is-active --quiet "$UPLOAD_TIMER" || return 1
   [[ $(readlink -f "$COLLECTOR_LINK") == "$OLD_COLLECTOR" ]] || return 1
   [[ $(readlink -f "$UPLOADER_LINK") == "$OLD_UPLOADER" ]] || return 1
+  deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
+    if health_ready_for_release "$restore_started_ns" \
+      && runtime_matches_collector "$OLD_COLLECTOR" false; then
+      systemctl enable --now "$UPLOAD_TIMER" >/dev/null || return 1
+      runtime_matches_collector "$OLD_COLLECTOR" true || return 1
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
 }
 
 health_ready_for_release() {
@@ -362,19 +388,23 @@ health_ready_for_release() {
     --manifest-sha256 "$manifest_sha" >/dev/null || return 1
 }
 
-runtime_matches_release() {
-  local require_enabled=$1 restarts main_pid main_exe
+runtime_matches_collector() {
+  local expected_collector=$1 require_enabled=$2 restarts main_pid main_exe
   systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
   restarts=$(systemctl show "$COLLECTOR_UNIT" --property=NRestarts --value) || return 1
   [[ $restarts == 0 ]] || return 1
   main_pid=$(systemctl show "$COLLECTOR_UNIT" --property=MainPID --value) || return 1
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
   main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
-  [[ $main_exe == "$CANDIDATE_COLLECTOR" ]] || return 1
+  [[ $main_exe == "$expected_collector" ]] || return 1
   if [[ $require_enabled == true ]]; then
     systemctl is-enabled --quiet "$COLLECTOR_UNIT" || return 1
     systemctl is-enabled --quiet "$UPLOAD_TIMER" || return 1
   fi
+}
+
+runtime_matches_release() {
+  runtime_matches_collector "$CANDIDATE_COLLECTOR" "$1"
 }
 
 wait_for_release_health() {
@@ -403,6 +433,12 @@ production_is_fail_closed() {
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
+}
+
+contain_production() {
+  systemctl disable --now "$COLLECTOR_UNIT" "$UPLOAD_TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
+  systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
 }
 
 write_evidence() {
@@ -473,16 +509,17 @@ write_evidence() {
 
 rollback_after_failure() {
   ROLLBACK_RESULT=disabled
-  systemctl disable --now "$COLLECTOR_UNIT" "$UPLOAD_TIMER" >/dev/null 2>&1 || true
-  systemctl stop "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
-  systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+  contain_production
   if [[ $OLD_MODE == upgrade ]]; then
     if restore_old_production; then
       ROLLBACK_RESULT=previous-release-restored
-    elif production_is_fail_closed; then
-      ROLLBACK_RESULT=previous-release-restore-failed-but-contained
     else
-      ROLLBACK_RESULT=previous-release-restore-containment-failed
+      contain_production
+      if production_is_fail_closed; then
+        ROLLBACK_RESULT=previous-release-restore-failed-but-contained
+      else
+        ROLLBACK_RESULT=previous-release-restore-containment-failed
+      fi
     fi
     copy_health_evidence rollback
     return
@@ -661,6 +698,8 @@ if systemctl is-active --quiet "$COLLECTOR_UNIT" \
   OLD_UPLOADER_SHA256=$(sha256sum "$OLD_UPLOADER" | awk '{print $1}')
   [[ $OLD_UPLOADER_SHA256 == "$OLD_UPLOADER_RELEASE_SHA256" ]] \
     || fail 'production uploader digest does not match its release directory'
+  runtime_matches_collector "$OLD_COLLECTOR" true \
+    || fail 'production collector process does not match its release symlink'
   secure_regular_file "$UPLOAD_ENV"
   validate_upload_env "$UPLOAD_ENV"
   stage_rollback_assets
@@ -680,8 +719,17 @@ fi
 STEP=stop-production
 TRANSITION_STARTED=1
 if [[ $OLD_MODE == upgrade ]]; then
+  systemctl disable "$COLLECTOR_UNIT" "$UPLOAD_TIMER"
   systemctl stop "$UPLOAD_TIMER" "$COLLECTOR_UNIT"
-  systemctl stop "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
+  systemctl stop "$UPLOAD_SERVICE"
+  ! systemctl is-active --quiet "$COLLECTOR_UNIT" \
+    || fail 'production collector remained active after stop'
+  ! systemctl is-active --quiet "$UPLOAD_TIMER" \
+    || fail 'production upload timer remained active after stop'
+  ! systemctl is-active --quiet "$UPLOAD_SERVICE" \
+    || fail 'production uploader remained active after stop'
+  quarantine_reference_staging \
+    || fail 'could not preserve interrupted V2 staging artifacts'
 fi
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
 
