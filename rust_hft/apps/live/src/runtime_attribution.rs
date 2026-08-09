@@ -470,6 +470,9 @@ fn execution_attribution(
                 "evidence_available_at_us".to_string(),
                 Utc::now().timestamp_micros().max(0) as f64,
             );
+            if metadata.venue.eq_ignore_ascii_case("binance") {
+                metrics.insert("instrument_market_spot".to_string(), 1.0);
+            }
             let mut event = order_attribution(
                 activation,
                 &metadata,

@@ -57,11 +57,11 @@ pub fn verify_runtime_latency_evidence(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     if deployment_id.trim().is_empty()
-        || market != "spot"
+        || !matches!(market, "spot" | "usdm")
         || symbol.trim().is_empty()
         || account_id.trim().is_empty()
     {
-        bail!("verified runtime latency evidence currently supports Binance Spot only");
+        bail!("runtime feedback deployment, market, symbol, and account are required");
     }
 
     let mut observations = Vec::new();
@@ -92,6 +92,11 @@ pub fn verify_runtime_latency_evidence(
             || event.outcome != AttributionOutcome::Healthy
             || event.deployment_id != deployment_id
             || event.account_id.as_deref() != Some(account_id)
+            || event
+                .metrics
+                .get(&format!("instrument_market_{market}"))
+                .copied()
+                != Some(1.0)
             || !event
                 .venue
                 .as_deref()
@@ -230,6 +235,7 @@ mod tests {
                     "evidence_available_at_us".to_string(),
                     1_783_987_200_000_000.0,
                 ),
+                ("instrument_market_spot".to_string(), 1.0),
             ]),
             reason: None,
             observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
