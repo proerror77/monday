@@ -1401,8 +1401,8 @@ mod tests {
         execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
 
         let mut conflicting = order_new("reused-order");
-        if let ExecutionEvent::OrderNew { symbol, .. } = &mut conflicting {
-            *symbol = Symbol::new("ETHUSDT");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut conflicting {
+            *arrival_price = Some(Price::from_f64(101.0).unwrap());
         }
         execution_attribution(&activation, &mut state, &conflicting).unwrap();
         execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
