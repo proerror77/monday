@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use data::binance_lob_replay::{
     source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
 };
+use data::binance_market_tape::AggregateTrade;
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet,
     verify_binance_market_tape_with_required_trade_and_lob_summaries, BinanceMarketTapeTriplet,
@@ -303,6 +304,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     )?;
     let rows = materialize_rows(
         &replay.samples,
+        verified.aggregate_trades(),
         args.market,
         &symbol,
         &revision,
@@ -529,6 +531,7 @@ fn sample_book(
 
 fn materialize_rows(
     samples: &[BookSample],
+    aggregate_trades: &[AggregateTrade],
     market: Market,
     symbol: &str,
     revision: &str,
@@ -537,6 +540,10 @@ fn materialize_rows(
     ingestion_time: DateTime<Utc>,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
     let mut rows = Vec::new();
+    let aggregate_trades = aggregate_trades
+        .iter()
+        .filter(|trade| trade.symbol == symbol)
+        .collect::<Vec<_>>();
     let source_revisions = BTreeMap::from([(
         format!("binance-{}-lob", market.as_str()),
         revision.to_string(),
@@ -553,7 +560,51 @@ fn materialize_rows(
             continue;
         }
         let label = future.mid_price / current.mid_price - 1.0;
+        let trade_start =
+            aggregate_trades.partition_point(|trade| trade.received_at_ns <= previous.time_ns);
+        let trade_end =
+            aggregate_trades.partition_point(|trade| trade.received_at_ns <= current.time_ns);
+        let bucket_trades = &aggregate_trades[trade_start..trade_end];
+        let (base_volume, quote_volume, signed_volume) = bucket_trades.iter().try_fold(
+            (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            |(base, quote, signed), trade| {
+                let quote_delta = trade
+                    .price
+                    .checked_mul(trade.quantity)
+                    .context("aggregate-trade notional overflow")?;
+                let signed_delta = if trade.is_buyer_maker {
+                    -trade.quantity
+                } else {
+                    trade.quantity
+                };
+                Ok::<_, anyhow::Error>((
+                    base + trade.quantity,
+                    quote + quote_delta,
+                    signed + signed_delta,
+                ))
+            },
+        )?;
         let features = BTreeMap::from([
+            (
+                "aggregate_trade_base_volume".to_string(),
+                decimal_f64(base_volume)?,
+            ),
+            (
+                "aggregate_trade_count".to_string(),
+                bucket_trades.len() as f64,
+            ),
+            (
+                "aggregate_trade_flow_imbalance".to_string(),
+                if base_volume.is_zero() {
+                    0.0
+                } else {
+                    decimal_f64(signed_volume / base_volume)?
+                },
+            ),
+            (
+                "aggregate_trade_quote_volume".to_string(),
+                decimal_f64(quote_volume)?,
+            ),
             (format!("ask_depth_top{depth}"), current.ask_depth),
             (format!("bid_depth_top{depth}"), current.bid_depth),
             ("book_imbalance".to_string(), current.book_imbalance),
@@ -584,7 +635,7 @@ fn materialize_rows(
             ingestion_time,
             symbol: symbol.to_string(),
             source_revisions: source_revisions.clone(),
-            modalities: BTreeSet::from([DataModality::Lob]),
+            modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
             features,
             label,
         });
@@ -774,6 +825,7 @@ mod tests {
             diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
             trade(700),
             diff(1_400, 176, 176, 175, json!([]), json!([["101", "0"]])),
+            trade(1_700),
             diff(2_400, 177, 177, 176, json!([["101", "3"]]), json!([])),
             diff(3_400, 178, 178, 177, json!([]), json!([["101.5", "4"]])),
             diff(4_400, 179, 179, 178, json!([["101", "0"]]), json!([])),
@@ -1083,13 +1135,20 @@ mod tests {
             })
         );
         assert_eq!(rows[0].symbol, "BTCUSDT");
-        assert_eq!(rows[0].modalities, BTreeSet::from([DataModality::Lob]));
+        assert_eq!(
+            rows[0].modalities,
+            BTreeSet::from([DataModality::Lob, DataModality::TradeTick])
+        );
         assert_eq!(rows[0].event_time.to_rfc3339(), "2026-07-14T00:00:02+00:00");
         assert_eq!(
             rows[0].label_available_time.to_rfc3339(),
             "2026-07-14T00:00:04+00:00"
         );
         assert!((rows[0].features["mid_price"] - 101.0).abs() < 1e-12);
+        assert_eq!(rows[0].features["aggregate_trade_count"], 1.0);
+        assert_eq!(rows[0].features["aggregate_trade_base_volume"], 2.0);
+        assert_eq!(rows[0].features["aggregate_trade_quote_volume"], 201.0);
+        assert_eq!(rows[0].features["aggregate_trade_flow_imbalance"], 1.0);
         assert!((rows[0].label - (101.25 / 101.0 - 1.0)).abs() < 1e-12);
     }
 

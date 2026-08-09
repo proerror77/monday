@@ -1,12 +1,10 @@
-owner: codex
-contract: cex-research-contract-v2
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-contract-v2
-branch: codex/cex-research-contract-v2
-base_sha: c1a2b934926602014cdf81401bc0f79af3d34e30
+owner: codex-root
+contract: lob-pit-trade-features
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-trade-features
+branch: codex/lob-pit-trade-features
+base_sha: e85ad316342bf3b51d620016380a13159439a8a2
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/Cargo.lock
-  - rust_hft/research-core/manifest/Cargo.toml
-  - rust_hft/research-core/manifest/src/lib.rs
-dependency: none
+  - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
+dependency: PR #781
 no_external_runtime_mutation: true
