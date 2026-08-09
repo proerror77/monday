@@ -101,6 +101,7 @@ members = [
     # Shared Catalogs
     "shared/instrument",
     "shared/config",
+    "shared/polymarket-tape",
 
     # Tools & Utilities
     "tools/collector",
