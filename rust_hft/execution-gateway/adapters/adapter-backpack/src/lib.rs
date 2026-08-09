@@ -390,6 +390,7 @@ impl BackpackExecutionClient {
         self.emit_event(ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
             quantity: intent.quantity,

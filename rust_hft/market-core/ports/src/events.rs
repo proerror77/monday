@@ -516,6 +516,10 @@ pub struct OrderIntentEnvelope {
     /// Stable idempotency key generated once before the intent enters execution.
     #[serde(default)]
     pub client_order_id: String,
+    /// Canonical runtime account identity. The worker rejects missing, unbound, or mismatched
+    /// identities before adapter entry; `None` is retained only for historical decoding.
+    #[serde(default)]
+    pub account_id: Option<AccountId>,
 }
 
 impl OrderIntentEnvelope {
@@ -526,11 +530,17 @@ impl OrderIntentEnvelope {
             intent,
             lifecycle,
             client_order_id,
+            account_id: None,
         }
     }
 
     pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
         self.client_order_id = client_order_id.into();
+        self
+    }
+
+    pub fn with_account_id(mut self, account_id: AccountId) -> Self {
+        self.account_id = Some(account_id);
         self
     }
 
@@ -640,6 +650,9 @@ pub enum ExecutionEvent {
         order_id: OrderId,
         #[serde(default)]
         client_order_id: Option<String>,
+        /// Canonical account identity resolved by the execution worker.
+        #[serde(default)]
+        account_id: Option<AccountId>,
         symbol: Symbol,
         side: Side,
         quantity: Quantity,
@@ -850,6 +863,7 @@ mod tests {
     fn envelope_rejects_order_above_signed_notional_ceiling() {
         let mut lifecycle = lifecycle(1_000, 2_000);
         lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(100));
+        let account_id = AccountId("binance-testnet".to_string());
         let envelope = OrderIntentEnvelope::new(
             OrderIntent::crypto_spot(
                 Symbol::new("BTCUSDT"),
@@ -862,7 +876,10 @@ mod tests {
                 Some(VenueId::BINANCE_SPOT),
             ),
             lifecycle,
-        );
+        )
+        .with_account_id(account_id.clone());
+
+        assert_eq!(envelope.account_id, Some(account_id));
 
         assert_eq!(
             envelope.validate_pre_execution(1_100, None),

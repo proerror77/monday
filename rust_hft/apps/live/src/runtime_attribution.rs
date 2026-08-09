@@ -1082,6 +1082,7 @@ mod tests {
         ExecutionEvent::OrderNew {
             order_id: OrderId(order_id.to_string()),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new(symbol),
             side,
             quantity: Quantity::from_f64(1.0).unwrap(),

@@ -5,9 +5,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use hft_core::{OrderId, Price, Quantity, Side, Symbol};
+use hft_core::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 use ports::ExecutionEvent;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -25,6 +25,8 @@ pub enum OrderStatus {
 pub struct OrderRecord {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<AccountId>,
     pub symbol: Symbol,
     pub side: Side,
     pub qty: Quantity,
@@ -44,6 +46,7 @@ pub struct OrderRecord {
 pub struct RegisterOrderParams {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
+    pub account_id: Option<AccountId>,
     pub symbol: Symbol,
     pub side: Side,
     pub qty: Quantity,
@@ -56,6 +59,7 @@ impl OrderRecord {
         Self {
             order_id: params.order_id,
             client_order_id: params.client_order_id,
+            account_id: params.account_id,
             symbol: params.symbol,
             side: params.side,
             qty: params.qty,
@@ -91,8 +95,27 @@ impl OmsCore {
 
     /// 註冊新下單（由引擎在 place_order 成功前後調用）
     pub fn register_order(&mut self, params: RegisterOrderParams) {
-        let order_id = params.order_id.clone();
-        self.orders.insert(order_id, OrderRecord::new(params));
+        let prior_account_id = self
+            .orders
+            .get(&params.order_id)
+            .and_then(|record| record.account_id.clone());
+        let mut record = OrderRecord::new(params);
+        if let Some(prior_account_id) = prior_account_id {
+            if record
+                .account_id
+                .as_ref()
+                .is_some_and(|account_id| account_id != &prior_account_id)
+            {
+                warn!(
+                    order_id = %record.order_id.0,
+                    prior_account_id = %prior_account_id.0,
+                    "refused to rebind order to a different canonical account identity"
+                );
+                return;
+            }
+            record.account_id = Some(prior_account_id);
+        }
+        self.orders.insert(record.order_id.clone(), record);
     }
 
     /// 應用執行事件（私有 WS 回報）更新狀態機
@@ -477,6 +500,7 @@ impl ports::OrderManager for OmsCore {
         self.register_order(RegisterOrderParams {
             order_id: params.order_id,
             client_order_id: params.client_order_id,
+            account_id: params.account_id,
             symbol: params.symbol,
             side: params.side,
             qty: params.qty,
@@ -523,6 +547,7 @@ impl ports::OrderManager for OmsCore {
                     ports::OrderRecord {
                         order_id: rec.order_id.clone(),
                         client_order_id: rec.client_order_id.clone(),
+                        account_id: rec.account_id.clone(),
                         symbol: rec.symbol.clone(),
                         side: rec.side,
                         qty: rec.qty,
@@ -555,6 +580,7 @@ impl ports::OrderManager for OmsCore {
                     OrderRecord {
                         order_id: rec.order_id,
                         client_order_id: rec.client_order_id,
+                        account_id: rec.account_id,
                         symbol: rec.symbol,
                         side: rec.side,
                         qty: rec.qty,
@@ -596,7 +622,7 @@ impl ports::OrderManager for OmsCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderId, Price, Quantity, Symbol, VenueId};
+    use hft_core::{AccountId, OrderId, Price, Quantity, Symbol, VenueId};
 
     #[test]
     fn test_ack_and_fill() {
@@ -605,6 +631,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -638,6 +665,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: o1.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -649,6 +677,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: o2.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("ETHUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(2.0).unwrap(),
@@ -664,6 +693,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: o3.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("SOLUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -690,6 +720,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(2.0).unwrap(),
@@ -728,6 +759,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("ETHUSDT"),
             side: Side::Sell,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -752,6 +784,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -788,6 +821,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -829,6 +863,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: Some("client-1".into()),
+            account_id: Some(AccountId("bitget-testnet".to_string())),
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(2.0).unwrap(),
@@ -861,6 +896,42 @@ mod tests {
         assert_eq!(order.status, OrderStatus::PartiallyFilled);
         assert_eq!(order.venue, Some(hft_core::VenueId::BITGET));
         assert_eq!(order.strategy_id, Some("strat-a".into()));
+        assert_eq!(
+            order.account_id,
+            Some(AccountId("bitget-testnet".to_string()))
+        );
+    }
+
+    #[test]
+    fn register_order_cannot_rebind_account_identity() {
+        let mut oms = OmsCore::new();
+        let order_id = OrderId("ACCOUNT-BOUND".to_string());
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: Some("client-1".to_string()),
+            account_id: Some(AccountId("canonical-account".to_string())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).expect("valid quantity"),
+            venue: Some(VenueId::BYBIT),
+            strategy_id: Some("strategy-1".to_string()),
+        });
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: Some("client-1".to_string()),
+            account_id: Some(AccountId("wrong-account".to_string())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).expect("valid quantity"),
+            venue: Some(VenueId::BYBIT),
+            strategy_id: Some("strategy-1".to_string()),
+        });
+
+        assert_eq!(
+            oms.get(&order_id)
+                .and_then(|order| order.account_id.clone()),
+            Some(AccountId("canonical-account".to_string()))
+        );
     }
 
     #[test]
@@ -870,6 +941,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -899,6 +971,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -934,6 +1007,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: order_id.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("123"),
             side: Side::Buy,
             qty: Quantity::from_f64(5.0).unwrap(),
@@ -967,6 +1041,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1013,6 +1088,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(2.0).unwrap(),
@@ -1057,6 +1133,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("123"),
             side: Side::Buy,
             qty: Quantity::from_f64(10.0).unwrap(),
@@ -1105,6 +1182,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1134,6 +1212,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: local_id.clone(),
             client_order_id: Some("client-1".into()),
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1172,6 +1251,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1202,6 +1282,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1240,6 +1321,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid1.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),
@@ -1260,6 +1342,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid2.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("ETHUSDT"),
             side: Side::Sell,
             qty: Quantity::from_f64(2.0).unwrap(),
@@ -1293,6 +1376,7 @@ mod tests {
         oms.register_order(RegisterOrderParams {
             order_id: oid.clone(),
             client_order_id: None,
+            account_id: None,
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_f64(1.0).unwrap(),

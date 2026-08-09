@@ -15,8 +15,9 @@ use hft_core::{
 };
 use hft_core::{Symbol, VenueId};
 use ports::{
-    AccountBalance, AssetInventoryCapability, AssetInventoryRecord, ExecutionClient,
-    ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
+    AccountBalance, AccountExecutionAdmission, AccountExecutionEnvironment, AccountReadbackState,
+    AssetInventoryCapability, AssetInventoryRecord, ExecutionClient, ExecutionEvent,
+    ExecutionRouter, OpenOrder, OrderIntent, OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
@@ -218,6 +219,8 @@ pub struct ExecutionWorker {
     /// 订单 ID 到客户端索引的映射
     order_to_client: FxHashMap<OrderId, usize>,
     tracked_orders: FxHashMap<OrderId, TrackedOrder>,
+    /// Authoritative open orders returned by the latest complete reconciliation, scoped by account.
+    reconciled_open_order_ids: FxHashMap<AccountId, HashSet<OrderId>>,
     /// 轮询计数器（用于 RoundRobin 策略）
     round_robin_counter: AtomicUsize,
     /// 延遲監控器 - 追蹤 Worker 執行延遲
@@ -237,6 +240,10 @@ pub struct ExecutionWorker {
     strategy_to_client: Option<rustc_hash::FxHashMap<String, usize>>,
     /// 帳戶到客戶端索引的映射（恢復訂單與控制面路由）
     account_to_client: FxHashMap<AccountId, usize>,
+    /// Runtime-owned, externally read-back admission facts. Empty is a deliberate deny-all.
+    account_admissions: FxHashMap<AccountId, AccountExecutionAdmission>,
+    /// Environment independently bound to the selected runtime client.
+    account_environments: FxHashMap<AccountId, AccountExecutionEnvironment>,
     /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
     accepting_intents: bool,
     /// Operator authorization is independent from transient stream recovery. Automatic recovery
@@ -264,12 +271,158 @@ pub struct ExecutionWorker {
 impl ExecutionWorker {
     /// 反查某 client 對應的 VenueId（若唯一對應）
     fn venue_for_client(&self, client_idx: usize) -> Option<VenueId> {
+        let mut matched = None;
         for (venue, idx) in &self.venue_to_client {
             if *idx == client_idx {
-                return Some(*venue);
+                if matched.is_some() {
+                    // Multiple venues sharing one client make account/venue admission ambiguous.
+                    return None;
+                }
+                matched = Some(*venue);
             }
         }
-        None
+        matched.or_else(|| {
+            let mut account_venues = HashSet::new();
+            for (account_id, bound_client_idx) in &self.account_to_client {
+                if *bound_client_idx == client_idx {
+                    if let Some(admission) = self.account_admissions.get(account_id) {
+                        account_venues.insert(admission.venue);
+                    }
+                }
+            }
+            if account_venues.len() == 1 {
+                account_venues.into_iter().next()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Refuse execution unless the runtime client binding and fresh external account proof agree.
+    /// Tokenized securities remain outside this generic gate until #700 supplies its own
+    /// product/compliance attestation policy.
+    fn validate_account_admission(
+        &self,
+        account_id: &AccountId,
+        intent: &OrderIntent,
+        client_idx: usize,
+        now: u64,
+    ) -> Result<(), &'static str> {
+        let admission = self
+            .account_admissions
+            .get(account_id)
+            .ok_or("account has no current external admission")?;
+        let selected_venue = self
+            .venue_for_client(client_idx)
+            .ok_or("selected execution client has no venue binding")?;
+        let bound_environment = self
+            .account_environments
+            .get(account_id)
+            .ok_or("account environment is not bound to an execution client")?;
+
+        if &admission.account_id != account_id {
+            return Err("account admission identity does not match intent account");
+        }
+        if intent
+            .target_venue
+            .is_some_and(|venue| venue != selected_venue)
+        {
+            return Err("intent venue does not match selected execution client");
+        }
+        if admission.venue != selected_venue {
+            return Err("account admission venue does not match selected execution client");
+        }
+        if admission.environment != *bound_environment {
+            return Err("account admission environment does not match execution client");
+        }
+        if admission.product_type != intent.product_type {
+            return Err("account admission product scope does not match intent");
+        }
+        if intent.product_type != hft_core::ProductType::Spot {
+            return Err("product requires a venue-specific account admission policy");
+        }
+        if !admission.ready {
+            return Err("account admission is not ready");
+        }
+        if admission.kill_switch_active {
+            return Err("account kill switch is active");
+        }
+        if admission.credential_reference.trim().is_empty() {
+            return Err("account admission has no credential reference");
+        }
+        if admission.readback.state != AccountReadbackState::Enabled {
+            return Err("external account readback is not enabled");
+        }
+        if admission
+            .readback
+            .regional_compliance_attestation_id
+            .trim()
+            .is_empty()
+            || admission.readback.receipt_id.trim().is_empty()
+            || admission.readback.evidence_digest.trim().is_empty()
+        {
+            return Err("account admission has incomplete external evidence");
+        }
+        if admission.readback.validated_at == 0
+            || admission.readback.validated_at > now
+            || admission.readback.valid_until < admission.readback.validated_at
+            || now > admission.readback.valid_until
+        {
+            return Err("account external readback is stale or invalid");
+        }
+        if !admission.readback.capability.can_trade_crypto_spot {
+            return Err("account capability does not permit crypto spot execution");
+        }
+        if admission.readback.balances.is_empty() {
+            return Err("account admission has no externally read-back assets");
+        }
+        if admission.readback.balances.iter().any(|balance| {
+            balance.asset.trim().is_empty()
+                || balance.available < rust_decimal::Decimal::ZERO
+                || balance.frozen < rust_decimal::Decimal::ZERO
+                || balance.total < rust_decimal::Decimal::ZERO
+                || balance.available + balance.frozen != balance.total
+                || balance
+                    .usd_value
+                    .is_some_and(|usd_value| usd_value < rust_decimal::Decimal::ZERO)
+                || (balance.usd_value.is_none()
+                    && (balance.available != rust_decimal::Decimal::ZERO
+                        || balance.frozen != rust_decimal::Decimal::ZERO
+                        || balance.total != rust_decimal::Decimal::ZERO))
+        }) {
+            return Err("account admission has malformed externally read-back assets");
+        }
+        if admission.max_order_notional <= rust_decimal::Decimal::ZERO {
+            return Err("account order-notional limit is not positive");
+        }
+        if admission.max_open_orders == 0 {
+            return Err("account open-order limit is not positive");
+        }
+        let price = intent
+            .price
+            .ok_or("account notional limit requires a priced intent")?;
+        let notional = price
+            .0
+            .checked_mul(intent.quantity.0)
+            .ok_or("account order notional overflowed")?;
+        if notional > admission.max_order_notional {
+            return Err("account order-notional limit exceeded");
+        }
+        let reconciled_order_ids = self
+            .reconciled_open_order_ids
+            .get(account_id)
+            .ok_or("account open-order reconciliation is incomplete")?;
+        let tracked_order_ids = self
+            .tracked_orders
+            .iter()
+            .filter(|(_, order)| order.account_id.as_ref() == Some(account_id))
+            .map(|(order_id, _)| order_id)
+            .filter(|order_id| !reconciled_order_ids.contains(*order_id));
+        let open_orders = reconciled_order_ids.len() + tracked_order_ids.count();
+        if open_orders >= admission.max_open_orders {
+            return Err("account open-order limit reached");
+        }
+        Ok(())
     }
 
     /// 檢查等待 Ack 的訂單是否超時，嘗試取消（同步改為 async 直接等待撤單）
@@ -332,6 +485,7 @@ impl ExecutionWorker {
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
+            reconciled_open_order_ids: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -342,6 +496,8 @@ impl ExecutionWorker {
             last_reconcile: Instant::now(),
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
+            account_admissions: FxHashMap::default(),
+            account_environments: FxHashMap::default(),
             accepting_intents: true,
             operator_intake_enabled: true,
             emergency_latched: false,
@@ -377,6 +533,7 @@ impl ExecutionWorker {
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
+            reconciled_open_order_ids: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -387,6 +544,8 @@ impl ExecutionWorker {
             last_reconcile: Instant::now(),
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
+            account_admissions: FxHashMap::default(),
+            account_environments: FxHashMap::default(),
             accepting_intents: true,
             operator_intake_enabled: true,
             emergency_latched: false,
@@ -583,6 +742,17 @@ impl ExecutionWorker {
         Ok(())
     }
 
+    async fn reject_intent(&mut self, client_order_id: &str, reason: impl Into<String>) {
+        self.queues
+            .send_event_reliable(ExecutionEvent::OrderReject {
+                order_id: OrderId(client_order_id.to_string()),
+                reason: reason.into(),
+                timestamp: now_micros(),
+            })
+            .await;
+        self.stats.orders_failed += 1;
+    }
+
     /// Process lifecycle-qualified intents. A placement is submitted once; ambiguous failures latch
     /// intake until reconciliation/restart instead of risking a duplicate live order.
     async fn process_order_intents(&mut self, intents: &mut Vec<OrderIntentEnvelope>) {
@@ -590,47 +760,207 @@ impl ExecutionWorker {
 
         if self.execution_clients.is_empty() {
             for envelope in intents.drain(..) {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id),
-                    reason: "没有可用的执行客户端".to_string(),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(&envelope.client_order_id, "没有可用的执行客户端")
+                    .await;
             }
             return;
         }
 
-        for envelope in intents.drain(..) {
+        for mut envelope in intents.drain(..) {
             self.drain_private_events_before_submission().await;
             if let Err(reason) = envelope.validate_pre_execution(now_micros(), None) {
-                let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(envelope.client_order_id.clone()),
-                    reason: format!("execution lifecycle gate rejected intent: {reason:?}"),
-                    timestamp: now_micros(),
-                };
-                self.queues.send_event_reliable(reject_event).await;
-                self.stats.orders_failed += 1;
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    format!("execution lifecycle gate rejected intent: {reason:?}"),
+                )
+                .await;
                 continue;
             }
-            let intent = &envelope.intent;
             if !self.accepting_intents {
                 self.reject_for_disabled_intake(&envelope).await;
                 continue;
             }
-            let client_idx = match self.select_execution_client(intent) {
-                Ok(idx) => idx,
-                Err(reason) => {
-                    warn!("客戶端選擇失敗: {}", reason);
-                    let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(envelope.client_order_id.clone()),
-                        reason: format!("路由失敗: {}", reason),
-                        timestamp: now_micros(),
-                    };
-                    self.queues.send_event_reliable(reject_event).await;
-                    self.stats.orders_failed += 1;
+            if envelope.intent.product_type != hft_core::ProductType::Spot {
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    "product requires a venue-specific account admission policy",
+                )
+                .await;
+                continue;
+            }
+            let simulated_client_idx = if envelope.account_id.is_none()
+                && self
+                    .execution_clients
+                    .iter()
+                    .all(|client| client.is_simulated_execution())
+            {
+                match self.select_execution_client(&envelope.intent) {
+                    Ok(client_idx) => match self.venue_for_client(client_idx) {
+                        Some(venue) => {
+                            if envelope
+                                .intent
+                                .target_venue
+                                .is_some_and(|target| target != venue)
+                            {
+                                self.reject_intent(
+                                    &envelope.client_order_id,
+                                    "simulated execution target venue does not match selected client",
+                                )
+                                .await;
+                                continue;
+                            }
+                            envelope.account_id =
+                                Some(AccountId(format!("simulated-venue:{}", venue.0)));
+                            Some(client_idx)
+                        }
+                        None => {
+                            self.reject_intent(
+                                &envelope.client_order_id,
+                                "simulated execution client lacks a unique venue identity",
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                    Err(reason) => {
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            format!("路由失敗: {reason}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let intent = &envelope.intent;
+            // Simulation bypasses external admission only; it still carries the canonical account
+            // identity through the executable envelope and resulting lifecycle records.
+            let account_id = match envelope.account_id.clone() {
+                Some(account_id) => account_id,
+                None => {
+                    self.reject_intent(
+                        &envelope.client_order_id,
+                        "missing canonical account identity",
+                    )
+                    .await;
                     continue;
                 }
+            };
+            if account_id.0.trim().is_empty() {
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    "canonical account identity is empty",
+                )
+                .await;
+                continue;
+            }
+            let bound_client_idx = self.account_to_client.get(&account_id).copied();
+            let mut admission_validated = false;
+            let client_idx = match bound_client_idx {
+                Some(bound_client_idx)
+                    if self
+                        .execution_clients
+                        .get(bound_client_idx)
+                        .is_some_and(|client| !client.is_simulated_execution()) =>
+                {
+                    if let Err(reason) = self.validate_account_admission(
+                        &account_id,
+                        intent,
+                        bound_client_idx,
+                        now_micros(),
+                    ) {
+                        warn!(
+                            account_id = %account_id.0,
+                            client_idx = bound_client_idx,
+                            reason,
+                            "account admission rejected execution intent"
+                        );
+                        self.reject_intent(&envelope.client_order_id, reason).await;
+                        continue;
+                    }
+                    admission_validated = true;
+                    bound_client_idx
+                }
+                None if self
+                    .execution_clients
+                    .iter()
+                    .any(|client| !client.is_simulated_execution()) =>
+                {
+                    self.reject_intent(
+                        &envelope.client_order_id,
+                        "account identity is not bound to an execution client",
+                    )
+                    .await;
+                    continue;
+                }
+                _ => match simulated_client_idx
+                    .map(Ok)
+                    .unwrap_or_else(|| self.select_execution_client(intent))
+                {
+                    Ok(idx) => idx,
+                    Err(reason) => {
+                        warn!("客戶端選擇失敗: {}", reason);
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            format!("路由失敗: {}", reason),
+                        )
+                        .await;
+                        continue;
+                    }
+                },
+            };
+            let account_id = if self.execution_clients[client_idx].is_simulated_execution() {
+                Some(account_id)
+            } else {
+                match self.account_to_client.get(&account_id) {
+                    Some(expected_client_idx) if *expected_client_idx == client_idx => {}
+                    Some(expected_client_idx) => {
+                        warn!(
+                            account_id = %account_id.0,
+                            selected_client_idx = client_idx,
+                            expected_client_idx = *expected_client_idx,
+                            "account identity does not match selected execution client"
+                        );
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            "account identity does not match selected execution client",
+                        )
+                        .await;
+                        continue;
+                    }
+                    None => {
+                        warn!(
+                            account_id = %account_id.0,
+                            "account identity is not bound to an execution client"
+                        );
+                        self.reject_intent(
+                            &envelope.client_order_id,
+                            "account identity is not bound to an execution client",
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                if !admission_validated {
+                    if let Err(reason) = self.validate_account_admission(
+                        &account_id,
+                        intent,
+                        client_idx,
+                        now_micros(),
+                    ) {
+                        warn!(
+                            account_id = %account_id.0,
+                            client_idx,
+                            reason,
+                            "account admission rejected execution intent"
+                        );
+                        self.reject_intent(&envelope.client_order_id, reason).await;
+                        continue;
+                    }
+                }
+                Some(account_id)
             };
             let trace_id = OrderId(envelope.client_order_id.clone());
             self.execution_timelines.insert(
@@ -681,19 +1011,13 @@ impl ExecutionWorker {
                     let venue_for_client = intent
                         .target_venue
                         .or_else(|| self.venue_for_client(client_idx));
-                    let account_id =
-                        self.account_to_client
-                            .iter()
-                            .find_map(|(account_id, index)| {
-                                (*index == client_idx).then_some(account_id.clone())
-                            });
                     self.tracked_orders.insert(
                         order_id.clone(),
                         TrackedOrder {
                             symbol: intent.symbol.clone(),
                             strategy_id: intent.strategy_id.clone(),
                             venue: venue_for_client,
-                            account_id,
+                            account_id: account_id.clone(),
                             side: intent.side,
                             limit_price: intent.price,
                             remaining_quantity: intent.quantity,
@@ -718,6 +1042,7 @@ impl ExecutionWorker {
                     let new_event = ExecutionEvent::OrderNew {
                         order_id: order_id.clone(),
                         client_order_id: Some(client_order_id),
+                        account_id,
                         symbol,
                         side,
                         quantity,
@@ -758,12 +1083,6 @@ impl ExecutionWorker {
                         let venue = intent
                             .target_venue
                             .or_else(|| self.venue_for_client(client_idx));
-                        let account_id =
-                            self.account_to_client
-                                .iter()
-                                .find_map(|(account_id, index)| {
-                                    (*index == client_idx).then_some(account_id.clone())
-                                });
                         if self.latch_duplicate_order_id(&order_id, client_idx) {
                             continue;
                         }
@@ -774,7 +1093,7 @@ impl ExecutionWorker {
                                 symbol: intent.symbol.clone(),
                                 strategy_id: intent.strategy_id.clone(),
                                 venue,
-                                account_id,
+                                account_id: account_id.clone(),
                                 side: intent.side,
                                 limit_price: intent.price,
                                 remaining_quantity: intent.quantity,
@@ -793,6 +1112,7 @@ impl ExecutionWorker {
                             .send_event_reliable(ExecutionEvent::OrderNew {
                                 order_id,
                                 client_order_id: Some(envelope.client_order_id.clone()),
+                                account_id,
                                 symbol: intent.symbol.clone(),
                                 side: intent.side,
                                 quantity: intent.quantity,
@@ -1358,6 +1678,9 @@ impl ExecutionWorker {
                     self.order_to_client.remove(order_id);
                     self.tracked_orders.remove(order_id);
                     self.execution_timelines.remove(order_id);
+                    for reconciled in self.reconciled_open_order_ids.values_mut() {
+                        reconciled.remove(order_id);
+                    }
                 }
             }
             ExecutionEvent::OrderCanceled { order_id, .. }
@@ -1367,6 +1690,9 @@ impl ExecutionWorker {
                 self.order_to_client.remove(order_id);
                 self.tracked_orders.remove(order_id);
                 self.execution_timelines.remove(order_id);
+                for reconciled in self.reconciled_open_order_ids.values_mut() {
+                    reconciled.remove(order_id);
+                }
             }
             _ => {}
         }
@@ -1528,6 +1854,7 @@ impl ExecutionWorker {
                         include_recent_fills,
                     )
                     .await;
+                self.update_reconciled_open_orders(&snapshot);
                 let _ = reply.send(snapshot);
             }
             ControlCommand::SetIntake { enabled, reply } => {
@@ -1979,6 +2306,7 @@ pub enum ControlCommand {
 }
 
 /// 创建并启动执行 Worker 任务
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_execution_worker_with_control(
     config: ExecutionWorkerConfig,
     queues: WorkerQueues,
@@ -1986,6 +2314,8 @@ pub fn spawn_execution_worker_with_control(
     venue_to_client: HashMap<VenueId, usize>,
     strategy_to_client: Option<std::collections::HashMap<String, usize>>,
     account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
+    account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
+    account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -1999,6 +2329,12 @@ pub fn spawn_execution_worker_with_control(
     if let Some(map) = account_to_client {
         worker.account_to_client = map.into_iter().collect();
     }
+    if let Some(map) = account_admissions {
+        worker.account_admissions = map.into_iter().collect();
+    }
+    if let Some(map) = account_environments {
+        worker.account_environments = map.into_iter().collect();
+    }
     let handle = tokio::spawn(async move {
         info!("执行 Worker {} 任务启动", config.name);
         worker.run().await
@@ -2007,6 +2343,7 @@ pub fn spawn_execution_worker_with_control(
 }
 
 /// 🔥 Phase 1.5: 创建并启动带路由器的执行 Worker 任务
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_execution_worker_with_control_and_router(
     config: ExecutionWorkerConfig,
     queues: WorkerQueues,
@@ -2015,6 +2352,8 @@ pub fn spawn_execution_worker_with_control_and_router(
     venue_to_client: HashMap<VenueId, usize>,
     strategy_to_client: Option<std::collections::HashMap<String, usize>>,
     account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
+    account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
+    account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -2033,6 +2372,12 @@ pub fn spawn_execution_worker_with_control_and_router(
     }
     if let Some(map) = account_to_client {
         worker.account_to_client = map.into_iter().collect();
+    }
+    if let Some(map) = account_admissions {
+        worker.account_admissions = map.into_iter().collect();
+    }
+    if let Some(map) = account_environments {
+        worker.account_environments = map.into_iter().collect();
     }
     let handle = tokio::spawn(async move {
         info!("执行 Worker {} 任务启动 (带路由器)", config.name);
@@ -2054,6 +2399,8 @@ pub fn spawn_execution_worker(
         HashMap::new(),
         None,
         None,
+        None,
+        None,
     );
     h
 }
@@ -2064,6 +2411,7 @@ impl ExecutionWorker {
     async fn reconcile_open_orders(&mut self) -> bool {
         let snapshot = self.collect_reconcile_snapshot(false, false, false).await;
         let complete = snapshot.is_complete();
+        self.update_reconciled_open_orders(&snapshot);
         if !complete {
             warn!("對帳快照不完整；系統不得將未知狀態視為無未結訂單");
         }
@@ -2095,6 +2443,25 @@ impl ExecutionWorker {
             }
         }
         complete
+    }
+
+    fn update_reconciled_open_orders(&mut self, snapshot: &WorkerReconcileSnapshot) {
+        if !snapshot.is_complete() {
+            self.reconciled_open_order_ids.clear();
+            return;
+        }
+        let mut reconciled = FxHashMap::default();
+        for client in &snapshot.clients {
+            let (Some(account_id), Ok(open_orders)) = (&client.account_id, &client.open_orders)
+            else {
+                continue;
+            };
+            reconciled
+                .entry(account_id.clone())
+                .or_insert_with(HashSet::new)
+                .extend(open_orders.iter().map(|order| order.order_id.clone()));
+        }
+        self.reconciled_open_order_ids = reconciled;
     }
 
     async fn execution_clients_currently_healthy(&mut self) -> bool {
@@ -2143,7 +2510,15 @@ impl ExecutionWorker {
         include_recent_fills: bool,
     ) -> WorkerReconcileSnapshot {
         let mut clients = Vec::with_capacity(self.execution_clients.len());
-        for (idx, client) in self.execution_clients.iter_mut().enumerate() {
+        for idx in 0..self.execution_clients.len() {
+            let venue = self.venue_for_client(idx);
+            let account_id = self
+                .account_to_client
+                .iter()
+                .find_map(|(account_id, client_idx)| {
+                    (*client_idx == idx).then_some(account_id.clone())
+                });
+            let client = &mut self.execution_clients[idx];
             let open_orders = client.list_open_orders().await;
             #[cfg(feature = "metrics")]
             {
@@ -2195,16 +2570,8 @@ impl ExecutionWorker {
             };
             clients.push(ClientReconcileSnapshot {
                 client_index: idx,
-                venue: self
-                    .venue_to_client
-                    .iter()
-                    .find_map(|(venue, client_idx)| (*client_idx == idx).then_some(*venue)),
-                account_id: self
-                    .account_to_client
-                    .iter()
-                    .find_map(|(account_id, client_idx)| {
-                        (*client_idx == idx).then_some(account_id.clone())
-                    }),
+                venue,
+                account_id,
                 open_orders,
                 balances,
                 positions,
@@ -2221,9 +2588,11 @@ impl ExecutionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+    use hft_core::{
+        AccountCapability, OrderType, Price, ProductType, Quantity, Side, Symbol, TimeInForce,
+    };
     use ports::BoxStream;
-    use ports::{ConnectionHealth, HftResult, OrderIntent};
+    use ports::{AccountExternalReadback, ConnectionHealth, HftResult, OrderIntent};
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
 
@@ -2345,6 +2714,7 @@ mod tests {
     #[derive(Default)]
     struct MockExecutionState {
         placed: Vec<Symbol>,
+        placed_accounts: Vec<Option<AccountId>>,
         canceled: Vec<OrderId>,
         open_orders: Vec<OpenOrder>,
         balances: Vec<AccountBalance>,
@@ -2354,6 +2724,7 @@ mod tests {
         finite_stream: bool,
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
         modify_error: bool,
+        simulated: bool,
     }
 
     struct MockExecutionClient {
@@ -2386,6 +2757,18 @@ mod tests {
             }
         }
 
+        async fn place_order_envelope(
+            &mut self,
+            envelope: &OrderIntentEnvelope,
+        ) -> HftResult<OrderId> {
+            self.state
+                .lock()
+                .unwrap()
+                .placed_accounts
+                .push(envelope.account_id.clone());
+            self.place_order(envelope.intent.clone()).await
+        }
+
         async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
             self.state.lock().unwrap().canceled.push(order_id.clone());
             if self.cancel_error {
@@ -2416,6 +2799,10 @@ mod tests {
 
         fn execution_stream_may_complete(&self) -> bool {
             self.state.lock().unwrap().finite_stream
+        }
+
+        fn is_simulated_execution(&self) -> bool {
+            self.state.lock().unwrap().simulated
         }
 
         async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
@@ -2540,7 +2927,10 @@ mod tests {
 
         for _ in 0..40 {
             engine_queues
-                .send_intent(create_test_intent("BTCUSDT"))
+                .send_intent(
+                    AccountId("recovery-test".to_string()),
+                    create_test_intent("BTCUSDT"),
+                )
                 .expect("queue stale recovery intent");
         }
         engine_queues.acknowledge_applied_execution_stream(2);
@@ -2699,6 +3089,65 @@ mod tests {
         }
     }
 
+    fn ready_spot_admission(account_id: AccountId, venue: VenueId) -> AccountExecutionAdmission {
+        AccountExecutionAdmission {
+            account_id,
+            venue,
+            product_type: ProductType::Spot,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref:test-account".to_string(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances: vec![AccountBalance {
+                    asset: "USDT".to_string(),
+                    available: rust_decimal::Decimal::from(1_000),
+                    frozen: rust_decimal::Decimal::ZERO,
+                    total: rust_decimal::Decimal::from(1_000),
+                    usd_value: Some(rust_decimal::Decimal::from(1_000)),
+                }],
+                capability: AccountCapability {
+                    can_trade_crypto_spot: true,
+                    can_trade_tokenized_securities: false,
+                    can_trade_brokerage_equities: false,
+                    jurisdiction: Some("test".to_string()),
+                    kyc_level: Some("test".to_string()),
+                },
+                regional_compliance_attestation_id: "compliance-test-receipt".to_string(),
+                receipt_id: "account-test-receipt".to_string(),
+                evidence_digest: "sha256:test".to_string(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: rust_decimal::Decimal::from(1_000_000),
+            max_open_orders: 10,
+            kill_switch_active: false,
+            ready: true,
+        }
+    }
+
+    fn bind_ready_spot_admission(
+        worker: &mut ExecutionWorker,
+        account_id: AccountId,
+        client_idx: usize,
+        venue: VenueId,
+    ) {
+        worker.venue_to_client.insert(venue, client_idx);
+        worker
+            .account_to_client
+            .insert(account_id.clone(), client_idx);
+        worker
+            .account_environments
+            .insert(account_id.clone(), AccountExecutionEnvironment::Testnet);
+        worker.account_admissions.insert(
+            account_id.clone(),
+            ready_spot_admission(account_id.clone(), venue),
+        );
+        worker
+            .reconciled_open_order_ids
+            .entry(account_id)
+            .or_default();
+    }
+
     #[test]
     fn test_consistent_hash_selection() {
         let client_count = 3;
@@ -2808,7 +3257,10 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         engine_queues
-            .send_intent(create_test_intent("ETHUSDT"))
+            .send_intent(
+                AccountId("emergency-test".to_string()),
+                create_test_intent("ETHUSDT"),
+            )
             .expect("queue intent");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -2951,7 +3403,10 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         engine_queues
-            .send_intent(create_test_intent("BTCUSDT"))
+            .send_intent(
+                AccountId("replacement-test".to_string()),
+                create_test_intent("BTCUSDT"),
+            )
             .expect("queue intent before ambiguous replacement");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -3264,11 +3719,12 @@ mod tests {
         };
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let account_id = AccountId("disconnect-test".to_string());
         engine_queues
-            .send_intent(create_test_intent("FIRST"))
+            .send_intent(account_id.clone(), create_test_intent("FIRST"))
             .expect("queue first intent");
         engine_queues
-            .send_intent(create_test_intent("SECOND"))
+            .send_intent(account_id.clone(), create_test_intent("SECOND"))
             .expect("queue second intent");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -3277,6 +3733,7 @@ mod tests {
             vec![Box::new(client)],
             control_rx,
         );
+        bind_ready_spot_admission(&mut worker, account_id, 0, VenueId::BYBIT);
         worker
             .execution_streams
             .push(Box::pin(futures::stream::unfold(
@@ -3352,7 +3809,10 @@ mod tests {
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         engine_queues
-            .send_intent(create_test_intent("BTCUSDT"))
+            .send_intent(
+                AccountId("intake-test".to_string()),
+                create_test_intent("BTCUSDT"),
+            )
             .expect("queue intent before reconciliation barrier");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -3528,8 +3988,9 @@ mod tests {
         };
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let account_id = AccountId("ambiguous-test".to_string());
         engine_queues
-            .send_intent(create_test_intent("BTCUSDT"))
+            .send_intent(account_id.clone(), create_test_intent("BTCUSDT"))
             .expect("queue intent");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -3538,6 +3999,7 @@ mod tests {
             vec![Box::new(client)],
             control_rx,
         );
+        bind_ready_spot_admission(&mut worker, account_id, 0, VenueId::BYBIT);
         let mut queued = worker.queues.receive_envelopes();
         let client_order_id = queued[0].client_order_id.clone();
 
@@ -3558,6 +4020,493 @@ mod tests {
                 ..
             }] if order_id == &provisional_id && event_client_id == &client_order_id
         ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_account_is_rejected_before_submission() {
+        let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        engine_queues
+            .send_envelope(ports::OrderIntentEnvelope::new(
+                create_test_intent("MISSING"),
+                ports::OrderIntentLifecycle::default(),
+            ))
+            .expect("queue missing-account intent");
+        let mismatched_account = AccountId("mismatched-account".to_string());
+        engine_queues
+            .send_envelope(
+                ports::OrderIntentEnvelope::new(
+                    create_test_intent("MISMATCHED"),
+                    ports::OrderIntentLifecycle::default(),
+                )
+                .with_account_id(mismatched_account.clone()),
+            )
+            .expect("queue mismatched-account intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.account_to_client = [(mismatched_account, 1usize)].into_iter().collect();
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        assert!(state.lock().unwrap().placed.is_empty());
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ExecutionEvent::OrderReject { reason: missing, .. },
+                ExecutionEvent::OrderReject { reason: mismatched, .. },
+            ] if missing == "missing canonical account identity"
+                && mismatched == "account identity does not match selected execution client"
+        ));
+    }
+
+    #[tokio::test]
+    async fn simulated_execution_assigns_a_canonical_local_account_before_submission() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let mut intent = create_test_intent("SIMULATED");
+        intent.target_venue = Some(VenueId::MOCK);
+        engine_queues
+            .send_envelope(OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::default(),
+            ))
+            .expect("queue simulated intent");
+        let mut mismatched_intent = create_test_intent("MISMATCHED_SIMULATED");
+        mismatched_intent.target_venue = Some(VenueId::BYBIT);
+        engine_queues
+            .send_envelope(OrderIntentEnvelope::new(
+                mismatched_intent,
+                ports::OrderIntentLifecycle::default(),
+            ))
+            .expect("queue venue-mismatched simulated intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        let expected = AccountId("simulated-venue:99".to_string());
+        assert_eq!(
+            state.lock().unwrap().placed_accounts,
+            vec![Some(expected.clone())]
+        );
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ExecutionEvent::OrderNew {
+                    account_id: Some(account_id),
+                    venue: Some(VenueId::MOCK),
+                    ..
+                },
+                ExecutionEvent::OrderReject { reason, .. },
+            ] if account_id == &expected
+                && reason == "simulated execution target venue does not match selected client"
+        ));
+    }
+
+    #[tokio::test]
+    async fn account_admission_requires_current_evidence_kill_clearance_and_limits() {
+        let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let missing = AccountId("missing-admission".to_string());
+        let stale = AccountId("stale-admission".to_string());
+        let disabled = AccountId("disabled-admission".to_string());
+        let killed = AccountId("killed-admission".to_string());
+        let limited = AccountId("limited-admission".to_string());
+        let incomplete = AccountId("incomplete-admission".to_string());
+        let malformed_asset = AccountId("malformed-asset-admission".to_string());
+        let inconsistent_asset = AccountId("inconsistent-asset-admission".to_string());
+        let venue_mismatch = AccountId("venue-mismatch-admission".to_string());
+        let environment_mismatch = AccountId("environment-mismatch-admission".to_string());
+        let product_mismatch = AccountId("product-mismatch-admission".to_string());
+        let intent_venue_mismatch = AccountId("intent-venue-mismatch-admission".to_string());
+        let blank_credential = AccountId("blank-credential-admission".to_string());
+        let incomplete_evidence = AccountId("incomplete-evidence-admission".to_string());
+        let no_spot_capability = AccountId("no-spot-capability-admission".to_string());
+        let zero_open_orders = AccountId("zero-open-orders-admission".to_string());
+        let unpriced = AccountId("unpriced-admission".to_string());
+        let ready = AccountId("ready-admission".to_string());
+        for (account_id, symbol) in [
+            (&missing, "MISSING"),
+            (&stale, "STALE"),
+            (&disabled, "DISABLED"),
+            (&killed, "KILLED"),
+            (&limited, "LIMITED"),
+            (&incomplete, "INCOMPLETE"),
+            (&malformed_asset, "MALFORMED_ASSET"),
+            (&inconsistent_asset, "INCONSISTENT_ASSET"),
+            (&venue_mismatch, "VENUE_MISMATCH"),
+            (&environment_mismatch, "ENVIRONMENT_MISMATCH"),
+            (&product_mismatch, "PRODUCT_MISMATCH"),
+            (&intent_venue_mismatch, "INTENT_VENUE_MISMATCH"),
+            (&blank_credential, "BLANK_CREDENTIAL"),
+            (&incomplete_evidence, "INCOMPLETE_EVIDENCE"),
+            (&no_spot_capability, "NO_SPOT_CAPABILITY"),
+            (&zero_open_orders, "ZERO_OPEN_ORDERS"),
+            (&unpriced, "UNPRICED"),
+            (&ready, "READY"),
+        ] {
+            let mut intent = create_test_intent(symbol);
+            if symbol == "INTENT_VENUE_MISMATCH" {
+                intent.target_venue = Some(VenueId::BINANCE);
+            } else if symbol == "UNPRICED" {
+                intent.price = None;
+            }
+            engine_queues
+                .send_intent(account_id.clone(), intent)
+                .expect("queue account-gated intent");
+        }
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::BYBIT, 0);
+        worker.account_to_client.insert(missing, 0);
+
+        bind_ready_spot_admission(&mut worker, stale.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&stale)
+            .expect("stale admission")
+            .readback
+            .valid_until = now_micros().saturating_sub(1);
+
+        bind_ready_spot_admission(&mut worker, disabled.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&disabled)
+            .expect("disabled admission")
+            .readback
+            .state = AccountReadbackState::Restricted;
+
+        bind_ready_spot_admission(&mut worker, killed.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&killed)
+            .expect("killed admission")
+            .kill_switch_active = true;
+
+        bind_ready_spot_admission(&mut worker, limited.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&limited)
+            .expect("limited admission")
+            .max_order_notional = rust_decimal::Decimal::from(99);
+
+        bind_ready_spot_admission(&mut worker, incomplete.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&incomplete)
+            .expect("incomplete admission")
+            .readback
+            .balances
+            .clear();
+
+        bind_ready_spot_admission(&mut worker, malformed_asset.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&malformed_asset)
+            .expect("malformed-asset admission")
+            .readback
+            .balances[0]
+            .usd_value = Some(-rust_decimal::Decimal::ONE);
+
+        bind_ready_spot_admission(&mut worker, inconsistent_asset.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&inconsistent_asset)
+            .expect("inconsistent-asset admission")
+            .readback
+            .balances[0]
+            .total = rust_decimal::Decimal::ONE;
+
+        bind_ready_spot_admission(&mut worker, venue_mismatch.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&venue_mismatch)
+            .expect("venue-mismatch admission")
+            .venue = VenueId::BINANCE;
+
+        bind_ready_spot_admission(&mut worker, environment_mismatch.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&environment_mismatch)
+            .expect("environment-mismatch admission")
+            .environment = AccountExecutionEnvironment::Live;
+
+        bind_ready_spot_admission(&mut worker, product_mismatch.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&product_mismatch)
+            .expect("product-mismatch admission")
+            .product_type = ProductType::TokenizedSecuritySpot;
+
+        bind_ready_spot_admission(
+            &mut worker,
+            intent_venue_mismatch.clone(),
+            0,
+            VenueId::BYBIT,
+        );
+
+        bind_ready_spot_admission(&mut worker, blank_credential.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&blank_credential)
+            .expect("blank-credential admission")
+            .credential_reference = "   ".to_string();
+
+        bind_ready_spot_admission(&mut worker, incomplete_evidence.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&incomplete_evidence)
+            .expect("incomplete-evidence admission")
+            .readback
+            .evidence_digest = String::new();
+
+        bind_ready_spot_admission(&mut worker, no_spot_capability.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&no_spot_capability)
+            .expect("no-spot-capability admission")
+            .readback
+            .capability
+            .can_trade_crypto_spot = false;
+
+        bind_ready_spot_admission(&mut worker, zero_open_orders.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&zero_open_orders)
+            .expect("zero-open-orders admission")
+            .max_open_orders = 0;
+
+        bind_ready_spot_admission(&mut worker, unpriced.clone(), 0, VenueId::BYBIT);
+
+        bind_ready_spot_admission(&mut worker, ready, 0, VenueId::BYBIT);
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        assert_eq!(state.lock().unwrap().placed, vec![Symbol::new("READY")]);
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        let rejects = events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::OrderReject { reason, .. } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rejects,
+            vec![
+                "account has no current external admission",
+                "account external readback is stale or invalid",
+                "external account readback is not enabled",
+                "account kill switch is active",
+                "account order-notional limit exceeded",
+                "account admission has no externally read-back assets",
+                "account admission has malformed externally read-back assets",
+                "account admission has malformed externally read-back assets",
+                "account admission venue does not match selected execution client",
+                "account admission environment does not match execution client",
+                "account admission product scope does not match intent",
+                "intent venue does not match selected execution client",
+                "account admission has no credential reference",
+                "account admission has incomplete external evidence",
+                "account capability does not permit crypto spot execution",
+                "account open-order limit is not positive",
+                "account notional limit requires a priced intent",
+            ]
+        );
+    }
+
+    #[test]
+    fn account_admission_counts_reconciled_open_orders() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let account_id = AccountId("restored-account".to_string());
+        bind_ready_spot_admission(&mut worker, account_id.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&account_id)
+            .expect("account admission")
+            .max_open_orders = 1;
+        worker.update_reconciled_open_orders(&WorkerReconcileSnapshot {
+            clients: vec![ClientReconcileSnapshot {
+                client_index: 0,
+                venue: Some(VenueId::BYBIT),
+                account_id: Some(account_id.clone()),
+                open_orders: Ok(vec![OpenOrder {
+                    order_id: OrderId("restored-order".to_string()),
+                    client_order_id: Some("restored-client".to_string()),
+                    symbol: Symbol::new("BTCUSDT"),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    original_quantity: Quantity::from_f64(1.0).unwrap(),
+                    remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                    filled_quantity: Quantity::zero(),
+                    price: Some(Price::from_f64(100.0).unwrap()),
+                    status: ports::OrderStatus::Acknowledged,
+                    created_at: 1,
+                    updated_at: 1,
+                }]),
+                balances: None,
+                positions: None,
+                recent_fills: None,
+                ..Default::default()
+            }],
+        });
+
+        assert_eq!(
+            worker
+                .validate_account_admission(
+                    &account_id,
+                    &create_test_intent("BTCUSDT"),
+                    0,
+                    now_micros(),
+                )
+                .unwrap_err(),
+            "account open-order limit reached"
+        );
+    }
+
+    #[test]
+    fn same_venue_account_binding_keeps_each_client_venue_identity() {
+        let clients = vec![
+            Box::new(MockExecutionClient {
+                state: Arc::new(StdMutex::new(MockExecutionState::default())),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+            Box::new(MockExecutionClient {
+                state: Arc::new(StdMutex::new(MockExecutionState::default())),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+        ];
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            clients,
+            control_rx,
+        );
+        let first_account = AccountId("same-venue-first".to_string());
+        let second_account = AccountId("same-venue-second".to_string());
+        bind_ready_spot_admission(&mut worker, first_account.clone(), 0, VenueId::BYBIT);
+        bind_ready_spot_admission(&mut worker, second_account, 1, VenueId::BYBIT);
+
+        assert!(worker
+            .validate_account_admission(
+                &first_account,
+                &create_test_intent("BTCUSDT"),
+                0,
+                now_micros(),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_unvalued_balance_row_does_not_block_admission() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let account_id = AccountId("zero-balance-row".to_string());
+        bind_ready_spot_admission(&mut worker, account_id.clone(), 0, VenueId::BYBIT);
+        worker
+            .account_admissions
+            .get_mut(&account_id)
+            .expect("account admission")
+            .readback
+            .balances
+            .push(AccountBalance {
+                asset: "EMPTY".to_string(),
+                available: rust_decimal::Decimal::ZERO,
+                frozen: rust_decimal::Decimal::ZERO,
+                total: rust_decimal::Decimal::ZERO,
+                usd_value: None,
+            });
+
+        assert!(worker
+            .validate_account_admission(
+                &account_id,
+                &create_test_intent("BTCUSDT"),
+                0,
+                now_micros(),
+            )
+            .is_ok());
     }
 
     #[test]
@@ -3660,10 +4609,10 @@ mod tests {
         second.strategy_id = "bitget".to_string();
         second.target_venue = Some(VenueId::BITGET);
         engine_queues
-            .send_intent(first)
+            .send_intent(AccountId("binance-main".to_string()), first)
             .expect("queue first intent");
         engine_queues
-            .send_intent(second)
+            .send_intent(AccountId("bitget-main".to_string()), second)
             .expect("queue second intent");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -3672,15 +4621,18 @@ mod tests {
             clients,
             control_rx,
         );
-        worker.venue_to_client = [(VenueId::BINANCE, 0usize), (VenueId::BITGET, 1usize)]
-            .into_iter()
-            .collect();
-        worker.account_to_client = [
-            (AccountId("binance-main".to_string()), 0usize),
-            (AccountId("bitget-main".to_string()), 1usize),
-        ]
-        .into_iter()
-        .collect();
+        bind_ready_spot_admission(
+            &mut worker,
+            AccountId("binance-main".to_string()),
+            0,
+            VenueId::BINANCE,
+        );
+        bind_ready_spot_admission(
+            &mut worker,
+            AccountId("bitget-main".to_string()),
+            1,
+            VenueId::BITGET,
+        );
         let mut queued = worker.queues.receive_envelopes();
 
         worker.process_order_intents(&mut queued).await;
@@ -3724,6 +4676,13 @@ mod tests {
                 .count(),
             1
         );
+        assert!(matches!(
+            events.as_slice(),
+            [ExecutionEvent::OrderNew {
+                account_id: Some(account_id),
+                ..
+            }] if account_id == &AccountId("binance-main".to_string())
+        ));
 
         worker
             .execution_streams

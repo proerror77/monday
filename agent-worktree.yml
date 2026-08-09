@@ -1,9 +1,22 @@
 owner: codex
-contract: bybit-spot-account-fills-709
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/bybit-spot-account-fills-709
-branch: codex/bybit-spot-account-fills-709
-base_sha: 46a5ae7d351c91c828e57275c5e08e93cd450c3e
+contract: account-oms-admission-710
+worktree: /Users/proerror/.codex/worktrees/cfad/monday
+branch: codex/account-oms-admission-710-owner
+base_sha: 1e74bf409ba1d0c3186e44dad51829127481ca13
 allowed_files:
-  - rust_hft/execution-gateway/adapters/adapter-bybit/src/lib.rs
-dependency: bybit-spot-asset-inventory-707
+  - rust_hft/apps/live/src/runtime_attribution.rs
+  - rust_hft/execution-gateway/adapters/adapter-backpack/src/lib.rs
+  - rust_hft/market-core/engine/src/execution_control.rs
+  - rust_hft/market-core/engine/src/execution_queues.rs
+  - rust_hft/market-core/engine/src/execution_worker.rs
+  - rust_hft/market-core/engine/src/lib.rs
+  - rust_hft/market-core/engine/tests/backpressure_safety_test.rs
+  - rust_hft/market-core/engine/tests/tokenized_security_execution_e2e.rs
+  - rust_hft/market-core/ports/src/events.rs
+  - rust_hft/market-core/ports/src/traits.rs
+  - rust_hft/market-core/runtime/src/system_builder.rs
+  - rust_hft/market-core/runtime/src/system_builder/runtime_management.rs
+  - rust_hft/market-core/runtime/src/system_builder/simulated_execution.rs
+  - rust_hft/risk-control/oms-core/src/lib.rs
+dependency: bybit-spot-account-fills-709
 no_external_runtime_mutation: true
