@@ -792,7 +792,7 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn trade(milliseconds: u64) -> Value {
+    fn trade(milliseconds: u64, id: u64) -> Value {
         let received_at_ns = event_ns(milliseconds);
         json!({
             "schema": "binance.market_tape.v1",
@@ -803,11 +803,11 @@ mod tests {
                 "e": "aggTrade",
                 "E": received_at_ns / 1_000_000,
                 "s": "BTCUSDT",
-                "a": 10,
+                "a": id,
                 "p": "100.5",
                 "q": "2",
-                "f": 10,
-                "l": 10,
+                "f": id,
+                "l": id,
                 "T": received_at_ns / 1_000_000,
                 "m": false
             }}
@@ -821,9 +821,9 @@ mod tests {
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
             diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
-            trade(700),
+            trade(700, 10),
             diff(1_400, 176, 176, 175, json!([]), json!([["101", "0"]])),
-            trade(1_700),
+            trade(1_700, 11),
             diff(2_400, 177, 177, 176, json!([["101", "3"]]), json!([])),
             diff(3_400, 178, 178, 177, json!([]), json!([["101.5", "4"]])),
             diff(4_400, 179, 179, 178, json!([["101", "0"]]), json!([])),
