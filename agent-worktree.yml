@@ -5,6 +5,8 @@ branch: codex/cex-research-contract-v2
 base_sha: c1a2b934926602014cdf81401bc0f79af3d34e30
 allowed_files:
   - agent-worktree.yml
+  - rust_hft/Cargo.lock
+  - rust_hft/research-core/manifest/Cargo.toml
   - rust_hft/research-core/manifest/src/lib.rs
 dependency: none
 no_external_runtime_mutation: true
