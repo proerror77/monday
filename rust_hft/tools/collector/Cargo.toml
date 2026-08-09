@@ -39,6 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
+integration = { package = "hft-integration", path = "../../market-core/integration" }
 
 # CLI 參數解析
 clap = { version = "4", features = ["derive"] }
@@ -103,6 +104,10 @@ path = "src/bin/bybit-options-archiver.rs"
 [[bin]]
 name = "binance-usdm-reference-upload"
 path = "src/bin/binance-usdm-reference-upload.rs"
+
+[[bin]]
+name = "binance-fee-snapshot"
+path = "src/bin/binance-fee-snapshot.rs"
 
 [[bin]]
 name = "binance-replay-parquet-cache-warmer"

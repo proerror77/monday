@@ -1,15 +1,14 @@
 owner: codex
-contract: binance-usdm-reference-v3-schema
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-upgrade
-branch: codex/binance-usdm-reference-v3-upgrade
-base_sha: 7f9dab1fbd2a6a9543e816514b0f74c23d383a2f
+contract: binance-fee-snapshot-v2
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-snapshot-v2
+branch: codex/binance-fee-snapshot-v2
+base_sha: 7d79deb392e3bc11063e09387aff5733fa9f8a44
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/data-pipelines/core/src/binance_usdm_reference.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_collector.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
-  - rust_hft/tools/collector/src/bin/binance-usdm-reference-collector.rs
-  - rust_hft/tools/collector/src/bin/binance-usdm-reference-artifact-verifier.rs
-dependency: none
+  - rust_hft/Cargo.lock
+  - rust_hft/tools/collector/Cargo.toml
+  - rust_hft/tools/collector/src/lib.rs
+  - rust_hft/tools/collector/src/binance_fee_artifact.rs
+  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+dependency: codex/binance-usdm-reference-v3-upgrade
 no_external_runtime_mutation: true
