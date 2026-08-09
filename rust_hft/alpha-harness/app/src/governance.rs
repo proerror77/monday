@@ -465,7 +465,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let lineage = store.mission_lineage(&args.mission_id)?;
     data_mission::require_promotable_research_dataset(
         &store,
-        &lineage.mission.dataset_manifest_id,
+        lineage.mission.dataset_manifest_id.as_str(),
     )?;
     let candidate = lineage
         .candidates
