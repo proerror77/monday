@@ -80,9 +80,9 @@ pub fn verify_runtime_latency_evidence(
                     index + 1
                 )
             })?;
-        let digest = Sha256::digest(line).to_vec();
-        if let Some(previous) = event_digests.insert(event.event_id.clone(), digest.clone()) {
-            if previous != digest {
+        let canonical = serde_json::to_vec(&signed)?;
+        if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
+            if previous != canonical {
                 bail!("runtime feedback contains conflicting duplicate event IDs");
             }
             continue;
@@ -116,10 +116,16 @@ pub fn verify_runtime_latency_evidence(
         if available_at > available_before {
             continue;
         }
+        let Some(arrival_slippage_bps) = event.metrics.get("arrival_slippage_bps").copied() else {
+            continue;
+        };
+        if !arrival_slippage_bps.is_finite() || arrival_slippage_bps < 0.0 {
+            bail!("runtime feedback arrival slippage is invalid");
+        }
         observations.push((
             available_at,
             metric_u64(&event.metrics, "intent_to_private_report_us")?,
-            metric_nonnegative(&event.metrics, "arrival_slippage_bps")?,
+            arrival_slippage_bps,
         ));
         signed_events.extend_from_slice(line);
         signed_events.push(b'\n');
@@ -299,7 +305,10 @@ mod tests {
     fn duplicate_signed_events_do_not_reweight_costs() {
         let (_directory, log, _log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
         let line = std::fs::read(&log).unwrap();
-        let bytes = [line.as_slice(), line.as_slice()].concat();
+        let signed: SignedRuntimeAttributionEvent = serde_json::from_slice(&line).unwrap();
+        let mut pretty = serde_json::to_vec_pretty(&signed).unwrap();
+        pretty.push(b'\n');
+        let bytes = [line.as_slice(), pretty.as_slice()].concat();
         std::fs::write(&log, &bytes).unwrap();
         let evidence = verify_runtime_latency_evidence(
             &log,
