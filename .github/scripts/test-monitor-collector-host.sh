@@ -47,8 +47,12 @@ grep -Fqx $'          if ! run_json=$(aliyun ecs InvokeCommand \\' "$workflow" |
 }
 grep -Fqx $'            --RegionId "${{ env.REGION_ID }}" \\' "$workflow" || command_contract_failed=1
 grep -Fqx $'            --InstanceId.1 "${{ env.INSTANCE_ID }}" \\' "$workflow" || command_contract_failed=1
-grep -Fqx '            --CommandId "${{ env.COMMAND_ID }}" 2>&1); then' "$workflow" || command_contract_failed=1
-grep -Fqx $'              --CommandId "${{ env.COMMAND_ID }}" \\' "$workflow" || command_contract_failed=1
+grep -Fqx '            --CommandId "$COMMAND_ID" 2>&1); then' "$workflow" || command_contract_failed=1
+grep -Fqx $'              --CommandId "$COMMAND_ID" \\' "$workflow" || command_contract_failed=1
+if grep -Fq '${{ env.COMMAND_ID }}' "$workflow"; then
+  printf 'collector monitor interpolates CommandId into the shell program\n' >&2
+  command_contract_failed=1
+fi
 if grep -Eq 'RunCommand|CommandContent|ContentEncoding|KeepCommand|remote_script' "$workflow"; then
   printf 'collector monitor still exposes dynamic Cloud Assistant command execution\n' >&2
   command_contract_failed=1

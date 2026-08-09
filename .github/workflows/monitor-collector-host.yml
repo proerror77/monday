@@ -92,7 +92,7 @@ jobs:
           if ! run_json=$(aliyun ecs InvokeCommand \
             --RegionId "${{ env.REGION_ID }}" \
             --InstanceId.1 "${{ env.INSTANCE_ID }}" \
-            --CommandId "${{ env.COMMAND_ID }}" 2>&1); then
+            --CommandId "$COMMAND_ID" 2>&1); then
             printf 'InvokeCommand failed: %s\n' "$run_json" >&2
             {
               echo "ok=unknown"
@@ -120,7 +120,7 @@ jobs:
             result_json=$(aliyun ecs DescribeInvocationResults \
               --RegionId "${{ env.REGION_ID }}" \
               --InvokeId "$invoke_id" \
-              --CommandId "${{ env.COMMAND_ID }}" \
+              --CommandId "$COMMAND_ID" \
               --InstanceId "${{ env.INSTANCE_ID }}" || true)
             status=$(printf '%s' "$result_json" | jq -r '[.. | objects | .InvocationStatus? // empty][0] // empty')
             exit_code=$(printf '%s' "$result_json" | jq -r '[.. | objects | .ExitCode? // empty][0] // empty')
