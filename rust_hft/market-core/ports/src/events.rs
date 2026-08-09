@@ -658,7 +658,7 @@ pub enum ExecutionEvent {
         quantity: Quantity,
         /// 原始意圖中的價格（Market 單通常為 None，會在引擎層補全）
         requested_price: Option<Price>,
-        /// Best executable price captured when a market intent entered execution.
+        /// Executable quote captured when a marketable intent entered execution.
         #[serde(default)]
         arrival_price: Option<Price>,
         timestamp: Timestamp,
