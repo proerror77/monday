@@ -1659,29 +1659,23 @@ impl Engine {
                 .iter()
                 .any(|envelope| Self::requires_arrival_quote(&envelope.intent))
             {
-                let latest_market_view = self.get_market_view();
                 let before_pricing = intents_work_buf.len();
                 intents_work_buf.retain_mut(|envelope| {
                     if !Self::requires_arrival_quote(&envelope.intent) {
                         return true;
                     }
-                    let arrival_price = Self::capture_arrival_price(
-                        &mut envelope.intent,
-                        l2_book,
-                        &latest_market_view,
-                    );
+                    let arrival_price = Self::capture_arrival_price(&mut envelope.intent, l2_book);
                     envelope.lifecycle.arrival_price = arrival_price;
                     if matches!(envelope.intent.order_type, OrderType::Market) {
                         envelope.intent.price = arrival_price;
-                        return arrival_price.is_some();
                     }
-                    true
+                    arrival_price.is_some()
                 });
                 let rejected = before_pricing.saturating_sub(intents_work_buf.len());
                 if rejected > 0 {
                     warn!(
                         rejected,
-                        "market intents rejected because no executable quote was available"
+                        "market or IOC intents rejected because no current executable quote was available"
                     );
                 }
             }
@@ -2038,9 +2032,8 @@ impl Engine {
     fn capture_arrival_price(
         intent: &mut ports::OrderIntent,
         event_book: Option<ports::L2BookView<'_>>,
-        latest_market_view: &MarketView,
     ) -> Option<hft_core::Price> {
-        let sequenced_quote = event_book.and_then(|book| {
+        event_book.and_then(|book| {
             if book.symbol != &intent.symbol {
                 return None;
             }
@@ -2056,19 +2049,7 @@ impl Engine {
                     Some(price)
                 }
             }
-        });
-        let venue_price = intent.target_venue.and_then(|venue| {
-            let key = hft_core::VenueSymbol::new(venue, intent.symbol.clone());
-            match intent.side {
-                Side::Buy => latest_market_view
-                    .get_best_ask_for_venue(&key)
-                    .map(|(price, _)| price),
-                Side::Sell => latest_market_view
-                    .get_best_bid_for_venue(&key)
-                    .map(|(price, _)| price),
-            }
-        });
-        sequenced_quote.or(venue_price)
+        })
     }
 
     /// 從市場事件中提取時間戳
@@ -2484,18 +2465,15 @@ mod tests {
             ask_prices: &ask_prices,
             ask_quantities: &[],
         };
-        let market_view = MarketView {
-            orderbooks: FxHashMap::default(),
-            arbitrage_opportunities: Vec::new(),
-            timestamp: 1,
-            version: 1,
-        };
-
-        let arrival = Engine::capture_arrival_price(&mut intent, Some(book), &market_view);
+        let arrival = Engine::capture_arrival_price(&mut intent, Some(book));
 
         assert_eq!(arrival, Some(Price::from_f64(101.0).unwrap()));
         assert_eq!(intent.target_venue, Some(VenueId::BINANCE));
         assert_eq!(intent.price, protection_limit);
+
+        let mut without_book = test_intent();
+        without_book.time_in_force = hft_core::TimeInForce::IOC;
+        assert_eq!(Engine::capture_arrival_price(&mut without_book, None), None);
     }
 
     struct EmittingStrategy {
