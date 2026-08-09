@@ -2,7 +2,7 @@ owner: codex-root
 contract: lob-pit-trade-features
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-trade-features
 branch: codex/lob-pit-trade-features
-base_sha: e85ad316342bf3b51d620016380a13159439a8a2
+base_sha: 2b6f5600d26860590f7283ceb9e16df1271eb18b
 allowed_files:
   - agent-worktree.yml
   - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
