@@ -1563,6 +1563,112 @@ mod tests {
     }
 
     #[test]
+    fn mcts_rejects_missing_or_tampered_baseline_policy_revision_before_transition() {
+        let mut fixture = fixture("mcts-baseline-policy-revision");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let source_db = results.join("alpha.duckdb");
+        let producer_id = fixture.mission.semantic_id().unwrap();
+        let source = AlphaStore::open(&source_db).unwrap();
+        let producer = source.get_mission(&producer_id).unwrap();
+        let dataset_manifest: CexReplayDatasetManifestV1 = serde_json::from_slice(
+            &std::fs::read(results.join("cex-replay-dataset-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let gate: alpha_domain::CexBaselineGateV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        let policy_revision = source.get_registry_revision(&gate.policy_hash).unwrap();
+        let copied_revisions = [
+            dataset_manifest.feature_manifest_id.as_str(),
+            dataset_manifest.manifest_id.as_str(),
+            gate.mission_id.as_str(),
+            gate.factor_bank_revision_id.as_str(),
+            gate.ridge_artifact_id.as_deref().unwrap(),
+            gate.cart_artifact_id.as_deref().unwrap(),
+            gate.gate_id.as_str(),
+        ]
+        .map(|revision_id| source.get_registry_revision(revision_id).unwrap());
+        drop(source);
+
+        let mut wrong_kind = policy_revision.clone();
+        wrong_kind.registry_kind = "cex_baseline_gate".to_string();
+        let mut wrong_parent = policy_revision.clone();
+        wrong_parent.parent_revision_id = Some("wrong-mission".to_string());
+        let mut tampered_payload = policy_revision.clone();
+        tampered_payload.payload["ridge_l2"] = serde_json::json!(2.0e-6);
+
+        for (case, policy_revision) in [
+            ("missing", None),
+            ("wrong-kind", Some(wrong_kind)),
+            ("wrong-parent", Some(wrong_parent)),
+            ("tampered-payload", Some(tampered_payload)),
+        ] {
+            let db = results.join(format!("policy-{case}.duckdb"));
+            let mut store = AlphaStore::open(&db).unwrap();
+            for revision in &copied_revisions {
+                store.put_registry_revision(revision).unwrap();
+            }
+            if let Some(revision) = policy_revision {
+                store.put_registry_revision(&revision).unwrap();
+            }
+            let mut consumer = producer.clone();
+            consumer.mission_id = format!("{producer_id}-mcts-{case}");
+            consumer.baseline_artifact_id = Some(gate.gate_id.clone());
+            consumer.status = MissionStatus::Pending;
+            consumer.terminal_reason = None;
+            consumer.created_at = Utc::now();
+            consumer.updated_at = consumer.created_at;
+            store.create_mission(&consumer).unwrap();
+            drop(store);
+
+            let args = RunMissionArgs {
+                db,
+                mission_id: consumer.mission_id,
+                engine: EngineChoice::Mcts,
+                seed: fixture.mission.spec.search.seed,
+                feature_fields: fixture.mission.spec.feature_fields.clone(),
+                offline_trace: None,
+                max_new_iterations: Some(1),
+                dataset: DatasetArgs {
+                    dataset_manifest: results.join("cex-replay-dataset-manifest.json"),
+                    validation: ValidationArgs::from_protocol(
+                        &fixture.mission.spec.evaluation_protocol,
+                    ),
+                },
+            };
+            let error = mission::execute_mission(&args, false).unwrap_err();
+
+            assert!(
+                error.to_string().contains("baseline policy"),
+                "{case}: {error:#}"
+            );
+            let store = AlphaStore::open(&args.db).unwrap();
+            assert_eq!(
+                store.get_mission(&args.mission_id).unwrap().status,
+                MissionStatus::Pending,
+                "{case}"
+            );
+            assert!(
+                store
+                    .mission_lineage(&args.mission_id)
+                    .unwrap()
+                    .iterations
+                    .is_empty(),
+                "{case}"
+            );
+        }
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn mcts_rejects_a_domain_valid_failed_gate_before_transition() {
         let fixture = fixture("mcts-failed-empty-gate");
         execute(fixture.args.clone()).unwrap();
@@ -1720,7 +1826,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("baseline gate producer binding drifted"));
+            .contains("baseline policy registry revision"));
         let store = AlphaStore::open(&args.db).unwrap();
         assert_eq!(
             store.get_mission(&args.mission_id).unwrap().status,

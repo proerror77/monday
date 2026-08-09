@@ -25,6 +25,7 @@ pub(crate) const BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR: &str =
 pub(crate) const OFFLINE_RL_LIVE_CAPABILITY_ERROR: &str =
     "Offline RL search is research-only and cannot produce live-executable formulas";
 const CEX_FACTOR_BANK_REGISTRY_KIND: &str = "cex_factor_bank";
+const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
@@ -224,8 +225,26 @@ fn validate_mcts_baseline_gate(
     if control_mission.semantic_id().map_err(anyhow::Error::msg)? != gate.mission_id {
         bail!("MCTS source research mission identity drifted");
     }
-    let baseline_policy =
-        CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
+    let policy_revision = store
+        .get_registry_revision(&gate.policy_hash)
+        .with_context(|| {
+            format!(
+                "MCTS baseline policy registry revision {} is missing",
+                gate.policy_hash
+            )
+        })?;
+    if policy_revision.registry_kind != CEX_BASELINE_POLICY_REGISTRY_KIND
+        || policy_revision.revision_id != gate.policy_hash
+        || policy_revision.parent_revision_id.as_deref() != Some(gate.mission_id.as_str())
+    {
+        bail!("MCTS baseline policy registry binding drifted");
+    }
+    let baseline_policy: CexBaselinePolicyV1 =
+        serde_json::from_value(policy_revision.payload.clone())
+            .context("MCTS baseline policy payload is invalid")?;
+    if baseline_policy.content_hash().map_err(anyhow::Error::msg)? != gate.policy_hash {
+        bail!("MCTS baseline policy identity drifted");
+    }
     baseline_policy.validate_binding(&control_mission.spec.policies.baseline)?;
 
     let ridge = match gate.ridge_artifact_id.as_deref() {
