@@ -558,8 +558,9 @@ the production units ship in the separate
 assets can never invalidate a completed shadow gate.
 
 The cutover accepts either an empty new host or one healthy digest-addressed
-production release. On an upgrade it first binds the old uploader, destination
-environment, and rollback assets by digest, stops the writer, and drains every
+production release. On an upgrade it first binds the independently released
+old collector and uploader, destination environment, and rollback assets by
+digest, stops the writer, and drains every
 V2 artifact before switching schemas. It revalidates the candidate release
 identity, the uploader sidecar digest, the production bundle manifest, and
 exactly one immutable `PASSED.sha256` shadow gate before touching systemd. It then

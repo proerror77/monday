@@ -27,6 +27,7 @@ done
 CANDIDATE_SHA256=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 CONTROLLER=$2
 RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-collector
+UPLOADER_RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-upload
 CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
 CANDIDATE_COLLECTOR="$CANDIDATE_RELEASE/binance-usdm-reference-collector"
 CANDIDATE_VERIFIER="$CANDIDATE_RELEASE/binance-usdm-reference-artifact-verifier"
@@ -124,6 +125,7 @@ OLD_MODE=not-determined
 OLD_COLLECTOR=
 OLD_UPLOADER=
 OLD_RELEASE_SHA256=
+OLD_UPLOADER_RELEASE_SHA256=
 OLD_UPLOADER_SHA256=
 ROLLBACK_ASSETS_SHA256=
 CANDIDATE_MAY_HAVE_WRITTEN=0
@@ -431,6 +433,7 @@ write_evidence() {
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg host_mode "$OLD_MODE" \
     --arg previous_release_sha256 "$OLD_RELEASE_SHA256" \
+    --arg previous_uploader_release_sha256 "$OLD_UPLOADER_RELEASE_SHA256" \
     --arg previous_uploader_sha256 "$OLD_UPLOADER_SHA256" \
     --arg rollback_assets_sha256 "$ROLLBACK_ASSETS_SHA256" \
     --arg collector_binary "$collector_target" \
@@ -454,6 +457,8 @@ write_evidence() {
       host_mode: $host_mode,
       previous_release_sha256:
         (if $previous_release_sha256 == "" then null else $previous_release_sha256 end),
+      previous_uploader_release_sha256:
+        (if $previous_uploader_release_sha256 == "" then null else $previous_uploader_release_sha256 end),
       previous_uploader_sha256:
         (if $previous_uploader_sha256 == "" then null else $previous_uploader_sha256 end),
       rollback_assets_sha256:
@@ -540,7 +545,8 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
   || fail 'cutover runner is outside the candidate deployment bundle'
 
 STEP=validate-candidate-release
-for path in /opt/monday /opt/monday/bin "$RELEASE_ROOT" "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
+for path in /opt/monday /opt/monday/bin "$RELEASE_ROOT" "$UPLOADER_RELEASE_ROOT" \
+  "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
   path_is_direct_or_absent "$path" || fail "release path contains a symlink: $path"
 done
 for binary in "$CANDIDATE_COLLECTOR" "$CANDIDATE_VERIFIER" "$CANDIDATE_UPLOADER"; do
@@ -646,21 +652,15 @@ if systemctl is-active --quiet "$COLLECTOR_UNIT" \
   OLD_RELEASE_SHA256=${BASH_REMATCH[1]}
   [[ $OLD_RELEASE_SHA256 != "$CANDIDATE_SHA256" ]] \
     || fail 'candidate is already the production release'
-  [[ $OLD_UPLOADER == "$RELEASE_ROOT/$OLD_RELEASE_SHA256/binance-usdm-reference-upload" ]] \
-    || fail "production uploader does not belong to the collector release: $OLD_UPLOADER"
+  [[ $OLD_UPLOADER =~ ^$UPLOADER_RELEASE_ROOT/([a-f0-9]{64})/binance-usdm-reference-upload$ ]] \
+    || fail "production uploader is not digest-addressed: $OLD_UPLOADER"
+  OLD_UPLOADER_RELEASE_SHA256=${BASH_REMATCH[1]}
   printf '%s  %s\n' "$OLD_RELEASE_SHA256" "$OLD_COLLECTOR" | sha256sum --check --strict
   secure_regular_file "$OLD_UPLOADER"
   [[ -x $OLD_UPLOADER ]] || fail 'production uploader is not executable'
-  old_uploader_sidecar="$RELEASE_ROOT/$OLD_RELEASE_SHA256/binance-usdm-reference-upload.sha256"
-  secure_regular_file "$old_uploader_sidecar"
-  [[ $(wc -l < "$old_uploader_sidecar") -eq 1 ]] \
-    || fail 'production uploader sidecar must contain exactly one entry'
-  old_uploader_entry=$(<"$old_uploader_sidecar")
-  [[ $old_uploader_entry =~ ^[a-f0-9]{64}[[:space:]]+binance-usdm-reference-upload$ ]] \
-    || fail 'production uploader sidecar has an invalid entry'
-  (cd "$RELEASE_ROOT/$OLD_RELEASE_SHA256" \
-    && sha256sum --check --strict binance-usdm-reference-upload.sha256)
   OLD_UPLOADER_SHA256=$(sha256sum "$OLD_UPLOADER" | awk '{print $1}')
+  [[ $OLD_UPLOADER_SHA256 == "$OLD_UPLOADER_RELEASE_SHA256" ]] \
+    || fail 'production uploader digest does not match its release directory'
   secure_regular_file "$UPLOAD_ENV"
   validate_upload_env "$UPLOAD_ENV"
   stage_rollback_assets
