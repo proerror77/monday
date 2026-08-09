@@ -2,9 +2,9 @@ owner: codex-root
 contract: lob-pit-trade-features
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-trade-features
 branch: codex/lob-pit-trade-features
-base_sha: 2b6f5600d26860590f7283ceb9e16df1271eb18b
+base_sha: a15880c940f5047ce76ca1485a48239698eb6821
 allowed_files:
   - agent-worktree.yml
   - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
-dependency: PR #781
+dependency: PR #781 merged as a15880c940f5047ce76ca1485a48239698eb6821
 no_external_runtime_mutation: true
