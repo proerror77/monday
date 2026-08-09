@@ -1,6 +1,7 @@
 //! Manifest contracts for reproducible research, evaluation, promotion, and live rollout.
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,7 @@ pub const CEX_MODALITY_LOB: &str = "lob";
 pub const CEX_MODALITY_AGGREGATE_TRADE: &str = "aggregate_trade";
 pub const CEX_MODALITY_FUNDING: &str = "funding";
 pub const CEX_MODALITY_OPEN_INTEREST: &str = "open_interest";
+pub const CEX_DERIVATIVES_MAX_GAP_NS: u64 = 90_000_000_000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -138,6 +140,7 @@ pub struct CexPitSeriesEvidenceV2 {
     pub first_available_at: DateTime<Utc>,
     pub last_available_at: DateTime<Utc>,
     pub observations: u64,
+    pub max_gap_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,9 +261,11 @@ impl CexReplaySnapshotV2 {
             || self.latency_cost.observations == 0
             || self.latency_cost.p50_ns > self.latency_cost.p95_ns
             || self.latency_cost.p95_ns > self.latency_cost.p99_ns
-            || !nonnegative_decimal(&self.latency_cost.p50_cost_bps)
-            || !nonnegative_decimal(&self.latency_cost.p95_cost_bps)
-            || !nonnegative_decimal(&self.latency_cost.p99_cost_bps)
+            || !ordered_nonnegative_decimals([
+                &self.latency_cost.p50_cost_bps,
+                &self.latency_cost.p95_cost_bps,
+                &self.latency_cost.p99_cost_bps,
+            ])
         {
             return Err(invalid("measured latency cost evidence is invalid"));
         }
@@ -279,6 +284,7 @@ fn pit_series_covers(
 ) -> bool {
     evidence.evidence.valid()
         && evidence.observations > 0
+        && evidence.max_gap_ns <= CEX_DERIVATIVES_MAX_GAP_NS
         && evidence.first_available_at <= first_event_time
         && evidence.first_available_at <= evidence.last_available_at
         && evidence.last_available_at >= last_event_time
@@ -464,14 +470,24 @@ fn valid_sha256(value: &str) -> bool {
 
 fn positive_decimal(value: &str) -> bool {
     value
-        .parse::<f64>()
-        .is_ok_and(|value| value.is_finite() && value > 0.0)
+        .parse::<Decimal>()
+        .is_ok_and(|value| value > Decimal::ZERO)
 }
 
 fn nonnegative_decimal(value: &str) -> bool {
-    value
-        .parse::<f64>()
-        .is_ok_and(|value| value.is_finite() && value >= 0.0)
+    !value.starts_with('-')
+        && value
+            .parse::<Decimal>()
+            .is_ok_and(|value| value >= Decimal::ZERO)
+}
+
+fn ordered_nonnegative_decimals(values: [&str; 3]) -> bool {
+    let parsed = values.map(|value| value.parse::<Decimal>().ok());
+    matches!(parsed, [Some(p50), Some(p95), Some(p99)]
+        if values.iter().all(|value| !value.starts_with('-'))
+            && p50 >= Decimal::ZERO
+            && p50 <= p95
+            && p95 <= p99)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -754,6 +770,7 @@ mod tests {
                         .unwrap()
                         .with_timezone(&Utc),
                     observations: 1,
+                    max_gap_ns: 3_000_000_000,
                 },
                 open_interest: CexPitSeriesEvidenceV2 {
                     evidence: triplet('7'),
@@ -764,6 +781,7 @@ mod tests {
                         .unwrap()
                         .with_timezone(&Utc),
                     observations: 1,
+                    max_gap_ns: 3_000_000_000,
                 },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
@@ -862,6 +880,44 @@ mod tests {
         assert_eq!(
             snapshot.validate().unwrap_err(),
             ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_derivatives_gap_over_limit() {
+        let mut snapshot = cex_snapshot();
+        snapshot
+            .derivatives_reference
+            .as_mut()
+            .unwrap()
+            .funding
+            .max_gap_ns = CEX_DERIVATIVES_MAX_GAP_NS + 1;
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_nonmonotonic_latency_cost() {
+        let mut snapshot = cex_snapshot();
+        snapshot.latency_cost.p50_cost_bps = "0.21".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_negative_decimal_underflow() {
+        let mut snapshot = cex_snapshot();
+        snapshot.fee_schedule.maker_buy_fee_bps = "-1e-400".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("PIT rules or fee evidence is invalid")
         );
     }
 
