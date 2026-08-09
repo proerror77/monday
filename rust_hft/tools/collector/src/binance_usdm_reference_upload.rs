@@ -419,6 +419,127 @@ pub fn upload_pending(config: &ReferenceUploadConfig) -> Result<ReferenceUploadS
     upload_pending_with(config, &mut run_checked)
 }
 
+pub(crate) struct OssTripletBatch {
+    pub dir: PathBuf,
+    pub object_prefix: String,
+    pub members: [PathBuf; 3],
+}
+
+pub(crate) fn upload_verified_triplet(
+    batch: &OssTripletBatch,
+    config: &ReferenceUploadConfig,
+    verifier: impl FnMut(&[PathBuf; 3]) -> Result<()>,
+) -> Result<bool> {
+    upload_verified_triplet_with(batch, config, &mut run_checked, verifier)
+}
+
+fn download_oss_triplet_with<F>(
+    batch: &OssTripletBatch,
+    config: &ReferenceUploadConfig,
+    runner: &mut F,
+) -> Result<(ExclusiveTempDir, [PathBuf; 3])>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let verify_dir = ExclusiveTempDir::create(&config.output_root, ".oss-verify")?;
+    let destination_dir = verify_dir.path().join(&batch.object_prefix);
+    ensure_canonical_directory(&destination_dir)?;
+    let mut downloaded = Vec::with_capacity(3);
+    for local in &batch.members {
+        direct_regular_file(local)?;
+        let name = local
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("artifact filename is not UTF-8")?;
+        let destination = destination_dir.join(name);
+        let remote = format!("oss://{}/{}/{name}", config.bucket, batch.object_prefix);
+        let mut command = oss_copy_command(
+            &remote,
+            destination
+                .to_str()
+                .context("verification path is not UTF-8")?,
+            config,
+        );
+        runner(&mut command, config.oss_timeout)?;
+        direct_regular_file(&destination)?;
+        downloaded.push(destination);
+    }
+    Ok((
+        verify_dir,
+        downloaded
+            .try_into()
+            .map_err(|_| anyhow!("artifact triplet is incomplete"))?,
+    ))
+}
+
+pub(crate) fn upload_verified_triplet_with<F, V>(
+    batch: &OssTripletBatch,
+    config: &ReferenceUploadConfig,
+    runner: &mut F,
+    mut verifier: V,
+) -> Result<bool>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+    V: FnMut(&[PathBuf; 3]) -> Result<()>,
+{
+    config.validate()?;
+    ensure_canonical_directory(&config.output_root)?;
+    for member in &batch.members {
+        direct_regular_file(member)?;
+    }
+    let already_present = match download_oss_triplet_with(batch, config, runner) {
+        Ok((_verify_dir, downloaded)) => {
+            verifier(&downloaded)?;
+            true
+        }
+        Err(_) => false,
+    };
+    if !already_present {
+        for local in &batch.members {
+            direct_regular_file(local)?;
+            let name = local
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("artifact filename is not UTF-8")?;
+            let destination = format!("oss://{}/{}/{name}", config.bucket, batch.object_prefix);
+            let mut command = oss_upload_command(
+                local.to_str().context("artifact path is not UTF-8")?,
+                &destination,
+                config,
+            );
+            runner(&mut command, config.oss_timeout)?;
+        }
+        let mut last_error = None;
+        for attempt in 0..OSS_READBACK_ATTEMPTS {
+            match download_oss_triplet_with(batch, config, runner) {
+                Ok((_verify_dir, downloaded)) => {
+                    verifier(&downloaded)?;
+                    last_error = None;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < OSS_READBACK_ATTEMPTS {
+                std::thread::sleep(OSS_READBACK_RETRY_DELAY);
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error.context("remote artifacts remained unreadable after bounded retries"));
+        }
+    }
+    for member in &batch.members {
+        direct_regular_file(member)?;
+        fs::remove_file(member)
+            .with_context(|| format!("remove uploaded artifact {}", member.display()))?;
+    }
+    fs::remove_dir(&batch.dir)
+        .with_context(|| format!("remove uploaded artifact directory {}", batch.dir.display()))?;
+    if let Some(parent) = batch.dir.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(already_present)
+}
+
 fn upload_pending_with<F>(
     config: &ReferenceUploadConfig,
     runner: &mut F,
