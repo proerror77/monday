@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::binance_market_tape::{MAX_SOURCE_DELAY_MS, MAX_SOURCE_LEAD_MS};
 
-pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v2";
+pub const REFERENCE_SCHEMA: &str = "binance.usdm_reference.v3";
 pub const EXCHANGE_INFO_ENDPOINT: &str = "/fapi/v1/exchangeInfo";
 pub const SERVER_TIME_ENDPOINT: &str = "/fapi/v1/time";
 pub const PREMIUM_INDEX_ENDPOINT: &str = "/fapi/v1/premiumIndex";
@@ -24,6 +24,9 @@ pub struct ActivePerpetualContract {
     pub base_asset: String,
     pub quote_asset: String,
     pub margin_asset: String,
+    pub tick_size: Decimal,
+    pub step_size: Decimal,
+    pub min_notional: Decimal,
     pub contract_type: String,
     pub status: String,
     pub onboard_date_ms: u64,
@@ -185,6 +188,12 @@ fn validate_contract(row: &ActivePerpetualContract) -> Result<()> {
     {
         bail!("reference metadata has an empty contract identity");
     }
+    if row.tick_size <= Decimal::ZERO
+        || row.step_size <= Decimal::ZERO
+        || row.min_notional <= Decimal::ZERO
+    {
+        bail!("reference trading rules must be positive");
+    }
     Ok(())
 }
 
@@ -303,6 +312,9 @@ pub fn active_perpetual_contracts(
             base_asset: required_string(raw, "baseAsset", "exchangeInfo")?.to_owned(),
             quote_asset: required_string(raw, "quoteAsset", "exchangeInfo")?.to_owned(),
             margin_asset: required_string(raw, "marginAsset", "exchangeInfo")?.to_owned(),
+            tick_size: required_filter_decimal(raw, "PRICE_FILTER", "tickSize")?,
+            step_size: required_filter_decimal(raw, "LOT_SIZE", "stepSize")?,
+            min_notional: required_filter_decimal(raw, "MIN_NOTIONAL", "notional")?,
             contract_type: contract_type.to_owned(),
             status: status.to_owned(),
             onboard_date_ms: required_u64(raw, "onboardDate", "exchangeInfo")?,
@@ -504,6 +516,27 @@ fn required_decimal(raw: &Value, field: &str, endpoint: &str) -> Result<Decimal>
         .with_context(|| format!("{endpoint} response has invalid decimal {field}"))
 }
 
+fn required_filter_decimal(raw: &Value, filter_type: &str, field: &str) -> Result<Decimal> {
+    let filters = raw
+        .get("filters")
+        .and_then(Value::as_array)
+        .context("exchangeInfo filters must be an array")?;
+    let mut matches = filters
+        .iter()
+        .filter(|filter| filter.get("filterType").and_then(Value::as_str) == Some(filter_type));
+    let filter = matches
+        .next()
+        .with_context(|| format!("exchangeInfo is missing {filter_type}"))?;
+    if matches.next().is_some() {
+        bail!("exchangeInfo has duplicate {filter_type}");
+    }
+    let value = required_decimal(filter, field, "exchangeInfo")?;
+    if value <= Decimal::ZERO {
+        bail!("exchangeInfo {filter_type} {field} must be positive");
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,7 +556,12 @@ mod tests {
                     "symbol": "BTCUSDT", "pair": "BTCUSDT", "contractType": "PERPETUAL",
                     "deliveryDate": 4133404800000_u64, "onboardDate": 1598252400000_u64,
                     "status": "TRADING", "baseAsset": "BTC", "quoteAsset": "USDT",
-                    "marginAsset": "USDT"
+                    "marginAsset": "USDT",
+                    "filters": [
+                        {"filterType":"PRICE_FILTER", "tickSize":"0.10"},
+                        {"filterType":"LOT_SIZE", "stepSize":"0.001"},
+                        {"filterType":"MIN_NOTIONAL", "notional":"5"}
+                    ]
                 },
                 {
                     "symbol": "ETHUSDT_250926", "pair": "ETHUSDT",
@@ -586,7 +624,10 @@ mod tests {
             batch.contracts()[0].source_clock_received_at_ns,
             SOURCE_CLOCK_RECEIVED_NS
         );
-        assert_eq!(batch.contracts()[0].schema, "binance.usdm_reference.v2");
+        assert_eq!(batch.contracts()[0].schema, "binance.usdm_reference.v3");
+        assert_eq!(batch.contracts()[0].tick_size, Decimal::new(1, 1));
+        assert_eq!(batch.contracts()[0].step_size, Decimal::new(1, 3));
+        assert_eq!(batch.contracts()[0].min_notional, Decimal::new(5, 0));
         let mut legacy_v1 = serde_json::to_value(&batch.contracts()[0]).unwrap();
         legacy_v1["schema"] = json!("binance.usdm_reference.v1");
         legacy_v1
@@ -673,6 +714,21 @@ mod tests {
     #[test]
     fn malformed_prices_and_future_source_clocks_fail_closed() {
         let expected = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let mut missing_tick = exchange_info();
+        missing_tick["symbols"][0]["filters"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert!(active_perpetual_contracts(
+            &missing_tick,
+            SOURCE_MS,
+            SOURCE_CLOCK_RECEIVED_NS,
+            RECEIVED_NS,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("missing PRICE_FILTER"));
+
         let mut zero_index = premium_index();
         zero_index[0]["indexPrice"] = json!("0");
         assert!(
@@ -730,8 +786,7 @@ mod tests {
         let expected = BTreeSet::from(["BTCUSDT".to_owned()]);
         let marks =
             mark_index_funding_observations(&premium_index(), &expected, RECEIVED_NS).unwrap();
-        let batch =
-            CompleteReferenceBatch::new(contracts, marks, vec![row]).unwrap();
+        let batch = CompleteReferenceBatch::new(contracts, marks, vec![row]).unwrap();
         let coverage = batch.coverage(RECEIVED_NS + 200_000_000, 1_000).unwrap();
         assert_eq!(coverage.open_interest_observations, 1);
         assert_eq!(coverage.stale_open_interest, 1);

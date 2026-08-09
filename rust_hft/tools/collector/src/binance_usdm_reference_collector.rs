@@ -260,8 +260,8 @@ mod tests {
         async fn exchange_info(&self) -> Result<TimedJson> {
             Ok(Self::timed(
                 json!({"symbols":[
-                    {"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,"status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT"},
-                    {"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,"status":"TRADING","baseAsset":"ETH","quoteAsset":"USDT","marginAsset":"USDT"}
+                    {"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,"status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001"},{"filterType":"MIN_NOTIONAL","notional":"5"}]},
+                    {"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","deliveryDate":4133404800000_u64,"onboardDate":1598252400000_u64,"status":"TRADING","baseAsset":"ETH","quoteAsset":"USDT","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001"},{"filterType":"MIN_NOTIONAL","notional":"5"}]}
                 ]}),
                 RECEIVED_NS + 10,
             ))

@@ -33,7 +33,7 @@ def canonical_artifact:
   and .venue == "binance_usdm"
   and .dataset == "reference"
   and .manifest_schema == "binance.usdm_reference_manifest.v1"
-  and .data_schema == "binance.usdm_reference.v2"
+  and .data_schema == "binance.usdm_reference.v3"
   and .source_origin == "https://fapi.binance.com"
   and (.source_endpoints | endpoints)
   and .max_staleness_ms == 30000
