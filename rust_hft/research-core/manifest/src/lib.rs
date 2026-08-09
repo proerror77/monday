@@ -125,6 +125,7 @@ pub struct CexInstrumentRulesV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFeeScheduleV2 {
+    pub account_fingerprint: String,
     pub maker_buy_fee_bps: String,
     pub maker_sell_fee_bps: String,
     pub taker_buy_fee_bps: String,
@@ -235,6 +236,7 @@ impl CexReplaySnapshotV2 {
             || self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.available_at > self.instrument_rules.valid_through
             || self.instrument_rules.valid_through < label_available_through
+            || !valid_sha256(&self.fee_schedule.account_fingerprint)
             || !nonnegative_decimal(&self.fee_schedule.maker_buy_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.maker_sell_fee_bps)
             || !nonnegative_decimal(&self.fee_schedule.taker_buy_fee_bps)
@@ -798,6 +800,7 @@ mod tests {
                 evidence: vec![triplet('4')],
             },
             fee_schedule: CexFeeScheduleV2 {
+                account_fingerprint: "9".repeat(64),
                 maker_buy_fee_bps: "2".to_string(),
                 maker_sell_fee_bps: "2".to_string(),
                 taker_buy_fee_bps: "5".to_string(),
