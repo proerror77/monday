@@ -348,7 +348,6 @@ fn execution_attribution(
             arrival_price,
             ..
         } => {
-            state.orders.remove(&order_id.0);
             let Some(venue) = venue.as_ref().map(ToString::to_string) else {
                 return Ok(None);
             };
@@ -361,6 +360,7 @@ fn execution_attribution(
             {
                 return Ok(None);
             }
+            let previous = state.orders.remove(&order_id.0);
             state.orders.insert(
                 order_id.0.clone(),
                 OrderMetadata {
@@ -369,9 +369,16 @@ fn execution_attribution(
                     symbol: symbol.to_string(),
                     side: *side,
                     requested_price: requested_price.map(|price| price.0),
-                    arrival_price: arrival_price.map(|price| price.0),
-                    timing: OrderTiming::default(),
-                    seen_fill_ids: HashSet::new(),
+                    arrival_price: arrival_price
+                        .map(|price| price.0)
+                        .or_else(|| previous.as_ref().and_then(|order| order.arrival_price)),
+                    timing: previous
+                        .as_ref()
+                        .map(|order| order.timing.clone())
+                        .unwrap_or_default(),
+                    seen_fill_ids: previous
+                        .map(|order| order.seen_fill_ids)
+                        .unwrap_or_default(),
                 },
             );
             Ok(None)
@@ -1267,6 +1274,11 @@ mod tests {
             },
         )
         .unwrap();
+        let mut duplicate = order_new("fill-order");
+        if let ExecutionEvent::OrderNew { arrival_price, .. } = &mut duplicate {
+            *arrival_price = None;
+        }
+        execution_attribution(&activation, &mut state, &duplicate).unwrap();
         let fill = execution_attribution(
             &activation,
             &mut state,
