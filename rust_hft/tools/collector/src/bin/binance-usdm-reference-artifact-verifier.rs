@@ -196,7 +196,7 @@ mod tests {
 
     fn reseal_data(published: &mut PublishedReferenceArtifact, data: &[u8]) {
         fs::write(&published.data_path, data).unwrap();
-        published.data_sha256 = hex::encode(Sha256::digest(&data));
+        published.data_sha256 = hex::encode(Sha256::digest(data));
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
         manifest["data_schema"] = serde_json::json!("binance.usdm_reference.v2");
