@@ -4,12 +4,14 @@ use crate::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
 use crate::polymarket_upload::ensure_canonical_directory;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
+use data::binance_market_tape::{MAX_SOURCE_DELAY_MS, MAX_SOURCE_LEAD_MS};
 use data::binance_usdm_reference::{
     ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
     OpenInterestObservation, ReferenceCoverage, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
     PREMIUM_INDEX_ENDPOINT, REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
 };
 use rand::random;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -127,6 +129,266 @@ enum ReferenceRecord {
     OpenInterest(OpenInterestObservation),
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalContractV2 {
+    schema: String,
+    symbol: String,
+    pair: String,
+    base_asset: String,
+    quote_asset: String,
+    margin_asset: String,
+    contract_type: String,
+    status: String,
+    #[serde(rename = "onboard_date_ms")]
+    _onboard_date_ms: u64,
+    #[serde(rename = "delivery_date_ms")]
+    _delivery_date_ms: u64,
+    source_time_ms: u64,
+    source_clock_received_at_ns: u64,
+    received_at_ns: u64,
+    source_endpoint: String,
+    source_clock_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalMarkV2 {
+    schema: String,
+    symbol: String,
+    mark_price: Decimal,
+    index_price: Decimal,
+    basis: Decimal,
+    basis_rate: Decimal,
+    #[serde(rename = "last_funding_rate")]
+    _last_funding_rate: Decimal,
+    #[serde(rename = "interest_rate")]
+    _interest_rate: Decimal,
+    next_funding_time_ms: u64,
+    source_time_ms: u64,
+    received_at_ns: u64,
+    source_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalOpenInterestV2 {
+    schema: String,
+    symbol: String,
+    open_interest: Decimal,
+    source_time_ms: u64,
+    received_at_ns: u64,
+    source_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", content = "observation", rename_all = "snake_case")]
+enum HistoricalReferenceRecordV2 {
+    Metadata(HistoricalContractV2),
+    MarkIndexFunding(HistoricalMarkV2),
+    OpenInterest(HistoricalOpenInterestV2),
+}
+
+#[derive(Debug)]
+struct HistoricalBatchV2 {
+    contracts: Vec<HistoricalContractV2>,
+    marks: Vec<HistoricalMarkV2>,
+    open_interest: Vec<HistoricalOpenInterestV2>,
+}
+
+impl HistoricalBatchV2 {
+    fn new(
+        contracts: Vec<HistoricalContractV2>,
+        marks: Vec<HistoricalMarkV2>,
+        open_interest: Vec<HistoricalOpenInterestV2>,
+    ) -> Result<Self> {
+        for row in &contracts {
+            validate_historical_contract(row)?;
+        }
+        for row in &marks {
+            validate_historical_mark(row)?;
+        }
+        for row in &open_interest {
+            validate_historical_open_interest(row)?;
+        }
+        let expected = historical_symbols(contracts.iter().map(|row| row.symbol.as_str()))?;
+        if expected.is_empty()
+            || historical_symbols(marks.iter().map(|row| row.symbol.as_str()))? != expected
+            || historical_symbols(open_interest.iter().map(|row| row.symbol.as_str()))? != expected
+        {
+            bail!("historical reference artifact has incomplete symbol coverage");
+        }
+        Ok(Self {
+            contracts,
+            marks,
+            open_interest,
+        })
+    }
+
+    fn coverage(&self, observed_at_ns: u64, max_staleness_ms: u64) -> Result<ArtifactCoverage> {
+        Ok(ArtifactCoverage {
+            active_contracts: self.contracts.len() as u64,
+            metadata_observations: self.contracts.len() as u64,
+            mark_index_funding_observations: self.marks.len() as u64,
+            open_interest_observations: self.open_interest.len() as u64,
+            stale_metadata: historical_stale_count(
+                self.contracts.iter().map(|row| row.source_time_ms),
+                observed_at_ns,
+                max_staleness_ms,
+            )?,
+            stale_mark_index_funding: historical_stale_count(
+                self.marks.iter().map(|row| row.source_time_ms),
+                observed_at_ns,
+                max_staleness_ms,
+            )?,
+            stale_open_interest: historical_stale_count(
+                self.open_interest.iter().map(|row| row.source_time_ms),
+                observed_at_ns,
+                max_staleness_ms,
+            )?,
+            api_error_count: 0,
+        })
+    }
+
+    fn time_bounds(&self) -> Result<ArtifactTimeBounds> {
+        artifact_time_bounds(
+            self.contracts
+                .iter()
+                .map(|row| row.source_time_ms)
+                .chain(self.marks.iter().map(|row| row.source_time_ms))
+                .chain(self.open_interest.iter().map(|row| row.source_time_ms)),
+            self.contracts
+                .iter()
+                .flat_map(|row| [row.source_clock_received_at_ns, row.received_at_ns])
+                .chain(self.marks.iter().map(|row| row.received_at_ns))
+                .chain(self.open_interest.iter().map(|row| row.received_at_ns)),
+        )
+    }
+
+    fn row_count(&self) -> u64 {
+        (self.contracts.len() + self.marks.len() + self.open_interest.len()) as u64
+    }
+}
+
+fn validate_historical_contract(row: &HistoricalContractV2) -> Result<()> {
+    validate_historical_symbol(&row.symbol)?;
+    validate_historical_receive_clock(row.source_time_ms, row.source_clock_received_at_ns)?;
+    validate_historical_receive_clock(row.source_time_ms, row.received_at_ns)?;
+    if row.source_clock_received_at_ns > row.received_at_ns {
+        bail!("historical reference metadata precedes its source-clock receipt");
+    }
+    if row.schema != HISTORICAL_REFERENCE_SCHEMA_V2
+        || row.source_endpoint != EXCHANGE_INFO_ENDPOINT
+        || row.source_clock_endpoint != SERVER_TIME_ENDPOINT
+        || row.contract_type != "PERPETUAL"
+        || row.status != "TRADING"
+        || row.pair.is_empty()
+        || row.base_asset.is_empty()
+        || row.quote_asset.is_empty()
+        || row.margin_asset.is_empty()
+    {
+        bail!("historical reference metadata identity is invalid");
+    }
+    Ok(())
+}
+
+fn validate_historical_mark(row: &HistoricalMarkV2) -> Result<()> {
+    validate_historical_symbol(&row.symbol)?;
+    validate_historical_receive_clock(row.source_time_ms, row.received_at_ns)?;
+    if row.schema != HISTORICAL_REFERENCE_SCHEMA_V2
+        || row.source_endpoint != PREMIUM_INDEX_ENDPOINT
+        || row.mark_price <= Decimal::ZERO
+        || row.index_price <= Decimal::ZERO
+        || row.next_funding_time_ms < row.source_time_ms
+    {
+        bail!("historical mark/index/funding observation is invalid");
+    }
+    let basis = row
+        .mark_price
+        .checked_sub(row.index_price)
+        .context("basis overflow")?;
+    let basis_rate = basis
+        .checked_div(row.index_price)
+        .context("basis-rate overflow")?;
+    if row.basis != basis || row.basis_rate != basis_rate {
+        bail!("historical mark/index/funding derived basis is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_historical_open_interest(row: &HistoricalOpenInterestV2) -> Result<()> {
+    validate_historical_symbol(&row.symbol)?;
+    validate_historical_source_not_future(row.source_time_ms, row.received_at_ns)?;
+    if row.schema != HISTORICAL_REFERENCE_SCHEMA_V2
+        || row.source_endpoint != OPEN_INTEREST_ENDPOINT
+        || row.open_interest < Decimal::ZERO
+    {
+        bail!("historical open-interest observation is invalid");
+    }
+    Ok(())
+}
+
+fn historical_symbols<'a>(symbols: impl Iterator<Item = &'a str>) -> Result<BTreeSet<String>> {
+    let mut unique = BTreeSet::new();
+    for symbol in symbols {
+        if !unique.insert(symbol.to_owned()) {
+            bail!("historical reference artifact has duplicate rows");
+        }
+    }
+    Ok(unique)
+}
+
+fn historical_stale_count(
+    source_times: impl Iterator<Item = u64>,
+    observed_at_ns: u64,
+    max_staleness_ms: u64,
+) -> Result<u64> {
+    let observed_at_ms = observed_at_ns / 1_000_000;
+    let mut stale = 0;
+    for source_time_ms in source_times {
+        if source_time_ms > observed_at_ms.saturating_add(MAX_SOURCE_LEAD_MS) {
+            bail!("historical reference source clock leads coverage clock");
+        }
+        if observed_at_ms.saturating_sub(source_time_ms) > max_staleness_ms {
+            stale += 1;
+        }
+    }
+    Ok(stale)
+}
+
+fn validate_historical_receive_clock(source_time_ms: u64, received_at_ns: u64) -> Result<()> {
+    let received_at_ms = received_at_ns / 1_000_000;
+    if source_time_ms > received_at_ms.saturating_add(MAX_SOURCE_LEAD_MS)
+        || received_at_ms > source_time_ms.saturating_add(MAX_SOURCE_DELAY_MS)
+    {
+        bail!("historical reference source clock is invalid at receipt");
+    }
+    Ok(())
+}
+
+fn validate_historical_source_not_future(source_time_ms: u64, received_at_ns: u64) -> Result<()> {
+    if source_time_ms > (received_at_ns / 1_000_000).saturating_add(MAX_SOURCE_LEAD_MS) {
+        bail!("historical reference source clock leads received clock");
+    }
+    Ok(())
+}
+
+fn validate_historical_symbol(symbol: &str) -> Result<()> {
+    if symbol.is_empty()
+        || symbol.chars().count() > 32
+        || !symbol.chars().all(|ch| {
+            ch.is_ascii_uppercase()
+                || ch.is_ascii_digit()
+                || ch == '_'
+                || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+                || ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+        })
+    {
+        bail!("historical reference symbol identity is invalid");
+    }
+    Ok(())
+}
+
 pub fn publish_reference_batch(
     config: &ReferenceArtifactConfig,
     source_origin: &str,
@@ -204,11 +466,8 @@ pub fn verify_reference_artifact_read_only(
     let manifest: ReferenceManifest =
         serde_json::from_slice(&manifest_bytes).context("parse reference manifest")?;
     if manifest.data_schema == REFERENCE_SCHEMA {
-        let batch = verify_reference_artifact(
-            published,
-            expected_data_sha256,
-            expected_manifest_sha256,
-        )?;
+        let batch =
+            verify_reference_artifact(published, expected_data_sha256, expected_manifest_sha256)?;
         return Ok(VerifiedReferenceCounts {
             metadata: batch.contracts().len(),
             mark_index_funding: batch.mark_index_funding().len(),
@@ -223,54 +482,34 @@ pub fn verify_reference_artifact_read_only(
         HISTORICAL_REFERENCE_SCHEMA_V2,
     )?;
     validate_partition_path(&published.data_path, &manifest)?;
-    let mut metadata = BTreeSet::new();
-    let mut funding = BTreeSet::new();
-    let mut open_interest = BTreeSet::new();
+    let mut contracts = Vec::new();
+    let mut marks = Vec::new();
+    let mut open_interest = Vec::new();
     for (index, line) in data.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let row: serde_json::Value = serde_json::from_slice(line)
-            .with_context(|| format!("parse historical reference row {}", index + 1))?;
-        let kind = row.get("kind").and_then(serde_json::Value::as_str);
-        let observation = row.get("observation").context("historical row has no observation")?;
-        if observation.get("schema").and_then(serde_json::Value::as_str)
-            != Some(HISTORICAL_REFERENCE_SCHEMA_V2)
+        match serde_json::from_slice::<HistoricalReferenceRecordV2>(line)
+            .with_context(|| format!("parse historical reference row {}", index + 1))?
         {
-            bail!("historical reference row schema is invalid");
-        }
-        let symbol = observation
-            .get("symbol")
-            .and_then(serde_json::Value::as_str)
-            .filter(|symbol| !symbol.is_empty())
-            .context("historical reference row symbol is invalid")?
-            .to_string();
-        let inserted = match kind {
-            Some("metadata") => metadata.insert(symbol),
-            Some("mark_index_funding") => funding.insert(symbol),
-            Some("open_interest") => open_interest.insert(symbol),
-            _ => bail!("historical reference row kind is invalid"),
-        };
-        if !inserted {
-            bail!("historical reference artifact has duplicate rows");
+            HistoricalReferenceRecordV2::Metadata(row) => contracts.push(row),
+            HistoricalReferenceRecordV2::MarkIndexFunding(row) => marks.push(row),
+            HistoricalReferenceRecordV2::OpenInterest(row) => open_interest.push(row),
         }
     }
-    if metadata.is_empty()
-        || metadata != funding
-        || metadata != open_interest
-        || manifest.rows != (metadata.len() + funding.len() + open_interest.len()) as u64
-        || manifest.coverage.active_contracts != metadata.len() as u64
-        || manifest.coverage.metadata_observations != metadata.len() as u64
-        || manifest.coverage.mark_index_funding_observations != funding.len() as u64
-        || manifest.coverage.open_interest_observations != open_interest.len() as u64
-        || !manifest.coverage.is_complete()
+    let batch = HistoricalBatchV2::new(contracts, marks, open_interest)?;
+    let coverage = batch.coverage(manifest.observed_at_ns, manifest.max_staleness_ms)?;
+    if coverage != manifest.coverage
+        || !coverage.is_complete()
+        || batch.time_bounds()? != manifest.time_bounds
+        || manifest.rows != batch.row_count()
     {
         bail!("historical reference manifest does not match complete artifact contents");
     }
     Ok(VerifiedReferenceCounts {
-        metadata: metadata.len(),
-        mark_index_funding: funding.len(),
-        open_interest: open_interest.len(),
+        metadata: batch.contracts.len(),
+        mark_index_funding: batch.marks.len(),
+        open_interest: batch.open_interest.len(),
         historical_read_only: true,
     })
 }
@@ -599,28 +838,36 @@ fn source_endpoints() -> Vec<String> {
 }
 
 fn time_bounds(batch: &CompleteReferenceBatch) -> Result<ArtifactTimeBounds> {
-    let source_times = batch
-        .contracts()
-        .iter()
-        .map(|row| row.source_time_ms)
-        .chain(
-            batch
-                .mark_index_funding()
-                .iter()
-                .map(|row| row.source_time_ms),
-        )
-        .chain(batch.open_interest().iter().map(|row| row.source_time_ms));
-    let received_times = batch
-        .contracts()
-        .iter()
-        .flat_map(|row| [row.source_clock_received_at_ns, row.received_at_ns])
-        .chain(
-            batch
-                .mark_index_funding()
-                .iter()
-                .map(|row| row.received_at_ns),
-        )
-        .chain(batch.open_interest().iter().map(|row| row.received_at_ns));
+    artifact_time_bounds(
+        batch
+            .contracts()
+            .iter()
+            .map(|row| row.source_time_ms)
+            .chain(
+                batch
+                    .mark_index_funding()
+                    .iter()
+                    .map(|row| row.source_time_ms),
+            )
+            .chain(batch.open_interest().iter().map(|row| row.source_time_ms)),
+        batch
+            .contracts()
+            .iter()
+            .flat_map(|row| [row.source_clock_received_at_ns, row.received_at_ns])
+            .chain(
+                batch
+                    .mark_index_funding()
+                    .iter()
+                    .map(|row| row.received_at_ns),
+            )
+            .chain(batch.open_interest().iter().map(|row| row.received_at_ns)),
+    )
+}
+
+fn artifact_time_bounds(
+    source_times: impl Iterator<Item = u64>,
+    received_times: impl Iterator<Item = u64>,
+) -> Result<ArtifactTimeBounds> {
     let sources = source_times.collect::<Vec<_>>();
     let received = received_times.collect::<Vec<_>>();
     Ok(ArtifactTimeBounds {

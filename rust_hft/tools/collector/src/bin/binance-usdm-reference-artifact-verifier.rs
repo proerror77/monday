@@ -57,11 +57,8 @@ fn verify(args: Args) -> Result<VerificationOutput> {
         data_sha256: args.data_sha256.clone(),
         manifest_sha256: args.manifest_sha256.clone(),
     };
-    let counts = verify_reference_artifact_read_only(
-        &published,
-        &args.data_sha256,
-        &args.manifest_sha256,
-    )?;
+    let counts =
+        verify_reference_artifact_read_only(&published, &args.data_sha256, &args.manifest_sha256)?;
     Ok(VerificationOutput {
         schema: OUTPUT_SCHEMA,
         data_path: args.data_path,
@@ -176,7 +173,10 @@ mod tests {
 
     fn rewrite_as_historical_v2(published: &mut PublishedReferenceArtifact) {
         let mut data = Vec::new();
-        for line in fs::read(&published.data_path).unwrap().split(|byte| *byte == b'\n') {
+        for line in fs::read(&published.data_path)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+        {
             if line.is_empty() {
                 continue;
             }
@@ -191,7 +191,11 @@ mod tests {
             serde_json::to_writer(&mut data, &row).unwrap();
             data.push(b'\n');
         }
-        fs::write(&published.data_path, &data).unwrap();
+        reseal_data(published, &data);
+    }
+
+    fn reseal_data(published: &mut PublishedReferenceArtifact, data: &[u8]) {
+        fs::write(&published.data_path, data).unwrap();
         published.data_sha256 = hex::encode(Sha256::digest(&data));
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
@@ -233,6 +237,30 @@ mod tests {
         assert_eq!(output.open_interest_observations, 1);
         assert!(output.historical_read_only);
         assert!(output.content_rows_verified);
+    }
+
+    #[test]
+    fn historical_v2_readback_rejects_inconsistent_typed_contents() {
+        let (_temp, mut published) = fixture();
+        rewrite_as_historical_v2(&mut published);
+        let mut data = Vec::new();
+        for line in fs::read(&published.data_path)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+        {
+            if line.is_empty() {
+                continue;
+            }
+            let mut row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            if row["kind"] == "mark_index_funding" {
+                row["observation"]["basis"] = serde_json::json!("999");
+            }
+            serde_json::to_writer(&mut data, &row).unwrap();
+            data.push(b'\n');
+        }
+        reseal_data(&mut published, &data);
+
+        assert!(verify(args(&published)).is_err());
     }
 
     #[test]
