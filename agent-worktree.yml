@@ -2,7 +2,7 @@ owner: codex-root
 contract: binance-fee-systemd-credentialed-production-assets
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-systemd
 branch: codex/binance-fee-systemd
-base_sha: f924e073cee336b0b23b40d83a2308272c124de2
+base_sha: f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff
 allowed_files:
   - agent-worktree.yml
   - .github/workflows/ci.yml
@@ -15,5 +15,6 @@ allowed_files:
   - deployment/aliyun/binance-fee-upload.timer
   - deployment/aliyun/binance-fee-upload.env
   - deployment/aliyun/test-binance-fee-release-contract.sh
-dependency: issue #790 / PR #791
+dependency: issue #790 / PR #791 merged into f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff
+issue: 792
 no_external_runtime_mutation: true
