@@ -5968,6 +5968,7 @@ dependencies = [
  "ploy-market-contracts",
  "ploy-operator-contracts",
  "ploy-trading",
+ "polymarket-tape-contract",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
@@ -6526,6 +6527,17 @@ dependencies = [
  "stacker",
  "sysinfo 0.33.1",
  "version_check",
+]
+
+[[package]]
+name = "polymarket-tape-contract"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
