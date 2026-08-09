@@ -6,6 +6,7 @@ base_sha: f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff
 allowed_files:
   - agent-worktree.yml
   - .github/workflows/ci.yml
+  - .github/workflows/acr-publish.yml
   - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
   - deployment/aliyun/binance-fee-snapshot-spot.service
   - deployment/aliyun/binance-fee-snapshot-spot.timer
@@ -14,6 +15,9 @@ allowed_files:
   - deployment/aliyun/binance-fee-upload.service
   - deployment/aliyun/binance-fee-upload.timer
   - deployment/aliyun/binance-fee-upload.env
+  - deployment/aliyun/binance-fee.conf
+  - deployment/aliyun/monday-collector-health.sh
+  - deployment/aliyun/test-monday-collector-health.sh
   - deployment/aliyun/test-binance-fee-release-contract.sh
 dependency: issue #790 / PR #791 merged into f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff
 issue: 792

@@ -57,6 +57,12 @@ BYBIT_UPLOAD_TIMER=bybit-options-upload.timer
 BYBIT_UPLOAD_SERVICE=bybit-options-upload.service
 USDM_REF_UPLOAD_TIMER=binance-usdm-reference-upload.timer
 USDM_REF_UPLOAD_SERVICE=binance-usdm-reference-upload.service
+FEE_SPOT_TIMER=binance-fee-snapshot-spot.timer
+FEE_SPOT_SERVICE=binance-fee-snapshot-spot.service
+FEE_USDM_TIMER=binance-fee-snapshot-usdm.timer
+FEE_USDM_SERVICE=binance-fee-snapshot-usdm.service
+FEE_UPLOAD_TIMER=binance-fee-upload.timer
+FEE_UPLOAD_SERVICE=binance-fee-upload.service
 POLY_RAW_OPS_GATE='polymarket-raw-ops-gate@.service'
 
 JSON_MODE=0
@@ -323,6 +329,15 @@ check_upload() {
     '$base + {($k): $v}')
 }
 
+check_upload_required() {
+  label=$1
+  spool_dir=$2
+  if [ ! -f "$spool_dir/upload-status.json" ] || [ -L "$spool_dir/upload-status.json" ]; then
+    record_breach "$label: upload-status.json missing or a symbolic link"
+  fi
+  check_upload "$label" "$spool_dir"
+}
+
 check_delay_gate() {
   # Journald delay-gate trips (the fail-closed reconnect path) in the last 15m.
   # Capture journalctl's own exit status separately: a successful no-match query
@@ -390,6 +405,12 @@ check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
 check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
 check_timer "$USDM_REF_UPLOAD_TIMER" "binance-usdm-reference-upload.timer"
 check_oneshot_result "$USDM_REF_UPLOAD_SERVICE" "binance-usdm-reference-upload.service"
+check_timer "$FEE_SPOT_TIMER" "binance-fee-snapshot-spot.timer"
+check_oneshot_result "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
+check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
+check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
+check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
 
 check_disabled_unit "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
@@ -402,6 +423,7 @@ check_upload "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-refere
 check_upload "bybit-options-upload" "$SPOOL_ROOT/bybit-options"
 check_upload "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket"
 check_upload "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference"
+check_upload_required "binance-fee-upload" "$SPOOL_ROOT/binance-fee"
 
 check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
 check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"

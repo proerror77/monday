@@ -585,6 +585,8 @@ jobs:
             binance-fee-upload.service
             binance-fee-upload.timer
             binance-fee-upload.env
+            binance-fee.conf
+            monday-collector-health.sh
           )
           (
             cd deployment/aliyun

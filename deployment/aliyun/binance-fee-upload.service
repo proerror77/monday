@@ -12,7 +12,7 @@ Group=hftcollector
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/binance-fee-upload.env
 ExecStart=/opt/monday/bin/binance-fee-snapshot-upload --output-root /data/monday/spool/binance-fee
-TimeoutStartSec=300
+TimeoutStartSec=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
