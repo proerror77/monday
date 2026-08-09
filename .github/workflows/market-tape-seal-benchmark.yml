@@ -130,11 +130,11 @@ jobs:
         run: |
           set -euo pipefail
           {
-            printf '## Polymarket tape seal benchmark\n\n'
-            printf 'Exact main: `%s`\n\n' "$EXACT_MAIN_SHA"
-            printf '```text\n'
-            grep -E 'UPLOAD_PHASE phase=benchmark_|IMMUTABLE_FIXTURE_(BENCH|CLEANUP)' "$BENCHMARK_LOG"
-            printf '```\n'
+            printf "## Polymarket tape seal benchmark\n\n"
+            printf "Exact main: %s\n\n" "$EXACT_MAIN_SHA"
+            printf "Phase evidence:\n\n"
+            grep -E 'UPLOAD_PHASE phase=benchmark_|IMMUTABLE_FIXTURE_(BENCH|CLEANUP)' "$BENCHMARK_LOG" \
+              | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove all benchmark data
