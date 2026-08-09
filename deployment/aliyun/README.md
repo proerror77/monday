@@ -550,14 +550,16 @@ install a digest-addressed release under
 pass the one-hour isolated shadow gate
 (`binance-usdm-reference-collector-shadow@<candidate-sha256>.service` observed
 by `binance-usdm-reference-shadow-gate.sh`), then promote with
-`binance-usdm-reference-cutover.sh <candidate-sha256>`. The shadow bundle
+`binance-usdm-reference-cutover.sh <candidate-sha256> <controller>`. The shadow bundle
 (`binance-usdm-reference-control.tar.gz`) keeps exactly the three gate assets;
 the production units ship in the separate
 `binance-usdm-reference-production-control.tar.gz` bundle, so production
 assets can never invalidate a completed shadow gate.
 
-The cutover is green-field only: it refuses any existing production unit,
-symlink, or canonical lake artifact. It revalidates the release identity, the
+The cutover accepts either an empty new host or one healthy digest-addressed
+production release. On an upgrade it first binds the old uploader, destination
+environment, and rollback assets by digest, stops the writer, and drains every
+V2 artifact before switching schemas. It revalidates the candidate release identity, the
 uploader sidecar digest, the production bundle manifest, and exactly one
 immutable `PASSED.sha256` shadow gate before touching systemd. It then
 installs the production units, points
@@ -568,6 +570,9 @@ checked health, proves one OSS round trip by draining the spool with the
 candidate uploader, requires fresh post-drain health, and only then enables
 `binance-usdm-reference-collector.service` and
 `binance-usdm-reference-upload.timer`. Failure after the transition starts
+drains any possible V3 output before restoring V2; if that drain cannot be
+proven empty, production remains fail-closed. The named controller and both
+release/rollback identities are recorded in cutover evidence.
 disables and runtime-masks every lane unit and removes candidate symlinks.
 Evidence is append-only under
 `/data/monday/evidence/binance-usdm-reference-cutovers/` and is valid only as
