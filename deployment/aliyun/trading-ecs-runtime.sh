@@ -302,6 +302,7 @@ validate_runtime_secrets() {
   local runtime_env=$secret_root/runtime.env
   local feedback_key=$secret_root/feedback-signing-key.hex
   local fs_type runtime_env_fs feedback_key_fs api_prefixes secret_prefixes grpc_token
+  local binance_account_json
   local expected_uid runtime_uid runtime_gid
   local runtime_ids
   expected_uid=${EXPECTED_ROOT_UID:-$EXPECTED_ROOT_UID_DEFAULT}
@@ -333,12 +334,11 @@ validate_runtime_secrets() {
   [[ $(wc -l <"$feedback_key") -eq 1 ]] || return 1
   grep -Eq '^[0-9a-f]{64}$' "$feedback_key" || return 1
   grep -Eq '^HFT_GRPC_AUTH_TOKEN=.+$' "$runtime_env" || return 1
-  grep -Eq '^HFT_SECRET_[A-Z0-9_]+_API_KEY=.+$' "$runtime_env" || return 1
-  grep -Eq '^HFT_SECRET_[A-Z0-9_]+_SECRET=.+$' "$runtime_env" || return 1
   if ! awk -F= '
     !/^[A-Z_][A-Z0-9_]*=.+$/ { exit 1 }
     seen[$1]++ { exit 1 }
     $1 == "HFT_GRPC_AUTH_TOKEN" { grpc++; next }
+    $1 == "HFT_SECRET_BINANCE_ACCOUNT_JSON" { next }
     $1 ~ /^HFT_SECRET_[A-Z0-9][A-Z0-9_]*_(API_KEY|SECRET)$/ { next }
     { exit 1 }
     END { if (grpc != 1) exit 1 }
@@ -349,7 +349,18 @@ validate_runtime_secrets() {
     "$runtime_env" | LC_ALL=C sort -u) || return 1
   secret_prefixes=$(sed -n 's/^HFT_SECRET_\([A-Z0-9_]*\)_SECRET=.*/\1/p' \
     "$runtime_env" | LC_ALL=C sort -u) || return 1
-  [[ -n $api_prefixes && $api_prefixes == "$secret_prefixes" ]] || return 1
+  [[ $api_prefixes == "$secret_prefixes" ]] || return 1
+  binance_account_json=$(sed -n 's/^HFT_SECRET_BINANCE_ACCOUNT_JSON=//p' \
+    "$runtime_env") || return 1
+  [[ -n $api_prefixes || -n $binance_account_json ]] || return 1
+  if [[ -n $binance_account_json ]]; then
+    ! grep -Eq '^HFT_SECRET_BINANCE_(API_KEY|SECRET)=' "$runtime_env" || return 1
+    jq -e '
+      type == "object"
+      and (keys | sort) == ["api_key", "runtime_account_id", "secret"]
+      and all(.runtime_account_id, .api_key, .secret; type == "string" and test("[^[:space:]]"))
+    ' <<<"$binance_account_json" >/dev/null || return 1
+  fi
   if grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=$|^[[:space:]]|[[:space:]]$' "$runtime_env"; then
     return 1
   fi
@@ -357,6 +368,24 @@ validate_runtime_secrets() {
   [[ ${#grpc_token} -ge 32 \
     && ! $grpc_token =~ ^[[:space:]] \
     && ! $grpc_token =~ [[:space:]]$ ]] || return 1
+}
+
+validate_runtime_account_binding() {
+  local activation_dir=$1 secret_root=${SECRET_ROOT:-$SECRET_ROOT_DEFAULT}
+  local binance_account_json policy_venue runtime_account_id
+  policy_venue=$(jq -er '.venue | ascii_downcase' \
+    "$activation_dir/deployment/policy.json") || return 1
+  case $policy_venue in
+    binance|binance_spot|binance_futures) ;;
+    *) return 0 ;;
+  esac
+  binance_account_json=$(sed -n 's/^HFT_SECRET_BINANCE_ACCOUNT_JSON=//p' \
+    "$secret_root/runtime.env") || return 1
+  [[ -n $binance_account_json ]] || return 1
+  runtime_account_id=$(jq -er '.runtime_account_id' <<<"$binance_account_json") || return 1
+  jq -e --arg runtime_account_id "$runtime_account_id" \
+    '.account_id == $runtime_account_id' \
+    "$activation_dir/deployment/policy.json" >/dev/null
 }
 
 load_current() {
@@ -412,6 +441,8 @@ preflight() {
   [[ $activation_sha == "$HFT_ACTIVATION_SHA256" ]] || die "activation identity mismatch"
   validate_paper_shadow_authority "$HFT_ACTIVATION_DIR" || die "activation is not fail-closed Paper/Shadow"
   validate_runtime_secrets || die "RAM-role injected tmpfs secrets are absent or unsafe"
+  validate_runtime_account_binding "$HFT_ACTIVATION_DIR" \
+    || die "Binance credential account does not match activation account"
   docker image inspect "$HFT_TRADING_IMAGE" --format '{{json .RepoDigests}}' \
     | jq -e --arg image "$HFT_TRADING_IMAGE" 'index($image) != null' >/dev/null \
     || die "digest-pinned image is not staged locally"
@@ -454,7 +485,7 @@ run_container() {
     --mount "type=bind,src=$secret_root/feedback-signing-key.hex,dst=/run/secrets/hft/feedback-signing-key.hex,readonly" \
     --entrypoint /bin/sh \
     "$HFT_TRADING_IMAGE" \
-    -euc 'while IFS= read -r secret; do export "$secret"; done < /run/secrets/hft/runtime.env; unset secret; exec /usr/local/bin/hft-live "$@"' \
+    -euc 'while IFS= read -r secret; do export "$secret"; done < /run/secrets/hft/runtime.env; unset secret; policy_venue=$(jq -er ".venue | ascii_downcase" /activation/deployment/policy.json); case "$policy_venue" in binance|binance_spot|binance_futures) runtime_account_id=$(printf %s "${HFT_SECRET_BINANCE_ACCOUNT_JSON:?}" | jq -er .runtime_account_id); policy_account_id=$(jq -er .account_id /activation/deployment/policy.json); [ "$runtime_account_id" = "$policy_account_id" ];; esac; if [ -n "${HFT_SECRET_BINANCE_ACCOUNT_JSON:-}" ]; then export HFT_SECRET_BINANCE_API_KEY=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .api_key) HFT_SECRET_BINANCE_SECRET=$(printf %s "$HFT_SECRET_BINANCE_ACCOUNT_JSON" | jq -er .secret); unset HFT_SECRET_BINANCE_ACCOUNT_JSON; fi; unset policy_venue runtime_account_id policy_account_id; exec /usr/local/bin/hft-live "$@"' \
     hft-live \
     --config /activation/config/system.yaml \
     --deployment-envelope /activation/deployment/envelope.json \

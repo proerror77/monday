@@ -2,7 +2,7 @@ owner: codex-root
 contract: runtime-arrival-instrumentation
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-arrival-instrumentation
 branch: codex/runtime-arrival-instrumentation
-base_sha: fd3afe63e5cd8919a8e1f68e23020aada29655c1
+base_sha: 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
 allowed_files:
   - agent-worktree.yml
   - rust_hft/apps/live/src/runtime_attribution.rs
@@ -11,5 +11,5 @@ allowed_files:
   - rust_hft/market-core/engine/src/lib.rs
   - rust_hft/market-core/ports/src/events.rs
   - rust_hft/market-core/runtime/src/system_builder/simulated_execution.rs
-dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1
+dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1; PR #789 merged into 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
 no_external_runtime_mutation: true

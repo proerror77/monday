@@ -2244,6 +2244,7 @@ mod tests {
                 evidence: vec![cex_triplet('4')],
             },
             fee_schedule: hft_research_manifest::CexFeeScheduleV2 {
+                runtime_account_id: "binance-main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 maker_buy_fee_bps: "2".to_string(),
                 maker_sell_fee_bps: "2".to_string(),
@@ -2274,6 +2275,7 @@ mod tests {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
                 venue: "binance".to_string(),
                 symbol: "BTCUSDT".to_string(),
+                runtime_account_id: "binance-main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 evidence: cex_triplet('8'),
                 first_observed_at: first_event_time - ChronoDuration::seconds(2),
