@@ -14,6 +14,7 @@ pub struct VerifiedRuntimeLatencyEvidence {
     pub signed_events: Vec<u8>,
     pub first_observed_at: DateTime<Utc>,
     pub last_observed_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
     pub observations: u64,
     pub p50_ns: u64,
     pub p95_ns: u64,
@@ -114,7 +115,10 @@ pub fn verify_runtime_latency_evidence(
             i64::try_from(available_at_us).context("evidence availability exceeds i64")?,
         )
         .context("runtime feedback evidence availability is invalid")?;
-        if available_at > available_before {
+        if event.observed_at > available_at {
+            bail!("runtime feedback observation is after its evidence availability");
+        }
+        if available_at > available_before || event.observed_at > available_before {
             continue;
         }
         let Some(arrival_slippage_bps) = event.metrics.get("arrival_slippage_bps").copied() else {
@@ -124,6 +128,7 @@ pub fn verify_runtime_latency_evidence(
             bail!("runtime feedback arrival slippage is invalid");
         }
         observations.push((
+            event.observed_at,
             available_at,
             metric_u64(&event.metrics, "intent_to_private_report_us")?,
             arrival_slippage_bps,
@@ -134,14 +139,18 @@ pub fn verify_runtime_latency_evidence(
     if observations.is_empty() {
         bail!("no verified pre-snapshot live order lifecycle observations match");
     }
-    observations.sort_by_key(|(observed_at, _, _)| *observed_at);
+    observations.sort_by_key(|(observed_at, _, _, _)| *observed_at);
     let mut latencies = observations
         .iter()
-        .map(|(_, latency_us, _)| latency_us.saturating_mul(1_000))
-        .collect::<Vec<_>>();
+        .map(|(_, _, latency_us, _)| {
+            latency_us
+                .checked_mul(1_000)
+                .context("runtime feedback latency overflows nanoseconds")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut costs = observations
         .iter()
-        .map(|(_, _, slippage_bps)| *slippage_bps)
+        .map(|(_, _, _, slippage_bps)| *slippage_bps)
         .collect::<Vec<_>>();
     latencies.sort_unstable();
     costs.sort_by(f64::total_cmp);
@@ -150,6 +159,11 @@ pub fn verify_runtime_latency_evidence(
         signed_events,
         first_observed_at: observations.first().unwrap().0,
         last_observed_at: observations.last().unwrap().0,
+        available_at: observations
+            .iter()
+            .map(|(_, available_at, _, _)| *available_at)
+            .max()
+            .unwrap(),
         observations: observations.len() as u64,
         p50_ns: percentile(&latencies, 50),
         p95_ns: percentile(&latencies, 95),
@@ -309,9 +323,10 @@ mod tests {
         let (_directory, log, _log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
         let line = std::fs::read(&log).unwrap();
         let signed: SignedRuntimeAttributionEvent = serde_json::from_slice(&line).unwrap();
-        let mut pretty = serde_json::to_vec_pretty(&signed).unwrap();
-        pretty.push(b'\n');
-        let bytes = [line.as_slice(), pretty.as_slice()].concat();
+        let value = serde_json::to_value(&signed).unwrap();
+        let mut alternate = serde_json::to_vec(&value).unwrap();
+        alternate.push(b'\n');
+        let bytes = [line.as_slice(), alternate.as_slice()].concat();
         std::fs::write(&log, &bytes).unwrap();
         let evidence = verify_runtime_latency_evidence(
             &log,
@@ -329,5 +344,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(evidence.observations, 1);
+    }
+
+    #[test]
+    fn rejects_observation_after_claimed_availability() {
+        let (_directory, log, _log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
+        let signed: SignedRuntimeAttributionEvent =
+            serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+        let mut event = signed.event;
+        event.observed_at = DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let signed =
+            sign_runtime_attribution_event(event, "key-1", &SigningKey::from_bytes(&[7_u8; 32]))
+                .unwrap();
+        let mut bytes = serde_json::to_vec(&signed).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&log, &bytes).unwrap();
+
+        assert!(verify_runtime_latency_evidence(
+            &log,
+            &hex::encode(Sha256::digest(&bytes)),
+            &keys,
+            &keys_sha,
+            "deployment-1",
+            "spot",
+            "BTCUSDT",
+            "binance-main",
+            DateTime::parse_from_rfc3339("2026-07-14T00:00:02Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .is_err());
     }
 }
