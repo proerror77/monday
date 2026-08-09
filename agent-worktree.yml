@@ -1,17 +1,17 @@
 owner: codex-root
-contract: cex-fee-runtime-account-binding
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/fee-account-binding
-branch: codex/fee-account-binding
-base_sha: fd3afe63e5cd8919a8e1f68e23020aada29655c1
+contract: binance-fee-oss-transport
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-oss-transport
+branch: codex/binance-fee-oss-transport
+base_sha: 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/research-core/manifest/src/lib.rs
-  - rust_hft/alpha-harness/app/src/mission_runner.rs
-  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
-  - rust_hft/tools/collector/src/binance_fee_artifact.rs
-  - deployment/aliyun/trading-ecs-runtime.sh
-  - deployment/aliyun/test-trading-ecs-host-contract.sh
-  - deployment/aliyun/TRADING_ECS_HOST.md
-  - rust_hft/deployment/docker/Dockerfile.trading
-dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1
+  - rust_hft/tools/collector/Cargo.toml
+  - rust_hft/tools/collector/src/lib.rs
+  - rust_hft/tools/collector/src/binance_fee_upload.rs
+  - rust_hft/tools/collector/src/bin/binance-fee-snapshot-upload.rs
+  - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
+  - rust_hft/deployment/docker/Dockerfile.binance-lob-archiver
+  - .github/workflows/acr-publish.yml
+dependency: PR #789 merged as 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
+issue: 790
 no_external_runtime_mutation: true

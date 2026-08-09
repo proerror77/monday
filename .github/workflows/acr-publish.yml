@@ -496,12 +496,16 @@ jobs:
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-collector" artifact/binance-usdm-reference-collector
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-artifact-verifier" artifact/binance-usdm-reference-artifact-verifier
           docker cp "$container_id:/usr/local/bin/binance-usdm-reference-upload" artifact/binance-usdm-reference-upload
+          docker cp "$container_id:/usr/local/bin/binance-fee-snapshot" artifact/binance-fee-snapshot
+          docker cp "$container_id:/usr/local/bin/binance-fee-snapshot-upload" artifact/binance-fee-snapshot-upload
           chmod 0755 artifact/binance-lob-archiver
           chmod 0755 artifact/polymarket-raw-ops
           chmod 0755 artifact/bybit-options-archiver
           chmod 0755 artifact/binance-usdm-reference-collector
           chmod 0755 artifact/binance-usdm-reference-artifact-verifier
           chmod 0755 artifact/binance-usdm-reference-upload
+          chmod 0755 artifact/binance-fee-snapshot
+          chmod 0755 artifact/binance-fee-snapshot-upload
           artifact/binance-lob-archiver --version \
             | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
           artifact/polymarket-raw-ops --version \
@@ -519,6 +523,10 @@ jobs:
               | tee binance-usdm-reference-artifact-verifier.sha256
             sha256sum binance-usdm-reference-upload \
               | tee binance-usdm-reference-upload.sha256
+            sha256sum binance-fee-snapshot \
+              | tee binance-fee-snapshot.sha256
+            sha256sum binance-fee-snapshot-upload \
+              | tee binance-fee-snapshot-upload.sha256
           )
           control_assets=(
             polymarket-raw-ops-gate-control.sh
