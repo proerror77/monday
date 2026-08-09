@@ -29,6 +29,9 @@ grep -Fqx "        description: Image target to publish (polymarket-raw-ops uses
 grep -Fqx '          - polymarket-raw-ops' "$workflow"
 grep -Fqx '          - research-source-test' "$workflow"
 grep -Fqx '  actions: read' "$workflow"
+grep -Fqx 'concurrency:' "$workflow"
+grep -Fqx '  group: acr-publish-${{ github.ref }}' "$workflow"
+grep -Fqx '  cancel-in-progress: false' "$workflow"
 grep -Fqx '      rebuild_research_runner:' "$workflow"
 grep -Fqx '      source_test_source_sha:' "$workflow"
 grep -Fqx '          jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs" \' "$workflow"
@@ -59,8 +62,12 @@ grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}'
 grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
 grep -Fqx '  publish-source-test:' "$workflow"
 grep -Fqx "    if: needs.selector.outputs.publish_target == 'research-source-test'" "$workflow"
+grep -Fqx '      source_test_profile: ${{ steps.source.outputs.source_test_profile }}' "$workflow"
+grep -Fqx '      source_test_tag: ${{ steps.source.outputs.source_test_tag }}' "$workflow"
 grep -Fqx '          SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}' "$workflow"
+grep -Fqx '          SOURCE_TEST_PROFILE: ${{ inputs.source_test_profile }}' "$workflow"
 grep -Fqx '            --source-test-sha "$SOURCE_TEST_SOURCE_SHA" \' "$workflow"
+grep -Fqx '            --source-test-profile "$SOURCE_TEST_PROFILE" \' "$workflow"
 
 source_test_block=$(sed -n '/^  publish-source-test:$/,$p' "$workflow")
 grep -Fq 'ref: ${{ github.sha }}' <<<"$source_test_block"
@@ -75,6 +82,11 @@ grep -Fq 'load: true' <<<"$source_test_block"
 grep -Fq 'push: false' <<<"$source_test_block"
 grep -Fq 'provenance: false' <<<"$source_test_block"
 grep -Fq 'research-source-test@${{ steps.push.outputs.digest }}' <<<"$source_test_block"
+grep -Fq 'IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
+grep -Fq '${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
+grep -Fq 'com.monday.image.source-test-profile=${{ needs.selector.outputs.source_test_profile }}' <<<"$source_test_block"
+grep -Fq 'com.monday.image.source-test-identity=${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
+grep -Fq 'SOURCE_TEST_TAG: ${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
 grep -Fq 'docker run --rm --network none --read-only' <<<"$source_test_block"
 grep -Fq -- '--tmpfs /tmp:rw,nosuid,nodev,size=16g' <<<"$source_test_block"
 grep -Fq -- '--tmpfs /tmp/monday-source-test-target:rw,exec,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=16g' <<<"$source_test_block"
@@ -83,10 +95,19 @@ grep -Fq 'Refuse source-test tag overwrite' <<<"$source_test_block"
 grep -Fq 'if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then' <<<"$source_test_block"
 grep -Fq '*"manifest unknown"*|*"no such manifest"*) ;;' <<<"$source_test_block"
 grep -Fq 'docker buildx imagetools inspect "$IMAGE_TAG" --format' <<<"$source_test_block"
+grep -Fq 'test "$actual_source_test_profile" = "$TEST_PROFILE"' <<<"$source_test_block"
+grep -Fq 'test "$actual_source_test_identity" = "$SOURCE_TEST_TAG"' <<<"$source_test_block"
+grep -Fq 'echo "publication_identity=$SOURCE_REVISION/$TEST_PROFILE"' <<<"$source_test_block"
+grep -Fq 'echo "publication_tag=$IMAGE_TAG"' <<<"$source_test_block"
 test "$(grep -n '^      - name: Verify source-test image before publication$' "$workflow" | cut -d: -f1)" \
   -lt "$(grep -n '^      - name: Push verified source-test image$' "$workflow" | cut -d: -f1)"
 if grep -Fq 'research-source-test:run-' <<<"$source_test_block" || grep -Fq 'cache-to: type=gha,mode=max,scope=acr-research-source-test' <<<"$source_test_block"; then
   printf 'source-test image contract retains a mutable tag or persistent build cache\n' >&2
+  exit 1
+fi
+if grep -Fq 'research-source-test:${{ needs.selector.outputs.source_sha }}' <<<"$source_test_block" || \
+  grep -Fq '${{ inputs.source_test_profile }}' <<<"$source_test_block"; then
+  printf 'source-test image contract bypasses its selected SHA/profile identity\n' >&2
   exit 1
 fi
 

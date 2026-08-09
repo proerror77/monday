@@ -336,9 +336,23 @@ proves neither application runtime nor Testnet/Live authority. It is independent
 of the suspended `monday-spot-cex-baseline-689`, which remains frozen pending
 separate governance reconciliation by its owner.
 
-The publisher accepts only the current `main` SHA, refuses to overwrite that tag, and
-records the immutable digest used by a Job; it creates neither a service nor a
-persistent build cache. The Job TTL cleans up its Pod and Job after the receipt.
-Registry retention or removal remains an ACR-owner action after that receipt.
-Each receipt is evidence only for the exact source revision named by its image;
-later commits require a newly published digest.
+The publisher accepts only the current `main` SHA and an allowed source-test
+profile. It derives the immutable publication tag
+`source-test-<40-hex-source-sha>-<profile>`, refuses to overwrite that exact
+SHA/profile tag, and records the tag, profile, and immutable digest used by a
+Job; it creates neither a service nor a persistent build cache. Historical
+source-SHA-only tags remain read-only history and cannot be relabeled or reused
+as proof for another profile. The Job TTL cleans up its Pod and Job after the
+receipt. Registry retention or removal remains an ACR-owner action after that
+receipt. Each receipt is evidence only for the exact source revision and
+verified profile named by its image; later commits or different profiles require
+a newly published digest.
+
+Because the selector admits source-test publication only from `refs/heads/main`,
+the workflow-level `acr-publish-${{ github.ref }}` concurrency group with
+`cancel-in-progress: false` serializes its tag-absence probe, build,
+verification, push, and digest readback. A later dispatch cannot reach the same
+tag's push until the first has finished, at which point the absence probe fails
+closed. Personal Edition has no immutable-image-tag setting, so this publisher
+lock and its exact digest record are the CI-path protection; registry writer
+access remains a separate ACR-owner boundary.

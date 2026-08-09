@@ -58,6 +58,8 @@ jobs:
       research_mode: ${{ steps.source.outputs.research_mode }}
       source_sha: ${{ steps.source.outputs.source_sha }}
       artifact_run_id: ${{ steps.source.outputs.artifact_run_id }}
+      source_test_profile: ${{ steps.source.outputs.source_test_profile }}
+      source_test_tag: ${{ steps.source.outputs.source_test_tag }}
     steps:
       - name: Checkout source selector
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -94,6 +96,7 @@ jobs:
           PUBLISH_TARGET: ${{ inputs.target }}
           REBUILD_RESEARCH_RUNNER: ${{ inputs.rebuild_research_runner }}
           SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}
+          SOURCE_TEST_PROFILE: ${{ inputs.source_test_profile }}
           CURRENT_SHA: ${{ github.sha }}
           CURRENT_RUN_ID: ${{ github.run_id }}
           CURRENT_REF: ${{ github.ref }}
@@ -110,6 +113,7 @@ jobs:
             --target "$PUBLISH_TARGET" \
             --rebuild "$REBUILD_RESEARCH_RUNNER" \
             --source-test-sha "$SOURCE_TEST_SOURCE_SHA" \
+            --source-test-profile "$SOURCE_TEST_PROFILE" \
             --current-sha "$CURRENT_SHA" \
             --current-run-id "$CURRENT_RUN_ID" \
             --current-ref "$CURRENT_REF"
@@ -673,7 +677,7 @@ jobs:
 
       - name: Validate source-test profile
         env:
-          TEST_PROFILE: ${{ inputs.source_test_profile }}
+          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
         run: |
           case "$TEST_PROFILE" in
             binance-bstocks-attestation|bybit-spot) ;;
@@ -692,7 +696,7 @@ jobs:
 
       - name: Refuse source-test tag overwrite
         env:
-          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
         run: |
           if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then
             echo "source-test image tag already exists: $IMAGE_TAG" >&2
@@ -715,24 +719,35 @@ jobs:
           build-args: |
             SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
           tags: |
-            ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
             com.monday.image.purpose=non-production-source-test
             com.monday.image.retention=single-ack-test
+            com.monday.image.source-test-profile=${{ needs.selector.outputs.source_test_profile }}
+            com.monday.image.source-test-identity=${{ needs.selector.outputs.source_test_tag }}
 
       - name: Verify source-test image before publication
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          TEST_PROFILE: ${{ inputs.source_test_profile }}
+          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
+          SOURCE_TEST_TAG: ${{ needs.selector.outputs.source_test_tag }}
         run: |
           set -euo pipefail
           actual_source_revision=$(docker image inspect \
             --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
             "$IMAGE")
+          actual_source_test_profile=$(docker image inspect \
+            --format '{{ index .Config.Labels "com.monday.image.source-test-profile" }}' \
+            "$IMAGE")
+          actual_source_test_identity=$(docker image inspect \
+            --format '{{ index .Config.Labels "com.monday.image.source-test-identity" }}' \
+            "$IMAGE")
           test "$actual_source_revision" = "$SOURCE_REVISION"
+          test "$actual_source_test_profile" = "$TEST_PROFILE"
+          test "$actual_source_test_identity" = "$SOURCE_TEST_TAG"
           docker run --rm --network none --read-only \
             --tmpfs /tmp:rw,nosuid,nodev,size=16g \
             --tmpfs /tmp/monday-source-test-target:rw,exec,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=16g \
@@ -741,7 +756,7 @@ jobs:
       - name: Push verified source-test image
         id: push
         env:
-          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_sha }}
+          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
         run: |
           set -euo pipefail
           docker push "$IMAGE_TAG"
@@ -752,13 +767,16 @@ jobs:
       - name: Record immutable source-test image
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test@${{ steps.push.outputs.digest }}
+          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          TEST_PROFILE: ${{ inputs.source_test_profile }}
+          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
         run: |
           {
             echo "research-source-test=$IMAGE"
             echo "source_revision=$SOURCE_REVISION"
             echo "verified_profile=$TEST_PROFILE"
+            echo "publication_identity=$SOURCE_REVISION/$TEST_PROFILE"
+            echo "publication_tag=$IMAGE_TAG"
             echo "retention=single ACK source-test Job; no runtime deployment"
           } >> "$GITHUB_STEP_SUMMARY"
 

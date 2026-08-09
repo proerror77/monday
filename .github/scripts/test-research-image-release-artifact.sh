@@ -35,12 +35,34 @@ assert_source manual-nonresearch $'publish_target=hft-trading\nresearch_mode=non
 assert_source manual-raw-ops-alias $'publish_target=binance-lob-archiver\nresearch_mode=none\nsource_sha=2222222222222222222222222222222222222222\nartifact_run_id=5678' \
   --event workflow_dispatch --target polymarket-raw-ops --rebuild false \
   --current-sha "$other_sha" --current-run-id 5678
-assert_source source-test $'publish_target=research-source-test\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678' \
+assert_source source-test $'publish_target=research-source-test\nresearch_mode=none\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=5678\nsource_test_profile=binance-bstocks-attestation\nsource_test_tag=source-test-1111111111111111111111111111111111111111-binance-bstocks-attestation' \
   --event workflow_dispatch --target research-source-test --rebuild false \
-  --source-test-sha "$main_sha" --current-ref refs/heads/main \
+  --source-test-sha "$main_sha" --source-test-profile binance-bstocks-attestation --current-ref refs/heads/main \
   --current-sha "$main_sha" --current-run-id 5678
 
-for rejected in failed-run pull-request-run branch-run implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-rebuild source-test-on-runtime automated-source-test; do
+assert_source_test_identity() {
+  local name=$1 profile=$2
+  local output="$tmp_dir/$name.out" tag selected_profile
+  "$selector" --event workflow_dispatch --target research-source-test --rebuild false \
+    --source-test-sha "$main_sha" --source-test-profile "$profile" \
+    --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 \
+    --output "$output"
+  selected_profile=$(sed -n 's/^source_test_profile=//p' "$output")
+  tag=$(sed -n 's/^source_test_tag=//p' "$output")
+  test "$selected_profile" = "$profile"
+  test "$tag" = "source-test-$main_sha-$profile"
+}
+
+assert_source_test_identity source-test-binance binance-bstocks-attestation
+assert_source_test_identity source-test-bybit bybit-spot
+assert_source_test_identity source-test-binance-repeat binance-bstocks-attestation
+binance_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/source-test-binance.out")
+bybit_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/source-test-bybit.out")
+binance_repeat_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/source-test-binance-repeat.out")
+test "$binance_source_test_tag" != "$bybit_source_test_tag"
+test "$binance_source_test_tag" = "$binance_repeat_source_test_tag"
+
+for rejected in failed-run pull-request-run branch-run implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
   case "$rejected" in
     failed-run) args=(--event workflow_run --conclusion failure --source-event push --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
     pull-request-run) args=(--event workflow_run --conclusion success --source-event pull_request --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
@@ -50,6 +72,7 @@ for rejected in failed-run pull-request-run branch-run implicit-rebuild source-t
     source-test-nonmain) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/codex/example --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-untrusted-sha) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-rebuild) args=(--event workflow_dispatch --target research-source-test --rebuild true --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
+    source-test-invalid-profile) args=(--event workflow_dispatch --target research-source-test --rebuild false --source-test-sha "$main_sha" --source-test-profile invalid-profile --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678) ;;
     source-test-on-runtime) args=(--event workflow_dispatch --target hft-trading --rebuild false --source-test-sha "$main_sha" --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     automated-source-test) args=(--event workflow_run --conclusion success --source-event push --head-branch main --head-sha "$main_sha" --run-id 1234 --binaries-conclusion success --smoke-conclusion success --source-test-sha "$main_sha") ;;
   esac
