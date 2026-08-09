@@ -7,13 +7,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V1: &str = "cex-replay-snapshot-v1";
+pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V2: &str = "cex-replay-snapshot-v2";
 pub const CEX_REPLAY_DATASET_KIND: &str = "cex_replay_feature_dataset";
 pub const CEX_REPLAY_DATASET_SCHEMA_V1: &str = "cex-replay-feature-dataset-v1";
+pub const CEX_REPLAY_DATASET_SCHEMA_V2: &str = "cex-replay-feature-dataset-v2";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2: &str = "binance-lob-pit-v2";
+pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3: &str = "binance-lob-pit-v3";
 pub const CEX_REPLAY_CLOCK_RECEIVED_AT_NS: &str = "received_at_ns";
 pub const CEX_FEATURE_AVAILABILITY_POLICY: &str = "feature_available_time_equals_event_time";
 pub const CEX_MODALITY_LOB: &str = "lob";
 pub const CEX_MODALITY_AGGREGATE_TRADE: &str = "aggregate_trade";
+pub const CEX_MODALITY_FUNDING: &str = "funding";
+pub const CEX_MODALITY_OPEN_INTEREST: &str = "open_interest";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ManifestError {
@@ -37,6 +42,7 @@ pub struct CexReplaySegmentIdentity {
     pub events: u64,
 }
 
+/// Historical CEX replay snapshot. Kept for read-only evidence decoding; new writers use V2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV1 {
@@ -58,99 +64,285 @@ pub struct CexReplaySnapshotV1 {
 
 impl CexReplaySnapshotV1 {
     pub fn validate(&self) -> Result<(), ManifestError> {
-        let invalid = ManifestError::InvalidCexReplaySnapshot;
-        if self.schema_version != CEX_REPLAY_SNAPSHOT_SCHEMA_V1
-            || self.venue != "binance"
-            || !matches!(self.instrument_type.as_str(), "spot" | "usdm")
-            || self.symbol.trim().is_empty()
-            || self.symbol != self.symbol.to_ascii_uppercase()
-            || self.replay_clock != CEX_REPLAY_CLOCK_RECEIVED_AT_NS
-            || self.feature_availability_policy != CEX_FEATURE_AVAILABILITY_POLICY
-            || self.bucket_ms == 0
-            || self.label_horizon_buckets == 0
-            || self.top_depth == 0
-            || self.first_event_time > self.last_event_time
-            || !valid_sha256(&self.feature_artifact_sha256)
-        {
-            return Err(invalid("metadata is incomplete"));
-        }
-        let required = BTreeSet::from([
+        validate_snapshot_core(
+            &self.schema_version,
+            CEX_REPLAY_SNAPSHOT_SCHEMA_V1,
+            &self.venue,
+            &self.instrument_type,
+            &self.symbol,
+            &self.replay_clock,
+            &self.required_modalities,
+            &BTreeSet::from([
+                CEX_MODALITY_LOB.to_string(),
+                CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ]),
+            &self.source_segments,
+            self.first_event_time,
+            self.last_event_time,
+            &self.feature_artifact_sha256,
+            &self.feature_availability_policy,
+            self.bucket_ms,
+            self.label_horizon_buckets,
+            self.top_depth,
+        )
+    }
+
+    pub fn sha256(&self) -> String {
+        snapshot_sha256(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexInstrumentRulesV2 {
+    pub tick_size: String,
+    pub step_size: String,
+    pub min_notional: String,
+    pub available_at: DateTime<Utc>,
+    pub valid_through: DateTime<Utc>,
+    pub evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFeeScheduleV2 {
+    pub maker_fee_bps: String,
+    pub taker_fee_bps: String,
+    pub available_at: DateTime<Utc>,
+    pub valid_through: DateTime<Utc>,
+    pub evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexDerivativesReferenceV2 {
+    pub artifact_sha256: String,
+    pub first_available_at: DateTime<Utc>,
+    pub last_available_at: DateTime<Utc>,
+    pub funding_observations: u64,
+    pub open_interest_observations: u64,
+    pub evaluation_funding_bps_per_bucket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexLatencyCostV2 {
+    pub method: String,
+    pub evidence_sha256: String,
+    pub first_observed_at: DateTime<Utc>,
+    pub last_observed_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
+    pub observations: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub p50_cost_bps: String,
+    pub p95_cost_bps: String,
+    pub p99_cost_bps: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexReplaySnapshotV2 {
+    pub schema_version: String,
+    pub venue: String,
+    pub instrument_type: String,
+    pub symbol: String,
+    pub replay_clock: String,
+    pub required_modalities: BTreeSet<String>,
+    pub source_segments: Vec<CexReplaySegmentIdentity>,
+    pub first_event_time: DateTime<Utc>,
+    pub last_event_time: DateTime<Utc>,
+    pub feature_artifact_sha256: String,
+    pub feature_availability_policy: String,
+    pub bucket_ms: u64,
+    pub label_horizon_buckets: usize,
+    pub top_depth: usize,
+    pub instrument_rules: CexInstrumentRulesV2,
+    pub fee_schedule: CexFeeScheduleV2,
+    pub derivatives_reference: Option<CexDerivativesReferenceV2>,
+    pub latency_cost: CexLatencyCostV2,
+}
+
+impl CexReplaySnapshotV2 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let mut required = BTreeSet::from([
             CEX_MODALITY_LOB.to_string(),
             CEX_MODALITY_AGGREGATE_TRADE.to_string(),
         ]);
-        if self.required_modalities != required {
-            return Err(invalid(
-                "required modalities must be lob and aggregate_trade",
-            ));
+        if self.instrument_type == "usdm" {
+            required.insert(CEX_MODALITY_FUNDING.to_string());
+            required.insert(CEX_MODALITY_OPEN_INTEREST.to_string());
         }
-        if self.source_segments.is_empty() {
-            return Err(invalid("source segments are empty"));
-        }
-        let mut identities = BTreeSet::new();
-        for segment in &self.source_segments {
-            if !valid_sha256(&segment.content_sha256)
-                || !valid_sha256(&segment.manifest_sha256)
-                || segment.start_received_at_ns > segment.end_received_at_ns
-                || segment.events == 0
-                || !identities.insert((
-                    segment.content_sha256.as_str(),
-                    segment.manifest_sha256.as_str(),
-                ))
-            {
-                return Err(invalid("source segment identity is invalid"));
-            }
-        }
-        if self
-            .source_segments
-            .windows(2)
-            .any(|pair| pair[0].end_received_at_ns > pair[1].start_received_at_ns)
+        validate_snapshot_core(
+            &self.schema_version,
+            CEX_REPLAY_SNAPSHOT_SCHEMA_V2,
+            &self.venue,
+            &self.instrument_type,
+            &self.symbol,
+            &self.replay_clock,
+            &self.required_modalities,
+            &required,
+            &self.source_segments,
+            self.first_event_time,
+            self.last_event_time,
+            &self.feature_artifact_sha256,
+            &self.feature_availability_policy,
+            self.bucket_ms,
+            self.label_horizon_buckets,
+            self.top_depth,
+        )?;
+        let invalid = ManifestError::InvalidCexReplaySnapshot;
+        if !positive_decimal(&self.instrument_rules.tick_size)
+            || !positive_decimal(&self.instrument_rules.step_size)
+            || !positive_decimal(&self.instrument_rules.min_notional)
+            || !valid_sha256(&self.instrument_rules.evidence_sha256)
+            || self.instrument_rules.available_at > self.first_event_time
+            || self.instrument_rules.available_at > self.instrument_rules.valid_through
+            || self.instrument_rules.valid_through < self.last_event_time
+            || !nonnegative_decimal(&self.fee_schedule.maker_fee_bps)
+            || !nonnegative_decimal(&self.fee_schedule.taker_fee_bps)
+            || !valid_sha256(&self.fee_schedule.evidence_sha256)
+            || self.fee_schedule.available_at > self.first_event_time
+            || self.fee_schedule.available_at > self.fee_schedule.valid_through
+            || self.fee_schedule.valid_through < self.last_event_time
         {
-            return Err(invalid("source segments are out of order or overlap"));
+            return Err(invalid("PIT rules or fee evidence is invalid"));
         }
-        let first_event_ns = u64::try_from(
-            self.first_event_time
-                .timestamp_nanos_opt()
-                .ok_or_else(|| invalid("event time is out of range"))?,
-        )
-        .map_err(|_| invalid("event time is out of range"))?;
-        let last_event_ns = u64::try_from(
-            self.last_event_time
-                .timestamp_nanos_opt()
-                .ok_or_else(|| invalid("event time is out of range"))?,
-        )
-        .map_err(|_| invalid("event time is out of range"))?;
-        let final_segment_end_ns = self
-            .source_segments
-            .last()
-            .expect("non-empty source segments have a last segment")
-            .end_received_at_ns;
-        if first_event_ns < self.source_segments[0].start_received_at_ns
-            || last_event_ns > final_segment_end_ns
+        match (&self.instrument_type[..], &self.derivatives_reference) {
+            ("usdm", Some(reference))
+                if valid_sha256(&reference.artifact_sha256)
+                    && reference.first_available_at <= reference.last_available_at
+                    && reference.first_available_at <= self.first_event_time
+                    && reference.last_available_at >= self.last_event_time
+                    && reference.funding_observations > 0
+                    && reference.open_interest_observations > 0
+                    && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
+            ("spot", None) => {}
+            _ => return Err(invalid("derivatives reference evidence is invalid")),
+        }
+        if self.latency_cost.method != "verified_order_lifecycle_realized_slippage"
+            || !valid_sha256(&self.latency_cost.evidence_sha256)
+            || self.latency_cost.first_observed_at > self.latency_cost.last_observed_at
+            || self.latency_cost.last_observed_at > self.first_event_time
+            || self.latency_cost.available_at < self.latency_cost.last_observed_at
+            || self.latency_cost.available_at > self.first_event_time
+            || self.latency_cost.observations == 0
+            || self.latency_cost.p50_ns > self.latency_cost.p95_ns
+            || self.latency_cost.p95_ns > self.latency_cost.p99_ns
+            || !nonnegative_decimal(&self.latency_cost.p50_cost_bps)
+            || !nonnegative_decimal(&self.latency_cost.p95_cost_bps)
+            || !nonnegative_decimal(&self.latency_cost.p99_cost_bps)
         {
-            return Err(invalid("event range is outside source segments"));
-        }
-        let horizon_buckets = u64::try_from(self.label_horizon_buckets)
-            .map_err(|_| invalid("label horizon is out of range"))?;
-        let horizon_ns = self
-            .bucket_ms
-            .checked_mul(1_000_000)
-            .and_then(|bucket_ns| bucket_ns.checked_mul(horizon_buckets))
-            .ok_or_else(|| invalid("label horizon is out of range"))?;
-        let last_label_available_ns = last_event_ns
-            .checked_add(horizon_ns)
-            .ok_or_else(|| invalid("label horizon is out of range"))?;
-        if last_label_available_ns > final_segment_end_ns {
-            return Err(invalid("label availability is outside source segments"));
+            return Err(invalid("measured latency cost evidence is invalid"));
         }
         Ok(())
     }
 
     pub fn sha256(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("CEX replay snapshot must serialize");
-        format!("{:x}", Sha256::digest(bytes))
+        snapshot_sha256(self)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_snapshot_core(
+    schema_version: &str,
+    expected_schema: &str,
+    venue: &str,
+    instrument_type: &str,
+    symbol: &str,
+    replay_clock: &str,
+    required_modalities: &BTreeSet<String>,
+    expected_modalities: &BTreeSet<String>,
+    source_segments: &[CexReplaySegmentIdentity],
+    first_event_time: DateTime<Utc>,
+    last_event_time: DateTime<Utc>,
+    feature_artifact_sha256: &str,
+    feature_availability_policy: &str,
+    bucket_ms: u64,
+    label_horizon_buckets: usize,
+    top_depth: usize,
+) -> Result<(), ManifestError> {
+    let invalid = ManifestError::InvalidCexReplaySnapshot;
+    if schema_version != expected_schema
+        || venue != "binance"
+        || !matches!(instrument_type, "spot" | "usdm")
+        || symbol.trim().is_empty()
+        || symbol != symbol.to_ascii_uppercase()
+        || replay_clock != CEX_REPLAY_CLOCK_RECEIVED_AT_NS
+        || feature_availability_policy != CEX_FEATURE_AVAILABILITY_POLICY
+        || bucket_ms == 0
+        || label_horizon_buckets == 0
+        || top_depth == 0
+        || first_event_time > last_event_time
+        || !valid_sha256(feature_artifact_sha256)
+        || source_segments.is_empty()
+    {
+        return Err(invalid("metadata is incomplete"));
+    }
+    if required_modalities != expected_modalities {
+        return Err(invalid("required modalities do not match the schema"));
+    }
+    let mut identities = BTreeSet::new();
+    for segment in source_segments {
+        if !valid_sha256(&segment.content_sha256)
+            || !valid_sha256(&segment.manifest_sha256)
+            || segment.start_received_at_ns > segment.end_received_at_ns
+            || segment.events == 0
+            || !identities.insert((
+                segment.content_sha256.as_str(),
+                segment.manifest_sha256.as_str(),
+            ))
+        {
+            return Err(invalid("source segment identity is invalid"));
+        }
+    }
+    if source_segments
+        .windows(2)
+        .any(|pair| pair[0].end_received_at_ns > pair[1].start_received_at_ns)
+    {
+        return Err(invalid("source segments are out of order or overlap"));
+    }
+    let first_event_ns = u64::try_from(
+        first_event_time
+            .timestamp_nanos_opt()
+            .ok_or_else(|| invalid("event time is out of range"))?,
+    )
+    .map_err(|_| invalid("event time is out of range"))?;
+    let last_event_ns = u64::try_from(
+        last_event_time
+            .timestamp_nanos_opt()
+            .ok_or_else(|| invalid("event time is out of range"))?,
+    )
+    .map_err(|_| invalid("event time is out of range"))?;
+    let final_segment_end_ns = source_segments
+        .last()
+        .expect("non-empty source segments have a last segment")
+        .end_received_at_ns;
+    if first_event_ns < source_segments[0].start_received_at_ns
+        || last_event_ns > final_segment_end_ns
+    {
+        return Err(invalid("event range is outside source segments"));
+    }
+    let horizon_buckets = u64::try_from(label_horizon_buckets)
+        .map_err(|_| invalid("label horizon is out of range"))?;
+    let last_label_available_ns = bucket_ms
+        .checked_mul(1_000_000)
+        .and_then(|bucket_ns| bucket_ns.checked_mul(horizon_buckets))
+        .and_then(|horizon_ns| last_event_ns.checked_add(horizon_ns))
+        .ok_or_else(|| invalid("label horizon is out of range"))?;
+    if last_label_available_ns > final_segment_end_ns {
+        return Err(invalid("label availability is outside source segments"));
+    }
+    Ok(())
+}
+
+fn snapshot_sha256<T: Serialize>(snapshot: &T) -> String {
+    let bytes = serde_json::to_vec(snapshot).expect("CEX replay snapshot must serialize");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Historical CEX replay dataset. Kept for read-only evidence decoding; it has no V1 writer API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV1 {
@@ -163,23 +355,6 @@ pub struct CexReplayDatasetManifestV1 {
 }
 
 impl CexReplayDatasetManifestV1 {
-    pub fn new(
-        feature_manifest_id: impl Into<String>,
-        snapshot: CexReplaySnapshotV1,
-    ) -> Result<Self, ManifestError> {
-        let snapshot_sha256 = snapshot.sha256();
-        let manifest = Self {
-            dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
-            schema_version: CEX_REPLAY_DATASET_SCHEMA_V1.to_string(),
-            manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
-            feature_manifest_id: feature_manifest_id.into(),
-            snapshot,
-            snapshot_sha256,
-        };
-        manifest.validate()?;
-        Ok(manifest)
-    }
-
     pub fn validate(&self) -> Result<(), ManifestError> {
         let invalid = ManifestError::InvalidCexReplayDataset;
         self.snapshot.validate()?;
@@ -196,10 +371,67 @@ impl CexReplayDatasetManifestV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexReplayDatasetManifestV2 {
+    pub dataset_kind: String,
+    pub schema_version: String,
+    pub manifest_id: String,
+    pub feature_manifest_id: String,
+    pub snapshot: CexReplaySnapshotV2,
+    pub snapshot_sha256: String,
+}
+
+impl CexReplayDatasetManifestV2 {
+    pub fn new(
+        feature_manifest_id: impl Into<String>,
+        snapshot: CexReplaySnapshotV2,
+    ) -> Result<Self, ManifestError> {
+        let snapshot_sha256 = snapshot.sha256();
+        let manifest = Self {
+            dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
+            schema_version: CEX_REPLAY_DATASET_SCHEMA_V2.to_string(),
+            manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
+            feature_manifest_id: feature_manifest_id.into(),
+            snapshot,
+            snapshot_sha256,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let invalid = ManifestError::InvalidCexReplayDataset;
+        self.snapshot.validate()?;
+        if self.dataset_kind != CEX_REPLAY_DATASET_KIND
+            || self.schema_version != CEX_REPLAY_DATASET_SCHEMA_V2
+            || self.feature_manifest_id.trim().is_empty()
+            || !valid_sha256(&self.snapshot_sha256)
+            || self.snapshot_sha256 != self.snapshot.sha256()
+            || self.manifest_id != format!("dataset-cex-replay-{}", self.snapshot_sha256)
+        {
+            return Err(invalid("metadata or digest is inconsistent"));
+        }
+        Ok(())
+    }
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         && value == value.to_ascii_lowercase()
+}
+
+fn positive_decimal(value: &str) -> bool {
+    value
+        .parse::<f64>()
+        .is_ok_and(|value| value.is_finite() && value > 0.0)
+}
+
+fn nonnegative_decimal(value: &str) -> bool {
+    value
+        .parse::<f64>()
+        .is_ok_and(|value| value.is_finite() && value >= 0.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -408,9 +640,9 @@ impl HarnessManifest {
 mod tests {
     use super::*;
 
-    fn cex_snapshot() -> CexReplaySnapshotV1 {
-        CexReplaySnapshotV1 {
-            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V1.to_string(),
+    fn cex_snapshot() -> CexReplaySnapshotV2 {
+        CexReplaySnapshotV2 {
+            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -418,6 +650,8 @@ mod tests {
             required_modalities: BTreeSet::from([
                 CEX_MODALITY_LOB.to_string(),
                 CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+                CEX_MODALITY_FUNDING.to_string(),
+                CEX_MODALITY_OPEN_INTEREST.to_string(),
             ]),
             source_segments: vec![CexReplaySegmentIdentity {
                 content_sha256: "1".repeat(64),
@@ -437,6 +671,61 @@ mod tests {
             bucket_ms: 1_000,
             label_horizon_buckets: 5,
             top_depth: 5,
+            instrument_rules: CexInstrumentRulesV2 {
+                tick_size: "0.1".to_string(),
+                step_size: "0.001".to_string(),
+                min_notional: "5".to_string(),
+                available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                evidence_sha256: "4".repeat(64),
+            },
+            fee_schedule: CexFeeScheduleV2 {
+                maker_fee_bps: "2".to_string(),
+                taker_fee_bps: "5".to_string(),
+                available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                evidence_sha256: "5".repeat(64),
+            },
+            derivatives_reference: Some(CexDerivativesReferenceV2 {
+                artifact_sha256: "6".repeat(64),
+                first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                funding_observations: 1,
+                open_interest_observations: 1,
+                evaluation_funding_bps_per_bucket: "0".to_string(),
+            }),
+            latency_cost: CexLatencyCostV2 {
+                method: "verified_order_lifecycle_realized_slippage".to_string(),
+                evidence_sha256: "7".repeat(64),
+                first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                last_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                observations: 100,
+                p50_ns: 1_000_000,
+                p95_ns: 2_000_000,
+                p99_ns: 3_000_000,
+                p50_cost_bps: "0.1".to_string(),
+                p95_cost_bps: "0.2".to_string(),
+                p99_cost_bps: "0.3".to_string(),
+            },
         }
     }
 
@@ -487,11 +776,11 @@ mod tests {
     fn cex_replay_dataset_identity_binds_snapshot_digest() {
         let snapshot = cex_snapshot();
         let manifest =
-            CexReplayDatasetManifestV1::new("dataset-feature-sha", snapshot.clone()).unwrap();
+            CexReplayDatasetManifestV2::new("dataset-feature-sha", snapshot.clone()).unwrap();
         let mut different_tape = snapshot;
         different_tape.source_segments[0].manifest_sha256 = "4".repeat(64);
         let different =
-            CexReplayDatasetManifestV1::new("dataset-feature-sha", different_tape).unwrap();
+            CexReplayDatasetManifestV2::new("dataset-feature-sha", different_tape).unwrap();
 
         assert_ne!(manifest.manifest_id, different.manifest_id);
         manifest.validate().unwrap();
