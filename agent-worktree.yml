@@ -2,7 +2,7 @@ owner: codex
 contract: execution-lifecycle-costs-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/execution-lifecycle-costs-v2
 branch: codex/execution-lifecycle-costs-v2
-base_sha: 8b93efcc52bd7a26ae01eb5f3d12903d870e027d
+base_sha: 2e927fcda973d1a64851ed38ed84224daf58acfe
 allowed_files:
   - agent-worktree.yml
   - rust_hft/market-core/ports/src/events.rs
