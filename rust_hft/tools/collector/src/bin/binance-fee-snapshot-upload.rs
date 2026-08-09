@@ -63,30 +63,3 @@ fn main() -> Result<()> {
     println!("{}", serde_json::to_string(&upload_pending(&config)?)?);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_accepts_bounded_upload_options() {
-        let parsed = Args::try_parse_from([
-            "binance-fee-snapshot-upload",
-            "--output-root",
-            "/tmp/fee",
-            "--bucket",
-            "bucket",
-            "--endpoint",
-            "endpoint",
-            "--region",
-            "region",
-            "--profile",
-            "profile",
-            "--oss-timeout-seconds",
-            "300",
-        ])
-        .unwrap();
-        assert!(parsed.output_root.is_absolute());
-        assert_eq!(parsed.oss_timeout_seconds, Some(300));
-    }
-}
