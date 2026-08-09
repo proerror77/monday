@@ -157,6 +157,9 @@ pub struct CexDerivativesReferenceV2 {
 #[serde(deny_unknown_fields)]
 pub struct CexLatencyCostV2 {
     pub method: String,
+    pub venue: String,
+    pub symbol: String,
+    pub account_fingerprint: String,
     pub evidence: CexArtifactTripletV2,
     pub first_observed_at: DateTime<Utc>,
     pub last_observed_at: DateTime<Utc>,
@@ -258,16 +261,19 @@ impl CexReplaySnapshotV2 {
                 if pit_series_covers(
                     &reference.funding,
                     self.first_event_time,
-                    self.last_event_time,
+                    label_available_through,
                 ) && pit_series_covers(
                     &reference.open_interest,
                     self.first_event_time,
-                    self.last_event_time,
+                    label_available_through,
                 ) && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
             ("spot", None) => {}
             _ => return Err(invalid("derivatives reference evidence is invalid")),
         }
         if self.latency_cost.method != "verified_order_lifecycle_realized_slippage"
+            || self.latency_cost.venue != self.venue
+            || self.latency_cost.symbol != self.symbol
+            || self.latency_cost.account_fingerprint != self.fee_schedule.account_fingerprint
             || !self.latency_cost.evidence.valid()
             || self.latency_cost.first_observed_at > self.latency_cost.last_observed_at
             || self.latency_cost.last_observed_at > self.first_event_time
@@ -301,7 +307,7 @@ impl CexReplaySnapshotV2 {
 fn pit_series_covers(
     evidence: &CexPitSeriesEvidenceV2,
     first_event_time: DateTime<Utc>,
-    last_event_time: DateTime<Utc>,
+    required_through: DateTime<Utc>,
 ) -> bool {
     let span_ns = evidence
         .last_available_at
@@ -314,7 +320,7 @@ fn pit_series_covers(
         && evidence.max_gap_ns <= CEX_DERIVATIVES_MAX_GAP_NS
         && evidence.first_available_at <= first_event_time
         && evidence.first_available_at <= evidence.last_available_at
-        && evidence.last_available_at >= last_event_time
+        && evidence.last_available_at >= required_through
         && span_ns.is_some_and(|span| {
             evidence
                 .max_gap_ns
@@ -820,27 +826,30 @@ mod tests {
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:09Z")
                         .unwrap()
                         .with_timezone(&Utc),
                     observations: 2,
-                    max_gap_ns: 3_000_000_000,
+                    max_gap_ns: 8_000_000_000,
                 },
                 open_interest: CexPitSeriesEvidenceV2 {
                     evidence: vec![triplet('7'), triplet('b')],
                     first_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
                         .unwrap()
                         .with_timezone(&Utc),
-                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:04Z")
+                    last_available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:09Z")
                         .unwrap()
                         .with_timezone(&Utc),
                     observations: 2,
-                    max_gap_ns: 3_000_000_000,
+                    max_gap_ns: 8_000_000_000,
                 },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
             latency_cost: CexLatencyCostV2 {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
+                venue: "binance".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                account_fingerprint: "9".repeat(64),
                 evidence: triplet('8'),
                 first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
                     .unwrap()
@@ -871,6 +880,7 @@ mod tests {
         assert_eq!(snapshot.sha256().len(), 64);
         let mut other_symbol = snapshot.clone();
         other_symbol.symbol = "SOLUSDT".to_string();
+        other_symbol.latency_cost.symbol = "SOLUSDT".to_string();
         other_symbol.validate().unwrap();
         assert_ne!(snapshot.sha256(), other_symbol.sha256());
     }
@@ -927,7 +937,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .open_interest
-            .last_available_at = DateTime::parse_from_rfc3339("2026-07-14T00:00:03Z")
+            .last_available_at = DateTime::parse_from_rfc3339("2026-07-14T00:00:08Z")
             .unwrap()
             .with_timezone(&Utc);
 
@@ -1022,6 +1032,17 @@ mod tests {
     fn cex_replay_snapshot_rejects_nonmonotonic_latency_cost() {
         let mut snapshot = cex_snapshot();
         snapshot.latency_cost.p50_cost_bps = "0.21".to_string();
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
+        );
+    }
+
+    #[test]
+    fn cex_replay_snapshot_rejects_latency_cost_from_another_scope() {
+        let mut snapshot = cex_snapshot();
+        snapshot.latency_cost.symbol = "ETHUSDT".to_string();
 
         assert_eq!(
             snapshot.validate().unwrap_err(),
