@@ -80,7 +80,7 @@ grep -Fq 'ExecStart=' "$archiver_unit"
 grep -Fq -- '--upload-only' "$upload_unit"
 grep -Fq 'Unit=bybit-options-upload.service' "$timer"
 # The production upload lane must recur, not fire once per boot.
-grep -Fq 'OnCalendar=' "$timer"
+grep -Fq 'OnCalendar=*-*-* *:23:00' "$timer"
 
 # The deploy lane must reject a release whose units drop the governed env.
 grep -Fq 'REQUIRED_ENV_KEYS=(MIN_FREE_GB BYBIT_OPTIONS_SPOOL_MAX_BYTES)' \
