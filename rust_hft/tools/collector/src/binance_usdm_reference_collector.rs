@@ -9,6 +9,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 pub const OFFICIAL_USDM_SOURCE_ORIGIN: &str = "https://fapi.binance.com";
 
@@ -58,32 +59,58 @@ impl HttpReferenceSource {
     }
 
     async fn get(&self, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
-        let mut request = self
-            .client
-            .get(format!("{OFFICIAL_USDM_SOURCE_ORIGIN}{endpoint}"));
-        if let Some(symbol) = symbol {
-            request = request.query(&[("symbol", symbol)]);
+        self.get_url(
+            &format!("{OFFICIAL_USDM_SOURCE_ORIGIN}{endpoint}"),
+            endpoint,
+            symbol,
+        )
+        .await
+    }
+
+    async fn get_url(&self, url: &str, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
+        let mut rate_limit_retries = 0;
+        loop {
+            let mut request = self.client.get(url);
+            if let Some(symbol) = symbol {
+                request = request.query(&[("symbol", symbol)]);
+            }
+            let response = request
+                .send()
+                .await
+                .context("USD-M reference request failed")?;
+            let status = response.status();
+            let retry_after_seconds = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30)
+                .min(60);
+            let bytes = response
+                .bytes()
+                .await
+                .context("USD-M reference response body failed")?;
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && rate_limit_retries == 0 {
+                rate_limit_retries += 1;
+                warn!(
+                    endpoint,
+                    retry_after_seconds, "Binance rate limited; retrying once"
+                );
+                tokio::time::sleep(Duration::from_secs(retry_after_seconds)).await;
+                continue;
+            }
+            let received_at_ns = now_ns()?;
+            if !status.is_success() {
+                bail!("USD-M reference endpoint {endpoint} returned HTTP {status}");
+            }
+            let value = serde_json::from_slice(&bytes).with_context(|| {
+                format!("USD-M reference endpoint {endpoint} returned invalid JSON")
+            })?;
+            return Ok(TimedJson {
+                value,
+                received_at_ns,
+            });
         }
-        let response = request
-            .send()
-            .await
-            .context("USD-M reference request failed")?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .context("USD-M reference response body failed")?;
-        let received_at_ns = now_ns()?;
-        if !status.is_success() {
-            bail!("USD-M reference endpoint {endpoint} returned HTTP {status}");
-        }
-        let value = serde_json::from_slice(&bytes).with_context(|| {
-            format!("USD-M reference endpoint {endpoint} returned invalid JSON")
-        })?;
-        Ok(TimedJson {
-            value,
-            received_at_ns,
-        })
     }
 }
 
@@ -213,6 +240,10 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
@@ -358,5 +389,53 @@ mod tests {
             assert!(HttpReferenceSource::new(origin, Duration::from_secs(1)).is_err());
         }
         HttpReferenceSource::new(OFFICIAL_USDM_SOURCE_ORIGIN, Duration::from_secs(1)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_source_retries_one_rate_limited_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = 0;
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while requests < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 1024];
+                        let _ = stream.read(&mut buffer);
+                        requests += 1;
+                        let response = if requests == 1 {
+                            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"serverTime\":1700000000}"
+                        };
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock server failed: {error}"),
+                }
+            }
+            requests
+        });
+        let source = HttpReferenceSource {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        };
+
+        let result = source
+            .get_url(
+                &format!("http://{address}/time"),
+                SERVER_TIME_ENDPOINT,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "429 should be retried once: {result:?}");
+        assert_eq!(server.join().unwrap(), 2);
     }
 }
