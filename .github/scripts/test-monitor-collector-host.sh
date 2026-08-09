@@ -5,6 +5,35 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workflow="$script_dir/../workflows/monitor-collector-host.yml"
 
+oidc_contract_failed=0
+grep -Fqx '  id-token: write' "$workflow" || {
+  printf 'collector monitor cannot request a GitHub OIDC token\n' >&2
+  oidc_contract_failed=1
+}
+grep -Fqx "    if: github.ref == 'refs/heads/main'" "$workflow" || {
+  printf 'collector monitor does not reject non-main OIDC use\n' >&2
+  oidc_contract_failed=1
+}
+grep -Fqx '# OIDC issuer: https://token.actions.githubusercontent.com' "$workflow" || oidc_contract_failed=1
+grep -Fqx '# OIDC audience: sts.aliyuncs.com' "$workflow" || oidc_contract_failed=1
+grep -Fqx '# OIDC subject: repo:proerror77/monday:ref:refs/heads/main' "$workflow" || oidc_contract_failed=1
+grep -Fqx '        uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1.1.0' "$workflow" || {
+  printf 'collector monitor does not use the pinned Aliyun OIDC credential exchange\n' >&2
+  oidc_contract_failed=1
+}
+grep -Fqx '          oidc-provider-arn: ${{ vars.ALIYUN_COLLECTOR_MONITOR_OIDC_PROVIDER_ARN }}' "$workflow" || oidc_contract_failed=1
+grep -Fqx '          role-to-assume: ${{ vars.ALIYUN_COLLECTOR_MONITOR_ROLE_ARN }}' "$workflow" || oidc_contract_failed=1
+grep -Fqx '          audience: sts.aliyuncs.com' "$workflow" || oidc_contract_failed=1
+grep -Fqx '        id: aliyun-auth' "$workflow" || oidc_contract_failed=1
+grep -Fqx '      - name: Record OIDC authentication failure' "$workflow" || oidc_contract_failed=1
+grep -Fqx "        if: always() && steps.aliyun-auth.outcome == 'failure'" "$workflow" || oidc_contract_failed=1
+grep -Fqx "          printf '%s\\n' 'Aliyun OIDC credential exchange failed before the collector health check.' >> \"\$GITHUB_STEP_SUMMARY\"" "$workflow" || oidc_contract_failed=1
+if grep -Eqi '(ALIYUN|ALIBABA_CLOUD|ALIBABACLOUD)_ACCESS_KEY_(ID|SECRET)|ALICLOUD_(ACCESS_KEY|SECRET_KEY)|aliyun[[:space:]]+configure|--access-key-(id|secret)|"mode": "AK"|"access_key_(id|secret)"' "$workflow"; then
+  printf 'collector monitor still depends on long-term Aliyun AccessKeys\n' >&2
+  oidc_contract_failed=1
+fi
+test "$oidc_contract_failed" -eq 0
+
 remote_assignment=$(sed -n '/^          remote_script=/,/^          content=/p' "$workflow" | sed '$d;s/^          //')
 expected_remote_assignment=$(printf '%s\n' \
   "remote_script=\$(printf '%s\\n' \\" \
