@@ -1376,7 +1376,7 @@ mod tests {
     fn execute_rejects_optimistic_costs_below_snapshot_evidence() {
         let mut fixture = fixture("optimistic-snapshot-costs");
         fixture.mission.spec.evaluation_protocol.costs.fee_bps = 0.0;
-        write_mission(&mut fixture);
+        resign_mission(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
