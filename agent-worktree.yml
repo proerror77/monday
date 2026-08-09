@@ -2,7 +2,7 @@ owner: codex-root
 contract: binance-fee-oss-transport
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-oss-transport
 branch: codex/binance-fee-oss-transport
-base_sha: 157358e75b458052f547fec74a64e5e6f43b3f8b
+base_sha: 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
 allowed_files:
   - agent-worktree.yml
   - rust_hft/tools/collector/Cargo.toml
@@ -12,6 +12,6 @@ allowed_files:
   - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
   - rust_hft/deployment/docker/Dockerfile.binance-lob-archiver
   - .github/workflows/acr-publish.yml
-dependency: PR #789 at 157358e75b458052f547fec74a64e5e6f43b3f8b
+dependency: PR #789 merged as 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
 issue: 790
 no_external_runtime_mutation: true
