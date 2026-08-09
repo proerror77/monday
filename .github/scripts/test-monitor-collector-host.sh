@@ -60,6 +60,52 @@ fi
 test "$oidc_contract_failed" -eq 0
 test "$command_contract_failed" -eq 0
 
+grep -Fqx '                  health_json=$(printf '\''%s'\'' "$output" | base64 --decode 2>/dev/null | jq -ce '\''select(type == "object")'\'' 2>/dev/null || true)' "$workflow" || {
+  printf 'collector monitor does not parse the complete multiline health JSON\n' >&2
+  exit 1
+}
+if grep -Fq "grep -m1 '^{'" "$workflow"; then
+  printf 'collector monitor still truncates multiline health JSON at the opening brace\n' >&2
+  exit 1
+fi
+
+decode_health_output() {
+  printf '%s' "$1" | base64 --decode 2>/dev/null | jq -ce 'select(type == "object")' 2>/dev/null || true
+}
+
+classify_health_output() {
+  local encoded_output=$1
+  local health_json invocation_failed ok
+  health_json=$(decode_health_output "$encoded_output")
+  invocation_failed=0
+  ok=unknown
+  if [ -z "$health_json" ]; then
+    invocation_failed=1
+  elif ok=$(printf '%s\n' "$health_json" | jq -er 'if (.ok | type) == "boolean" then (.ok | tostring) else error(".ok must be boolean") end'); then
+    :
+  else
+    invocation_failed=1
+    ok=unknown
+  fi
+  printf '%s %s\n' "$ok" "$invocation_failed"
+}
+
+healthy_output=$(printf '%s\n' '{' '  "ok": true,' '  "breaches": []' '}' | base64 | tr -d '\n')
+unhealthy_output=$(printf '%s\n' '{' '  "ok": false,' '  "breaches": ["disk warning"]' '}' | base64 | tr -d '\n')
+test "$(classify_health_output "$healthy_output")" = 'true 0'
+test "$(classify_health_output "$unhealthy_output")" = 'false 0'
+
+for invalid_output in \
+  '' \
+  'not-base64' \
+  "$(printf '%s' 'not-json' | base64 | tr -d '\n')" \
+  "$(printf '%s' '{"ok":' | base64 | tr -d '\n')"; do
+  test "$(classify_health_output "$invalid_output")" = 'unknown 1'
+done
+
+grep -Fqx '              echo "exit_code=invokecommand-error"' "$workflow"
+grep -Fqx '              echo "exit_code=no-invoke-id"' "$workflow"
+
 health_validation=$(sed -n \
   '/^          if \[ -n "\$health_json" \]; then$/,/^          echo "invocation_failed=/p' \
   "$workflow")
@@ -83,6 +129,7 @@ for invalid_health in '{}' '{"ok":null}' '{"ok":"false"}'; do
 done
 
 grep -Fqx '      - name: Fail unhealthy monitor run' "$workflow"
+grep -Fqx "        if: steps.health.outputs.invocation_failed == '0' && steps.health.outputs.ok == 'false'" "$workflow"
 grep -Fqx "        if: always() && steps.health.outputs.ok != 'true'" "$workflow"
 grep -Fqx '        run: exit 1' "$workflow"
 grep -Fqx "        if: steps.health.outputs.invocation_failed == '1'" "$workflow"
