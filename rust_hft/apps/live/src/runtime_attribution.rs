@@ -441,7 +441,7 @@ fn execution_attribution(
                 if requested > 0.0 && fill > 0.0 {
                     let signed = match metadata.side {
                         Side::Buy => fill / requested - 1.0,
-                        Side::Sell => requested / fill - 1.0,
+                        Side::Sell => 1.0 - fill / requested,
                     };
                     metrics.insert(
                         "realized_slippage_bps".to_string(),
@@ -1261,6 +1261,33 @@ mod tests {
         assert_eq!(fill.metrics["write_to_private_report_us"], 40.0);
         assert_eq!(fill.metrics["intent_to_private_report_us"], 75.0);
         assert!((fill.metrics["realized_slippage_bps"] - 100.0).abs() < 1e-9);
+
+        execution_attribution(
+            &activation,
+            &mut state,
+            &order_new_for(
+                "sell-order",
+                "BTCUSDT",
+                Side::Sell,
+                "bundle-1:BTCUSDT",
+                Some(VenueId::BITGET),
+            ),
+        )
+        .unwrap();
+        let sell_fill = execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::Fill {
+                order_id: OrderId("sell-order".to_string()),
+                price: Price::from_f64(50.0).unwrap(),
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                timestamp: NOW_US + 2,
+                fill_id: "sell-fill-1".to_string(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!((sell_fill.metrics["realized_slippage_bps"] - 5_000.0).abs() < 1e-9);
 
         execution_attribution(&activation, &mut state, &order_new("reject-order")).unwrap();
         let reject = execution_attribution(

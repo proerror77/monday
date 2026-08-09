@@ -1238,6 +1238,16 @@ impl ExecutionWorker {
         client_idx: usize,
         event: &ExecutionEvent,
     ) -> (bool, Option<ExecutionEvent>) {
+        if let ExecutionEvent::OrderLifecycleTiming { order_id, .. } = event {
+            error!(
+                order_id = %order_id.0,
+                client_idx,
+                "discarded worker-owned lifecycle timing from an execution adapter"
+            );
+            self.emergency_latched = true;
+            self.latch_stream_recovery();
+            return (true, None);
+        }
         let ExecutionEvent::PrivateOrderTiming {
             order_id,
             kind,
@@ -4585,6 +4595,42 @@ mod tests {
         after.apply_private(ports::PrivateOrderEventKind::Ack, 60);
         assert_eq!(after.spans().write_to_response_us, Some(15));
         assert_eq!(after.spans().write_to_private_ack_us, Some(25));
+    }
+
+    #[test]
+    fn adapter_cannot_supply_worker_owned_lifecycle_timing() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+
+        let (captured, forwarded) = worker.capture_private_timing(
+            0,
+            &ExecutionEvent::OrderLifecycleTiming {
+                order_id: OrderId("forged".to_string()),
+                observed_at: now_micros(),
+                write_to_private_ack_us: Some(1),
+                write_to_private_report_us: Some(1),
+                intent_to_private_report_us: Some(1),
+            },
+        );
+
+        assert!(captured);
+        assert!(forwarded.is_none());
+        assert!(worker.emergency_latched);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
     }
 
     #[tokio::test]
