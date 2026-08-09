@@ -302,12 +302,15 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
             .max()
             .context("segments have no end time")?,
     )?;
+    let source_revisions = BTreeMap::from([(
+        format!("binance-{}-lob", args.market.as_str()),
+        revision.clone(),
+    )]);
     let rows = materialize_rows(
         &replay.samples,
         verified.aggregate_trades(),
-        args.market,
+        &source_revisions,
         &symbol,
-        &revision,
         args.label_horizon_buckets,
         args.top_depth,
         ingestion_time,
@@ -532,9 +535,8 @@ fn sample_book(
 fn materialize_rows(
     samples: &[BookSample],
     aggregate_trades: &[AggregateTrade],
-    market: Market,
+    source_revisions: &BTreeMap<String, String>,
     symbol: &str,
-    revision: &str,
     horizon: usize,
     depth: usize,
     ingestion_time: DateTime<Utc>,
@@ -544,10 +546,6 @@ fn materialize_rows(
         .iter()
         .filter(|trade| trade.symbol == symbol)
         .collect::<Vec<_>>();
-    let source_revisions = BTreeMap::from([(
-        format!("binance-{}-lob", market.as_str()),
-        revision.to_string(),
-    )]);
     for index in 1..samples.len().saturating_sub(horizon) {
         let previous = &samples[index - 1];
         let current = &samples[index];
