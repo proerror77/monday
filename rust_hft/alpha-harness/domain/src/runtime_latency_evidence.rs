@@ -33,21 +33,26 @@ pub struct VerifiedRuntimeLatencyEvidence {
     pub p99_cost_bps: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeLatencyEvidenceSource<'a> {
+    pub feedback_log: &'a Path,
+    pub feedback_log_sha256: &'a str,
+    pub trusted_keys: &'a Path,
+    pub trusted_keys_sha256: &'a str,
+}
+
 pub fn verify_runtime_latency_evidence(
-    feedback_log: &Path,
-    feedback_log_sha256: &str,
-    trusted_keys_path: &Path,
-    trusted_keys_sha256: &str,
+    source: RuntimeLatencyEvidenceSource<'_>,
     deployment_id: &str,
     market: &str,
     symbol: &str,
     account_id: &str,
     available_before: DateTime<Utc>,
 ) -> Result<VerifiedRuntimeLatencyEvidence> {
-    let expected_feedback_sha256 = expected_sha256(feedback_log_sha256, "feedback log")?;
+    let expected_feedback_sha256 = expected_sha256(source.feedback_log_sha256, "feedback log")?;
     let key_bytes = read_sha256_anchored(
-        trusted_keys_path,
-        trusted_keys_sha256,
+        source.trusted_keys,
+        source.trusted_keys_sha256,
         "feedback trusted keys",
     )?;
     let encoded: BTreeMap<String, String> = serde_json::from_slice(&key_bytes)
@@ -81,8 +86,9 @@ pub fn verify_runtime_latency_evidence(
     let mut observations = Vec::new();
     let mut signed_events = Vec::new();
     let mut event_digests = BTreeMap::new();
-    let mut feedback =
-        BufReader::new(File::open(feedback_log).context("failed to open runtime feedback log")?);
+    let mut feedback = BufReader::new(
+        File::open(source.feedback_log).context("failed to open runtime feedback log")?,
+    );
     let mut feedback_hasher = Sha256::new();
     let mut line = Vec::new();
     let mut line_number = 0_usize;
@@ -338,10 +344,12 @@ mod tests {
     fn accepts_only_signed_live_lifecycle_costs() {
         let (_directory, log, log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
         let evidence = verify_runtime_latency_evidence(
-            &log,
-            &log_sha,
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
@@ -362,10 +370,12 @@ mod tests {
     fn rejects_shadow_costs_as_not_real() {
         let (_directory, log, log_sha, keys, keys_sha) = write_fixture(AttributionMode::Shadow);
         assert!(verify_runtime_latency_evidence(
-            &log,
-            &log_sha,
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
@@ -382,12 +392,15 @@ mod tests {
         let (_directory, log, log_sha, keys, _keys_sha) = write_fixture(AttributionMode::LiveSmall);
         let bytes = vec![b' '; MAX_TRUSTED_KEYS_BYTES + 1];
         std::fs::write(&keys, &bytes).unwrap();
+        let keys_sha = hex::encode(Sha256::digest(&bytes));
 
         let error = verify_runtime_latency_evidence(
-            &log,
-            &log_sha,
-            &keys,
-            &hex::encode(Sha256::digest(&bytes)),
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
@@ -405,10 +418,12 @@ mod tests {
     fn rejects_usdm_without_a_derivatives_execution_path() {
         let (_directory, log, log_sha, keys, keys_sha) = write_fixture(AttributionMode::LiveSmall);
         assert!(verify_runtime_latency_evidence(
-            &log,
-            &log_sha,
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "usdm",
             "BTCUSDT",
@@ -430,11 +445,14 @@ mod tests {
         alternate.push(b'\n');
         let bytes = [line.as_slice(), alternate.as_slice()].concat();
         std::fs::write(&log, &bytes).unwrap();
+        let log_sha = hex::encode(Sha256::digest(&bytes));
         let evidence = verify_runtime_latency_evidence(
-            &log,
-            &hex::encode(Sha256::digest(&bytes)),
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
@@ -462,12 +480,15 @@ mod tests {
         bytes.push(b'\n');
         bytes.extend_from_slice(&std::fs::read(&log).unwrap());
         std::fs::write(&log, &bytes).unwrap();
+        let log_sha = hex::encode(Sha256::digest(&bytes));
 
         assert!(verify_runtime_latency_evidence(
-            &log,
-            &hex::encode(Sha256::digest(&bytes)),
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
@@ -494,12 +515,15 @@ mod tests {
         let mut bytes = serde_json::to_vec(&signed).unwrap();
         bytes.push(b'\n');
         std::fs::write(&log, &bytes).unwrap();
+        let log_sha = hex::encode(Sha256::digest(&bytes));
 
         assert!(verify_runtime_latency_evidence(
-            &log,
-            &hex::encode(Sha256::digest(&bytes)),
-            &keys,
-            &keys_sha,
+            RuntimeLatencyEvidenceSource {
+                feedback_log: &log,
+                feedback_log_sha256: &log_sha,
+                trusted_keys: &keys,
+                trusted_keys_sha256: &keys_sha,
+            },
             "deployment-1",
             "spot",
             "BTCUSDT",
