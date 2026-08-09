@@ -118,11 +118,7 @@ fn nonnegative_decimal(value: &str) -> bool {
 }
 
 pub fn valid_runtime_account_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    !value.trim().is_empty()
 }
 
 #[derive(Debug, Clone)]
@@ -407,7 +403,7 @@ mod tests {
                 venue: "binance".to_string(),
                 market: "spot".to_string(),
                 symbol: "BTCUSDT".to_string(),
-                runtime_account_id: "binance-primary".to_string(),
+                runtime_account_id: "desk/main".to_string(),
                 account_fingerprint: "a".repeat(64),
                 maker_fee_bps: SideFeeBps {
                     buy: "10".to_string(),

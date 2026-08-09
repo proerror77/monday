@@ -545,11 +545,7 @@ fn valid_cex_symbol(value: &str) -> bool {
 }
 
 fn valid_runtime_account_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    !value.trim().is_empty()
 }
 
 fn positive_decimal(value: &str) -> bool {
@@ -836,7 +832,7 @@ mod tests {
                 evidence: vec![triplet('4')],
             },
             fee_schedule: CexFeeScheduleV2 {
-                runtime_account_id: "binance-primary".to_string(),
+                runtime_account_id: "desk/main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 maker_buy_fee_bps: "2".to_string(),
                 maker_sell_fee_bps: "2".to_string(),
@@ -879,7 +875,7 @@ mod tests {
                 method: "verified_order_lifecycle_realized_slippage".to_string(),
                 venue: "binance".to_string(),
                 symbol: "BTCUSDT".to_string(),
-                runtime_account_id: "binance-primary".to_string(),
+                runtime_account_id: "desk/main".to_string(),
                 account_fingerprint: "9".repeat(64),
                 evidence: triplet('8'),
                 first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")

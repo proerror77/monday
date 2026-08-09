@@ -48,8 +48,6 @@ struct Args {
     #[arg(long)]
     symbol: String,
     #[arg(long)]
-    account_id: String,
-    #[arg(long)]
     output_root: PathBuf,
 }
 
@@ -57,11 +55,12 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let symbol = args.symbol.trim().to_ascii_uppercase();
-    if !valid_binance_symbol(&symbol)
-        || !valid_runtime_account_id(&args.account_id)
-        || !args.output_root.is_absolute()
-    {
-        bail!("symbol, account id, and absolute output root are required");
+    if !valid_binance_symbol(&symbol) || !args.output_root.is_absolute() {
+        bail!("symbol and absolute output root are required");
+    }
+    let runtime_account_id = required_env("HFT_SECRET_BINANCE_RUNTIME_ACCOUNT_ID")?;
+    if !valid_runtime_account_id(&runtime_account_id) {
+        bail!("HFT_SECRET_BINANCE_RUNTIME_ACCOUNT_ID is invalid");
     }
     let credentials = BinanceCredentials::new(
         required_env("HFT_SECRET_BINANCE_API_KEY")?,
@@ -112,7 +111,7 @@ async fn main() -> Result<()> {
             venue: "binance".to_string(),
             market: args.market.name().to_string(),
             symbol,
-            runtime_account_id: args.account_id,
+            runtime_account_id,
             account_fingerprint,
             maker_fee_bps,
             taker_fee_bps,
