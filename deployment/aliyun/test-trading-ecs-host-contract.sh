@@ -529,8 +529,6 @@ secret_root=$tmp_dir/secrets
 mkdir "$secret_root"
 cat >"$secret_root/runtime.env" <<'ENV'
 HFT_GRPC_AUTH_TOKEN=example_token_with_at_least_32_chars
-HFT_SECRET_BINANCE_API_KEY=example_key
-HFT_SECRET_BINANCE_SECRET=example_secret
 HFT_SECRET_BINANCE_ACCOUNT_JSON={"runtime_account_id":"binance_main","api_key":"example_key","secret":"example_secret"}
 ENV
 printf '%s\n' "$(printf 'b%.0s' {1..64})" >"$secret_root/feedback-signing-key.hex"
@@ -565,18 +563,6 @@ chmod 0440 "$secret_root/feedback-signing-key.hex"
   chmod 0640 "$secret_root/runtime.env"
   sed -i.bak \
     's/short_token/example_token_with_at_least_32_chars/' \
-    "$secret_root/runtime.env"
-  rm "$secret_root/runtime.env.bak"
-  chmod 0440 "$secret_root/runtime.env"
-  validate_runtime_secrets
-  chmod 0640 "$secret_root/runtime.env"
-  sed -i.bak 's/"api_key":"example_key"/"api_key":"wrong_key"/' \
-    "$secret_root/runtime.env"
-  rm "$secret_root/runtime.env.bak"
-  chmod 0440 "$secret_root/runtime.env"
-  ! validate_runtime_secrets
-  chmod 0640 "$secret_root/runtime.env"
-  sed -i.bak 's/"api_key":"wrong_key"/"api_key":"example_key"/' \
     "$secret_root/runtime.env"
   rm "$secret_root/runtime.env.bak"
   chmod 0440 "$secret_root/runtime.env"

@@ -10,5 +10,7 @@ allowed_files:
   - rust_hft/tools/collector/src/binance_fee_artifact.rs
   - deployment/aliyun/trading-ecs-runtime.sh
   - deployment/aliyun/test-trading-ecs-host-contract.sh
+  - deployment/aliyun/TRADING_ECS_HOST.md
+  - rust_hft/deployment/docker/Dockerfile.trading
 dependency: none
 no_external_runtime_mutation: true
