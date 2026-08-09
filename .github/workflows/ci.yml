@@ -439,6 +439,7 @@ jobs:
           ../deployment/aliyun/test-rust-lob-restore.sh
           ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
           ../deployment/aliyun/test-trading-ecs-host-contract.sh
+          ../deployment/aliyun/test-binance-fee-release-contract.sh
 
   market_recorder_contract:
     name: Market Recorder Release Contract

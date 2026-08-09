@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::HashMap, fs, path::PathBuf, str::FromStr, time::Duration};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Market {
@@ -50,6 +50,8 @@ struct Args {
     symbol: String,
     #[arg(long)]
     output_root: PathBuf,
+    #[arg(long)]
+    account_secret_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -64,10 +66,13 @@ struct BinanceAccountSecret {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let symbol = args.symbol.trim().to_ascii_uppercase();
-    if !valid_binance_symbol(&symbol) || !args.output_root.is_absolute() {
-        bail!("symbol and absolute output root are required");
+    if !valid_binance_symbol(&symbol)
+        || !args.output_root.is_absolute()
+        || !args.account_secret_file.is_absolute()
+    {
+        bail!("symbol, absolute output root, and absolute account secret file are required");
     }
-    let account_secret = parse_account_secret(&required_env("HFT_SECRET_BINANCE_ACCOUNT_JSON")?)?;
+    let account_secret = read_account_secret(&args.account_secret_file)?;
     let runtime_account_id = account_secret.runtime_account_id;
     let credentials = BinanceCredentials::new(account_secret.api_key, account_secret.secret);
     let account_fingerprint = hex::encode(Sha256::digest(credentials.api_key.as_bytes()));
@@ -142,17 +147,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn required_env(name: &str) -> Result<String> {
-    let value = std::env::var_os(name)
-        .with_context(|| format!("{name} is required"))?
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))?;
-    if value.trim().is_empty() {
-        bail!("{name} is empty");
-    }
-    Ok(value)
-}
-
 fn parse_account_secret(value: &str) -> Result<BinanceAccountSecret> {
     let secret: BinanceAccountSecret =
         serde_json::from_str(value).context("Binance account secret is invalid JSON")?;
@@ -163,6 +157,12 @@ fn parse_account_secret(value: &str) -> Result<BinanceAccountSecret> {
         bail!("Binance account secret is incomplete");
     }
     Ok(secret)
+}
+
+fn read_account_secret(path: &std::path::Path) -> Result<BinanceAccountSecret> {
+    let value = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Binance account secret {}", path.display()))?;
+    parse_account_secret(&value)
 }
 
 fn validate_response_symbol(payload: &Value, expected: &str) -> Result<()> {
@@ -329,6 +329,16 @@ mod tests {
             r#"{"runtime_account_id":"desk/main","api_key":"key","secret":""}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn missing_credential_file_fails_before_any_request() {
+        let missing = std::env::temp_dir().join(format!(
+            "monday-binance-fee-missing-credential-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&missing);
+        assert!(read_account_secret(&missing).is_err());
     }
 
     #[test]
