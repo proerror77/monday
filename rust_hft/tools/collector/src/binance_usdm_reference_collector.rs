@@ -8,6 +8,7 @@ use data::binance_usdm_reference::{
 use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -18,6 +19,24 @@ pub struct TimedJson {
     pub value: Value,
     pub received_at_ns: u64,
 }
+
+#[derive(Debug)]
+struct RateLimited {
+    endpoint: String,
+    retry_after_seconds: u64,
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "USD-M reference endpoint {} returned HTTP 429 Too Many Requests",
+            self.endpoint
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 #[async_trait]
 pub trait ReferenceSource: Sync {
@@ -68,49 +87,44 @@ impl HttpReferenceSource {
     }
 
     async fn get_url(&self, url: &str, endpoint: &str, symbol: Option<&str>) -> Result<TimedJson> {
-        let mut rate_limit_retries = 0;
-        loop {
-            let mut request = self.client.get(url);
-            if let Some(symbol) = symbol {
-                request = request.query(&[("symbol", symbol)]);
-            }
-            let response = request
-                .send()
-                .await
-                .context("USD-M reference request failed")?;
-            let status = response.status();
-            let retry_after_seconds = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(30)
-                .min(60);
-            let bytes = response
-                .bytes()
-                .await
-                .context("USD-M reference response body failed")?;
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && rate_limit_retries == 0 {
-                rate_limit_retries += 1;
-                warn!(
-                    endpoint,
-                    retry_after_seconds, "Binance rate limited; retrying once"
-                );
-                tokio::time::sleep(Duration::from_secs(retry_after_seconds)).await;
-                continue;
-            }
-            let received_at_ns = now_ns()?;
-            if !status.is_success() {
-                bail!("USD-M reference endpoint {endpoint} returned HTTP {status}");
-            }
-            let value = serde_json::from_slice(&bytes).with_context(|| {
-                format!("USD-M reference endpoint {endpoint} returned invalid JSON")
-            })?;
-            return Ok(TimedJson {
-                value,
-                received_at_ns,
-            });
+        let mut request = self.client.get(url);
+        if let Some(symbol) = symbol {
+            request = request.query(&[("symbol", symbol)]);
         }
+        let response = request
+            .send()
+            .await
+            .context("USD-M reference request failed")?;
+        let status = response.status();
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30)
+            .min(60);
+        let bytes = response
+            .bytes()
+            .await
+            .context("USD-M reference response body failed")?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(RateLimited {
+                endpoint: endpoint.to_owned(),
+                retry_after_seconds,
+            }
+            .into());
+        }
+        let received_at_ns = now_ns()?;
+        if !status.is_success() {
+            bail!("USD-M reference endpoint {endpoint} returned HTTP {status}");
+        }
+        let value = serde_json::from_slice(&bytes).with_context(|| {
+            format!("USD-M reference endpoint {endpoint} returned invalid JSON")
+        })?;
+        Ok(TimedJson {
+            value,
+            received_at_ns,
+        })
     }
 }
 
@@ -164,6 +178,28 @@ pub async fn collect_complete_reference_batch(
     if oi_concurrency == 0 {
         bail!("OI concurrency must be positive");
     }
+    match collect_complete_reference_batch_once(source, oi_concurrency, clocks).await {
+        Err(error) => {
+            let Some(rate_limit) = error.downcast_ref::<RateLimited>() else {
+                return Err(error);
+            };
+            warn!(
+                endpoint = rate_limit.endpoint,
+                retry_after_seconds = rate_limit.retry_after_seconds,
+                "Binance rate limited; restarting the complete reference batch once"
+            );
+            tokio::time::sleep(Duration::from_secs(rate_limit.retry_after_seconds)).await;
+            collect_complete_reference_batch_once(source, oi_concurrency, clocks).await
+        }
+        result => result,
+    }
+}
+
+async fn collect_complete_reference_batch_once(
+    source: &dyn ReferenceSource,
+    oi_concurrency: usize,
+    clocks: &mut ReferenceClockValidator,
+) -> Result<CollectedReferenceBatch> {
     let server_time = source.server_time().await?;
     let source_time_ms = server_time
         .value
@@ -242,8 +278,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
-    use std::time::Instant;
 
     const SOURCE_MS: u64 = 1_700_000_000_000;
     const RECEIVED_NS: u64 = 1_700_000_000_500_000_000;
@@ -315,6 +351,42 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing fake OI for {symbol}"))?;
             Ok(Self::timed(value, RECEIVED_NS + 30))
+        }
+    }
+
+    struct RateLimitedOnceSource {
+        inner: FakeSource,
+        server_time_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReferenceSource for RateLimitedOnceSource {
+        fn source_origin(&self) -> &str {
+            self.inner.source_origin()
+        }
+
+        async fn server_time(&self) -> Result<TimedJson> {
+            self.server_time_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.server_time().await
+        }
+
+        async fn exchange_info(&self) -> Result<TimedJson> {
+            self.inner.exchange_info().await
+        }
+
+        async fn premium_index(&self) -> Result<TimedJson> {
+            if self.server_time_calls.load(Ordering::SeqCst) == 1 {
+                return Err(RateLimited {
+                    endpoint: PREMIUM_INDEX_ENDPOINT.to_owned(),
+                    retry_after_seconds: 0,
+                }
+                .into());
+            }
+            self.inner.premium_index().await
+        }
+
+        async fn open_interest(&self, symbol: &str) -> Result<TimedJson> {
+            self.inner.open_interest(symbol).await
         }
     }
 
@@ -392,33 +464,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_source_retries_one_rate_limited_request() {
+    async fn http_source_preserves_bounded_retry_after_on_rate_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let mut requests = 0;
-            listener.set_nonblocking(true).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while requests < 2 && Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 1024];
-                        let _ = stream.read(&mut buffer);
-                        requests += 1;
-                        let response = if requests == 1 {
-                            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        } else {
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"serverTime\":1700000000}"
-                        };
-                        stream.write_all(response.as_bytes()).unwrap();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("mock server failed: {error}"),
-                }
-            }
-            requests
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
         });
         let source = HttpReferenceSource {
             client: reqwest::Client::builder()
@@ -427,15 +482,38 @@ mod tests {
                 .unwrap(),
         };
 
-        let result = source
+        let error = source
             .get_url(
                 &format!("http://{address}/time"),
                 SERVER_TIME_ENDPOINT,
                 None,
             )
-            .await;
+            .await
+            .unwrap_err();
 
-        assert!(result.is_ok(), "429 should be retried once: {result:?}");
-        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(
+            error
+                .downcast_ref::<RateLimited>()
+                .unwrap()
+                .retry_after_seconds,
+            0
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_restarts_the_complete_batch_once() {
+        let source = RateLimitedOnceSource {
+            inner: FakeSource::complete(),
+            server_time_calls: AtomicUsize::new(0),
+        };
+
+        let collected =
+            collect_complete_reference_batch(&source, 2, &mut ReferenceClockValidator::default())
+                .await
+                .unwrap();
+
+        assert_eq!(source.server_time_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(collected.batch().open_interest().len(), 2);
     }
 }
