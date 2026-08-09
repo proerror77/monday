@@ -4064,6 +4064,14 @@ mod tests {
         assert_eq!(manifest["segment_complete"], false);
         assert_eq!(manifest["reference_context_complete"], false);
         assert_eq!(
+            manifest["trade_completions"]["market-1"]["condition_id"],
+            "0xcondition"
+        );
+        assert_eq!(
+            manifest["trade_completions"]["market-1"]["completion_sequence"],
+            0
+        );
+        assert_eq!(
             manifest["replay_scope"],
             "reference_hour_segment_requires_market_metadata_context"
         );
