@@ -112,6 +112,7 @@ impl ExecutionClient for SimulatedExecutionClient {
             side: intent.side,
             quantity: intent.quantity,
             requested_price: intent.price,
+            arrival_price: None,
             timestamp: now,
             venue: Some(self.venue),
             strategy_id: intent.strategy_id.clone(),
