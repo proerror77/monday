@@ -191,7 +191,8 @@ pub fn prepare_dataset(
     }
     if rows.iter().any(|row| {
         row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
-            || row.funding_bps.to_bits() != protocol.costs.funding_bps.to_bits()
+            || row.funding_bps < 0.0
+            || row.funding_bps > protocol.costs.funding_bps
             || row.latency_bps.to_bits() != protocol.costs.latency_bps.to_bits()
     }) {
         return Err(EvaluationError::ProtocolMismatch);

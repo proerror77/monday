@@ -16,8 +16,9 @@ use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_research_manifest::{
-    CexReplayDatasetManifestV1, CexReplaySnapshotV1, ManifestId,
+    CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2, ManifestId,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
 };
 use reqwest::{
     blocking::Client,
@@ -58,7 +59,7 @@ struct Materialization {
     top_depth: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
-    snapshot: CexReplaySnapshotV1,
+    snapshot: CexReplaySnapshotV2,
     snapshot_sha256: String,
 }
 
@@ -202,9 +203,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &materialization_path,
         MAX_MATERIALIZATION_BYTES,
     )?;
-    let materialization: Materialization =
-        serde_json::from_slice(&std::fs::read(&materialization_path)?)
-            .context("materialization manifest is invalid JSON")?;
+    let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
     validate_materialization(&materialization, &feature_sha256, &validation)?;
     validate_mission_materialization_binding(
         &control_mission,
@@ -450,6 +449,28 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     })
 }
 
+fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("materialization manifest is invalid JSON")?;
+    match value.get("schema_version").and_then(serde_json::Value::as_str) {
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
+            serde_json::from_value(value).context("V3 materialization manifest is invalid")
+        }
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2) => {
+            let snapshot: CexReplaySnapshotV1 = serde_json::from_value(
+                value
+                    .get("snapshot")
+                    .cloned()
+                    .context("historical V2 materialization has no snapshot")?,
+            )
+            .context("historical V2 materialization snapshot is invalid")?;
+            snapshot.validate().map_err(anyhow::Error::new)?;
+            bail!("historical V2 materialization is read-only and cannot execute")
+        }
+        _ => bail!("materialization kind or schema is unsupported"),
+    }
+}
+
 fn persist_baseline_evidence(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -693,7 +714,7 @@ fn validate_mission_materialization_binding(
 fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
-    dataset: &CexReplayDatasetManifestV1,
+    dataset: &CexReplayDatasetManifestV2,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
         || mission.spec.inputs.feature.content_sha256 != features.artifact_sha256
@@ -720,7 +741,7 @@ fn validate_materialization(
         bail!("CEX replay snapshot SHA256 mismatch");
     }
     if materialization.dataset_kind != MATERIALIZATION_KIND
-        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2
+        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3
     {
         bail!("materialization kind or schema is unsupported");
     }
@@ -763,6 +784,34 @@ fn validate_materialization(
         || materialization.label_horizon_buckets != validation.label_horizon_buckets
     {
         bail!("evaluation label horizon or frequency does not match the materialization");
+    }
+    let fee_bps = if validation.cross_spread {
+        &materialization.snapshot.fee_schedule.taker_fee_bps
+    } else {
+        &materialization.snapshot.fee_schedule.maker_fee_bps
+    }
+    .parse::<f64>()
+    .context("snapshot fee evidence is not numeric")?;
+    let funding_bps = materialization
+        .snapshot
+        .derivatives_reference
+        .as_ref()
+        .map(|reference| reference.evaluation_funding_bps_per_bucket.parse::<f64>())
+        .transpose()
+        .context("snapshot funding evidence is not numeric")?
+        .unwrap_or(0.0);
+    let latency_bps = materialization
+        .snapshot
+        .latency_cost
+        .p95_cost_bps
+        .parse::<f64>()
+        .context("snapshot execution latency evidence is not numeric")?;
+    if validation.rebate_bps != 0.0
+        || validation.fee_bps.to_bits() != fee_bps.to_bits()
+        || validation.funding_bps.to_bits() != funding_bps.to_bits()
+        || validation.latency_bps.to_bits() != latency_bps.to_bits()
+    {
+        bail!("evaluation costs do not match the verified CEX replay snapshot");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
     for segment in &materialization.source_segments {
@@ -1083,7 +1132,7 @@ mod tests {
         fixture.materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
         fixture.materialization["snapshot"]["feature_artifact_sha256"] =
             serde_json::json!("0".repeat(64));
-        let snapshot: CexReplaySnapshotV1 =
+        let snapshot: CexReplaySnapshotV2 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         resign_materialization_outer(&mut fixture);
@@ -1099,28 +1148,7 @@ mod tests {
     #[test]
     fn execute_rejects_snapshot_missing_aggregate_trade_modality() {
         let mut fixture = fixture("missing-aggregate-trade-modality");
-        fixture.materialization["snapshot"] = serde_json::json!({
-            "schema_version": "cex-replay-snapshot-v1",
-            "venue": "binance",
-            "instrument_type": "usdm",
-            "symbol": "BTCUSDT",
-            "replay_clock": "received_at_ns",
-            "required_modalities": ["lob"],
-            "source_segments": [{
-                "content_sha256": "1".repeat(64),
-                "manifest_sha256": "2".repeat(64),
-                "start_received_at_ns": 1,
-                "end_received_at_ns": 2,
-                "events": 1
-            }],
-            "first_event_time": fixture.materialization["first_event_time"].clone(),
-            "last_event_time": fixture.materialization["last_event_time"].clone(),
-            "feature_artifact_sha256": fixture.materialization["artifact_sha256"].clone(),
-            "feature_availability_policy": "feature_available_time_equals_event_time",
-            "bucket_ms": 1_000,
-            "label_horizon_buckets": 5,
-            "top_depth": 5
-        });
+        fixture.materialization["snapshot"]["required_modalities"] = serde_json::json!(["lob"]);
         fixture.materialization["snapshot_sha256"] = serde_json::json!("0".repeat(64));
         resign_materialization_outer(&mut fixture);
 
@@ -1281,7 +1309,8 @@ mod tests {
     #[test]
     fn execute_records_explicit_taker_costs_in_evidence() {
         let mut fixture = fixture("explicit-taker-costs");
-        fixture.mission.spec.evaluation_protocol.costs.rebate_bps = 0.25;
+        fixture.mission.spec.evaluation_protocol.costs.fee_bps = 5.0;
+        fixture.mission.spec.evaluation_protocol.costs.rebate_bps = 0.0;
         fixture.mission.spec.evaluation_protocol.costs.slippage_bps = 0.75;
         fixture.mission.spec.evaluation_protocol.costs.cross_spread = true;
         fixture
@@ -1311,8 +1340,8 @@ mod tests {
         .unwrap();
         let costs =
             &evidence["evaluations"][0]["record"]["payload"]["evaluation_protocol"]["costs"];
-        assert_eq!(costs["fee_bps"], 2.0);
-        assert_eq!(costs["rebate_bps"], 0.25);
+        assert_eq!(costs["fee_bps"], 5.0);
+        assert_eq!(costs["rebate_bps"], 0.0);
         assert_eq!(costs["latency_bps"], 0.5);
         assert_eq!(costs["slippage_bps"], 0.75);
         assert_eq!(costs["cross_spread"], true);
@@ -1337,7 +1366,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(execution_model["schema_version"], "execution_cost_model_v2");
-        assert_eq!(execution_model["rebate_bps"], 0.25);
+        assert_eq!(execution_model["rebate_bps"], 0.0);
         assert_eq!(execution_model["additional_slippage_bps"], 0.75);
         assert_eq!(execution_model["queue_position_modeled"], false);
         assert_eq!(execution_model["partial_fills_modeled"], false);
@@ -1578,7 +1607,7 @@ mod tests {
         let producer_id = fixture.mission.semantic_id().unwrap();
         let source = AlphaStore::open(&source_db).unwrap();
         let producer = source.get_mission(&producer_id).unwrap();
-        let dataset_manifest: CexReplayDatasetManifestV1 = serde_json::from_slice(
+        let dataset_manifest: CexReplayDatasetManifestV2 = serde_json::from_slice(
             &std::fs::read(results.join("cex-replay-dataset-manifest.json")).unwrap(),
         )
         .unwrap();
@@ -2143,12 +2172,19 @@ mod tests {
                         "binance-usdm-lob".to_string(),
                         source_revision.clone(),
                     )]),
-                    modalities: BTreeSet::from([DataModality::Lob]),
+                    modalities: BTreeSet::from([
+                        DataModality::Lob,
+                        DataModality::TradeTick,
+                        DataModality::Funding,
+                        DataModality::OpenInterest,
+                    ]),
                     features: BTreeMap::from([
                         ("ask_depth_top5".to_string(), 10.0),
                         ("bid_depth_top5".to_string(), 10.0),
                         ("book_imbalance".to_string(), index as f64 / 100.0),
                         ("mid_price".to_string(), 60_000.0),
+                        ("funding_rate".to_string(), 0.0001),
+                        ("open_interest".to_string(), 12_345.5),
                         ("spread_bps".to_string(), (index as f64 / 10.0).sin().abs()),
                     ]),
                     label: if index % 2 == 0 { 0.001 } else { -0.0005 },
@@ -2171,8 +2207,8 @@ mod tests {
         )
         .unwrap();
         let source_end_ns = u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-        let snapshot = CexReplaySnapshotV1 {
-            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V1.to_string(),
+        let snapshot = CexReplaySnapshotV2 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -2180,6 +2216,8 @@ mod tests {
             required_modalities: BTreeSet::from([
                 hft_research_manifest::CEX_MODALITY_LOB.to_string(),
                 hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+                hft_research_manifest::CEX_MODALITY_FUNDING.to_string(),
+                hft_research_manifest::CEX_MODALITY_OPEN_INTEREST.to_string(),
             ]),
             source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
                 content_sha256: source_content_sha256.clone(),
@@ -2196,11 +2234,48 @@ mod tests {
             bucket_ms: 1_000,
             label_horizon_buckets: 5,
             top_depth: 5,
+            instrument_rules: hft_research_manifest::CexInstrumentRulesV2 {
+                tick_size: "0.1".to_string(),
+                step_size: "0.001".to_string(),
+                min_notional: "5".to_string(),
+                available_at: first_event_time - ChronoDuration::seconds(1),
+                valid_through: last_event_time,
+                evidence_sha256: "4".repeat(64),
+            },
+            fee_schedule: hft_research_manifest::CexFeeScheduleV2 {
+                maker_fee_bps: "2".to_string(),
+                taker_fee_bps: "5".to_string(),
+                available_at: first_event_time - ChronoDuration::seconds(1),
+                valid_through: last_event_time,
+                evidence_sha256: "5".repeat(64),
+            },
+            derivatives_reference: Some(hft_research_manifest::CexDerivativesReferenceV2 {
+                artifact_sha256: "6".repeat(64),
+                first_available_at: first_event_time - ChronoDuration::seconds(1),
+                last_available_at: last_event_time,
+                funding_observations: 160,
+                open_interest_observations: 160,
+                evaluation_funding_bps_per_bucket: "0".to_string(),
+            }),
+            latency_cost: hft_research_manifest::CexLatencyCostV2 {
+                method: "verified_order_lifecycle_realized_slippage".to_string(),
+                evidence_sha256: "7".repeat(64),
+                first_observed_at: first_event_time - ChronoDuration::seconds(2),
+                last_observed_at: first_event_time - ChronoDuration::seconds(1),
+                available_at: first_event_time - ChronoDuration::seconds(1),
+                observations: 160,
+                p50_ns: 1_000_000,
+                p95_ns: 2_000_000,
+                p99_ns: 3_000_000,
+                p50_cost_bps: "0.1".to_string(),
+                p95_cost_bps: "0.5".to_string(),
+                p99_cost_bps: "0.6".to_string(),
+            },
         };
         let snapshot_sha256 = snapshot.sha256();
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
-            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
             "mission_id": "data-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
@@ -2285,7 +2360,7 @@ mod tests {
         let materialization_sha256 = sha256_file(&materialization_path).unwrap();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
         let dataset =
-            CexReplayDatasetManifestV1::new(format!("dataset-{feature_sha256}"), snapshot.clone())
+            CexReplayDatasetManifestV2::new(format!("dataset-{feature_sha256}"), snapshot.clone())
                 .unwrap();
         let mut mission = CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
@@ -2411,6 +2486,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_v2_materialization_decodes_read_only() {
+        let fixture = fixture("historical-v2-read-only");
+        let mut value = fixture.materialization.clone();
+        value["schema_version"] = serde_json::json!(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2);
+        let snapshot = value["snapshot"].as_object_mut().unwrap();
+        snapshot.insert(
+            "schema_version".to_string(),
+            serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V1),
+        );
+        snapshot.insert(
+            "required_modalities".to_string(),
+            serde_json::json!([
+                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE,
+                hft_research_manifest::CEX_MODALITY_LOB
+            ]),
+        );
+        for field in [
+            "instrument_rules",
+            "fee_schedule",
+            "derivatives_reference",
+            "latency_cost",
+        ] {
+            snapshot.remove(field);
+        }
+
+        let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("historical V2 materialization is read-only"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
     fn rewrite_features(fixture: &mut Fixture, mutate: impl Fn(&mut PointInTimeFeatureRow)) {
         let bytes = std::fs::read(&fixture.feature_path).unwrap();
         let mut rows = std::io::BufReader::new(bytes.as_slice())
@@ -2477,7 +2584,7 @@ mod tests {
     }
 
     fn rebind_mission_inputs(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV1 =
+        let snapshot: CexReplaySnapshotV2 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         let snapshot_sha256 = snapshot.sha256();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
@@ -2491,7 +2598,7 @@ mod tests {
             .unwrap()
             .to_string();
         let dataset =
-            CexReplayDatasetManifestV1::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
+            CexReplayDatasetManifestV2::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
         fixture.mission.spec.data_mission_id = data_mission_id.clone();
         fixture.mission.spec.inputs = CexResearchInputBindingsV1 {
             dataset: CexResearchContentRefV1 {
@@ -2534,7 +2641,7 @@ mod tests {
     }
 
     fn resign_materialization(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV1 =
+        let snapshot: CexReplaySnapshotV2 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         std::fs::write(
