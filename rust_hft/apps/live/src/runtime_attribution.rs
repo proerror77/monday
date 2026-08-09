@@ -58,6 +58,7 @@ struct StrategyTarget {
 #[derive(Debug)]
 struct AttributionState {
     orders: HashMap<String, OrderMetadata>,
+    invalid_order_ids: HashSet<String>,
     targets: BTreeMap<String, StrategyTarget>,
     ledgers: BTreeMap<String, StrategyLedger>,
     valuation_started: bool,
@@ -212,6 +213,7 @@ impl AttributionState {
             .collect();
         Ok(Self {
             orders: HashMap::new(),
+            invalid_order_ids: HashSet::new(),
             targets,
             ledgers,
             valuation_started: false,
@@ -348,26 +350,37 @@ fn execution_attribution(
             arrival_price,
             ..
         } => {
-            let previous = state.orders.remove(&order_id.0);
-            let Some(venue) = venue.as_ref().map(ToString::to_string) else {
-                return Ok(None);
-            };
-            let Some(expected_strategy_id) = expected_strategy_id(activation, symbol.as_str())
-            else {
-                return Ok(None);
-            };
-            if strategy_id != &expected_strategy_id
-                || !venue.eq_ignore_ascii_case(&activation.venue)
-            {
+            if state.invalid_order_ids.contains(&order_id.0) {
                 return Ok(None);
             }
+            let previous = state.orders.remove(&order_id.0);
+            let candidate_venue = venue.as_ref().map(ToString::to_string);
+            let expected_strategy_id = expected_strategy_id(activation, symbol.as_str());
+            if candidate_venue
+                .as_ref()
+                .is_none_or(|venue| !venue.eq_ignore_ascii_case(&activation.venue))
+                || expected_strategy_id
+                    .as_ref()
+                    .is_none_or(|expected| strategy_id != expected)
+            {
+                if previous.is_some() {
+                    state.invalid_order_ids.insert(order_id.0.clone());
+                }
+                return Ok(None);
+            }
+            let venue = candidate_venue.unwrap();
             if previous.as_ref().is_some_and(|order| {
                 order.strategy_id != *strategy_id
                     || !order.venue.eq_ignore_ascii_case(&venue)
                     || order.symbol != symbol.as_str()
                     || order.side != *side
                     || order.requested_price != requested_price.map(|price| price.0)
+                    || matches!(
+                        (order.arrival_price, arrival_price.map(|price| price.0)),
+                        (Some(previous), Some(current)) if previous != current
+                    )
             }) {
+                state.invalid_order_ids.insert(order_id.0.clone());
                 return Ok(None);
             }
             state.orders.insert(
@@ -1392,6 +1405,7 @@ mod tests {
             *symbol = Symbol::new("ETHUSDT");
         }
         execution_attribution(&activation, &mut state, &conflicting).unwrap();
+        execution_attribution(&activation, &mut state, &order_new("reused-order")).unwrap();
 
         let fill = execution_attribution(
             &activation,
@@ -1406,6 +1420,7 @@ mod tests {
         )
         .unwrap();
         assert!(fill.is_none());
+        assert!(state.invalid_order_ids.contains("reused-order"));
     }
 
     #[test]
