@@ -470,8 +470,12 @@ fn execution_attribution(
                 "evidence_available_at_us".to_string(),
                 Utc::now().timestamp_micros().max(0) as f64,
             );
-            if metadata.venue.eq_ignore_ascii_case("binance") {
+            if metadata.venue.eq_ignore_ascii_case("binance")
+                || metadata.venue.eq_ignore_ascii_case("binance_spot")
+            {
                 metrics.insert("instrument_market_spot".to_string(), 1.0);
+            } else if metadata.venue.eq_ignore_ascii_case("binance_futures") {
+                metrics.insert("instrument_market_usdm".to_string(), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -1356,6 +1360,42 @@ mod tests {
         assert_eq!(cancel.outcome, AttributionOutcome::Healthy);
         assert!(!state.orders.contains_key("reject-order"));
         assert!(!state.orders.contains_key("cancel-order"));
+    }
+
+    #[test]
+    fn binance_futures_fill_carries_usdm_market_identity() {
+        let mut activation = activation();
+        activation.venue = "BINANCE_FUTURES".to_string();
+        let mut state = AttributionState::new(&activation).unwrap();
+        execution_attribution(
+            &activation,
+            &mut state,
+            &order_new_for(
+                "futures-order",
+                "BTCUSDT",
+                Side::Buy,
+                "bundle-1:BTCUSDT",
+                Some(VenueId::BINANCE_FUTURES),
+            ),
+        )
+        .unwrap();
+
+        let fill = execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::Fill {
+                order_id: OrderId("futures-order".to_string()),
+                price: Price::from_f64(101.0).unwrap(),
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                timestamp: NOW_US + 1,
+                fill_id: "futures-fill-1".to_string(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fill.metrics["instrument_market_usdm"], 1.0);
+        assert!(!fill.metrics.contains_key("instrument_market_spot"));
     }
 
     #[test]
