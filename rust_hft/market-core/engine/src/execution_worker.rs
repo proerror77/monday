@@ -1125,7 +1125,7 @@ impl ExecutionWorker {
                                 side: intent.side,
                                 quantity: intent.quantity,
                                 requested_price: intent.price,
-                                arrival_price: arrival_price(&intent),
+                                arrival_price: arrival_price(intent),
                                 timestamp: now_micros(),
                                 venue,
                                 strategy_id: intent.strategy_id.clone(),
