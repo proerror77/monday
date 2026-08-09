@@ -4,14 +4,15 @@ umask 027
 export LC_ALL=C
 
 usage() {
-  printf 'Usage: %s <candidate-binary-sha256>\n' "${0##*/}" >&2
+  printf 'Usage: %s <candidate-binary-sha256> <controller>\n' "${0##*/}" >&2
 }
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   printf 'must run as root\n' >&2
   exit 2
 fi
-if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
+if [[ $# -ne 2 || ! $1 =~ ^[A-Fa-f0-9]{64}$ \
+  || ! $2 =~ ^[A-Za-z0-9._@-]{1,128}$ ]]; then
   usage
   exit 2
 fi
@@ -24,7 +25,9 @@ for command in awk chmod cmp date dirname env find flock grep id install jq ln m
 done
 
 CANDIDATE_SHA256=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+CONTROLLER=$2
 RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-collector
+UPLOADER_RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-upload
 CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
 CANDIDATE_COLLECTOR="$CANDIDATE_RELEASE/binance-usdm-reference-collector"
 CANDIDATE_VERIFIER="$CANDIDATE_RELEASE/binance-usdm-reference-artifact-verifier"
@@ -118,6 +121,14 @@ TRANSITION_STARTED=0
 SUCCESS=0
 CANDIDATE_STARTED_NS=0
 DRAIN_DONE_NS=0
+OLD_MODE=not-determined
+OLD_COLLECTOR=
+OLD_UPLOADER=
+OLD_RELEASE_SHA256=
+OLD_UPLOADER_RELEASE_SHA256=
+OLD_UPLOADER_SHA256=
+ROLLBACK_ASSETS_SHA256=
+CANDIDATE_MAY_HAVE_WRITTEN=0
 
 fail() {
   FAILURE_REASON=$*
@@ -246,8 +257,24 @@ require_empty_lake() {
   fi
 }
 
-run_candidate_drain() {
-  local key value
+quarantine_reference_staging() {
+  local quarantine="$EVIDENCE_DIR/quarantined-v2-staging" path target count=0
+  [[ -d $CANONICAL_SPOOL/lake ]] || return 0
+  while IFS= read -r -d '' path; do
+    [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]] || return 1
+    ((count += 1))
+    if (( count == 1 )); then
+      install -d -m 0750 "$quarantine" || return 1
+    fi
+    target="$quarantine/staging-$count"
+    mv -- "$path" "$target" || return 1
+    printf '%s\t%s\n' "$path" "$target" >>"$quarantine/paths.tsv" || return 1
+  done < <(find "$CANONICAL_SPOOL/lake" -name '.reference-staging.*' \
+    \( -type d -o -type l \) -print0)
+}
+
+run_uploader() {
+  local uploader=$1 key value
   local -a env_args
   canonical_spool_paths_safe || return 1
   env_args=()
@@ -261,9 +288,78 @@ run_candidate_drain() {
     PATH="$SAFE_PATH" \
     RUST_LOG=info \
     "${env_args[@]}" \
-    "$CANDIDATE_UPLOADER" --output-root "$CANONICAL_SPOOL" || return 1
+    "$uploader" --output-root "$CANONICAL_SPOOL" || return 1
+}
+
+run_candidate_drain() {
+  run_uploader "$CANDIDATE_UPLOADER" || return 1
   jq -e '.last_error == null and (.uploaded_batches + .retried_batches) >= 1' \
     "$CANONICAL_SPOOL/upload-status.json" >/dev/null || return 1
+}
+
+stage_rollback_assets() {
+  local rollback="$EVIDENCE_DIR/rollback-assets" asset source
+  install -d -m 0750 "$rollback" || return 1
+  for asset in binance-usdm-reference-collector.service \
+    binance-usdm-reference-upload.service binance-usdm-reference-upload.timer; do
+    source="/etc/systemd/system/$asset"
+    secure_regular_file "$source"
+    install -m 0640 "$source" "$rollback/$asset" || return 1
+  done
+  secure_regular_file "$UPLOAD_ENV"
+  install -m 0640 "$UPLOAD_ENV" "$rollback/binance-usdm-reference-upload.env" || return 1
+  (
+    cd "$rollback"
+    sha256sum binance-usdm-reference-collector.service \
+      binance-usdm-reference-upload.service \
+      binance-usdm-reference-upload.timer \
+      binance-usdm-reference-upload.env > rollback-assets.sha256
+  ) || return 1
+  chmod 0640 "$rollback/rollback-assets.sha256" || return 1
+  ROLLBACK_ASSETS_SHA256=$(sha256sum "$rollback/rollback-assets.sha256" | awk '{print $1}') \
+    || return 1
+}
+
+restore_old_production() {
+  local rollback="$EVIDENCE_DIR/rollback-assets" restore_started_ns deadline
+  secure_regular_file "$rollback/rollback-assets.sha256"
+  [[ $(sha256sum "$rollback/rollback-assets.sha256" | awk '{print $1}') \
+    == "$ROLLBACK_ASSETS_SHA256" ]] || return 1
+  (cd "$rollback" && sha256sum --check --strict rollback-assets.sha256) || return 1
+  if (( CANDIDATE_MAY_HAVE_WRITTEN )); then
+    run_uploader "$CANDIDATE_UPLOADER" || return 1
+    require_empty_lake || return 1
+  fi
+  atomic_install 0644 "$rollback/binance-usdm-reference-collector.service" \
+    /etc/systemd/system/binance-usdm-reference-collector.service || return 1
+  atomic_install 0644 "$rollback/binance-usdm-reference-upload.service" \
+    /etc/systemd/system/binance-usdm-reference-upload.service || return 1
+  atomic_install 0644 "$rollback/binance-usdm-reference-upload.timer" \
+    /etc/systemd/system/binance-usdm-reference-upload.timer || return 1
+  atomic_install 0640 "$rollback/binance-usdm-reference-upload.env" "$UPLOAD_ENV" || return 1
+  atomic_symlink "$OLD_COLLECTOR" "$COLLECTOR_LINK" || return 1
+  atomic_symlink "$OLD_UPLOADER" "$UPLOADER_LINK" || return 1
+  systemctl daemon-reload || return 1
+  systemctl unmask --runtime "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" "$UPLOAD_TIMER" >/dev/null \
+    || return 1
+  systemctl reset-failed "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
+  restore_started_ns=$(date +%s%N) || return 1
+  systemctl start "$COLLECTOR_UNIT" || return 1
+  systemctl enable "$COLLECTOR_UNIT" >/dev/null || return 1
+  [[ $(readlink -f "$COLLECTOR_LINK") == "$OLD_COLLECTOR" ]] || return 1
+  [[ $(readlink -f "$UPLOADER_LINK") == "$OLD_UPLOADER" ]] || return 1
+  deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
+    if health_ready_for_release "$restore_started_ns" \
+      && runtime_matches_collector "$OLD_COLLECTOR" false; then
+      systemctl enable --now "$UPLOAD_TIMER" >/dev/null || return 1
+      runtime_matches_collector "$OLD_COLLECTOR" true || return 1
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
 }
 
 health_ready_for_release() {
@@ -292,19 +388,23 @@ health_ready_for_release() {
     --manifest-sha256 "$manifest_sha" >/dev/null || return 1
 }
 
-runtime_matches_release() {
-  local require_enabled=$1 restarts main_pid main_exe
+runtime_matches_collector() {
+  local expected_collector=$1 require_enabled=$2 restarts main_pid main_exe
   systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
   restarts=$(systemctl show "$COLLECTOR_UNIT" --property=NRestarts --value) || return 1
   [[ $restarts == 0 ]] || return 1
   main_pid=$(systemctl show "$COLLECTOR_UNIT" --property=MainPID --value) || return 1
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
   main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
-  [[ $main_exe == "$CANDIDATE_COLLECTOR" ]] || return 1
+  [[ $main_exe == "$expected_collector" ]] || return 1
   if [[ $require_enabled == true ]]; then
     systemctl is-enabled --quiet "$COLLECTOR_UNIT" || return 1
     systemctl is-enabled --quiet "$UPLOAD_TIMER" || return 1
   fi
+}
+
+runtime_matches_release() {
+  runtime_matches_collector "$CANDIDATE_COLLECTOR" "$1"
 }
 
 wait_for_release_health() {
@@ -335,6 +435,12 @@ production_is_fail_closed() {
   done
 }
 
+contain_production() {
+  systemctl disable --now "$COLLECTOR_UNIT" "$UPLOAD_TIMER" >/dev/null 2>&1 || true
+  systemctl stop "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
+  systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+}
+
 write_evidence() {
   local temporary collector_target uploader_target collector_active timer_enabled
   temporary="$EVIDENCE_DIR/cutover.json.tmp"
@@ -357,9 +463,15 @@ write_evidence() {
     --arg step "$STEP" \
     --arg failure_reason "$FAILURE_REASON" \
     --arg rollback_result "$ROLLBACK_RESULT" \
+    --arg controller "$CONTROLLER" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
+    --arg host_mode "$OLD_MODE" \
+    --arg previous_release_sha256 "$OLD_RELEASE_SHA256" \
+    --arg previous_uploader_release_sha256 "$OLD_UPLOADER_RELEASE_SHA256" \
+    --arg previous_uploader_sha256 "$OLD_UPLOADER_SHA256" \
+    --arg rollback_assets_sha256 "$ROLLBACK_ASSETS_SHA256" \
     --arg collector_binary "$collector_target" \
     --arg uploader_binary "$uploader_target" \
     --argjson collector_active "$collector_active" \
@@ -372,12 +484,21 @@ write_evidence() {
       last_step: $step,
       failure_reason: (if $failure_reason == "" then null else $failure_reason end),
       rollback_result: $rollback_result,
+      controller: $controller,
       candidate_sha256: $candidate_sha256,
       deployment_bundle_sha256:
         (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       deployment_source_revision:
         (if $deployment_source_revision == "" then null else $deployment_source_revision end),
-      host_mode: "new-host",
+      host_mode: $host_mode,
+      previous_release_sha256:
+        (if $previous_release_sha256 == "" then null else $previous_release_sha256 end),
+      previous_uploader_release_sha256:
+        (if $previous_uploader_release_sha256 == "" then null else $previous_uploader_release_sha256 end),
+      previous_uploader_sha256:
+        (if $previous_uploader_sha256 == "" then null else $previous_uploader_sha256 end),
+      rollback_assets_sha256:
+        (if $rollback_assets_sha256 == "" then null else $rollback_assets_sha256 end),
       collector_binary: (if $collector_binary == "" then null else $collector_binary end),
       uploader_binary: (if $uploader_binary == "" then null else $uploader_binary end),
       production_units: {collector_active: $collector_active, upload_timer_enabled: $upload_timer_enabled}
@@ -388,9 +509,21 @@ write_evidence() {
 
 rollback_after_failure() {
   ROLLBACK_RESULT=disabled
-  systemctl disable --now "$COLLECTOR_UNIT" "$UPLOAD_TIMER" >/dev/null 2>&1 || true
-  systemctl stop "$UPLOAD_SERVICE" >/dev/null 2>&1 || true
-  systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+  contain_production
+  if [[ $OLD_MODE == upgrade ]]; then
+    if restore_old_production; then
+      ROLLBACK_RESULT=previous-release-restored
+    else
+      contain_production
+      if production_is_fail_closed; then
+        ROLLBACK_RESULT=previous-release-restore-failed-but-contained
+      else
+        ROLLBACK_RESULT=previous-release-restore-containment-failed
+      fi
+    fi
+    copy_health_evidence rollback
+    return
+  fi
   if systemctl is-active --quiet "$COLLECTOR_UNIT" \
     || systemctl is-enabled --quiet "$COLLECTOR_UNIT" \
     || systemctl is-enabled --quiet "$UPLOAD_TIMER"; then
@@ -449,7 +582,8 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
   || fail 'cutover runner is outside the candidate deployment bundle'
 
 STEP=validate-candidate-release
-for path in /opt/monday /opt/monday/bin "$RELEASE_ROOT" "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
+for path in /opt/monday /opt/monday/bin "$RELEASE_ROOT" "$UPLOADER_RELEASE_ROOT" \
+  "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
   path_is_direct_or_absent "$path" || fail "release path contains a symlink: $path"
 done
 for binary in "$CANDIDATE_COLLECTOR" "$CANDIDATE_VERIFIER" "$CANDIDATE_UPLOADER"; do
@@ -538,22 +672,74 @@ install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
 
 STEP=validate-host-state
 canonical_spool_paths_safe || fail 'canonical spool path contains a symlink or escapes /data'
-for unit in "${TRANSITION_MASK_UNITS[@]}"; do
-  systemctl is-active --quiet "$unit" && fail "unit must be inactive before cutover: $unit"
-done
-for unit in "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" "$UPLOAD_TIMER"; do
-  systemctl is-enabled --quiet "$unit" \
-    && fail "production unit must be disabled before cutover: $unit"
-done
-[[ ! -e $COLLECTOR_LINK && ! -L $COLLECTOR_LINK ]] \
-  || fail "production collector symlink already exists: $COLLECTOR_LINK"
-[[ ! -e $UPLOADER_LINK && ! -L $UPLOADER_LINK ]] \
-  || fail "production uploader symlink already exists: $UPLOADER_LINK"
-require_empty_lake || fail 'new host canonical spool contains reference lake artifacts'
+systemctl is-active --quiet "$SHADOW_UNIT" \
+  && fail "candidate shadow unit must be inactive before cutover: $SHADOW_UNIT"
+if systemctl is-active --quiet "$COLLECTOR_UNIT" \
+  && systemctl is-active --quiet "$UPLOAD_TIMER" \
+  && ! systemctl is-active --quiet "$UPLOAD_SERVICE" \
+  && systemctl is-enabled --quiet "$COLLECTOR_UNIT" \
+  && systemctl is-enabled --quiet "$UPLOAD_TIMER"; then
+  OLD_MODE=upgrade
+  [[ -L $COLLECTOR_LINK && -L $UPLOADER_LINK ]] \
+    || fail 'running production binaries must be release symlinks'
+  OLD_COLLECTOR=$(readlink -f "$COLLECTOR_LINK")
+  OLD_UPLOADER=$(readlink -f "$UPLOADER_LINK")
+  [[ $OLD_COLLECTOR =~ ^$RELEASE_ROOT/([a-f0-9]{64})/binance-usdm-reference-collector$ ]] \
+    || fail "production collector is not digest-addressed: $OLD_COLLECTOR"
+  OLD_RELEASE_SHA256=${BASH_REMATCH[1]}
+  [[ $OLD_RELEASE_SHA256 != "$CANDIDATE_SHA256" ]] \
+    || fail 'candidate is already the production release'
+  [[ $OLD_UPLOADER =~ ^$UPLOADER_RELEASE_ROOT/([a-f0-9]{64})/binance-usdm-reference-upload$ ]] \
+    || fail "production uploader is not digest-addressed: $OLD_UPLOADER"
+  OLD_UPLOADER_RELEASE_SHA256=${BASH_REMATCH[1]}
+  printf '%s  %s\n' "$OLD_RELEASE_SHA256" "$OLD_COLLECTOR" | sha256sum --check --strict
+  secure_regular_file "$OLD_UPLOADER"
+  [[ -x $OLD_UPLOADER ]] || fail 'production uploader is not executable'
+  OLD_UPLOADER_SHA256=$(sha256sum "$OLD_UPLOADER" | awk '{print $1}')
+  [[ $OLD_UPLOADER_SHA256 == "$OLD_UPLOADER_RELEASE_SHA256" ]] \
+    || fail 'production uploader digest does not match its release directory'
+  runtime_matches_collector "$OLD_COLLECTOR" true \
+    || fail 'production collector process does not match its release symlink'
+  secure_regular_file "$UPLOAD_ENV"
+  validate_upload_env "$UPLOAD_ENV"
+  stage_rollback_assets
+elif ! systemctl is-active --quiet "$COLLECTOR_UNIT" \
+  && ! systemctl is-active --quiet "$UPLOAD_TIMER" \
+  && ! systemctl is-active --quiet "$UPLOAD_SERVICE" \
+  && ! systemctl is-enabled --quiet "$COLLECTOR_UNIT" \
+  && ! systemctl is-enabled --quiet "$UPLOAD_TIMER" \
+  && [[ ! -e $COLLECTOR_LINK && ! -L $COLLECTOR_LINK ]] \
+  && [[ ! -e $UPLOADER_LINK && ! -L $UPLOADER_LINK ]]; then
+  OLD_MODE=new-host
+  require_empty_lake || fail 'new host canonical spool contains reference lake artifacts'
+else
+  fail 'production state is neither a healthy existing release nor an empty new host'
+fi
 
 STEP=stop-production
 TRANSITION_STARTED=1
+if [[ $OLD_MODE == upgrade ]]; then
+  systemctl disable "$COLLECTOR_UNIT" "$UPLOAD_TIMER"
+  systemctl stop "$UPLOAD_TIMER" "$COLLECTOR_UNIT"
+  systemctl stop "$UPLOAD_SERVICE"
+  ! systemctl is-active --quiet "$COLLECTOR_UNIT" \
+    || fail 'production collector remained active after stop'
+  ! systemctl is-active --quiet "$UPLOAD_TIMER" \
+    || fail 'production upload timer remained active after stop'
+  ! systemctl is-active --quiet "$UPLOAD_SERVICE" \
+    || fail 'production uploader remained active after stop'
+  quarantine_reference_staging \
+    || fail 'could not preserve interrupted V2 staging artifacts'
+fi
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
+
+if [[ $OLD_MODE == upgrade ]]; then
+  STEP=drain-v2-with-old-uploader
+  run_uploader "$OLD_UPLOADER" || fail 'old uploader could not drain the V2 backlog'
+  require_empty_lake || fail 'V2 backlog remains after the old uploader drain'
+  install -m 0640 "$CANONICAL_SPOOL/upload-status.json" \
+    "$EVIDENCE_DIR/pre-upgrade-upload-status.json"
+fi
 
 STEP=install-candidate-production-assets
 validate_deployment "$CANDIDATE_DEPLOYMENT"
@@ -562,8 +748,8 @@ install -d -m 0750 -o hftcollector -g hftcollector "$CANONICAL_SPOOL"
 install -d -m 0750 -o hftcollector -g hftcollector /var/lib/hft-collector
 systemctl daemon-reload
 
-STEP=verify-new-host-spool
-require_empty_lake || fail 'new host canonical spool contains reference lake artifacts'
+STEP=verify-empty-spool-before-v3
+require_empty_lake || fail 'canonical spool contains artifacts before the V3 switch'
 
 STEP=switch-production-symlink
 atomic_symlink "$CANDIDATE_COLLECTOR" "$COLLECTOR_LINK"
@@ -578,6 +764,7 @@ STEP=start-candidate-production
 systemctl reset-failed "$COLLECTOR_UNIT" >/dev/null 2>&1 || true
 systemctl unmask --runtime "$COLLECTOR_UNIT" "$UPLOAD_SERVICE" "$UPLOAD_TIMER" >/dev/null
 CANDIDATE_STARTED_NS=$(date +%s%N)
+CANDIDATE_MAY_HAVE_WRITTEN=1
 systemctl start "$COLLECTOR_UNIT"
 
 STEP=verify-candidate-production

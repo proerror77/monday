@@ -1,15 +1,12 @@
 owner: codex
-contract: binance-usdm-reference-v3-schema
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-upgrade
-branch: codex/binance-usdm-reference-v3-upgrade
-base_sha: 1d94b43a42ca9abfa2783e84c416a4595952204d
+contract: binance-usdm-reference-v3-cutover
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-cutover
+branch: codex/binance-usdm-reference-v3-cutover
+base_sha: 8b93efcc52bd7a26ae01eb5f3d12903d870e027d
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/data-pipelines/core/src/binance_usdm_reference.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_collector.rs
-  - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
-  - rust_hft/tools/collector/src/bin/binance-usdm-reference-collector.rs
-  - rust_hft/tools/collector/src/bin/binance-usdm-reference-artifact-verifier.rs
+  - deployment/aliyun/README.md
+  - deployment/aliyun/binance-usdm-reference-cutover.sh
+  - deployment/aliyun/test-binance-usdm-reference-host-gate.sh
 dependency: none
 no_external_runtime_mutation: true
