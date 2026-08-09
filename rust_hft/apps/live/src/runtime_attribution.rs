@@ -35,7 +35,16 @@ struct OrderMetadata {
     venue: String,
     symbol: String,
     side: Side,
+    requested_price: Option<Decimal>,
+    timing: OrderTiming,
     seen_fill_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OrderTiming {
+    write_to_private_ack_us: Option<u64>,
+    write_to_private_report_us: Option<u64>,
+    intent_to_private_report_us: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +343,7 @@ fn execution_attribution(
             side,
             venue,
             strategy_id,
+            requested_price,
             ..
         } => {
             state.orders.remove(&order_id.0);
@@ -356,9 +366,28 @@ fn execution_attribution(
                     venue,
                     symbol: symbol.to_string(),
                     side: *side,
+                    requested_price: requested_price.map(|price| price.0),
+                    timing: OrderTiming::default(),
                     seen_fill_ids: HashSet::new(),
                 },
             );
+            Ok(None)
+        }
+        ExecutionEvent::OrderLifecycleTiming {
+            order_id,
+            write_to_private_ack_us,
+            write_to_private_report_us,
+            intent_to_private_report_us,
+            ..
+        } => {
+            let Some(metadata) = state.orders.get_mut(&order_id.0) else {
+                return Ok(None);
+            };
+            metadata.timing = OrderTiming {
+                write_to_private_ack_us: *write_to_private_ack_us,
+                write_to_private_report_us: *write_to_private_report_us,
+                intent_to_private_report_us: *intent_to_private_report_us,
+            };
             Ok(None)
         }
         ExecutionEvent::Fill {
@@ -397,6 +426,29 @@ fn execution_attribution(
                 "fill_quantity".to_string(),
                 finite_metric("fill_quantity", quantity.to_f64())?,
             );
+            if let Some(value) = metadata.timing.write_to_private_ack_us {
+                metrics.insert("write_to_private_ack_us".to_string(), value as f64);
+            }
+            if let Some(value) = metadata.timing.write_to_private_report_us {
+                metrics.insert("write_to_private_report_us".to_string(), value as f64);
+            }
+            if let Some(value) = metadata.timing.intent_to_private_report_us {
+                metrics.insert("intent_to_private_report_us".to_string(), value as f64);
+            }
+            if let Some(requested_price) = metadata.requested_price {
+                let requested = finite_metric("requested_price", requested_price.to_f64())?;
+                let fill = finite_metric("fill_price", price.to_f64())?;
+                if requested > 0.0 {
+                    let signed = match metadata.side {
+                        Side::Buy => fill / requested - 1.0,
+                        Side::Sell => requested / fill - 1.0,
+                    };
+                    metrics.insert(
+                        "realized_slippage_bps".to_string(),
+                        (signed * 10_000.0).max(0.0),
+                    );
+                }
+            }
             let mut event = order_attribution(
                 activation,
                 &metadata,
@@ -868,6 +920,8 @@ fn inferred_pre_submission_reject(
         venue: activation.venue.clone(),
         symbol,
         side: Side::Buy,
+        requested_price: None,
+        timing: OrderTiming::default(),
         seen_fill_ids: HashSet::new(),
     })
 }
@@ -1171,6 +1225,18 @@ mod tests {
         let mut state = AttributionState::new(&activation).unwrap();
 
         execution_attribution(&activation, &mut state, &order_new("fill-order")).unwrap();
+        execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::OrderLifecycleTiming {
+                order_id: OrderId("fill-order".to_string()),
+                observed_at: NOW_US,
+                write_to_private_ack_us: Some(20),
+                write_to_private_report_us: Some(40),
+                intent_to_private_report_us: Some(75),
+            },
+        )
+        .unwrap();
         let fill = execution_attribution(
             &activation,
             &mut state,
@@ -1191,6 +1257,10 @@ mod tests {
         assert_eq!(fill.account_id.as_deref(), Some("account-1"));
         assert_eq!(fill.symbol.as_deref(), Some("BTCUSDT"));
         assert_eq!(fill.metrics["fill_price"], 101.0);
+        assert_eq!(fill.metrics["write_to_private_ack_us"], 20.0);
+        assert_eq!(fill.metrics["write_to_private_report_us"], 40.0);
+        assert_eq!(fill.metrics["intent_to_private_report_us"], 75.0);
+        assert!((fill.metrics["realized_slippage_bps"] - 100.0).abs() < 1e-9);
 
         execution_attribution(&activation, &mut state, &order_new("reject-order")).unwrap();
         let reject = execution_attribution(

@@ -1233,14 +1233,18 @@ impl ExecutionWorker {
         }
     }
 
-    fn capture_private_timing(&mut self, client_idx: usize, event: &ExecutionEvent) -> bool {
+    fn capture_private_timing(
+        &mut self,
+        client_idx: usize,
+        event: &ExecutionEvent,
+    ) -> (bool, Option<ExecutionEvent>) {
         let ExecutionEvent::PrivateOrderTiming {
             order_id,
             kind,
             received_mono_us,
         } = event
         else {
-            return false;
+            return (false, None);
         };
         if let Some(timeline) = self.execution_timelines.get_mut(order_id) {
             if timeline.client_idx != client_idx {
@@ -1252,9 +1256,10 @@ impl ExecutionWorker {
                 );
                 self.emergency_latched = true;
                 self.latch_stream_recovery();
-                return true;
+                return (true, None);
             }
             timeline.apply_private(*kind, *received_mono_us);
+            let spans = timeline.spans();
             #[cfg(feature = "metrics")]
             match kind {
                 ports::PrivateOrderEventKind::Ack => {
@@ -1264,7 +1269,6 @@ impl ExecutionWorker {
                     }
                 }
                 ports::PrivateOrderEventKind::Report => {
-                    let spans = timeline.spans();
                     if let Some(value) = spans.write_to_private_report_us {
                         infra_metrics::MetricsRegistry::global()
                             .record_execution_write_to_private_report(value as f64);
@@ -1275,8 +1279,18 @@ impl ExecutionWorker {
                     }
                 }
             }
+            return (
+                true,
+                Some(ExecutionEvent::OrderLifecycleTiming {
+                    order_id: order_id.clone(),
+                    observed_at: now_micros(),
+                    write_to_private_ack_us: spans.write_to_private_ack_us,
+                    write_to_private_report_us: spans.write_to_private_report_us,
+                    intent_to_private_report_us: spans.intent_to_private_report_us,
+                }),
+            );
         }
-        true
+        (true, None)
     }
 
     fn latch_duplicate_order_id(&mut self, order_id: &OrderId, client_idx: usize) -> bool {
@@ -1308,7 +1322,12 @@ impl ExecutionWorker {
                     client_idx,
                     result: Ok(event),
                 })) => {
-                    if self.capture_private_timing(client_idx, &event) {
+                    let (captured, timing) = self.capture_private_timing(client_idx, &event);
+                    if captured {
+                        if let Some(timing) = timing {
+                            self.queues.send_event_reliable(timing).await;
+                            self.stats.events_sent += 1;
+                        }
                         events_count += 1;
                         continue;
                     }
@@ -1361,7 +1380,12 @@ impl ExecutionWorker {
                 client_idx,
                 result: Ok(event),
             }) => {
-                if self.capture_private_timing(client_idx, &event) {
+                let (captured, timing) = self.capture_private_timing(client_idx, &event);
+                if captured {
+                    if let Some(timing) = timing {
+                        self.queues.send_event_reliable(timing).await;
+                        self.stats.events_sent += 1;
+                    }
                     return;
                 }
                 if !self.private_order_event_matches_client(client_idx, &event) {
@@ -1543,7 +1567,8 @@ impl ExecutionWorker {
             | ExecutionEvent::OrderCompleted { order_id, .. }
             | ExecutionEvent::OrderCanceled { order_id, .. }
             | ExecutionEvent::OrderModified { order_id, .. }
-            | ExecutionEvent::PrivateOrderTiming { order_id, .. } => order_id,
+            | ExecutionEvent::PrivateOrderTiming { order_id, .. }
+            | ExecutionEvent::OrderLifecycleTiming { order_id, .. } => order_id,
             _ => return true,
         };
         let Some(expected_client_idx) = self.order_to_client.get(order_id).copied() else {

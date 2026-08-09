@@ -1,9 +1,12 @@
 owner: codex
-contract: usdm-reference-empty-batch-recovery
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/usdm-reference-empty-batch
-branch: codex/usdm-reference-empty-batch
-base_sha: e2a66fcd72ffb50e0af1b6c0e7481c243bbea9f9
+contract: execution-lifecycle-costs-v2
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/execution-lifecycle-costs-v2
+branch: codex/execution-lifecycle-costs-v2
+base_sha: 7f9dab1fbd2a6a9543e816514b0f74c23d383a2f
 allowed_files:
-  - rust_hft/tools/collector/src/binance_usdm_reference_upload.rs
+  - agent-worktree.yml
+  - rust_hft/market-core/ports/src/events.rs
+  - rust_hft/market-core/engine/src/execution_worker.rs
+  - rust_hft/apps/live/src/runtime_attribution.rs
 dependency: none
 no_external_runtime_mutation: true
