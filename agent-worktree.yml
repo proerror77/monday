@@ -2,7 +2,7 @@ owner: codex
 contract: binance-usdm-reference-v3-cutover
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-usdm-reference-v3-cutover
 branch: codex/binance-usdm-reference-v3-cutover
-base_sha: 7f9dab1fbd2a6a9543e816514b0f74c23d383a2f
+base_sha: cac166b484011d0eb6a6739b5ef2c452a765a64b
 allowed_files:
   - agent-worktree.yml
   - deployment/aliyun/README.md
