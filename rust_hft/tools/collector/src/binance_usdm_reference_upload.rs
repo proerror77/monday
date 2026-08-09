@@ -65,24 +65,18 @@ fn strict_date(name: &str) -> bool {
     let Some(date) = name.strip_prefix("date=") else {
         return false;
     };
-    let bytes = date.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
 }
 
 fn strict_hour(name: &str) -> bool {
     name.strip_prefix("hour=")
-        .is_some_and(|hour| hour.len() == 2 && hour.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|hour| hour.len() == 2 && hour.parse::<u8>().is_ok_and(|hour| hour < 24))
 }
 
 fn strict_batch(name: &str) -> bool {
     name.strip_prefix("batch=")
-        .is_some_and(|batch| !batch.is_empty() && batch.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|batch| batch.parse::<u64>().ok())
+        .is_some()
 }
 
 fn direct_directory(path: &Path) -> Result<()> {
@@ -865,13 +859,15 @@ mod tests {
         let root = TestDir::new();
         let bucket = TestDir::new();
         let published = publish_batch(root.path(), RECEIVED_NS + 100);
-        fs::create_dir_all(batch_dir(&published).parent().unwrap().join("hour=99")).unwrap();
+        let malformed = batch_dir(&published).parent().unwrap().join("hour=99");
+        fs::create_dir_all(&malformed).unwrap();
         let mut oss = FakeOss::default();
         assert!(upload_pending_with(&config(root.path()), &mut |command, timeout| {
             oss.run(bucket.path(), command, timeout)
         })
         .is_err());
         assert_eq!(oss.uploads, 0);
+        assert!(malformed.is_dir());
         assert!(batch_dir(&published).join(DATA_NAME).is_file());
     }
 }
