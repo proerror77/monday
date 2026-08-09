@@ -1027,22 +1027,27 @@ fn validate_inputs(
                     "l2",
                 ],
             )?;
-            if inputs.reference.record_id_versions != ["v2"] {
-                bail!("validated reference input must contain v2 trades");
-            }
             validate_segment(&inputs.reference, "crypto_expiry_reference", tape_contract)?;
             validate_reference_event_identity(&inputs.reference, require_reference_completions)?;
-            if ["market_metadata", "polymarket_trade", "market_settlement"]
-                .iter()
-                .any(|kind| {
-                    inputs
-                        .reference
-                        .event_types
-                        .get(*kind)
-                        .copied()
-                        .unwrap_or_default()
-                        == 0
-                })
+            if inputs
+                .reference
+                .event_types
+                .get("market_metadata")
+                .copied()
+                .unwrap_or_default()
+                == 0
+                || (require_reference_completions
+                    && ["polymarket_trade", "market_settlement"]
+                        .iter()
+                        .any(|kind| {
+                            inputs
+                                .reference
+                                .event_types
+                                .get(*kind)
+                                .copied()
+                                .unwrap_or_default()
+                                == 0
+                        }))
             {
                 bail!("validated reference input is missing a required event type");
             }
@@ -1090,15 +1095,21 @@ fn validate_inputs(
                         .context("validated reference event count overflow")?;
                 }
             }
-            if ["market_metadata", "polymarket_trade", "market_settlement"]
-                .iter()
-                .any(|kind| {
-                    reference_event_types
-                        .get(*kind)
-                        .copied()
-                        .unwrap_or_default()
-                        == 0
-                })
+            if reference_event_types
+                .get("market_metadata")
+                .copied()
+                .unwrap_or_default()
+                == 0
+                || (require_reference_completions
+                    && ["polymarket_trade", "market_settlement"]
+                        .iter()
+                        .any(|kind| {
+                            reference_event_types
+                                .get(*kind)
+                                .copied()
+                                .unwrap_or_default()
+                                == 0
+                        }))
             {
                 bail!("validated reference inputs are missing a required event type");
             }
@@ -1770,6 +1781,38 @@ pub(super) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_candidate_triplet(&temp);
         assert!(seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn seals_candidate_triplet_with_metadata_only_reference_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_candidate_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        let reference = &mut manifest["validated_inputs"]["reference"];
+        reference["record_id_versions"] = json!([]);
+        reference["event_types"] = json!({"market_metadata": 1});
+        reference["events"] = json!(1);
+        reference["end_sequence"] = json!(1);
+        reference["trade_completions"] = json!({});
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        assert!(seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet)).is_ok());
+
+        manifest["validated_inputs"]["reference"]["event_types"] = json!({"market_settlement": 1});
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+        assert!(
+            seal_polymarket_evidence_candidate_triplet(&triplet, &trust(&triplet))
+                .unwrap_err()
+                .to_string()
+                .contains("missing a required event type")
+        );
     }
 
     #[test]
