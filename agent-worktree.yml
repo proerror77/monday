@@ -2,7 +2,7 @@ owner: codex
 contract: cex-research-evaluator-v2
 worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-evaluator-v2
 branch: codex/cex-research-evaluator-v2
-base_sha: bb5e5729e4153f0a6a757ea8d14ecb8cfffb4f51
+base_sha: b475ab29f000034d0a475b4465a4a93a07055d46
 allowed_files:
   - agent-worktree.yml
   - rust_hft/alpha-harness/app/src/data_mission.rs
