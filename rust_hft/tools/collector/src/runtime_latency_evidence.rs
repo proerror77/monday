@@ -107,13 +107,6 @@ pub fn verify_runtime_latency_evidence(
             verify_runtime_attribution_event(&signed, &trusted_keys).with_context(|| {
                 format!("runtime feedback line {line_number} failed signature verification")
             })?;
-        let canonical = serde_json::to_vec(&signed)?;
-        if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
-            if previous != canonical {
-                bail!("runtime feedback contains conflicting duplicate event IDs");
-            }
-            continue;
-        }
         if event.mode != AttributionMode::LiveSmall
             || event.kind != AttributionKind::Fill
             || event.outcome != AttributionOutcome::Healthy
@@ -155,6 +148,13 @@ pub fn verify_runtime_latency_evidence(
         };
         if !arrival_slippage_bps.is_finite() || arrival_slippage_bps < 0.0 {
             bail!("runtime feedback arrival slippage is invalid");
+        }
+        let canonical = serde_json::to_vec(&signed)?;
+        if let Some(previous) = event_digests.insert(event.event_id.clone(), canonical.clone()) {
+            if previous != canonical {
+                bail!("runtime feedback contains conflicting duplicate event IDs");
+            }
+            continue;
         }
         observations.push((
             event.observed_at,
