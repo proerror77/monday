@@ -529,9 +529,11 @@ secret_root=$tmp_dir/secrets
 mkdir "$secret_root"
 cat >"$secret_root/runtime.env" <<'ENV'
 HFT_GRPC_AUTH_TOKEN=example_token_with_at_least_32_chars
-HFT_SECRET_BINANCE_API_KEY=example_key
-HFT_SECRET_BINANCE_SECRET=example_secret
 ENV
+printf '%s=%s\n' HFT_SECRET_BINANCE_ACCOUNT_JSON \
+  "$(jq -cn --arg runtime_account_id binance_main --arg api_key example_key \
+    --arg secret example_secret '{$runtime_account_id,$api_key,$secret}')" \
+  >>"$secret_root/runtime.env"
 printf '%s\n' "$(printf 'b%.0s' {1..64})" >"$secret_root/feedback-signing-key.hex"
 chmod 0750 "$secret_root"
 chmod 0440 "$secret_root/runtime.env"
@@ -554,6 +556,25 @@ chmod 0440 "$secret_root/feedback-signing-key.hex"
   SECRET_ROOT=$secret_root
   findmnt() { printf '%s\n' tmpfs; }
   validate_runtime_secrets
+  binding_activation=$tmp_dir/binding-activation
+  mkdir -p "$binding_activation/deployment"
+  printf '%s\n' '{"account_id":"wrong-account","venue":"binance"}' \
+    >"$binding_activation/deployment/policy.json"
+  ! validate_runtime_account_binding "$binding_activation"
+  printf '%s\n' '{"account_id":"binance_main","venue":"binance"}' \
+    >"$binding_activation/deployment/policy.json"
+  validate_runtime_account_binding "$binding_activation"
+  missing_bundle_root=$tmp_dir/missing-binance-bundle
+  mkdir "$missing_bundle_root"
+  grep -v '^HFT_SECRET_BINANCE_ACCOUNT_JSON=' "$secret_root/runtime.env" \
+    >"$missing_bundle_root/runtime.env"
+  (
+    SECRET_ROOT=$missing_bundle_root
+    ! validate_runtime_account_binding "$binding_activation"
+  )
+  printf '%s\n' '{"account_id":"other-account","venue":"bitget"}' \
+    >"$binding_activation/deployment/policy.json"
+  validate_runtime_account_binding "$binding_activation"
   chmod 0640 "$secret_root/runtime.env"
   sed -i.bak \
     's/example_token_with_at_least_32_chars/short_token/' \
@@ -564,6 +585,18 @@ chmod 0440 "$secret_root/feedback-signing-key.hex"
   chmod 0640 "$secret_root/runtime.env"
   sed -i.bak \
     's/short_token/example_token_with_at_least_32_chars/' \
+    "$secret_root/runtime.env"
+  rm "$secret_root/runtime.env.bak"
+  chmod 0440 "$secret_root/runtime.env"
+  validate_runtime_secrets
+  chmod 0640 "$secret_root/runtime.env"
+  sed -i.bak 's/"runtime_account_id":"binance_main"/"runtime_account_id":""/' \
+    "$secret_root/runtime.env"
+  rm "$secret_root/runtime.env.bak"
+  chmod 0440 "$secret_root/runtime.env"
+  ! validate_runtime_secrets
+  chmod 0640 "$secret_root/runtime.env"
+  sed -i.bak 's/"runtime_account_id":""/"runtime_account_id":"binance_main"/' \
     "$secret_root/runtime.env"
   rm "$secret_root/runtime.env.bak"
   chmod 0440 "$secret_root/runtime.env"
@@ -1233,6 +1266,8 @@ grep -Fq -- '--stop-signal SIGINT' "$RUNTIME"
 grep -Fq -- '--stop-timeout 60' "$RUNTIME"
 grep -Fq -- '--ulimit core=0:0' "$RUNTIME"
 grep -Fq -- '--entrypoint /bin/sh' "$RUNTIME"
+grep -Fq 'policy_account_id=$(jq -er .account_id /activation/deployment/policy.json)' "$RUNTIME"
+grep -Fq '[ "$runtime_account_id" = "$policy_account_id" ]' "$RUNTIME"
 grep -Fq '/run/secrets/hft/runtime.env' "$RUNTIME"
 if grep -Fq -- '--env-file' "$RUNTIME"; then
   printf 'Docker daemon metadata must not contain runtime secret values\n' >&2

@@ -1,22 +1,17 @@
-owner: codex
-contract: cex-research-evaluator-v2
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/cex-research-evaluator-v2
-branch: codex/cex-research-evaluator-v2
-base_sha: 02968ad2fba0ab4ac46927904046009fc0f33ed7
+owner: codex-root
+contract: cex-fee-runtime-account-binding
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/fee-account-binding
+branch: codex/fee-account-binding
+base_sha: fd3afe63e5cd8919a8e1f68e23020aada29655c1
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/Cargo.lock
-  - rust_hft/alpha-harness/app/src/data_mission.rs
-  - rust_hft/alpha-harness/app/src/governance.rs
-  - rust_hft/alpha-harness/app/src/mission.rs
-  - rust_hft/alpha-harness/app/src/mission_runner.rs
-  - rust_hft/alpha-harness/engine/src/evaluation.rs
-  - rust_hft/alpha-harness/engine/src/formula_evaluator.rs
-  - rust_hft/alpha-harness/engine/src/engines/mod.rs
-  - rust_hft/alpha-harness/engine/src/engines/mcts.rs
-  - rust_hft/alpha-harness/engine/src/lib.rs
-  - rust_hft/alpha-harness/onnx-evaluator/src/lib.rs
-  - rust_hft/research-core/manifest/Cargo.toml
   - rust_hft/research-core/manifest/src/lib.rs
-dependency: PR #781 and PR #783 merged into 02968ad2fba0ab4ac46927904046009fc0f33ed7
+  - rust_hft/alpha-harness/app/src/mission_runner.rs
+  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+  - rust_hft/tools/collector/src/binance_fee_artifact.rs
+  - deployment/aliyun/trading-ecs-runtime.sh
+  - deployment/aliyun/test-trading-ecs-host-contract.sh
+  - deployment/aliyun/TRADING_ECS_HOST.md
+  - rust_hft/deployment/docker/Dockerfile.trading
+dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1
 no_external_runtime_mutation: true
