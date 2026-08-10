@@ -13,17 +13,18 @@ use data::binance_market_tape_artifact::{
 use futures::{SinkExt, StreamExt};
 use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
-    recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
-    write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
-    SegmentConfig, SendOutcome, RAW_SCHEMA,
+    recover_parts, segment_partition, send_or_shutdown, sha256_file, write_health,
+    write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
+    QueueHealth, Segment, SegmentConfig, SendOutcome, UploadStatus, RAW_SCHEMA,
 };
+use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -119,6 +120,8 @@ struct UploadConfig {
 const UPLOADED_CLEANUP_SCHEMA: &str = "monday.binance_lob.uploaded_cleanup.v1";
 const UPLOADED_CLEANUP_SUFFIX: &str = ".uploaded-cleanup.json";
 const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
+const OSS_READBACK_ATTEMPTS: usize = 3;
+const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
 const SUBSCRIPTION_PROOF_ID: u64 = 1;
 const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
@@ -3046,47 +3049,104 @@ async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usi
     let mut status = read_upload_status(&config.spool_dir);
     let result = upload_pending(config).await;
     match &result {
-        Ok(uploaded) => {
-            if *uploaded > 0 {
-                status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            status.last_error_at = None;
-            status.last_error = None;
-        }
-        Err(error) => {
-            status.last_error_at = Some(chrono::Utc::now().to_rfc3339());
-            status.last_error = Some(error.to_string().chars().take(500).collect());
-            status.failure_count = status.failure_count.saturating_add(1);
-        }
+        Ok(outcome) => apply_upload_outcome(&mut status, outcome),
+        Err(error) => apply_upload_failure(&mut status, error),
     }
     write_upload_status(&config.spool_dir, &status)
         .context("failed to persist OSS upload status")?;
-    result
+    match result {
+        Ok(outcome) if outcome.failures.is_empty() => Ok(outcome.uploaded + outcome.retried),
+        Ok(outcome) => anyhow::bail!("{} pending OSS uploads failed", outcome.failures.len()),
+        Err(error) => Err(error),
+    }
 }
 
-async fn upload_pending(config: &UploadConfig) -> anyhow::Result<usize> {
+fn apply_upload_outcome(status: &mut UploadStatus, outcome: &LobUploadOutcome) {
+    let now = chrono::Utc::now().to_rfc3339();
+    status.updated_at = Some(now.clone());
+    status.discovery_failed = false;
+    status.uploaded_batches = outcome.uploaded as u64;
+    status.retried_batches = outcome.retried as u64;
+    status.pending_batches = Some(outcome.pending_batches);
+    status.failed_batches = outcome.failures.clone();
+    status.failure_count = status
+        .failure_count
+        .saturating_add(outcome.failures.len() as u64);
+    if let Some(segment) = &outcome.last_uploaded {
+        status.last_success_at = Some(now.clone());
+        status.last_uploaded_object = Some(segment.object.clone());
+        status.last_uploaded_triplet = Some(json!({
+            "object_prefix": segment.object_prefix,
+            "data_sha256": segment.data_sha256,
+            "manifest_sha256": segment.manifest_sha256,
+            "success_sha256": segment.data_sha256,
+            "data_bytes": segment.data_bytes,
+            "uploaded_at": now,
+        }));
+    }
+    if outcome.failures.is_empty() {
+        status.last_error_at = None;
+        status.last_error = None;
+    } else {
+        status.last_error_at = Some(chrono::Utc::now().to_rfc3339());
+        status.last_error = outcome
+            .failures
+            .last()
+            .and_then(|failure| failure.get("error"))
+            .and_then(Value::as_str)
+            .map(|error| error.chars().take(500).collect());
+    }
+}
+
+fn apply_upload_failure(status: &mut UploadStatus, error: &anyhow::Error) {
+    let now = chrono::Utc::now().to_rfc3339();
+    status.updated_at = Some(now.clone());
+    status.discovery_failed = true;
+    status.pending_batches = None;
+    status.last_error_at = Some(now);
+    status.last_error = Some(error.to_string().chars().take(500).collect());
+    status.failure_count = status.failure_count.saturating_add(1);
+}
+
+async fn upload_pending(config: &UploadConfig) -> anyhow::Result<LobUploadOutcome> {
     let config = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let recovered = recover_uploaded_cleanups(&config.spool_dir)?;
-        if recovered > 0 {
-            info!(recovered, "completed interrupted local upload cleanup");
-        }
-        let mut failures = 0_usize;
-        let mut uploaded = 0_usize;
-        for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
-            if let Err(error) = upload_one(&config, &manifest) {
-                failures += 1;
+    tokio::task::spawn_blocking(move || upload_pending_blocking_with(&config, &mut run_oss_checked))
+        .await?
+}
+
+fn upload_pending_blocking_with<F>(
+    config: &UploadConfig,
+    runner: &mut F,
+) -> anyhow::Result<LobUploadOutcome>
+where
+    F: FnMut(&mut Command, Duration) -> anyhow::Result<ExitStatus>,
+{
+    let recovered = recover_uploaded_cleanups(&config.spool_dir)?;
+    if recovered > 0 {
+        info!(recovered, "completed interrupted local upload cleanup");
+    }
+    let mut outcome = LobUploadOutcome::default();
+    for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
+        match upload_one_with(config, &manifest, runner) {
+            Ok(segment) => {
+                if segment.retried {
+                    outcome.retried += 1;
+                } else {
+                    outcome.uploaded += 1;
+                }
+                outcome.last_uploaded = Some(segment);
+            }
+            Err(error) => {
                 error!(manifest = %manifest.display(), error = %error, "OSS upload retained for retry");
-            } else {
-                uploaded += 1;
+                outcome.failures.push(json!({
+                    "batch": manifest.file_name().and_then(|name| name.to_str()),
+                    "error": error.to_string(),
+                }));
             }
         }
-        if failures > 0 {
-            anyhow::bail!("{failures} pending OSS uploads failed");
-        }
-        anyhow::Ok(uploaded)
-    })
-    .await?
+    }
+    outcome.pending_batches = files_with_suffix(&config.spool_dir, ".manifest.json")?.len() as u64;
+    anyhow::Ok(outcome)
 }
 
 fn write_uploaded_cleanup_marker(
@@ -3316,7 +3376,166 @@ fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
+#[derive(Debug)]
+struct UploadedSegment {
+    retried: bool,
+    object: String,
+    object_prefix: String,
+    data_sha256: String,
+    manifest_sha256: String,
+    data_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct LobUploadOutcome {
+    uploaded: usize,
+    retried: usize,
+    pending_batches: u64,
+    last_uploaded: Option<UploadedSegment>,
+    failures: Vec<Value>,
+}
+
+fn run_oss_checked(command: &mut Command, timeout: Duration) -> anyhow::Result<ExitStatus> {
+    let status = command_status_with_timeout(command, timeout)?;
+    if !status.success() {
+        anyhow::bail!("aliyun ossutil exited with {status}");
+    }
+    Ok(status)
+}
+
+fn oss_segment_command(config: &UploadConfig, source: &str, destination: &str) -> Command {
+    let mut command = Command::new("aliyun");
+    command
+        .args(["ossutil", "cp"])
+        .arg(source)
+        .arg(destination)
+        .args([
+            "--profile",
+            &config.aliyun_profile,
+            "--endpoint",
+            &config.oss_endpoint,
+            "--region",
+            &config.oss_region,
+        ]);
+    command
+}
+
+/// Download the remote triplet under neutral names so a crashed verification
+/// directory is never picked up by the spool manifest scan.
+fn download_remote_segment_with<F>(
+    config: &UploadConfig,
+    prefix: &str,
+    members: &[PathBuf; 3],
+    runner: &mut F,
+) -> anyhow::Result<(ExclusiveTempDir, [PathBuf; 3])>
+where
+    F: FnMut(&mut Command, Duration) -> anyhow::Result<ExitStatus>,
+{
+    let verify_dir = ExclusiveTempDir::create(&config.spool_dir, ".oss-verify")?;
+    let mut downloaded = Vec::with_capacity(3);
+    for (local, name) in members.iter().zip(["data", "manifest", "success"]) {
+        let object = format!(
+            "oss://{}/{prefix}/{}",
+            config.oss_bucket,
+            local_file_name(local)?
+        );
+        let destination = verify_dir.path().join(name);
+        let mut command = oss_segment_command(
+            config,
+            &object,
+            destination
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("verification path is not UTF-8"))?,
+        );
+        runner(&mut command, config.oss_copy_timeout)?;
+        let metadata = std::fs::symlink_metadata(&destination).with_context(|| {
+            format!("inspect downloaded segment artifact {}", destination.display())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            anyhow::bail!(
+                "downloaded segment artifact must be a direct regular file: {}",
+                destination.display()
+            );
+        }
+        downloaded.push(destination);
+    }
+    Ok((
+        verify_dir,
+        downloaded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("segment triplet is incomplete"))?,
+    ))
+}
+
+/// Upload the segment triplet only after proving the remote objects are either
+/// absent or byte-identical, then verify the uploaded triplet by readback
+/// before any local artifact may be deleted. A conflicting remote object is a
+/// hard error: the local triplet is retained untouched.
+fn upload_segment_triplet_with<F, V>(
+    config: &UploadConfig,
+    prefix: &str,
+    members: &[PathBuf; 3],
+    verify: V,
+    runner: &mut F,
+) -> anyhow::Result<bool>
+where
+    F: FnMut(&mut Command, Duration) -> anyhow::Result<ExitStatus>,
+    V: Fn(&[PathBuf; 3]) -> anyhow::Result<()>,
+{
+    if let Ok((_verify_dir, downloaded)) =
+        download_remote_segment_with(config, prefix, members, runner)
+    {
+        verify(&downloaded).context(
+            "remote segment triplet conflicts with the local segment; retaining local artifacts",
+        )?;
+        return Ok(true);
+    }
+    for local in members {
+        let destination = format!(
+            "oss://{}/{prefix}/{}",
+            config.oss_bucket,
+            local_file_name(local)?
+        );
+        let mut command = oss_segment_command(
+            config,
+            local
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("segment artifact path is not UTF-8"))?,
+            &destination,
+        );
+        command.arg("--ignore-existing");
+        runner(&mut command, config.oss_copy_timeout)?;
+    }
+    let mut last_error = None;
+    for attempt in 0..OSS_READBACK_ATTEMPTS {
+        match download_remote_segment_with(config, prefix, members, runner) {
+            Ok((_verify_dir, downloaded)) => {
+                verify(&downloaded).context("remote segment triplet failed readback verification")?;
+                last_error = None;
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < OSS_READBACK_ATTEMPTS {
+            thread::sleep(OSS_READBACK_RETRY_DELAY);
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(
+            error.context("remote segment artifacts remained unreadable after bounded retries")
+        );
+    }
+    Ok(false)
+}
+
+fn upload_one_with<F>(
+    config: &UploadConfig,
+    manifest: &Path,
+    runner: &mut F,
+) -> anyhow::Result<UploadedSegment>
+where
+    F: FnMut(&mut Command, Duration) -> anyhow::Result<ExitStatus>,
+{
     let metadata: Value = serde_json::from_reader(std::fs::File::open(manifest)?)?;
     let data = manifest.with_file_name(
         metadata["file"]
@@ -3325,8 +3544,9 @@ fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
     );
     let digest = metadata["sha256"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("manifest missing sha256"))?;
-    let success = write_success_marker(&data, digest)?;
+        .ok_or_else(|| anyhow::anyhow!("manifest missing sha256"))?
+        .to_owned();
+    let success = write_success_marker(&data, &digest)?;
     let prefix = format!(
         "lake/raw/venue=binance/market={}/dataset={}/shard={}/date={}/hour={}",
         metadata["market"].as_str().unwrap_or_default(),
@@ -3335,35 +3555,40 @@ fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
         metadata["date"].as_str().unwrap_or_default(),
         metadata["hour"].as_str().unwrap_or_default(),
     );
-    for source in [&data, manifest, &success] {
-        let name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let mut command = Command::new("aliyun");
-        command
-            .args(["ossutil", "cp"])
-            .arg(source)
-            .arg(format!("oss://{}/{prefix}/{name}", config.oss_bucket))
-            .args([
-                "--profile",
-                &config.aliyun_profile,
-                "--endpoint",
-                &config.oss_endpoint,
-                "--region",
-                &config.oss_region,
-                "--force",
-            ]);
-        let status = command_status_with_timeout(&mut command, config.oss_copy_timeout)?;
-        if !status.success() {
-            anyhow::bail!(
-                "aliyun ossutil failed for {} with {status}",
-                source.display()
-            );
-        }
-    }
+    let manifest_sha256 = sha256_file(manifest)?;
+    let data_bytes = std::fs::metadata(&data)?.len();
+    let members = [data.clone(), manifest.to_path_buf(), success.clone()];
+    let expected_success = format!("{digest}\n").into_bytes();
+    let verify = |downloaded: &[PathBuf; 3]| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            sha256_file(&downloaded[0])? == digest,
+            "remote segment data sha256 mismatch"
+        );
+        anyhow::ensure!(
+            sha256_file(&downloaded[1])? == manifest_sha256,
+            "remote segment manifest sha256 mismatch"
+        );
+        anyhow::ensure!(
+            std::fs::read(&downloaded[2])? == expected_success,
+            "remote segment _SUCCESS content mismatch"
+        );
+        Ok(())
+    };
+    let retried = upload_segment_triplet_with(config, &prefix, &members, verify, runner)?;
     let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
-    cleanup_uploaded_marker(&marker)
+    cleanup_uploaded_marker(&marker)?;
+    Ok(UploadedSegment {
+        retried,
+        object: format!(
+            "oss://{}/{prefix}/{}",
+            config.oss_bucket,
+            local_file_name(&data)?
+        ),
+        object_prefix: prefix,
+        data_sha256: digest,
+        manifest_sha256,
+        data_bytes,
+    })
 }
 
 async fn wait_for_signal(shutdown: watch::Sender<bool>, watchdog: ProcessWatchdog) {
@@ -3963,7 +4188,9 @@ mod tests {
             oss_copy_timeout: Duration::from_secs(1),
         };
 
-        assert_eq!(upload_pending(&config).await.unwrap(), 0);
+        let outcome = upload_pending(&config).await.unwrap();
+        assert_eq!(outcome.uploaded, 0);
+        assert_eq!(outcome.pending_batches, 0);
         assert!(!marker.exists());
         assert!(files_with_suffix(&spool_dir, ".manifest.json")
             .unwrap()
@@ -3997,6 +4224,399 @@ mod tests {
             .contains("invalid uploaded cleanup marker schema"));
         assert!(marker.is_file());
         std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    struct UploadTestDir {
+        _temp: tempfile::TempDir,
+        spool: PathBuf,
+        bucket: PathBuf,
+    }
+
+    impl UploadTestDir {
+        fn new() -> Self {
+            let temp = tempfile::Builder::new()
+                .prefix("monday-lob-upload-test-")
+                .tempdir()
+                .unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let spool = root.join("spool");
+            let bucket = root.join("bucket");
+            std::fs::create_dir_all(&spool).unwrap();
+            std::fs::create_dir_all(&bucket).unwrap();
+            Self {
+                _temp: temp,
+                spool,
+                bucket,
+            }
+        }
+
+        fn config(&self) -> UploadConfig {
+            UploadConfig {
+                spool_dir: self.spool.clone(),
+                oss_bucket: "test-bucket".into(),
+                oss_endpoint: "unused".into(),
+                oss_region: "ap-northeast-1".into(),
+                aliyun_profile: "unused".into(),
+                oss_copy_timeout: Duration::from_secs(5),
+            }
+        }
+
+        fn write_segment(&self, id: &str, data_bytes: &[u8]) -> SegmentFixture {
+            let data = self.spool.join(format!("part-{id}.jsonl.zst"));
+            std::fs::write(&data, data_bytes).unwrap();
+            let digest = sha256_file(&data).unwrap();
+            let manifest = self.spool.join(format!("part-{id}.jsonl.zst.manifest.json"));
+            std::fs::write(
+                &manifest,
+                serde_json::to_vec(&json!({
+                    "file": format!("part-{id}.jsonl.zst"),
+                    "sha256": digest,
+                    "market": "spot",
+                    "dataset": "spot_all",
+                    "shard_id": "all",
+                    "date": "2026-08-10",
+                    "hour": "05",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            SegmentFixture {
+                data,
+                manifest,
+                success: self.spool.join(format!("part-{id}.jsonl.zst._SUCCESS")),
+                digest,
+                prefix: "lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/date=2026-08-10/hour=05".to_owned(),
+            }
+        }
+    }
+
+    struct SegmentFixture {
+        data: PathBuf,
+        manifest: PathBuf,
+        success: PathBuf,
+        digest: String,
+        prefix: String,
+    }
+
+    impl SegmentFixture {
+        fn remote(&self, bucket: &Path, name: &str) -> PathBuf {
+            bucket.join(&self.prefix).join(name)
+        }
+
+        fn seed_remote(&self, bucket: &Path, data_bytes: &[u8]) {
+            let manifest_bytes = std::fs::read(&self.manifest).unwrap();
+            for (name, bytes) in [
+                (
+                    local_file_name(&self.data).unwrap().to_owned(),
+                    data_bytes.to_vec(),
+                ),
+                (
+                    local_file_name(&self.manifest).unwrap().to_owned(),
+                    manifest_bytes,
+                ),
+                (
+                    format!("{}._SUCCESS", local_file_name(&self.data).unwrap()),
+                    format!("{}\n", self.digest).into_bytes(),
+                ),
+            ] {
+                let remote = self.remote(bucket, &name);
+                std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+                std::fs::write(remote, bytes).unwrap();
+            }
+        }
+
+        fn assert_local_retained(&self) {
+            for path in [&self.data, &self.manifest, &self.success] {
+                assert!(path.is_file(), "{} was removed", path.display());
+            }
+        }
+
+        fn assert_local_removed(&self) {
+            for path in [&self.data, &self.manifest, &self.success] {
+                assert!(!path.exists(), "{} was not cleaned", path.display());
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeOss {
+        uploads: usize,
+        corrupt_segment: Option<String>,
+    }
+
+    impl FakeOss {
+        fn run(
+            &mut self,
+            bucket_root: &Path,
+            command: &mut Command,
+            _timeout: Duration,
+        ) -> anyhow::Result<ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(command.get_program(), "aliyun");
+            assert_eq!(args[0], "ossutil");
+            assert_eq!(args[1], "cp");
+            let source = &args[2];
+            let destination = &args[3];
+            let ignore_existing = args.iter().any(|arg| arg == "--ignore-existing");
+            assert!(!args.iter().any(|arg| arg == "--force"));
+            if let Some(key) = source.strip_prefix("oss://test-bucket/") {
+                let remote = bucket_root.join(key);
+                if !remote.is_file() {
+                    return Ok(ExitStatus::from_raw(1));
+                }
+                std::fs::copy(&remote, destination)?;
+            } else {
+                self.uploads += 1;
+                let key = destination
+                    .strip_prefix("oss://test-bucket/")
+                    .expect("upload destination is an OSS object");
+                let remote = bucket_root.join(key);
+                if remote.exists() && ignore_existing {
+                    return Ok(ExitStatus::from_raw(0));
+                }
+                std::fs::create_dir_all(remote.parent().expect("object has a parent"))?;
+                let mut bytes = std::fs::read(source)?;
+                if source.ends_with(".jsonl.zst")
+                    && self
+                        .corrupt_segment
+                        .as_deref()
+                        .is_some_and(|id| source.contains(id))
+                {
+                    bytes.push(b'!');
+                }
+                std::fs::write(&remote, bytes)?;
+            }
+            Ok(ExitStatus::from_raw(0))
+        }
+    }
+
+    #[test]
+    fn verified_readback_removes_the_local_triplet_and_returns_a_receipt() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        let manifest_sha256 = sha256_file(&fixture.manifest).unwrap();
+        let mut fake = FakeOss::default();
+
+        let segment =
+            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+                fake.run(&dirs.bucket, command, timeout)
+            })
+            .unwrap();
+
+        assert!(!segment.retried);
+        assert_eq!(fake.uploads, 3);
+        fixture.assert_local_removed();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+        for name in [
+            "part-1700000000000000000.jsonl.zst",
+            "part-1700000000000000000.jsonl.zst.manifest.json",
+            "part-1700000000000000000.jsonl.zst._SUCCESS",
+        ] {
+            assert!(fixture.remote(&dirs.bucket, name).is_file());
+        }
+        assert_eq!(
+            segment.object,
+            format!(
+                "oss://test-bucket/{}/part-1700000000000000000.jsonl.zst",
+                fixture.prefix
+            )
+        );
+        assert_eq!(segment.object_prefix, fixture.prefix);
+        assert_eq!(segment.data_sha256, fixture.digest);
+        assert_eq!(segment.manifest_sha256, manifest_sha256);
+        assert_eq!(segment.data_bytes, b"segment-bytes".len() as u64);
+    }
+
+    #[test]
+    fn corrupted_readback_retains_the_local_triplet() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        let mut fake = FakeOss {
+            uploads: 0,
+            corrupt_segment: Some("1700000000000000000".into()),
+        };
+
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            fake.run(&dirs.bucket, command, timeout)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("readback verification"));
+        fixture.assert_local_retained();
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn conflicting_remote_triplet_fails_closed_and_retains_the_local_triplet() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        fixture.seed_remote(&dirs.bucket, b"different-remote-bytes");
+        let mut fake = FakeOss::default();
+
+        let error = upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+            fake.run(&dirs.bucket, command, timeout)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("conflicts"));
+        assert_eq!(fake.uploads, 0);
+        fixture.assert_local_retained();
+        assert_eq!(
+            std::fs::read(fixture.remote(&dirs.bucket, "part-1700000000000000000.jsonl.zst"))
+                .unwrap(),
+            b"different-remote-bytes"
+        );
+    }
+
+    #[test]
+    fn matching_remote_triplet_is_an_idempotent_retry() {
+        let dirs = UploadTestDir::new();
+        let fixture = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        fixture.seed_remote(&dirs.bucket, b"segment-bytes");
+        let mut fake = FakeOss::default();
+
+        let segment =
+            upload_one_with(&dirs.config(), &fixture.manifest, &mut |command, timeout| {
+                fake.run(&dirs.bucket, command, timeout)
+            })
+            .unwrap();
+
+        assert!(segment.retried);
+        assert_eq!(fake.uploads, 0);
+        fixture.assert_local_removed();
+    }
+
+    #[test]
+    fn upload_pending_reports_failures_per_segment_and_keeps_uploading() {
+        let dirs = UploadTestDir::new();
+        let good = dirs.write_segment("1700000000000000000", b"segment-bytes");
+        let bad = dirs.write_segment("1700000000000000001", b"corrupted-bytes");
+        let config = dirs.config();
+        let bucket = dirs.bucket.clone();
+        let mut fake = FakeOss {
+            uploads: 0,
+            corrupt_segment: Some("1700000000000000001".into()),
+        };
+
+        let outcome = upload_pending_blocking_with(&config, &mut |command, timeout| {
+            fake.run(&bucket, command, timeout)
+        })
+        .unwrap();
+
+        assert_eq!(outcome.uploaded, 1);
+        assert_eq!(outcome.retried, 0);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(
+            outcome.failures[0]["batch"],
+            json!("part-1700000000000000001.jsonl.zst.manifest.json")
+        );
+        assert_eq!(outcome.pending_batches, 1);
+        let receipt = outcome.last_uploaded.expect("one segment uploaded");
+        assert!(!receipt.retried);
+        good.assert_local_removed();
+        bad.assert_local_retained();
+    }
+
+    #[test]
+    fn upload_status_records_the_upload_receipt() {
+        let dirs = UploadTestDir::new();
+        let outcome = LobUploadOutcome {
+            uploaded: 1,
+            retried: 0,
+            pending_batches: 2,
+            last_uploaded: Some(UploadedSegment {
+                retried: false,
+                object: "oss://test-bucket/lake/raw/part-1.jsonl.zst".into(),
+                object_prefix: "lake/raw".into(),
+                data_sha256: "a".repeat(64),
+                manifest_sha256: "b".repeat(64),
+                data_bytes: 42,
+            }),
+            failures: Vec::new(),
+        };
+        let mut status = UploadStatus::default();
+        apply_upload_outcome(&mut status, &outcome);
+        write_upload_status(&dirs.spool, &status).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(dirs.spool.join("upload-status.json")).unwrap())
+                .unwrap();
+        assert!(persisted["updated_at"].is_string());
+        assert_eq!(persisted["pending_batches"], 2);
+        assert_eq!(persisted["uploaded_batches"], 1);
+        assert_eq!(persisted["retried_batches"], 0);
+        assert_eq!(persisted["failed_batches"], json!([]));
+        assert_eq!(persisted["failure_count"], 0);
+        assert_eq!(persisted["discovery_failed"], false);
+        assert!(persisted["last_error"].is_null());
+        assert!(persisted["last_error_at"].is_null());
+        chrono::DateTime::parse_from_rfc3339(persisted["last_success_at"].as_str().unwrap())
+            .expect("last_success_at must be RFC3339");
+        assert_eq!(
+            persisted["last_uploaded_object"],
+            "oss://test-bucket/lake/raw/part-1.jsonl.zst"
+        );
+        let triplet = &persisted["last_uploaded_triplet"];
+        assert_eq!(triplet["object_prefix"], "lake/raw");
+        assert_eq!(triplet["data_sha256"], "a".repeat(64));
+        assert_eq!(triplet["manifest_sha256"], "b".repeat(64));
+        assert_eq!(triplet["success_sha256"], "a".repeat(64));
+        assert_eq!(triplet["data_bytes"], 42);
+        chrono::DateTime::parse_from_rfc3339(triplet["uploaded_at"].as_str().unwrap())
+            .expect("receipt uploaded_at must be RFC3339");
+    }
+
+    #[test]
+    fn upload_status_records_failures_and_keeps_the_backlog_visible() {
+        let dirs = UploadTestDir::new();
+        let mut status = UploadStatus {
+            failure_count: 3,
+            ..UploadStatus::default()
+        };
+        let outcome = LobUploadOutcome {
+            uploaded: 0,
+            retried: 0,
+            pending_batches: 1,
+            last_uploaded: None,
+            failures: vec![json!({"batch": "part-1.jsonl.zst.manifest.json", "error": "oss down"})],
+        };
+        apply_upload_outcome(&mut status, &outcome);
+        write_upload_status(&dirs.spool, &status).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(dirs.spool.join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["pending_batches"], 1);
+        assert_eq!(persisted["failure_count"], 4);
+        assert_eq!(persisted["failed_batches"][0]["error"], "oss down");
+        assert_eq!(persisted["last_error"], "oss down");
+        assert!(persisted["last_error_at"].is_string());
+        assert!(persisted["last_success_at"].is_null());
+        assert!(persisted["last_uploaded_triplet"].is_null());
+    }
+
+    #[test]
+    fn upload_status_records_a_discovery_failure() {
+        let dirs = UploadTestDir::new();
+        let mut status = UploadStatus::default();
+        apply_upload_failure(&mut status, &anyhow::anyhow!("spool scan failed"));
+        write_upload_status(&dirs.spool, &status).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(dirs.spool.join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["discovery_failed"], true);
+        assert!(persisted["pending_batches"].is_null());
+        assert_eq!(persisted["last_error"], "spool scan failed");
+        assert_eq!(persisted["failure_count"], 1);
     }
 
     fn test_config(rest_base: String) -> Config {
