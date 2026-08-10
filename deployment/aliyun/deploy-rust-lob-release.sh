@@ -199,6 +199,7 @@ release_metadata="$release_dir/release.json"
 install -d -m 0755 "$release_root"
 install -d -m 0755 /etc/monday
 install -d -m 0750 -o hftcollector -g hftcollector \
+  /data/monday/spool/binance-lob-rust-shadow \
   /data/monday/spool/binance-lob-rust-shadow/spot \
   /data/monday/spool/binance-lob-rust-shadow/usdm
 for path in \
