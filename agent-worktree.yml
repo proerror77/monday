@@ -1,13 +1,10 @@
-owner: codex-root/ci-cache-restore-fix
-contract: rust-cache-restore-prefix
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/rust-cache-restore-prefix
-branch: codex/rust-cache-restore-prefix
-base_sha: fd22f9321f13832df5c9b96363610fd50f619ad8
+owner: codex-root/usdm-stream-liveness-fix
+contract: usdm-stream-liveness-and-canonical-url-805
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/usdm-stream-liveness
+branch: codex/usdm-stream-liveness
+base_sha: 54497535d60c0164f35bef86c00f226adc76b3e1
 allowed_files:
   - agent-worktree.yml
-  - .github/workflows/ploy-ci.yml
-  - .github/workflows/acr-publish.yml
-  - .github/workflows/ci.yml
-  - .github/scripts/test-acr-publish-workflow.sh
-dependency: origin/main at fd22f9321f13832df5c9b96363610fd50f619ad8
+  - rust_hft/tools/collector/src/bin/binance-lob-archiver.rs
+dependency: runtime issue #805
 no_external_runtime_mutation: true

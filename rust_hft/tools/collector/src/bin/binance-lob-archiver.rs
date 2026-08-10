@@ -125,6 +125,9 @@ const OSS_READBACK_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
 const SUBSCRIPTION_PROOF_ID: u64 = 1;
 const SUBSCRIPTION_PROOF_TIMEOUT: Duration = Duration::from_secs(20);
+// Non-depth Binance streams can be quiet between updates; keep their reconnect
+// liveness bounded without forcing 60s disconnects on sparse shards.
+const SPARSE_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RECONNECT_PROOF_BUFFERED_EVENTS: usize = 16_384;
 /// Raw trade and bookTicker shards sustain a much higher message rate than
 /// depth@100ms, aggTrade, or forceOrder shards (hot symbols burst into the
@@ -157,6 +160,16 @@ impl StreamShard {
             MAX_RECONNECT_PROOF_BUFFERED_HIGH_RATE_EVENTS
         } else {
             MAX_RECONNECT_PROOF_BUFFERED_EVENTS
+        }
+    }
+
+    fn stall_timeout(&self, configured: Duration) -> Duration {
+        let depth_only = !self.streams.is_empty()
+            && self.streams.iter().all(|stream| stream.contains("@depth"));
+        if !depth_only && configured < SPARSE_STREAM_STALL_TIMEOUT {
+            SPARSE_STREAM_STALL_TIMEOUT
+        } else {
+            configured
         }
     }
 }
@@ -390,13 +403,13 @@ impl Config {
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/market/stream?streams={trades}"
+                                    "wss://fstream.binance.com/stream?streams={trades}"
                                 ),
                                 streams: trade_streams,
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/market/stream?streams={book_tickers}"
+                                    "wss://fstream.binance.com/stream?streams={book_tickers}"
                                 ),
                                 streams: book_ticker_streams,
                             },
@@ -982,12 +995,13 @@ async fn run_session(
         .sum::<usize>();
     let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_shards);
     for (producer_id, shard) in stream_shards.into_iter().enumerate() {
+        let stall_timeout = shard.stall_timeout(config.stall_timeout);
         tasks.spawn(receive_url(
             shard,
             sender.clone(),
             stream_connected_tx.clone(),
             session_stop_rx.clone(),
-            config.stall_timeout,
+            stall_timeout,
             SUBSCRIPTION_PROOF_TIMEOUT,
             watchdog.clone(),
             producer_id,
@@ -4727,23 +4741,21 @@ mod tests {
         usdm_config.dataset = "usdm_all".into();
         let usdm = usdm_config.stream_shards();
         assert_eq!(usdm.len(), 5);
-        assert!(usdm.iter().any(|shard| {
-            shard
-                .url
-                .starts_with("wss://fstream.binance.com/public/stream")
-                && shard.streams.contains("btcusdt@depth@100ms")
-                && shard.streams.len() == 1
-        }));
-        for stream in [
-            "btcusdt@aggTrade",
-            "btcusdt@trade",
-            "btcusdt@bookTicker",
-            "btcusdt@forceOrder",
+        for (stream, url_prefix) in [
+            (
+                "btcusdt@depth@100ms",
+                "wss://fstream.binance.com/public/stream",
+            ),
+            ("btcusdt@aggTrade", "wss://fstream.binance.com/market/stream"),
+            ("btcusdt@trade", "wss://fstream.binance.com/stream"),
+            ("btcusdt@bookTicker", "wss://fstream.binance.com/stream"),
+            (
+                "btcusdt@forceOrder",
+                "wss://fstream.binance.com/market/stream",
+            ),
         ] {
             assert!(usdm.iter().any(|shard| {
-                shard
-                    .url
-                    .starts_with("wss://fstream.binance.com/market/stream")
+                shard.url.starts_with(url_prefix)
                     && shard.streams.contains(stream)
                     && shard.streams.len() == 1
             }), "usdm shard for {stream}");
@@ -4796,6 +4808,36 @@ mod tests {
             };
             assert!(!shard.is_high_rate(), "{stream}");
         }
+    }
+
+    #[test]
+    fn stream_shard_stall_timeout_keeps_sparse_streams_alive() {
+        let configured = Duration::from_secs(60);
+        let depth_shard = StreamShard {
+            url: String::new(),
+            streams: BTreeSet::from(["btcusdt@depth@100ms".to_owned()]),
+        };
+        assert_eq!(depth_shard.stall_timeout(configured), configured);
+
+        for stream in [
+            "btcusdt@aggTrade",
+            "btcusdt@trade",
+            "btcusdt@bookTicker",
+            "btcusdt@forceOrder",
+        ] {
+            let shard = StreamShard {
+                url: String::new(),
+                streams: BTreeSet::from([stream.to_owned()]),
+            };
+            assert_eq!(shard.stall_timeout(configured), SPARSE_STREAM_STALL_TIMEOUT);
+        }
+
+        let already_loose = Duration::from_secs(420);
+        let trade_shard = StreamShard {
+            url: String::new(),
+            streams: BTreeSet::from(["btcusdt@trade".to_owned()]),
+        };
+        assert_eq!(trade_shard.stall_timeout(already_loose), already_loose);
     }
 
     #[test]
