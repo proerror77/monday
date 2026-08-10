@@ -569,14 +569,32 @@ fn publish_latency_evidence(
     account_fingerprint: &str,
     verified: &VerifiedRuntimeLatencyEvidence,
 ) -> Result<CexArtifactTripletV2> {
-    let data_sha256 = hex::encode(Sha256::digest(&verified.signed_events));
+    // Anchor the complete supplied cohort: republish the full digest-anchored
+    // feedback log and the trusted-key document so independent readers can
+    // reverify every signed event instead of trusting a selected subset.
+    let data_sha256 = args
+        .runtime_feedback_log_sha256
+        .trim()
+        .to_ascii_lowercase();
     let data_path = args
         .artifact_dir
         .join(format!("{data_sha256}.runtime-feedback.jsonl"));
+    republish_verified_file(&args.runtime_feedback_log, &data_path, &data_sha256)?;
+    let keys_sha256 = args
+        .runtime_feedback_trusted_keys_sha256
+        .trim()
+        .to_ascii_lowercase();
+    republish_verified_file(
+        &args.runtime_feedback_trusted_keys,
+        &args
+            .artifact_dir
+            .join(format!("{keys_sha256}.runtime-feedback-keys.json")),
+        &keys_sha256,
+    )?;
     let manifest = serde_json::to_vec(&serde_json::json!({
         "schema": "monday.runtime-feedback-evidence.v1",
         "data_sha256": data_sha256,
-        "trusted_keys_sha256": args.runtime_feedback_trusted_keys_sha256,
+        "trusted_keys_sha256": keys_sha256,
         "deployment_id": args.runtime_feedback_deployment_id,
         "venue": "binance",
         "symbol": symbol,
@@ -594,13 +612,12 @@ fn publish_latency_evidence(
     let success_path = args
         .artifact_dir
         .join(format!("{data_sha256}.runtime-feedback._SUCCESS"));
-    publish_immutable(&data_path, &verified.signed_events)?;
     publish_immutable(&manifest_path, &manifest)?;
     publish_immutable(&success_path, success.as_bytes())?;
     Ok(CexArtifactTripletV2 {
         data_sha256: data_sha256.clone(),
         manifest_sha256,
-        success_sha256: data_sha256.clone(),
+        success_sha256: data_sha256,
     })
 }
 
@@ -1051,6 +1068,7 @@ fn materialize_rows(
         }
         let label = future.mid_price / current.mid_price - 1.0;
         let event_time = datetime_ns(current.time_ns)?;
+        let future_time = datetime_ns(future.time_ns)?;
         let trade_start =
             aggregate_trades.partition_point(|trade| trade.received_at_ns <= previous.time_ns);
         let trade_end =
@@ -1137,12 +1155,14 @@ fn materialize_rows(
                 .find(|point| point.available_at <= event_time)
                 .context("PIT open-interest coverage is missing")?;
             features.insert("funding_rate".to_string(), funding.funding_rate.parse()?);
-            let previous_time = datetime_ns(previous.time_ns)?;
+            // The evaluator applies funding_cost_bps to the position held over
+            // this row's (current, future] label interval, so charge exactly
+            // the settlements inside that holding interval.
             let crossed_funding = context
                 .funding
                 .iter()
                 .map(|point| point.next_funding_at)
-                .filter(|scheduled| *scheduled > previous_time && *scheduled <= event_time)
+                .filter(|scheduled| *scheduled > event_time && *scheduled <= future_time)
                 .collect::<BTreeSet<_>>();
             let funding_cost_bps = crossed_funding
                 .into_iter()
@@ -1174,7 +1194,7 @@ fn materialize_rows(
         rows.push(PointInTimeFeatureRow {
             event_time,
             feature_available_time: event_time,
-            label_available_time: datetime_ns(future.time_ns)?,
+            label_available_time: future_time,
             ingestion_time,
             symbol: symbol.to_string(),
             source_revisions: source_revisions.clone(),
@@ -1768,6 +1788,62 @@ mod tests {
     }
 
     #[test]
+    fn charges_funding_over_the_holding_interval() {
+        let fixture = Fixture::new(Market::Spot, &valid_rows("spot"));
+        let mut args = fixture.args();
+        args.market = Market::Usdm;
+        let sample = |seconds: u64| BookSample {
+            series_id: 1,
+            time_ns: event_ns(seconds * 1_000),
+            mid_price: 100.0,
+            spread_bps: 1.0,
+            bid_depth: 10.0,
+            ask_depth: 10.0,
+            top_depth_imbalance: 0.0,
+            book_imbalance: 0.0,
+        };
+        let samples = (1..=6).map(sample).collect::<Vec<_>>();
+        let funding_point = |available_ms: u64, next_ms: u64, rate: &str| FundingPointV2 {
+            available_at: datetime_ns(event_ns(available_ms)).unwrap(),
+            next_funding_at: datetime_ns(event_ns(next_ms)).unwrap(),
+            funding_rate: rate.to_string(),
+        };
+        let context = ResearchContextV2 {
+            instrument_rules: None,
+            derivatives_reference: None,
+            funding: vec![
+                funding_point(500, 1_500, "0.0001"),
+                funding_point(1_600, 3_500, "0.0002"),
+                funding_point(3_700, 4_500, "0.0001"),
+                funding_point(4_600, 5_500, "0.0004"),
+            ],
+            open_interest: vec![OpenInterestPointV2 {
+                available_at: datetime_ns(event_ns(500)).unwrap(),
+                open_interest: "12345.5".to_string(),
+            }],
+        };
+
+        let rows = materialize_rows(
+            &samples,
+            &[],
+            &args,
+            &BTreeMap::new(),
+            "BTCUSDT",
+            datetime_ns(event_ns(6_500)).unwrap(),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        // Holding intervals are (2s, 4s], (3s, 5s], (4s, 6s]; the 1.5s
+        // settlement precedes every holding interval and is never charged.
+        assert!((rows[0].features["funding_cost_bps"] - 2.0).abs() < 1e-9);
+        assert!((rows[1].features["funding_cost_bps"] - 3.0).abs() < 1e-9);
+        assert!((rows[2].features["funding_cost_bps"] - 5.0).abs() < 1e-9);
+        assert!((rows[0].features["funding_rate"] - 0.0002).abs() < 1e-12);
+    }
+
+    #[test]
     fn rejects_fee_and_runtime_evidence_from_different_accounts() {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut args = fixture.args();
@@ -1885,5 +1961,27 @@ mod tests {
                 .join(format!("{}.fee._SUCCESS", fee.data_sha256))
                 .is_file());
         }
+        let artifact_dir = fixture.directory.join("artifacts");
+        // The published latency evidence anchors the complete supplied cohort:
+        // the full feedback log (not a selected subset) and the trusted-key
+        // document are both resolvable under their content digests.
+        assert_eq!(
+            snapshot.latency_cost.evidence.data_sha256,
+            fixture.runtime_feedback_log_sha256
+        );
+        assert_eq!(
+            std::fs::read(artifact_dir.join(format!(
+                "{}.runtime-feedback.jsonl",
+                fixture.runtime_feedback_log_sha256
+            )))
+            .unwrap(),
+            std::fs::read(&fixture.runtime_feedback_log).unwrap()
+        );
+        assert!(artifact_dir
+            .join(format!(
+                "{}.runtime-feedback-keys.json",
+                fixture.runtime_feedback_trusted_keys_sha256
+            ))
+            .is_file());
     }
 }
