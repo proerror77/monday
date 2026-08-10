@@ -28,14 +28,20 @@ def complete_coverage:
   and .stale_open_interest >= 0
   and .api_error_count == 0;
 
+def uint:
+  type == "number" and . == (. | floor) and . >= 0;
+
 def pit_clock(observations; observed):
-  .observations == observations
+  (.observations | uint)
+  and .observations == observations
+  and (.first_event_time_ms | uint)
+  and (.last_event_time_ms | uint)
   and .first_event_time_ms <= .last_event_time_ms
+  and (.first_available_at_ns | uint)
+  and (.last_available_at_ns | uint)
   and .first_available_at_ns <= .last_available_at_ns
   and .last_available_at_ns <= observed
-  and (.max_gap_ns | type) == "number"
-  and .max_gap_ns == (.max_gap_ns | floor)
-  and .max_gap_ns >= 0
+  and (.max_gap_ns | uint)
   and .max_gap_ns <= 90000000000;
 
 def canonical_artifact:

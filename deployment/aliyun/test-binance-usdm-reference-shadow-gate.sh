@@ -112,6 +112,11 @@ reject 'del(.artifacts[1].open_interest)' missing-oi-clock
 reject '.artifacts[1].open_interest.max_gap_ns=90000000001' oi-gap-exceeded
 reject '.artifacts[1].mark_index_funding.observations=499' mark-clock-count-mismatch
 reject '.artifacts[1].mark_index_funding.last_available_at_ns=1700000091000000000' mark-clock-after-observed
+reject 'del(.artifacts[1].open_interest.first_event_time_ms)' missing-oi-first-event
+reject 'del(.artifacts[1].mark_index_funding.first_available_at_ns)' missing-mark-first-available
+reject '.artifacts[1].open_interest.first_available_at_ns=-1' negative-oi-first-available
+reject '.artifacts[1].mark_index_funding.last_event_time_ms=1699999999000.5' fractional-mark-last-event
+reject '.artifacts[1].open_interest.last_available_at_ns="1699999999900000000"' string-oi-last-available
 reject '.artifacts[2].success_sha256=("9"*64)' bad-success
 reject '.artifacts[1].canonical_readback=false' no-readback
 reject '.artifacts[1].observed_at_ns=1700000200000000000' discontinuous

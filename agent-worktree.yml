@@ -5,8 +5,11 @@ branch: codex/binance-reference-modality-pit-clocks
 base_sha: 161b761dff56acb758dd4a1787fd0b3b8130196a
 dependency: none
 allowed_files:
-  - rust_hft/tools/collector/src/binance_usdm_reference.rs
   - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
-  - deployment/aliyun/test-binance-usdm-reference-release-contract.sh
+  - rust_hft/tools/collector/src/bin/binance-usdm-reference-artifact-verifier.rs
+  - deployment/aliyun/binance-usdm-reference-shadow-gate.sh
+  - deployment/aliyun/binance-usdm-reference-shadow-gate-policy.jq
+  - deployment/aliyun/test-binance-usdm-reference-shadow-gate.sh
+  - deployment/aliyun/test-binance-usdm-reference-host-gate.sh
   - agent-worktree.yml
 no_external_runtime_mutation: true

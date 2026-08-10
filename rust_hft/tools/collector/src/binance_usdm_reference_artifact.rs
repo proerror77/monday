@@ -450,9 +450,9 @@ pub fn verify_reference_artifact(
         MANIFEST_SCHEMA_V2 => {
             verify_current_manifest_v2(published, &data, &manifest_bytes, expected_data_sha256)
         }
-        MANIFEST_SCHEMA_V1 => {
-            verify_current_manifest_v1(published, &data, &manifest_bytes, expected_data_sha256)
-        }
+        MANIFEST_SCHEMA_V1 => bail!(
+            "historical v1 reference manifests are read-only evidence and cannot pass the writable verifier"
+        ),
         _ => bail!("reference manifest schema is unsupported"),
     }
 }
@@ -597,8 +597,12 @@ pub fn verify_reference_artifact_read_only(
     let manifest: HistoricalManifestV1 =
         serde_json::from_slice(&manifest_bytes).context("parse historical v1 reference manifest")?;
     if manifest.identity.data_schema == REFERENCE_SCHEMA {
-        let batch =
-            verify_reference_artifact(published, expected_data_sha256, expected_manifest_sha256)?;
+        let batch = verify_current_manifest_v1(
+            published,
+            &data,
+            &manifest_bytes,
+            expected_data_sha256,
+        )?;
         return Ok(VerifiedReferenceCounts {
             metadata: batch.contracts().len(),
             mark_index_funding: batch.mark_index_funding().len(),
@@ -1582,6 +1586,10 @@ mod tests {
         bytes.push(b'\n');
         fs::write(&published.manifest_path, &bytes).unwrap();
         let manifest_sha256 = digest(&bytes);
+        let error = verify_reference_artifact(&published, &published.data_sha256, &manifest_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only evidence"), "{error}");
         let counts = verify_reference_artifact_read_only(
             &published,
             &published.data_sha256,
