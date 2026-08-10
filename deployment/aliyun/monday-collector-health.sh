@@ -80,13 +80,19 @@ FEE_FAILURE_WINDOW='10 min ago'
 #   once per rotation; allow two full rotations.
 # - fee snapshots publish every 60s and binance-fee-upload.timer retries every
 #   60s (mirrors the FEE_FAILURE_WINDOW='10 min ago' journal window).
-# - usdm-reference and both polymarket lanes run on 5-minute upload timers.
+# - usdm-reference runs on a 5-minute upload timer over hourly reference
+#   batches.
+# - both polymarket lanes rotate tapes hourly
+#   (record_market_updates_rotate_seconds = 3600; the reference writer rotates
+#   at UTC-hour boundaries) and last_success_at only advances when a rotated
+#   tape actually uploads, so the 5-minute upload timer is not a heartbeat;
+#   allow two full rotations, same as LOB.
 # - bybit options segments finalize on the hour and the upload timer sweeps
 #   them at :23, so 90 minutes covers one full finalize+sweep cycle.
 LOB_SUCCESS_MAX_AGE=7200
 FEE_SUCCESS_MAX_AGE=600
 REF_SUCCESS_MAX_AGE=1200
-POLY_SUCCESS_MAX_AGE=1800
+POLY_SUCCESS_MAX_AGE=7200
 BYBIT_SUCCESS_MAX_AGE=5400
 
 # Gate 3: pending backlog bounds per lane (count limit, oldest-artifact age).
@@ -399,24 +405,19 @@ scan_pending_lake() {
   pending_count=0
   pending_oldest=0
   [ -d "$1/lake/raw" ] || return 0
-  # Single-pass scan inside a pipe subshell (POSIX sh has no process
-  # substitution); the subshell prints "<count> <oldest-mtime>" once for the
-  # parent to unpack.
-  pending_stats=$(find "$1/lake/raw" -type d -name 'batch=*' 2>/dev/null | {
-    count=0
-    oldest=0
-    while IFS= read -r dir; do
-      count=$((count + 1))
-      mtime=$(file_mtime "$dir")
-      case "$mtime" in (*[!0-9]*|'') continue ;; esac
-      if [ "$oldest" -eq 0 ] || [ "$mtime" -lt "$oldest" ]; then
-        oldest=$mtime
-      fi
-    done
-    printf '%s %s\n' "$count" "$oldest"
-  })
-  pending_count=${pending_stats%% *}
-  pending_oldest=${pending_stats##* }
+  # Capture find's exit status: a traversal error (permissions, I/O) must set
+  # pending_scan_failed so the caller can breach instead of reading a partial
+  # scan as an empty backlog.
+  scan_out=$(find "$1/lake/raw" -type d -name 'batch=*' 2>/dev/null) || pending_scan_failed=1
+  # Batch directory names come from the governed lake layout (no whitespace).
+  for dir in $scan_out; do
+    pending_count=$((pending_count + 1))
+    mtime=$(file_mtime "$dir")
+    case "$mtime" in (*[!0-9]*|'') continue ;; esac
+    if [ "$pending_oldest" -eq 0 ] || [ "$mtime" -lt "$pending_oldest" ]; then
+      pending_oldest=$mtime
+    fi
+  done
 }
 
 scan_pending_bybit_raw() {
@@ -463,13 +464,47 @@ check_upload_lane() {
       '$base + {($k): $v}')
   }
 
+  # Gate 3 runs first so a missing status file on a non-mandated lane cannot
+  # hide a real backlog: the pending artifacts live on disk independently of
+  # the uploader's status reporting. A scan that cannot inspect the spool is
+  # a breach (fail closed), never a silent zero backlog.
+  pending_count=0
+  pending_oldest=0
+  pending_scan_failed=0
+  if [ ! -d "$spool_dir" ] || [ ! -r "$spool_dir" ]; then
+    pending_scan_failed=1
+  else
+    case "$pending_kind" in
+      manifests) scan_pending_glob "$spool_dir/*.manifest.json" ;;
+      lake) scan_pending_lake "$spool_dir" ;;
+      tapes) scan_pending_glob "$spool_dir/market-updates.*.ndjson" ;;
+      bybit-raw) scan_pending_bybit_raw "$spool_dir" ;;
+    esac
+  fi
+  if [ "$pending_scan_failed" -eq 1 ]; then
+    record_breach "$label: pending upload backlog scan failed ($spool_dir)"
+  fi
+  pending_age=0
+  if [ "$pending_oldest" -gt 0 ]; then
+    pending_age=$((NOW_SEC - pending_oldest))
+    [ "$pending_age" -lt 0 ] && pending_age=0
+  fi
+  if [ "$pending_count" -gt "$pending_max" ]; then
+    record_breach "$label: pending upload backlog $pending_count over limit $pending_max"
+  fi
+  if [ "$pending_age" -gt "$pending_max_age" ]; then
+    record_breach "$label: oldest pending upload backlog age ${pending_age}s over ${pending_max_age}s"
+  fi
+
   if [ ! -f "$upload_file" ] || [ -L "$upload_file" ]; then
     if [ "$required" = 1 ]; then
       record_breach "$label: upload-status.json missing or a symbolic link"
     else
       record_warning "$label: upload-status.json missing or a symbolic link"
     fi
-    emit_lane_json '{"last_success_at": null, "last_success_age_seconds": null, "last_error_at": null, "last_error": null, "failure_count": 0, "failure_delta": false, "pending_count": 0, "oldest_pending_age_seconds": 0}'
+    uobj=$(jq -n --argjson pc "$pending_count" --argjson pa "$pending_age" \
+      '{last_success_at: null, last_success_age_seconds: null, last_error_at: null, last_error: null, failure_count: 0, failure_delta: false, pending_count: $pc, oldest_pending_age_seconds: $pa}')
+    emit_lane_json "$uobj"
     return 0
   fi
 
@@ -487,18 +522,32 @@ check_upload_lane() {
   fi
   if ! upload_json=$(jq -ce "$upload_filter" "$upload_file" 2>/dev/null); then
     record_breach "$label: upload-status.json is malformed"
-    emit_lane_json '{"last_success_at": null, "last_success_age_seconds": null, "last_error_at": null, "last_error": null, "failure_count": 0, "failure_delta": false, "pending_count": 0, "oldest_pending_age_seconds": 0}'
+    uobj=$(jq -n --argjson pc "$pending_count" --argjson pa "$pending_age" \
+      '{last_success_at: null, last_success_age_seconds: null, last_error_at: null, last_error: null, failure_count: 0, failure_delta: false, pending_count: $pc, oldest_pending_age_seconds: $pa}')
+    emit_lane_json "$uobj"
     return 0
   fi
 
-  # Gate 2: last_success_at presence + freshness. RFC3339 strings on the
-  # binance/polymarket lanes, epoch milliseconds on the bybit lane.
+  # Gate 2: last_success_at presence + freshness. The real emitters produce
+  # RFC3339 with six fractional digits and a Z suffix (polymarket_upload::
+  # utc_now, reused by the fee and usdm-reference uploaders) or Chrono
+  # to_rfc3339() with a +00:00 offset and optional fractional seconds (LOB);
+  # the bybit lane writes epoch milliseconds. jq's fromdateiso8601 only
+  # accepts the whole-second Z form, so normalize first; non-UTC offsets are
+  # refused rather than silently reinterpreted.
   success_raw=$(printf '%s' "$upload_json" | jq -c '(.last_success_at // null)')
   success_epoch=$(printf '%s' "$upload_json" | jq -r '
     (.last_success_at // null)
     | if . == null then empty
       elif type == "number" then (if . > 100000000000 then (. / 1000) else . end | floor)
-      else (try fromdateiso8601 catch empty)
+      elif type == "string" then
+        if test("[+-](0[1-9]|[1-9][0-9]):[0-9]{2}$") then empty
+        else ( sub("([Zz]|[+-]00:00)$"; "")
+               | sub("\\.[0-9]+$"; "")
+               | . + "Z"
+               | try fromdateiso8601 catch empty )
+        end
+      else empty
       end' 2>/dev/null)
   case "$success_epoch" in (*[!0-9]*|'') success_epoch="" ;; esac
   success_age_json=null
@@ -538,27 +587,6 @@ check_upload_lane() {
     fi
   fi
   state_lines="$state_lines failure_count|$label=$failure_count"
-
-  # Gate 3: pending backlog count + oldest pending age.
-  pending_count=0
-  pending_oldest=0
-  case "$pending_kind" in
-    manifests) scan_pending_glob "$spool_dir/*.manifest.json" ;;
-    lake) scan_pending_lake "$spool_dir" ;;
-    tapes) scan_pending_glob "$spool_dir/market-updates.*.ndjson" ;;
-    bybit-raw) scan_pending_bybit_raw "$spool_dir" ;;
-  esac
-  pending_age=0
-  if [ "$pending_oldest" -gt 0 ]; then
-    pending_age=$((NOW_SEC - pending_oldest))
-    [ "$pending_age" -lt 0 ] && pending_age=0
-  fi
-  if [ "$pending_count" -gt "$pending_max" ]; then
-    record_breach "$label: pending upload backlog $pending_count over limit $pending_max"
-  fi
-  if [ "$pending_age" -gt "$pending_max_age" ]; then
-    record_breach "$label: oldest pending upload backlog age ${pending_age}s over ${pending_max_age}s"
-  fi
 
   uobj=$(jq -n --argjson s "$success_raw" --argjson sa "$success_age_json" \
     --arg e "$err_at" --arg m "$err_msg" --argjson f "$failure_count" \

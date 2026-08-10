@@ -148,11 +148,18 @@ EOF
 
 write_upload() {
   # $1 path, $2 last_error_at JSON, $3 last_error JSON, $4 failure_count,
-  # $5 last_success age in seconds (default 60). RFC3339 timestamps, matching
-  # the binance/polymarket uploaders. jq computes the time portably (BSD date
-  # and GNU date disagree on epoch formatting flags).
+  # $5 last_success age in seconds (default 60). Emits six fractional digits
+  # and a Z suffix, exactly what polymarket_upload::utc_now (reused by the fee
+  # and usdm-reference uploaders) produces, so the fixtures cannot hide a
+  # parser gap behind jq's whole-second todate form. jq computes the time
+  # portably (BSD date and GNU date disagree on epoch formatting flags).
   age=${5:-60}
-  success_at=$(jq -rn --argjson age "$age" '(now - $age) | todate')
+  success_at=$(jq -rn --argjson age "$age" '
+    (now - $age) as $t
+    | ($t | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S"))
+      + "."
+      + (("000000" + ((($t - ($t | floor)) * 1000000 | floor) | tostring))[-6:])
+      + "Z"')
   cat > "$1" <<EOF
 {"last_success_at": "$success_at", "last_error_at": $2, "last_error": $3, "failure_count": $4}
 EOF
@@ -417,6 +424,54 @@ expect "gate2 fee missing success: exit 1" "$(rc_is 1; echo $?)"
 expect "gate2 fee missing success: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing a parseable last_success_at'; echo $?)"
 
 # ---------------------------------------------------------------------------
+# 6b. Gate 2: real uploader timestamp formats parse (green)
+#     - whole-second Z (legacy form)
+#     - six fractional digits + Z (polymarket_upload::utc_now; fee, reference)
+#     - +00:00 offset without/with fractional seconds (Chrono to_rfc3339, LOB)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_offset=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_offset" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 offset format: exit 0" "$(rc_is 0; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_frac_offset=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + ".123456+00:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_frac_offset" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 frac+offset format: exit 0" "$(rc_is 0; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_whole=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "Z"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_whole" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 whole-second format: exit 0" "$(rc_is 0; echo $?)"
+
+# A non-UTC offset is refused (breach) rather than silently read as UTC.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_non_utc=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_non_utc" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 non-UTC offset: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 non-UTC offset: breach message" "$(grep_out 'binance-lob-archiver-production@spot: upload-status.json missing a parseable last_success_at'; echo $?)"
+
+# ---------------------------------------------------------------------------
 # 7. Gate 3: pending backlog count over the limit is a breach
 # ---------------------------------------------------------------------------
 reset_env
@@ -503,6 +558,33 @@ raw="$spool_root/bybit-options/quotes.ndjson"
 touch -t 202001010000 "$raw"
 run_health
 expect "gate3 bybit uploaded: exit 0" "$(rc_is 0; echo $?)"
+
+# Gate 3 still fails closed when a non-mandated lane has no status file: the
+# backlog lives on disk independently of the uploader's status reporting.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/polymarket/upload-status.json"
+tape="$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t 202001010000 "$tape"
+run_health
+expect "gate3 no-status backlog: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 no-status backlog: breach message" "$(grep_out 'polymarket-market-tape-upload: oldest pending upload backlog age'; echo $?)"
+expect "gate3 no-status backlog: missing status still a warning" "$(grep_out '^warning: polymarket-market-tape-upload: upload-status.json missing'; echo $?)"
+
+# A pending-backlog scan that cannot inspect the spool is a breach, never a
+# silent zero backlog.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+chmod 000 "$spool_root/binance-fee"
+run_health
+chmod 755 "$spool_root/binance-fee"
+expect "gate3 scan fail: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 scan fail: breach message" "$(grep_out 'binance-fee-upload: pending upload backlog scan failed'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 9. Gate 4: last_error present is a breach

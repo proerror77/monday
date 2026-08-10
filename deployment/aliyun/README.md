@@ -168,7 +168,7 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | Hard gate | Breach condition |
 | --- | --- |
 | 1. Status file | `upload-status.json` missing, a symlink, or unparseable on the mandated lanes (`binance-lob` spot/usdm, `binance-fee`) |
-| 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 1800s, bybit 5400s; each just above the lane's upload cadence) |
+| 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 7200s, bybit 5400s; each just above the lane's upload cadence — the polymarket lanes rotate tapes hourly, so the 5-minute upload timer is not a heartbeat) |
 | 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
 
