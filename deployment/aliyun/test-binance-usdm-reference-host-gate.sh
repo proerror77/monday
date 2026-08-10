@@ -273,15 +273,68 @@ grep -Fq 'V2 backlog remains after the old uploader drain' "$cutover"
 grep -Fq 'restore_old_production' "$cutover"
 grep -Fq 'previous-release-restored' "$cutover"
 grep -Fq "validate_upload_env \"\$UPLOAD_ENV\"" "$cutover"
-grep -Fq 'UPLOADER_RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-upload' "$cutover"
-grep -Fq "OLD_UPLOADER_RELEASE_SHA256=\${BASH_REMATCH[1]}" "$cutover"
-grep -Fq "OLD_UPLOADER_SHA256 == \"\$OLD_UPLOADER_RELEASE_SHA256\"" "$cutover"
+grep -Fq 'validate_old_release_uploader' "$cutover"
+grep -Fq 'previous_uploader_sha256:' "$cutover"
+if grep -Fq 'previous_uploader_release_sha256' "$cutover"; then
+  printf '%s\n' 'cutover receipt retained the obsolete standalone uploader release identity' >&2
+  exit 1
+fi
 grep -Fq 'CANDIDATE_MAY_HAVE_WRITTEN=1' "$cutover"
 grep -Fq "controller: \$controller" "$cutover"
 grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true" "$cutover"
 grep -Fq "systemctl disable \"\$COLLECTOR_UNIT\" \"\$UPLOAD_TIMER\"" "$cutover"
 grep -Fq "! systemctl is-active --quiet \"\$UPLOAD_SERVICE\"" "$cutover"
 grep -Fq 'quarantine_reference_staging' "$cutover"
+
+# A release installed by this cutover keeps collector and uploader together.
+# Exercise the real upgrade identity validator against that first-cutover shape.
+eval "$(awk '/^validate_old_release_uploader\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
+first_release_root="$tmp_dir/first-cutover-releases"
+first_release="$first_release_root/$candidate"
+mkdir -p "$first_release"
+cp "$collector_fixture" "$first_release/binance-usdm-reference-collector"
+printf '#!/bin/sh\nexit 0\n' >"$first_release/binance-usdm-reference-upload"
+chmod 0755 "$first_release/binance-usdm-reference-upload"
+first_uploader="$first_release/binance-usdm-reference-upload"
+first_uploader_sha=$(sha256sum "$first_uploader" | awk '{print $1}')
+printf '%s  binance-usdm-reference-upload\n' "$first_uploader_sha" \
+  >"$first_release/binance-usdm-reference-upload.sha256"
+# shellcheck disable=SC2034 # Read by the extracted production validator.
+RELEASE_ROOT=$first_release_root
+# shellcheck disable=SC2034 # Read by the extracted production validator.
+OLD_RELEASE_SHA256=$candidate
+OLD_UPLOADER=$first_uploader
+OLD_UPLOADER_SHA256=
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
+secure_regular_file() {
+  [[ -f $1 && ! -L $1 && ${untrusted_path:-} != "$1" ]] \
+    || fail "untrusted fixture: $1"
+}
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+validate_old_release_uploader
+[[ $OLD_UPLOADER_SHA256 == "$first_uploader_sha" ]]
+
+if (untrusted_path="$first_release/binance-usdm-reference-upload.sha256"; \
+  validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted an untrusted uploader sidecar' >&2
+  exit 1
+fi
+
+legacy_release="$tmp_dir/legacy-uploader-release/$first_uploader_sha"
+mkdir -p "$legacy_release"
+cp "$OLD_UPLOADER" "$legacy_release/binance-usdm-reference-upload"
+# shellcheck disable=SC2030 # Deliberately isolate the rejected path fixture.
+if (OLD_UPLOADER="$legacy_release/binance-usdm-reference-upload"; \
+  validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted a non-collocated uploader' >&2
+  exit 1
+fi
+
+printf 'tampered\n' >>"$first_uploader"
+if (validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted uploader drift from its sidecar' >&2
+  exit 1
+fi
 
 drain_line=$(grep -n 'STEP=drain-v2-with-old-uploader' "$cutover" | cut -d: -f1)
 switch_line=$(grep -n 'STEP=switch-production-symlink' "$cutover" | cut -d: -f1)
