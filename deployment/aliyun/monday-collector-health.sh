@@ -38,6 +38,7 @@ RESTART_MAX_DELTA=1
 # ("15min" is rejected with "Failed to parse timestamp" and would read as a
 # permanent journald-query breach).
 DELAY_GATE_WINDOW='15 min ago'
+FEE_FAILURE_WINDOW='10 min ago'
 
 # Governed units. Persistent services must be active + enabled + Result=success
 # and are monitored for restart-rate deltas. Upload lanes are driven by timers
@@ -374,6 +375,20 @@ check_delay_gate() {
     '$base + {($k): $v}')
 }
 
+check_recent_snapshot_failures() {
+  unit=$1
+  label=$2
+  journal_out=$(journalctl -u "$unit" --since "$FEE_FAILURE_WINDOW" --no-pager 2>/dev/null)
+  journal_rc=$?
+  failures=$(printf '%s\n' "$journal_out" | grep -c 'Failed with result' || true)
+  case "$failures" in (*[!0-9]*|'') failures=0 ;; esac
+  if [ "$journal_rc" -ne 0 ]; then
+    record_breach "$label: snapshot failure journal query failed (exit $journal_rc)"
+  elif [ "$failures" -gt 0 ]; then
+    record_breach "$label: $failures recent snapshot failure(s)"
+  fi
+}
+
 write_state() {
   [ "$DRY_RUN" -eq 1 ] && return 0
   # A state-persistence failure means the next poll can lose restart/upload
@@ -424,6 +439,8 @@ check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
 check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
 check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
+check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 
 check_disabled_unit "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 

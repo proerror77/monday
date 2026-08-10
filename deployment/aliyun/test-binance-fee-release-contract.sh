@@ -53,5 +53,6 @@ grep -Fq 'binance-fee.conf' "$acr_workflow"
 grep -Fq 'monday-collector-health.sh' "$acr_workflow"
 grep -Fq 'monday.binance_fee_release.v1' "$acr_workflow"
 grep -Fq 'binance-fee-release.json.sha256' "$acr_workflow"
+grep -Fq 'deployment/aliyun/test-binance-fee-release-contract.sh' "$acr_workflow"
 
 printf '%s\n' 'Binance fee release contract tests passed'

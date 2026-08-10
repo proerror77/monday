@@ -250,6 +250,10 @@ jobs:
           [[ "$RESEARCH_MODE" == artifact ]] || \
             [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
 
+      - name: Verify Binance fee release contract
+        if: matrix.repository == 'binance-lob-archiver'
+        run: deployment/aliyun/test-binance-fee-release-contract.sh
+
       - name: Download research runner binaries
         if: matrix.repository == 'research-runner'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

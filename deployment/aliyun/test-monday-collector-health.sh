@@ -66,6 +66,7 @@ run_health() {
     STUB_DF_AVAIL_KIB="${STUB_DF_AVAIL_KIB:-$DF_AVAIL_HEALTHY}" \
     STUB_MOUNTED="${STUB_MOUNTED:-1}" \
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
+    STUB_JOURNAL_FEE_FAILURES="${STUB_JOURNAL_FEE_FAILURES:-0}" \
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
@@ -83,6 +84,7 @@ reset_env() {
   STUB_DF_AVAIL_KIB=$DF_AVAIL_HEALTHY
   STUB_MOUNTED=1
   STUB_JOURNAL_TRIPS=0
+  STUB_JOURNAL_FEE_FAILURES=0
   STUB_JOURNAL_FAIL=0
   unset MONDAY_COLLECTOR_STATE_DIR
 }
@@ -245,6 +247,12 @@ i=0
 count="${STUB_JOURNAL_TRIPS:-0}"
 while [ "$i" -lt "$count" ]; do
   printf 'err: binance: source-to-receive delay exceeds the governed limit\n'
+  i=$((i + 1))
+done
+i=0
+count="${STUB_JOURNAL_FEE_FAILURES:-0}"
+while [ "$i" -lt "$count" ]; do
+  printf 'systemd: binance-fee-snapshot-spot.service: Failed with result exit-code\n'
   i=$((i + 1))
 done
 EOF
@@ -599,6 +607,16 @@ write_upload "$spool_root/binance-fee/upload-status.json" null null 1
 run_health
 expect "fee initial failure: exit 1" "$(rc_is 1; echo $?)"
 expect "fee initial failure: breach message" "$(grep_out 'binance-fee-upload: initial upload failure_count=1'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_JOURNAL_FEE_FAILURES=1
+run_health
+expect "fee recent snapshot failure: exit 1" "$(rc_is 1; echo $?)"
+expect "fee recent snapshot failure: breach message" "$(grep_out 'recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
