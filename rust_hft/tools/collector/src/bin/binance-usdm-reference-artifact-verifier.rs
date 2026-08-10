@@ -202,6 +202,45 @@ mod tests {
         manifest["data_schema"] = serde_json::json!("binance.usdm_reference.v2");
         manifest["bytes"] = serde_json::json!(data.len());
         manifest["sha256"] = serde_json::json!(published.data_sha256);
+        // Historical v2 triplets were published with V1 manifests carrying one
+        // merged cross-modality time_bounds, so downgrade the freshly sealed V2
+        // manifest to that exact historical shape.
+        manifest["schema"] = serde_json::json!("binance.usdm_reference_manifest.v1");
+        let mut min_source_time_ms = u64::MAX;
+        let mut max_source_time_ms = 0_u64;
+        let mut min_received_at_ns = u64::MAX;
+        let mut max_received_at_ns = 0_u64;
+        for line in data.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            let observation = &row["observation"];
+            let source_time_ms = observation["source_time_ms"].as_u64().unwrap();
+            min_source_time_ms = min_source_time_ms.min(source_time_ms);
+            max_source_time_ms = max_source_time_ms.max(source_time_ms);
+            let received_at_ns = observation["received_at_ns"].as_u64().unwrap();
+            min_received_at_ns = min_received_at_ns.min(received_at_ns);
+            max_received_at_ns = max_received_at_ns.max(received_at_ns);
+            if row["kind"] == "metadata" {
+                let clock_received_at_ns =
+                    observation["source_clock_received_at_ns"].as_u64().unwrap();
+                min_received_at_ns = min_received_at_ns.min(clock_received_at_ns);
+                max_received_at_ns = max_received_at_ns.max(clock_received_at_ns);
+            }
+        }
+        let object = manifest.as_object_mut().unwrap();
+        object.remove("mark_index_funding");
+        object.remove("open_interest");
+        object.insert(
+            "time_bounds".to_owned(),
+            serde_json::json!({
+                "min_source_time_ms": min_source_time_ms,
+                "max_source_time_ms": max_source_time_ms,
+                "min_received_at_ns": min_received_at_ns,
+                "max_received_at_ns": max_received_at_ns,
+            }),
+        );
         let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         manifest_bytes.push(b'\n');
         fs::write(&published.manifest_path, &manifest_bytes).unwrap();
