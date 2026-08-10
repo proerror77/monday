@@ -40,7 +40,6 @@ engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 alpha-domain = { path = "../../alpha-harness/domain" }
-ed25519-dalek = { workspace = true }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
 polymarket-tape-contract = { path = "../../shared/polymarket-tape" }
 
@@ -79,6 +78,7 @@ duckdb = ["dep:duckdb"]
 
 [dev-dependencies]
 zstd = "0.13"
+ed25519-dalek = { workspace = true }
 
 [[bin]]
 name = "hft-collector"

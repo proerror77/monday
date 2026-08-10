@@ -14,8 +14,8 @@ use hft_collector::binance_fee_artifact::{verify_fee_artifact, PublishedFeeArtif
 use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact, PublishedReferenceArtifact,
 };
-use hft_collector::runtime_latency_evidence::{
-    verify_runtime_latency_evidence, VerifiedRuntimeLatencyEvidence,
+use alpha_domain::runtime_latency_evidence::{
+    verify_runtime_latency_evidence, RuntimeLatencyEvidenceSource, VerifiedRuntimeLatencyEvidence,
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_research_manifest::{
@@ -527,10 +527,12 @@ fn load_latency_cost(
         bail!("fee and runtime latency evidence accounts differ");
     }
     let verified = verify_runtime_latency_evidence(
-        &args.runtime_feedback_log,
-        &args.runtime_feedback_log_sha256,
-        &args.runtime_feedback_trusted_keys,
-        &args.runtime_feedback_trusted_keys_sha256,
+        RuntimeLatencyEvidenceSource {
+            feedback_log: &args.runtime_feedback_log,
+            feedback_log_sha256: &args.runtime_feedback_log_sha256,
+            trusted_keys: &args.runtime_feedback_trusted_keys,
+            trusted_keys_sha256: &args.runtime_feedback_trusted_keys_sha256,
+        },
         &args.runtime_feedback_deployment_id,
         args.market.as_str(),
         symbol,
@@ -632,6 +634,15 @@ fn bind_fee_evidence(
         {
             bail!("fee artifact identity does not match materialization");
         }
+        republish_evidence_triplet(
+            &args.artifact_dir,
+            "fee",
+            &published.data_path,
+            &published.manifest_path,
+            &published.success_path,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )?;
         snapshots.push((snapshot, artifact_triplet(&published)?));
     }
     snapshots.sort_by_key(|(snapshot, _)| snapshot.received_at);
@@ -705,6 +716,49 @@ fn artifact_triplet(artifact: &PublishedFeeArtifact) -> Result<CexArtifactTriple
     })
 }
 
+/// Re-publish a verified evidence triplet into the materialization artifact
+/// directory under content-addressed names so the digests recorded in the
+/// snapshot resolve to immutable local files.
+#[allow(clippy::too_many_arguments)]
+fn republish_evidence_triplet(
+    artifact_dir: &Path,
+    kind: &str,
+    data_path: &Path,
+    manifest_path: &Path,
+    success_path: &Path,
+    data_sha256: &str,
+    manifest_sha256: &str,
+) -> Result<()> {
+    republish_verified_file(
+        data_path,
+        &artifact_dir.join(format!("{data_sha256}.{kind}.data")),
+        data_sha256,
+    )?;
+    republish_verified_file(
+        manifest_path,
+        &artifact_dir.join(format!("{manifest_sha256}.{kind}.manifest.json")),
+        manifest_sha256,
+    )?;
+    let success = std::fs::read(success_path)
+        .with_context(|| format!("failed to read {kind} success marker"))?;
+    if success != format!("{data_sha256}\n").as_bytes() {
+        bail!("verified {kind} evidence success marker changed before publication");
+    }
+    publish_immutable(
+        &artifact_dir.join(format!("{data_sha256}.{kind}._SUCCESS")),
+        &success,
+    )
+}
+
+fn republish_verified_file(source: &Path, target: &Path, expected_sha256: &str) -> Result<()> {
+    let bytes = std::fs::read(source)
+        .with_context(|| format!("failed to read verified evidence {}", source.display()))?;
+    if hex::encode(Sha256::digest(&bytes)) != expected_sha256 {
+        bail!("verified evidence changed before publication");
+    }
+    publish_immutable(target, &bytes)
+}
+
 fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV2) -> Result<()> {
     let count = args.reference_data.len();
     if args.market == Market::Spot {
@@ -741,6 +795,15 @@ fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV
             manifest_sha256: manifest_sha256.clone(),
         };
         let batch = verify_reference_artifact(&published, data_sha256, manifest_sha256)?;
+        republish_evidence_triplet(
+            &args.artifact_dir,
+            "reference",
+            &published.data_path,
+            &published.manifest_path,
+            &published.success_path,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )?;
         let contract = batch
             .contracts()
             .iter()
@@ -1237,7 +1300,7 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
     use hft_collector::binance_fee_artifact::{
-        publish_fee_snapshot, BinanceFeeSnapshot, SideFeeBps, FEE_SCHEMA,
+        publish_fee_snapshot, BinanceFeeSnapshot, BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
     };
     use hft_collector::binance_usdm_reference_artifact::{
         publish_reference_batch, ReferenceArtifactConfig,
@@ -1294,17 +1357,35 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn fee_snapshot(milliseconds: u64) -> BinanceFeeSnapshot {
+    fn fee_snapshot(market: Market, milliseconds: u64) -> BinanceFeeSnapshot {
         let observed_at = datetime_ns(event_ns(milliseconds)).unwrap();
+        let (calculation, source_endpoint, instrument_rules, rules_source_endpoint) = match market {
+            Market::Spot => (
+                "liquidity_plus_side_standard_special_tax_without_asset_discount".to_string(),
+                "/api/v3/account/commission".to_string(),
+                Some(BinanceInstrumentRules {
+                    tick_size: "0.1".to_string(),
+                    step_size: "0.001".to_string(),
+                    min_notional: "5".to_string(),
+                }),
+                Some("/api/v3/exchangeInfo".to_string()),
+            ),
+            Market::Usdm => (
+                "account_commission_rate".to_string(),
+                "/fapi/v1/commissionRate".to_string(),
+                None,
+                None,
+            ),
+        };
         BinanceFeeSnapshot {
             schema: FEE_SCHEMA.to_string(), venue: "binance".to_string(),
-            market: "usdm".to_string(), symbol: "BTCUSDT".to_string(),
+            market: market.as_str().to_string(), symbol: "BTCUSDT".to_string(),
             runtime_account_id: "binance-main".to_string(),
             account_fingerprint: "a".repeat(64),
             maker_fee_bps: SideFeeBps { buy: "2".into(), sell: "2".into() },
             taker_fee_bps: SideFeeBps { buy: "5".into(), sell: "5".into() },
-            calculation: "account_commission_rate".to_string(), source_endpoint: "/fapi/v1/commissionRate".to_string(),
-            instrument_rules: None, rules_source_endpoint: None,
+            calculation, source_endpoint,
+            instrument_rules, rules_source_endpoint,
             requested_at: observed_at, received_at: observed_at,
         }
     }
@@ -1362,9 +1443,9 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn valid_rows() -> Vec<Value> {
+    fn valid_rows(market: &str) -> Vec<Value> {
         vec![
-            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":2,"websocket_streams":2}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":market,"symbols":1,"websocket_shards":2,"websocket_streams":2}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
             diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
@@ -1382,6 +1463,7 @@ mod tests {
 
     struct Fixture {
         directory: PathBuf,
+        market: Market,
         data: PathBuf,
         manifest: PathBuf,
         success: PathBuf,
@@ -1396,7 +1478,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(rows: &[Value]) -> Self {
+        fn new(market: Market, rows: &[Value]) -> Self {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let requested_directory = std::env::temp_dir()
                 .join(format!("lob-pit-materializer-{}-{id}", std::process::id()));
@@ -1449,8 +1531,8 @@ mod tests {
             let manifest_value = json!({
                 "schema": "binance.market_tape.v1",
                 "venue": "binance",
-                "market": "usdm",
-                "dataset": "usdm_all",
+                "market": market.as_str(),
+                "dataset": format!("{}_all", market.as_str()),
                 "shard_id": "all",
                 "mode": "diff",
                 "symbols": ["BTCUSDT"],
@@ -1523,7 +1605,7 @@ mod tests {
                             "evidence_available_at_us".to_string(),
                             event_ns(0) as f64 / 1_000.0,
                         ),
-                        ("instrument_market_usdm".to_string(), 1.0),
+                        ("instrument_market_".to_string() + market.as_str(), 1.0),
                     ]),
                     reason: None,
                     observed_at: datetime_ns(event_ns(0)).unwrap(),
@@ -1539,33 +1621,40 @@ mod tests {
             let fees = [0, 6_000]
                 .into_iter()
                 .map(|milliseconds| {
-                    publish_fee_snapshot(&directory.join("fees"), &fee_snapshot(milliseconds))
-                        .unwrap()
+                    publish_fee_snapshot(
+                        &directory.join("fees"),
+                        &fee_snapshot(market, milliseconds),
+                    )
+                    .unwrap()
                 })
                 .collect();
             let reference_root = directory.join("reference");
-            let references = [
-                (0, 3_000, 1, 123_455),
-                (2_500, 4_000, 2, 123_460),
-                (6_000, 9_000, 3, 123_465),
-            ]
-            .into_iter()
-            .map(|(milliseconds, next_funding_ms, funding, oi)| {
-                publish_reference_batch(
-                    &ReferenceArtifactConfig {
-                        output_root: reference_root.clone(),
-                        observed_at_ns: event_ns(milliseconds),
-                        max_staleness_ms: 1_000,
-                    },
-                    OFFICIAL_USDM_SOURCE_ORIGIN,
-                    &reference_batch(milliseconds, next_funding_ms, funding, oi),
-                )
-                .unwrap()
-            })
-            .collect();
+            let references = match market {
+                Market::Spot => Vec::new(),
+                Market::Usdm => [
+                    (0, 3_000, 1, 123_455),
+                    (2_500, 4_000, 2, 123_460),
+                    (6_000, 9_000, 3, 123_465),
+                ]
+                .into_iter()
+                .map(|(milliseconds, next_funding_ms, funding, oi)| {
+                    publish_reference_batch(
+                        &ReferenceArtifactConfig {
+                            output_root: reference_root.clone(),
+                            observed_at_ns: event_ns(milliseconds),
+                            max_staleness_ms: 1_000,
+                        },
+                        OFFICIAL_USDM_SOURCE_ORIGIN,
+                        &reference_batch(milliseconds, next_funding_ms, funding, oi),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            };
 
             Self {
                 directory,
+                market,
                 data,
                 manifest,
                 success,
@@ -1584,7 +1673,7 @@ mod tests {
         fn args(&self) -> Args {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
-                market: Market::Usdm, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
+                market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"), runtime_feedback_log: self.runtime_feedback_log.clone(),
@@ -1606,7 +1695,7 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_segment_argument_lengths_before_file_access() {
-        let fixture = Fixture::new(&valid_rows());
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut args = fixture.args();
         args.segment = vec![PathBuf::from("/does/not/exist.jsonl.zst")];
         args.segment_content_sha256.clear();
@@ -1618,7 +1707,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_external_content_digest() {
-        let fixture = Fixture::new(&valid_rows());
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut args = fixture.args();
         args.segment_content_sha256[0] = "0".repeat(64);
 
@@ -1630,7 +1719,7 @@ mod tests {
 
     #[test]
     fn rejects_combined_tape_without_strict_modality_evidence() {
-        let fixture = Fixture::new(&valid_rows());
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut manifest: Value =
             serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
         for field in [
@@ -1680,7 +1769,7 @@ mod tests {
 
     #[test]
     fn rejects_fee_and_runtime_evidence_from_different_accounts() {
-        let fixture = Fixture::new(&valid_rows());
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let mut args = fixture.args();
         args.runtime_feedback_account_id = "different-account".to_string();
 
@@ -1691,10 +1780,12 @@ mod tests {
 
     #[test]
     fn rejects_sparse_fee_evidence() {
-        let fixture = Fixture::new(&valid_rows());
-        let late =
-            publish_fee_snapshot(&fixture.directory.join("late-fee"), &fee_snapshot(120_000))
-                .unwrap();
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let late = publish_fee_snapshot(
+            &fixture.directory.join("late-fee"),
+            &fee_snapshot(Market::Usdm, 120_000),
+        )
+        .unwrap();
         let mut args = fixture.args();
         args.fee_data[1] = late.data_path;
         args.fee_data_sha256[1] = late.data_sha256;
@@ -1706,8 +1797,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_usdm_without_a_derivatives_execution_path() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let args = fixture.args();
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(error.contains("USD-M runtime latency evidence is unavailable"));
+        assert!(args
+            .artifact_dir
+            .join(format!("{}.reference.data", fixture.references[0].data_sha256))
+            .is_file());
+    }
+
+    #[test]
     fn preserves_report_evidence_and_point_in_time_rows() {
-        let fixture = Fixture::new(&valid_rows());
+        let fixture = Fixture::new(Market::Spot, &valid_rows("spot"));
         let published = materialize(&fixture.args()).unwrap();
         let output = serde_json::to_value(&published).unwrap();
         let source = &output["report"]["source_segments"][0];
@@ -1725,29 +1830,15 @@ mod tests {
         assert_eq!(published.report.rows, 3);
         snapshot.validate().unwrap();
         assert_eq!(output["report"]["snapshot_sha256"], snapshot.sha256());
+        assert!(snapshot.derivatives_reference.is_none());
         assert_eq!(snapshot.instrument_rules.tick_size, "0.1");
+        assert_eq!(snapshot.instrument_rules.step_size, "0.001");
+        assert_eq!(snapshot.instrument_rules.min_notional, "5");
         assert_eq!(snapshot.fee_schedule.maker_buy_fee_bps, "2");
         assert_eq!(snapshot.fee_schedule.taker_buy_fee_bps, "5");
         assert_eq!(snapshot.fee_schedule.runtime_account_id, "binance-main");
-        assert_eq!(
-            snapshot
-                .derivatives_reference
-                .as_ref()
-                .unwrap()
-                .funding
-                .observations,
-            3
-        );
         assert_eq!(snapshot.latency_cost.p95_cost_bps, "1.25");
         assert_eq!(snapshot.latency_cost.runtime_account_id, "binance-main");
-        assert_eq!(
-            snapshot
-                .derivatives_reference
-                .as_ref()
-                .unwrap()
-                .evaluation_funding_bps_per_bucket,
-            "1"
-        );
         assert_eq!(
             source,
             &json!({
@@ -1759,31 +1850,40 @@ mod tests {
                 "success_marker_sha256": hex::encode(Sha256::digest(format!("{}\n", fixture.content_sha256))),
                 "start_received_at_ns": event_ns(0),
                 "end_received_at_ns": event_ns(6_500),
-                "events": valid_rows().len()
+                "events": valid_rows("spot").len()
             })
         );
         assert_eq!(rows[0].symbol, "BTCUSDT");
         assert_eq!(
             rows[0].modalities,
-            BTreeSet::from([
-                DataModality::Lob,
-                DataModality::TradeTick,
-                DataModality::Funding,
-                DataModality::OpenInterest,
-            ])
+            BTreeSet::from([DataModality::Lob, DataModality::TradeTick])
         );
-        assert_eq!(rows[0].features["aggregate_trade_count"], 0.0);
+        // Aggregate-trade buckets are (previous_sample, current_sample]: the 1.7s
+        // trade lands in the first row's (1s, 2s] bucket and the 0.7s trade is
+        // before the first sampled row.
+        assert_eq!(rows[0].features["aggregate_trade_count"], 1.0);
+        assert_eq!(rows[0].features["aggregate_trade_base_volume"], 2.0);
+        assert_eq!(rows[0].features["aggregate_trade_quote_volume"], 201.0);
+        assert_eq!(rows[0].features["aggregate_trade_flow_imbalance"], 1.0);
+        assert_eq!(rows[1].features["aggregate_trade_count"], 0.0);
         assert_eq!(rows[0].event_time.to_rfc3339(), "2026-07-14T00:00:02+00:00");
         assert_eq!(
             rows[0].label_available_time.to_rfc3339(),
             "2026-07-14T00:00:04+00:00"
         );
         assert!((rows[0].features["mid_price"] - 101.0).abs() < 1e-12);
-        assert!((rows[0].features["funding_rate"] - 0.0001).abs() < 1e-12);
-        assert_eq!(rows[0].features["funding_cost_bps"], 0.0);
-        assert_eq!(rows[1].features["funding_cost_bps"], 0.0);
-        assert_eq!(rows[2].features["funding_cost_bps"], 2.0);
-        assert!((rows[0].features["open_interest"] - 12345.5).abs() < 1e-12);
         assert!((rows[0].label - (101.25 / 101.0 - 1.0)).abs() < 1e-12);
+        for fee in &fixture.fees {
+            let artifact_dir = fixture.directory.join("artifacts");
+            assert!(artifact_dir
+                .join(format!("{}.fee.data", fee.data_sha256))
+                .is_file());
+            assert!(artifact_dir
+                .join(format!("{}.fee.manifest.json", fee.manifest_sha256))
+                .is_file());
+            assert!(artifact_dir
+                .join(format!("{}.fee._SUCCESS", fee.data_sha256))
+                .is_file());
+        }
     }
 }
