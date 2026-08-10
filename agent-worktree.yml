@@ -1,11 +1,13 @@
-owner: codex-root
-contract: lob-shadow-spool-owner
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-shadow-spool-owner
-branch: codex/lob-shadow-spool-owner
-base_sha: 2fb07d94c245f71ac6508fe12ebbe416118a3eba
+owner: codex-root/ci-cache-restore-fix
+contract: rust-cache-restore-prefix
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/rust-cache-restore-prefix
+branch: codex/rust-cache-restore-prefix
+base_sha: fd22f9321f13832df5c9b96363610fd50f619ad8
 allowed_files:
   - agent-worktree.yml
-  - deployment/aliyun/deploy-rust-lob-release.sh
-  - deployment/aliyun/test-rust-lob-control-plane.sh
-dependency: runtime issue #805 candidate install exposed a non-traversable shadow spool parent
+  - .github/workflows/ploy-ci.yml
+  - .github/workflows/acr-publish.yml
+  - .github/workflows/ci.yml
+  - .github/scripts/test-acr-publish-workflow.sh
+dependency: origin/main at fd22f9321f13832df5c9b96363610fd50f619ad8
 no_external_runtime_mutation: true

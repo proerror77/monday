@@ -186,7 +186,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
-          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/**/Cargo.lock') }}
+          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}
           cache-all-crates: true
 
       - name: Build research runner binaries

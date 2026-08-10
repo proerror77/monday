@@ -166,7 +166,7 @@ jobs:
         with:
           workspaces: |
             rust_hft
-          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
+          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}
           cache-all-crates: false
           save-if: ${{ github.event_name != 'pull_request' }}
 

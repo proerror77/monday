@@ -6,6 +6,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workflow="$script_dir/../workflows/acr-publish.yml"
 dockerignore="$script_dir/../../.dockerignore"
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
+ci_workflow="$script_dir/../workflows/ci.yml"
 dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.research"
 source_test_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.source-test"
 source_test_entrypoint="$script_dir/../../rust_hft/deployment/docker/source-test-entrypoint.sh"
@@ -202,6 +203,16 @@ grep -Fqx '        continue-on-error: true' "$workflow"
 if grep -Fq 'sccache --zero-stats' "$workflow" || \
   grep -Fq 'path: ~/.cache/sccache' "$workflow" || \
   grep -Fq -- '}}-${{ github.sha }}' "$workflow"; then
+  exit 1
+fi
+
+grep -Fqx '          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$workflow"
+grep -Fqx '          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$ploy_workflow"
+grep -Fqx '          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$ci_workflow"
+# rust-cache@v2 hashes the Rust environment and lockfiles by default. Keep the
+# user prefix stable so that its restore key survives Cargo.lock changes.
+if grep -Eq "key: (research-image-bookworm|rust_hft-ci-rust)-.*hashFiles\\(.*Cargo[.]lock" "$workflow" "$ploy_workflow" "$ci_workflow"; then
+  printf 'Rust cache user key duplicates the action Cargo.lock environment hash\n' >&2
   exit 1
 fi
 
