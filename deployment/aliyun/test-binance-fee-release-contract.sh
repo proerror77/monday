@@ -14,6 +14,7 @@ tmpfiles="$script_dir/binance-fee.conf"
 acr_workflow="$script_dir/../../.github/workflows/acr-publish.yml"
 
 grep -Fq 'account_secret_file: PathBuf' "$producer"
+grep -Fq '!args.account_secret_file.is_absolute()' "$producer"
 if grep -Fq 'HFT_SECRET_BINANCE_ACCOUNT_JSON' "$producer"; then
   exit 1
 fi
@@ -22,7 +23,7 @@ for service in "$spot_service" "$usdm_service"; do
   grep -Fxq 'LoadCredential=binance-account.json:/etc/monday/credentials/binance-account.json' "$service"
   grep -Fq -- '--account-secret-file %d/binance-account.json' "$service"
   grep -Fxq 'ReadWritePaths=/data/monday/spool/binance-fee' "$service"
-  if grep -Eq '^(Environment|EnvironmentFile)=.*(api_key|secret|credential)' "$service"; then
+  if grep -Eqi '^(Environment|EnvironmentFile)=.*(api_key|secret|credential)' "$service"; then
     exit 1
   fi
 done
@@ -31,6 +32,7 @@ grep -Fq -- '--market usdm --symbol BTCUSDT' "$usdm_service"
 
 for timer in "$spot_timer" "$usdm_timer"; do
   grep -Fxq 'OnUnitActiveSec=60s' "$timer"
+  grep -Fxq 'AccuracySec=1s' "$timer"
   grep -Fxq 'Persistent=true' "$timer"
 done
 grep -Fxq 'Unit=binance-fee-snapshot-spot.service' "$spot_timer"

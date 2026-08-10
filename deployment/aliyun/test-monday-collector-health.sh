@@ -603,6 +603,16 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
+printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "fee status missing count: exit 1" "$(rc_is 1; echo $?)"
+expect "fee status missing count: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
 write_upload "$spool_root/binance-fee/upload-status.json" null null 1
 run_health
 expect "fee initial failure: exit 1" "$(rc_is 1; echo $?)"
