@@ -1,0 +1,29 @@
+[Unit]
+Description=Monday Binance Spot BTCUSDT fee snapshot
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=oneshot
+User=hftcollector
+Group=hftcollector
+LoadCredential=binance-account.json:/etc/monday/credentials/binance-account.json
+ExecStart=/opt/monday/bin/binance-fee-snapshot --market spot --symbol BTCUSDT --output-root /data/monday/spool/binance-fee --account-secret-file %d/binance-account.json
+TimeoutStartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday/spool/binance-fee
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=128M
+MemoryMax=192M

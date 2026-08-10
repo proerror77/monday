@@ -1,15 +1,25 @@
 owner: codex-root
-contract: runtime-latency-verifier
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-latency-evidence
-branch: codex/runtime-latency-evidence
-base_sha: 0bd446df30d7068b696d8033159b9e070983df73
+contract: binance-fee-systemd-credentialed-production-assets
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-systemd
+branch: codex/binance-fee-systemd
+base_sha: bd402f481dbe25ccc8dfb336be3fff5be47a727d
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/Cargo.lock
-  - rust_hft/alpha-harness/domain/Cargo.toml
-  - rust_hft/alpha-harness/domain/src/lib.rs
-  - rust_hft/alpha-harness/domain/src/runtime_latency_evidence.rs
-  - rust_hft/tools/collector/Cargo.toml
-  - rust_hft/tools/collector/src/lib.rs
-dependency: PR #787 merged into 0bd446df30d7068b696d8033159b9e070983df73
+  - .github/workflows/ci.yml
+  - .github/workflows/acr-publish.yml
+  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
+  - rust_hft/tools/collector/src/binance_fee_upload.rs
+  - deployment/aliyun/binance-fee-snapshot-spot.service
+  - deployment/aliyun/binance-fee-snapshot-spot.timer
+  - deployment/aliyun/binance-fee-snapshot-usdm.service
+  - deployment/aliyun/binance-fee-snapshot-usdm.timer
+  - deployment/aliyun/binance-fee-upload.service
+  - deployment/aliyun/binance-fee-upload.timer
+  - deployment/aliyun/binance-fee-upload.env
+  - deployment/aliyun/binance-fee.conf
+  - deployment/aliyun/monday-collector-health.sh
+  - deployment/aliyun/test-monday-collector-health.sh
+  - deployment/aliyun/test-binance-fee-release-contract.sh
+dependency: issue #790 / PR #791 merged into f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff; PR #787 merged into 0bd446df30d7068b696d8033159b9e070983df73; PR #788 merged into bd402f481dbe25ccc8dfb336be3fff5be47a727d
+issue: 792
 no_external_runtime_mutation: true

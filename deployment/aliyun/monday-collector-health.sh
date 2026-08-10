@@ -38,6 +38,7 @@ RESTART_MAX_DELTA=1
 # ("15min" is rejected with "Failed to parse timestamp" and would read as a
 # permanent journald-query breach).
 DELAY_GATE_WINDOW='15 min ago'
+FEE_FAILURE_WINDOW='10 min ago'
 
 # Governed units. Persistent services must be active + enabled + Result=success
 # and are monitored for restart-rate deltas. Upload lanes are driven by timers
@@ -57,6 +58,12 @@ BYBIT_UPLOAD_TIMER=bybit-options-upload.timer
 BYBIT_UPLOAD_SERVICE=bybit-options-upload.service
 USDM_REF_UPLOAD_TIMER=binance-usdm-reference-upload.timer
 USDM_REF_UPLOAD_SERVICE=binance-usdm-reference-upload.service
+FEE_SPOT_TIMER=binance-fee-snapshot-spot.timer
+FEE_SPOT_SERVICE=binance-fee-snapshot-spot.service
+FEE_USDM_TIMER=binance-fee-snapshot-usdm.timer
+FEE_USDM_SERVICE=binance-fee-snapshot-usdm.service
+FEE_UPLOAD_TIMER=binance-fee-upload.timer
+FEE_UPLOAD_SERVICE=binance-fee-upload.service
 POLY_RAW_OPS_GATE='polymarket-raw-ops-gate@.service'
 
 JSON_MODE=0
@@ -296,9 +303,24 @@ check_upload() {
   failure_count=0
   failure_delta=0
   if [ -f "$upload_file" ]; then
-    err_at=$(jq -r '(.last_error_at // null)' "$upload_file" 2>/dev/null || printf 'null')
-    err_msg=$(jq -r '(.last_error // null)' "$upload_file" 2>/dev/null || printf 'null')
-    failure_count=$(jq -r '(.failure_count // 0)' "$upload_file" 2>/dev/null || printf '0')
+    if [ "$label" = "binance-fee-upload" ]; then
+      upload_filter='if type == "object"
+        and has("failure_count")
+        and (.failure_count != null)
+        and (.failure_count | type == "number")
+        and (.failure_count | floor == .)
+        and (.failure_count >= 0)
+      then . else error("invalid upload status") end'
+    else
+      upload_filter='if type == "object" then . else error("invalid upload status") end'
+    fi
+    if upload_json=$(jq -ce "$upload_filter" "$upload_file" 2>/dev/null); then
+      err_at=$(printf '%s' "$upload_json" | jq -r '(.last_error_at // null)')
+      err_msg=$(printf '%s' "$upload_json" | jq -r '(.last_error // null)')
+      failure_count=$(printf '%s' "$upload_json" | jq -r '(.failure_count // 0)')
+    else
+      record_breach "$label: upload-status.json is malformed"
+    fi
   fi
   case "$failure_count" in (*[!0-9]*|'') failure_count=0 ;; esac
   if [ -n "$err_at" ] && [ "$err_at" != "null" ]; then
@@ -308,9 +330,12 @@ check_upload() {
     record_breach "$label: upload last_error=$err_msg"
   fi
   prior=$(read_prior "failure_count|$label")
-  if [ "$DRY_RUN" -eq 0 ] && [ -n "$prior" ]; then
+  if [ "$DRY_RUN" -eq 0 ]; then
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
-    if [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
+    if [ -z "$prior" ] && [ "$label" = "binance-fee-upload" ] && [ "$failure_count" -gt 0 ]; then
+      failure_delta=1
+      record_breach "$label: initial upload failure_count=$failure_count"
+    elif [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
       failure_delta=1
       record_breach "$label: upload failure_count increased $prior -> $failure_count"
     fi
@@ -321,6 +346,15 @@ check_upload() {
     '{last_error_at: $e, last_error: $m, failure_count: $f, failure_delta: ($d == 1)}')
   uploads_json=$(jq -n --argjson base "$uploads_json" --arg k "$label" --argjson v "$uobj" \
     '$base + {($k): $v}')
+}
+
+check_upload_required() {
+  label=$1
+  spool_dir=$2
+  if [ ! -f "$spool_dir/upload-status.json" ] || [ -L "$spool_dir/upload-status.json" ]; then
+    record_breach "$label: upload-status.json missing or a symbolic link"
+  fi
+  check_upload "$label" "$spool_dir"
 }
 
 check_delay_gate() {
@@ -344,6 +378,20 @@ check_delay_gate() {
   dobj=$(jq -n --argjson t "$trips" '{trips_15m: $t}')
   delay_gate_json=$(jq -n --argjson base "$delay_gate_json" --arg k "$unit" --argjson v "$dobj" \
     '$base + {($k): $v}')
+}
+
+check_recent_snapshot_failures() {
+  unit=$1
+  label=$2
+  journal_out=$(journalctl -u "$unit" --since "$FEE_FAILURE_WINDOW" --no-pager 2>/dev/null)
+  journal_rc=$?
+  failures=$(printf '%s\n' "$journal_out" | grep -c 'Failed with result' || true)
+  case "$failures" in (*[!0-9]*|'') failures=0 ;; esac
+  if [ "$journal_rc" -ne 0 ]; then
+    record_breach "$label: snapshot failure journal query failed (exit $journal_rc)"
+  elif [ "$failures" -gt 0 ]; then
+    record_breach "$label: $failures recent snapshot failure(s)"
+  fi
 }
 
 write_state() {
@@ -390,6 +438,14 @@ check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
 check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
 check_timer "$USDM_REF_UPLOAD_TIMER" "binance-usdm-reference-upload.timer"
 check_oneshot_result "$USDM_REF_UPLOAD_SERVICE" "binance-usdm-reference-upload.service"
+check_timer "$FEE_SPOT_TIMER" "binance-fee-snapshot-spot.timer"
+check_oneshot_result "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
+check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
+check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
+check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
+check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 
 check_disabled_unit "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
@@ -402,6 +458,7 @@ check_upload "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-refere
 check_upload "bybit-options-upload" "$SPOOL_ROOT/bybit-options"
 check_upload "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket"
 check_upload "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference"
+check_upload_required "binance-fee-upload" "$SPOOL_ROOT/binance-fee"
 
 check_delay_gate "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
 check_delay_gate "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"

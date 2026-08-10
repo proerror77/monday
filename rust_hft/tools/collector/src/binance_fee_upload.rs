@@ -232,6 +232,10 @@ where
     ensure_canonical_directory(&config.output_root)?;
     let status_path = config.output_root.join("upload-status.json");
     let mut status = read_status(&status_path)?;
+    let failure_count = status
+        .get("failure_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let batches = match discover_batches(&config.output_root) {
         Ok(batches) => batches,
         Err(error) => {
@@ -241,6 +245,10 @@ where
             status.insert("discovery_failed".to_string(), json!(true));
             status.insert("last_error_at".to_string(), json!(now));
             status.insert("last_error".to_string(), json!(error.to_string()));
+            status.insert(
+                "failure_count".to_string(),
+                json!(failure_count.saturating_add(1)),
+            );
             atomic_json(&status_path, &Value::Object(status))?;
             return Err(error);
         }
@@ -291,6 +299,10 @@ where
     status.insert("retried_batches".to_string(), json!(retried_batches));
     status.insert("pending_batches".to_string(), pending_batches);
     status.insert("failed_batches".to_string(), Value::Array(failures.clone()));
+    status.insert(
+        "failure_count".to_string(),
+        json!(failure_count.saturating_add(failures.len() as u64)),
+    );
     status.insert(
         "last_error_at".to_string(),
         if failures.is_empty() {
@@ -516,5 +528,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unexpected"));
+        assert_eq!(status["failure_count"], 1);
+
+        fs::remove_dir_all(root.path().join("lake/unexpected")).unwrap();
+        upload_pending_with(&config, |_, _| unreachable!()).unwrap();
+        let recovered: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(recovered["failure_count"], 1);
+        assert!(recovered["last_error"].is_null());
     }
 }

@@ -66,6 +66,7 @@ run_health() {
     STUB_DF_AVAIL_KIB="${STUB_DF_AVAIL_KIB:-$DF_AVAIL_HEALTHY}" \
     STUB_MOUNTED="${STUB_MOUNTED:-1}" \
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
+    STUB_JOURNAL_FEE_FAILURES="${STUB_JOURNAL_FEE_FAILURES:-0}" \
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
@@ -83,6 +84,7 @@ reset_env() {
   STUB_DF_AVAIL_KIB=$DF_AVAIL_HEALTHY
   STUB_MOUNTED=1
   STUB_JOURNAL_TRIPS=0
+  STUB_JOURNAL_FEE_FAILURES=0
   STUB_JOURNAL_FAIL=0
   unset MONDAY_COLLECTOR_STATE_DIR
 }
@@ -108,6 +110,7 @@ make_spools() {
            "$spool_root/binance-lob/usdm" \
            "$spool_root/binance-usdm-reference" \
            "$spool_root/bybit-options" \
+           "$spool_root/binance-fee" \
            "$spool_root/polymarket" \
            "$spool_root/polymarket-reference"
 }
@@ -144,6 +147,7 @@ healthy_fixtures() {
   write_upload "$spool_root/binance-lob/usdm/upload-status.json" null null 0
   write_upload "$spool_root/binance-usdm-reference/upload-status.json" null null 0
   write_upload "$spool_root/bybit-options/upload-status.json" null null 0
+  write_upload "$spool_root/binance-fee/upload-status.json" null null 0
   write_upload "$spool_root/polymarket/upload-status.json" null null 0
   write_upload "$spool_root/polymarket-reference/upload-status.json" null null 0
 }
@@ -164,6 +168,12 @@ bybit-options-upload.timer	active	enabled	-	-
 bybit-options-upload.service	-	-	success	-
 binance-usdm-reference-upload.timer	active	enabled	-	-
 binance-usdm-reference-upload.service	-	-	success	-
+binance-fee-snapshot-spot.timer	active	enabled	-	-
+binance-fee-snapshot-spot.service	-	-	success	-
+binance-fee-snapshot-usdm.timer	active	enabled	-	-
+binance-fee-snapshot-usdm.service	-	-	success	-
+binance-fee-upload.timer	active	enabled	-	-
+binance-fee-upload.service	-	-	success	-
 polymarket-raw-ops-gate@.service	-	disabled	-	-
 EOF
 }
@@ -237,6 +247,12 @@ i=0
 count="${STUB_JOURNAL_TRIPS:-0}"
 while [ "$i" -lt "$count" ]; do
   printf 'err: binance: source-to-receive delay exceeds the governed limit\n'
+  i=$((i + 1))
+done
+i=0
+count="${STUB_JOURNAL_FEE_FAILURES:-0}"
+while [ "$i" -lt "$count" ]; do
+  printf 'systemd: binance-fee-snapshot-spot.service: Failed with result exit-code\n'
   i=$((i + 1))
 done
 EOF
@@ -502,6 +518,7 @@ healthy_scenario
 make_spools
 write_health spot 45 0 false synced
 write_health usdm 45 0 false synced
+write_upload "$spool_root/binance-fee/upload-status.json" null null 0
 run_health
 expect "missing upload-status: exit 0" "$(rc_is 0; echo $?)"
 expect "missing upload-status: ok:true" "$(grep_out '^ok:true$'; echo $?)"
@@ -525,10 +542,14 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and .checks.units["binance-lob-archiver-production@spot.service"].active == true
   and .checks.units["bybit-options-archiver.service"].active == true
   and .checks.units["bybit-options-archiver.service"].enabled == true
+  and .checks.units["binance-fee-snapshot-spot.timer"].active == true
+  and .checks.units["binance-fee-snapshot-usdm.timer"].active == true
+  and .checks.units["binance-fee-upload.timer"].enabled == true
   and (.checks.health["binance-lob-archiver-production@spot"].age_seconds | type) == "number"
   and .checks.health["binance-lob-archiver-production@spot"].status == "synced"
   and (.checks.uploads["binance-lob-archiver-production@spot"].failure_count | type) == "number"
   and .checks.uploads["binance-lob-archiver-production@spot"].last_error_at == "null"
+  and .checks.uploads["binance-fee-upload"].last_error == "null"
   and (.checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m | type) == "number"
 '; echo $?)"
 
@@ -554,6 +575,67 @@ healthy_fixtures
 run_health --dry-run
 expect "dry-run: exit 0" "$(rc_is 0; echo $?)"
 expect "dry-run: state file not created" "$([ ! -e "$state_dir/state.json" ]; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 21. Binance fee upload status is mandatory
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "fee status missing: exit 1" "$(rc_is 1; echo $?)"
+expect "fee status missing: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{not json\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "fee status malformed: exit 1" "$(rc_is 1; echo $?)"
+expect "fee status malformed: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "fee status missing count: exit 1" "$(rc_is 1; echo $?)"
+expect "fee status missing count: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-usdm-reference/upload-status.json"
+run_health
+expect "reference status missing count: exit 0" "$(rc_is 0; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/binance-fee/upload-status.json" null null 1
+run_health
+expect "fee initial failure: exit 1" "$(rc_is 1; echo $?)"
+expect "fee initial failure: breach message" "$(grep_out 'binance-fee-upload: initial upload failure_count=1'; echo $?)"
+
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_JOURNAL_FEE_FAILURES=1
+run_health
+expect "fee recent snapshot failure: exit 1" "$(rc_is 1; echo $?)"
+expect "fee recent snapshot failure: breach message" "$(grep_out 'recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

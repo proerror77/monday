@@ -1,0 +1,31 @@
+[Unit]
+Description=Archive verified Monday Binance fee snapshots to OSS
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=oneshot
+User=hftcollector
+Group=hftcollector
+Environment=HOME=/var/lib/hft-collector
+EnvironmentFile=/etc/monday/binance-fee-upload.env
+ExecStart=/opt/monday/bin/binance-fee-snapshot-upload --output-root /data/monday/spool/binance-fee
+TimeoutStartSec=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+StateDirectory=hft-collector
+ReadWritePaths=/data/monday/spool/binance-fee
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=256M
+MemoryMax=384M
