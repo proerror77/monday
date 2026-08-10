@@ -193,6 +193,7 @@ jobs:
           set -euo pipefail
           breaches=$(jq -r '.breaches[]' /tmp/collector-health.json)
           checked_at=$(jq -r '.checked_at' /tmp/collector-health.json)
+          warnings=$(jq -r '(.warnings // [])[]' /tmp/collector-health.json)
           {
             printf 'Host: monday-trade-data-26 (Aliyun Tokyo ap-northeast-1, instance %s)\n' "${{ env.INSTANCE_ID }}"
             printf 'Checked at: %s\n' "$checked_at"
@@ -201,6 +202,10 @@ jobs:
             printf 'Primary alert channel is the Cloud Monitor disk alarm; this issue is the repository fallback and needs human triage.\n\n'
             printf 'Breaches:\n'
             printf '%s\n' "$breaches" | sed 's/^/- /'
+            if [ -n "$warnings" ]; then
+              printf '\nWarnings (not blocking):\n'
+              printf '%s\n' "$warnings" | sed 's/^/- /'
+            fi
           } > /tmp/collector-health-issue.md
 
           existing=$(gh issue list --state open --search 'in:title "Durable monitor breach"' \

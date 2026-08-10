@@ -4,6 +4,16 @@
 # /tmp fixture trees with stubbed systemctl/df/journalctl/mountpoint/logger.
 # The script is read-only toward units, so the stubs never mutate anything.
 #
+# Contract under test: exactly four hard gates (breaches) —
+#   1. upload-status.json exists and parses (binance-lob spot/usdm, binance-fee)
+#   2. last_success_at present and fresh per upload lane
+#   3. pending upload backlog bounded (count + oldest pending age)
+#   4. failure_count not growing, last_error empty (all lanes)
+# plus the expected-disabled installation gate (polymarket-raw-ops-gate) and
+# state-persistence failures. Everything else (units, timers, restarts,
+# health.json, delay-gate journal, disk, mount, fee snapshot journal) is a
+# warning: reported, never blocking ok:true.
+#
 # Usage: ./test-monday-collector-health.sh
 set -euo pipefail
 
@@ -22,7 +32,6 @@ err_file="$test_root/err"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
-DF_AVAIL_WARN=39200000       # 20% free (<25% warn, >=10% crit)
 DF_AVAIL_CRIT=9800000        # 5% free (<10% crit)
 
 pass_count=0
@@ -94,6 +103,11 @@ reset_state() {
   mkdir -p "$state_dir"
 }
 
+reset_spool() {
+  rm -rf "$spool_root"
+  make_spools
+}
+
 write_scenario() {
   cat > "$scenario"
 }
@@ -133,23 +147,47 @@ EOF
 }
 
 write_upload() {
-  # $1 path, $2 last_error_at JSON, $3 last_error JSON, $4 failure_count
+  # $1 path, $2 last_error_at JSON, $3 last_error JSON, $4 failure_count,
+  # $5 last_success age in seconds (default 60). Emits six fractional digits
+  # and a Z suffix, exactly what polymarket_upload::utc_now (reused by the fee
+  # and usdm-reference uploaders) produces, so the fixtures cannot hide a
+  # parser gap behind jq's whole-second todate form. jq computes the time
+  # portably (BSD date and GNU date disagree on epoch formatting flags).
+  age=${5:-60}
+  success_at=$(jq -rn --argjson age "$age" '
+    (now - $age) as $t
+    | ($t | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S"))
+      + "."
+      + (("000000" + ((($t - ($t | floor)) * 1000000 | floor) | tostring))[-6:])
+      + "Z"')
   cat > "$1" <<EOF
-{"last_success_at": "2026-08-07T00:00:00Z", "last_error_at": $2, "last_error": $3, "failure_count": $4}
+{"last_success_at": "$success_at", "last_error_at": $2, "last_error": $3, "failure_count": $4}
+EOF
+}
+
+write_upload_ms() {
+  # bybit-options lane: epoch-millisecond timestamps.
+  age=${5:-60}
+  success_ms=$(jq -rn --argjson age "$age" '((now - $age) * 1000 | floor)')
+  cat > "$1" <<EOF
+{"last_success_at": $success_ms, "last_error_at": $2, "last_error": $3, "failure_count": $4}
 EOF
 }
 
 healthy_fixtures() {
-  make_spools
+  reset_spool
   write_health spot 45 0 false synced
   write_health usdm 45 0 false synced
   write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0
   write_upload "$spool_root/binance-lob/usdm/upload-status.json" null null 0
   write_upload "$spool_root/binance-usdm-reference/upload-status.json" null null 0
-  write_upload "$spool_root/bybit-options/upload-status.json" null null 0
+  write_upload_ms "$spool_root/bybit-options/upload-status.json" null null 0
   write_upload "$spool_root/binance-fee/upload-status.json" null null 0
   write_upload "$spool_root/polymarket/upload-status.json" null null 0
   write_upload "$spool_root/polymarket-reference/upload-status.json" null null 0
+  # Active (not yet rotated) tapes must not count as pending backlog.
+  : > "$spool_root/polymarket/market-updates.ndjson"
+  : > "$spool_root/polymarket-reference/market-updates.ndjson"
 }
 
 healthy_scenario() {
@@ -280,12 +318,315 @@ run_health
 expect "healthy: exit 0" "$(rc_is 0; echo $?)"
 expect "healthy: ok:true" "$(grep_out '^ok:true$'; echo $?)"
 expect "healthy: no breach lines" "$(grep_not_out '^breach:'; echo $?)"
-expect "healthy: state file written" "$([ -f "$state_dir/state.json" ]; echo $?)"
+expect "healthy: no warning lines" "$(grep_not_out '^warning:'; echo $?)"
+expect "healthy: state file written" "$(if [ -f "$state_dir/state.json" ]; then echo 0; else echo 1; fi)"
 expect "healthy: state records nrestarts" "$(grep -q '^nrestarts|binance-lob-archiver-production@spot.service=4$' "$state_dir/state.json"; echo $?)"
 expect "healthy: state records failure_count" "$(grep -q '^failure_count|polymarket-market-tape-upload=0$' "$state_dir/state.json"; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 2. Disk critical
+# 2. Gate 1: missing upload-status.json on a mandated lane is a breach
+#    (replaces the old 'LOB missing status is healthy' expectation)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate1 lob missing: exit 1" "$(rc_is 1; echo $?)"
+expect "gate1 lob missing: breach message" "$(grep_out 'binance-lob-archiver-production@spot: upload-status.json missing'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "gate1 fee missing: exit 1" "$(rc_is 1; echo $?)"
+expect "gate1 fee missing: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 3. Gate 1: malformed upload-status.json is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{not json\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "gate1 fee malformed: exit 1" "$(rc_is 1; echo $?)"
+expect "gate1 fee malformed: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "gate1 fee missing count: exit 1" "$(rc_is 1; echo $?)"
+expect "gate1 fee missing count: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 4. Gate 1: missing upload-status.json on a non-mandated lane is only a warning
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/polymarket/upload-status.json"
+run_health
+expect "gate1 polymarket missing: exit 0" "$(rc_is 0; echo $?)"
+expect "gate1 polymarket missing: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+expect "gate1 polymarket missing: warning message" "$(grep_out '^warning: polymarket-market-tape-upload: upload-status.json missing'; echo $?)"
+expect "gate1 polymarket missing: no breach lines" "$(grep_not_out '^breach:'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 5. Gate 2: stale last_success_at is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 0 7300
+run_health
+expect "gate2 lob stale: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 lob stale: breach message" "$(grep_out 'binance-lob-archiver-production@spot: last upload success stale'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/binance-fee/upload-status.json" null null 0 700
+run_health
+expect "gate2 fee stale: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 fee stale: breach message" "$(grep_out 'binance-fee-upload: last upload success stale'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload_ms "$spool_root/bybit-options/upload-status.json" null null 0 5500
+run_health
+expect "gate2 bybit stale (epoch ms): exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 bybit stale (epoch ms): breach message" "$(grep_out 'bybit-options-upload: last upload success stale'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 6. Gate 2: missing last_success_at is a breach (fee lane before the parallel
+#    uploader change deploys)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '{"last_error_at":null,"last_error":null,"failure_count":0}\n' > "$spool_root/binance-fee/upload-status.json"
+run_health
+expect "gate2 fee missing success: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 fee missing success: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing a parseable last_success_at'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 6b. Gate 2: real uploader timestamp formats parse (green)
+#     - whole-second Z (legacy form)
+#     - six fractional digits + Z (polymarket_upload::utc_now; fee, reference)
+#     - +00:00 offset without/with fractional seconds (Chrono to_rfc3339, LOB)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_offset=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_offset" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 offset format: exit 0" "$(rc_is 0; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_frac_offset=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + ".123456+00:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_frac_offset" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 frac+offset format: exit 0" "$(rc_is 0; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_whole=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "Z"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_whole" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 whole-second format: exit 0" "$(rc_is 0; echo $?)"
+
+# A non-UTC offset is refused (breach) rather than silently read as UTC.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+fresh_non_utc=$(jq -rn '(now - 60) | floor | gmtime | strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"')
+printf '{"last_success_at":"%s","last_error_at":null,"last_error":null,"failure_count":0}\n' "$fresh_non_utc" \
+  > "$spool_root/binance-lob/spot/upload-status.json"
+run_health
+expect "gate2 non-UTC offset: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 non-UTC offset: breach message" "$(grep_out 'binance-lob-archiver-production@spot: upload-status.json missing a parseable last_success_at'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 7. Gate 3: pending backlog count over the limit is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+for i in 1 2 3 4 5; do
+  : > "$spool_root/binance-lob/spot/segment-$i.manifest.json"
+done
+run_health
+expect "gate3 lob count: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 lob count: breach message" "$(grep_out 'binance-lob-archiver-production@spot: pending upload backlog 5 over limit 4'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+i=0
+while [ "$i" -lt 25 ]; do
+  mkdir -p "$spool_root/binance-usdm-reference/lake/raw/venue=binance_usdm/dataset=reference/date=2099-01-01/hour=00/batch=$i"
+  i=$((i + 1))
+done
+run_health
+expect "gate3 reference count: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 reference count: breach message" "$(grep_out 'binance-usdm-reference-collector: pending upload backlog 25 over limit 24'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 8. Gate 3: oldest pending backlog age over the bound is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+: > "$spool_root/binance-lob/spot/old.manifest.json"
+touch -t 202001010000 "$spool_root/binance-lob/spot/old.manifest.json"
+run_health
+expect "gate3 lob age: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 lob age: breach message" "$(grep_out 'binance-lob-archiver-production@spot: oldest pending upload backlog age'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+tape="$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t 202001010000 "$tape"
+run_health
+expect "gate3 polymarket tape age: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 polymarket tape age: breach message" "$(grep_out 'polymarket-market-tape-upload: oldest pending upload backlog age'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$spool_root/binance-fee/lake/raw/venue=binance_usdm/dataset=fee/account=abc/date=2020-01-01/hour=00/batch=1"
+touch -t 202001010000 "$spool_root/binance-fee/lake/raw/venue=binance_usdm/dataset=fee/account=abc/date=2020-01-01/hour=00/batch=1"
+run_health
+expect "gate3 fee batch age: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 fee batch age: breach message" "$(grep_out 'binance-fee-upload: oldest pending upload backlog age'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+raw="$spool_root/bybit-options/quotes.ndjson"
+: > "$raw"
+: > "$raw.manifest.json"
+: > "$raw._SUCCESS"
+touch -t 202001010000 "$raw"
+run_health
+expect "gate3 bybit raw age: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 bybit raw age: breach message" "$(grep_out 'bybit-options-upload: oldest pending upload backlog age'; echo $?)"
+
+# An uploaded bybit segment (readback marker present) is not backlog.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+raw="$spool_root/bybit-options/quotes.ndjson"
+: > "$raw"
+: > "$raw.manifest.json"
+: > "$raw._SUCCESS"
+: > "$raw.uploaded.json"
+touch -t 202001010000 "$raw"
+run_health
+expect "gate3 bybit uploaded: exit 0" "$(rc_is 0; echo $?)"
+
+# Gate 3 still fails closed when a non-mandated lane has no status file: the
+# backlog lives on disk independently of the uploader's status reporting.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/polymarket/upload-status.json"
+tape="$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t 202001010000 "$tape"
+run_health
+expect "gate3 no-status backlog: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 no-status backlog: breach message" "$(grep_out 'polymarket-market-tape-upload: oldest pending upload backlog age'; echo $?)"
+expect "gate3 no-status backlog: missing status still a warning" "$(grep_out '^warning: polymarket-market-tape-upload: upload-status.json missing'; echo $?)"
+
+# A pending-backlog scan that cannot inspect the spool is a breach, never a
+# silent zero backlog.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+chmod 000 "$spool_root/binance-fee"
+run_health
+chmod 755 "$spool_root/binance-fee"
+expect "gate3 scan fail: exit 1" "$(rc_is 1; echo $?)"
+expect "gate3 scan fail: breach message" "$(grep_out 'binance-fee-upload: pending upload backlog scan failed'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 9. Gate 4: last_error present is a breach
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/binance-lob/spot/upload-status.json" '"2026-08-07T01:00:00Z"' '"oss upload readback mismatch"' 3
+run_health
+expect "gate4 upload error: exit 1" "$(rc_is 1; echo $?)"
+expect "gate4 upload error: breach message" "$(grep_out 'upload last_error'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 10. Gate 4: failure_count growth is a breach (two runs)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+run_health
+expect "gate4 delta: baseline healthy" "$(rc_is 0; echo $?)"
+write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 5
+run_health
+expect "gate4 delta: exit 1" "$(rc_is 1; echo $?)"
+expect "gate4 delta: breach message" "$(grep_out 'failure_count increased 0 -> 5'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 11. Gate 4: a first observation with a nonzero failure_count is a breach,
+#     uniformly across lanes
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 2
+run_health
+expect "gate4 initial count: exit 1" "$(rc_is 1; echo $?)"
+expect "gate4 initial count: breach message" "$(grep_out 'polymarket-market-tape-upload: initial upload failure_count=2'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 12. Demoted: disk critical is a warning, not a breach
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -293,24 +634,12 @@ healthy_scenario
 healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
 run_health
-expect "disk critical: exit 1" "$(rc_is 1; echo $?)"
-expect "disk critical: ok:false" "$(grep_out '^ok:false$'; echo $?)"
-expect "disk critical: breach message" "$(grep_out 'below critical 10%'; echo $?)"
+expect "disk critical: exit 0" "$(rc_is 0; echo $?)"
+expect "disk critical: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+expect "disk critical: warning message" "$(grep_out '^warning: disk: /data free .* below critical 10%'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 3. Disk warning
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
-run_health
-expect "disk warning: exit 1" "$(rc_is 1; echo $?)"
-expect "disk warning: breach message" "$(grep_out 'below warning 25%'; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 4. Unit inactive
+# 13. Demoted: unit inactive / timer disabled / result failure are warnings
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -318,35 +647,29 @@ healthy_scenario
 healthy_fixtures
 rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active|binance-lob-archiver-production@spot.service	inactive|'
 run_health
-expect "unit inactive: exit 1" "$(rc_is 1; echo $?)"
-expect "unit inactive: breach message" "$(grep_out 'not active'; echo $?)"
+expect "unit inactive: exit 0" "$(rc_is 0; echo $?)"
+expect "unit inactive: warning message" "$(grep_out '^warning: binance-lob-archiver-production@spot: not active'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 5. Timer not enabled
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled|polymarket-market-tape-upload-watchdog.timer	active	disabled|'
 run_health
-expect "timer not enabled: exit 1" "$(rc_is 1; echo $?)"
-expect "timer not enabled: breach message" "$(grep_out 'timer not enabled'; echo $?)"
+expect "timer not enabled: exit 0" "$(rc_is 0; echo $?)"
+expect "timer not enabled: warning message" "$(grep_out '^warning: .*timer not enabled'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 6. Unit result failure
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 rewrite_scenario 's|^binance-lob-archiver-production@usdm.service	active	enabled	success|binance-lob-archiver-production@usdm.service	active	enabled	exit-code|'
 run_health
-expect "unit result failure: exit 1" "$(rc_is 1; echo $?)"
-expect "unit result failure: breach message" "$(grep_out "Result='exit-code'"; echo $?)"
+expect "unit result failure: exit 0" "$(rc_is 0; echo $?)"
+expect "unit result failure: warning message" "$(grep_out "^warning: .*Result='exit-code'"; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 7. Restart-rate delta (two runs)
+# 14. Demoted: restart-rate delta is a warning (two runs)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -356,11 +679,11 @@ run_health
 expect "restart delta: baseline healthy" "$(rc_is 0; echo $?)"
 rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active	enabled	success	4|binance-lob-archiver-production@spot.service	active	enabled	success	7|'
 run_health
-expect "restart delta: exit 1" "$(rc_is 1; echo $?)"
-expect "restart delta: breach message" "$(grep_out 'restart rate high'; echo $?)"
+expect "restart delta: exit 0" "$(rc_is 0; echo $?)"
+expect "restart delta: warning message" "$(grep_out '^warning: .*restart rate high'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 8. Health stale
+# 15. Demoted: health.json stale/gap/missing/symlink are warnings
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -368,36 +691,27 @@ healthy_scenario
 healthy_fixtures
 write_health spot 600 0 false synced
 run_health
-expect "health stale: exit 1" "$(rc_is 1; echo $?)"
-expect "health stale: breach message" "$(grep_out 'health.json stale'; echo $?)"
+expect "health stale: exit 0" "$(rc_is 0; echo $?)"
+expect "health stale: warning message" "$(grep_out '^warning: .*health.json stale'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 9. Health sequence gap
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 write_health usdm 45 5 false synced
 run_health
-expect "health gap: exit 1" "$(rc_is 1; echo $?)"
-expect "health gap: breach message" "$(grep_out 'sequence_gaps=5'; echo $?)"
+expect "health gap: exit 0" "$(rc_is 0; echo $?)"
+expect "health gap: warning message" "$(grep_out '^warning: .*sequence_gaps=5'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 10. Health missing
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 rm -f "$spool_root/binance-lob/spot/health.json"
 run_health
-expect "health missing: exit 1" "$(rc_is 1; echo $?)"
-expect "health missing: breach message" "$(grep_out 'health.json missing'; echo $?)"
+expect "health missing: exit 0" "$(rc_is 0; echo $?)"
+expect "health missing: warning message" "$(grep_out '^warning: .*health.json missing'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 10b. Health.json is a symbolic link
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
@@ -405,38 +719,12 @@ healthy_fixtures
 rm -f "$spool_root/binance-lob/spot/health.json"
 ln -s /dev/null "$spool_root/binance-lob/spot/health.json"
 run_health
-expect "health symlink: exit 1" "$(rc_is 1; echo $?)"
-expect "health symlink: breach message" "$(grep_out 'health.json missing or a symbolic link'; echo $?)"
+expect "health symlink: exit 0" "$(rc_is 0; echo $?)"
+expect "health symlink: warning message" "$(grep_out '^warning: .*health.json missing or a symbolic link'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 11. Upload error present
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-write_upload "$spool_root/binance-lob/spot/upload-status.json" '"2026-08-07T01:00:00Z"' '"oss upload readback mismatch"' 3
-run_health
-expect "upload error: exit 1" "$(rc_is 1; echo $?)"
-expect "upload error: breach message" "$(grep_out 'upload last_error'; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 12. Upload failure-count delta (two runs)
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 3
-run_health
-expect "upload delta: baseline healthy" "$(rc_is 0; echo $?)"
-write_upload "$spool_root/binance-lob/spot/upload-status.json" null null 5
-run_health
-expect "upload delta: exit 1" "$(rc_is 1; echo $?)"
-expect "upload delta: breach message" "$(grep_out 'failure_count increased 3 -> 5'; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 13. Delay-gate trips
+# 16. Demoted: delay-gate trips / journald failure / fee snapshot failures are
+#     warnings
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -444,23 +732,41 @@ healthy_scenario
 healthy_fixtures
 STUB_JOURNAL_TRIPS=2
 run_health
-expect "delay gate: exit 1" "$(rc_is 1; echo $?)"
-expect "delay gate: breach message" "$(grep_out 'delay-gate trip'; echo $?)"
+expect "delay gate: exit 0" "$(rc_is 0; echo $?)"
+expect "delay gate: warning message" "$(grep_out '^warning: .*delay-gate trip'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 13b. Delay-gate evidence uninspectable (journalctl failure)
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 STUB_JOURNAL_FAIL=1
 run_health
-expect "delay gate journald fail: exit 1" "$(rc_is 1; echo $?)"
-expect "delay gate journald fail: breach message" "$(grep_out 'journald query failed'; echo $?)"
+expect "journald fail: exit 0" "$(rc_is 0; echo $?)"
+expect "journald fail: warning message" "$(grep_out '^warning: .*journald query failed'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_JOURNAL_FEE_FAILURES=1
+run_health
+expect "fee snapshot failure: exit 0" "$(rc_is 0; echo $?)"
+expect "fee snapshot failure: warning message" "$(grep_out '^warning: .*recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 13c. State persistence failure is a breach
+# 17. Demoted: /data unmounted is a warning
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_MOUNTED=0
+run_health
+expect "mount: exit 0" "$(rc_is 0; echo $?)"
+expect "mount: warning message" "$(grep_out '^warning: mount: /data is not mounted'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 18. State persistence failure stays a breach (gate 4 delta evidence)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -474,31 +780,7 @@ expect "state persist fail: exit 1" "$(rc_is 1; echo $?)"
 expect "state persist fail: breach message" "$(grep_out 'state: state directory unavailable'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 14. /data unmounted
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-STUB_MOUNTED=0
-run_health
-expect "mount: exit 1" "$(rc_is 1; echo $?)"
-expect "mount: breach message" "$(grep_out '/data is not mounted'; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 15. bybit-options-archiver inactive (governed production lane must run)
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-rewrite_scenario 's|^bybit-options-archiver.service	active	enabled|bybit-options-archiver.service	inactive	enabled|'
-run_health
-expect "bybit inactive: exit 1" "$(rc_is 1; echo $?)"
-expect "bybit inactive: breach message" "$(grep_out 'bybit-options-archiver: not active'; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 16. polymarket-raw-ops-gate indirect (an instance enabled)
+# 19. polymarket-raw-ops-gate stays a breach (indirect and static)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -509,22 +791,17 @@ run_health
 expect "poly gate indirect: exit 1" "$(rc_is 1; echo $?)"
 expect "poly gate indirect: breach message" "$(grep_out 'polymarket-raw-ops-gate: expected disabled'; echo $?)"
 
-# ---------------------------------------------------------------------------
-# 17. Missing upload-status.json is not a breach
-# ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
-make_spools
-write_health spot 45 0 false synced
-write_health usdm 45 0 false synced
-write_upload "$spool_root/binance-fee/upload-status.json" null null 0
+healthy_fixtures
+rewrite_scenario 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	static|'
 run_health
-expect "missing upload-status: exit 0" "$(rc_is 0; echo $?)"
-expect "missing upload-status: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+expect "poly gate static: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate static: breach message" "$(grep_out "polymarket-raw-ops-gate: expected disabled but is-enabled='static'"; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 18. JSON output shape (healthy)
+# 20. JSON output shape (healthy, includes the warnings array)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -537,36 +814,57 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and (.checked_at | type) == "string"
   and (.breaches | type) == "array"
   and (.breaches | length) == 0
+  and (.warnings | type) == "array"
+  and (.warnings | length) == 0
   and (.checks.disk.free_percent | type) == "number"
   and .checks.mount.data_mounted == true
   and .checks.units["binance-lob-archiver-production@spot.service"].active == true
   and .checks.units["bybit-options-archiver.service"].active == true
-  and .checks.units["bybit-options-archiver.service"].enabled == true
-  and .checks.units["binance-fee-snapshot-spot.timer"].active == true
-  and .checks.units["binance-fee-snapshot-usdm.timer"].active == true
-  and .checks.units["binance-fee-upload.timer"].enabled == true
+  and .checks.units["polymarket-raw-ops-gate@.service"].is_enabled == "disabled"
   and (.checks.health["binance-lob-archiver-production@spot"].age_seconds | type) == "number"
   and .checks.health["binance-lob-archiver-production@spot"].status == "synced"
   and (.checks.uploads["binance-lob-archiver-production@spot"].failure_count | type) == "number"
   and .checks.uploads["binance-lob-archiver-production@spot"].last_error_at == "null"
+  and (.checks.uploads["binance-lob-archiver-production@spot"].last_success_age_seconds | type) == "number"
+  and (.checks.uploads["binance-lob-archiver-production@spot"].pending_count | type) == "number"
   and .checks.uploads["binance-fee-upload"].last_error == "null"
+  and (.checks.uploads["bybit-options-upload"].last_success_age_seconds | type) == "number"
   and (.checks.delay_gate["binance-lob-archiver-production@spot.service"].trips_15m | type) == "number"
 '; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 19. JSON output shape (breaching)
+# 21. JSON output shape (warnings do not block ok:true)
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
+STUB_JOURNAL_TRIPS=1
+run_health --json
+expect "json warnings: exit 0" "$(rc_is 0; echo $?)"
+expect "json warnings: ok:true with warnings" "$(json_query '
+  .ok == true
+  and (.breaches | length) == 0
+  and (.warnings | length) >= 2
+  and (.warnings | any(contains("below critical")))
+  and (.warnings | any(contains("delay-gate trip")))
+'; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 22. JSON output shape (breaching)
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rm -f "$spool_root/binance-lob/usdm/upload-status.json"
 run_health --json
 expect "json breach: exit 1" "$(rc_is 1; echo $?)"
 expect "json breach: ok:false and breaches non-empty" "$(json_query '.ok == false and (.breaches | length) >= 1'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 20. --dry-run does not touch state
+# 23. --dry-run does not touch state
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -575,67 +873,6 @@ healthy_fixtures
 run_health --dry-run
 expect "dry-run: exit 0" "$(rc_is 0; echo $?)"
 expect "dry-run: state file not created" "$([ ! -e "$state_dir/state.json" ]; echo $?)"
-
-# ---------------------------------------------------------------------------
-# 21. Binance fee upload status is mandatory
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-rm -f "$spool_root/binance-fee/upload-status.json"
-run_health
-expect "fee status missing: exit 1" "$(rc_is 1; echo $?)"
-expect "fee status missing: breach message" "$(grep_out 'binance-fee-upload: upload-status.json missing'; echo $?)"
-
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-printf '{not json\n' > "$spool_root/binance-fee/upload-status.json"
-run_health
-expect "fee status malformed: exit 1" "$(rc_is 1; echo $?)"
-expect "fee status malformed: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
-
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-fee/upload-status.json"
-run_health
-expect "fee status missing count: exit 1" "$(rc_is 1; echo $?)"
-expect "fee status missing count: breach message" "$(grep_out 'binance-fee-upload: upload-status.json is malformed'; echo $?)"
-
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-printf '{"last_success_at":"2026-08-07T00:00:00Z","last_error_at":null,"last_error":null}\n' > "$spool_root/binance-usdm-reference/upload-status.json"
-run_health
-expect "reference status missing count: exit 0" "$(rc_is 0; echo $?)"
-
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-write_upload "$spool_root/binance-fee/upload-status.json" null null 1
-run_health
-expect "fee initial failure: exit 1" "$(rc_is 1; echo $?)"
-expect "fee initial failure: breach message" "$(grep_out 'binance-fee-upload: initial upload failure_count=1'; echo $?)"
-
-# ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-STUB_JOURNAL_FEE_FAILURES=1
-run_health
-expect "fee recent snapshot failure: exit 1" "$(rc_is 1; echo $?)"
-expect "fee recent snapshot failure: breach message" "$(grep_out 'recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
