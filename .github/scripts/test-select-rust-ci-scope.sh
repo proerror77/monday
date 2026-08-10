@@ -180,7 +180,7 @@ grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
 grep -Fqx '      - rust_fast_gates' "$ci_workflow"
 grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$ci_workflow"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' "$ci_workflow"
 grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
 
 # Job-block extraction: lines from '^  <name>:' up to (excluding) the next
@@ -203,11 +203,11 @@ grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust
 # sccache must be wired into EACH of the two heavy jobs (per-job presence,
 # not a file-wide count).
 grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$rust_job_block"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$rust_job_block"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$rust_job_block"
 grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$rust_job_block"
 fast_lane_block=$(job_block rust_hft_engine_fast_lane)
 grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$fast_lane_block"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$fast_lane_block"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$fast_lane_block"
 grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 
 # Suite placement is pinned both ways: fast-only work stays out of the heavy
@@ -265,8 +265,8 @@ grep -Fqx '      - name: Test issue lifecycle status reconciliation' "$ploy_work
 grep -A1 -F '      - name: Test issue lifecycle status reconciliation' "$ploy_workflow" | grep -Fqx '        working-directory: .'
 grep -Fqx '        run: .github/scripts/test-issue-lifecycle-status-reconcile.sh' "$ploy_workflow"
 
-# sccache must use the #559/#566 pattern (sccache-action + GHA backend,
-# rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
+# sccache must use the #559/#566 pattern (sccache-action + per-job local
+# cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
 # actions/cache sccache block must stay removed.
 ! grep -Fq 'sccache --zero-stats' "$ploy_workflow"
@@ -286,7 +286,7 @@ for ploy_rust_job in \
   ploy_block=$(ploy_job_block "$ploy_rust_job")
   [ -n "$ploy_block" ]
   grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$ploy_block"
-  grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' <<<"$ploy_block"
+  grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$ploy_block"
   grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' <<<"$ploy_block"
   grep -Fqx '        continue-on-error: true' <<<"$ploy_block"
   grep -Fq "if: steps.sccache.outcome == 'failure'" <<<"$ploy_block"
@@ -296,7 +296,7 @@ for ploy_rust_job in \
 done
 research_image_block=$(ploy_job_block research-image-binaries)
 grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-grep -Fqx "      SCCACHE_GHA_RW_MODE: \${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}" <<<"$research_image_block"
+! grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
