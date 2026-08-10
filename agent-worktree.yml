@@ -1,13 +1,15 @@
 owner: codex
-contract: collector-health-hard-gates
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/collector-health-hard-gates
-branch: codex/collector-health-hard-gates
-base_sha: be9e746a1ddf7e6f26264c4811c4a3511c3caa87
+contract: binance-reference-modality-pit-clocks
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-reference-modality-pit-clocks
+branch: codex/binance-reference-modality-pit-clocks
+base_sha: 161b761dff56acb758dd4a1787fd0b3b8130196a
+dependency: none
 allowed_files:
+  - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
+  - rust_hft/tools/collector/src/bin/binance-usdm-reference-artifact-verifier.rs
+  - deployment/aliyun/binance-usdm-reference-shadow-gate.sh
+  - deployment/aliyun/binance-usdm-reference-shadow-gate-policy.jq
+  - deployment/aliyun/test-binance-usdm-reference-shadow-gate.sh
+  - deployment/aliyun/test-binance-usdm-reference-host-gate.sh
   - agent-worktree.yml
-  - deployment/aliyun/monday-collector-health.sh
-  - deployment/aliyun/test-monday-collector-health.sh
-  - .github/workflows/monitor-collector-host.yml
-  - deployment/aliyun/README.md
-dependency: upload-status last_success_at for the fee uploader lands in a parallel PR; this contract treats a missing last_success_at as a breach, so it must merge after or together with that PR
 no_external_runtime_mutation: true

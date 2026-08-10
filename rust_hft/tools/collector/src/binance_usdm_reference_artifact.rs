@@ -10,6 +10,7 @@ use data::binance_usdm_reference::{
     OpenInterestObservation, ReferenceCoverage, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
     PREMIUM_INDEX_ENDPOINT, REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
 };
+use hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS;
 use rand::random;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const MANIFEST_SCHEMA: &str = "binance.usdm_reference_manifest.v1";
+const MANIFEST_SCHEMA_V1: &str = "binance.usdm_reference_manifest.v1";
+const MANIFEST_SCHEMA_V2: &str = "binance.usdm_reference_manifest.v2";
 const VENUE: &str = "binance_usdm";
 const DATASET: &str = "reference";
 const DATA_NAME: &str = "reference.ndjson";
@@ -102,8 +104,23 @@ struct ArtifactTimeBounds {
     min_received_at_ns: u64,
     max_received_at_ns: u64,
 }
+
+/// Point-in-time clock evidence for one reference modality. Availability times
+/// are row-level `received_at_ns`; event times are exchange `source_time_ms`.
+/// Funding/mark-index and open interest are published as separate clocks so a
+/// consumer never merges their independent release cadences.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ReferenceManifest {
+struct ModalityPitClock {
+    observations: u64,
+    first_available_at_ns: u64,
+    last_available_at_ns: u64,
+    max_gap_ns: u64,
+    first_event_time_ms: u64,
+    last_event_time_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManifestIdentity {
     schema: String,
     venue: String,
     dataset: String,
@@ -118,7 +135,29 @@ struct ReferenceManifest {
     observed_at_ns: u64,
     max_staleness_ms: u64,
     coverage: ArtifactCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReferenceManifest {
+    #[serde(flatten)]
+    identity: ManifestIdentity,
+    mark_index_funding: ModalityPitClock,
+    open_interest: ModalityPitClock,
+}
+
+/// Pre-V2 manifest with one merged cross-modality `time_bounds`. Decoded
+/// read-only for artifacts published before per-modality PIT clocks; never
+/// written by the current publisher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoricalManifestV1 {
+    #[serde(flatten)]
+    identity: ManifestIdentity,
     time_bounds: ArtifactTimeBounds,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestSchemaPeek {
+    schema: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -402,6 +441,27 @@ pub fn verify_reference_artifact(
     expected_data_sha256: &str,
     expected_manifest_sha256: &str,
 ) -> Result<CompleteReferenceBatch> {
+    let (data, manifest_bytes) = read_artifact_trust_anchor(
+        published,
+        expected_data_sha256,
+        expected_manifest_sha256,
+    )?;
+    match peek_manifest_schema(&manifest_bytes)?.as_str() {
+        MANIFEST_SCHEMA_V2 => {
+            verify_current_manifest_v2(published, &data, &manifest_bytes, expected_data_sha256)
+        }
+        MANIFEST_SCHEMA_V1 => bail!(
+            "historical v1 reference manifests are read-only evidence and cannot pass the writable verifier"
+        ),
+        _ => bail!("reference manifest schema is unsupported"),
+    }
+}
+
+fn read_artifact_trust_anchor(
+    published: &PublishedReferenceArtifact,
+    expected_data_sha256: &str,
+    expected_manifest_sha256: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     validate_digest(expected_data_sha256, "expected data")?;
     validate_digest(expected_manifest_sha256, "expected manifest")?;
     validate_artifact_paths(published)?;
@@ -414,10 +474,16 @@ pub fn verify_reference_artifact(
     {
         bail!("reference artifact digest trust anchor does not match");
     }
-    let manifest: ReferenceManifest =
-        serde_json::from_slice(&manifest_bytes).context("parse reference manifest")?;
-    validate_manifest_identity(&manifest, expected_data_sha256, data.len() as u64)?;
-    validate_partition_path(&published.data_path, &manifest)?;
+    Ok((data, manifest_bytes))
+}
+
+fn peek_manifest_schema(manifest_bytes: &[u8]) -> Result<String> {
+    Ok(serde_json::from_slice::<ManifestSchemaPeek>(manifest_bytes)
+        .context("parse reference manifest schema")?
+        .schema)
+}
+
+fn parse_current_batch(data: &[u8]) -> Result<CompleteReferenceBatch> {
     let mut contracts = Vec::new();
     let mut marks = Vec::new();
     let mut open_interest = Vec::new();
@@ -433,13 +499,71 @@ pub fn verify_reference_artifact(
             ReferenceRecord::OpenInterest(row) => open_interest.push(row),
         }
     }
-    let batch = CompleteReferenceBatch::new(contracts, marks, open_interest)?;
-    let coverage =
-        ArtifactCoverage::from(batch.coverage(manifest.observed_at_ns, manifest.max_staleness_ms)?);
-    if coverage != manifest.coverage
+    CompleteReferenceBatch::new(contracts, marks, open_interest)
+}
+
+fn verify_current_manifest_v2(
+    published: &PublishedReferenceArtifact,
+    data: &[u8],
+    manifest_bytes: &[u8],
+    expected_data_sha256: &str,
+) -> Result<CompleteReferenceBatch> {
+    let manifest: ReferenceManifest =
+        serde_json::from_slice(manifest_bytes).context("parse reference manifest")?;
+    validate_manifest_identity(
+        &manifest.identity,
+        MANIFEST_SCHEMA_V2,
+        REFERENCE_SCHEMA,
+        expected_data_sha256,
+        data.len() as u64,
+    )?;
+    validate_partition_path(&published.data_path, manifest.identity.observed_at_ns)?;
+    let batch = parse_current_batch(data)?;
+    let coverage = ArtifactCoverage::from(
+        batch.coverage(
+            manifest.identity.observed_at_ns,
+            manifest.identity.max_staleness_ms,
+        )?,
+    );
+    let (mark_index_funding, open_interest) = batch_modality_clocks(&batch)?;
+    if coverage != manifest.identity.coverage
+        || !coverage.is_complete()
+        || mark_index_funding != manifest.mark_index_funding
+        || open_interest != manifest.open_interest
+        || manifest.identity.rows != row_count(&batch)
+    {
+        bail!("reference manifest does not match complete artifact contents");
+    }
+    Ok(batch)
+}
+
+fn verify_current_manifest_v1(
+    published: &PublishedReferenceArtifact,
+    data: &[u8],
+    manifest_bytes: &[u8],
+    expected_data_sha256: &str,
+) -> Result<CompleteReferenceBatch> {
+    let manifest: HistoricalManifestV1 =
+        serde_json::from_slice(manifest_bytes).context("parse historical v1 reference manifest")?;
+    validate_manifest_identity(
+        &manifest.identity,
+        MANIFEST_SCHEMA_V1,
+        REFERENCE_SCHEMA,
+        expected_data_sha256,
+        data.len() as u64,
+    )?;
+    validate_partition_path(&published.data_path, manifest.identity.observed_at_ns)?;
+    let batch = parse_current_batch(data)?;
+    let coverage = ArtifactCoverage::from(
+        batch.coverage(
+            manifest.identity.observed_at_ns,
+            manifest.identity.max_staleness_ms,
+        )?,
+    );
+    if coverage != manifest.identity.coverage
         || !coverage.is_complete()
         || time_bounds(&batch)? != manifest.time_bounds
-        || manifest.rows != row_count(&batch)
+        || manifest.identity.rows != row_count(&batch)
     {
         bail!("reference manifest does not match complete artifact contents");
     }
@@ -451,21 +575,13 @@ pub fn verify_reference_artifact_read_only(
     expected_data_sha256: &str,
     expected_manifest_sha256: &str,
 ) -> Result<VerifiedReferenceCounts> {
-    validate_digest(expected_data_sha256, "expected data")?;
-    validate_digest(expected_manifest_sha256, "expected manifest")?;
-    validate_artifact_paths(published)?;
-    let data = read_bound_file(&published.data_path, MAX_DATA_BYTES)?;
-    let manifest_bytes = read_bound_file(&published.manifest_path, MAX_MANIFEST_BYTES)?;
-    let success = read_bound_file(&published.success_path, MAX_SUCCESS_BYTES)?;
-    if digest(&data) != expected_data_sha256
-        || digest(&manifest_bytes) != expected_manifest_sha256
-        || success != format!("{expected_data_sha256}\n").as_bytes()
-    {
-        bail!("reference artifact digest trust anchor does not match");
-    }
-    let manifest: ReferenceManifest =
-        serde_json::from_slice(&manifest_bytes).context("parse reference manifest")?;
-    if manifest.data_schema == REFERENCE_SCHEMA {
+    let (data, manifest_bytes) = read_artifact_trust_anchor(
+        published,
+        expected_data_sha256,
+        expected_manifest_sha256,
+    )?;
+    let schema = peek_manifest_schema(&manifest_bytes)?;
+    if schema == MANIFEST_SCHEMA_V2 {
         let batch =
             verify_reference_artifact(published, expected_data_sha256, expected_manifest_sha256)?;
         return Ok(VerifiedReferenceCounts {
@@ -475,13 +591,33 @@ pub fn verify_reference_artifact_read_only(
             historical_read_only: false,
         });
     }
-    validate_manifest_identity_for_schema(
-        &manifest,
+    if schema != MANIFEST_SCHEMA_V1 {
+        bail!("reference manifest schema is unsupported");
+    }
+    let manifest: HistoricalManifestV1 =
+        serde_json::from_slice(&manifest_bytes).context("parse historical v1 reference manifest")?;
+    if manifest.identity.data_schema == REFERENCE_SCHEMA {
+        let batch = verify_current_manifest_v1(
+            published,
+            &data,
+            &manifest_bytes,
+            expected_data_sha256,
+        )?;
+        return Ok(VerifiedReferenceCounts {
+            metadata: batch.contracts().len(),
+            mark_index_funding: batch.mark_index_funding().len(),
+            open_interest: batch.open_interest().len(),
+            historical_read_only: false,
+        });
+    }
+    validate_manifest_identity(
+        &manifest.identity,
+        MANIFEST_SCHEMA_V1,
+        HISTORICAL_REFERENCE_SCHEMA_V2,
         expected_data_sha256,
         data.len() as u64,
-        HISTORICAL_REFERENCE_SCHEMA_V2,
     )?;
-    validate_partition_path(&published.data_path, &manifest)?;
+    validate_partition_path(&published.data_path, manifest.identity.observed_at_ns)?;
     let mut contracts = Vec::new();
     let mut marks = Vec::new();
     let mut open_interest = Vec::new();
@@ -498,11 +634,14 @@ pub fn verify_reference_artifact_read_only(
         }
     }
     let batch = HistoricalBatchV2::new(contracts, marks, open_interest)?;
-    let coverage = batch.coverage(manifest.observed_at_ns, manifest.max_staleness_ms)?;
-    if coverage != manifest.coverage
+    let coverage = batch.coverage(
+        manifest.identity.observed_at_ns,
+        manifest.identity.max_staleness_ms,
+    )?;
+    if coverage != manifest.identity.coverage
         || !coverage.is_complete()
         || batch.time_bounds()? != manifest.time_bounds
-        || manifest.rows != batch.row_count()
+        || manifest.identity.rows != batch.row_count()
     {
         bail!("historical reference manifest does not match complete artifact contents");
     }
@@ -528,6 +667,7 @@ fn publish_reference_batch_inner(
     if !coverage.is_complete() {
         bail!("reference artifact batch is incomplete or stale");
     }
+    let (mark_index_funding, open_interest) = batch_modality_clocks(batch)?;
     let records = batch
         .contracts()
         .iter()
@@ -568,21 +708,24 @@ fn publish_reference_batch_inner(
     }
     let mut staging = StagingDir::create(&hour_dir)?;
     let manifest = ReferenceManifest {
-        schema: MANIFEST_SCHEMA.to_owned(),
-        venue: VENUE.to_owned(),
-        dataset: DATASET.to_owned(),
-        data_schema: REFERENCE_SCHEMA.to_owned(),
-        format: "ndjson".to_owned(),
-        source_origin: source_origin.to_owned(),
-        source_endpoints: source_endpoints(),
-        file: DATA_NAME.to_owned(),
-        bytes: data.len() as u64,
-        sha256: data_sha256.clone(),
-        rows: row_count(batch),
-        observed_at_ns: config.observed_at_ns,
-        max_staleness_ms: config.max_staleness_ms,
-        coverage,
-        time_bounds: time_bounds(batch)?,
+        identity: ManifestIdentity {
+            schema: MANIFEST_SCHEMA_V2.to_owned(),
+            venue: VENUE.to_owned(),
+            dataset: DATASET.to_owned(),
+            data_schema: REFERENCE_SCHEMA.to_owned(),
+            format: "ndjson".to_owned(),
+            source_origin: source_origin.to_owned(),
+            source_endpoints: source_endpoints(),
+            file: DATA_NAME.to_owned(),
+            bytes: data.len() as u64,
+            sha256: data_sha256.clone(),
+            rows: row_count(batch),
+            observed_at_ns: config.observed_at_ns,
+            max_staleness_ms: config.max_staleness_ms,
+            coverage,
+        },
+        mark_index_funding,
+        open_interest,
     };
     let mut manifest_bytes = serde_json::to_vec(&manifest)?;
     manifest_bytes.push(b'\n');
@@ -765,41 +908,29 @@ fn validate_artifact_paths(published: &PublishedReferenceArtifact) -> Result<()>
 }
 
 fn validate_manifest_identity(
-    manifest: &ReferenceManifest,
+    identity: &ManifestIdentity,
+    expected_manifest_schema: &str,
+    expected_data_schema: &str,
     expected_data_sha256: &str,
     data_bytes: u64,
 ) -> Result<()> {
-    validate_manifest_identity_for_schema(
-        manifest,
-        expected_data_sha256,
-        data_bytes,
-        REFERENCE_SCHEMA,
-    )
-}
-
-fn validate_manifest_identity_for_schema(
-    manifest: &ReferenceManifest,
-    expected_data_sha256: &str,
-    data_bytes: u64,
-    expected_schema: &str,
-) -> Result<()> {
-    if manifest.schema != MANIFEST_SCHEMA
-        || manifest.venue != VENUE
-        || manifest.dataset != DATASET
-        || manifest.data_schema != expected_schema
-        || manifest.format != "ndjson"
-        || manifest.source_origin != OFFICIAL_USDM_SOURCE_ORIGIN
-        || manifest.source_endpoints != source_endpoints()
-        || manifest.file != DATA_NAME
-        || manifest.bytes != data_bytes
-        || manifest.sha256 != expected_data_sha256
+    if identity.schema != expected_manifest_schema
+        || identity.venue != VENUE
+        || identity.dataset != DATASET
+        || identity.data_schema != expected_data_schema
+        || identity.format != "ndjson"
+        || identity.source_origin != OFFICIAL_USDM_SOURCE_ORIGIN
+        || identity.source_endpoints != source_endpoints()
+        || identity.file != DATA_NAME
+        || identity.bytes != data_bytes
+        || identity.sha256 != expected_data_sha256
     {
         bail!("reference manifest identity is invalid");
     }
     Ok(())
 }
 
-fn validate_partition_path(data_path: &Path, manifest: &ReferenceManifest) -> Result<()> {
+fn validate_partition_path(data_path: &Path, observed_at_ns: u64) -> Result<()> {
     let batch = data_path.parent().context("missing batch partition")?;
     let hour = batch.parent().context("missing hour partition")?;
     let date = hour.parent().context("missing date partition")?;
@@ -807,9 +938,9 @@ fn validate_partition_path(data_path: &Path, manifest: &ReferenceManifest) -> Re
     let venue = dataset.parent().context("missing venue partition")?;
     let raw = venue.parent().context("missing raw partition")?;
     let lake = raw.parent().context("missing lake partition")?;
-    let expected = utc_partition(manifest.observed_at_ns)?;
+    let expected = utc_partition(observed_at_ns)?;
     if batch.file_name().and_then(|value| value.to_str())
-        != Some(&format!("batch={}", manifest.observed_at_ns))
+        != Some(&format!("batch={observed_at_ns}"))
         || hour.file_name().and_then(|value| value.to_str())
             != Some(&format!("hour={}", expected.1))
         || date.file_name().and_then(|value| value.to_str())
@@ -837,6 +968,8 @@ fn source_endpoints() -> Vec<String> {
     .collect()
 }
 
+// Merged cross-modality bounds are only computed to read back historical V1
+// manifests; the current publisher emits per-modality PIT clocks instead.
 fn time_bounds(batch: &CompleteReferenceBatch) -> Result<ArtifactTimeBounds> {
     artifact_time_bounds(
         batch
@@ -887,6 +1020,60 @@ fn artifact_time_bounds(
             .iter()
             .max()
             .context("reference batch has no receive time")?,
+    })
+}
+
+fn batch_modality_clocks(
+    batch: &CompleteReferenceBatch,
+) -> Result<(ModalityPitClock, ModalityPitClock)> {
+    let mark_index_funding = modality_pit_clock(
+        "mark/index/funding",
+        batch
+            .mark_index_funding()
+            .iter()
+            .map(|row| (row.source_time_ms, row.received_at_ns)),
+    )?;
+    let open_interest = modality_pit_clock(
+        "open-interest",
+        batch
+            .open_interest()
+            .iter()
+            .map(|row| (row.source_time_ms, row.received_at_ns)),
+    )?;
+    Ok((mark_index_funding, open_interest))
+}
+
+fn modality_pit_clock(
+    modality: &str,
+    rows: impl Iterator<Item = (u64, u64)>,
+) -> Result<ModalityPitClock> {
+    let mut first_event_time_ms = u64::MAX;
+    let mut last_event_time_ms = 0_u64;
+    let mut available_at_ns = Vec::new();
+    for (source_time_ms, received_at_ns) in rows {
+        first_event_time_ms = first_event_time_ms.min(source_time_ms);
+        last_event_time_ms = last_event_time_ms.max(source_time_ms);
+        available_at_ns.push(received_at_ns);
+    }
+    if available_at_ns.is_empty() {
+        bail!("reference {modality} modality has no observations");
+    }
+    available_at_ns.sort_unstable();
+    let max_gap_ns = available_at_ns
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap_or(0);
+    if max_gap_ns > CEX_DERIVATIVES_MAX_GAP_NS {
+        bail!("reference {modality} modality exceeds the PIT availability gap bound");
+    }
+    Ok(ModalityPitClock {
+        observations: available_at_ns.len() as u64,
+        first_available_at_ns: available_at_ns[0],
+        last_available_at_ns: available_at_ns[available_at_ns.len() - 1],
+        max_gap_ns,
+        first_event_time_ms,
+        last_event_time_ms,
     })
 }
 
@@ -1026,11 +1213,13 @@ mod tests {
 
         let manifest: ReferenceManifest =
             serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
-        assert_eq!(manifest.source_endpoints, source_endpoints());
-        assert_eq!(manifest.coverage.api_error_count, 0);
-        assert_eq!(manifest.coverage.stale_metadata, 0);
-        assert_eq!(manifest.time_bounds.min_received_at_ns, RECEIVED_NS - 100);
-        assert_eq!(manifest.time_bounds.max_received_at_ns, RECEIVED_NS + 50);
+        assert_eq!(manifest.identity.source_endpoints, source_endpoints());
+        assert_eq!(manifest.identity.coverage.api_error_count, 0);
+        assert_eq!(manifest.identity.coverage.stale_metadata, 0);
+        assert_eq!(manifest.mark_index_funding.first_available_at_ns, RECEIVED_NS);
+        assert_eq!(manifest.mark_index_funding.last_available_at_ns, RECEIVED_NS);
+        assert_eq!(manifest.open_interest.first_available_at_ns, RECEIVED_NS + 50);
+        assert_eq!(manifest.open_interest.last_available_at_ns, RECEIVED_NS + 50);
     }
 
     #[test]
@@ -1083,10 +1272,10 @@ mod tests {
             publish_reference_batch(&config(root), OFFICIAL_USDM_SOURCE_ORIGIN, &batch).unwrap();
         let manifest: ReferenceManifest =
             serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
-        assert_eq!(manifest.coverage.open_interest_observations, 1);
-        assert_eq!(manifest.coverage.stale_open_interest, 1);
-        assert_eq!(manifest.coverage.stale_metadata, 0);
-        assert_eq!(manifest.coverage.stale_mark_index_funding, 0);
+        assert_eq!(manifest.identity.coverage.open_interest_observations, 1);
+        assert_eq!(manifest.identity.coverage.stale_open_interest, 1);
+        assert_eq!(manifest.identity.coverage.stale_metadata, 0);
+        assert_eq!(manifest.identity.coverage.stale_mark_index_funding, 0);
         verify_reference_artifact(
             &published,
             &published.data_sha256,
@@ -1145,5 +1334,276 @@ mod tests {
             &published.manifest_sha256,
         )
         .is_err());
+    }
+
+    fn contract_row(symbol: &str, source_ms: u64, received_ns: u64) -> ActivePerpetualContract {
+        ActivePerpetualContract {
+            schema: REFERENCE_SCHEMA.to_owned(),
+            symbol: symbol.to_owned(),
+            pair: symbol.to_owned(),
+            base_asset: "BTC".to_owned(),
+            quote_asset: "USDT".to_owned(),
+            margin_asset: "USDT".to_owned(),
+            tick_size: Decimal::new(1, 1),
+            step_size: Decimal::new(1, 3),
+            min_notional: Decimal::new(5, 0),
+            contract_type: "PERPETUAL".to_owned(),
+            status: "TRADING".to_owned(),
+            onboard_date_ms: 1,
+            delivery_date_ms: 4_133_404_800_000,
+            source_time_ms: source_ms,
+            source_clock_received_at_ns: received_ns - 100,
+            received_at_ns: received_ns,
+            source_endpoint: EXCHANGE_INFO_ENDPOINT.to_owned(),
+            source_clock_endpoint: SERVER_TIME_ENDPOINT.to_owned(),
+        }
+    }
+
+    fn mark_row(symbol: &str, source_ms: u64, received_ns: u64) -> MarkIndexFundingObservation {
+        MarkIndexFundingObservation {
+            schema: REFERENCE_SCHEMA.to_owned(),
+            symbol: symbol.to_owned(),
+            mark_price: Decimal::new(101, 0),
+            index_price: Decimal::new(100, 0),
+            basis: Decimal::ONE,
+            basis_rate: Decimal::new(1, 2),
+            last_funding_rate: Decimal::new(1, 4),
+            interest_rate: Decimal::new(1, 4),
+            next_funding_time_ms: source_ms + 28_800_000,
+            source_time_ms: source_ms,
+            received_at_ns: received_ns,
+            source_endpoint: PREMIUM_INDEX_ENDPOINT.to_owned(),
+        }
+    }
+
+    fn open_interest_row(
+        symbol: &str,
+        source_ms: u64,
+        received_ns: u64,
+    ) -> OpenInterestObservation {
+        OpenInterestObservation {
+            schema: REFERENCE_SCHEMA.to_owned(),
+            symbol: symbol.to_owned(),
+            open_interest: Decimal::new(12345, 3),
+            source_time_ms: source_ms,
+            received_at_ns: received_ns,
+            source_endpoint: OPEN_INTEREST_ENDPOINT.to_owned(),
+        }
+    }
+
+    #[test]
+    fn modality_pit_clocks_stay_independent_under_interleaved_arrival() {
+        let temp = tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let batch = CompleteReferenceBatch::new(
+            vec![
+                contract_row("AAAUSDT", SOURCE_MS, RECEIVED_NS - 50),
+                contract_row("BBBUSDT", SOURCE_MS, RECEIVED_NS - 40),
+            ],
+            vec![
+                mark_row("AAAUSDT", SOURCE_MS, RECEIVED_NS),
+                mark_row("BBBUSDT", SOURCE_MS, RECEIVED_NS + 200_000_000),
+            ],
+            vec![
+                open_interest_row("AAAUSDT", SOURCE_MS - 3_600_000, RECEIVED_NS + 100_000_000),
+                open_interest_row("BBBUSDT", SOURCE_MS - 3_600_000, RECEIVED_NS + 300_000_000),
+            ],
+        )
+        .unwrap();
+        let config = ReferenceArtifactConfig {
+            output_root: root,
+            observed_at_ns: RECEIVED_NS + 400_000_000,
+            max_staleness_ms: 1_000,
+        };
+        let published =
+            publish_reference_batch(&config, OFFICIAL_USDM_SOURCE_ORIGIN, &batch).unwrap();
+        let manifest: ReferenceManifest =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.mark_index_funding,
+            ModalityPitClock {
+                observations: 2,
+                first_available_at_ns: RECEIVED_NS,
+                last_available_at_ns: RECEIVED_NS + 200_000_000,
+                max_gap_ns: 200_000_000,
+                first_event_time_ms: SOURCE_MS,
+                last_event_time_ms: SOURCE_MS,
+            }
+        );
+        assert_eq!(
+            manifest.open_interest,
+            ModalityPitClock {
+                observations: 2,
+                first_available_at_ns: RECEIVED_NS + 100_000_000,
+                last_available_at_ns: RECEIVED_NS + 300_000_000,
+                max_gap_ns: 200_000_000,
+                first_event_time_ms: SOURCE_MS - 3_600_000,
+                last_event_time_ms: SOURCE_MS - 3_600_000,
+            }
+        );
+        verify_reference_artifact(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn modality_availability_gap_above_bound_fails_closed() {
+        let temp = tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let late_ms = SOURCE_MS + 100_000;
+        let late_ns = RECEIVED_NS + 100_000_000_000;
+        let batch = CompleteReferenceBatch::new(
+            vec![
+                contract_row("AAAUSDT", late_ms, late_ns - 50),
+                contract_row("BBBUSDT", late_ms, late_ns - 40),
+            ],
+            vec![
+                mark_row("AAAUSDT", SOURCE_MS, RECEIVED_NS),
+                mark_row("BBBUSDT", late_ms, late_ns),
+            ],
+            vec![
+                open_interest_row("AAAUSDT", late_ms, late_ns - 30),
+                open_interest_row("BBBUSDT", late_ms, late_ns - 20),
+            ],
+        )
+        .unwrap();
+        let config = ReferenceArtifactConfig {
+            output_root: root.clone(),
+            observed_at_ns: late_ns + 100,
+            max_staleness_ms: 120_000,
+        };
+        let error = publish_reference_batch(&config, OFFICIAL_USDM_SOURCE_ORIGIN, &batch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exceeds the PIT availability gap bound"),
+            "{error}"
+        );
+        let partition = utc_partition(config.observed_at_ns).unwrap();
+        let hour = root
+            .join("lake/raw")
+            .join(format!("venue={VENUE}"))
+            .join(format!("dataset={DATASET}"))
+            .join(format!("date={}", partition.0))
+            .join(format!("hour={}", partition.1));
+        assert!(!hour.exists() || fs::read_dir(&hour).unwrap().count() == 0);
+    }
+
+    #[test]
+    fn missing_modality_clock_fails_closed() {
+        assert!(modality_pit_clock("open-interest", std::iter::empty()).is_err());
+
+        let (_temp, _config, published) = publish_fixture();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("open_interest");
+        let mut bytes = serde_json::to_vec(&manifest).unwrap();
+        bytes.push(b'\n');
+        fs::write(&published.manifest_path, &bytes).unwrap();
+        let manifest_sha256 = digest(&bytes);
+        assert!(verify_reference_artifact(
+            &published,
+            &published.data_sha256,
+            &manifest_sha256,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_publishes_per_modality_pit_clocks_without_merged_time_bounds() {
+        let (_temp, _config, published) = publish_fixture();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], MANIFEST_SCHEMA_V2);
+        assert!(manifest.get("time_bounds").is_none());
+        for modality in ["mark_index_funding", "open_interest"] {
+            let clock = manifest
+                .get(modality)
+                .unwrap_or_else(|| panic!("manifest is missing {modality}"));
+            let mut keys: Vec<&str> = clock
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "first_available_at_ns",
+                    "first_event_time_ms",
+                    "last_available_at_ns",
+                    "last_event_time_ms",
+                    "max_gap_ns",
+                    "observations",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn historical_v1_manifest_remains_readable_read_only() {
+        let (_temp, config, published) = publish_fixture();
+        let data = fs::read(&published.data_path).unwrap();
+        let manifest = serde_json::json!({
+            "schema": MANIFEST_SCHEMA_V1,
+            "venue": VENUE,
+            "dataset": DATASET,
+            "data_schema": REFERENCE_SCHEMA,
+            "format": "ndjson",
+            "source_origin": OFFICIAL_USDM_SOURCE_ORIGIN,
+            "source_endpoints": source_endpoints(),
+            "file": DATA_NAME,
+            "bytes": data.len(),
+            "sha256": published.data_sha256,
+            "rows": 3,
+            "observed_at_ns": config.observed_at_ns,
+            "max_staleness_ms": config.max_staleness_ms,
+            "coverage": {
+                "active_contracts": 1,
+                "metadata_observations": 1,
+                "mark_index_funding_observations": 1,
+                "open_interest_observations": 1,
+                "stale_metadata": 0,
+                "stale_mark_index_funding": 0,
+                "stale_open_interest": 0,
+                "api_error_count": 0,
+            },
+            "time_bounds": {
+                "min_source_time_ms": SOURCE_MS,
+                "max_source_time_ms": SOURCE_MS,
+                "min_received_at_ns": RECEIVED_NS - 100,
+                "max_received_at_ns": RECEIVED_NS + 50,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&manifest).unwrap();
+        bytes.push(b'\n');
+        fs::write(&published.manifest_path, &bytes).unwrap();
+        let manifest_sha256 = digest(&bytes);
+        let error = verify_reference_artifact(&published, &published.data_sha256, &manifest_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only evidence"), "{error}");
+        let counts = verify_reference_artifact_read_only(
+            &published,
+            &published.data_sha256,
+            &manifest_sha256,
+        )
+        .unwrap();
+        assert_eq!(
+            counts,
+            VerifiedReferenceCounts {
+                metadata: 1,
+                mark_index_funding: 1,
+                open_interest: 1,
+                historical_read_only: false,
+            }
+        );
     }
 }
