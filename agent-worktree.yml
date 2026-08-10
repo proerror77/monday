@@ -1,15 +1,15 @@
 owner: codex-root
-contract: runtime-arrival-instrumentation
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-arrival-instrumentation
-branch: codex/runtime-arrival-instrumentation
-base_sha: 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5
+contract: runtime-latency-verifier
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/runtime-latency-evidence
+branch: codex/runtime-latency-evidence
+base_sha: 0bd446df30d7068b696d8033159b9e070983df73
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/apps/live/src/runtime_attribution.rs
-  - rust_hft/execution-gateway/adapters/adapter-backpack/src/lib.rs
-  - rust_hft/market-core/engine/src/execution_worker.rs
-  - rust_hft/market-core/engine/src/lib.rs
-  - rust_hft/market-core/ports/src/events.rs
-  - rust_hft/market-core/runtime/src/system_builder/simulated_execution.rs
-dependency: PR #782 merged into fd3afe63e5cd8919a8e1f68e23020aada29655c1; PR #789 merged into 4e8358f6fb706fe8d5e0ef99b06982e9a37916a5; PR #791 merged into f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff
+  - rust_hft/Cargo.lock
+  - rust_hft/alpha-harness/domain/Cargo.toml
+  - rust_hft/alpha-harness/domain/src/lib.rs
+  - rust_hft/alpha-harness/domain/src/runtime_latency_evidence.rs
+  - rust_hft/tools/collector/Cargo.toml
+  - rust_hft/tools/collector/src/lib.rs
+dependency: PR #787 merged into 0bd446df30d7068b696d8033159b9e070983df73
 no_external_runtime_mutation: true
