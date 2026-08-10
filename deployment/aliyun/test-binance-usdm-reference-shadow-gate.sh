@@ -18,7 +18,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 artifact=$(jq -cn \
   --arg data "$data_sha" --arg manifest "$manifest_sha" \
   '{canonical_readback:true,dataset:"reference",venue:"binance_usdm",
-    manifest_schema:"binance.usdm_reference_manifest.v1",
+    manifest_schema:"binance.usdm_reference_manifest.v2",
     data_schema:"binance.usdm_reference.v3",
     source_origin:"https://fapi.binance.com",
     max_staleness_ms:30000,
@@ -28,8 +28,12 @@ artifact=$(jq -cn \
       "https://fapi.binance.com/fapi/v1/openInterest"],
     data_sha256:$data,manifest_sha256:$manifest,success_sha256:$data,
     content_rows_verified:true,observed_at_ns:1700000000000000000,
-    time_bounds:{min_source_time_ms:1699999999000,max_source_time_ms:1700000000000,
-      min_received_at_ns:1699999999500000000,max_received_at_ns:1699999999900000000},
+    mark_index_funding:{observations:500,first_event_time_ms:1699999999000,
+      last_event_time_ms:1700000000000,first_available_at_ns:1699999999500000000,
+      last_available_at_ns:1699999999800000000,max_gap_ns:1000000},
+    open_interest:{observations:500,first_event_time_ms:1699999995000,
+      last_event_time_ms:1699999999000,first_available_at_ns:1699999999600000000,
+      last_available_at_ns:1699999999900000000,max_gap_ns:1000000},
     coverage:{active_contracts:500,metadata_observations:500,
       mark_index_funding_observations:500,open_interest_observations:500,
       stale_metadata:0,stale_mark_index_funding:0,stale_open_interest:0,
@@ -102,6 +106,12 @@ reject '.artifacts[1].coverage.active_contracts=399
   | .artifacts[1].coverage.open_interest_observations=399' small-universe
 reject '.artifacts[1].max_staleness_ms=300000' relaxed-staleness
 reject 'del(.artifacts[1].max_staleness_ms)' missing-staleness
+reject '.artifacts[1].manifest_schema="binance.usdm_reference_manifest.v1"' legacy-manifest-schema
+reject 'del(.artifacts[1].mark_index_funding)' missing-mark-clock
+reject 'del(.artifacts[1].open_interest)' missing-oi-clock
+reject '.artifacts[1].open_interest.max_gap_ns=90000000001' oi-gap-exceeded
+reject '.artifacts[1].mark_index_funding.observations=499' mark-clock-count-mismatch
+reject '.artifacts[1].mark_index_funding.last_available_at_ns=1700000091000000000' mark-clock-after-observed
 reject '.artifacts[2].success_sha256=("9"*64)' bad-success
 reject '.artifacts[1].canonical_readback=false' no-readback
 reject '.artifacts[1].observed_at_ns=1700000200000000000' discontinuous

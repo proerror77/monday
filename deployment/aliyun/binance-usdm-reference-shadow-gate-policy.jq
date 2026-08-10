@@ -28,11 +28,22 @@ def complete_coverage:
   and .stale_open_interest >= 0
   and .api_error_count == 0;
 
+def pit_clock(observations; observed):
+  .observations == observations
+  and .first_event_time_ms <= .last_event_time_ms
+  and .first_available_at_ns <= .last_available_at_ns
+  and .last_available_at_ns <= observed
+  and (.max_gap_ns | type) == "number"
+  and .max_gap_ns == (.max_gap_ns | floor)
+  and .max_gap_ns >= 0
+  and .max_gap_ns <= 90000000000;
+
 def canonical_artifact:
-  .canonical_readback == true
+  . as $artifact
+  | .canonical_readback == true
   and .venue == "binance_usdm"
   and .dataset == "reference"
-  and .manifest_schema == "binance.usdm_reference_manifest.v1"
+  and .manifest_schema == "binance.usdm_reference_manifest.v2"
   and .data_schema == "binance.usdm_reference.v3"
   and .source_origin == "https://fapi.binance.com"
   and (.source_endpoints | endpoints)
@@ -45,9 +56,12 @@ def canonical_artifact:
   and .observed_at_ns == (.observed_at_ns | floor)
   and .observed_at_ns > 0
   and (.coverage | complete_coverage)
-  and .time_bounds.min_source_time_ms <= .time_bounds.max_source_time_ms
-  and .time_bounds.min_received_at_ns <= .time_bounds.max_received_at_ns
-  and .time_bounds.max_received_at_ns <= .observed_at_ns;
+  and ($artifact.mark_index_funding
+    | pit_clock($artifact.coverage.mark_index_funding_observations;
+      $artifact.observed_at_ns))
+  and ($artifact.open_interest
+    | pit_clock($artifact.coverage.open_interest_observations;
+      $artifact.observed_at_ns));
 
 .schema == "monday.binance_usdm_reference_shadow_gate.v1"
 and .candidate_sha256 == $candidate_sha256

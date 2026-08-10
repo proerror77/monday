@@ -1,10 +1,12 @@
 owner: codex
-contract: actionlint-macos-15-intel
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/actionlint-macos-15-intel
-branch: codex/actionlint-macos-15-intel
+contract: binance-reference-modality-pit-clocks
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-reference-modality-pit-clocks
+branch: codex/binance-reference-modality-pit-clocks
 base_sha: 161b761dff56acb758dd4a1787fd0b3b8130196a
-allowed_files:
-  - .github/workflows/ploy-ci.yml
-  - agent-worktree.yml
 dependency: none
+allowed_files:
+  - rust_hft/tools/collector/src/binance_usdm_reference.rs
+  - rust_hft/tools/collector/src/binance_usdm_reference_artifact.rs
+  - deployment/aliyun/test-binance-usdm-reference-release-contract.sh
+  - agent-worktree.yml
 no_external_runtime_mutation: true
