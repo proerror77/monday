@@ -32,7 +32,6 @@ err_file="$test_root/err"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
-DF_AVAIL_WARN=39200000       # 20% free (<25% warn, >=10% crit)
 DF_AVAIL_CRIT=9800000        # 5% free (<10% crit)
 
 pass_count=0
@@ -313,7 +312,7 @@ expect "healthy: exit 0" "$(rc_is 0; echo $?)"
 expect "healthy: ok:true" "$(grep_out '^ok:true$'; echo $?)"
 expect "healthy: no breach lines" "$(grep_not_out '^breach:'; echo $?)"
 expect "healthy: no warning lines" "$(grep_not_out '^warning:'; echo $?)"
-expect "healthy: state file written" "$([ -f "$state_dir/state.json" ]; echo $?)"
+expect "healthy: state file written" "$(if [ -f "$state_dir/state.json" ]; then echo 0; else echo 1; fi)"
 expect "healthy: state records nrestarts" "$(grep -q '^nrestarts|binance-lob-archiver-production@spot.service=4$' "$state_dir/state.json"; echo $?)"
 expect "healthy: state records failure_count" "$(grep -q '^failure_count|polymarket-market-tape-upload=0$' "$state_dir/state.json"; echo $?)"
 

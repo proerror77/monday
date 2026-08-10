@@ -399,14 +399,24 @@ scan_pending_lake() {
   pending_count=0
   pending_oldest=0
   [ -d "$1/lake/raw" ] || return 0
-  for dir in $(find "$1/lake/raw" -type d -name 'batch=*' 2>/dev/null); do
-    pending_count=$((pending_count + 1))
-    mtime=$(file_mtime "$dir")
-    case "$mtime" in (*[!0-9]*|'') continue ;; esac
-    if [ "$pending_oldest" -eq 0 ] || [ "$mtime" -lt "$pending_oldest" ]; then
-      pending_oldest=$mtime
-    fi
-  done
+  # Single-pass scan inside a pipe subshell (POSIX sh has no process
+  # substitution); the subshell prints "<count> <oldest-mtime>" once for the
+  # parent to unpack.
+  pending_stats=$(find "$1/lake/raw" -type d -name 'batch=*' 2>/dev/null | {
+    count=0
+    oldest=0
+    while IFS= read -r dir; do
+      count=$((count + 1))
+      mtime=$(file_mtime "$dir")
+      case "$mtime" in (*[!0-9]*|'') continue ;; esac
+      if [ "$oldest" -eq 0 ] || [ "$mtime" -lt "$oldest" ]; then
+        oldest=$mtime
+      fi
+    done
+    printf '%s %s\n' "$count" "$oldest"
+  })
+  pending_count=${pending_stats%% *}
+  pending_oldest=${pending_stats##* }
 }
 
 scan_pending_bybit_raw() {
