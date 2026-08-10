@@ -191,7 +191,7 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
     runs-on: ubuntu-latest
     container: rust:1.91-bookworm
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: rust_hft

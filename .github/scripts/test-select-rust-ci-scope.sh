@@ -294,6 +294,8 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   ! grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"
 done
+research_image_block=$(ploy_job_block research-image-binaries)
+grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
