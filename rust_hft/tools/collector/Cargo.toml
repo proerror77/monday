@@ -78,6 +78,7 @@ duckdb = ["dep:duckdb"]
 
 [dev-dependencies]
 zstd = "0.13"
+ed25519-dalek = { workspace = true }
 
 [[bin]]
 name = "hft-collector"

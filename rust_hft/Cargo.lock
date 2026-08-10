@@ -4932,6 +4932,7 @@ dependencies = [
  "clap",
  "clickhouse 0.12.2",
  "duckdb",
+ "ed25519-dalek",
  "flate2",
  "fs4",
  "futures",
