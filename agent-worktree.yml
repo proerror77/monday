@@ -1,10 +1,13 @@
 owner: codex
-contract: actionlint-macos-15-intel
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/actionlint-macos-15-intel
-branch: codex/actionlint-macos-15-intel
-base_sha: 161b761dff56acb758dd4a1787fd0b3b8130196a
+contract: collector-health-hard-gates
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/collector-health-hard-gates
+branch: codex/collector-health-hard-gates
+base_sha: be9e746a1ddf7e6f26264c4811c4a3511c3caa87
 allowed_files:
-  - .github/workflows/ploy-ci.yml
   - agent-worktree.yml
-dependency: none
+  - deployment/aliyun/monday-collector-health.sh
+  - deployment/aliyun/test-monday-collector-health.sh
+  - .github/workflows/monitor-collector-host.yml
+  - deployment/aliyun/README.md
+dependency: upload-status last_success_at for the fee uploader lands in a parallel PR; this contract treats a missing last_success_at as a breach, so it must merge after or together with that PR
 no_external_runtime_mutation: true
