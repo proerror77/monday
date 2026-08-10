@@ -162,19 +162,34 @@ tape files or `upload-status.json`. It emits one JSON snapshot (or a human
 to journald tag `monday-collector-health`. Run with `--json` for machine output
 and `--dry-run` to avoid reading or writing the persistent delta state.
 
-| Check | Breach condition |
+The monitor has exactly four hard gates. Each is a breach: it fails closed into
+the `monitor-collector-host` workflow issue and blocks `ok:true`.
+
+| Hard gate | Breach condition |
+| --- | --- |
+| 1. Status file | `upload-status.json` missing, a symlink, or unparseable on the mandated lanes (`binance-lob` spot/usdm, `binance-fee`) |
+| 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 1800s, bybit 5400s; each just above the lane's upload cadence) |
+| 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
+| 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
+
+Two legacy guards stay breaches: `polymarket-raw-ops-gate@.service` must remain
+disabled/masked/not-found (`static` proves an uncleaned host installation), and
+state-persistence failures (gate 4 delta detection depends on that state).
+
+Every other check is a warning — reported in the JSON `warnings` array and as
+`warning:` lines, never blocking `ok:true`:
+
+| Warning | Condition |
 | --- | --- |
 | `/data` disk | free < 25% (warn) or < 10% (critical) via `df -Pk /data` |
-| Governed services | `binance-lob-archiver-production@spot/usdm` and `binance-usdm-reference-collector` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
-| Upload lanes | `polymarket-market-tape-upload.timer` and `polymarket-reference-upload.timer` active AND enabled; their oneshot services' last `Result==success` |
-| Watchdog | `polymarket-market-tape-upload-watchdog.timer` active AND enabled; the watchdog service's last `Result==success` |
-| Incident fill source | `bybit-options-archiver.service` and `polymarket-raw-ops-gate@.service` must stay disabled/masked/not-found |
+| Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
+| Upload lane units | upload/watchdog/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
-| `upload-status.json` | `last_error_at`/`last_error` present, or a `failure_count` delta since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
+| Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
 | `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
 
-The persistent-service check deliberately does not breach on `NRestarts > 0`:
+The persistent-service check deliberately does not warn on `NRestarts > 0`:
 both Binance archivers restart every six hours by design
 (`RuntimeMaxSec=21600`). Crash loops are detected through `Result != success`
 or an `NRestarts` delta greater than one between consecutive five-minute polls.
