@@ -296,7 +296,7 @@ for ploy_rust_job in \
 done
 research_image_block=$(ploy_job_block research-image-binaries)
 grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-grep -Fqx '      SCCACHE_GHA_RW_MODE: READ_ONLY' <<<"$research_image_block"
+grep -Fqx "      SCCACHE_GHA_RW_MODE: \${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}" <<<"$research_image_block"
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
