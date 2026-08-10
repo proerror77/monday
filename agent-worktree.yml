@@ -1,25 +1,12 @@
 owner: codex-root
-contract: binance-fee-systemd-credentialed-production-assets
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/binance-fee-systemd
-branch: codex/binance-fee-systemd
-base_sha: bd402f481dbe25ccc8dfb336be3fff5be47a727d
+contract: lob-pit-materializer-v2
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-materializer-v2
+branch: codex/lob-pit-materializer-v2
+base_sha: be9e746a1ddf7e6f26264c4811c4a3511c3caa87
 allowed_files:
   - agent-worktree.yml
-  - .github/workflows/ci.yml
-  - .github/workflows/acr-publish.yml
-  - rust_hft/tools/collector/src/bin/binance-fee-snapshot.rs
-  - rust_hft/tools/collector/src/binance_fee_upload.rs
-  - deployment/aliyun/binance-fee-snapshot-spot.service
-  - deployment/aliyun/binance-fee-snapshot-spot.timer
-  - deployment/aliyun/binance-fee-snapshot-usdm.service
-  - deployment/aliyun/binance-fee-snapshot-usdm.timer
-  - deployment/aliyun/binance-fee-upload.service
-  - deployment/aliyun/binance-fee-upload.timer
-  - deployment/aliyun/binance-fee-upload.env
-  - deployment/aliyun/binance-fee.conf
-  - deployment/aliyun/monday-collector-health.sh
-  - deployment/aliyun/test-monday-collector-health.sh
-  - deployment/aliyun/test-binance-fee-release-contract.sh
-dependency: issue #790 / PR #791 merged into f9cd212e3d6c63c5978bbeb5a0a6eb6d7d6282ff; PR #787 merged into 0bd446df30d7068b696d8033159b9e070983df73; PR #788 merged into bd402f481dbe25ccc8dfb336be3fff5be47a727d
-issue: 792
+  - rust_hft/Cargo.lock
+  - rust_hft/tools/collector/Cargo.toml
+  - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
+dependency: origin/main at be9e746a1ddf7e6f26264c4811c4a3511c3caa87 (contains PRs #787/#788/#789/#793)
 no_external_runtime_mutation: true
