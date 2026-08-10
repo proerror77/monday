@@ -29,7 +29,7 @@ write_artifact() {
   data_sha=$(sha256sum "$data" | awk '{print $1}')
   manifest="$data.manifest.json"
   jq -S -n --arg data_sha "$data_sha" --argjson observed "$observed_ns" '
-    {schema:"binance.usdm_reference_manifest.v1",venue:"binance_usdm",
+    {schema:"binance.usdm_reference_manifest.v2",venue:"binance_usdm",
       dataset:"reference",data_schema:"binance.usdm_reference.v3",format:"ndjson",
       source_origin:"https://fapi.binance.com",
       source_endpoints:["https://fapi.binance.com/fapi/v1/time",
@@ -42,10 +42,14 @@ write_artifact() {
         mark_index_funding_observations:500,open_interest_observations:500,
         stale_metadata:0,stale_mark_index_funding:0,stale_open_interest:0,
         api_error_count:0},
-      time_bounds:{min_source_time_ms:1999999999000,
-        max_source_time_ms:2000000000000,
-        min_received_at_ns:1999999999500000000,
-        max_received_at_ns:1999999999900000000}}' >"$manifest"
+      mark_index_funding:{observations:500,
+        first_event_time_ms:1999999999000,last_event_time_ms:2000000000000,
+        first_available_at_ns:1999999999500000000,
+        last_available_at_ns:1999999999800000000,max_gap_ns:1000000},
+      open_interest:{observations:500,
+        first_event_time_ms:1999999995000,last_event_time_ms:1999999999000,
+        first_available_at_ns:1999999999600000000,
+        last_available_at_ns:1999999999900000000,max_gap_ns:1000000}}' >"$manifest"
   printf '%s\n' "$data_sha" >"$data._SUCCESS"
 }
 

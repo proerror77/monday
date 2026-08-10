@@ -324,7 +324,8 @@ while IFS= read -r manifest; do
       source_endpoints:.source_endpoints,max_staleness_ms:.max_staleness_ms,
       data_sha256:.sha256,manifest_sha256:$manifest_sha,success_sha256:.sha256,
       content_rows_verified:true,observed_at_ns:.observed_at_ns,
-      time_bounds:.time_bounds,coverage:.coverage}
+      mark_index_funding:.mark_index_funding,open_interest:.open_interest,
+      coverage:.coverage}
   ' "$manifest" >"$temp_dir/$observed.json"
   check_sha "$data_sha" "$data" || die "artifact changed after readback: $data"
   check_sha "$current_manifest_sha" "$manifest" \
