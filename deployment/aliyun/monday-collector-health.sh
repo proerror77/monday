@@ -303,18 +303,21 @@ check_upload() {
   failure_count=0
   failure_delta=0
   if [ -f "$upload_file" ]; then
-    if upload_json=$(jq -ce '
-      if type == "object"
+    if [ "$label" = "binance-fee-upload" ]; then
+      upload_filter='if type == "object"
         and has("failure_count")
         and (.failure_count != null)
         and (.failure_count | type == "number")
         and (.failure_count | floor == .)
         and (.failure_count >= 0)
-      then . else error("invalid upload status") end
-    ' "$upload_file" 2>/dev/null); then
+      then . else error("invalid upload status") end'
+    else
+      upload_filter='if type == "object" then . else error("invalid upload status") end'
+    fi
+    if upload_json=$(jq -ce "$upload_filter" "$upload_file" 2>/dev/null); then
       err_at=$(printf '%s' "$upload_json" | jq -r '(.last_error_at // null)')
       err_msg=$(printf '%s' "$upload_json" | jq -r '(.last_error // null)')
-      failure_count=$(printf '%s' "$upload_json" | jq -r '.failure_count')
+      failure_count=$(printf '%s' "$upload_json" | jq -r '(.failure_count // 0)')
     else
       record_breach "$label: upload-status.json is malformed"
     fi
