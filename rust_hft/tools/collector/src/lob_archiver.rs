@@ -1019,12 +1019,20 @@ pub fn write_health(
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UploadStatus {
+    pub updated_at: Option<String>,
     pub last_success_at: Option<String>,
     pub last_error_at: Option<String>,
     pub last_error: Option<String>,
-    #[serde(default)]
     pub failure_count: u64,
+    pub discovery_failed: bool,
+    pub pending_batches: Option<u64>,
+    pub uploaded_batches: u64,
+    pub retried_batches: u64,
+    pub failed_batches: Vec<Value>,
+    pub last_uploaded_object: Option<String>,
+    pub last_uploaded_triplet: Option<Value>,
 }
 
 pub fn read_upload_status(spool_dir: &Path) -> UploadStatus {
@@ -1458,6 +1466,7 @@ mod tests {
                 last_error_at: Some("2026-07-14T16:00:00Z".into()),
                 last_error: Some("oss down".into()),
                 failure_count: 7,
+                ..UploadStatus::default()
             },
         )
         .unwrap();

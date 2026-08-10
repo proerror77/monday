@@ -281,10 +281,10 @@ struct UploadedSegment {
     canonical_complete: bool,
 }
 
-pub(crate) struct ExclusiveTempDir(PathBuf);
+pub struct ExclusiveTempDir(PathBuf);
 
 impl ExclusiveTempDir {
-    pub(crate) fn create(parent: &Path, prefix: &str) -> Result<Self> {
+    pub fn create(parent: &Path, prefix: &str) -> Result<Self> {
         ensure_canonical_directory(parent)?;
         for _ in 0..32 {
             let path = parent.join(format!("{prefix}.{:016x}", random::<u64>()));
@@ -297,7 +297,7 @@ impl ExclusiveTempDir {
         bail!("could not allocate an exclusive temporary directory")
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.0
     }
 }
