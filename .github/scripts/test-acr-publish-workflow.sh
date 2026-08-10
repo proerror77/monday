@@ -192,11 +192,11 @@ if grep -Eq 'command:|nodeName:|tolerations:|secretKeyRef:|env:|envFrom:|persist
   exit 1
 fi
 
-# research-runner-binaries compiles on the runner and must use the #559/#566
-# sccache-action pattern; the publish matrix compiles inside docker, where a
-# host-side wrapper does not apply.
+# research-runner-binaries compiles on the runner and uses per-job local
+# sccache; the publish matrix compiles inside docker, where a host-side wrapper
+# does not apply. Neither path may write the shared GHA object cache.
 grep -Fqx '      RUSTC_WRAPPER: sccache' "$workflow"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "true"' "$workflow"
+grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' "$workflow"
 grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$workflow"
 grep -Fqx '        continue-on-error: true' "$workflow"
 if grep -Fq 'sccache --zero-stats' "$workflow" || \
