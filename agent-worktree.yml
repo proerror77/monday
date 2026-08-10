@@ -1,12 +1,11 @@
 owner: codex-root
-contract: lob-pit-materializer-v2
-worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-pit-materializer-v2
-branch: codex/lob-pit-materializer-v2
-base_sha: be9e746a1ddf7e6f26264c4811c4a3511c3caa87
+contract: lob-shadow-spool-owner
+worktree: /Users/proerror/Documents/monday/.worktrees/codex/lob-shadow-spool-owner
+branch: codex/lob-shadow-spool-owner
+base_sha: 2fb07d94c245f71ac6508fe12ebbe416118a3eba
 allowed_files:
   - agent-worktree.yml
-  - rust_hft/Cargo.lock
-  - rust_hft/tools/collector/Cargo.toml
-  - rust_hft/tools/collector/src/bin/lob-pit-materializer.rs
-dependency: origin/main at be9e746a1ddf7e6f26264c4811c4a3511c3caa87 (contains PRs #787/#788/#789/#793)
+  - deployment/aliyun/deploy-rust-lob-release.sh
+  - deployment/aliyun/test-rust-lob-control-plane.sh
+dependency: runtime issue #805 candidate install exposed a non-traversable shadow spool parent
 no_external_runtime_mutation: true

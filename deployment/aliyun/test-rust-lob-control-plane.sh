@@ -870,6 +870,10 @@ grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXX
   "$INSTALL_RELEASE"
 grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
   "$INSTALL_RELEASE"
+shadow_spool_install=$(sed -n \
+  '/^install -d -m 0750 -o hftcollector -g hftcollector \\/,/^  \/data\/monday\/spool\/binance-lob-rust-shadow\/usdm$/p' \
+  "$INSTALL_RELEASE")
+grep -Fxq "  /data/monday/spool/binance-lob-rust-shadow \\" <<<"$shadow_spool_install"
 grep -Fq 'install -d -m 0755 /opt/monday/releases' "$INSTALL_RELEASE"
 grep -Fq 'chmod 0755 "$release_staging"' "$INSTALL_RELEASE"
 grep -Fq 'release directory must be traversable with mode 0755' "$INSTALL_RELEASE"
