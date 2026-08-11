@@ -204,6 +204,10 @@ case "${1:-}" in
     unit=${2:-}
     candidate=${unit#polymarket-raw-ops-gate@}
     candidate=${candidate%.service}
+    if [[ ${FAKE_START_REJECT:-0} == 1 ]]; then
+      [[ ${FAKE_START_REJECT_ACTIVE:-0} != 1 ]] || write_state active active
+      exit 17
+    fi
     INVOCATION_ID=$(read_state invocation) \
       "$FAKE_GATE_CONTROL" prepare "$candidate"
     write_state active active
@@ -791,6 +795,27 @@ if ! (
   exit 1
 fi
 
+supervisor_env_file="$supervisor_root/run/monday/polymarket-raw-ops-gates/$supervisor_candidate_sha.env"
+set_supervisor_state active inactive
+if env "${gate_control_env[@]}" FAKE_START_REJECT=1 \
+  "$supervisor_control" start "$supervisor_candidate" \
+  "$supervisor_candidate_sha" "$supervisor_source" >/dev/null 2>&1; then
+  printf 'rejected Gate start unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ ! -e $supervisor_env_file ]]
+set_supervisor_state active inactive
+if env "${gate_control_env[@]}" FAKE_START_REJECT=1 \
+  FAKE_START_REJECT_ACTIVE=1 "$supervisor_control" start \
+  "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" >/dev/null 2>&1; then
+  printf 'active rejected Gate start unexpectedly passed\n' >&2
+  exit 1
+fi
+[[ -f $supervisor_env_file ]]
+rm -f -- "$supervisor_env_file"
+set_supervisor_state active inactive
+
 supervisor_starts_before_normal=$(grep -Fxc "start $supervisor_unit" "$supervisor_calls" || true)
 start_supervisor "$supervisor_invocation" >"$supervisor_tmp/start.json"
 jq -e --arg unit "$supervisor_unit" --arg invocation "$supervisor_invocation" '
@@ -799,6 +824,7 @@ jq -e --arg unit "$supervisor_unit" --arg invocation "$supervisor_invocation" '
   "$supervisor_tmp/start.json" >/dev/null
 supervisor_starts_after_normal=$(grep -Fxc "start $supervisor_unit" "$supervisor_calls")
 [[ $supervisor_starts_after_normal -eq $((supervisor_starts_before_normal + 1)) ]]
+[[ -f $supervisor_env_file ]]
 assert_running_status "$supervisor_invocation"
 reject gate_control start "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source"
@@ -822,6 +848,7 @@ FAKE_SHADOW_STOP_FAIL=1 finalize_supervisor "$supervisor_invocation" \
   exit-code exited 17 \
   >"$supervisor_tmp/failed.json"
 assert_terminal "$supervisor_tmp/failed.json" failed
+[[ ! -e $supervisor_env_file ]]
 [[ $(<"$supervisor_state/shadow") == inactive ]]
 [[ ! -e $failed_evidence/PASSED.sha256 \
   && ! -e $failed_evidence/.PASSED.sha256.ready \
@@ -894,6 +921,7 @@ fi
 gate_control status "$supervisor_candidate_sha" \
   "$supervisor_prepare_invocation" >"$supervisor_tmp/prepare-recovered.json"
 assert_terminal "$supervisor_tmp/prepare-recovered.json" passed
+[[ ! -e $supervisor_env_file ]]
 [[ -f $prepare_evidence/PASSED.sha256 \
   && -f $prepare_dir/receipt.json \
   && ! -e $prepare_dir/.receipt.json.ready \

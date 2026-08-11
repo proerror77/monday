@@ -9,8 +9,9 @@
 #   2. last_success_at present and fresh per upload lane
 #   3. pending upload backlog bounded (count + oldest pending age)
 #   4. failure_count not growing, last_error empty (all lanes)
-# plus the expected-disabled installation gate (polymarket-raw-ops-gate) and
-# state-persistence failures. Everything else (units, timers, restarts,
+# plus the raw-ops Gate containment contract (static template with no active
+# instance, running lock, or residual environment) and state-persistence
+# failures. Everything else (units, timers, restarts,
 # health.json, delay-gate journal, disk, mount, fee snapshot journal) is a
 # warning: reported, never blocking ok:true.
 #
@@ -77,8 +78,14 @@ run_health() {
     STUB_JOURNAL_TRIPS="${STUB_JOURNAL_TRIPS:-0}" \
     STUB_JOURNAL_FEE_FAILURES="${STUB_JOURNAL_FEE_FAILURES:-0}" \
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
+    STUB_FLOCK_HELD="${STUB_FLOCK_HELD:-0}" \
+    STUB_FLOCK_ERROR="${STUB_FLOCK_ERROR:-0}" \
+    STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
+    STUB_LOCK_PATH="$test_root/run/monday/polymarket-raw-ops-gates/control.lock" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
+    MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
+    MONDAY_COLLECTOR_HEALTH_TEST_ROOT="$test_root" \
     PATH="$stub_dir:$PATH" \
     "$health_script" "$@" >"$out_file" 2>"$err_file"
   rc=$?
@@ -95,12 +102,24 @@ reset_env() {
   STUB_JOURNAL_TRIPS=0
   STUB_JOURNAL_FEE_FAILURES=0
   STUB_JOURNAL_FAIL=0
+  STUB_FLOCK_HELD=0
+  STUB_FLOCK_ERROR=0
+  STUB_LOCK_APPEAR=0
   unset MONDAY_COLLECTOR_STATE_DIR
 }
 
 reset_state() {
   rm -rf "$state_dir"
   mkdir -p "$state_dir"
+  case "$test_root" in
+    /tmp/monday-collector-health-test.*)
+      rm -rf -- "$test_root/run"
+      ;;
+    *)
+      printf 'refusing to reset an unexpected health test root: %s\n' "$test_root" >&2
+      exit 2
+      ;;
+  esac
 }
 
 reset_spool() {
@@ -212,7 +231,7 @@ binance-fee-snapshot-usdm.timer	active	enabled	-	-
 binance-fee-snapshot-usdm.service	-	-	success	-
 binance-fee-upload.timer	active	enabled	-	-
 binance-fee-upload.service	-	-	success	-
-polymarket-raw-ops-gate@.service	-	disabled	-	-
+polymarket-raw-ops-gate@.service	-	static	-	-
 EOF
 }
 
@@ -220,6 +239,21 @@ EOF
 cat > "$stub_dir/systemctl" <<'EOF'
 #!/bin/sh
 SCENARIO="${STUB_SCENARIO:?STUB_SCENARIO not set}"
+case "${1:-}" in
+  list-units)
+    awk -F '\t' '
+      $1 ~ /^polymarket-raw-ops-gate@.+[.]service$/ &&
+      ($2 == "active" || $2 == "activating" || $2 == "deactivating" || $2 == "reloading") {
+        printf "%s loaded %s running\n", $1, $2
+      }
+    ' "$SCENARIO"
+    if [ "${STUB_LOCK_APPEAR:-0}" = "1" ]; then
+      mkdir -p "$(dirname -- "${STUB_LOCK_PATH:?STUB_LOCK_PATH not set}")"
+      : >"$STUB_LOCK_PATH"
+    fi
+    exit 0
+    ;;
+esac
 unit=""
 prop=""
 prev=""
@@ -298,6 +332,15 @@ EOF
 cat > "$stub_dir/mountpoint" <<'EOF'
 #!/bin/sh
 [ "${STUB_MOUNTED:-1}" = "1" ]
+EOF
+
+cat > "$stub_dir/flock" <<'EOF'
+#!/bin/sh
+if [ "${STUB_FLOCK_ERROR:-0}" = "1" ]; then
+  exit 2
+fi
+[ "${STUB_FLOCK_HELD:-0}" = "1" ] && exit 1
+exit 0
 EOF
 
 cat > "$stub_dir/logger" <<'EOF'
@@ -780,25 +823,115 @@ expect "state persist fail: exit 1" "$(rc_is 1; echo $?)"
 expect "state persist fail: breach message" "$(grep_out 'state: state directory unavailable'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 19. polymarket-raw-ops-gate stays a breach (indirect and static)
+# 19. polymarket-raw-ops-gate uses the static template and containment checks
 # ---------------------------------------------------------------------------
-reset_env
-reset_state
-healthy_scenario
-healthy_fixtures
-rewrite_scenario 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	indirect|'
-run_health
-expect "poly gate indirect: exit 1" "$(rc_is 1; echo $?)"
-expect "poly gate indirect: breach message" "$(grep_out 'polymarket-raw-ops-gate: expected disabled'; echo $?)"
+if env MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
+  MONDAY_COLLECTOR_HEALTH_TEST_ROOT="/tmp/monday-collector-health-test../escape" \
+  PATH="$stub_dir:$PATH" "$health_script" --json >/dev/null 2>&1; then
+  printf 'health monitor accepted a traversal test root\n' >&2
+  exit 1
+fi
+expect "poly gate test root traversal: rejected" "0"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-rewrite_scenario 's|^polymarket-raw-ops-gate@.service	-	disabled|polymarket-raw-ops-gate@.service	-	static|'
+rewrite_scenario 's|^polymarket-raw-ops-gate@.service	-	static|polymarket-raw-ops-gate@.service	-	indirect|'
 run_health
-expect "poly gate static: exit 1" "$(rc_is 1; echo $?)"
-expect "poly gate static: breach message" "$(grep_out "polymarket-raw-ops-gate: expected disabled but is-enabled='static'"; echo $?)"
+expect "poly gate indirect: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate indirect: breach message" "$(grep_out 'polymarket-raw-ops-gate: unexpected is-enabled'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+run_health
+expect "poly gate static clean: exit 0" "$(rc_is 0; echo $?)"
+expect "poly gate static clean: no breach" "$(grep_not_out 'polymarket-raw-ops-gate:'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday/polymarket-raw-ops-gates"
+: > "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+STUB_FLOCK_HELD=1
+run_health
+expect "poly gate held lock: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate held lock: breach message" "$(grep_out 'polymarket-raw-ops-gate: running control lock is held or unavailable'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday/polymarket-raw-ops-gates"
+: > "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+STUB_FLOCK_ERROR=1
+run_health --json
+expect "poly gate lock inspect error: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate lock inspect error: separate JSON state" "$(json_query '
+  .ok == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_held == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_check_failed == true
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday/polymarket-raw-ops-gates"
+: > "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+chmod 000 "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+STUB_FLOCK_ERROR=1
+run_health --json
+chmod 600 "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+expect "poly gate unreadable regular lock: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate unreadable regular lock: inspect failure" "$(json_query '
+  .ok == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_check_failed == true
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_LOCK_APPEAR=1
+run_health --json
+expect "poly gate lock appears during snapshot: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate lock appears during snapshot: fail-closed readback" "$(json_query '
+  .ok == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_race_detected == true
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday/polymarket-raw-ops-gates"
+: > "$test_root/run/monday/polymarket-raw-ops-gates/candidate.env"
+run_health
+expect "poly gate residual env: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate residual env: breach message" "$(grep_out 'polymarket-raw-ops-gate: residual Gate environment file'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday"
+: > "$test_root/run/monday/polymarket-raw-ops-gates"
+run_health
+expect "poly gate runtime root malformed: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate runtime root malformed: breach message" "$(grep_out 'polymarket-raw-ops-gate: Gate runtime root is not an inspectable directory'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '%s\n' 'polymarket-raw-ops-gate@candidate.service	active	enabled	success	0' >> "$scenario"
+run_health
+expect "poly gate active instance: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate active instance: breach message" "$(grep_out 'polymarket-raw-ops-gate: active Gate instance'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 20. JSON output shape (healthy, includes the warnings array)
@@ -820,7 +953,12 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and .checks.mount.data_mounted == true
   and .checks.units["binance-lob-archiver-production@spot.service"].active == true
   and .checks.units["bybit-options-archiver.service"].active == true
-  and .checks.units["polymarket-raw-ops-gate@.service"].is_enabled == "disabled"
+  and .checks.units["polymarket-raw-ops-gate@.service"].is_enabled == "static"
+  and (.checks.units["polymarket-raw-ops-gate@.service"].active_instances | length) == 0
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_held == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_check_failed == false
+  and (.checks.units["polymarket-raw-ops-gate@.service"].residual_env | length) == 0
+  and .checks.units["polymarket-raw-ops-gate@.service"].residual_env_check_failed == false
   and (.checks.health["binance-lob-archiver-production@spot"].age_seconds | type) == "number"
   and .checks.health["binance-lob-archiver-production@spot"].status == "synced"
   and (.checks.uploads["binance-lob-archiver-production@spot"].failure_count | type) == "number"

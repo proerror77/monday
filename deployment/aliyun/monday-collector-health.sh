@@ -9,8 +9,8 @@
 # watchdog.sh) self-healed without ever alerting a human.
 #
 # Health contract: exactly FOUR hard gates, each a breach that fails closed
-# into the monitor-collector-host workflow issue, plus the expected-disabled
-# installation gates:
+# into the monitor-collector-host workflow issue, plus the raw-ops Gate
+# containment contract:
 #   1. upload-status.json exists and parses for the mandated lanes
 #      (binance-lob spot/usdm and binance-fee); missing or malformed = breach.
 #   2. last_success_at is present and fresh on every upload lane. Thresholds
@@ -30,10 +30,11 @@
 #      .uploaded.json readback marker.
 #   4. failure_count must not grow between polls and last_error must be empty,
 #      uniformly across all upload lanes.
-# polymarket-raw-ops-gate stays a breach when is-enabled is anything but
-# disabled/masked/not-found (e.g. 'static'): it proves an uncleaned host
-# installation. State-persistence failures also stay breaches because gate 4
-# delta detection depends on the persisted state.
+# The raw-ops Gate template has no [Install] section, so systemd reports it as
+# static. Static is healthy only when no Gate instance, running lock, or
+# residual EnvironmentFile remains on the host. State-persistence failures
+# also stay breaches because gate 4 delta detection depends on the persisted
+# state.
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
 # Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
@@ -56,6 +57,9 @@
 #   MONDAY_COLLECTOR_SPOOL_ROOT  spool root (default /data/monday/spool)
 #   MONDAY_COLLECTOR_STATE_DIR   state directory (default
 #                                /var/lib/monday-collector-health)
+#   MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 and
+#   MONDAY_COLLECTOR_HEALTH_TEST_ROOT  are reserved for the contract test
+#                                      fixture under /tmp.
 set -u
 
 TAG=monday-collector-health
@@ -133,6 +137,27 @@ FEE_USDM_SERVICE=binance-fee-snapshot-usdm.service
 FEE_UPLOAD_TIMER=binance-fee-upload.timer
 FEE_UPLOAD_SERVICE=binance-fee-upload.service
 POLY_RAW_OPS_GATE='polymarket-raw-ops-gate@.service'
+POLY_RAW_OPS_GATE_RUN_ROOT=/run/monday/polymarket-raw-ops-gates
+POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
+if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
+  test_root=${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}
+  case "$test_root" in
+    *..*)
+      printf 'invalid collector-health test root\n' >&2
+      exit 2
+      ;;
+    /tmp/monday-collector-health-test.*) ;;
+    *)
+      printf 'invalid collector-health test root\n' >&2
+      exit 2
+      ;;
+  esac
+  POLY_RAW_OPS_GATE_RUN_ROOT="$test_root/run/monday/polymarket-raw-ops-gates"
+  POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
+elif [ -n "${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}" ]; then
+  printf 'collector-health test root requires explicit test mode\n' >&2
+  exit 2
+fi
 
 JSON_MODE=0
 DRY_RUN=0
@@ -324,19 +349,134 @@ check_oneshot_result() {
     '$base + {($k): $v}')
 }
 
-check_disabled_unit() {
-  # The raw-ops gate template must remain DISABLED. Breach on any is-enabled
-  # state that is not explicitly disabled/masked/not-found (enabled, static,
-  # indirect, ... all mean the unit can be activated and the host still carries
-  # an uncleaned installation).
+collect_raw_ops_gate_snapshot() {
+  gate_list=$(systemctl list-units 'polymarket-raw-ops-gate@*.service' \
+    --all --no-legend --no-pager 2>/dev/null)
+  gate_list_rc=$?
+  active_instances=$(printf '%s\n' "$gate_list" | awk '
+    $1 ~ /^polymarket-raw-ops-gate@[^.]+[.]service$/ &&
+    ($3 == "active" || $3 == "activating" || $3 == "deactivating" || $3 == "reloading") {
+      print $1
+    }
+  ')
+  if [ "$gate_list_rc" -ne 0 ]; then
+    record_breach "$label: cannot inspect active Gate instances (systemctl list-units exit $gate_list_rc)"
+  fi
+  if [ -n "$active_instances" ]; then
+    record_breach "$label: active Gate instance(s): $(printf '%s' "$active_instances" | tr '\n' ' ')"
+  fi
+
+  residual_env=""
+  residual_env_check_failed=0
+  if [ -e "$POLY_RAW_OPS_GATE_RUN_ROOT" ] || [ -L "$POLY_RAW_OPS_GATE_RUN_ROOT" ]; then
+    if [ ! -d "$POLY_RAW_OPS_GATE_RUN_ROOT" ] || [ -L "$POLY_RAW_OPS_GATE_RUN_ROOT" ] \
+      || [ ! -r "$POLY_RAW_OPS_GATE_RUN_ROOT" ] || [ ! -x "$POLY_RAW_OPS_GATE_RUN_ROOT" ]; then
+      residual_env_check_failed=1
+      record_breach "$label: Gate runtime root is not an inspectable directory ($POLY_RAW_OPS_GATE_RUN_ROOT)"
+    fi
+  fi
+  if [ "$residual_env_check_failed" -eq 0 ] && [ -d "$POLY_RAW_OPS_GATE_RUN_ROOT" ]; then
+    for env_file in "$POLY_RAW_OPS_GATE_RUN_ROOT"/*.env; do
+      if [ -e "$env_file" ] || [ -L "$env_file" ]; then
+        if [ -n "$residual_env" ]; then
+          residual_env="$residual_env
+$env_file"
+        else
+          residual_env=$env_file
+        fi
+      fi
+    done
+  fi
+  if [ -n "$residual_env" ]; then
+    record_breach "$label: residual Gate environment file(s): $(printf '%s' "$residual_env" | tr '\n' ' ')"
+  fi
+}
+
+check_raw_ops_gate() {
+  # The raw-ops gate template has no [Install] section, so static is the
+  # expected installed state. Retain the old absence/masked states as clean,
+  # but fail closed on an enabled/indirect template or an uninspectable state.
   unit=$1
   label=$2
   enabled=$(unit_is_enabled "$unit")
   case "$enabled" in
-    disabled|masked|not-found|'') ;;
-    *) record_breach "$label: expected disabled but is-enabled='$enabled'" ;;
+    static|disabled|masked|not-found) ;;
+    *) record_breach "$label: unexpected is-enabled='$enabled'" ;;
   esac
-  obj=$(jq -n --arg e "$enabled" '{is_enabled: $e}')
+
+  lock_held=0
+  lock_check_failed=0
+  lock_race_detected=0
+  held_locks=""
+  active_instances=""
+  residual_env=""
+  residual_env_check_failed=0
+  lock_path=$POLY_RAW_OPS_GATE_CONTROL_LOCK
+  lock_label='control lock'
+  lock_path_present=0
+  if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+    lock_path_present=1
+  fi
+
+  # A free control lock is held for the entire unit+EnvironmentFile snapshot.
+  # The grouped redirection keeps an unreadable regular lock from terminating
+  # this POSIX monitor before it can emit a fail-closed breach. A lock that is
+  # absent at the first check is scanned optimistically and rechecked after the
+  # snapshot; appearance during that window is also a breach.
+  if [ "$lock_path_present" -eq 1 ] && { [ ! -f "$lock_path" ] || [ -L "$lock_path" ]; }; then
+    lock_check_failed=1
+    record_breach "$label: $lock_label path is not a regular file ($lock_path)"
+    collect_raw_ops_gate_snapshot
+  elif [ "$lock_path_present" -eq 1 ] && ! command -v flock >/dev/null 2>&1; then
+    lock_check_failed=1
+    record_breach "$label: cannot inspect $lock_label (flock unavailable)"
+    collect_raw_ops_gate_snapshot
+  elif [ "$lock_path_present" -eq 1 ]; then
+    lock_group_ran=0
+    snapshot_collected=0
+    {
+      lock_group_ran=1
+      flock -n 9 2>/dev/null
+      flock_rc=$?
+      if [ "$flock_rc" -eq 0 ]; then
+        collect_raw_ops_gate_snapshot
+        snapshot_collected=1
+      elif [ "$flock_rc" -eq 1 ]; then
+        lock_held=1
+        held_locks=$lock_path
+        record_breach "$label: running $lock_label is held or unavailable ($lock_path)"
+      else
+        lock_check_failed=1
+        record_breach "$label: cannot inspect $lock_label (flock exit $flock_rc)"
+      fi
+    } 9<"$lock_path" 2>/dev/null
+    if [ "$lock_group_ran" -eq 0 ]; then
+      lock_check_failed=1
+      record_breach "$label: cannot inspect $lock_label ($lock_path)"
+      collect_raw_ops_gate_snapshot
+    elif [ "$snapshot_collected" -eq 0 ] && [ "$lock_held" -eq 0 ]; then
+      collect_raw_ops_gate_snapshot
+    fi
+  else
+    collect_raw_ops_gate_snapshot
+    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+      lock_race_detected=1
+      record_breach "$label: $lock_path appeared during the containment snapshot"
+    fi
+  fi
+
+  active_instances_json=$(printf '%s\n' "$active_instances" | jq -Rsc \
+    'split("\n") | map(select(length > 0))')
+  held_locks_json=$(printf '%s\n' "$held_locks" | jq -Rsc \
+    'split("\n") | map(select(length > 0))')
+  residual_env_json=$(printf '%s\n' "$residual_env" | jq -Rsc \
+    'split("\n") | map(select(length > 0))')
+  obj=$(jq -n --arg e "$enabled" --argjson i "$active_instances_json" \
+    --argjson h "$held_locks_json" --argjson r "$residual_env_json" \
+    --argjson l "$(bool_json "$lock_held")" --argjson u "$(bool_json "$lock_check_failed")" \
+    --argjson f "$(bool_json "$residual_env_check_failed")" \
+    --argjson x "$(bool_json "$lock_race_detected")" \
+    '{is_enabled: $e, active_instances: $i, lock_held: $l, lock_check_failed: $u, lock_race_detected: $x, held_locks: $h, residual_env: $r, residual_env_check_failed: $f}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
     '$base + {($k): $v}')
 }
@@ -684,7 +824,7 @@ check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
 check_recent_snapshot_failures "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
 check_recent_snapshot_failures "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
 
-check_disabled_unit "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
+check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
 check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
 check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"

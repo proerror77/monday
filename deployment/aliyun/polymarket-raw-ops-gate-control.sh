@@ -120,6 +120,16 @@ effective_exec_argv() {
 sync_file() { [[ $test_mode == true ]] || sync "$1"; }
 sync_dir() { [[ $test_mode == true ]] || sync -f "$1"; }
 
+remove_gate_environment() {
+  local candidate_sha=$1 env_file="$RUN_ROOT/$1.env"
+  valid_candidate "$candidate_sha" || die 'cannot remove Gate EnvironmentFile for an invalid candidate'
+  if [[ -e $env_file || -L $env_file ]]; then
+    secure_control_file "$env_file"
+    rm -f -- "$env_file"
+    sync_dir "$RUN_ROOT"
+  fi
+}
+
 install_gate_unit() {
   local backup previous_sha temporary unit_sha
   local replaced=false
@@ -283,6 +293,7 @@ print_status() {
     exec 8>>"$directory/commit.lock"
     flock -x 8
     commit_terminal_receipt "$candidate_sha" "$expected_invocation" "$request"
+    remove_gate_environment "$candidate_sha"
   fi
   if [[ -e $receipt || -L $receipt ]]; then
     secure_control_file "$receipt"
@@ -508,6 +519,7 @@ finalize_gate() {
     || -e $temporary || -L $temporary \
     || -e $staged_receipt || -L $staged_receipt ]]; then
     commit_terminal_receipt "$candidate_sha" "$invocation" "$request"
+    remove_gate_environment "$candidate_sha"
     jq -c . "$receipt"
     return
   fi
@@ -577,6 +589,7 @@ finalize_gate() {
   sync_file "$staged_receipt"
   sync_dir "$directory"
   commit_terminal_receipt "$candidate_sha" "$invocation" "$request"
+  remove_gate_environment "$candidate_sha"
   jq -c . "$receipt"
   [[ $shadow_containment != active ]] \
     || die 'candidate shadow remains active after Gate finalization'
@@ -904,7 +917,15 @@ start_gate() {
   mv "${env_file}.tmp.$$" "$env_file"
   sync_file "$env_file"
   systemctl daemon-reload
-  systemctl start "$unit" || die 'systemd rejected the Gate job'
+  if ! systemctl start "$unit"; then
+    active_state=$(systemctl_value "$unit" ActiveState || true)
+    main_pid=$(systemctl_value "$unit" MainPID || true)
+    if [[ ($active_state == inactive || $active_state == failed) \
+      && $main_pid == 0 ]]; then
+      remove_gate_environment "$candidate_sha"
+    fi
+    die 'systemd rejected the Gate job'
+  fi
   if ! invocation=$(systemctl_value "$unit" InvocationID) \
     || ! valid_invocation "$invocation"; then
     systemctl stop "$unit" >/dev/null \
