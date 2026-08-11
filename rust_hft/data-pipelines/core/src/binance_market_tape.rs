@@ -185,7 +185,12 @@ impl LobContinuitySummaryBuilder {
             }
             // Trade, ticker, and liquidation families carry no LOB continuity
             // state; they are validated by their own sequence/clock contracts.
-            "stream_coverage" | "agg_trade" | "raw_trade" | "book_ticker" | "force_order" => {}
+            "stream_coverage"
+            | "agg_trade"
+            | "raw_trade"
+            | "raw_trade_zero_price"
+            | "book_ticker"
+            | "force_order" => {}
             _ => {}
         }
         Ok(())
@@ -347,6 +352,7 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
                 | "agg_trade"
                 | "aggregate_trade_gap"
                 | "raw_trade"
+                | "raw_trade_zero_price"
                 | "book_ticker"
                 | "force_order"
         ),
@@ -779,6 +785,18 @@ impl RawTrade {
     }
 
     pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_zero_price(frame, received_at_ns, false)
+    }
+
+    pub fn from_zero_price_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_zero_price(frame, received_at_ns, true)
+    }
+
+    fn from_frame_with_zero_price(
+        frame: &Value,
+        received_at_ns: u64,
+        allow_zero_price: bool,
+    ) -> Result<Self> {
         let data = frame.get("data").unwrap_or(frame);
         if data.get("e").and_then(Value::as_str) != Some("trade") {
             anyhow::bail!("raw trade frame has the wrong event identity");
@@ -786,7 +804,15 @@ impl RawTrade {
         let symbol = required_string(data, "s", "raw trade")?.to_ascii_uppercase();
         validate_stream_identity(frame, &symbol, "trade")?;
         let trade_id = required_u64(data, "t", "raw trade")?;
-        let price = positive_decimal(data, "p", "raw trade")?;
+        let price = required_string(data, "p", "raw trade")?
+            .parse::<Decimal>()
+            .with_context(|| "raw trade field p is not decimal")?;
+        if price < Decimal::ZERO || (!allow_zero_price && price == Decimal::ZERO) {
+            anyhow::bail!("raw trade field p is not positive");
+        }
+        if allow_zero_price && price != Decimal::ZERO {
+            anyhow::bail!("raw trade zero-price field p is not zero");
+        }
         let quantity = positive_decimal(data, "q", "raw trade")?;
         let event_time_ms = required_u64(data, "E", "raw trade")?;
         let trade_time_ms = required_u64(data, "T", "raw trade")?;
@@ -1480,9 +1506,15 @@ mod tests {
         assert!(market_tape_schema(MARKET_TAPE_SCHEMA));
         assert!(market_tape_schema(MARKET_TAPE_SCHEMA_V2));
         assert!(!market_tape_schema(LEGACY_LOB_TAPE_SCHEMA));
-        for event_type in ["raw_trade", "book_ticker", "force_order"] {
+        for event_type in [
+            "raw_trade",
+            "raw_trade_zero_price",
+            "book_ticker",
+            "force_order",
+        ] {
             assert!(event_type_allowed(MARKET_TAPE_SCHEMA_V2, event_type));
             assert!(!event_type_allowed(MARKET_TAPE_SCHEMA, event_type));
+            assert!(!event_type_allowed(LEGACY_LOB_TAPE_SCHEMA, event_type));
         }
         for schema in [MARKET_TAPE_SCHEMA, MARKET_TAPE_SCHEMA_V2] {
             for event_type in [
@@ -1528,6 +1560,41 @@ mod tests {
                 .to_string()
                 .contains("identity")
         );
+    }
+
+    #[test]
+    fn raw_trade_zero_price_entry_reuses_strict_validation() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        let mut zero = raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
+        zero["data"]["p"] = json!("0");
+        assert!(RawTrade::from_frame(&zero, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("not positive"));
+        assert_eq!(
+            RawTrade::from_zero_price_frame(&zero, received_at_ns)
+                .unwrap()
+                .price,
+            Decimal::ZERO
+        );
+
+        let mut negative = zero.clone();
+        negative["data"]["p"] = json!("-1");
+        assert!(RawTrade::from_zero_price_frame(&negative, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("not positive"));
+
+        let mut positive = zero.clone();
+        positive["data"]["p"] = json!("100.5");
+        assert!(RawTrade::from_zero_price_frame(&positive, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("not zero"));
+
+        let mut malformed = zero;
+        malformed["data"]["q"] = Value::Null;
+        assert!(RawTrade::from_zero_price_frame(&malformed, received_at_ns).is_err());
     }
 
     #[test]
