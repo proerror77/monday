@@ -5567,6 +5567,32 @@ mod tests {
         })
     }
 
+    fn observed_usdm_cys_raw_trade_frame(
+        id: u64,
+        event_time_ms: u64,
+        trade_time_ms: u64,
+        price: &str,
+        quantity: &str,
+        execution_type: &str,
+        is_buyer_maker: bool,
+    ) -> Value {
+        json!({
+            "stream": "cysusdt@trade",
+            "data": {
+                "e": "trade",
+                "E": event_time_ms,
+                "s": "CYSUSDT",
+                "t": id,
+                "p": price,
+                "q": quantity,
+                "T": trade_time_ms,
+                "X": execution_type,
+                "m": is_buyer_maker,
+                "st": 1
+            }
+        })
+    }
+
     #[rustfmt::skip]
     fn book_ticker_frame(received_at_ns: u64) -> Value {
         let event_time_ms = received_at_ns / 1_000_000 - 1;
@@ -5846,12 +5872,12 @@ mod tests {
         let mut config = test_config("http://unused".into());
         config.market = Market::Usdm;
         config.dataset = "usdm_all".into();
-        config.symbols = vec!["BTCUSDC".into()];
+        config.symbols = vec!["CYSUSDT".into()];
         config.spool_dir = dirs.spool.clone();
         let session_id = "session-usdm-upload-only";
-        let first_trade_received_at_ns = 1_786_430_318_869_000_000;
-        let last_trade_received_at_ns = 1_786_430_322_755_000_000;
-        let pre_trade_received_at_ns = 1_786_430_318_864_000_000;
+        let first_trade_received_at_ns = 1_786_437_637_142_000_000;
+        let last_trade_received_at_ns = 1_786_437_637_153_000_000;
+        let pre_trade_received_at_ns = 1_786_437_637_137_000_000;
         let segment_start = first_trade_received_at_ns - 20_000_000;
         let mut segment = Segment::create(config.segment_config(), segment_start).unwrap();
         let stream_types = config.stream_types();
@@ -5871,13 +5897,13 @@ mod tests {
             .unwrap();
 
         let mut states = HashMap::from([(
-            "BTCUSDC".to_owned(),
-            OrderBookState::new("BTCUSDC", Market::Usdm),
+            "CYSUSDT".to_owned(),
+            OrderBookState::new("CYSUSDT", Market::Usdm),
         )]);
         let coverage = config
             .stream_types()
             .iter()
-            .map(|stream_type| vec![format!("btcusdc@{stream_type}")])
+            .map(|stream_type| vec![format!("cysusdt@{stream_type}")])
             .collect::<Vec<_>>();
         let mut budget = PendingBudget::new(10);
         let mut process_state = ProcessState::new(false);
@@ -5901,7 +5927,7 @@ mod tests {
             session_id,
             Event::Snapshot {
                 received_at_ns: snapshot_received_at_ns,
-                symbol: "BTCUSDC".into(),
+                symbol: "CYSUSDT".into(),
                 request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
                 snapshot: json!({
                     "lastUpdateId": 100,
@@ -5918,12 +5944,12 @@ mod tests {
                 "depth@100ms" => vec![
                     (
                         json!({
-                            "stream": "btcusdc@depth@100ms",
+                            "stream": "cysusdt@depth@100ms",
                             "data": {
                                 "e": "depthUpdate",
-                                "E": 1_786_430_318_863_u64,
-                                "T": 1_786_430_318_863_u64,
-                                "s": "BTCUSDC",
+                                "E": 1_786_437_637_136_u64,
+                                "T": 1_786_437_637_136_u64,
+                                "s": "CYSUSDT",
                                 "U": 101,
                                 "u": 101,
                                 "pu": 100,
@@ -5937,90 +5963,120 @@ mod tests {
                 "aggTrade" => vec![
                     (
                         json!({
-                            "stream": "btcusdc@aggTrade",
+                            "stream": "cysusdt@aggTrade",
                             "data": {
                                 "e": "aggTrade",
-                                "E": 1_786_430_318_863_u64,
-                                "s": "BTCUSDC",
+                                "E": 1_786_437_637_136_u64,
+                                "s": "CYSUSDT",
                                 "a": 1,
                                 "f": 1,
                                 "l": 1,
                                 "p": "101",
                                 "q": "0.2",
-                                "T": 1_786_430_318_863_u64,
+                                "T": 1_786_437_637_136_u64,
                                 "m": true,
                             },
                         }),
                         pre_trade_received_at_ns + 1_000_000,
                     ),
                 ],
+                // Receive times are deterministic test delivery clocks, not captured payload fields.
                 "trade" => vec![
                     (
-                        observed_usdm_raw_trade_frame(
-                            553104311,
-                            1_786_430_318_864,
-                            1_786_430_318_864,
-                            "63841.2",
-                            "0.013",
+                        observed_usdm_cys_raw_trade_frame(
+                            110193461,
+                            1_786_437_637_137,
+                            1_786_437_637_137,
+                            "1.3910000",
+                            "4",
                             "MARKET",
+                            false,
                         ),
                         first_trade_received_at_ns,
                     ),
                     (
-                        observed_usdm_raw_trade_frame(
-                            553104312,
-                            1_786_430_320_180,
-                            1_786_430_320_180,
-                            "0",
-                            "0",
-                            "NA",
-                        ),
-                        1_786_430_320_185_000_000,
-                    ),
-                    (
-                        observed_usdm_raw_trade_frame(
-                            553104313,
-                            1_786_430_322_206,
-                            1_786_430_322_206,
-                            "0",
-                            "0",
-                            "NA",
-                        ),
-                        1_786_430_322_211_000_000,
-                    ),
-                    (
-                        observed_usdm_raw_trade_frame(
-                            553104314,
-                            1_786_430_322_673,
-                            1_786_430_322_673,
-                            "0",
-                            "0",
-                            "NA",
-                        ),
-                        1_786_430_322_678_000_000,
-                    ),
-                    (
-                        observed_usdm_raw_trade_frame(
-                            553104315,
-                            1_786_430_322_750,
-                            1_786_430_322_749,
-                            "63841.2",
-                            "0.001",
+                        observed_usdm_cys_raw_trade_frame(
+                            110193462,
+                            1_786_437_637_138,
+                            1_786_437_637_138,
+                            "1.3907000",
+                            "16",
                             "MARKET",
+                            false,
+                        ),
+                        first_trade_received_at_ns + 2_000_000,
+                    ),
+                    (
+                        observed_usdm_cys_raw_trade_frame(
+                            110193463,
+                            1_786_437_637_139,
+                            1_786_437_637_139,
+                            "1.3906000",
+                            "29",
+                            "MARKET",
+                            false,
+                        ),
+                        first_trade_received_at_ns + 4_000_000,
+                    ),
+                    (
+                        observed_usdm_cys_raw_trade_frame(
+                            110193464,
+                            1_786_437_637_139,
+                            1_786_437_637_139,
+                            "0",
+                            "0",
+                            "INSURANCE_FUND",
+                            false,
+                        ),
+                        first_trade_received_at_ns + 5_000_000,
+                    ),
+                    (
+                        observed_usdm_cys_raw_trade_frame(
+                            110193465,
+                            1_786_437_637_140,
+                            1_786_437_637_139,
+                            "1.3906000",
+                            "54",
+                            "MARKET",
+                            false,
+                        ),
+                        first_trade_received_at_ns + 7_000_000,
+                    ),
+                    (
+                        observed_usdm_cys_raw_trade_frame(
+                            110193466,
+                            1_786_437_637_140,
+                            1_786_437_637_139,
+                            "1.3907000",
+                            "67",
+                            "MARKET",
+                            false,
+                        ),
+                        first_trade_received_at_ns + 8_000_000,
+                    ),
+                    (
+                        observed_usdm_cys_raw_trade_frame(
+                            110193467,
+                            1_786_437_637_142,
+                            1_786_437_637_142,
+                            "1.3905000",
+                            "6",
+                            "MARKET",
+                            true,
                         ),
                         last_trade_received_at_ns,
                     ),
                 ],
                 "bookTicker" => {
                     let mut frame = book_ticker_frame(last_trade_received_at_ns + 1_000_000);
-                    frame["stream"] = json!("btcusdc@bookTicker");
-                    frame["data"]["s"] = json!("BTCUSDC");
+                    frame["stream"] = json!("cysusdt@bookTicker");
+                    frame["data"]["s"] = json!("CYSUSDT");
                     vec![(frame, last_trade_received_at_ns + 1_000_000)]
                 }
                 "forceOrder" => {
                     let mut frame = force_order_frame(last_trade_received_at_ns + 2_000_000);
-                    frame["stream"] = json!("btcusdc@forceOrder");
-                    frame["data"]["o"]["s"] = json!("BTCUSDC");
+                    frame["stream"] = json!("cysusdt@forceOrder");
+                    frame["data"]["o"]["s"] = json!("CYSUSDT");
                     vec![(frame, last_trade_received_at_ns + 2_000_000)]
                 }
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
@@ -6052,8 +6108,8 @@ mod tests {
         .expect("USD-M contract segment must be non-empty");
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["event_types"]["raw_trade"], 2);
-        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 3);
+        assert_eq!(manifest["event_types"]["raw_trade"], 6);
+        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
 
         let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();

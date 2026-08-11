@@ -814,7 +814,7 @@ impl RawTrade {
             anyhow::bail!("raw trade zero-price field p is not zero");
         }
         let quantity = if allow_zero_price {
-            // Accept only the observed public USD-M sentinel shape; this is not
+            // Accept only the observed public USD-M sentinel shapes; this is not
             // a general non-positive-price fallback.
             let quantity = required_string(data, "q", "raw trade")?
                 .parse::<Decimal>()
@@ -822,8 +822,9 @@ impl RawTrade {
             if quantity != Decimal::ZERO {
                 anyhow::bail!("raw trade zero-price field q is not zero: {quantity}");
             }
-            if required_string(data, "X", "raw trade")? != "NA" {
-                anyhow::bail!("raw trade zero-price field X is not NA");
+            let execution_type = required_string(data, "X", "raw trade")?;
+            if !matches!(execution_type, "NA" | "INSURANCE_FUND") {
+                anyhow::bail!("raw trade zero-price field X is unsupported: {execution_type}");
             }
             if required_u64(data, "st", "raw trade")? != 1 {
                 anyhow::bail!("raw trade zero-price field st is not 1");
@@ -1647,9 +1648,38 @@ mod tests {
         missing_execution["data"].as_object_mut().unwrap().remove("X");
         assert!(RawTrade::from_zero_price_frame(&missing_execution, received_at_ns).is_err());
 
-        let mut wrong_execution = zero;
+        let mut wrong_execution = zero.clone();
         wrong_execution["data"]["X"] = json!("MARKET");
         assert!(RawTrade::from_zero_price_frame(&wrong_execution, received_at_ns).is_err());
+
+        let mut unknown_execution = zero;
+        unknown_execution["data"]["X"] = json!("UNKNOWN");
+        assert!(RawTrade::from_zero_price_frame(&unknown_execution, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("X is unsupported"));
+
+        let insurance_fund = json!({
+            "stream": "cysusdt@trade",
+            "data": {
+                "e": "trade",
+                "E": 1_786_437_637_139_u64,
+                "T": 1_786_437_637_139_u64,
+                "s": "CYSUSDT",
+                "t": 110193464_u64,
+                "p": "0",
+                "q": "0",
+                "X": "INSURANCE_FUND",
+                "m": false,
+                "st": 1_u64
+            }
+        });
+        let insurance_trade =
+            RawTrade::from_zero_price_frame(&insurance_fund, 1_786_437_637_144_000_000).unwrap();
+        assert_eq!(insurance_trade.symbol, "CYSUSDT");
+        assert_eq!(insurance_trade.trade_id, 110193464);
+        assert_eq!(insurance_trade.price, Decimal::ZERO);
+        assert_eq!(insurance_trade.quantity, Decimal::ZERO);
     }
 
     #[test]
