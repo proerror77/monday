@@ -190,6 +190,7 @@ impl LobContinuitySummaryBuilder {
             | "raw_trade"
             | "raw_trade_zero_price"
             | "book_ticker"
+            | "stale_book_ticker"
             | "force_order" => {}
             _ => {}
         }
@@ -354,6 +355,7 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
                 | "raw_trade"
                 | "raw_trade_zero_price"
                 | "book_ticker"
+                | "stale_book_ticker"
                 | "force_order"
         ),
         _ => false,
@@ -918,12 +920,31 @@ impl BookTicker {
     }
 
     pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_clock_policy(frame, received_at_ns, false)
+    }
+
+    /// Parse a USD-M bookTicker while allowing a stale event clock. All shape,
+    /// identity, price, and ordering checks remain strict; callers must only
+    /// use this path to classify an event whose E-to-receive delay was already
+    /// observed to exceed MAX_SOURCE_DELAY_MS.
+    pub fn from_frame_allow_stale(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_clock_policy(frame, received_at_ns, true)
+    }
+
+    fn from_frame_with_clock_policy(
+        frame: &Value,
+        received_at_ns: u64,
+        allow_stale: bool,
+    ) -> Result<Self> {
         let data = frame.get("data").unwrap_or(frame);
         // The frame shape decides the market: USD-M frames carry an explicit
         // event identity and source clocks, spot frames carry neither.
         let usdm = match data.get("e").and_then(Value::as_str) {
             Some("bookTicker") => true,
             Some(_) => anyhow::bail!("book ticker frame has the wrong event identity"),
+            None if allow_stale => {
+                anyhow::bail!("stale book ticker frame has no USD-M event identity")
+            }
             None => false,
         };
         let symbol = if usdm {
@@ -943,9 +964,14 @@ impl BookTicker {
             if transaction_time_ms.is_some_and(|transaction| transaction > event_time_ms) {
                 anyhow::bail!("book ticker source clocks are reversed");
             }
-            validate_receive_clock(event_time_ms, received_at_ns, "book ticker")?;
-            if let Some(transaction_time_ms) = transaction_time_ms {
-                validate_receive_clock(transaction_time_ms, received_at_ns, "book ticker")?;
+            if allow_stale {
+                validate_receive_clock_without_delay(
+                    event_time_ms,
+                    received_at_ns,
+                    "book ticker E",
+                )?;
+            } else {
+                validate_receive_clock(event_time_ms, received_at_ns, "book ticker E")?;
             }
             event_time_ms
         } else {
@@ -1053,12 +1079,22 @@ fn spot_symbol(frame: &Value, data: &Value, kind: &str) -> Result<String> {
 }
 
 fn validate_receive_clock(event_time_ms: u64, received_at_ns: u64, kind: &str) -> Result<()> {
+    validate_receive_clock_without_delay(event_time_ms, received_at_ns, kind)?;
+    let received_at_ms = received_at_ns / 1_000_000;
+    if received_at_ms.saturating_sub(event_time_ms) > MAX_SOURCE_DELAY_MS {
+        anyhow::bail!("{kind} source-to-receive delay exceeds the governed limit");
+    }
+    Ok(())
+}
+
+fn validate_receive_clock_without_delay(
+    event_time_ms: u64,
+    received_at_ns: u64,
+    kind: &str,
+) -> Result<()> {
     let received_at_ms = received_at_ns / 1_000_000;
     if event_time_ms.saturating_sub(received_at_ms) > MAX_SOURCE_LEAD_MS {
         anyhow::bail!("{kind} source clock lead exceeds the governed limit");
-    }
-    if received_at_ms.saturating_sub(event_time_ms) > MAX_SOURCE_DELAY_MS {
-        anyhow::bail!("{kind} source-to-receive delay exceeds the governed limit");
     }
     Ok(())
 }
@@ -1529,6 +1565,7 @@ mod tests {
             "raw_trade",
             "raw_trade_zero_price",
             "book_ticker",
+            "stale_book_ticker",
             "force_order",
         ] {
             assert!(event_type_allowed(MARKET_TAPE_SCHEMA_V2, event_type));
@@ -1756,13 +1793,37 @@ mod tests {
         let mut later = book_ticker_frame(1_700_000_000_001);
         later["data"]["u"] = json!(400900999);
         BookTicker::from_frame(&later, received_at_ns).unwrap();
+        let mut stale_transaction = book_ticker_frame(1_700_000_000_099);
+        stale_transaction["data"]["T"] = json!(1_700_000_000_000_u64);
+        BookTicker::from_frame(&stale_transaction, received_at_ns).unwrap();
         assert!(BookTicker::from_frame(
             &book_ticker_frame(1_700_000_000_000),
             1_700_000_031_000_000_000
         )
         .unwrap_err()
         .to_string()
-        .contains("delay"));
+        .contains("book ticker E source-to-receive delay"));
+        BookTicker::from_frame_allow_stale(
+            &book_ticker_frame(1_700_000_000_000),
+            1_700_000_031_000_000_000,
+        )
+        .unwrap();
+        let mut reversed = book_ticker_frame(1_700_000_000_000);
+        reversed["data"]["T"] = json!(1_700_000_000_001_u64);
+        assert!(BookTicker::from_frame_allow_stale(
+            &reversed,
+            1_700_000_031_000_000_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reversed"));
+        assert!(BookTicker::from_frame_allow_stale(
+            &book_ticker_frame(1_700_000_000_100 + MAX_SOURCE_LEAD_MS + 1),
+            received_at_ns,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("book ticker E source clock lead"));
         let mut non_positive = book_ticker_frame(1_700_000_000_000);
         non_positive["data"]["b"] = json!("0");
         assert!(BookTicker::from_frame(&non_positive, received_at_ns)
@@ -1812,6 +1873,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing"));
+        assert!(BookTicker::from_frame_allow_stale(
+            &spot_book_ticker_frame(),
+            received_at_ns,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("USD-M event identity"));
     }
 
     #[test]
