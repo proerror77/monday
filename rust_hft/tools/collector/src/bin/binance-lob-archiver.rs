@@ -6705,6 +6705,267 @@ mod tests {
     }
 
     #[test]
+    fn spot_coherent_zero_book_ticker_keeps_same_shard_and_uploads_strict_tape() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for the upload-only contract")
+            .status
+            .success());
+        let dirs = UploadTestDir::new();
+        let mut config = test_config("http://unused".into());
+        config.symbols = vec!["CHIPUSD1".into()];
+        config.spool_dir = dirs.spool.clone();
+        let session_id = "session-spot-coherent-side";
+        let producer_id = 3;
+        let session_start_ns = now_ns().unwrap();
+        let mut segment = Segment::create(config.segment_config(), session_start_ns).unwrap();
+        let stream_types = config.stream_types();
+        segment
+            .write(
+                "session_start",
+                json!({
+                    "session_id": session_id,
+                    "market": config.market.as_str(),
+                    "symbols": config.symbols.len(),
+                    "websocket_shards": stream_types.len(),
+                    "websocket_streams": stream_types.len(),
+                    "stream_types": stream_types,
+                }),
+                session_start_ns,
+            )
+            .unwrap();
+
+        let mut states = HashMap::from([(
+            "CHIPUSD1".to_owned(),
+            OrderBookState::new("CHIPUSD1", Market::Spot),
+        )]);
+        let coverage = config
+            .stream_types()
+            .iter()
+            .map(|stream_type| vec![format!("chipusd1@{stream_type}")])
+            .collect::<Vec<_>>();
+        let mut budget = PendingBudget::new(10);
+        let mut process_state = ProcessState::new(false);
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            session_id,
+            Event::StreamCoverageVerified { shards: coverage },
+            &mut process_state,
+        )
+        .unwrap();
+
+        let snapshot_received_at_ns = now_ns().unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            session_id,
+            Event::Snapshot {
+                received_at_ns: snapshot_received_at_ns,
+                symbol: "CHIPUSD1".into(),
+                request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
+                snapshot: json!({
+                    "lastUpdateId": 100,
+                    "bids": [["0.02215", "1"]],
+                    "asks": [["0.02216", "1"]],
+                }),
+            },
+            &mut process_state,
+        )
+        .unwrap();
+
+        let aggregate_received_at_ns = now_ns().unwrap();
+        let aggregate_event_time_ms = aggregate_received_at_ns / 1_000_000 - 1;
+        let aggregate = json!({
+            "stream": "chipusd1@aggTrade",
+            "data": {
+                "e": "aggTrade",
+                "E": aggregate_event_time_ms,
+                "s": "CHIPUSD1",
+                "a": 1,
+                "f": 1,
+                "l": 1,
+                "p": "0.02215",
+                "q": "1",
+                "T": aggregate_event_time_ms,
+                "m": false,
+            },
+        });
+        let event = event_from_frame_for_shard(aggregate, aggregate_received_at_ns, producer_id)
+            .unwrap();
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                session_id,
+                event,
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+
+        // This is the exact observed Spot CHIPUSD1 payload: both absent-side
+        // values are zero, so it remains a normal book_ticker event.
+        let zero_book_ticker = json!({
+            "stream": "chipusd1@bookTicker",
+            "data": {
+                "u": 14_756_445_u64,
+                "s": "CHIPUSD1",
+                "b": "0.02215000",
+                "B": "3946.00000000",
+                "a": "0.00000000",
+                "A": "0.00000000",
+            },
+        });
+        let zero_book_ticker_received_at_ns = now_ns().unwrap();
+        let book_state_before_ticker = states["CHIPUSD1"].checkpoint(session_id).unwrap();
+        assert_eq!(
+            book_state_before_ticker.bids,
+            vec![["0.02215".to_owned(), "1".to_owned()]]
+        );
+        let event = event_from_frame_for_shard(
+            zero_book_ticker,
+            zero_book_ticker_received_at_ns,
+            producer_id,
+        )
+        .unwrap();
+        assert!(matches!(event, Event::BookTicker { .. }));
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                session_id,
+                event,
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        let book_state_after_ticker = states["CHIPUSD1"].checkpoint(session_id).unwrap();
+        assert_eq!(book_state_after_ticker, book_state_before_ticker);
+
+        let trade_received_at_ns = now_ns().unwrap();
+        let trade_event_time_ms = trade_received_at_ns / 1_000_000 - 1;
+        let trade = json!({
+            "stream": "chipusd1@trade",
+            "data": {
+                "e": "trade",
+                "E": trade_event_time_ms,
+                "s": "CHIPUSD1",
+                "t": 1,
+                "p": "0.02215",
+                "q": "1",
+                "T": trade_event_time_ms,
+                "m": false,
+            },
+        });
+        let event = event_from_frame_for_shard(trade, trade_received_at_ns, producer_id).unwrap();
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                session_id,
+                event,
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+
+        let depth_received_at_ns = now_ns().unwrap();
+        let depth_event_time_ms = depth_received_at_ns / 1_000_000 - 1;
+        let depth = json!({
+            "stream": "chipusd1@depth@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "E": depth_event_time_ms,
+                "T": depth_event_time_ms,
+                "s": "CHIPUSD1",
+                "U": 101,
+                "u": 101,
+                "b": [["0.02215", "2"]],
+                "a": [],
+            },
+        });
+        let event = event_from_frame_for_shard(depth, depth_received_at_ns, producer_id).unwrap();
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                session_id,
+                event,
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            session_id,
+            "test",
+            &process_state,
+        )
+        .unwrap()
+        .expect("Spot contract segment must be non-empty");
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["event_types"]["book_ticker"], 1);
+        assert_eq!(manifest["event_types"]["raw_trade"], 1);
+        assert_eq!(manifest["event_types"]["agg_trade"], 1);
+        assert_eq!(manifest["lob_continuity"]["sequence_gaps"], 0);
+        assert_eq!(process_state.sequence_gaps, 0);
+
+        let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
+        write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(
+            &artifacts.sha256,
+            &manifest_sha256,
+        )
+        .unwrap();
+        let triplet = BinanceMarketTapeTriplet {
+            data: artifacts.data.clone(),
+            manifest: artifacts.manifest.clone(),
+            success: artifacts.success.clone(),
+        };
+        let sealed = seal_binance_market_tape_triplet(&triplet, &trust).unwrap();
+        verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+
+        let mut fake = FakeOss::default();
+        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+            fake.run(&dirs.bucket, command, timeout)
+        })
+        .unwrap();
+        assert_eq!(outcome.uploaded, 1);
+        assert_eq!(outcome.retried, 0);
+        assert_eq!(outcome.pending_batches, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(fake.uploads, 3);
+        assert!(!artifacts.data.exists());
+        assert!(!artifacts.manifest.exists());
+        assert!(!artifacts.success.exists());
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn book_ticker_and_force_order_are_archived_without_sequence_state() {
         let root = env::temp_dir().join(format!(
             "monday-binance-book-ticker-{}",
