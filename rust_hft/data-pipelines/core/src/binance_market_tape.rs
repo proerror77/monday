@@ -813,7 +813,25 @@ impl RawTrade {
         if allow_zero_price && price != Decimal::ZERO {
             anyhow::bail!("raw trade zero-price field p is not zero");
         }
-        let quantity = positive_decimal(data, "q", "raw trade")?;
+        let quantity = if allow_zero_price {
+            // Accept only the observed public USD-M sentinel shape; this is not
+            // a general non-positive-price fallback.
+            let quantity = required_string(data, "q", "raw trade")?
+                .parse::<Decimal>()
+                .with_context(|| "raw trade field q is not decimal")?;
+            if quantity != Decimal::ZERO {
+                anyhow::bail!("raw trade zero-price field q is not zero: {quantity}");
+            }
+            if required_string(data, "X", "raw trade")? != "NA" {
+                anyhow::bail!("raw trade zero-price field X is not NA");
+            }
+            if required_u64(data, "st", "raw trade")? != 1 {
+                anyhow::bail!("raw trade zero-price field st is not 1");
+            }
+            quantity
+        } else {
+            positive_decimal(data, "q", "raw trade")?
+        };
         let event_time_ms = required_u64(data, "E", "raw trade")?;
         let trade_time_ms = required_u64(data, "T", "raw trade")?;
         let is_buyer_maker = data
@@ -1563,10 +1581,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_trade_zero_price_entry_reuses_strict_validation() {
+    fn raw_trade_zero_price_requires_observed_sentinel_shape() {
         let received_at_ns = 1_700_000_000_100_000_000;
         let mut zero = raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
         zero["data"]["p"] = json!("0");
+        zero["data"]["q"] = json!("0");
+        zero["data"]["X"] = json!("NA");
+        zero["data"]["st"] = json!(1);
         assert!(RawTrade::from_frame(&zero, received_at_ns)
             .unwrap_err()
             .to_string()
@@ -1592,9 +1613,68 @@ mod tests {
             .to_string()
             .contains("not zero"));
 
-        let mut malformed = zero;
+        let mut nonzero_quantity = zero.clone();
+        nonzero_quantity["data"]["q"] = json!("0.25");
+        assert!(RawTrade::from_zero_price_frame(&nonzero_quantity, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("q is not zero"));
+
+        let mut positive_with_zero_quantity = raw_trade_frame(
+            1,
+            1_700_000_000_000,
+            1_700_000_000_000,
+        );
+        positive_with_zero_quantity["data"]["q"] = json!("0");
+        assert!(RawTrade::from_frame(&positive_with_zero_quantity, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("q is not positive"));
+
+        let mut malformed = zero.clone();
         malformed["data"]["q"] = Value::Null;
         assert!(RawTrade::from_zero_price_frame(&malformed, received_at_ns).is_err());
+
+        let mut missing_status = zero.clone();
+        missing_status["data"].as_object_mut().unwrap().remove("st");
+        assert!(RawTrade::from_zero_price_frame(&missing_status, received_at_ns).is_err());
+
+        let mut wrong_status = zero.clone();
+        wrong_status["data"]["st"] = json!(2);
+        assert!(RawTrade::from_zero_price_frame(&wrong_status, received_at_ns).is_err());
+
+        let mut missing_execution = zero.clone();
+        missing_execution["data"].as_object_mut().unwrap().remove("X");
+        assert!(RawTrade::from_zero_price_frame(&missing_execution, received_at_ns).is_err());
+
+        let mut wrong_execution = zero;
+        wrong_execution["data"]["X"] = json!("MARKET");
+        assert!(RawTrade::from_zero_price_frame(&wrong_execution, received_at_ns).is_err());
+    }
+
+    #[test]
+    fn observed_usdm_zero_price_sentinel_shape_is_accepted() {
+        let frame = json!({
+            "stream": "btcusdc@trade",
+            "data": {
+                "e": "trade",
+                "E": 1_786_430_320_180_u64,
+                "s": "BTCUSDC",
+                "t": 553104312_u64,
+                "p": "0",
+                "q": "0",
+                "T": 1_786_430_320_180_u64,
+                "X": "NA",
+                "m": false,
+                "st": 1_u64
+            }
+        });
+        let trade = RawTrade::from_zero_price_frame(&frame, 1_786_430_320_300_000_000)
+            .unwrap();
+        assert_eq!(trade.symbol, "BTCUSDC");
+        assert_eq!(trade.trade_id, 553104312);
+        assert_eq!(trade.price, Decimal::ZERO);
+        assert_eq!(trade.quantity, Decimal::ZERO);
     }
 
     #[test]
