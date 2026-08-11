@@ -233,10 +233,22 @@ impl BinanceRawTradeContinuityVerifier {
             {
                 bail!("raw-trade rows do not share one session_id");
             }
-            if event_type != "raw_trade" {
+            if event_type == "raw_trade_zero_price"
+                && segment.manifest.market != Market::Usdm.as_str()
+            {
+                bail!("market-tape zero-price raw trades are USD-M only");
+            }
+            if !matches!(event_type, "raw_trade" | "raw_trade_zero_price") {
                 continue;
             }
-            let trade = RawTrade::from_archived_event(raw, received_at_ns)?;
+            let trade = if event_type == "raw_trade_zero_price" {
+                RawTrade::from_zero_price_frame(
+                    raw.get("frame").context("raw trade event has no frame")?,
+                    received_at_ns,
+                )?
+            } else {
+                RawTrade::from_archived_event(raw, received_at_ns)?
+            };
             require_symbol(
                 self.symbols.as_ref().expect("initialized above"),
                 &trade.symbol,
@@ -247,9 +259,11 @@ impl BinanceRawTradeContinuityVerifier {
                 received_at_ns,
             )?;
             self.raw_trade_sequence.observe(&trade)?;
-            raw_trade_count = raw_trade_count
-                .checked_add(1)
-                .context("raw-trade count overflow")?;
+            if event_type == "raw_trade" {
+                raw_trade_count = raw_trade_count
+                    .checked_add(1)
+                    .context("raw-trade count overflow")?;
+            }
         }
         if raw_trade_count == 0 {
             bail!("market-tape segment is missing raw trades");
@@ -612,6 +626,22 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                 }
                 "raw_trade" => {
                     let trade = RawTrade::from_archived_event(raw, received_at_ns)?;
+                    require_symbol(&symbols, &trade.symbol)?;
+                    observe_receive_clock(
+                        &mut raw_trade_receive_clocks,
+                        &trade.symbol,
+                        received_at_ns,
+                    )?;
+                    raw_trade_sequence.observe(&trade)?;
+                }
+                "raw_trade_zero_price" => {
+                    if market != Market::Usdm {
+                        bail!("market-tape zero-price raw trades are USD-M only");
+                    }
+                    let trade = RawTrade::from_zero_price_frame(
+                        raw.get("frame").context("raw trade event has no frame")?,
+                        received_at_ns,
+                    )?;
                     require_symbol(&symbols, &trade.symbol)?;
                     observe_receive_clock(
                         &mut raw_trade_receive_clocks,
@@ -1015,7 +1045,7 @@ fn allowed_fields(event_type: &str, schema: &str) -> &'static [&'static str] {
         "session_start" => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards", "websocket_streams"],
         "stream_coverage" => &["schema", "received_at_ns", "type", "session_id", "shards"],
         "snapshot" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "symbol", "request_started_at_ns", "snapshot"],
-        "diff" | "agg_trade" | "raw_trade" | "book_ticker" | "force_order" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
+        "diff" | "agg_trade" | "raw_trade" | "raw_trade_zero_price" | "book_ticker" | "force_order" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
         "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "continuity_complete", "stream_coverage_verified", "bids", "asks", "reason", "replay_safe"],
         _ => unreachable!("event type checked above"),
     }
@@ -1369,6 +1399,13 @@ mod tests {
     #[rustfmt::skip]
     fn raw_trade_row(received_at_ns: u64, id: u64) -> Value {
         json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"raw_trade","session_id":"session-1","frame":{"stream":"btcusdt@trade","data":{"e":"trade","E":received_at_ns/1_000_000,"s":"BTCUSDT","t":id,"p":"100.5","q":"2","T":received_at_ns/1_000_000,"m":false}}})
+    }
+
+    fn zero_raw_trade_row(received_at_ns: u64, id: u64) -> Value {
+        let mut row = raw_trade_row(received_at_ns, id);
+        row["type"] = json!("raw_trade_zero_price");
+        row["frame"]["data"]["p"] = json!("0");
+        row
     }
 
     #[rustfmt::skip]
@@ -2178,6 +2215,127 @@ mod tests {
         assert_eq!(verified.segments()[0].events, event_count);
         assert_eq!(verified.aggregate_trades().len(), 1);
         assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
+    }
+
+    #[test]
+    fn v2_zero_price_raw_trade_is_continuous_but_not_a_valid_trade_surface() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.insert(5, zero_raw_trade_row(START_NS + 330_000_000, 11));
+        rows.insert(6, raw_trade_row(START_NS + 335_000_000, 12));
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["event_types"]["raw_trade"], 2);
+        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
+
+        let mut raw_trade_verifier = BinanceRawTradeContinuityVerifier::default();
+        raw_trade_verifier
+            .observe_segment(seal_binance_market_tape_triplet(&triplet, &anchor).unwrap())
+            .unwrap();
+        let verified =
+            verify_binance_market_tape(vec![
+                seal_binance_market_tape_triplet(&triplet, &anchor).unwrap()
+            ])
+            .unwrap();
+        assert_eq!(verified.segments()[0].events, rows.len() as u64);
+        assert_eq!(verified.aggregate_trades().len(), 1);
+
+        let root = tempdir();
+        let zero_only_rows = vec![zero_raw_trade_row(START_NS, 1)];
+        let (zero_only, zero_only_anchor) =
+            write_triplet_v2(root.path(), &zero_only_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let error = BinanceRawTradeContinuityVerifier::default()
+            .observe_segment(
+                seal_binance_market_tape_triplet(&zero_only, &zero_only_anchor).unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("missing raw trades"));
+    }
+
+    #[test]
+    fn zero_price_raw_trade_is_usdm_v2_only_and_strictly_shaped() {
+        const SPOT_STREAM_TYPES: [&str; 4] = ["depth@100ms", "aggTrade", "trade", "bookTicker"];
+
+        let root = tempdir();
+        let mut spot_rows = valid_v2_rows();
+        spot_rows.retain(|row| row["type"] != "force_order");
+        spot_rows[0]["market"] = json!("spot");
+        spot_rows[0]["stream_types"] = json!(SPOT_STREAM_TYPES);
+        spot_rows.insert(5, zero_raw_trade_row(START_NS + 330_000_000, 11));
+        spot_rows.insert(6, raw_trade_row(START_NS + 335_000_000, 12));
+        let spot_rows = with_stream_coverage_v2(spot_rows, &["BTCUSDT"], &SPOT_STREAM_TYPES);
+        let (spot_triplet, _) =
+            write_triplet_v2(root.path(), &spot_rows, &["BTCUSDT"], &SPOT_STREAM_TYPES);
+        let spot_anchor = rewrite_manifest(&spot_triplet, |manifest| {
+            manifest["market"] = json!("spot");
+        });
+        assert!(
+            verify_binance_market_tape(vec![seal_binance_market_tape_triplet(
+                &spot_triplet,
+                &spot_anchor
+            )
+            .unwrap(),])
+            .unwrap_err()
+            .to_string()
+            .contains("USD-M")
+        );
+
+        let root = tempdir();
+        let mut v1_rows = valid_rows();
+        let mut v1_zero = zero_raw_trade_row(START_NS + 350_000_000, 11);
+        v1_zero["schema"] = json!(MARKET_TAPE_SCHEMA);
+        v1_rows.push(v1_zero);
+        v1_rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        let (v1_triplet, v1_anchor) = write_triplet(root.path(), &v1_rows);
+        assert!(
+            verify_binance_market_tape(vec![seal_binance_market_tape_triplet(
+                &v1_triplet,
+                &v1_anchor
+            )
+            .unwrap(),])
+            .unwrap_err()
+            .to_string()
+            .contains("raw_trade_zero_price")
+        );
+
+        let root = tempdir();
+        let mut negative_rows = valid_v2_rows();
+        let mut negative = zero_raw_trade_row(START_NS + 330_000_000, 11);
+        negative["frame"]["data"]["p"] = json!("-1");
+        negative_rows.insert(5, negative);
+        let (negative_triplet, negative_anchor) =
+            write_triplet_v2(root.path(), &negative_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        assert!(
+            verify_binance_market_tape(vec![seal_binance_market_tape_triplet(
+                &negative_triplet,
+                &negative_anchor
+            )
+            .unwrap(),])
+            .unwrap_err()
+            .to_string()
+            .contains("not positive")
+        );
+
+        let root = tempdir();
+        let mut unknown_rows = valid_v2_rows();
+        let mut unknown = zero_raw_trade_row(START_NS + 330_000_000, 11);
+        unknown["surprise"] = json!(true);
+        unknown_rows.insert(5, unknown);
+        let (unknown_triplet, unknown_anchor) =
+            write_triplet_v2(root.path(), &unknown_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        assert!(
+            verify_binance_market_tape(vec![seal_binance_market_tape_triplet(
+                &unknown_triplet,
+                &unknown_anchor
+            )
+            .unwrap(),])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+        );
     }
 
     #[test]

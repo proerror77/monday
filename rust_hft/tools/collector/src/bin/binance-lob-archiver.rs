@@ -1232,11 +1232,11 @@ async fn run_session(
     drop(sender);
     while let Some(joined) = tasks.join_next().await {
         if let Ok(Ok(TaskExit::Stopped(Some(event)))) = joined {
-            archive_only(&mut segment, &session_id, event)?;
+            archive_only(&mut segment, &session_id, config.market, event)?;
         }
     }
     while let Ok(event) = receiver.try_recv() {
-        archive_only(&mut segment, &session_id, event)?;
+        archive_only(&mut segment, &session_id, config.market, event)?;
     }
     if failure.is_some() {
         segment.mark_replay_unsafe();
@@ -1383,6 +1383,13 @@ fn process_event(
             if !states.contains_key(&trade.symbol) {
                 anyhow::bail!("unconfigured symbol {}", trade.symbol);
             }
+            let zero_price = trade.price == rust_decimal::Decimal::ZERO;
+            if zero_price && config.market != Market::Usdm {
+                anyhow::bail!(
+                    "zero-price raw trade is unsupported for {:?}",
+                    config.market
+                );
+            }
             if let Err(error) = process_state.raw_trades.observe(&trade) {
                 segment.mark_replay_unsafe();
                 process_state.sequence_gaps += 1;
@@ -1399,11 +1406,19 @@ fn process_event(
                 )?;
                 return Err(error);
             }
-            segment.write(
-                "raw_trade",
-                json!({"session_id":session_id,"frame":frame}),
-                trade.received_at_ns,
-            )?;
+            if zero_price {
+                segment.write(
+                    "raw_trade_zero_price",
+                    json!({"session_id":session_id,"frame":frame}),
+                    trade.received_at_ns,
+                )?;
+            } else {
+                segment.write(
+                    "raw_trade",
+                    json!({"session_id":session_id,"frame":frame}),
+                    trade.received_at_ns,
+                )?;
+            }
             let stream_name = format!("{}@trade", trade.symbol.to_ascii_lowercase());
             let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
@@ -1651,7 +1666,12 @@ fn segment_due_at(start_ns: u64, now_ns: u64, segment_seconds: u64) -> anyhow::R
         || segment_partition(start_ns)? != segment_partition(now_ns)?)
 }
 
-fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow::Result<()> {
+fn archive_only(
+    segment: &mut Segment,
+    session_id: &str,
+    market: Market,
+    event: Event,
+) -> anyhow::Result<()> {
     if !matches!(
         &event,
         Event::InitialSnapshotsComplete | Event::StreamCoverageVerified { .. }
@@ -1673,11 +1693,25 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
             trade.received_at_ns,
         ),
-        Event::RawTrade { trade, frame } => segment.write(
-            "raw_trade",
-            json!({"session_id":session_id,"archived_only":true,"frame":frame}),
-            trade.received_at_ns,
-        ),
+        Event::RawTrade { trade, frame } => {
+            if trade.price == rust_decimal::Decimal::ZERO {
+                anyhow::ensure!(
+                    market == Market::Usdm,
+                    "zero-price raw trade is unsupported for {:?}",
+                    market
+                );
+                return segment.write(
+                    "raw_trade_zero_price",
+                    json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+                    trade.received_at_ns,
+                );
+            }
+            segment.write(
+                "raw_trade",
+                json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+                trade.received_at_ns,
+            )
+        }
         Event::BookTicker { ticker, frame } => segment.write(
             "book_ticker",
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
@@ -2598,7 +2632,13 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
         return Ok(Event::AggregateTrade { trade, frame });
     }
     if channel.eq_ignore_ascii_case("trade") {
-        let trade = RawTrade::from_frame(&frame, received_at_ns)?;
+        let trade = match RawTrade::from_frame(&frame, received_at_ns) {
+            Ok(trade) => trade,
+            Err(error) => match RawTrade::from_zero_price_frame(&frame, received_at_ns) {
+                Ok(trade) => trade,
+                Err(_) => return Err(error),
+            },
+        };
         return Ok(Event::RawTrade { trade, frame });
     }
     if channel.eq_ignore_ascii_case("bookTicker") {
@@ -5606,6 +5646,98 @@ mod tests {
         assert!(error.to_string().contains("raw trade gap"));
         assert_eq!(segment.event_count("sequence_gap"), 1);
         assert!(!segment.is_replay_safe());
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_price_raw_trade_is_audited_without_restarting_or_entering_the_tape() {
+        let root = env::temp_dir().join(format!(
+            "monday-binance-zero-price-raw-trade-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.spool_dir = root.clone();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+
+        let received_at_ns = now_ns().unwrap();
+        let mut zero_price = raw_trade_frame(9, received_at_ns);
+        zero_price["data"]["p"] = json!("0");
+        let event = event_from_frame(zero_price, received_at_ns).unwrap();
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                event,
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert_eq!(segment.event_count("raw_trade"), 0);
+        assert_eq!(segment.event_count("raw_trade_zero_price"), 1);
+
+        let received_at_ns = now_ns().unwrap();
+        let mut negative_price = raw_trade_frame(10, received_at_ns);
+        negative_price["data"]["p"] = json!("-1");
+        assert!(event_from_frame(negative_price, received_at_ns).is_err());
+
+        let received_at_ns = now_ns().unwrap();
+        let event = event_from_frame(raw_trade_frame(10, received_at_ns), received_at_ns).unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            event,
+            &mut process_state,
+        )
+        .unwrap();
+        assert_eq!(segment.event_count("raw_trade"), 1);
+
+        let received_at_ns = now_ns().unwrap();
+        let mut archived_only_zero = raw_trade_frame(11, received_at_ns);
+        archived_only_zero["data"]["p"] = json!("0");
+        archive_only(
+            &mut segment,
+            "session-1",
+            config.market,
+            event_from_frame(archived_only_zero, received_at_ns).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(segment.event_count("raw_trade_zero_price"), 2);
+
+        let received_at_ns = now_ns().unwrap();
+        let mut spot_zero = raw_trade_frame(12, received_at_ns);
+        spot_zero["data"]["p"] = json!("0");
+        let error = archive_only(
+            &mut segment,
+            "session-1",
+            Market::Spot,
+            event_from_frame(spot_zero, received_at_ns).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("zero-price raw trade is unsupported"));
+        assert_eq!(segment.event_count("raw_trade_zero_price"), 2);
+
+        let received_at_ns = now_ns().unwrap();
+        let mut malformed = raw_trade_frame(13, received_at_ns);
+        malformed["data"]["p"] = json!("0");
+        malformed["data"]["q"] = Value::Null;
+        assert!(event_from_frame(malformed, received_at_ns).is_err());
+
         drop(segment);
         std::fs::remove_dir_all(root).unwrap();
     }
