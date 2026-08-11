@@ -175,6 +175,121 @@ impl StreamShard {
     }
 }
 
+const UNKNOWN_ELAPSED_MS: u64 = u64::MAX;
+
+#[derive(Debug)]
+struct ProducerDiagnosticState {
+    producer_id: usize,
+    url: String,
+    streams: Vec<String>,
+    last_received_ms: AtomicU64,
+    last_enqueued_ms: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProducerDiagnosticSnapshot {
+    producer_id: usize,
+    url: String,
+    streams: Vec<String>,
+    frame_age_ms: Option<u64>,
+    enqueued_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ProducerDiagnostics {
+    producers: RwLock<Vec<ProducerDiagnosticState>>,
+}
+
+impl ProducerDiagnostics {
+    #[cfg(test)]
+    fn new(shards: &[StreamShard]) -> Self {
+        Self {
+            producers: RwLock::new(
+                shards
+                    .iter()
+                    .enumerate()
+                    .map(|(producer_id, shard)| ProducerDiagnosticState {
+                        producer_id,
+                        url: shard.url.clone(),
+                        streams: shard.streams.iter().cloned().collect(),
+                        last_received_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+                        last_enqueued_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn reset(&self, shards: &[StreamShard]) {
+        let mut producers = self
+            .producers
+            .write()
+            .expect("producer diagnostics lock poisoned");
+        *producers = shards
+            .iter()
+            .enumerate()
+            .map(|(producer_id, shard)| ProducerDiagnosticState {
+                producer_id,
+                url: shard.url.clone(),
+                streams: shard.streams.iter().cloned().collect(),
+                last_received_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+                last_enqueued_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+            })
+            .collect();
+    }
+
+    fn mark_received_at(&self, producer_id: usize, elapsed_ms: u64) {
+        if let Some(producer) = self
+            .producers
+            .read()
+            .expect("producer diagnostics lock poisoned")
+            .get(producer_id)
+        {
+            producer
+                .last_received_ms
+                .store(elapsed_ms, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_enqueued_at(&self, producer_id: usize, elapsed_ms: u64) {
+        if let Some(producer) = self
+            .producers
+            .read()
+            .expect("producer diagnostics lock poisoned")
+            .get(producer_id)
+        {
+            producer
+                .last_enqueued_ms
+                .store(elapsed_ms, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot_at(&self, now_ms: u64) -> Vec<ProducerDiagnosticSnapshot> {
+        self.producers
+            .read()
+            .expect("producer diagnostics lock poisoned")
+            .iter()
+            .map(|producer| ProducerDiagnosticSnapshot {
+                producer_id: producer.producer_id,
+                url: producer.url.clone(),
+                streams: producer.streams.clone(),
+                frame_age_ms: elapsed_age(
+                    producer.last_received_ms.load(Ordering::Relaxed),
+                    now_ms,
+                ),
+                enqueued_age_ms: elapsed_age(
+                    producer.last_enqueued_ms.load(Ordering::Relaxed),
+                    now_ms,
+                ),
+            })
+            .collect()
+    }
+}
+
+fn elapsed_age(last_elapsed_ms: u64, now_elapsed_ms: u64) -> Option<u64> {
+    (last_elapsed_ms != UNKNOWN_ELAPSED_MS).then(|| now_elapsed_ms.saturating_sub(last_elapsed_ms))
+}
+
 #[derive(Debug)]
 struct SpoolLock {
     _file: std::fs::File,
@@ -663,6 +778,11 @@ struct ProcessWatchdog {
 struct ProcessWatchdogInner {
     started: Instant,
     last_data_ms: AtomicU64,
+    last_processed_ms: AtomicU64,
+    queue_capacity: AtomicU64,
+    queue_remaining_capacity: AtomicU64,
+    queue_saturated: AtomicU8,
+    producer_diagnostics: Arc<ProducerDiagnostics>,
     state: AtomicU8,
 }
 
@@ -676,18 +796,31 @@ enum ProcessWatchdogState {
 }
 
 impl ProcessWatchdog {
+    #[cfg(test)]
     fn new_state() -> Self {
+        Self::new_with_diagnostics(Arc::new(ProducerDiagnostics::default()))
+    }
+
+    fn new_with_diagnostics(producer_diagnostics: Arc<ProducerDiagnostics>) -> Self {
         Self {
             inner: Arc::new(ProcessWatchdogInner {
                 started: Instant::now(),
                 last_data_ms: AtomicU64::new(0),
+                last_processed_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+                queue_capacity: AtomicU64::new(0),
+                queue_remaining_capacity: AtomicU64::new(0),
+                queue_saturated: AtomicU8::new(0),
+                producer_diagnostics,
                 state: AtomicU8::new(ProcessWatchdogState::Disarmed as u8),
             }),
         }
     }
 
-    fn start(timeout: Duration) -> anyhow::Result<Self> {
-        let watchdog = Self::new_state();
+    fn start(
+        timeout: Duration,
+        producer_diagnostics: Arc<ProducerDiagnostics>,
+    ) -> anyhow::Result<Self> {
+        let watchdog = Self::new_with_diagnostics(producer_diagnostics);
         let monitor = watchdog.clone();
         thread::Builder::new()
             .name("binance-lob-process-watchdog".into())
@@ -700,10 +833,35 @@ impl ProcessWatchdog {
                     let now_ms = monitor.elapsed_ms();
                     if monitor.try_begin_exit_at(now_ms, timeout) {
                         let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
+                        let processed_age_ms = elapsed_age(
+                            monitor.inner.last_processed_ms.load(Ordering::Relaxed),
+                            now_ms,
+                        );
+                        let queue_capacity = monitor.inner.queue_capacity.load(Ordering::Relaxed);
+                        let queue_remaining_capacity = monitor
+                            .inner
+                            .queue_remaining_capacity
+                            .load(Ordering::Relaxed);
+                        let queue_saturated =
+                            monitor.inner.queue_saturated.load(Ordering::Relaxed) != 0;
                         error!(
                             silent_ms = now_ms.saturating_sub(last_ms),
+                            processed_age_ms = ?processed_age_ms,
+                            queue_capacity,
+                            queue_remaining_capacity,
+                            queue_saturated,
                             "process watchdog exiting after market-data stall"
                         );
+                        for producer in monitor.inner.producer_diagnostics.snapshot_at(now_ms) {
+                            error!(
+                                producer_id = producer.producer_id,
+                                url = %producer.url,
+                                streams = ?producer.streams,
+                                frame_age_ms = ?producer.frame_age_ms,
+                                enqueued_age_ms = ?producer.enqueued_age_ms,
+                                "process watchdog producer diagnostic"
+                            );
+                        }
                         std::process::exit(75);
                     }
                 }
@@ -717,6 +875,45 @@ impl ProcessWatchdog {
         self.inner
             .last_data_ms
             .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn mark_data_for(&self, producer_id: usize) {
+        let elapsed_ms = self.elapsed_ms();
+        self.inner.last_data_ms.store(elapsed_ms, Ordering::Relaxed);
+        self.inner
+            .producer_diagnostics
+            .mark_received_at(producer_id, elapsed_ms);
+    }
+
+    fn mark_enqueued_for(&self, producer_id: usize) {
+        self.inner
+            .producer_diagnostics
+            .mark_enqueued_at(producer_id, self.elapsed_ms());
+    }
+
+    fn mark_processed(&self) {
+        self.inner
+            .last_processed_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn record_queue_health(&self, queue: QueueHealth) {
+        self.inner
+            .queue_capacity
+            .store(queue.capacity as u64, Ordering::Relaxed);
+        self.inner
+            .queue_remaining_capacity
+            .store(queue.remaining_capacity as u64, Ordering::Relaxed);
+        self.inner
+            .queue_saturated
+            .store(queue.saturated as u8, Ordering::Relaxed);
+    }
+
+    fn reset_session_diagnostics(&self, stream_shards: &[StreamShard]) {
+        self.inner.producer_diagnostics.reset(stream_shards);
+        self.inner
+            .last_processed_ms
+            .store(UNKNOWN_ELAPSED_MS, Ordering::Relaxed);
     }
 
     fn arm(&self) -> bool {
@@ -853,7 +1050,8 @@ async fn main() -> anyhow::Result<()> {
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
     }
-    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
+    let producer_diagnostics = Arc::new(ProducerDiagnostics::default());
+    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout, producer_diagnostics)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
     let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone(), watchdog.clone()));
@@ -979,6 +1177,7 @@ async fn run_session(
         anyhow::bail!("no active symbols remain after runtime exclusions");
     }
     let stream_shards = config.stream_shards();
+    watchdog.reset_session_diagnostics(&stream_shards);
     let high_rate_shards = stream_shards
         .iter()
         .filter(|shard| shard.is_high_rate())
@@ -987,6 +1186,7 @@ async fn run_session(
         .max_buffered_diffs
         .saturating_add(high_rate_shards.saturating_mul(HIGH_RATE_SHARD_QUEUE_BACKLOG));
     let (sender, mut receiver) = mpsc::channel(queue_capacity);
+    watchdog.record_queue_health(QueueHealth::from_sender(&sender));
     let (rotation_pause_tx, rotation_pause_rx) = watch::channel(0_u64);
     let (rotation_resume_tx, rotation_resume_rx) = watch::channel(0_u64);
     let mut rotation_epoch = 0_u64;
@@ -1069,6 +1269,8 @@ async fn run_session(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
                             &mut process_state,
                         )?;
+                        watchdog.mark_processed();
+                        watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     }
                     Some(Ok(Ok(TaskExit::Stopped(None)))) if *session_stop_rx.borrow() => {},
                     Some(Ok(Ok(TaskExit::Stopped(None)))) => {
@@ -1099,6 +1301,8 @@ async fn run_session(
                                 break;
                             }
                         }
+                        watchdog.mark_processed();
+                        watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     }
                     None => {
                         failure = Some(anyhow::anyhow!("archive queue closed"));
@@ -1150,6 +1354,7 @@ async fn run_session(
                 &mut process_state,
                 expected_rotation_producers,
                 rotation_epoch,
+                Some(&watchdog),
             )
             .await
             {
@@ -1211,6 +1416,7 @@ async fn run_session(
         }
 
         if last_health.elapsed() >= Duration::from_secs(30) {
+            watchdog.record_queue_health(QueueHealth::from_sender(&sender));
             let status =
                 if !process_state.streams_healthy() || !process_state.depth_streams_healthy() {
                     "reconnecting"
@@ -1650,6 +1856,7 @@ async fn await_rotation_barriers(
     process_state: &mut ProcessState,
     expected_producers: usize,
     epoch: u64,
+    watchdog: Option<&ProcessWatchdog>,
 ) -> anyhow::Result<RotationBarrierResult> {
     let acknowledgement_timeout = config
         .stall_timeout
@@ -1674,6 +1881,9 @@ async fn await_rotation_barriers(
                             event,
                             process_state,
                         )?;
+                        if let Some(watchdog) = watchdog {
+                            watchdog.mark_processed();
+                        }
                         return Err(anyhow::anyhow!(
                             "collector producer stopped unexpectedly while awaiting segment rotation barrier"
                         ));
@@ -1714,6 +1924,9 @@ async fn await_rotation_barriers(
                     acknowledged.insert(producer_id),
                     "duplicate rotation barrier from producer {producer_id} for epoch {epoch}"
                 );
+                if let Some(watchdog) = watchdog {
+                    watchdog.mark_processed();
+                }
             }
             event => {
                 let action = process_event(
@@ -1725,6 +1938,9 @@ async fn await_rotation_barriers(
                     event,
                     process_state,
                 )?;
+                if let Some(watchdog) = watchdog {
+                    watchdog.mark_processed();
+                }
                 if action.restarts_capture_session() {
                     return Ok(RotationBarrierResult::RestartSession);
                 }
@@ -2435,7 +2651,7 @@ async fn receive_url(
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data();
+                watchdog.mark_data_for(producer_id);
                 let frame: Value = serde_json::from_str(&text)?;
                 if frame.get("id").and_then(Value::as_u64) == Some(SUBSCRIPTION_PROOF_ID) {
                     let listed = validate_subscription_listing(&frame, &shard.streams)?;
@@ -2459,8 +2675,12 @@ async fn receive_url(
                         coverage_announced = true;
                     }
                     for event in proof_events.drain(..) {
+                        watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                         match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                            SendOutcome::Sent => {}
+                            SendOutcome::Sent => {
+                                watchdog.mark_enqueued_for(producer_id);
+                                watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+                            }
                             SendOutcome::Shutdown(event) => {
                                 return Ok(TaskExit::Stopped(Some(event)));
                             }
@@ -2478,13 +2698,17 @@ async fn receive_url(
                     }
                     proof_events.push(event);
                 } else {
+                    watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     match receive_before_subscription_proof_deadline(
                         subscription_proof_deadline,
                         send_or_shutdown(&sender, event, &mut shutdown),
                     )
                     .await??
                     {
-                        SendOutcome::Sent => {}
+                        SendOutcome::Sent => {
+                            watchdog.mark_enqueued_for(producer_id);
+                            watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+                        }
                         SendOutcome::Shutdown(event) => {
                             return Ok(TaskExit::Stopped(Some(event)));
                         }
@@ -2561,14 +2785,18 @@ async fn receive_url(
             // Complete-message delivery from Tungstenite in userspace; not kernel or NIC RX.
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
-                watchdog.mark_data();
+                watchdog.mark_data_for(producer_id);
                 let event = event_from_frame_for_shard(
                     serde_json::from_str(&text)?,
                     received_at_ns,
                     producer_id,
                 )?;
+                watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                    SendOutcome::Sent => {}
+                    SendOutcome::Sent => {
+                        watchdog.mark_enqueued_for(producer_id);
+                        watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+                    }
                     SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
                 }
             }
@@ -7329,6 +7557,130 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn producer_watchdog_diagnostics_identify_stale_producer() {
+        let shards = vec![
+            StreamShard {
+                url: "wss://first".into(),
+                streams: BTreeSet::from(["btcusdt@trade".into()]),
+            },
+            StreamShard {
+                url: "wss://second".into(),
+                streams: BTreeSet::from(["ethusdt@trade".into()]),
+            },
+        ];
+        let diagnostics = ProducerDiagnostics::new(&shards);
+        diagnostics.mark_received_at(0, 900);
+        diagnostics.mark_enqueued_at(0, 910);
+        diagnostics.mark_received_at(1, 100);
+        diagnostics.mark_enqueued_at(1, 110);
+
+        let snapshots = diagnostics.snapshot_at(1_000);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].producer_id, 0);
+        assert_eq!(snapshots[0].url, "wss://first");
+        assert_eq!(snapshots[0].streams, vec!["btcusdt@trade"]);
+        assert_eq!(snapshots[0].frame_age_ms, Some(100));
+        assert_eq!(snapshots[0].enqueued_age_ms, Some(90));
+        assert_eq!(snapshots[1].producer_id, 1);
+        assert_eq!(snapshots[1].url, "wss://second");
+        assert_eq!(snapshots[1].frame_age_ms, Some(900));
+        assert_eq!(snapshots[1].enqueued_age_ms, Some(890));
+    }
+
+    #[test]
+    fn producer_watchdog_diagnostics_refresh_metadata_per_session() {
+        let first = vec![StreamShard {
+            url: "wss://first".into(),
+            streams: BTreeSet::from(["btcusdt@trade".into()]),
+        }];
+        let second = vec![StreamShard {
+            url: "wss://second".into(),
+            streams: BTreeSet::from(["ethusdt@bookTicker".into()]),
+        }];
+        let diagnostics = ProducerDiagnostics::new(&first);
+        diagnostics.mark_received_at(0, 100);
+        diagnostics.reset(&second);
+
+        let snapshots = diagnostics.snapshot_at(250);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].url, "wss://second");
+        assert_eq!(snapshots[0].streams, vec!["ethusdt@bookTicker"]);
+        assert_eq!(snapshots[0].frame_age_ms, None);
+        assert_eq!(snapshots[0].enqueued_age_ms, None);
+    }
+
+    #[test]
+    fn producer_watchdog_diagnostics_expose_queue_full_after_enqueue() {
+        let shards = vec![StreamShard {
+            url: "wss://first".into(),
+            streams: BTreeSet::from(["btcusdt@trade".into()]),
+        }];
+        let diagnostics = ProducerDiagnostics::new(&shards);
+        diagnostics.mark_received_at(0, 100);
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(()).unwrap();
+
+        let watchdog = ProcessWatchdog::new_state();
+        watchdog.record_queue_health(QueueHealth::from_sender(&sender));
+        let snapshots = diagnostics.snapshot_at(250);
+        assert_eq!(snapshots[0].frame_age_ms, Some(150));
+        assert_eq!(snapshots[0].enqueued_age_ms, None);
+        let queue = QueueHealth::from_sender(&sender);
+        assert_eq!(queue.remaining_capacity, 0);
+        assert!(queue.saturated);
+        assert_eq!(
+            watchdog
+                .inner
+                .queue_remaining_capacity
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(watchdog.inner.queue_saturated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn process_watchdog_reset_preserves_unknown_processed_age() {
+        let watchdog = ProcessWatchdog::new_state();
+        assert_eq!(
+            watchdog.inner.last_processed_ms.load(Ordering::Relaxed),
+            UNKNOWN_ELAPSED_MS
+        );
+        watchdog.mark_processed();
+        assert_ne!(
+            watchdog.inner.last_processed_ms.load(Ordering::Relaxed),
+            UNKNOWN_ELAPSED_MS
+        );
+        watchdog.reset_session_diagnostics(&[]);
+        assert_eq!(
+            watchdog.inner.last_processed_ms.load(Ordering::Relaxed),
+            UNKNOWN_ELAPSED_MS
+        );
+        assert_eq!(elapsed_age(UNKNOWN_ELAPSED_MS, 250), None);
+    }
+
+    #[test]
+    fn producer_watchdog_diagnostics_keep_all_silent_producers_visible() {
+        let shards = vec![
+            StreamShard {
+                url: "wss://first".into(),
+                streams: BTreeSet::from(["btcusdt@trade".into()]),
+            },
+            StreamShard {
+                url: "wss://second".into(),
+                streams: BTreeSet::from(["ethusdt@trade".into()]),
+            },
+        ];
+        let snapshots = ProducerDiagnostics::new(&shards).snapshot_at(1_000);
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.frame_age_ms.is_none()));
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.enqueued_age_ms.is_none()));
+    }
+
     fn armed_watchdog() -> ProcessWatchdog {
         let watchdog = ProcessWatchdog::new_state();
         watchdog.inner.last_data_ms.store(1_000, Ordering::Relaxed);
@@ -8314,6 +8666,7 @@ mod tests {
                 &mut process_state,
                 1,
                 1,
+                None,
             ),
         )
         .await
@@ -8379,6 +8732,7 @@ mod tests {
                 &mut process_state,
                 1,
                 1,
+                None,
             ),
         )
         .await
