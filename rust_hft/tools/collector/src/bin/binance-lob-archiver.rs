@@ -16,7 +16,7 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, sha256_file, write_health,
     write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
-    QueueHealth, Segment, SegmentConfig, SendOutcome, UploadStatus, RAW_SCHEMA,
+    QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, UploadStatus, RAW_SCHEMA,
 };
 use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
@@ -1248,6 +1248,7 @@ async fn run_session(
     let mut last_health = Instant::now() - Duration::from_secs(60);
     let mut failure = None;
     let mut sync_deadline = None;
+    let mut pending_segment_finalizer = None;
 
     loop {
         let mut pending_action = ProcessAction::None;
@@ -1265,10 +1266,16 @@ async fn run_session(
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
-                        pending_action = process_event(
+                        match process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
                             &mut process_state,
-                        )?;
+                        ) {
+                            Ok(action) => pending_action = action,
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
                         watchdog.mark_processed();
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     }
@@ -1325,9 +1332,31 @@ async fn run_session(
             }
         }
 
+        if let Err(error) = poll_finished_segment_finalizer(&mut pending_segment_finalizer).await {
+            failure = Some(error);
+            break;
+        }
+
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
-        if segment_due(&segment, config.segment_seconds)? {
+        let segment_is_due = match segment_due(&segment, config.segment_seconds) {
+            Ok(is_due) => is_due,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        };
+        if segment_is_due
+            && pending_segment_finalizer
+                .as_ref()
+                .is_none_or(|finalizer| finalizer.is_finished())
+        {
+            if let Err(error) =
+                collect_pending_segment_finalizer(&mut pending_segment_finalizer).await
+            {
+                failure = Some(error);
+                break;
+            }
             // Each producer emits its barrier after every event whose receive
             // timestamp it has already captured on that producer's sender.
             rotation_epoch = match rotation_epoch.checked_add(1) {
@@ -1392,15 +1421,12 @@ async fn run_session(
                     break;
                 }
             };
-            if let Err(error) = finish_segment_rotation(
+            pending_segment_finalizer = Some(finish_segment_rotation(
                 &mut segment,
                 next_segment,
                 &rotation_resume_tx,
                 rotation_epoch,
-            ) {
-                failure = Some(error);
-                break;
-            }
+            ));
         }
 
         if states.values().all(|state| state.synced) {
@@ -1425,17 +1451,27 @@ async fn run_session(
                 } else {
                     "syncing"
                 };
-            write_health(
+            let manifest_count = match files_with_suffix(&config.spool_dir, ".manifest.json") {
+                Ok(manifests) => manifests.len(),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            if let Err(error) = write_health(
                 &config.spool_dir,
                 config.market,
                 &config.dataset,
                 &session_id,
                 status,
                 process_state.sequence_gaps,
-                files_with_suffix(&config.spool_dir, ".manifest.json")?.len(),
+                manifest_count,
                 QueueHealth::from_sender(&sender),
                 &states,
-            )?;
+            ) {
+                failure = Some(error);
+                break;
+            }
             last_health = Instant::now();
         }
     }
@@ -1443,6 +1479,13 @@ async fn run_session(
     let _ = session_stop_tx.send(true);
     let final_queue_health = QueueHealth::from_sender(&sender);
     drop(sender);
+    if let Err(error) = collect_pending_segment_finalizer(&mut pending_segment_finalizer).await {
+        if failure.is_none() {
+            failure = Some(error);
+        } else {
+            error!(error = %error, "scheduled segment finalizer failed during shutdown");
+        }
+    }
     while let Some(joined) = tasks.join_next().await {
         if let Ok(Ok(TaskExit::Stopped(Some(event)))) = joined {
             archive_only(&mut segment, &session_id, config.market, event)?;
@@ -2170,38 +2213,52 @@ fn begin_segment_rotation(
     Ok(next)
 }
 
+type SegmentFinalizer = tokio::task::JoinHandle<anyhow::Result<Option<SegmentArtifacts>>>;
+
+fn spawn_segment_finalizer<F>(finalizer: F) -> SegmentFinalizer
+where
+    F: FnOnce() -> anyhow::Result<Option<SegmentArtifacts>> + Send + 'static,
+{
+    tokio::task::spawn_blocking(finalizer)
+}
+
+async fn collect_segment_finalizer(finalizer: SegmentFinalizer) -> anyhow::Result<()> {
+    finalizer
+        .await
+        .context("scheduled segment finalizer task failed")??;
+    Ok(())
+}
+
+async fn collect_pending_segment_finalizer(
+    pending: &mut Option<SegmentFinalizer>,
+) -> anyhow::Result<()> {
+    if let Some(finalizer) = pending.take() {
+        collect_segment_finalizer(finalizer).await?;
+    }
+    Ok(())
+}
+
+async fn poll_finished_segment_finalizer(
+    pending: &mut Option<SegmentFinalizer>,
+) -> anyhow::Result<()> {
+    if pending
+        .as_ref()
+        .is_some_and(|finalizer| finalizer.is_finished())
+    {
+        collect_pending_segment_finalizer(pending).await?;
+    }
+    Ok(())
+}
+
 fn finish_segment_rotation(
     segment: &mut Segment,
     next_segment: Segment,
     rotation_resume_tx: &watch::Sender<u64>,
     rotation_epoch: u64,
-) -> anyhow::Result<()> {
+) -> SegmentFinalizer {
     let closing_segment = std::mem::replace(segment, next_segment);
     let _ = rotation_resume_tx.send(rotation_epoch);
-    closing_segment.close()?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn rotate_segment(
-    segment: Segment,
-    config: &Config,
-    states: &HashMap<String, OrderBookState>,
-    session_id: &str,
-    reason: &str,
-    process_state: &ProcessState,
-) -> anyhow::Result<Segment> {
-    let mut closing_segment = segment;
-    let next = begin_segment_rotation(
-        &mut closing_segment,
-        config,
-        states,
-        session_id,
-        reason,
-        process_state,
-    )?;
-    closing_segment.close()?;
-    Ok(next)
+    spawn_segment_finalizer(move || closing_segment.close())
 }
 
 fn replay_checkpoint_ready(
@@ -8079,8 +8136,8 @@ mod tests {
         assert_eq!(eth_checkpoint["replay_safe"], true);
     }
 
-    #[test]
-    fn unseeded_rotation_stays_replay_unsafe_after_later_trade() {
+    #[tokio::test]
+    async fn unseeded_rotation_stays_replay_unsafe_after_later_trade() {
         let root = tempfile::Builder::new()
             .prefix("monday-unseeded-rotation-test-")
             .tempdir()
@@ -8115,8 +8172,9 @@ mod tests {
         let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
         let process_state = trusted_process_state(&config.symbols);
         let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut next = rotate_segment(
-            segment,
+        let mut closing_segment = segment;
+        let next_segment = begin_segment_rotation(
+            &mut closing_segment,
             &config,
             &states,
             "session-1",
@@ -8124,6 +8182,15 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        let (resume_tx, _resume_rx) = watch::channel(0_u64);
+        let finalizer = finish_segment_rotation(
+            &mut closing_segment,
+            next_segment,
+            &resume_tx,
+            1,
+        );
+        collect_segment_finalizer(finalizer).await.unwrap();
+        let mut next = closing_segment;
 
         let mut process_state = process_state;
         archive_first_btc_aggregate_trade(
@@ -8221,8 +8288,8 @@ mod tests {
         assert_eq!(manifest["has_replay_safe_checkpoint"], false);
     }
 
-    #[test]
-    fn scheduled_rotation_seeds_but_sequence_gap_does_not() {
+    #[tokio::test]
+    async fn scheduled_rotation_seeds_but_sequence_gap_does_not() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -8272,8 +8339,9 @@ mod tests {
             &mut process_state,
         );
 
-        let mut next = rotate_segment(
-            segment,
+        let mut closing_segment = segment;
+        let next_segment = begin_segment_rotation(
+            &mut closing_segment,
             &config,
             &states,
             "session-1",
@@ -8281,6 +8349,15 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        let (resume_tx, _resume_rx) = watch::channel(0_u64);
+        let finalizer = finish_segment_rotation(
+            &mut closing_segment,
+            next_segment,
+            &resume_tx,
+            1,
+        );
+        collect_segment_finalizer(finalizer).await.unwrap();
+        let mut next = closing_segment;
         let next_start_ns = next.start_ns;
         let received_at_ns = now_ns().unwrap();
         let event_time_ms = received_at_ns / 1_000_000;
@@ -8335,8 +8412,9 @@ mod tests {
             11,
         );
         process_state.sequence_gaps = 1;
-        let after_gap = rotate_segment(
-            gap_segment,
+        let mut closing_gap_segment = gap_segment;
+        let next_gap_segment = begin_segment_rotation(
+            &mut closing_gap_segment,
             &config,
             &states,
             "session-1",
@@ -8344,6 +8422,14 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        let finalizer = finish_segment_rotation(
+            &mut closing_gap_segment,
+            next_gap_segment,
+            &resume_tx,
+            2,
+        );
+        collect_segment_finalizer(finalizer).await.unwrap();
+        let after_gap = closing_gap_segment;
         let gap_artifacts = close_segment(
             after_gap,
             &config,
@@ -8367,8 +8453,8 @@ mod tests {
             .any(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open"));
     }
 
-    #[test]
-    fn post_warmup_rotation_can_seed_after_an_incomplete_segment() {
+    #[tokio::test]
+    async fn post_warmup_rotation_can_seed_after_an_incomplete_segment() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -8392,8 +8478,9 @@ mod tests {
 
         // The first rotation occurs before snapshots complete, so its output
         // remains replay-unsafe and the next segment starts without a seed.
-        let mut next = rotate_segment(
-            segment,
+        let mut closing_segment = segment;
+        let next_segment = begin_segment_rotation(
+            &mut closing_segment,
             &config,
             &states,
             "session-1",
@@ -8401,6 +8488,15 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        let (resume_tx, _resume_rx) = watch::channel(0_u64);
+        let finalizer = finish_segment_rotation(
+            &mut closing_segment,
+            next_segment,
+            &resume_tx,
+            1,
+        );
+        collect_segment_finalizer(finalizer).await.unwrap();
+        let mut next = closing_segment;
         assert!(!next.is_replay_safe());
         let state = states.get_mut("BTCUSDT").unwrap();
         state
@@ -8434,8 +8530,9 @@ mod tests {
             &mut process_state,
         );
 
-        let mut seeded = rotate_segment(
-            next,
+        let mut closing_next = next;
+        let seeded_segment = begin_segment_rotation(
+            &mut closing_next,
             &config,
             &states,
             "session-1",
@@ -8443,6 +8540,14 @@ mod tests {
             &process_state,
         )
         .unwrap();
+        let finalizer = finish_segment_rotation(
+            &mut closing_next,
+            seeded_segment,
+            &resume_tx,
+            2,
+        );
+        collect_segment_finalizer(finalizer).await.unwrap();
+        let mut seeded = closing_next;
         let seeded_start_ns = seeded.start_ns;
         let received_at_ns = now_ns().unwrap();
         let event_time_ms = received_at_ns / 1_000_000;
@@ -8741,8 +8846,8 @@ mod tests {
         assert!(tasks.is_empty());
     }
 
-    #[test]
-    fn failed_rotation_close_leaves_next_segment_for_shutdown() {
+    #[tokio::test]
+    async fn failed_rotation_close_leaves_next_segment_for_shutdown() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
         config.spool_dir = root.path().to_path_buf();
@@ -8762,11 +8867,109 @@ mod tests {
         let next_segment = Segment::create(config.segment_config(), start_ns + 1).unwrap();
         let (resume_tx, mut resume_rx) = watch::channel(0_u64);
 
-        assert!(finish_segment_rotation(&mut segment, next_segment, &resume_tx, 1).is_err());
+        let finalizer = finish_segment_rotation(&mut segment, next_segment, &resume_tx, 1);
         assert_eq!(*resume_rx.borrow_and_update(), 1);
+        assert!(collect_segment_finalizer(finalizer).await.is_err());
 
         segment.mark_replay_unsafe();
         assert!(segment.close().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduled_finalizer_does_not_block_async_health_tick() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let finalizer = spawn_segment_finalizer(move || {
+            release_rx
+                .recv()
+                .expect("release blocked scheduled finalizer");
+            Ok(None)
+        });
+
+        let health_tick = tokio::spawn(async {
+            for _ in 0..2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_millis(250), health_tick)
+            .await
+            .expect("blocked finalizer stalled async health progress")
+            .expect("health tick task panicked");
+        assert!(!finalizer.is_finished());
+
+        release_tx
+            .send(())
+            .expect("scheduled finalizer receiver still live");
+        collect_segment_finalizer(finalizer)
+            .await
+            .expect("released scheduled finalizer must complete");
+    }
+
+    #[tokio::test]
+    async fn scheduled_finalizer_error_is_fail_closed() {
+        let finalizer = spawn_segment_finalizer(|| {
+            Err(anyhow::anyhow!("scheduled finalizer test failure"))
+        });
+        let error = collect_segment_finalizer(finalizer)
+            .await
+            .expect_err("scheduled finalizer errors must fail closed");
+        assert!(error.to_string().contains("scheduled finalizer test failure"));
+    }
+
+    #[tokio::test]
+    async fn finished_scheduled_finalizer_error_is_polled_without_waiting_for_rotation() {
+        let finalizer = spawn_segment_finalizer(|| {
+            Err(anyhow::anyhow!("completed scheduled finalizer failure"))
+        });
+        let mut pending = Some(finalizer);
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !pending
+                .as_ref()
+                .expect("scheduled finalizer remains pending")
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduled finalizer did not complete promptly");
+
+        let error = poll_finished_segment_finalizer(&mut pending)
+            .await
+            .expect_err("completed finalizer error must fail closed at the next poll");
+        assert!(error
+            .to_string()
+            .contains("completed scheduled finalizer failure"));
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_collects_pending_scheduled_finalizer_before_return() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let completed = Arc::new(AtomicU64::new(0));
+        let completed_in_finalizer = completed.clone();
+        let finalizer = spawn_segment_finalizer(move || {
+            release_rx
+                .recv()
+                .expect("release pending shutdown finalizer");
+            completed_in_finalizer.store(1, Ordering::Release);
+            Ok(None)
+        });
+        let mut pending = Some(finalizer);
+        let collection = tokio::spawn(async move {
+            collect_pending_segment_finalizer(&mut pending).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!collection.is_finished());
+        assert_eq!(completed.load(Ordering::Acquire), 0);
+        release_tx
+            .send(())
+            .expect("pending shutdown finalizer receiver still live");
+        collection
+            .await
+            .expect("shutdown collection task panicked")
+            .expect("shutdown must collect pending finalizer");
+        assert_eq!(completed.load(Ordering::Acquire), 1);
     }
 
     #[test]
