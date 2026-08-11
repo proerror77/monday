@@ -1405,7 +1405,42 @@ mod tests {
         let mut row = raw_trade_row(received_at_ns, id);
         row["type"] = json!("raw_trade_zero_price");
         row["frame"]["data"]["p"] = json!("0");
+        row["frame"]["data"]["q"] = json!("0");
+        row["frame"]["data"]["X"] = json!("NA");
+        row["frame"]["data"]["st"] = json!(1);
         row
+    }
+
+    fn observed_window_raw_trade_row(
+        received_at_ns: u64,
+        id: u64,
+        event_time_ms: u64,
+        trade_time_ms: u64,
+        price: &str,
+        quantity: &str,
+        execution_type: &str,
+    ) -> Value {
+        json!({
+            "schema": MARKET_TAPE_SCHEMA_V2,
+            "received_at_ns": received_at_ns,
+            "type": if price == "0" { "raw_trade_zero_price" } else { "raw_trade" },
+            "session_id": "session-1",
+            "frame": {
+                "stream": "btcusdc@trade",
+                "data": {
+                    "e": "trade",
+                    "E": event_time_ms,
+                    "s": "BTCUSDC",
+                    "t": id,
+                    "p": price,
+                    "q": quantity,
+                    "T": trade_time_ms,
+                    "X": execution_type,
+                    "m": false,
+                    "st": 1
+                }
+            }
+        })
     }
 
     #[rustfmt::skip]
@@ -2253,6 +2288,90 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("missing raw trades"));
+    }
+
+    #[test]
+    fn observed_usdm_raw_trade_window_preserves_zero_price_continuity() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.retain(|row| row["type"] != "raw_trade");
+        for row in &mut rows {
+            if row["symbol"] == "BTCUSDT" {
+                row["symbol"] = json!("BTCUSDC");
+            }
+            if let Some(stream) = row["frame"]["stream"].as_str() {
+                row["frame"]["stream"] = json!(stream.replace("btcusdt", "btcusdc"));
+            }
+            if row["frame"]["data"]["s"] == "BTCUSDT" {
+                row["frame"]["data"]["s"] = json!("BTCUSDC");
+            }
+            if row["frame"]["data"]["o"]["s"] == "BTCUSDT" {
+                row["frame"]["data"]["o"]["s"] = json!("BTCUSDC");
+            }
+        }
+        rows.extend([
+            observed_window_raw_trade_row(
+                1_786_430_318_869_000_000,
+                553104311,
+                1_786_430_318_864,
+                1_786_430_318_864,
+                "63841.2",
+                "0.013",
+                "MARKET",
+            ),
+            observed_window_raw_trade_row(
+                1_786_430_320_185_000_000,
+                553104312,
+                1_786_430_320_180,
+                1_786_430_320_180,
+                "0",
+                "0",
+                "NA",
+            ),
+            observed_window_raw_trade_row(
+                1_786_430_322_211_000_000,
+                553104313,
+                1_786_430_322_206,
+                1_786_430_322_206,
+                "0",
+                "0",
+                "NA",
+            ),
+            observed_window_raw_trade_row(
+                1_786_430_322_678_000_000,
+                553104314,
+                1_786_430_322_673,
+                1_786_430_322_673,
+                "0",
+                "0",
+                "NA",
+            ),
+            observed_window_raw_trade_row(
+                1_786_430_322_755_000_000,
+                553104315,
+                1_786_430_322_750,
+                1_786_430_322_749,
+                "63841.2",
+                "0.001",
+                "MARKET",
+            ),
+        ]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDC"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDC"], &V2_STREAM_TYPES);
+        BinanceRawTradeContinuityVerifier::default()
+            .observe_segment(seal_binance_market_tape_triplet(&triplet, &anchor).unwrap())
+            .unwrap();
+        let verified = verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(verified.segments()[0].events, rows.len() as u64);
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["event_types"]["raw_trade"], 2);
+        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 3);
     }
 
     #[test]

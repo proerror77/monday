@@ -5542,6 +5542,31 @@ mod tests {
         })
     }
 
+    fn observed_usdm_raw_trade_frame(
+        id: u64,
+        event_time_ms: u64,
+        trade_time_ms: u64,
+        price: &str,
+        quantity: &str,
+        execution_type: &str,
+    ) -> Value {
+        json!({
+            "stream": "btcusdc@trade",
+            "data": {
+                "e": "trade",
+                "E": event_time_ms,
+                "s": "BTCUSDC",
+                "t": id,
+                "p": price,
+                "q": quantity,
+                "T": trade_time_ms,
+                "X": execution_type,
+                "m": false,
+                "st": 1
+            }
+        })
+    }
+
     #[rustfmt::skip]
     fn book_ticker_frame(received_at_ns: u64) -> Value {
         let event_time_ms = received_at_ns / 1_000_000 - 1;
@@ -5678,18 +5703,26 @@ mod tests {
         let mut config = test_config("http://unused".into());
         config.market = Market::Usdm;
         config.dataset = "usdm_all".into();
+        config.symbols = vec!["BTCUSDC".into()];
         config.spool_dir = root.clone();
         let mut states = HashMap::from([(
-            "BTCUSDT".to_owned(),
-            OrderBookState::new("BTCUSDT", Market::Usdm),
+            "BTCUSDC".to_owned(),
+            OrderBookState::new("BTCUSDC", Market::Usdm),
         )]);
         let mut budget = PendingBudget::new(1);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
         let mut process_state = trusted_process_state(&config.symbols);
 
         let received_at_ns = now_ns().unwrap();
-        let mut zero_price = raw_trade_frame(9, received_at_ns);
-        zero_price["data"]["p"] = json!("0");
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let zero_price = observed_usdm_raw_trade_frame(
+            9,
+            event_time_ms,
+            event_time_ms,
+            "0",
+            "0",
+            "NA",
+        );
         let event = event_from_frame(zero_price, received_at_ns).unwrap();
         assert_eq!(
             process_event(
@@ -5708,12 +5741,31 @@ mod tests {
         assert_eq!(segment.event_count("raw_trade_zero_price"), 1);
 
         let received_at_ns = now_ns().unwrap();
-        let mut negative_price = raw_trade_frame(10, received_at_ns);
-        negative_price["data"]["p"] = json!("-1");
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let negative_price = observed_usdm_raw_trade_frame(
+            10,
+            event_time_ms,
+            event_time_ms,
+            "-1",
+            "0",
+            "NA",
+        );
         assert!(event_from_frame(negative_price, received_at_ns).is_err());
 
         let received_at_ns = now_ns().unwrap();
-        let event = event_from_frame(raw_trade_frame(10, received_at_ns), received_at_ns).unwrap();
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let event = event_from_frame(
+            observed_usdm_raw_trade_frame(
+                10,
+                event_time_ms,
+                event_time_ms,
+                "101",
+                "0.2",
+                "MARKET",
+            ),
+            received_at_ns,
+        )
+        .unwrap();
         process_event(
             &config,
             &mut segment,
@@ -5727,8 +5779,15 @@ mod tests {
         assert_eq!(segment.event_count("raw_trade"), 1);
 
         let received_at_ns = now_ns().unwrap();
-        let mut archived_only_zero = raw_trade_frame(11, received_at_ns);
-        archived_only_zero["data"]["p"] = json!("0");
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let archived_only_zero = observed_usdm_raw_trade_frame(
+            11,
+            event_time_ms,
+            event_time_ms,
+            "0",
+            "0",
+            "NA",
+        );
         archive_only(
             &mut segment,
             "session-1",
@@ -5739,8 +5798,15 @@ mod tests {
         assert_eq!(segment.event_count("raw_trade_zero_price"), 2);
 
         let received_at_ns = now_ns().unwrap();
-        let mut spot_zero = raw_trade_frame(12, received_at_ns);
-        spot_zero["data"]["p"] = json!("0");
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let spot_zero = observed_usdm_raw_trade_frame(
+            12,
+            event_time_ms,
+            event_time_ms,
+            "0",
+            "0",
+            "NA",
+        );
         let error = archive_only(
             &mut segment,
             "session-1",
@@ -5752,8 +5818,15 @@ mod tests {
         assert_eq!(segment.event_count("raw_trade_zero_price"), 2);
 
         let received_at_ns = now_ns().unwrap();
-        let mut malformed = raw_trade_frame(13, received_at_ns);
-        malformed["data"]["p"] = json!("0");
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let mut malformed = observed_usdm_raw_trade_frame(
+            13,
+            event_time_ms,
+            event_time_ms,
+            "0",
+            "0",
+            "NA",
+        );
         malformed["data"]["q"] = Value::Null;
         assert!(event_from_frame(malformed, received_at_ns).is_err());
 
@@ -5773,9 +5846,13 @@ mod tests {
         let mut config = test_config("http://unused".into());
         config.market = Market::Usdm;
         config.dataset = "usdm_all".into();
+        config.symbols = vec!["BTCUSDC".into()];
         config.spool_dir = dirs.spool.clone();
         let session_id = "session-usdm-upload-only";
-        let segment_start = now_ns().unwrap();
+        let first_trade_received_at_ns = 1_786_430_318_869_000_000;
+        let last_trade_received_at_ns = 1_786_430_322_755_000_000;
+        let pre_trade_received_at_ns = 1_786_430_318_864_000_000;
+        let segment_start = first_trade_received_at_ns - 20_000_000;
         let mut segment = Segment::create(config.segment_config(), segment_start).unwrap();
         let stream_types = config.stream_types();
         segment
@@ -5794,13 +5871,13 @@ mod tests {
             .unwrap();
 
         let mut states = HashMap::from([(
-            "BTCUSDT".to_owned(),
-            OrderBookState::new("BTCUSDT", Market::Usdm),
+            "BTCUSDC".to_owned(),
+            OrderBookState::new("BTCUSDC", Market::Usdm),
         )]);
         let coverage = config
             .stream_types()
             .iter()
-            .map(|stream_type| vec![format!("btcusdt@{stream_type}")])
+            .map(|stream_type| vec![format!("btcusdc@{stream_type}")])
             .collect::<Vec<_>>();
         let mut budget = PendingBudget::new(10);
         let mut process_state = ProcessState::new(false);
@@ -5815,7 +5892,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot_received_at_ns = now_ns().unwrap();
+        let snapshot_received_at_ns = pre_trade_received_at_ns - 1_000_000;
         process_event(
             &config,
             &mut segment,
@@ -5824,7 +5901,7 @@ mod tests {
             session_id,
             Event::Snapshot {
                 received_at_ns: snapshot_received_at_ns,
-                symbol: "BTCUSDT".into(),
+                symbol: "BTCUSDC".into(),
                 request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
                 snapshot: json!({
                     "lastUpdateId": 100,
@@ -5837,50 +5914,118 @@ mod tests {
         .unwrap();
 
         for stream_type in config.stream_types() {
-            let received_at_ns = now_ns().unwrap();
-            let event_time_ms = received_at_ns / 1_000_000 - 1;
             let frames = match stream_type.as_str() {
-                "depth@100ms" => vec![json!({
-                    "stream": "btcusdt@depth@100ms",
-                    "data": {
-                        "e": "depthUpdate",
-                        "E": event_time_ms,
-                        "T": event_time_ms,
-                        "s": "BTCUSDT",
-                        "U": 101,
-                        "u": 101,
-                        "pu": 100,
-                        "b": [["100", "2"]],
-                        "a": [],
-                    },
-                })],
-                "aggTrade" => vec![json!({
-                    "stream": "btcusdt@aggTrade",
-                    "data": {
-                        "e": "aggTrade",
-                        "E": event_time_ms,
-                        "s": "BTCUSDT",
-                        "a": 1,
-                        "f": 1,
-                        "l": 1,
-                        "p": "101",
-                        "q": "0.2",
-                        "T": event_time_ms,
-                        "m": true,
-                    },
-                })],
-                "trade" => {
-                    let positive = raw_trade_frame(9, received_at_ns);
-                    let mut zero_price = raw_trade_frame(10, received_at_ns);
-                    zero_price["data"]["p"] = json!("0");
-                    vec![positive, zero_price]
+                "depth@100ms" => vec![
+                    (
+                        json!({
+                            "stream": "btcusdc@depth@100ms",
+                            "data": {
+                                "e": "depthUpdate",
+                                "E": 1_786_430_318_863_u64,
+                                "T": 1_786_430_318_863_u64,
+                                "s": "BTCUSDC",
+                                "U": 101,
+                                "u": 101,
+                                "pu": 100,
+                                "b": [["100", "2"]],
+                                "a": [],
+                            },
+                        }),
+                        pre_trade_received_at_ns,
+                    ),
+                ],
+                "aggTrade" => vec![
+                    (
+                        json!({
+                            "stream": "btcusdc@aggTrade",
+                            "data": {
+                                "e": "aggTrade",
+                                "E": 1_786_430_318_863_u64,
+                                "s": "BTCUSDC",
+                                "a": 1,
+                                "f": 1,
+                                "l": 1,
+                                "p": "101",
+                                "q": "0.2",
+                                "T": 1_786_430_318_863_u64,
+                                "m": true,
+                            },
+                        }),
+                        pre_trade_received_at_ns + 1_000_000,
+                    ),
+                ],
+                "trade" => vec![
+                    (
+                        observed_usdm_raw_trade_frame(
+                            553104311,
+                            1_786_430_318_864,
+                            1_786_430_318_864,
+                            "63841.2",
+                            "0.013",
+                            "MARKET",
+                        ),
+                        first_trade_received_at_ns,
+                    ),
+                    (
+                        observed_usdm_raw_trade_frame(
+                            553104312,
+                            1_786_430_320_180,
+                            1_786_430_320_180,
+                            "0",
+                            "0",
+                            "NA",
+                        ),
+                        1_786_430_320_185_000_000,
+                    ),
+                    (
+                        observed_usdm_raw_trade_frame(
+                            553104313,
+                            1_786_430_322_206,
+                            1_786_430_322_206,
+                            "0",
+                            "0",
+                            "NA",
+                        ),
+                        1_786_430_322_211_000_000,
+                    ),
+                    (
+                        observed_usdm_raw_trade_frame(
+                            553104314,
+                            1_786_430_322_673,
+                            1_786_430_322_673,
+                            "0",
+                            "0",
+                            "NA",
+                        ),
+                        1_786_430_322_678_000_000,
+                    ),
+                    (
+                        observed_usdm_raw_trade_frame(
+                            553104315,
+                            1_786_430_322_750,
+                            1_786_430_322_749,
+                            "63841.2",
+                            "0.001",
+                            "MARKET",
+                        ),
+                        last_trade_received_at_ns,
+                    ),
+                ],
+                "bookTicker" => {
+                    let mut frame = book_ticker_frame(last_trade_received_at_ns + 1_000_000);
+                    frame["stream"] = json!("btcusdc@bookTicker");
+                    frame["data"]["s"] = json!("BTCUSDC");
+                    vec![(frame, last_trade_received_at_ns + 1_000_000)]
                 }
-                "bookTicker" => vec![book_ticker_frame(received_at_ns)],
-                "forceOrder" => vec![force_order_frame(received_at_ns)],
+                "forceOrder" => {
+                    let mut frame = force_order_frame(last_trade_received_at_ns + 2_000_000);
+                    frame["stream"] = json!("btcusdc@forceOrder");
+                    frame["data"]["o"]["s"] = json!("BTCUSDC");
+                    vec![(frame, last_trade_received_at_ns + 2_000_000)]
+                }
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
             };
-            for frame in frames {
-                let received_at_ns = now_ns().unwrap();
+            for (frame, received_at_ns) in frames {
                 let event = event_from_frame(frame, received_at_ns).unwrap();
                 process_event(
                     &config,
@@ -5907,8 +6052,8 @@ mod tests {
         .expect("USD-M contract segment must be non-empty");
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["event_types"]["raw_trade"], 1);
-        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
+        assert_eq!(manifest["event_types"]["raw_trade"], 2);
+        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 3);
 
         let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
