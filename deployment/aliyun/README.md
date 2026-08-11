@@ -172,9 +172,11 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
 
-Two legacy guards stay breaches: `polymarket-raw-ops-gate@.service` must remain
-disabled/masked/not-found (`static` proves an uncleaned host installation), and
-state-persistence failures (gate 4 delta detection depends on that state).
+The raw-ops Gate template has no `[Install]` section, so `static` is the
+healthy installed state only when no Gate instance is active, the control lock
+is free, and the Gate runtime root has no residual `*.env` (uninspectable
+state remains a breach). State-persistence failures also stay breaches (gate 4
+delta detection depends on that state).
 
 Every other check is a warning — reported in the JSON `warnings` array and as
 `warning:` lines, never blocking `ok:true`:
