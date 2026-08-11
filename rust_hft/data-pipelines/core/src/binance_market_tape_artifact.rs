@@ -23,7 +23,7 @@ use crate::binance_market_tape::{
     DepthSourceClockSequenceValidator, ForceOrder, LobContinuitySummary,
     LobContinuitySummaryBuilder, RawTrade, RawTradeSequenceValidator,
     AGGREGATE_TRADE_SUMMARY_CONTRACT, LOB_CONTINUITY_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
-    MARKET_TAPE_SCHEMA_V2,
+    MARKET_TAPE_SCHEMA_V2, MAX_SOURCE_DELAY_MS,
 };
 
 const REPLAY_SCOPE: &str =
@@ -659,6 +659,91 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                         received_at_ns,
                     )?;
                 }
+                "stale_book_ticker" => {
+                    if market != Market::Usdm {
+                        bail!("stale book tickers are USD-M only");
+                    }
+                    let frame = raw
+                        .get("frame")
+                        .context("stale book ticker event has no frame")?;
+                    let ticker = BookTicker::from_frame_allow_stale(frame, received_at_ns)?;
+                    let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
+                    require_symbol(&symbols, &symbol)?;
+                    if ticker.symbol != symbol {
+                        bail!("stale book ticker symbol does not match its frame");
+                    }
+                    let data = frame.get("data").unwrap_or(frame);
+                    let event_time_ms = data
+                        .get("E")
+                        .and_then(Value::as_u64)
+                        .context("stale book ticker frame is missing E")?;
+                    let transaction_time_ms = data
+                        .get("T")
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .context("stale book ticker frame has malformed T")
+                        })
+                        .transpose()?;
+                    if raw.get("E").and_then(Value::as_u64) != Some(event_time_ms) {
+                        bail!("stale book ticker E does not match its frame");
+                    }
+                    let audited_transaction_time_ms = raw
+                        .get("T")
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .context("stale book ticker row has malformed T")
+                        })
+                        .transpose()?;
+                    if audited_transaction_time_ms != transaction_time_ms {
+                        bail!("stale book ticker T does not match its frame");
+                    }
+                    if transaction_time_ms.is_some_and(|transaction| transaction > event_time_ms) {
+                        bail!("stale book ticker source clocks are reversed");
+                    }
+                    let receive_minus_event_ms = received_at_ns
+                        .checked_div(1_000_000)
+                        .and_then(|received| received.checked_sub(event_time_ms))
+                        .context("stale book ticker receive clock is not behind E")?;
+                    if receive_minus_event_ms <= MAX_SOURCE_DELAY_MS {
+                        bail!("stale book ticker does not exceed the governed delay");
+                    }
+                    if raw.get("receive_minus_event_ms").and_then(Value::as_u64)
+                        != Some(receive_minus_event_ms)
+                    {
+                        bail!("stale book ticker receive delay does not match its frame");
+                    }
+                    let event_minus_transaction_ms = transaction_time_ms
+                        .map(|transaction| event_time_ms - transaction);
+                    let audited_event_minus_transaction_ms = raw
+                        .get("event_minus_transaction_ms")
+                        .map(|value| {
+                            value.as_u64().context(
+                                "stale book ticker row has malformed event_minus_transaction_ms",
+                            )
+                        })
+                        .transpose()?;
+                    if audited_event_minus_transaction_ms != event_minus_transaction_ms {
+                        bail!("stale book ticker transaction delay does not match its frame");
+                    }
+                    let producer_id = raw
+                        .get("producer_id")
+                        .and_then(Value::as_u64)
+                        .context("stale book ticker row is missing producer_id")?;
+                    let declared_shards = session_shard_count
+                        .context("stale book ticker row has no session shard declaration")?;
+                    if producer_id >= declared_shards {
+                        bail!(
+                            "stale book ticker producer_id {producer_id} is outside declared websocket_shards {declared_shards}"
+                        );
+                    }
+                    observe_receive_clock(
+                        &mut book_ticker_receive_clocks,
+                        &ticker.symbol,
+                        received_at_ns,
+                    )?;
+                }
                 "force_order" => {
                     if market != Market::Usdm {
                         bail!("market-tape force orders are USD-M only");
@@ -1046,6 +1131,20 @@ fn allowed_fields(event_type: &str, schema: &str) -> &'static [&'static str] {
         "stream_coverage" => &["schema", "received_at_ns", "type", "session_id", "shards"],
         "snapshot" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "symbol", "request_started_at_ns", "snapshot"],
         "diff" | "agg_trade" | "raw_trade" | "raw_trade_zero_price" | "book_ticker" | "force_order" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
+        "stale_book_ticker" => &[
+            "schema",
+            "received_at_ns",
+            "type",
+            "session_id",
+            "archived_only",
+            "frame",
+            "producer_id",
+            "symbol",
+            "E",
+            "T",
+            "receive_minus_event_ms",
+            "event_minus_transaction_ms",
+        ],
         "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "continuity_complete", "stream_coverage_verified", "bids", "asks", "reason", "replay_safe"],
         _ => unreachable!("event type checked above"),
     }
@@ -1446,6 +1545,50 @@ mod tests {
     #[rustfmt::skip]
     fn book_ticker_row(received_at_ns: u64) -> Value {
         json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"book_ticker","session_id":"session-1","frame":{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","u":400900217,"E":received_at_ns/1_000_000,"T":received_at_ns/1_000_000,"s":"BTCUSDT","b":"100.5","B":"31.21","a":"100.6","A":"40.66"}}})
+    }
+
+    fn stale_book_ticker_row(received_at_ns: u64) -> Value {
+        let event_time_ms = received_at_ns / 1_000_000 - 31_000;
+        let transaction_time_ms = event_time_ms - 5;
+        json!({
+            "schema": MARKET_TAPE_SCHEMA_V2,
+            "received_at_ns": received_at_ns,
+            "type": "stale_book_ticker",
+            "session_id": "session-1",
+            "producer_id": 0,
+            "symbol": "BTCUSDT",
+            "E": event_time_ms,
+            "T": transaction_time_ms,
+            "receive_minus_event_ms": 31_000,
+            "event_minus_transaction_ms": 5,
+            "frame": {
+                "stream": "btcusdt@bookTicker",
+                "data": {
+                    "e": "bookTicker",
+                    "u": 400900217,
+                    "E": event_time_ms,
+                    "T": transaction_time_ms,
+                    "s": "BTCUSDT",
+                    "b": "100.5",
+                    "B": "31.21",
+                    "a": "100.6",
+                    "A": "40.66"
+                }
+            }
+        })
+    }
+
+    fn stale_book_ticker_without_transaction_row(received_at_ns: u64) -> Value {
+        let mut row = stale_book_ticker_row(received_at_ns);
+        row.as_object_mut().unwrap().remove("T");
+        row.as_object_mut()
+            .unwrap()
+            .remove("event_minus_transaction_ms");
+        row["frame"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("T");
+        row
     }
 
     #[rustfmt::skip]
@@ -2240,7 +2383,9 @@ mod tests {
     #[test]
     fn complete_v2_with_new_event_families_verifies() {
         let root = tempdir();
-        let rows = with_stream_coverage_v2(valid_v2_rows(), &["BTCUSDT"], &V2_STREAM_TYPES);
+        let mut rows = valid_v2_rows();
+        rows.insert(5, stale_book_ticker_row(START_NS + 330_000_000));
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &V2_STREAM_TYPES);
         let event_count = rows.len() as u64;
         let (triplet, anchor) =
             write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
@@ -2250,6 +2395,60 @@ mod tests {
         assert_eq!(verified.segments()[0].events, event_count);
         assert_eq!(verified.aggregate_trades().len(), 1);
         assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
+    }
+
+    #[test]
+    fn stale_book_ticker_without_transaction_clock_verifies() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.insert(
+            5,
+            stale_book_ticker_without_transaction_row(START_NS + 330_000_000),
+        );
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+
+        verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+
+        let root = tempdir();
+        let mut invalid_rows = valid_v2_rows();
+        let mut invalid = stale_book_ticker_without_transaction_row(START_NS + 330_000_000);
+        invalid["event_minus_transaction_ms"] = Value::Null;
+        invalid_rows.insert(5, invalid);
+        let invalid_rows = with_stream_coverage_v2(invalid_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &invalid_rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let error = verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("malformed event_minus_transaction_ms"));
+    }
+
+    #[test]
+    fn stale_book_ticker_producer_id_must_be_declared() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        let mut stale = stale_book_ticker_row(START_NS + 330_000_000);
+        stale["producer_id"] = json!(2);
+        rows.insert(5, stale);
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+
+        let error = verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside declared websocket_shards"));
     }
 
     #[test]

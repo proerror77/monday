@@ -3,6 +3,7 @@ use clap::Parser;
 use data::binance_market_tape::{
     AggregateTrade, AggregateTradeSequenceValidator, BookTicker, DepthSourceClock,
     DepthSourceClockSequenceValidator, ForceOrder, RawTrade, RawTradeSequenceValidator,
+    MAX_SOURCE_DELAY_MS,
 };
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet, verify_binance_market_tape_for_strict_gate,
@@ -490,6 +491,12 @@ enum Event {
     BookTicker {
         ticker: BookTicker,
         frame: Value,
+    },
+    StaleBookTicker {
+        ticker: BookTicker,
+        frame: Value,
+        producer_id: usize,
+        receive_minus_event_ms: u64,
     },
     ForceOrder {
         order: ForceOrder,
@@ -1279,6 +1286,61 @@ fn sync_timed_out(
     deadline.is_some_and(|deadline| now > deadline && states.values().any(|state| !state.synced))
 }
 
+fn write_stale_book_ticker(
+    segment: &mut Segment,
+    session_id: &str,
+    ticker: &BookTicker,
+    frame: Value,
+    producer_id: usize,
+    receive_minus_event_ms: u64,
+    archived_only: bool,
+) -> anyhow::Result<()> {
+    let data = frame.get("data").unwrap_or(&frame);
+    let event_time_ms = data
+        .get("E")
+        .and_then(Value::as_u64)
+        .context("stale book ticker frame is missing E")?;
+    let transaction_time_ms = data
+        .get("T")
+        .map(|value| {
+            value
+                .as_u64()
+                .context("stale book ticker frame has malformed T")
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        transaction_time_ms.is_none_or(|transaction| transaction <= event_time_ms),
+        "stale book ticker source clocks are reversed"
+    );
+    let expected_receive_minus_event_ms = (ticker.received_at_ns / 1_000_000)
+        .saturating_sub(event_time_ms);
+    anyhow::ensure!(
+        expected_receive_minus_event_ms > MAX_SOURCE_DELAY_MS
+            && expected_receive_minus_event_ms == receive_minus_event_ms,
+        "stale book ticker delay does not exceed the governed limit"
+    );
+    let mut row = json!({
+        "session_id":session_id,
+        "producer_id":producer_id,
+        "symbol":ticker.symbol,
+        "E":event_time_ms,
+        "receive_minus_event_ms":receive_minus_event_ms,
+        "frame":frame,
+    });
+    if archived_only {
+        row["archived_only"] = json!(true);
+    }
+    if let Some(transaction_time_ms) = transaction_time_ms {
+        row["T"] = json!(transaction_time_ms);
+        row["event_minus_transaction_ms"] = json!(event_time_ms - transaction_time_ms);
+    }
+    segment.write(
+        "stale_book_ticker",
+        row,
+        ticker.received_at_ns,
+    )
+}
+
 fn process_event(
     config: &Config,
     segment: &mut Segment,
@@ -1444,6 +1506,32 @@ fn process_event(
             if reconnecting_before && process_state.streams_healthy() {
                 return Ok(ProcessAction::RestartSession);
             }
+        }
+        Event::StaleBookTicker {
+            ticker,
+            frame,
+            producer_id,
+            receive_minus_event_ms,
+        } => {
+            anyhow::ensure!(
+                config.market == Market::Usdm,
+                "stale book tickers are USD-M only"
+            );
+            if config.is_excluded(&ticker.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&ticker.symbol) {
+                anyhow::bail!("unconfigured symbol {}", ticker.symbol);
+            }
+            write_stale_book_ticker(
+                segment,
+                session_id,
+                &ticker,
+                frame,
+                producer_id,
+                receive_minus_event_ms,
+                false,
+            )?;
         }
         Event::ForceOrder { order, frame } => {
             anyhow::ensure!(
@@ -1717,6 +1805,26 @@ fn archive_only(
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
             ticker.received_at_ns,
         ),
+        Event::StaleBookTicker {
+            ticker,
+            frame,
+            producer_id,
+            receive_minus_event_ms,
+        } => {
+            anyhow::ensure!(
+                market == Market::Usdm,
+                "stale book tickers are USD-M only"
+            );
+            write_stale_book_ticker(
+                segment,
+                session_id,
+                &ticker,
+                frame,
+                producer_id,
+                receive_minus_event_ms,
+                true,
+            )
+        }
         Event::ForceOrder { order, frame } => segment.write(
             "force_order",
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
@@ -2361,7 +2469,7 @@ async fn receive_url(
                     reconnect_backoff = 1;
                     break;
                 }
-                let event = event_from_frame(frame, received_at_ns)?;
+                let event = event_from_frame_for_shard(frame, received_at_ns, producer_id)?;
                 if coverage_announced {
                     if proof_events.len() >= proof_buffer_budget {
                         anyhow::bail!(
@@ -2454,7 +2562,11 @@ async fn receive_url(
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
                 watchdog.mark_data();
-                let event = event_from_frame(serde_json::from_str(&text)?, received_at_ns)?;
+                let event = event_from_frame_for_shard(
+                    serde_json::from_str(&text)?,
+                    received_at_ns,
+                    producer_id,
+                )?;
                 match send_or_shutdown(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {}
                     SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
@@ -2655,6 +2767,39 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
         return Ok(Event::ForceOrder { order, frame });
     }
     anyhow::bail!("unsupported Binance research stream {stream}");
+}
+
+fn event_from_frame_for_shard(
+    frame: Value,
+    received_at_ns: u64,
+    producer_id: usize,
+) -> anyhow::Result<Event> {
+    let channel = frame
+        .get("stream")
+        .and_then(Value::as_str)
+        .and_then(|stream| stream.rsplit_once('@').map(|(_, channel)| channel));
+    if !channel.is_some_and(|channel| channel.eq_ignore_ascii_case("bookTicker")) {
+        return event_from_frame(frame, received_at_ns);
+    }
+    let strict_error = match event_from_frame(frame.clone(), received_at_ns) {
+        Ok(event) => return Ok(event),
+        Err(error) => error,
+    };
+    let ticker = match BookTicker::from_frame_allow_stale(&frame, received_at_ns) {
+        Ok(ticker) => ticker,
+        Err(_) => return Err(strict_error),
+    };
+    let receive_minus_event_ms = (received_at_ns / 1_000_000)
+        .saturating_sub(ticker.event_time_ms);
+    if receive_minus_event_ms <= MAX_SOURCE_DELAY_MS {
+        return Err(strict_error);
+    }
+    Ok(Event::StaleBookTicker {
+        ticker,
+        frame,
+        producer_id,
+        receive_minus_event_ms,
+    })
 }
 
 async fn produce_snapshots(
@@ -5013,6 +5158,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_usdm_book_ticker_is_dropped_without_terminating_shard() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received_at_ns = now_ns().unwrap();
+        let stale_event_time_ms = received_at_ns / 1_000_000 - 31_000;
+        let mut stale = book_ticker_frame(received_at_ns);
+        stale["data"]["E"] = json!(stale_event_time_ms);
+        stale["data"]["T"] = json!(stale_event_time_ms);
+        let next_trade = raw_trade_frame(9, received_at_ns);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = websocket.next().await.unwrap().unwrap();
+            assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": SUBSCRIPTION_PROOF_ID,
+                        "result": ["btcusdt@bookTicker", "btcusdt@trade"]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(stale.to_string().into()))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(next_trade.to_string().into()))
+                .await
+                .unwrap();
+        });
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_pause_tx, pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let shard = StreamShard {
+            url: format!("ws://{address}"),
+            streams: BTreeSet::from([
+                "btcusdt@bookTicker".to_owned(),
+                "btcusdt@trade".to_owned(),
+            ]),
+        };
+
+        let task = tokio::spawn(receive_url(
+            shard,
+            sender,
+            stream_connected,
+            shutdown,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ProcessWatchdog::new_state(),
+            7,
+            pause_rx,
+            resume_rx,
+        ));
+        let mut saw_stale = false;
+        let mut saw_trade = false;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    Event::StaleBookTicker {
+                        producer_id,
+                        receive_minus_event_ms,
+                        ..
+                    } => {
+                        assert_eq!(producer_id, 7);
+                        assert!(receive_minus_event_ms > MAX_SOURCE_DELAY_MS);
+                        saw_stale = true;
+                    }
+                    Event::RawTrade { .. } => {
+                        saw_trade = true;
+                    }
+                    _ => {}
+                }
+                if saw_stale && saw_trade {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("shard did not deliver the next valid trade");
+        assert!(saw_stale, "stale ticker was not audited");
+        assert!(saw_trade, "stale ticker terminated the shard before the trade");
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn transient_websocket_close_is_reconnected_without_failing_the_stream_task() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -5641,6 +5882,18 @@ mod tests {
     }
 
     #[test]
+    fn book_ticker_with_fresh_event_and_stale_transaction_clock_is_accepted() {
+        let received_at_ns = now_ns().unwrap();
+        let received_at_ms = received_at_ns / 1_000_000;
+        let mut frame = book_ticker_frame(received_at_ns);
+        frame["data"]["E"] = json!(received_at_ms - 1);
+        frame["data"]["T"] = json!(received_at_ms - 31_000);
+        let event = event_from_frame(frame, received_at_ns)
+            .expect("book ticker receive delay is governed by E, not T");
+        assert!(matches!(event, Event::BookTicker { .. }));
+    }
+
+    #[test]
     fn event_from_frame_dispatches_spot_shaped_book_ticker() {
         // Spot bookTicker payloads carry no e/E/T fields; the frame must still
         // flow through dispatch instead of killing the producer.
@@ -5939,7 +6192,7 @@ mod tests {
         )
         .unwrap();
 
-        for stream_type in config.stream_types() {
+        for (producer_id, stream_type) in config.stream_types().into_iter().enumerate() {
             let frames = match stream_type.as_str() {
                 "depth@100ms" => vec![
                     (
@@ -6068,10 +6321,20 @@ mod tests {
                     ),
                 ],
                 "bookTicker" => {
-                    let mut frame = book_ticker_frame(last_trade_received_at_ns + 1_000_000);
-                    frame["stream"] = json!("cysusdt@bookTicker");
-                    frame["data"]["s"] = json!("CYSUSDT");
-                    vec![(frame, last_trade_received_at_ns + 1_000_000)]
+                    let stale_received_at_ns = last_trade_received_at_ns + 1_000_000;
+                    let stale_event_time_ms = stale_received_at_ns / 1_000_000 - 31_000;
+                    let mut stale = book_ticker_frame(stale_received_at_ns);
+                    stale["stream"] = json!("cysusdt@bookTicker");
+                    stale["data"]["s"] = json!("CYSUSDT");
+                    stale["data"]["E"] = json!(stale_event_time_ms);
+                    stale["data"].as_object_mut().unwrap().remove("T");
+                    let mut current = book_ticker_frame(last_trade_received_at_ns + 2_000_000);
+                    current["stream"] = json!("cysusdt@bookTicker");
+                    current["data"]["s"] = json!("CYSUSDT");
+                    vec![
+                        (stale, stale_received_at_ns),
+                        (current, last_trade_received_at_ns + 2_000_000),
+                    ]
                 }
                 "forceOrder" => {
                     let mut frame = force_order_frame(last_trade_received_at_ns + 2_000_000);
@@ -6082,7 +6345,7 @@ mod tests {
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
             };
             for (frame, received_at_ns) in frames {
-                let event = event_from_frame(frame, received_at_ns).unwrap();
+                let event = event_from_frame_for_shard(frame, received_at_ns, producer_id).unwrap();
                 process_event(
                     &config,
                     &mut segment,
@@ -6110,6 +6373,10 @@ mod tests {
             serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["event_types"]["raw_trade"], 6);
         assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
+        assert_eq!(manifest["event_types"]["stale_book_ticker"], 1);
+        assert_eq!(manifest["event_types"]["book_ticker"], 1);
+        assert_eq!(manifest["lob_continuity"]["sequence_gaps"], 0);
+        assert_eq!(process_state.sequence_gaps, 0);
 
         let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
