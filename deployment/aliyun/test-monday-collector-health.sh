@@ -80,6 +80,8 @@ run_health() {
     STUB_JOURNAL_FAIL="${STUB_JOURNAL_FAIL:-0}" \
     STUB_FLOCK_HELD="${STUB_FLOCK_HELD:-0}" \
     STUB_FLOCK_ERROR="${STUB_FLOCK_ERROR:-0}" \
+    STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
+    STUB_LOCK_PATH="$test_root/run/monday/polymarket-raw-ops-gates/control.lock" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
     MONDAY_COLLECTOR_STATE_DIR="${MONDAY_COLLECTOR_STATE_DIR:-$state_dir}" \
     MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
@@ -102,13 +104,22 @@ reset_env() {
   STUB_JOURNAL_FAIL=0
   STUB_FLOCK_HELD=0
   STUB_FLOCK_ERROR=0
+  STUB_LOCK_APPEAR=0
   unset MONDAY_COLLECTOR_STATE_DIR
 }
 
 reset_state() {
   rm -rf "$state_dir"
   mkdir -p "$state_dir"
-  rm -rf "$test_root/run"
+  case "$test_root" in
+    /tmp/monday-collector-health-test.*)
+      rm -rf -- "$test_root/run"
+      ;;
+    *)
+      printf 'refusing to reset an unexpected health test root: %s\n' "$test_root" >&2
+      exit 2
+      ;;
+  esac
 }
 
 reset_spool() {
@@ -236,6 +247,10 @@ case "${1:-}" in
         printf "%s loaded %s running\n", $1, $2
       }
     ' "$SCENARIO"
+    if [ "${STUB_LOCK_APPEAR:-0}" = "1" ]; then
+      mkdir -p "$(dirname -- "${STUB_LOCK_PATH:?STUB_LOCK_PATH not set}")"
+      : >"$STUB_LOCK_PATH"
+    fi
     exit 0
     ;;
 esac
@@ -810,6 +825,14 @@ expect "state persist fail: breach message" "$(grep_out 'state: state directory 
 # ---------------------------------------------------------------------------
 # 19. polymarket-raw-ops-gate uses the static template and containment checks
 # ---------------------------------------------------------------------------
+if env MONDAY_COLLECTOR_HEALTH_TEST_MODE=1 \
+  MONDAY_COLLECTOR_HEALTH_TEST_ROOT="/tmp/monday-collector-health-test../escape" \
+  PATH="$stub_dir:$PATH" "$health_script" --json >/dev/null 2>&1; then
+  printf 'health monitor accepted a traversal test root\n' >&2
+  exit 1
+fi
+expect "poly gate test root traversal: rejected" "0"
+
 reset_env
 reset_state
 healthy_scenario
@@ -851,6 +874,34 @@ expect "poly gate lock inspect error: separate JSON state" "$(json_query '
   .ok == false
   and .checks.units["polymarket-raw-ops-gate@.service"].lock_held == false
   and .checks.units["polymarket-raw-ops-gate@.service"].lock_check_failed == true
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+mkdir -p "$test_root/run/monday/polymarket-raw-ops-gates"
+: > "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+chmod 000 "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+STUB_FLOCK_ERROR=1
+run_health --json
+chmod 600 "$test_root/run/monday/polymarket-raw-ops-gates/control.lock"
+expect "poly gate unreadable regular lock: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate unreadable regular lock: inspect failure" "$(json_query '
+  .ok == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_check_failed == true
+'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_LOCK_APPEAR=1
+run_health --json
+expect "poly gate lock appears during snapshot: exit 1" "$(rc_is 1; echo $?)"
+expect "poly gate lock appears during snapshot: fail-closed readback" "$(json_query '
+  .ok == false
+  and .checks.units["polymarket-raw-ops-gate@.service"].lock_race_detected == true
 '; echo $?)"
 
 reset_env

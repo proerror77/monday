@@ -142,6 +142,10 @@ POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
 if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
   test_root=${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}
   case "$test_root" in
+    *..*)
+      printf 'invalid collector-health test root\n' >&2
+      exit 2
+      ;;
     /tmp/monday-collector-health-test.*) ;;
     *)
       printf 'invalid collector-health test root\n' >&2
@@ -345,18 +349,7 @@ check_oneshot_result() {
     '$base + {($k): $v}')
 }
 
-check_raw_ops_gate() {
-  # The raw-ops gate template has no [Install] section, so static is the
-  # expected installed state. Retain the old absence/masked states as clean,
-  # but fail closed on an enabled/indirect template or an uninspectable state.
-  unit=$1
-  label=$2
-  enabled=$(unit_is_enabled "$unit")
-  case "$enabled" in
-    static|disabled|masked|not-found) ;;
-    *) record_breach "$label: unexpected is-enabled='$enabled'" ;;
-  esac
-
+collect_raw_ops_gate_snapshot() {
   gate_list=$(systemctl list-units 'polymarket-raw-ops-gate@*.service' \
     --all --no-legend --no-pager 2>/dev/null)
   gate_list_rc=$?
@@ -371,41 +364,6 @@ check_raw_ops_gate() {
   fi
   if [ -n "$active_instances" ]; then
     record_breach "$label: active Gate instance(s): $(printf '%s' "$active_instances" | tr '\n' ' ')"
-  fi
-
-  lock_held=0
-  lock_check_failed=0
-  held_locks=""
-  lock_path=$POLY_RAW_OPS_GATE_CONTROL_LOCK
-  lock_label='control lock'
-  # The Gate controller exposes no read-only lock-state API. Probe the
-  # existing lock through a read-only descriptor and fail closed on any
-  # non-standard flock result; rc=1 is held or otherwise unavailable.
-  if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
-    if [ ! -f "$lock_path" ] || [ -L "$lock_path" ]; then
-      lock_check_failed=1
-      record_breach "$label: $lock_label path is not a regular file ($lock_path)"
-    elif ! command -v flock >/dev/null 2>&1; then
-      lock_check_failed=1
-      record_breach "$label: cannot inspect $lock_label (flock unavailable)"
-    elif ! exec 9<"$lock_path" 2>/dev/null; then
-      lock_check_failed=1
-      record_breach "$label: cannot inspect $lock_label ($lock_path)"
-    else
-      flock -n 9 2>/dev/null
-      flock_rc=$?
-      exec 9<&-
-      if [ "$flock_rc" -eq 0 ]; then
-        :
-      elif [ "$flock_rc" -eq 1 ]; then
-        lock_held=1
-        held_locks=$lock_path
-        record_breach "$label: running $lock_label is held or unavailable ($lock_path)"
-      else
-        lock_check_failed=1
-        record_breach "$label: cannot inspect $lock_label (flock exit $flock_rc)"
-      fi
-    fi
   fi
 
   residual_env=""
@@ -432,6 +390,80 @@ $env_file"
   if [ -n "$residual_env" ]; then
     record_breach "$label: residual Gate environment file(s): $(printf '%s' "$residual_env" | tr '\n' ' ')"
   fi
+}
+
+check_raw_ops_gate() {
+  # The raw-ops gate template has no [Install] section, so static is the
+  # expected installed state. Retain the old absence/masked states as clean,
+  # but fail closed on an enabled/indirect template or an uninspectable state.
+  unit=$1
+  label=$2
+  enabled=$(unit_is_enabled "$unit")
+  case "$enabled" in
+    static|disabled|masked|not-found) ;;
+    *) record_breach "$label: unexpected is-enabled='$enabled'" ;;
+  esac
+
+  lock_held=0
+  lock_check_failed=0
+  lock_race_detected=0
+  held_locks=""
+  active_instances=""
+  residual_env=""
+  residual_env_check_failed=0
+  lock_path=$POLY_RAW_OPS_GATE_CONTROL_LOCK
+  lock_label='control lock'
+  lock_path_present=0
+  if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+    lock_path_present=1
+  fi
+
+  # A free control lock is held for the entire unit+EnvironmentFile snapshot.
+  # The grouped redirection keeps an unreadable regular lock from terminating
+  # this POSIX monitor before it can emit a fail-closed breach. A lock that is
+  # absent at the first check is scanned optimistically and rechecked after the
+  # snapshot; appearance during that window is also a breach.
+  if [ "$lock_path_present" -eq 1 ] && { [ ! -f "$lock_path" ] || [ -L "$lock_path" ]; }; then
+    lock_check_failed=1
+    record_breach "$label: $lock_label path is not a regular file ($lock_path)"
+    collect_raw_ops_gate_snapshot
+  elif [ "$lock_path_present" -eq 1 ] && ! command -v flock >/dev/null 2>&1; then
+    lock_check_failed=1
+    record_breach "$label: cannot inspect $lock_label (flock unavailable)"
+    collect_raw_ops_gate_snapshot
+  elif [ "$lock_path_present" -eq 1 ]; then
+    lock_group_ran=0
+    snapshot_collected=0
+    {
+      lock_group_ran=1
+      flock -n 9 2>/dev/null
+      flock_rc=$?
+      if [ "$flock_rc" -eq 0 ]; then
+        collect_raw_ops_gate_snapshot
+        snapshot_collected=1
+      elif [ "$flock_rc" -eq 1 ]; then
+        lock_held=1
+        held_locks=$lock_path
+        record_breach "$label: running $lock_label is held or unavailable ($lock_path)"
+      else
+        lock_check_failed=1
+        record_breach "$label: cannot inspect $lock_label (flock exit $flock_rc)"
+      fi
+    } 9<"$lock_path" 2>/dev/null
+    if [ "$lock_group_ran" -eq 0 ]; then
+      lock_check_failed=1
+      record_breach "$label: cannot inspect $lock_label ($lock_path)"
+      collect_raw_ops_gate_snapshot
+    elif [ "$snapshot_collected" -eq 0 ] && [ "$lock_held" -eq 0 ]; then
+      collect_raw_ops_gate_snapshot
+    fi
+  else
+    collect_raw_ops_gate_snapshot
+    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+      lock_race_detected=1
+      record_breach "$label: $lock_path appeared during the containment snapshot"
+    fi
+  fi
 
   active_instances_json=$(printf '%s\n' "$active_instances" | jq -Rsc \
     'split("\n") | map(select(length > 0))')
@@ -443,7 +475,8 @@ $env_file"
     --argjson h "$held_locks_json" --argjson r "$residual_env_json" \
     --argjson l "$(bool_json "$lock_held")" --argjson u "$(bool_json "$lock_check_failed")" \
     --argjson f "$(bool_json "$residual_env_check_failed")" \
-    '{is_enabled: $e, active_instances: $i, lock_held: $l, lock_check_failed: $u, held_locks: $h, residual_env: $r, residual_env_check_failed: $f}')
+    --argjson x "$(bool_json "$lock_race_detected")" \
+    '{is_enabled: $e, active_instances: $i, lock_held: $l, lock_check_failed: $u, lock_race_detected: $x, held_locks: $h, residual_env: $r, residual_env_check_failed: $f}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
     '$base + {($k): $v}')
 }
