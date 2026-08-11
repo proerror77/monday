@@ -954,10 +954,10 @@ impl BookTicker {
         };
         validate_stream_identity(frame, &symbol, "bookTicker")?;
         let update_id = required_u64(data, "u", "book ticker")?;
-        let best_bid_price = positive_decimal(data, "b", "book ticker")?;
-        let best_bid_quantity = positive_decimal(data, "B", "book ticker")?;
-        let best_ask_price = positive_decimal(data, "a", "book ticker")?;
-        let best_ask_quantity = positive_decimal(data, "A", "book ticker")?;
+        let (best_bid_price, best_bid_quantity) =
+            coherent_decimal_pair(data, "b", "B", "book ticker")?;
+        let (best_ask_price, best_ask_quantity) =
+            coherent_decimal_pair(data, "a", "A", "book ticker")?;
         let event_time_ms = if usdm {
             let event_time_ms = required_u64(data, "E", "book ticker")?;
             let transaction_time_ms = optional_u64(data, "T", "book ticker")?;
@@ -1133,6 +1133,31 @@ fn positive_decimal(value: &Value, field: &str, kind: &str) -> Result<Decimal> {
         anyhow::bail!("{kind} field {field} is not positive");
     }
     Ok(decimal)
+}
+
+fn coherent_decimal_pair(
+    value: &Value,
+    price_field: &str,
+    quantity_field: &str,
+    kind: &str,
+) -> Result<(Decimal, Decimal)> {
+    let price = required_string(value, price_field, kind)?
+        .parse::<Decimal>()
+        .with_context(|| format!("{kind} field {price_field} is not decimal"))?;
+    let quantity = required_string(value, quantity_field, kind)?
+        .parse::<Decimal>()
+        .with_context(|| format!("{kind} field {quantity_field} is not decimal"))?;
+    if price < Decimal::ZERO {
+        anyhow::bail!("{kind} field {price_field} is negative");
+    }
+    if quantity < Decimal::ZERO {
+        anyhow::bail!("{kind} field {quantity_field} is negative");
+    }
+    anyhow::ensure!(
+        (price == Decimal::ZERO) == (quantity == Decimal::ZERO),
+        "{kind} fields {price_field}/{quantity_field} must be both zero or both positive"
+    );
+    Ok((price, quantity))
 }
 
 #[cfg(test)]
@@ -1857,7 +1882,21 @@ mod tests {
         assert!(BookTicker::from_frame(&non_positive, received_at_ns)
             .unwrap_err()
             .to_string()
-            .contains("positive"));
+            .contains("both zero or both positive"));
+
+        let mut negative = spot_book_ticker_frame();
+        negative["data"]["a"] = json!("-0.1");
+        assert!(BookTicker::from_frame(&negative, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("negative"));
+
+        let mut malformed = spot_book_ticker_frame();
+        malformed["data"]["A"] = json!("not-a-decimal");
+        assert!(BookTicker::from_frame(&malformed, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("not decimal"));
 
         // No `s` field and no stream name to derive it from.
         let bare = json!({"data": {"u": 400900217, "b": "100.5", "B": "31.21", "a": "100.6", "A": "40.66"}});
@@ -1880,6 +1919,26 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("USD-M event identity"));
+    }
+
+    #[test]
+    fn spot_book_ticker_accepts_observed_zero_ask_side() {
+        let frame = json!({
+            "stream": "chipusd1@bookTicker",
+            "data": {
+                "u": 14_756_445_u64,
+                "s": "CHIPUSD1",
+                "b": "0.02215000",
+                "B": "3946.00000000",
+                "a": "0.00000000",
+                "A": "0.00000000"
+            }
+        });
+        let ticker = BookTicker::from_frame(&frame, 1_786_486_642_461_639_000)
+            .expect("coherent zero ask side is a valid spot book ticker");
+        assert_eq!(ticker.symbol, "CHIPUSD1");
+        assert_eq!(ticker.best_ask_price, Decimal::ZERO);
+        assert_eq!(ticker.best_ask_quantity, Decimal::ZERO);
     }
 
     #[test]
