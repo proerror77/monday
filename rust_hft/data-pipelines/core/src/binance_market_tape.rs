@@ -808,7 +808,7 @@ impl RawTrade {
             .parse::<Decimal>()
             .with_context(|| "raw trade field p is not decimal")?;
         if price < Decimal::ZERO || (!allow_zero_price && price == Decimal::ZERO) {
-            anyhow::bail!("raw trade field p is not positive");
+            anyhow::bail!("raw trade field p is not positive: {price}");
         }
         if allow_zero_price && price != Decimal::ZERO {
             anyhow::bail!("raw trade zero-price field p is not zero");
@@ -1570,7 +1570,7 @@ mod tests {
         assert!(RawTrade::from_frame(&zero, received_at_ns)
             .unwrap_err()
             .to_string()
-            .contains("not positive"));
+            .contains("not positive: 0"));
         assert_eq!(
             RawTrade::from_zero_price_frame(&zero, received_at_ns)
                 .unwrap()
@@ -1583,7 +1583,7 @@ mod tests {
         assert!(RawTrade::from_zero_price_frame(&negative, received_at_ns)
             .unwrap_err()
             .to_string()
-            .contains("not positive"));
+            .contains("not positive: -1"));
 
         let mut positive = zero.clone();
         positive["data"]["p"] = json!("100.5");

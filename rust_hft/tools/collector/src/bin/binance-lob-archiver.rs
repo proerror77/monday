@@ -2632,12 +2632,17 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
         return Ok(Event::AggregateTrade { trade, frame });
     }
     if channel.eq_ignore_ascii_case("trade") {
-        let trade = match RawTrade::from_frame(&frame, received_at_ns) {
-            Ok(trade) => trade,
-            Err(error) => match RawTrade::from_zero_price_frame(&frame, received_at_ns) {
-                Ok(trade) => trade,
-                Err(_) => return Err(error),
-            },
+        let zero_price = frame
+            .get("data")
+            .unwrap_or(&frame)
+            .get("p")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+            == Some(rust_decimal::Decimal::ZERO);
+        let trade = if zero_price {
+            RawTrade::from_zero_price_frame(&frame, received_at_ns)?
+        } else {
+            RawTrade::from_frame(&frame, received_at_ns)?
         };
         return Ok(Event::RawTrade { trade, frame });
     }
@@ -5595,6 +5600,20 @@ mod tests {
         };
         assert_eq!(ticker.symbol, "BTCUSDT");
         assert_eq!(ticker.received_at_ns, received_at_ns);
+    }
+
+    #[test]
+    fn zero_price_raw_trade_preserves_missing_quantity_error() {
+        let received_at_ns = now_ns().unwrap();
+        let mut frame = raw_trade_frame(9, received_at_ns);
+        frame["data"]["p"] = json!("0");
+        frame["data"].as_object_mut().unwrap().remove("q");
+        let error = event_from_frame(frame, received_at_ns).unwrap_err().to_string();
+        assert!(
+            error.contains("raw trade field q is missing"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("raw trade field p is not positive"));
     }
 
     #[test]
