@@ -5743,6 +5743,196 @@ mod tests {
     }
 
     #[test]
+    fn binance_frame_to_upload_only_contract_covers_every_usdm_stream() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for the upload-only contract")
+            .status
+            .success());
+        let dirs = UploadTestDir::new();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.spool_dir = dirs.spool.clone();
+        let session_id = "session-usdm-upload-only";
+        let segment_start = now_ns().unwrap();
+        let mut segment = Segment::create(config.segment_config(), segment_start).unwrap();
+        let stream_types = config.stream_types();
+        segment
+            .write(
+                "session_start",
+                json!({
+                    "session_id": session_id,
+                    "market": config.market.as_str(),
+                    "symbols": config.symbols.len(),
+                    "websocket_shards": stream_types.len(),
+                    "websocket_streams": stream_types.len(),
+                    "stream_types": stream_types,
+                }),
+                now_ns().unwrap(),
+            )
+            .unwrap();
+
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Usdm),
+        )]);
+        let coverage = config
+            .stream_types()
+            .iter()
+            .map(|stream_type| vec![format!("btcusdt@{stream_type}")])
+            .collect::<Vec<_>>();
+        let mut budget = PendingBudget::new(10);
+        let mut process_state = ProcessState::new(false);
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            session_id,
+            Event::StreamCoverageVerified { shards: coverage },
+            &mut process_state,
+        )
+        .unwrap();
+
+        let snapshot_received_at_ns = now_ns().unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            session_id,
+            Event::Snapshot {
+                received_at_ns: snapshot_received_at_ns,
+                symbol: "BTCUSDT".into(),
+                request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
+                snapshot: json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["101", "1"]],
+                }),
+            },
+            &mut process_state,
+        )
+        .unwrap();
+
+        for stream_type in config.stream_types() {
+            let received_at_ns = now_ns().unwrap();
+            let event_time_ms = received_at_ns / 1_000_000 - 1;
+            let frames = match stream_type.as_str() {
+                "depth@100ms" => vec![json!({
+                    "stream": "btcusdt@depth@100ms",
+                    "data": {
+                        "e": "depthUpdate",
+                        "E": event_time_ms,
+                        "T": event_time_ms,
+                        "s": "BTCUSDT",
+                        "U": 101,
+                        "u": 101,
+                        "pu": 100,
+                        "b": [["100", "2"]],
+                        "a": [],
+                    },
+                })],
+                "aggTrade" => vec![json!({
+                    "stream": "btcusdt@aggTrade",
+                    "data": {
+                        "e": "aggTrade",
+                        "E": event_time_ms,
+                        "s": "BTCUSDT",
+                        "a": 1,
+                        "f": 1,
+                        "l": 1,
+                        "p": "101",
+                        "q": "0.2",
+                        "T": event_time_ms,
+                        "m": true,
+                    },
+                })],
+                "trade" => {
+                    let positive = raw_trade_frame(9, received_at_ns);
+                    let mut zero_price = raw_trade_frame(10, received_at_ns);
+                    zero_price["data"]["p"] = json!("0");
+                    vec![positive, zero_price]
+                }
+                "bookTicker" => vec![book_ticker_frame(received_at_ns)],
+                "forceOrder" => vec![force_order_frame(received_at_ns)],
+                unknown => panic!("unexpected USD-M stream type {unknown}"),
+            };
+            for frame in frames {
+                let received_at_ns = now_ns().unwrap();
+                let event = event_from_frame(frame, received_at_ns).unwrap();
+                process_event(
+                    &config,
+                    &mut segment,
+                    &mut states,
+                    &mut budget,
+                    session_id,
+                    event,
+                    &mut process_state,
+                )
+                .unwrap();
+            }
+        }
+
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            session_id,
+            "test",
+            &process_state,
+        )
+        .unwrap()
+        .expect("USD-M contract segment must be non-empty");
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["event_types"]["raw_trade"], 1);
+        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
+
+        let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
+        write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(
+            &artifacts.sha256,
+            &manifest_sha256,
+        )
+        .unwrap();
+        let triplet = BinanceMarketTapeTriplet {
+            data: artifacts.data.clone(),
+            manifest: artifacts.manifest.clone(),
+            success: artifacts.success.clone(),
+        };
+        let sealed = seal_binance_market_tape_triplet(&triplet, &trust).unwrap();
+        verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+
+        let mut fake = FakeOss::default();
+        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+            fake.run(&dirs.bucket, command, timeout)
+        })
+        .unwrap();
+        assert_eq!(outcome.uploaded, 1);
+        assert_eq!(outcome.retried, 0);
+        assert_eq!(outcome.pending_batches, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(fake.uploads, 3);
+        assert!(!artifacts.data.exists());
+        assert!(!artifacts.manifest.exists());
+        assert!(!artifacts.success.exists());
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+        let uploaded = outcome.last_uploaded.expect("upload receipt");
+        for name in [
+            triplet.data.file_name().unwrap(),
+            triplet.manifest.file_name().unwrap(),
+            triplet.success.file_name().unwrap(),
+        ] {
+            assert!(dirs.bucket.join(&uploaded.object_prefix).join(name).is_file());
+        }
+    }
+
+    #[test]
     fn book_ticker_and_force_order_are_archived_without_sequence_state() {
         let root = env::temp_dir().join(format!(
             "monday-binance-book-ticker-{}",
