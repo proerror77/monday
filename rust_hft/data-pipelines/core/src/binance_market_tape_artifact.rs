@@ -573,6 +573,7 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                     } else {
                         if identities.is_empty()
                             && !snapshot_seeds.contains(&symbol)
+                            && !require_trade_summaries
                             && !require_lob_continuity
                         {
                             bail!(
@@ -2261,6 +2262,27 @@ mod tests {
 
         let verified =
             verify_binance_market_tape_with_required_trade_and_lob_summaries(vec![sealed]).unwrap();
+        assert!(matches!(
+            verified.replayed_books()[0].events(),
+            [
+                ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot { .. }),
+                ReplayedBinanceBookEvent::Checkpoint { .. },
+            ]
+        ));
+    }
+
+    #[test]
+    fn first_segment_replay_safe_checkpoint_seeds_plain_trade_verifier() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.retain(|row| !matches!(row["type"].as_str(), Some("snapshot") | Some("diff")));
+        let rows = with_stream_coverage(rows, &["BTCUSDT"]);
+        let (triplet, _) = write_triplet(root.path(), &rows);
+        let anchor = add_trade_summaries(&triplet, one_trade_summary("2"));
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified =
+            verify_binance_market_tape_with_required_trade_summaries(vec![sealed]).unwrap();
         assert!(matches!(
             verified.replayed_books()[0].events(),
             [
