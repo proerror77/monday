@@ -1,11 +1,12 @@
 # Branch Operations
 
-A branch belongs to one independently mergeable section, issue, and PR. Its
-dedicated worktree has exactly one write owner.
+Use a branch when a change will be published or must be isolated from concurrent
+writes. A branch has one write owner and contains one independently reviewable
+behavior.
 
-Before edits, commits, rebases, pushes, or merges, re-read the branch, `HEAD`,
-and status. Do not pull or push another issue's branch as a synchronization
-mechanism; depend on the merged predecessor or an explicitly declared stack.
+Re-read branch, `HEAD`, status, and PR head before publishing or merging. Do not
+use another contract's branch as a synchronization mechanism; depend on its
+merged result or an explicit stack.
 
-Preserve branches and worktrees after merge, failure, or abandonment until the
-repository owner explicitly authorizes cleanup of exact targets.
+Do not delete a branch or worktree without explicit repository-owner
+authorization for the exact target.

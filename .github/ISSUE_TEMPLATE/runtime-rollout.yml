@@ -1,53 +1,46 @@
-name: Runtime rollout
-description: Request one bounded live mutation or runtime-evidence contract
-labels: ["enhancement", "needs-triage", "runtime"]
+name: Runtime outcome
+description: Request and record one bounded live outcome
+labels: ["enhancement", "runtime"]
 body:
   - type: input
     id: target
     attributes:
-      label: Exact target identity
-      description: Name the bounded host, cluster resource, service, or repository setting.
+      label: Exact target
     validations:
       required: true
   - type: input
     id: controller
     attributes:
-      label: Named controller
-      description: Name the one authorized writer for this rollout.
+      label: One controller
     validations:
       required: true
   - type: textarea
     id: candidate
     attributes:
-      label: Candidate and configuration identity
-      description: Record immutable source, artifact/image/binary, and configuration identities.
+      label: Candidate identity
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration identity
     validations:
       required: true
   - type: textarea
     id: rollback
     attributes:
       label: Rollback identity and procedure
-      description: Record the immutable previous state and bounded rollback action.
     validations:
       required: true
   - type: textarea
-    id: stop_rules
+    id: stop
     attributes:
-      label: Stop rules
-      description: Name failures that stop mutation or prevent promotion.
+      label: Stop and cleanup rules
     validations:
       required: true
   - type: textarea
-    id: success
+    id: proof
     attributes:
-      label: Success and cleanup evidence
-      description: Define independent readback, post-change observation, cleanup, and rollback-expiry evidence.
-    validations:
-      required: true
-  - type: textarea
-    id: out_of_scope
-    attributes:
-      label: Out of scope
-      description: Name adjacent resources, services, and trust domains that must not change.
+      label: Success and direct readback
     validations:
       required: true

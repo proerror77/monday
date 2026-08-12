@@ -1,47 +1,26 @@
-name: Product requirement
-description: Define a multi-step outcome before decomposition
-title: "PRD: "
-labels: ["enhancement", "needs-triage", "tracking"]
+name: Product outcome
+description: Coordinate a durable multi-owner or multi-session outcome
+title: "Outcome: "
+labels: ["enhancement", "tracking"]
 body:
   - type: textarea
     id: problem
     attributes:
-      label: Problem Statement
-      description: Describe the user-visible problem and why it matters.
+      label: Problem
+      description: What user-visible problem must be solved?
     validations:
       required: true
   - type: textarea
-    id: solution
+    id: outcome
     attributes:
-      label: Solution
-      description: Describe the outcome without prescribing speculative machinery.
+      label: Observable outcome
+      description: What result proves the problem is solved?
     validations:
       required: true
   - type: textarea
-    id: stories
+    id: constraints
     attributes:
-      label: User Stories
-      description: List the actors, capabilities, and benefits this outcome must cover.
+      label: Constraints
+      description: Record only real authority, safety, or compatibility boundaries.
     validations:
-      required: true
-  - type: textarea
-    id: decisions
-    attributes:
-      label: Implementation Decisions
-      description: Record approved boundaries, interfaces, and rollout units.
-    validations:
-      required: true
-  - type: textarea
-    id: testing
-    attributes:
-      label: Testing Decisions
-      description: Name the public seams and acceptance evidence.
-    validations:
-      required: true
-  - type: textarea
-    id: out_of_scope
-    attributes:
-      label: Out of Scope
-      description: Name adjacent work that this PRD does not authorize.
-    validations:
-      required: true
+      required: false

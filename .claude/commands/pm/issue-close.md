@@ -107,9 +107,6 @@ open_blockers=$(gh api --paginate "repos/{owner}/{repo}/issues/$issue_number/dep
   --jq '.[] | select(.state != "closed") | .number') || exit 1
 [ -z "$open_blockers" ] || { echo "❌ Native blockers remain open" >&2; exit 1; }
 issue_labels=$(gh issue view "$issue_number" --json labels --jq '.labels[].name') || exit 1
-category_count=$(printf '%s\n' "$issue_labels" | awk '$0 == "bug" || $0 == "enhancement" { n++ } END { print n + 0 }')
-triage_count=$(printf '%s\n' "$issue_labels" | awk '/^(needs-triage|needs-info|ready-for-agent|ready-for-human|wontfix)$/ { n++ } END { print n + 0 }')
-[ "$category_count" -eq 1 ] && [ "$triage_count" -eq 1 ] || { echo "❌ Issue labels violate the lifecycle contract" >&2; exit 1; }
 
 if printf '%s\n' "$issue_labels" | grep -Fxq tracking; then
   open_children=$(gh api --paginate "repos/{owner}/{repo}/issues/$issue_number/sub_issues" \
@@ -122,8 +119,8 @@ if printf '%s\n' "$issue_labels" | grep -Fxq tracking; then
 fi
 
 if printf '%s\n' "$issue_labels" | grep -Fxq runtime; then
-  runtime_record=$(gh issue view "$issue_number" --json comments \
-    --jq '[.comments[].body] | join("\n")') || exit 1
+  runtime_record=$(gh issue view "$issue_number" --json body,comments \
+    --jq '[.body] + [.comments[].body] | join("\n")') || exit 1
   runtime_record="$runtime_record
 $completion_evidence"
   for field in "Exact target" "Named controller" "Candidate identity" \

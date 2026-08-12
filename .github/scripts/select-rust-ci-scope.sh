@@ -285,11 +285,9 @@ for path in "${paths[@]}"; do
       select_all_security_jobs
       continue
       ;;
-    .github/workflows/issue-lifecycle.yml|\
     .github/workflows/claude.yml|.github/workflows/claude-code-review.yml|\
     .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|\
-    docs/agents/issue-tracker.md|docs/agents/triage-labels.md|\
-    .github/scripts/issue-lifecycle-*|.github/scripts/test-issue-lifecycle-*)
+    docs/agents/issue-tracker.md|docs/agents/triage-labels.md)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       select_job ploy/workflow-lint
       continue
