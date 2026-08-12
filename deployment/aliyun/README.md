@@ -800,8 +800,11 @@ isolated spools below, and isolated OSS datasets:
 | USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
 
 The sealed-triplet preflight binds candidate source/bundle/build identity and
-independently verifies two Spot and two USD-M data/manifest/`_SUCCESS` triplets
-with the strict continuity verifiers. It does not claim to replay raw frames;
+independently verifies one or more latest Spot and USD-M data/manifest/`_SUCCESS`
+triplets with the strict continuity verifiers. It does not claim to replay raw
+frames; the preflight is a candidate/format check, while cross-segment
+continuity and the required two new post-observation triplets per market remain
+correctness-mode evidence:
 the merged exact-frame parser E2E remains the parser evidence. The controller
 must supply the reviewed corpus receipt's expected replay identity as the
 preflight's third argument; the preflight never generates that trust anchor
