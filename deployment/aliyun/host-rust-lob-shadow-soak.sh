@@ -48,12 +48,15 @@ fi
 }
 readonly CANDIDATE_SHA256=$1
 readonly SOAK_SECONDS=${2:-1800}
+readonly MIN_SOAK_SECONDS=1201
 [[ $CANDIDATE_SHA256 =~ ^[a-f0-9]{64}$ ]] || {
   printf 'candidate SHA must be 64 lowercase hexadecimal characters\n' >&2
   exit 2
 }
-[[ $SOAK_SECONDS =~ ^[1-9][0-9]*$ && $SOAK_SECONDS -le 7200 ]] || {
-  printf 'duration must be 1..7200 seconds\n' >&2
+[[ $SOAK_SECONDS =~ ^[1-9][0-9]*$ && $SOAK_SECONDS -ge $MIN_SOAK_SECONDS \
+  && $SOAK_SECONDS -le 7200 ]] || {
+  printf 'duration must be %s..7200 seconds for two observation segments\n' \
+    "$MIN_SOAK_SECONDS" >&2
   exit 2
 }
 
@@ -84,9 +87,9 @@ die() {
   exit 1
 }
 
-for command in aliyun awk cmp cp date df dirname find flock grep head hostname id install jq \
-  journalctl mountpoint readelf readlink rm runuser sed sha256sum sleep sort stat systemctl \
-  systemd-run tail tr wc zstd; do
+for command in aliyun awk chmod chown cmp cp date df dirname env find flock grep head hostname \
+  id install jq journalctl mktemp mountpoint readelf readlink rm runuser sed sha256sum sleep \
+  sort stat systemctl systemd-run tail tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -99,6 +102,24 @@ data_free_kb=$(df -Pk /data | awk 'NR == 2 {print $4}')
 id "$SERVICE_USER" >/dev/null 2>&1 || die "missing service user: $SERVICE_USER"
 [[ -r /proc/uptime ]] || die '/proc/uptime is required for monotonic timing'
 
+tmp_dir=
+run_resources_started=false
+cleanup_partial() {
+  local path
+  set +e
+  [[ -z ${tmp_dir:-} ]] || rm -rf -- "$tmp_dir"
+  if [[ ${run_resources_started:-false} == true ]]; then
+    for path in "${evidence_dir:-}" "${run_spool_path:-}"; do
+      [[ -n $path ]] || continue
+      rm -rf -- "$path"
+    done
+  fi
+}
+trap cleanup_partial EXIT
+tmp_dir=$(mktemp -d)
+chown "$SERVICE_USER:$SERVICE_USER" "$tmp_dir"
+chmod 0750 "$tmp_dir"
+
 candidate_release="$RELEASE_ROOT/$CANDIDATE_SHA256"
 candidate_binary="$candidate_release/binance-lob-archiver"
 candidate_deployment="$candidate_release/deployment"
@@ -109,6 +130,18 @@ direct_directory() {
   local path=$1
   [[ -d $path && ! -L $path ]] || return 1
   [[ $(readlink -f -- "$path") == "$path" ]]
+}
+
+assert_no_symlink_ancestors() {
+  local cursor=$1
+  while [[ $cursor != / ]]; do
+    if [[ -e $cursor || -L $cursor ]]; then
+      [[ -d $cursor && ! -L $cursor ]] \
+        || die "path ancestor is missing, not a directory, or a symlink: $cursor"
+    fi
+    cursor=${cursor%/*}
+    [[ -n $cursor ]] || cursor=/
+  done
 }
 
 secure_regular_file() {
@@ -323,12 +356,15 @@ assert_production_baseline() {
 }
 
 evidence_dir="$EVIDENCE_ROOT/$CANDIDATE_SHA256/$evidence_run_id"
+run_spool_path="$RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id"
 direct_directory "/data/monday" || die '/data/monday is not a direct directory'
 direct_directory "/data/monday/evidence" || die '/data/monday/evidence is not a direct directory'
+assert_no_symlink_ancestors "$run_spool_path"
+[[ ! -e $evidence_dir && ! -L $evidence_dir ]] || die 'soak evidence path already exists'
+[[ ! -e $run_spool_path && ! -L $run_spool_path ]] || die 'run-scoped spool already exists'
+run_resources_started=true
 install -d -m 0750 "$EVIDENCE_ROOT" "$EVIDENCE_ROOT/$CANDIDATE_SHA256" "$evidence_dir"
 direct_directory "$evidence_dir" || die 'soak evidence path is indirect'
-[[ ! -e $RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id ]] \
-  || die 'run-scoped spool already exists'
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" \
   "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256" \
   "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id" \
@@ -341,9 +377,6 @@ done
 [[ ! -e "$evidence_dir/gate.json" && ! -e "$evidence_dir/PASSED.sha256" ]] \
   || die 'soak evidence path unexpectedly contains a formal gate marker'
 
-tmp_dir=$(mktemp -d)
-chown "$SERVICE_USER:$SERVICE_USER" "$tmp_dir"
-chmod 0750 "$tmp_dir"
 baseline_fingerprint="$evidence_dir/production-baseline.json"
 current_fingerprint="$tmp_dir/production-current.json"
 install -d -m 0755 "$(dirname "$LOCK_FILE")"
@@ -635,7 +668,7 @@ sample_health() {
       n_restarts:$restarts,cpu_usage_ns:$cpu_usage}')
   cgroup_obj=$(sample_cgroup "$market")
   spool_obj=$(find "${spool_dir[$market]}" -maxdepth 1 -type f \
-    -printf '%T@ %s %p\n' | sort -nr | head -100 \
+    -printf '%T@ %s %p\n' | sort -nr | sed -n '1,100p' \
     | jq -Rsc 'split("\n") | map(select(length > 0))')
   jq -cn --arg sampled_at "$now" --arg market "$market" --arg phase "$phase" \
     --arg health_state "$health_state" --argjson health "$health_obj" \
@@ -796,8 +829,9 @@ manifest_uris() {
     else
       token=${line##*[$' \t']}
       token=${token#/}
-      [[ $token == *.manifest.json && $token == lake/* ]] \
-        && printf 'oss://%s/%s\n' "${oss_bucket[$market]}" "$token"
+      if [[ $token == *.manifest.json && $token == lake/* ]]; then
+        printf 'oss://%s/%s\n' "${oss_bucket[$market]}" "$token"
+      fi
     fi
   done <"$listing" | sort -u
 }
@@ -809,6 +843,7 @@ run_strict_verifier() {
   strict_verifier_counter=$((strict_verifier_counter + 1))
   strict_verifier_unit="monday-rust-soak-verifier-$$-$strict_verifier_counter.service"
   if systemd-run --quiet --wait --collect --unit="$strict_verifier_unit" \
+    --uid="$SERVICE_USER" --gid="$SERVICE_USER" \
     --property=KillMode=control-group --property=MemoryHigh=5000M \
     --property=MemoryMax=6400M -- "$candidate_binary" "$@"; then
     status=0
@@ -877,7 +912,7 @@ verify_market_readback() {
   sort -nr -k1,1 "$candidates" | tail -n 2 | sort -n -k1,1 >"$selected"
   while IFS=$'\t' read -r start_ns end_ns uri file manifest_digest; do
     segment_dir="$tmp_dir/$market-segment-$start_ns"
-    install -d -m 0750 "$segment_dir"
+    install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"
     manifest_path="$segment_dir/${file}.manifest.json"
     zst_path="$segment_dir/$file"
     success_path="$segment_dir/$file._SUCCESS"
@@ -931,15 +966,13 @@ verify_market_readback() {
   run_strict_verifier "${aggregate_args[@]}" \
     >"$evidence_dir/${market}-aggregate-continuity.txt" 2>&1 \
     || die "$market aggregate continuity verifier failed"
-  if [[ $market == usdm ]]; then
-    local -a raw_args=(--verify-raw-trade-continuity)
-    raw_args+=(--verify-segment "${strict_segments[0]}" --segment-content-sha256 "${strict_segments[1]}" \
-      --segment-manifest-sha256 "${strict_segments[2]}" --verify-segment "${strict_segments[3]}" \
-      --segment-content-sha256 "${strict_segments[4]}" --segment-manifest-sha256 "${strict_segments[5]}")
-    run_strict_verifier "${raw_args[@]}" \
-      >"$evidence_dir/${market}-raw-trade-continuity.txt" 2>&1 \
-      || die 'USD-M raw-trade continuity verifier failed'
-  fi
+  local -a raw_args=(--verify-raw-trade-continuity)
+  raw_args+=(--verify-segment "${strict_segments[0]}" --segment-content-sha256 "${strict_segments[1]}" \
+    --segment-manifest-sha256 "${strict_segments[2]}" --verify-segment "${strict_segments[3]}" \
+    --segment-content-sha256 "${strict_segments[4]}" --segment-manifest-sha256 "${strict_segments[5]}")
+  run_strict_verifier "${raw_args[@]}" \
+    >"$evidence_dir/${market}-raw-trade-continuity.txt" 2>&1 \
+    || die "$market raw-trade continuity verifier failed"
 }
 
 soak_completed=false
@@ -965,14 +998,14 @@ stop_primaries_and_wait() {
 }
 
 capture_journal() {
-  local end_iso=$1
+  local end_iso=$1 output=${2:-"$evidence_dir/journal.txt"}
   journalctl -u "${unit[spot]}" -u "${unit[usdm]}" \
     --since "$start_iso" --until "$end_iso" --no-pager -o short-precise \
-    >"$evidence_dir/journal.txt" 2>&1 || cleanup_failure=true
+    >"$output" 2>&1 || cleanup_failure=true
 }
 
 capture_final_producer_diagnostics() {
-  local market
+  local suffix=${1:-final} market
   for market in "${MARKETS[@]}"; do
     {
       printf 'market=%s producer=%s\n' "$market" "${unit[$market]}"
@@ -983,7 +1016,7 @@ capture_final_producer_diagnostics() {
           queue_saturated,sequence_gaps,symbol_count,stream_coverage_verified_count,
           all_stream_coverage_verified}' "${spool_dir[$market]}/health.json" || true
       fi
-    } >"$evidence_dir/${market}-producer-final.txt" 2>&1 || cleanup_failure=true
+    } >"$evidence_dir/${market}-producer-$suffix.txt" 2>&1 || cleanup_failure=true
   done
 }
 
@@ -991,8 +1024,8 @@ cleanup() {
   local status=$? end_iso
   set +e
   end_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  capture_journal "$end_iso"
-  capture_final_producer_diagnostics
+  capture_journal "$end_iso" "$evidence_dir/journal-precleanup.txt"
+  capture_final_producer_diagnostics precleanup
   [[ $watchdog_failure == true ]] && cleanup_failure=true
   for market in "${MARKETS[@]}"; do
     [[ ${recovery_active[$market]:-false} != true ]] || cleanup_failure=true
@@ -1029,6 +1062,9 @@ cleanup() {
   install -m 0640 "$current_fingerprint" "$evidence_dir/production-final.json" 2>/dev/null \
     || cleanup_failure=true
   df -Pk /data >"$evidence_dir/data-df-final.txt" 2>/dev/null || cleanup_failure=true
+  end_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  capture_journal "$end_iso" "$evidence_dir/journal.txt"
+  capture_final_producer_diagnostics
   if [[ -n ${LOCK_FILE:-} ]]; then
     flock -u 9 >/dev/null 2>&1 || true
     exec 9>&-
@@ -1051,7 +1087,7 @@ cleanup() {
         formal_gate:false,cutover:false,live:false,finished_at:$finished_at,
         run_spool:$run_spool}' >"$evidence_dir/receipt.json"
   fi
-  rm -rf "$tmp_dir"
+  rm -rf -- "$tmp_dir"
   exit "$status"
 }
 trap 'exit 143' HUP INT TERM
@@ -1139,8 +1175,16 @@ journalctl -u "${unit[spot]}" -u "${unit[usdm]}" \
   --since "$start_iso" --until "$prestop_iso" --no-pager -o short-precise \
   >"$evidence_dir/journal-prestop.txt" 2>&1 \
   || die 'failed to capture the pre-stop shadow journal'
+tail_journal="$evidence_dir/journal-prestop-tail.txt"
+journalctl -u "${unit[spot]}" -u "${unit[usdm]}" \
+  --since "$watchdog_window_start_iso" --until "$prestop_iso" --no-pager -o short-precise \
+  >"$tail_journal" 2>&1 \
+  || die 'failed to capture the final pre-stop shadow journal window'
 if grep -Eiq "$FATAL_JOURNAL_REGEX" "$evidence_dir/journal-prestop.txt"; then
   die 'shadow journal contains a fatal watchdog/session diagnostic'
+fi
+if grep -Eiq "$TRANSPORT_JOURNAL_REGEX" "$tail_journal"; then
+  die 'shadow journal contains a transport reset after the final health sample'
 fi
 
 stop_primaries_and_wait || die 'shadow primaries did not stop synchronously'
