@@ -693,7 +693,7 @@ impl ProcessAction {
 
 #[derive(Debug, PartialEq, Eq)]
 enum RotationBarrierResult {
-    Ready { initial_snapshots_complete: bool },
+    Ready { initial_snapshots_complete: usize },
     RestartSession,
 }
 
@@ -1233,9 +1233,17 @@ async fn run_session(
         .sum::<usize>();
     // One message per websocket shard, fanned out to every snapshot producer so
     // each waits for full stream coverage before pulling REST snapshots. Every
-    // producer subscribes synchronously in the spawn loop below, before any
-    // websocket task is polled, so no connection notification can be missed.
+    // producer subscribes before any websocket task is spawned: on the
+    // multi-thread runtime a spawned task may run immediately, and a coverage
+    // notification sent into an empty broadcast set would be dropped and never
+    // re-announced.
     let (stream_connected_tx, _) = broadcast::channel(expected_shards.max(1));
+    let snapshot_subscriptions = (0..snapshot_producers)
+        .map(|_| stream_connected_tx.subscribe())
+        .collect::<Vec<_>>();
+    // One process-wide REST rate limiter shared by every snapshot producer, so
+    // N shards cannot multiply SNAPSHOT_REQUESTS_PER_SECOND by N.
+    let snapshot_rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
     for (producer_id, shard) in stream_shards.into_iter().enumerate() {
         let stall_timeout = shard.stall_timeout(config.stall_timeout);
         tasks.spawn(receive_url(
@@ -1251,18 +1259,23 @@ async fn run_session(
             rotation_resume_rx.clone(),
         ));
     }
-    for (index, symbols) in snapshot_shards.into_iter().enumerate() {
+    for (index, (symbols, subscription)) in snapshot_shards
+        .into_iter()
+        .zip(snapshot_subscriptions)
+        .enumerate()
+    {
         tasks.spawn(produce_snapshots_after_streams_connect(
             config.clone(),
             sender.clone(),
             session_stop_rx.clone(),
-            stream_connected_tx.subscribe(),
+            subscription,
             expected_shards,
             expected_shards + index,
             rotation_pause_rx.clone(),
             rotation_resume_rx.clone(),
             symbols,
             index == 0,
+            snapshot_rate_limiter.clone(),
         ));
     }
     let mut states = active_symbols
@@ -1286,6 +1299,7 @@ async fn run_session(
     let mut last_health = Instant::now() - Duration::from_secs(60);
     let mut failure = None;
     let mut sync_deadline = None;
+    let mut snapshot_completions = 0_usize;
     let mut pending_segment_finalizer = None;
 
     loop {
@@ -1366,7 +1380,10 @@ async fn run_session(
                 unreachable!("recovered reconnect must restart the session")
             }
             ProcessAction::InitialSnapshotsComplete => {
-                sync_deadline = Some(Instant::now() + config.sync_timeout);
+                snapshot_completions += 1;
+                if snapshot_completions >= snapshot_producers {
+                    sync_deadline = Some(Instant::now() + config.sync_timeout);
+                }
             }
         }
 
@@ -1432,7 +1449,7 @@ async fn run_session(
                     break;
                 }
             };
-            let initial_snapshots_complete = match barriers {
+            let completed_during_barrier = match barriers {
                 RotationBarrierResult::Ready {
                     initial_snapshots_complete,
                 } => initial_snapshots_complete,
@@ -1441,7 +1458,8 @@ async fn run_session(
                     break;
                 }
             };
-            if initial_snapshots_complete {
+            snapshot_completions += completed_during_barrier;
+            if snapshot_completions >= snapshot_producers {
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
             }
             let next_segment = match begin_segment_rotation(
@@ -2052,7 +2070,7 @@ async fn await_rotation_barriers(
         .max(SUBSCRIPTION_PROOF_TIMEOUT.saturating_add(Duration::from_secs(1)));
     let deadline = tokio::time::Instant::now() + acknowledgement_timeout;
     let mut acknowledged = BTreeSet::new();
-    let mut saw_initial_snapshots_complete = false;
+    let mut initial_snapshots_complete = 0_usize;
     while acknowledged.len() < expected_producers {
         let event = tokio::select! {
             event = receiver.recv() => {
@@ -2133,13 +2151,14 @@ async fn await_rotation_barriers(
                 if action.restarts_capture_session() {
                     return Ok(RotationBarrierResult::RestartSession);
                 }
-                saw_initial_snapshots_complete |=
-                    matches!(action, ProcessAction::InitialSnapshotsComplete);
+                if matches!(action, ProcessAction::InitialSnapshotsComplete) {
+                    initial_snapshots_complete += 1;
+                }
             }
         }
     }
     Ok(RotationBarrierResult::Ready {
-        initial_snapshots_complete: saw_initial_snapshots_complete,
+        initial_snapshots_complete,
     })
 }
 
@@ -2624,6 +2643,27 @@ async fn wait_for_rotation_or_shutdown<T>(
     }
 }
 
+fn snapshot_rate_limiter(
+    requests_per_second: f64,
+) -> Arc<tokio::sync::Mutex<tokio::time::Interval>> {
+    Arc::new(tokio::sync::Mutex::new(tokio::time::interval(
+        Duration::from_secs_f64(1.0 / requests_per_second.max(0.1)),
+    )))
+}
+
+async fn wait_for_snapshot_rate_slot(
+    rate_limiter: &Arc<tokio::sync::Mutex<tokio::time::Interval>>,
+    shutdown: &mut watch::Receiver<bool>,
+    rotation_pause: &mut watch::Receiver<u64>,
+) -> anyhow::Result<ProducerWait<()>> {
+    let mut limiter = rate_limiter.lock().await;
+    match wait_for_rotation_or_shutdown(limiter.tick(), shutdown, rotation_pause).await? {
+        ProducerWait::Ready(_) => Ok(ProducerWait::Ready(())),
+        ProducerWait::PauseRequested => Ok(ProducerWait::PauseRequested),
+        ProducerWait::Stopped => Ok(ProducerWait::Stopped),
+    }
+}
+
 async fn wait_for_stream_reconnect(
     sender: &mpsc::Sender<Event>,
     producer_id: usize,
@@ -3089,6 +3129,7 @@ async fn produce_snapshots_after_streams_connect(
     mut rotation_resume: watch::Receiver<u64>,
     symbols: Vec<String>,
     announce_coverage: bool,
+    rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
     let mut shards = Vec::with_capacity(expected_shards);
     let mut last_pause_epoch = 0_u64;
@@ -3143,6 +3184,7 @@ async fn produce_snapshots_after_streams_connect(
         rotation_resume,
         last_pause_epoch,
         symbols,
+        rate_limiter,
     )
     .await
 }
@@ -3338,11 +3380,11 @@ async fn produce_snapshots(
     mut rotation_resume: watch::Receiver<u64>,
     mut last_pause_epoch: u64,
     symbols: Vec<String>,
+    rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
-    let interval = Duration::from_secs_f64(1.0 / config.snapshot_requests_per_second.max(0.1));
     'symbols: for symbol in symbols {
         let started = now_ns()?;
         let mut attempt = 0_usize;
@@ -3388,6 +3430,27 @@ async fn produce_snapshots(
                         }
                         continue;
                     }
+                }
+            }
+            match wait_for_snapshot_rate_slot(&rate_limiter, &mut shutdown, &mut rotation_pause)
+                .await?
+            {
+                ProducerWait::Ready(()) => {}
+                ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
+                ProducerWait::PauseRequested => {
+                    if let Some(exit) = acknowledge_rotation_pause(
+                        producer_id,
+                        &sender,
+                        &mut rotation_pause,
+                        &mut rotation_resume,
+                        &mut last_pause_epoch,
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
+                    continue;
                 }
             }
             match wait_for_rotation_or_shutdown(
@@ -3447,33 +3510,7 @@ async fn produce_snapshots(
                 reason: "one-sided initial snapshot is not replay-complete".to_owned(),
             };
             match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                SendOutcome::Sent => {
-                    match wait_for_rotation_or_shutdown(
-                        tokio::time::sleep(interval),
-                        &mut shutdown,
-                        &mut rotation_pause,
-                    )
-                    .await?
-                    {
-                        ProducerWait::Ready(()) => continue 'symbols,
-                        ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
-                        ProducerWait::PauseRequested => {
-                            if let Some(exit) = acknowledge_rotation_pause(
-                                producer_id,
-                                &sender,
-                                &mut rotation_pause,
-                                &mut rotation_resume,
-                                &mut last_pause_epoch,
-                                &mut shutdown,
-                            )
-                            .await?
-                            {
-                                return Ok(exit);
-                            }
-                            continue 'symbols;
-                        }
-                    }
-                }
+                SendOutcome::Sent => continue 'symbols,
                 SendOutcome::Shutdown(event) => {
                     return Ok(TaskExit::Stopped(Some(event)));
                 }
@@ -3490,30 +3527,6 @@ async fn produce_snapshots(
         match send_or_shutdown(&sender, event, &mut shutdown).await? {
             SendOutcome::Sent => {}
             SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
-        }
-        match wait_for_rotation_or_shutdown(
-            tokio::time::sleep(interval),
-            &mut shutdown,
-            &mut rotation_pause,
-        )
-        .await?
-        {
-            ProducerWait::Ready(()) => {}
-            ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
-            ProducerWait::PauseRequested => {
-                if let Some(exit) = acknowledge_rotation_pause(
-                    producer_id,
-                    &sender,
-                    &mut rotation_pause,
-                    &mut rotation_resume,
-                    &mut last_pause_epoch,
-                    &mut shutdown,
-                )
-                .await?
-                {
-                    return Ok(exit);
-                }
-            }
         }
     }
     match send_or_shutdown(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
@@ -7969,6 +7982,7 @@ mod tests {
         });
         let config = Arc::new(test_config(format!("http://{address}")));
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let (sender, mut receiver) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (connected_tx, _) = broadcast::channel(2);
@@ -7985,6 +7999,7 @@ mod tests {
             resume_rx,
             symbols,
             true,
+            rate_limiter,
         ));
 
         connected_tx
@@ -8051,6 +8066,7 @@ mod tests {
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8060,6 +8076,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            rate_limiter,
         ));
 
         assert!(matches!(
@@ -8110,6 +8127,7 @@ mod tests {
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
 
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
@@ -8120,6 +8138,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            rate_limiter,
         ));
 
         match receiver.recv().await {
@@ -8188,6 +8207,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8197,6 +8217,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            rate_limiter,
         ));
 
         first_request_rx.await.unwrap();
@@ -8263,6 +8284,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8272,6 +8294,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            rate_limiter,
         ));
 
         first_response_rx.await.unwrap();
@@ -8308,28 +8331,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_during_snapshot_interval_acknowledges_rotation() {
+    async fn pause_during_snapshot_rate_slot_acknowledges_rotation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request).unwrap();
-            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
         });
         let mut config = test_config(format!("http://{address}"));
-        config.snapshot_requests_per_second = 0.1;
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+        config.snapshot_requests_per_second = 0.5;
         let (sender, mut receiver) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8339,6 +8366,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            rate_limiter,
         ));
 
         assert!(matches!(
@@ -8356,6 +8384,10 @@ mod tests {
             })
         ));
         resume_tx.send(1).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, .. }) if symbol == "ETHUSDT"
+        ));
         assert!(matches!(
             receiver.recv().await,
             Some(Event::InitialSnapshotsComplete)
@@ -9748,7 +9780,7 @@ mod tests {
         assert_eq!(
             barriers,
             RotationBarrierResult::Ready {
-                initial_snapshots_complete: false
+                initial_snapshots_complete: 0
             }
         );
         assert!(captured_at_ns < now_ns().unwrap());
