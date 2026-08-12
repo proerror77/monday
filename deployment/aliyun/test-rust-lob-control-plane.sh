@@ -7,6 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
+SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
 COLLECTOR_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
 ARTIFACT_VERIFIER="$SCRIPT_DIR/../../rust_hft/data-pipelines/core/src/binance_market_tape_artifact.rs"
@@ -110,6 +111,15 @@ grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$ACR_WORKFLOW"
 grep -Fq "grep -Fqx 'binance-lob-archiver \${{ needs.selector.outputs.source_sha }}'" "$ACR_WORKFLOW"
+grep -Fxq 'MemoryHigh=4400M' "$SHADOW_UNIT"
+grep -Fxq 'MemoryMax=5000M' "$SHADOW_UNIT"
+grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
+grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
+grep -Fq 'memory_max_bytes[$market] == 5242880000' "$GATE"
+if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GATE"; then
+  printf 'shadow memory contract still depends on a persistent USD-M drop-in\n' >&2
+  exit 1
+fi
 
 observation_started_ns=1000000900
 same_second_warmup_start_ns=1000000100
