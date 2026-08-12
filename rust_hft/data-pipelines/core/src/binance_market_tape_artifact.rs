@@ -185,6 +185,9 @@ impl BinanceRawTradeContinuityVerifier {
         if segment.manifest.schema != MARKET_TAPE_SCHEMA_V2 {
             bail!("raw-trade continuity requires binance.market_tape.v2 segments");
         }
+        if !segment.manifest.raw_trade_incomplete_symbols.is_empty() {
+            bail!("raw-trade data is incomplete for a declared symbol");
+        }
         let symbols = segment
             .manifest
             .symbols
@@ -510,6 +513,7 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
         let mut trade_summaries = AggregateTradeSummaryBuilder::default();
         let mut lob_continuity = LobContinuitySummaryBuilder::new(symbols.iter().cloned())?;
         let mut checkpoints = BTreeSet::new();
+        let mut audited_stale_raw_trade_symbols = BTreeSet::new();
         let mut snapshot_seeds = BTreeSet::new();
         let mut coverage_shard_count = None;
         let mut session_shard_count = None;
@@ -649,6 +653,84 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                         received_at_ns,
                     )?;
                     raw_trade_sequence.observe(&trade)?;
+                }
+                "stale_raw_trade" => {
+                    if market != Market::Usdm {
+                        bail!("stale raw trades are USD-M only");
+                    }
+                    let frame = raw
+                        .get("frame")
+                        .context("stale raw trade event has no frame")?;
+                    let data = frame.get("data").unwrap_or(frame);
+                    let zero_price = data
+                        .get("p")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<Decimal>().ok())
+                        == Some(Decimal::ZERO);
+                    let trade = if zero_price {
+                        RawTrade::from_zero_price_frame_allow_stale(frame, received_at_ns)?
+                    } else {
+                        RawTrade::from_frame_allow_stale(frame, received_at_ns)?
+                    };
+                    let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
+                    require_symbol(&symbols, &symbol)?;
+                    if trade.symbol != symbol {
+                        bail!("stale raw trade symbol does not match its frame");
+                    }
+                    let stream = required_string(raw, "stream")?;
+                    if frame.get("stream").and_then(Value::as_str) != Some(stream) {
+                        bail!("stale raw trade stream does not match its frame");
+                    }
+                    let event_time_ms = data
+                        .get("E")
+                        .and_then(Value::as_u64)
+                        .context("stale raw trade frame is missing E")?;
+                    let trade_time_ms = data
+                        .get("T")
+                        .and_then(Value::as_u64)
+                        .context("stale raw trade frame is missing T")?;
+                    if raw.get("E").and_then(Value::as_u64) != Some(event_time_ms)
+                        || raw.get("T").and_then(Value::as_u64) != Some(trade_time_ms)
+                    {
+                        bail!("stale raw trade source clocks do not match its frame");
+                    }
+                    let received_at_ms = received_at_ns / 1_000_000;
+                    let recv_minus_event_ms = received_at_ms
+                        .checked_sub(event_time_ms)
+                        .context("stale raw trade receive clock is not behind E")?;
+                    let recv_minus_trade_ms = received_at_ms
+                        .checked_sub(trade_time_ms)
+                        .context("stale raw trade receive clock is not behind T")?;
+                    let event_minus_trade_ms = event_time_ms - trade_time_ms;
+                    if recv_minus_event_ms <= MAX_SOURCE_DELAY_MS {
+                        bail!("stale raw trade does not exceed the governed delay");
+                    }
+                    if raw.get("recv_minus_event_ms").and_then(Value::as_u64)
+                        != Some(recv_minus_event_ms)
+                        || raw.get("event_minus_trade_ms").and_then(Value::as_u64)
+                            != Some(event_minus_trade_ms)
+                        || raw.get("recv_minus_trade_ms").and_then(Value::as_u64)
+                            != Some(recv_minus_trade_ms)
+                    {
+                        bail!("stale raw trade clock audit does not match its frame");
+                    }
+                    let producer_id = raw
+                        .get("producer_id")
+                        .and_then(Value::as_u64)
+                        .context("stale raw trade row is missing producer_id")?;
+                    let declared_shards = session_shard_count
+                        .context("stale raw trade row has no session shard declaration")?;
+                    if producer_id >= declared_shards {
+                        bail!(
+                            "stale raw trade producer_id {producer_id} is outside declared websocket_shards {declared_shards}"
+                        );
+                    }
+                    observe_receive_clock(
+                        &mut raw_trade_receive_clocks,
+                        &trade.symbol,
+                        received_at_ns,
+                    )?;
+                    audited_stale_raw_trade_symbols.insert(symbol);
                 }
                 "book_ticker" => {
                     let ticker = BookTicker::from_archived_event(raw, received_at_ns)?;
@@ -826,6 +908,16 @@ fn verify_binance_market_tape_with_requirements_and_surfaces(
                 _ => bail!("incomplete market-tape event {event_type}"),
             }
         }
+        if audited_stale_raw_trade_symbols
+            != segment
+                .manifest
+                .raw_trade_incomplete_symbols
+                .iter()
+                .cloned()
+                .collect()
+        {
+            bail!("market-tape raw-trade incompleteness does not match raw rows");
+        }
         if counts != segment.manifest.event_types
             || segment.rows.len() as u64 != segment.manifest.events
         {
@@ -964,6 +1056,8 @@ struct TapeManifest {
     events: u64,
     event_types: BTreeMap<String, u64>,
     has_replay_safe_checkpoint: bool,
+    #[serde(default)]
+    raw_trade_incomplete_symbols: Vec<String>,
     snapshot_ready_count: u64,
     bridged_count: u64,
     #[serde(default)]
@@ -1069,6 +1163,9 @@ fn validate_manifest_identity(
 }
 
 fn validate_manifest_quality(manifest: &TapeManifest, require_stream_coverage: bool) -> Result<()> {
+    if !manifest.raw_trade_incomplete_symbols.is_empty() {
+        bail!("market-tape raw-trade data is incomplete for a declared symbol");
+    }
     if !manifest.has_replay_safe_checkpoint {
         bail!("market-tape segment is missing a replay-safe checkpoint");
     }
@@ -1144,6 +1241,22 @@ fn allowed_fields(event_type: &str, schema: &str) -> &'static [&'static str] {
             "T",
             "receive_minus_event_ms",
             "event_minus_transaction_ms",
+        ],
+        "stale_raw_trade" => &[
+            "schema",
+            "received_at_ns",
+            "type",
+            "session_id",
+            "archived_only",
+            "frame",
+            "producer_id",
+            "stream",
+            "symbol",
+            "E",
+            "T",
+            "recv_minus_event_ms",
+            "event_minus_trade_ms",
+            "recv_minus_trade_ms",
         ],
         "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "continuity_complete", "stream_coverage_verified", "bids", "asks", "reason", "replay_safe"],
         _ => unreachable!("event type checked above"),
@@ -1573,6 +1686,40 @@ mod tests {
                     "B": "31.21",
                     "a": "100.6",
                     "A": "40.66"
+                }
+            }
+        })
+    }
+
+    fn stale_raw_trade_row(received_at_ns: u64) -> Value {
+        let event_time_ms = received_at_ns / 1_000_000 - 30_944;
+        let trade_time_ms = event_time_ms - 1;
+        json!({
+            "schema": MARKET_TAPE_SCHEMA_V2,
+            "received_at_ns": received_at_ns,
+            "type": "stale_raw_trade",
+            "session_id": "session-1",
+            "producer_id": 0,
+            "stream": "btcusdt@trade",
+            "symbol": "BTCUSDT",
+            "E": event_time_ms,
+            "T": trade_time_ms,
+            "recv_minus_event_ms": 30_944,
+            "event_minus_trade_ms": 1,
+            "recv_minus_trade_ms": 30_945,
+            "frame": {
+                "stream": "btcusdt@trade",
+                "data": {
+                    "e": "trade",
+                    "E": event_time_ms,
+                    "T": trade_time_ms,
+                    "X": "MARKET",
+                    "m": false,
+                    "p": "0.0664000",
+                    "q": "506",
+                    "s": "BTCUSDT",
+                    "st": 1,
+                    "t": 11
                 }
             }
         })
@@ -2395,6 +2542,39 @@ mod tests {
         assert_eq!(verified.segments()[0].events, event_count);
         assert_eq!(verified.aggregate_trades().len(), 1);
         assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
+    }
+
+    #[test]
+    fn stale_raw_trade_rows_must_declare_symbol_incompleteness() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows();
+        rows.insert(5, stale_raw_trade_row(START_NS + 330_000_000));
+        let rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, anchor) =
+            write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let error = verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("raw-trade incompleteness does not match raw rows"));
+    }
+
+    #[test]
+    fn raw_trade_continuity_rejects_declared_incomplete_symbols() {
+        let root = tempdir();
+        let rows = with_stream_coverage_v2(valid_v2_rows(), &["BTCUSDT"], &V2_STREAM_TYPES);
+        let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &V2_STREAM_TYPES);
+        let anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["raw_trade_incomplete_symbols"] = json!(["BTCUSDT"]);
+        });
+        let error = BinanceRawTradeContinuityVerifier::default()
+            .observe_segment(seal_binance_market_tape_triplet(&triplet, &anchor).unwrap())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("raw-trade data is incomplete"));
     }
 
     #[test]

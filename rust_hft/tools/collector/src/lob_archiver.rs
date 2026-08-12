@@ -415,6 +415,7 @@ pub struct Segment {
     counts: BTreeMap<String, u64>,
     trade_summaries: AggregateTradeSummaryBuilder,
     replay_safe: bool,
+    raw_trade_incomplete_symbols: BTreeSet<String>,
     snapshot_ready_symbols: BTreeSet<String>,
     bridged_symbols: BTreeSet<String>,
     stream_coverage_verified_symbols: BTreeSet<String>,
@@ -489,6 +490,7 @@ impl Segment {
             counts: BTreeMap::new(),
             trade_summaries: AggregateTradeSummaryBuilder::default(),
             replay_safe: true,
+            raw_trade_incomplete_symbols: BTreeSet::new(),
             snapshot_ready_symbols: BTreeSet::new(),
             bridged_symbols: BTreeSet::new(),
             stream_coverage_verified_symbols: BTreeSet::new(),
@@ -514,6 +516,13 @@ impl Segment {
         let payload = payload
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("archive payload must be an object"))?;
+        if event_type == "stale_raw_trade" {
+            self.replay_safe = false;
+            if let Some(symbol) = payload.get("symbol").and_then(Value::as_str) {
+                self.raw_trade_incomplete_symbols
+                    .insert(symbol.to_ascii_uppercase());
+            }
+        }
         if event_type == "checkpoint" {
             if let Some(symbol) = payload.get("symbol").and_then(Value::as_str) {
                 if payload.get("synced").and_then(Value::as_bool) == Some(true) {
@@ -598,6 +607,7 @@ impl Segment {
             self.manifest_start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
+            self.raw_trade_incomplete_symbols,
             readiness,
         )
         .map(Some)
@@ -615,6 +625,7 @@ fn finalize_segment(
     start_ns: u64,
     end_ns: u64,
     has_replay_safe_checkpoint: bool,
+    raw_trade_incomplete_symbols: BTreeSet<String>,
     readiness: ReadinessSummary,
 ) -> anyhow::Result<SegmentArtifacts> {
     let replay_scope = match schema {
@@ -664,6 +675,7 @@ fn finalize_segment(
         "events": events,
         "event_types": counts,
         "has_replay_safe_checkpoint": has_replay_safe_checkpoint,
+        "raw_trade_incomplete_symbols": raw_trade_incomplete_symbols.into_iter().collect::<Vec<_>>(),
         "snapshot_ready_count": readiness.snapshot_ready_count,
         "bridged_count": readiness.bridged_count,
         "stream_coverage_verified_count": readiness.stream_coverage_verified_count,
@@ -783,6 +795,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let mut invalid_at = None;
         let mut detected_schema: Option<(bool, String)> = None;
         let mut quarantine = false;
+        let mut raw_trade_incomplete_symbols = BTreeSet::new();
         for line in bytes.split_inclusive(|byte| *byte == b'\n') {
             let complete = line.last() == Some(&b'\n');
             let parsed = serde_json::from_slice::<Value>(line);
@@ -851,6 +864,14 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                     break;
                 }
             }
+            if event_type == "stale_raw_trade" {
+                if let Some(symbol) = event.get("symbol").and_then(Value::as_str) {
+                    raw_trade_incomplete_symbols.insert(symbol.to_ascii_uppercase());
+                } else {
+                    quarantine = true;
+                    break;
+                }
+            }
             *counts.entry(event_type.to_owned()).or_default() += 1;
             offset += line.len();
         }
@@ -886,6 +907,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             start_ns,
             end_ns,
             false,
+            raw_trade_incomplete_symbols,
             readiness_summary(
                 config.symbols.len(),
                 config
