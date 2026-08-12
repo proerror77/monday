@@ -515,9 +515,14 @@ for market in "${markets[@]}"; do
   cpu_quota_us[$market]=$(timespan_to_us "$quota_raw") \
     || die "$market CPU quota is unavailable: $quota_raw"
   ((cpu_quota_us[$market] > 0)) || die "$market CPU quota must be finite"
+  [[ -z $(systemctl_value "$market" DropInPaths) ]] \
+    || die "$market shadow service has an unexpected systemd drop-in"
+  [[ $(systemctl_value "$market" MemoryHigh) == 4613734400 ]] \
+    || die "$market shadow service MemoryHigh differs from the gated template"
   memory_max_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryMax)" \
     "$market MemoryMax")
-  ((memory_max_bytes[$market] > 0)) || die "$market MemoryMax must be finite"
+  ((memory_max_bytes[$market] == 5242880000)) \
+    || die "$market shadow service MemoryMax differs from the gated template"
   max_memory_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
     "$market MemoryCurrent")
 done
