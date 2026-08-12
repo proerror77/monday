@@ -603,6 +603,14 @@ enum Event {
         trade: RawTrade,
         frame: Value,
     },
+    StaleRawTrade {
+        trade: RawTrade,
+        frame: Value,
+        producer_id: usize,
+        recv_minus_event_ms: u64,
+        event_minus_trade_ms: u64,
+        recv_minus_trade_ms: u64,
+    },
     BookTicker {
         ticker: BookTicker,
         frame: Value,
@@ -681,6 +689,7 @@ struct ProcessState {
     depth_source_clocks: DepthSourceClockSequenceValidator,
     aggregate_trades: AggregateTradeSequenceValidator,
     raw_trades: RawTradeSequenceValidator,
+    raw_trade_stale_ranges: HashMap<String, (u64, u64)>,
     stream_coverage_trusted: bool,
     stream_coverage_shards: Vec<Vec<String>>,
     reconnecting_shards: Vec<BTreeSet<String>>,
@@ -1535,6 +1544,44 @@ fn sync_timed_out(
     deadline.is_some_and(|deadline| now > deadline && states.values().any(|state| !state.synced))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_stale_raw_trade(
+    segment: &mut Segment,
+    session_id: &str,
+    trade: &RawTrade,
+    frame: Value,
+    producer_id: usize,
+    recv_minus_event_ms: u64,
+    event_minus_trade_ms: u64,
+    recv_minus_trade_ms: u64,
+    archived_only: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        recv_minus_event_ms > MAX_SOURCE_DELAY_MS,
+        "stale raw trade does not exceed the governed delay"
+    );
+    let stream = frame
+        .get("stream")
+        .and_then(Value::as_str)
+        .context("stale raw trade frame is missing stream")?;
+    let mut row = json!({
+        "session_id":session_id,
+        "producer_id":producer_id,
+        "stream":stream,
+        "symbol":trade.symbol,
+        "E":trade.event_time_ms,
+        "T":trade.trade_time_ms,
+        "recv_minus_event_ms":recv_minus_event_ms,
+        "event_minus_trade_ms":event_minus_trade_ms,
+        "recv_minus_trade_ms":recv_minus_trade_ms,
+        "frame":frame,
+    });
+    if archived_only {
+        row["archived_only"] = json!(true);
+    }
+    segment.write("stale_raw_trade", row, trade.received_at_ns)
+}
+
 fn write_stale_book_ticker(
     segment: &mut Segment,
     session_id: &str,
@@ -1701,7 +1748,13 @@ fn process_event(
                     config.market
                 );
             }
-            if let Err(error) = process_state.raw_trades.observe(&trade) {
+            let sequence_result = match process_state.raw_trade_stale_ranges.remove(&trade.symbol) {
+                Some((stale_start_id, stale_end_id)) => process_state
+                    .raw_trades
+                    .observe_after_stale_range(&trade, stale_start_id, stale_end_id),
+                None => process_state.raw_trades.observe(&trade),
+            };
+            if let Err(error) = sequence_result {
                 segment.mark_replay_unsafe();
                 process_state.sequence_gaps += 1;
                 segment.write(
@@ -1781,6 +1834,70 @@ fn process_event(
                 receive_minus_event_ms,
                 false,
             )?;
+        }
+        Event::StaleRawTrade {
+            trade,
+            frame,
+            producer_id,
+            recv_minus_event_ms,
+            event_minus_trade_ms,
+            recv_minus_trade_ms,
+        } => {
+            anyhow::ensure!(config.market == Market::Usdm, "stale raw trades are USD-M only");
+            if config.is_excluded(&trade.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&trade.symbol) {
+                anyhow::bail!("unconfigured symbol {}", trade.symbol);
+            }
+            let symbol = trade.symbol.clone();
+            write_stale_raw_trade(
+                segment,
+                session_id,
+                &trade,
+                frame.clone(),
+                producer_id,
+                recv_minus_event_ms,
+                event_minus_trade_ms,
+                recv_minus_trade_ms,
+                false,
+            )?;
+            if let Some((_, previous_stale_id)) =
+                process_state.raw_trade_stale_ranges.get(&symbol).copied()
+            {
+                let expected_stale_id = previous_stale_id
+                    .checked_add(1)
+                    .context("raw trade stale id overflow")?;
+                if trade.trade_id != expected_stale_id {
+                    let error = anyhow::anyhow!(
+                        "{} raw trade gap expected={} received={}",
+                        symbol,
+                        expected_stale_id,
+                        trade.trade_id
+                    );
+                    segment.mark_replay_unsafe();
+                    process_state.sequence_gaps += 1;
+                    segment.write(
+                        "sequence_gap",
+                        json!({
+                            "session_id":session_id,
+                            "kind":"raw_trade_sequence",
+                            "symbol":symbol,
+                            "error":error.to_string(),
+                            "frame":frame,
+                        }),
+                        trade.received_at_ns,
+                    )?;
+                    return Err(error);
+                }
+                if let Some(range) = process_state.raw_trade_stale_ranges.get_mut(&symbol) {
+                    range.1 = trade.trade_id;
+                }
+            } else {
+                process_state
+                    .raw_trade_stale_ranges
+                    .insert(symbol, (trade.trade_id, trade.trade_id));
+            }
         }
         Event::ForceOrder { order, frame } => {
             anyhow::ensure!(
@@ -2081,6 +2198,27 @@ fn archive_only(
                 frame,
                 producer_id,
                 receive_minus_event_ms,
+                true,
+            )
+        }
+        Event::StaleRawTrade {
+            trade,
+            frame,
+            producer_id,
+            recv_minus_event_ms,
+            event_minus_trade_ms,
+            recv_minus_trade_ms,
+        } => {
+            anyhow::ensure!(market == Market::Usdm, "stale raw trades are USD-M only");
+            write_stale_raw_trade(
+                segment,
+                session_id,
+                &trade,
+                frame,
+                producer_id,
+                recv_minus_event_ms,
+                event_minus_trade_ms,
+                recv_minus_trade_ms,
                 true,
             )
         }
@@ -3044,6 +3182,21 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
 }
 
 fn raw_trade_from_frame(frame: &Value, received_at_ns: u64) -> anyhow::Result<RawTrade> {
+    raw_trade_from_frame_with_clock_policy(frame, received_at_ns, false)
+}
+
+fn raw_trade_from_frame_allow_stale(
+    frame: &Value,
+    received_at_ns: u64,
+) -> anyhow::Result<RawTrade> {
+    raw_trade_from_frame_with_clock_policy(frame, received_at_ns, true)
+}
+
+fn raw_trade_from_frame_with_clock_policy(
+    frame: &Value,
+    received_at_ns: u64,
+    allow_stale: bool,
+) -> anyhow::Result<RawTrade> {
     let zero_price = frame
         .get("data")
         .unwrap_or(frame)
@@ -3051,8 +3204,12 @@ fn raw_trade_from_frame(frame: &Value, received_at_ns: u64) -> anyhow::Result<Ra
         .and_then(Value::as_str)
         .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
         == Some(rust_decimal::Decimal::ZERO);
-    if zero_price {
+    if zero_price && allow_stale {
+        RawTrade::from_zero_price_frame_allow_stale(frame, received_at_ns)
+    } else if zero_price {
         RawTrade::from_zero_price_frame(frame, received_at_ns)
+    } else if allow_stale {
+        RawTrade::from_frame_allow_stale(frame, received_at_ns)
     } else {
         RawTrade::from_frame(frame, received_at_ns)
     }
@@ -3072,31 +3229,48 @@ fn event_from_frame_for_shard(
         if !is_raw_trade {
             return event_from_frame(frame, received_at_ns);
         }
-        let trade = raw_trade_from_frame(&frame, received_at_ns).map_err(|error| {
-            let data = frame.get("data").unwrap_or(&frame);
-            let event_time_ms = data.get("E").and_then(Value::as_u64);
-            let trade_time_ms = data.get("T").and_then(Value::as_u64);
-            let value_or_missing = |value: Option<u64>| {
-                value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
-            };
-            anyhow::anyhow!(
-                "{error:#}; stream={} symbol={} E={} T={} received_at_ns={received_at_ns} recv_minus_event_ms={} event_minus_trade_ms={} recv_minus_trade_ms={} producer_id={producer_id} frame={frame}",
-                frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
-                data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
-                value_or_missing(event_time_ms),
-                value_or_missing(trade_time_ms),
-                value_or_missing(event_time_ms.map(|event_time_ms| {
-                    (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
-                })),
-                value_or_missing(event_time_ms.zip(trade_time_ms).map(
-                    |(event_time_ms, trade_time_ms)| event_time_ms.saturating_sub(trade_time_ms)
-                )),
-                value_or_missing(trade_time_ms.map(|trade_time_ms| {
-                    (received_at_ns / 1_000_000).saturating_sub(trade_time_ms)
-                })),
-            )
-        })?;
-        return Ok(Event::RawTrade { trade, frame });
+        let strict_error = match raw_trade_from_frame(&frame, received_at_ns) {
+            Ok(trade) => return Ok(Event::RawTrade { trade, frame }),
+            Err(error) => error,
+        };
+        if let Ok(trade) = raw_trade_from_frame_allow_stale(&frame, received_at_ns) {
+            let received_at_ms = received_at_ns / 1_000_000;
+            let recv_minus_event_ms = received_at_ms.saturating_sub(trade.event_time_ms);
+            let event_minus_trade_ms = trade.event_time_ms.saturating_sub(trade.trade_time_ms);
+            let recv_minus_trade_ms = received_at_ms.saturating_sub(trade.trade_time_ms);
+            if recv_minus_event_ms > MAX_SOURCE_DELAY_MS {
+                return Ok(Event::StaleRawTrade {
+                    trade,
+                    frame,
+                    producer_id,
+                    recv_minus_event_ms,
+                    event_minus_trade_ms,
+                    recv_minus_trade_ms,
+                });
+            }
+        }
+        let data = frame.get("data").unwrap_or(&frame);
+        let event_time_ms = data.get("E").and_then(Value::as_u64);
+        let trade_time_ms = data.get("T").and_then(Value::as_u64);
+        let value_or_missing = |value: Option<u64>| {
+            value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
+        };
+        anyhow::bail!(
+            "{strict_error:#}; stream={} symbol={} E={} T={} received_at_ns={received_at_ns} recv_minus_event_ms={} event_minus_trade_ms={} recv_minus_trade_ms={} producer_id={producer_id} frame={frame}",
+            frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
+            data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
+            value_or_missing(event_time_ms),
+            value_or_missing(trade_time_ms),
+            value_or_missing(event_time_ms.map(|event_time_ms| {
+                (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
+            })),
+            value_or_missing(event_time_ms.zip(trade_time_ms).map(
+                |(event_time_ms, trade_time_ms)| event_time_ms.saturating_sub(trade_time_ms)
+            )),
+            value_or_missing(trade_time_ms.map(|trade_time_ms| {
+                (received_at_ns / 1_000_000).saturating_sub(trade_time_ms)
+            })),
+        )
     }
     let strict_error = match event_from_frame(frame.clone(), received_at_ns) {
         Ok(event) => return Ok(event),
@@ -6199,7 +6373,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_raw_trade_error_preserves_source_clocks_and_original_frame() {
+    fn stale_raw_trade_event_preserves_source_clocks_and_original_frame() {
         let received_at_ns = 1_700_000_031_000_000_000;
         let event_time_ms = 1_700_000_000_000;
         let trade_time_ms = event_time_ms - 10;
@@ -6207,36 +6381,304 @@ mod tests {
         let frame =
             observed_usdm_raw_trade_frame(9, event_time_ms, trade_time_ms, "101", "0.2", "NA");
 
-        let error = event_from_frame_for_shard(frame.clone(), received_at_ns, producer_id)
-            .expect_err("stale raw trade must remain fail closed")
-            .to_string();
-
-        for expected in [
-            "raw trade E source-to-receive delay exceeds the governed limit",
-            "stream=btcusdc@trade",
-            "symbol=BTCUSDC",
-            "E=1700000000000",
-            "T=1699999999990",
-            "received_at_ns=1700000031000000000",
-            "recv_minus_event_ms=31000",
-            "event_minus_trade_ms=10",
-            "recv_minus_trade_ms=31010",
-            "producer_id=7",
-            &format!("frame={frame}"),
-        ] {
-            assert!(error.contains(expected), "missing {expected:?} in {error}");
-        }
+        let event = event_from_frame_for_shard(frame.clone(), received_at_ns, producer_id)
+            .expect("stale raw trade is isolated as an audit event");
+        let Event::StaleRawTrade {
+            trade,
+            frame: audited_frame,
+            producer_id: audited_producer_id,
+            recv_minus_event_ms,
+            event_minus_trade_ms,
+            recv_minus_trade_ms,
+        } = event
+        else {
+            panic!("stale raw trade must not enter normal raw-trade flow");
+        };
+        assert_eq!(trade.symbol, "BTCUSDC");
+        assert_eq!(audited_frame, frame);
+        assert_eq!(audited_producer_id, producer_id);
+        assert_eq!(recv_minus_event_ms, 31_000);
+        assert_eq!(event_minus_trade_ms, 10);
+        assert_eq!(recv_minus_trade_ms, 31_010);
 
         let mut frame = frame;
         frame["data"]["E"] = json!(received_at_ns / 1_000_000 - 1);
         let error = event_from_frame_for_shard(frame, received_at_ns, producer_id)
-            .expect_err("stale raw trade T clock must remain fail closed")
+            .expect_err("T-only raw trade staleness remains fail closed")
             .to_string();
         assert!(error.contains("raw trade age exceeds the governed limit"));
         assert!(error.contains("recv_minus_event_ms=1"));
         assert!(error.contains("event_minus_trade_ms=31009"));
         assert!(error.contains("recv_minus_trade_ms=31010"));
-        assert!(!error.contains("raw trade E source-to-receive delay"));
+    }
+
+    #[test]
+    fn stale_raw_trade_is_audited_dropped_and_next_trade_keeps_session_without_gap() {
+        let dirs = UploadTestDir::new();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.symbols = vec!["CUSDT".into()];
+        config.spool_dir = dirs.spool.clone();
+        let mut states = HashMap::from([(
+            "CUSDT".to_owned(),
+            OrderBookState::new("CUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let stale_received_at_ns = 1_786_515_635_275_887_892;
+        let mut segment =
+            Segment::create(config.segment_config(), stale_received_at_ns - 10_000_000).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        let session_id = "session-cusdt-stale-raw-trade";
+        let exact_stale_frame = json!({
+            "data":{"E":1786515604331_u64,"T":1786515604330_u64,"X":"MARKET","e":"trade","m":false,"p":"0.0664000","q":"506","s":"CUSDT","st":1,"t":140253949_u64},
+            "stream":"cusdt@trade"
+        });
+
+        let frames = [
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635272_u64,"T":1786515635272_u64,"s":"CUSDT","t":140253948_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                stale_received_at_ns - 2_000_000,
+            ),
+            (
+                exact_stale_frame.clone(),
+                stale_received_at_ns,
+            ),
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635276_u64,"T":1786515635276_u64,"s":"CUSDT","t":140253950_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                stale_received_at_ns + 2_000_000,
+            ),
+        ];
+
+        for (frame, received_at_ns) in frames {
+            let event = event_from_frame_for_shard(frame, received_at_ns, 7).unwrap();
+            assert_eq!(
+                process_event(
+                    &config,
+                    &mut segment,
+                    &mut states,
+                    &mut budget,
+                    session_id,
+                    event,
+                    &mut process_state,
+                )
+                .unwrap(),
+                ProcessAction::None
+            );
+        }
+
+        assert_eq!(segment.event_count("raw_trade"), 2);
+        assert_eq!(segment.event_count("stale_raw_trade"), 1);
+        assert_eq!(process_state.sequence_gaps, 0);
+        assert!(!segment.is_replay_safe());
+        let artifacts = segment.close().unwrap().unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["raw_trade_incomplete_symbols"], json!(["CUSDT"]));
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        assert_eq!(manifest["lob_continuity"]["sequence_gaps"], 0);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(&artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rows = String::from_utf8(output.stdout).unwrap();
+        let rows = rows
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let normal_trade_ids = rows
+            .iter()
+            .filter(|row| row["type"] == "raw_trade")
+            .map(|row| row["frame"]["data"]["t"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(normal_trade_ids, vec![140253948, 140253950]);
+        let audit = rows
+            .iter()
+            .find(|row| row["type"] == "stale_raw_trade")
+            .expect("stale raw trade audit row");
+        assert_eq!(audit["session_id"], session_id);
+        assert_eq!(audit["producer_id"], 7);
+        assert_eq!(audit["symbol"], "CUSDT");
+        assert_eq!(audit["E"], 1786515604331_u64);
+        assert_eq!(audit["T"], 1786515604330_u64);
+        assert_eq!(audit["received_at_ns"], stale_received_at_ns);
+        assert_eq!(audit["recv_minus_event_ms"], 30_944_u64);
+        assert_eq!(audit["event_minus_trade_ms"], 1_u64);
+        assert_eq!(audit["recv_minus_trade_ms"], 30_945_u64);
+        assert_eq!(audit["frame"], exact_stale_frame);
+
+        let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
+        write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
+        let trust =
+            BinanceMarketTapeTrustAnchor::from_lower_hex(&artifacts.sha256, &manifest_sha256)
+                .unwrap();
+        let triplet = BinanceMarketTapeTriplet {
+            data: artifacts.data.clone(),
+            manifest: artifacts.manifest.clone(),
+            success: artifacts.success.clone(),
+        };
+        let sealed = seal_binance_market_tape_triplet(&triplet, &trust).unwrap();
+        let strict_error = verify_binance_market_tape_for_strict_gate(vec![sealed])
+            .expect_err("incomplete raw-trade data must not pass the strict verifier");
+        assert!(strict_error
+            .to_string()
+            .contains("raw-trade data is incomplete"));
+
+        let mut fake = FakeOss::default();
+        let outcome = upload_pending_blocking_with(&dirs.config(), &mut |command, timeout| {
+            fake.run(&dirs.bucket, command, timeout)
+        })
+        .unwrap();
+        assert_eq!(outcome.uploaded, 1);
+        assert_eq!(outcome.pending_batches, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(fake.uploads, 3);
+        assert!(!artifacts.data.exists());
+        assert!(!artifacts.manifest.exists());
+        assert!(!artifacts.success.exists());
+        assert!(files_with_suffix(&dirs.spool, UPLOADED_CLEANUP_SUFFIX)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn consecutive_stale_raw_trades_are_audited_before_next_trade() {
+        let dirs = UploadTestDir::new();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.symbols = vec!["CUSDT".into()];
+        config.spool_dir = dirs.spool.clone();
+        let mut states = HashMap::from([(
+            "CUSDT".to_owned(),
+            OrderBookState::new("CUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let received_at_ns = 1_786_515_635_275_887_892;
+        let mut segment = Segment::create(config.segment_config(), received_at_ns - 10_000_000)
+            .unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        let session_id = "session-cusdt-consecutive-stale-raw-trades";
+        let stale_frame = |trade_id, event_time_ms| {
+            json!({
+                "data":{"E":event_time_ms,"T":event_time_ms - 1,"X":"MARKET","e":"trade","m":false,"p":"0.0664000","q":"506","s":"CUSDT","st":1,"t":trade_id},
+                "stream":"cusdt@trade"
+            })
+        };
+        let frames = [
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635272_u64,"T":1786515635272_u64,"s":"CUSDT","t":140253948_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                received_at_ns - 3_000_000,
+            ),
+            (stale_frame(140253949_u64, 1786515604331_u64), received_at_ns),
+            (
+                stale_frame(140253950_u64, 1786515604332_u64),
+                received_at_ns + 1_000_000,
+            ),
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635276_u64,"T":1786515635276_u64,"s":"CUSDT","t":140253951_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                received_at_ns + 3_000_000,
+            ),
+        ];
+        for (frame, frame_received_at_ns) in frames {
+            let event = event_from_frame_for_shard(frame, frame_received_at_ns, 7).unwrap();
+            assert_eq!(
+                process_event(
+                    &config,
+                    &mut segment,
+                    &mut states,
+                    &mut budget,
+                    session_id,
+                    event,
+                    &mut process_state,
+                )
+                .unwrap(),
+                ProcessAction::None
+            );
+        }
+        assert_eq!(segment.event_count("raw_trade"), 2);
+        assert_eq!(segment.event_count("stale_raw_trade"), 2);
+        assert_eq!(process_state.sequence_gaps, 0);
+    }
+
+    #[test]
+    fn missing_stale_raw_trade_id_remains_fail_closed() {
+        let dirs = UploadTestDir::new();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_all".into();
+        config.symbols = vec!["CUSDT".into()];
+        config.spool_dir = dirs.spool.clone();
+        let mut states = HashMap::from([(
+            "CUSDT".to_owned(),
+            OrderBookState::new("CUSDT", Market::Usdm),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let received_at_ns = 1_786_515_635_275_887_892;
+        let mut segment = Segment::create(config.segment_config(), received_at_ns - 10_000_000)
+            .unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        let session_id = "session-cusdt-missing-stale-raw-trade-id";
+        let frames = [
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635272_u64,"T":1786515635272_u64,"s":"CUSDT","t":140253948_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                received_at_ns - 3_000_000,
+            ),
+            (
+                json!({
+                    "data":{"E":1786515604331_u64,"T":1786515604330_u64,"X":"MARKET","e":"trade","m":false,"p":"0.0664000","q":"506","s":"CUSDT","st":1,"t":140253949_u64},
+                    "stream":"cusdt@trade"
+                }),
+                received_at_ns,
+            ),
+            (
+                json!({
+                    "stream":"cusdt@trade",
+                    "data":{"e":"trade","E":1786515635276_u64,"T":1786515635276_u64,"s":"CUSDT","t":140253951_u64,"p":"0.0664000","q":"506","m":false,"X":"MARKET","st":1}
+                }),
+                received_at_ns + 3_000_000,
+            ),
+        ];
+        for (index, (frame, frame_received_at_ns)) in frames.into_iter().enumerate() {
+            let event = event_from_frame_for_shard(frame, frame_received_at_ns, 7).unwrap();
+            let result = process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                session_id,
+                event,
+                &mut process_state,
+            );
+            if index < 2 {
+                assert_eq!(result.unwrap(), ProcessAction::None);
+            } else {
+                let error = result.expect_err("missing raw-trade id must fail closed");
+                assert!(error.to_string().contains("raw trade gap"));
+            }
+        }
+        assert_eq!(segment.event_count("raw_trade"), 1);
+        assert_eq!(segment.event_count("stale_raw_trade"), 1);
+        assert_eq!(segment.event_count("sequence_gap"), 1);
+        assert_eq!(process_state.sequence_gaps, 1);
+        assert!(!segment.is_replay_safe());
     }
 
     #[test]

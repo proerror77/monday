@@ -189,6 +189,7 @@ impl LobContinuitySummaryBuilder {
             | "agg_trade"
             | "raw_trade"
             | "raw_trade_zero_price"
+            | "stale_raw_trade"
             | "book_ticker"
             | "stale_book_ticker"
             | "force_order" => {}
@@ -354,6 +355,7 @@ pub fn event_type_allowed(schema: &str, event_type: &str) -> bool {
                 | "aggregate_trade_gap"
                 | "raw_trade"
                 | "raw_trade_zero_price"
+                | "stale_raw_trade"
                 | "book_ticker"
                 | "stale_book_ticker"
                 | "force_order"
@@ -788,17 +790,29 @@ impl RawTrade {
     }
 
     pub fn from_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
-        Self::from_frame_with_zero_price(frame, received_at_ns, false)
+        Self::from_frame_with_zero_price(frame, received_at_ns, false, false)
+    }
+
+    /// Parse a structurally valid raw trade while allowing a stale source
+    /// clock so the collector can audit and drop it without terminating the
+    /// websocket producer.
+    pub fn from_frame_allow_stale(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_zero_price(frame, received_at_ns, false, true)
     }
 
     pub fn from_zero_price_frame(frame: &Value, received_at_ns: u64) -> Result<Self> {
-        Self::from_frame_with_zero_price(frame, received_at_ns, true)
+        Self::from_frame_with_zero_price(frame, received_at_ns, true, false)
+    }
+
+    pub fn from_zero_price_frame_allow_stale(frame: &Value, received_at_ns: u64) -> Result<Self> {
+        Self::from_frame_with_zero_price(frame, received_at_ns, true, true)
     }
 
     fn from_frame_with_zero_price(
         frame: &Value,
         received_at_ns: u64,
         allow_zero_price: bool,
+        allow_stale: bool,
     ) -> Result<Self> {
         let data = frame.get("data").unwrap_or(frame);
         if data.get("e").and_then(Value::as_str) != Some("trade") {
@@ -845,7 +859,11 @@ impl RawTrade {
         if trade_time_ms > event_time_ms {
             anyhow::bail!("raw trade source clocks are reversed");
         }
-        validate_trade_clocks(event_time_ms, trade_time_ms, received_at_ns, "raw trade")?;
+        if allow_stale {
+            validate_receive_clock_without_delay(event_time_ms, received_at_ns, "raw trade E")?;
+        } else {
+            validate_trade_clocks(event_time_ms, trade_time_ms, received_at_ns, "raw trade")?;
+        }
         Ok(Self {
             symbol,
             trade_id,
@@ -891,6 +909,51 @@ impl RawTradeSequenceValidator {
             (trade.trade_id, trade.event_time_ms, trade.trade_time_ms),
         );
         Ok(())
+    }
+
+    /// Advance over one or more explicitly audited stale trades without
+    /// admitting their payloads to the normal raw-trade tape or applying their
+    /// source clocks.
+    pub fn observe_after_stale_range(
+        &mut self,
+        trade: &RawTrade,
+        stale_start_id: u64,
+        stale_end_id: u64,
+    ) -> Result<()> {
+        if stale_end_id < stale_start_id {
+            anyhow::bail!("raw trade stale id range is reversed");
+        }
+        let Some((previous_id, previous_event_time, previous_trade_time)) =
+            self.last.get(&trade.symbol).copied()
+        else {
+            return self.observe(trade);
+        };
+        let expected_stale = previous_id
+            .checked_add(1)
+            .context("raw trade id overflow")?;
+        let expected_trade = stale_end_id
+            .checked_add(1)
+            .context("raw trade id overflow")?;
+        if stale_start_id != expected_stale || trade.trade_id != expected_trade {
+            anyhow::bail!(
+                "{} raw trade gap expected={} received={}",
+                trade.symbol,
+                expected_stale,
+                trade.trade_id
+            );
+        }
+        if trade.event_time_ms < previous_event_time || trade.trade_time_ms < previous_trade_time {
+            anyhow::bail!("{} raw trade source-time rollback", trade.symbol);
+        }
+        self.last.insert(
+            trade.symbol.clone(),
+            (trade.trade_id, trade.event_time_ms, trade.trade_time_ms),
+        );
+        Ok(())
+    }
+
+    pub fn observe_after_stale(&mut self, trade: &RawTrade, stale_trade_id: u64) -> Result<()> {
+        self.observe_after_stale_range(trade, stale_trade_id, stale_trade_id)
     }
 }
 
@@ -1678,6 +1741,25 @@ mod tests {
     }
 
     #[test]
+    fn stale_raw_trade_parser_keeps_shape_strict_but_allows_audit_clock() {
+        let received_at_ns = 1_786_515_635_275_887_892;
+        let frame = json!({
+            "data":{"E":1_786_515_604_331_u64,"T":1_786_515_604_330_u64,"X":"MARKET","e":"trade","m":false,"p":"0.0664000","q":"506","s":"CUSDT","st":1,"t":140253949_u64},
+            "stream":"cusdt@trade"
+        });
+        let trade = RawTrade::from_frame_allow_stale(&frame, received_at_ns).unwrap();
+        assert_eq!(trade.symbol, "CUSDT");
+        assert_eq!(trade.trade_id, 140253949);
+        assert!(RawTrade::from_frame(&frame, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("delay"));
+        let mut malformed = frame;
+        malformed["data"]["q"] = Value::Null;
+        assert!(RawTrade::from_frame_allow_stale(&malformed, received_at_ns).is_err());
+    }
+
+    #[test]
     fn raw_trade_zero_price_requires_observed_sentinel_shape() {
         let received_at_ns = 1_700_000_000_100_000_000;
         let mut zero = raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
@@ -1840,6 +1922,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rollback"));
+    }
+
+    #[test]
+    fn raw_trade_sequence_can_advance_over_one_audited_stale_id() {
+        let received_at_ns = 1_786_515_635_275_887_892;
+        let first = RawTrade::from_frame(
+            &raw_trade_frame(140253948, 1_786_515_635_272, 1_786_515_635_272),
+            received_at_ns,
+        )
+        .unwrap();
+        let next = RawTrade::from_frame(
+            &raw_trade_frame(140253950, 1_786_515_635_276, 1_786_515_635_276),
+            received_at_ns,
+        )
+        .unwrap();
+        let mut sequence = RawTradeSequenceValidator::default();
+        sequence.observe(&first).unwrap();
+        sequence.observe_after_stale(&next, 140253949).unwrap();
+        assert!(sequence
+            .observe_after_stale(&next, 140253949)
+            .unwrap_err()
+            .to_string()
+            .contains("gap"));
     }
 
     #[test]
