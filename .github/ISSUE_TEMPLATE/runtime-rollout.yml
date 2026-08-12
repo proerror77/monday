@@ -1,5 +1,5 @@
 name: Runtime outcome
-description: Authorize and record one bounded live outcome
+description: Request and record one bounded live outcome
 labels: ["enhancement", "runtime"]
 body:
   - type: input
@@ -15,9 +15,21 @@ body:
     validations:
       required: true
   - type: textarea
-    id: identities
+    id: candidate
     attributes:
-      label: Candidate and rollback identities
+      label: Candidate identity
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration identity
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback identity and procedure
     validations:
       required: true
   - type: textarea

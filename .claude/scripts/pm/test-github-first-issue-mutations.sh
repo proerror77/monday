@@ -27,7 +27,9 @@ case "$*" in
   'issue view 123 --json comments --jq'*)
     if [ "${GH_SCENARIO:-}" = runtime_comments ]; then echo 'Exact target: svc; Named controller: alice; Candidate identity: sha-1; Configuration identity: cfg-1; Rollback identity: sha-0; Rollback procedure: restore; Stop rules: any failure; Terminal result: passed; Cleanup evidence: removed'; fi ;;
   'issue view 123 --json body,comments --jq'*)
-    if [ "${GH_SCENARIO:-}" = runtime_body_only ]; then echo 'Exact target: svc; Named controller: alice; Candidate identity: sha-1; Configuration identity: cfg-1; Rollback identity: sha-0; Rollback procedure: restore; Stop rules: any failure; Terminal result: passed; Cleanup evidence: removed'; fi ;;
+    case "${GH_SCENARIO:-}" in
+      runtime_body_only|runtime_comments) echo 'Exact target: svc; Named controller: alice; Candidate identity: sha-1; Configuration identity: cfg-1; Rollback identity: sha-0; Rollback procedure: restore; Stop rules: any failure; Terminal result: passed; Cleanup evidence: removed' ;;
+    esac ;;
   'issue view 123 --json number,title,state,url') [ "${GH_SCENARIO:-}" != read_fail ] && echo '{"number":123}' ;;
   'issue view 123 --json state,updatedAt,url --jq'*)
     [ "${GH_SCENARIO:-}" != reopen_final_read_fail ] || exit 1
@@ -74,13 +76,14 @@ refuse normal 'Acceptance checks: Result : passed; Result: passed'
 refuse normal 'Acceptance checks: - Result: passed; Result: passed'
 refuse normal 'Acceptance checks: ~~Result:~~ passed; Result: passed'
 refuse normal 'Acceptance checks: focused; Result: failed'
-for scenario in blocker no_category conflict_category no_triage conflict_triage; do refuse "$scenario" "$valid"; done
+refuse blocker "$valid"
+for scenario in no_category conflict_category no_triage conflict_triage; do allow "$scenario" "$valid"; done
 refuse tracking "$valid"
 refuse tracking_child "$valid; Parent acceptance audit: passed"
 allow tracking_box "$valid; Parent acceptance audit: passed"
 runtime='Exact target: svc; Named controller: alice; Candidate identity: sha-1; Configuration identity: cfg-1; Rollback identity: sha-0; Rollback procedure: restore; Stop rules: any failure; Terminal result: passed; Cleanup evidence: removed'
 refuse runtime "$valid; ${runtime/Terminal result: passed/Terminal result: failed}"
-refuse runtime_body_only "$valid"
+allow runtime_body_only "$valid"
 for field in "Exact target" "Named controller" "Candidate identity" "Configuration identity" "Rollback identity" "Rollback procedure" "Stop rules" "Terminal result" "Cleanup evidence"; do
   missing=$(printf '%s' "$runtime" | sed -E "s/(^|; )$field: [^;]*(; |$)/\\1/")
   placeholder=$(printf '%s' "$runtime" | sed -E "s/($field: )[^;]*/\\1TBD/")

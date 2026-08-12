@@ -1,27 +1,17 @@
 # Agent Coordination
 
-Each section, issue, and PR has one write owner, branch, and worktree. Never
-place multiple writable agents in one worktree or have them exchange work by
-pulling a shared branch.
+One active contract has one write owner. Read-only research and review may run
+in parallel.
 
-Before the first write, the owner records:
+Use the current checkout for an isolated local change when its ownership and
+dirty state are known. Use a dedicated branch and worktree when work is
+concurrent, published, or likely to span sessions. A managed worktree records
+its contract, owner, path, branch, base SHA, allowed files, and dependencies in
+the private path returned by `git rev-parse --git-path agent-worktree.yml`.
 
-```yaml
-contract: Issue #{number}: {one behavior contract}
-owner: {agent or human}
-worktree: .worktrees/codex/{issue-slug}
-branch: codex/{issue-slug}
-base_sha: {exact integration-base SHA}
-allowed_files: [{paths or patterns}]
-dependency: None | #{blocking-issue}
-```
+Stop on overlapping ownership or unexpected branch movement. Re-read branch,
+`HEAD`, status, and PR head before publishing or merging. Ownership handoff does
+not create a new issue; update the existing contract record.
 
-Write this YAML to the worktree-private path returned by
-`git rev-parse --git-path agent-worktree.yml`. It is the runtime record; this
-policy file is only its template and must not be overwritten.
-
-Read-only research and review may run in parallel. A second writable change is
-either a separate issue/worktree or waits for an explicit ownership transfer.
-Before every edit, commit, rebase, push, or merge, re-read the branch, `HEAD`,
-and worktree status; stop on unexpected movement. Report final worktree status
-to the coordinator. Cleanup requires explicit repository-owner authorization.
+Never remove a worktree or branch without explicit repository-owner
+authorization for the exact target.

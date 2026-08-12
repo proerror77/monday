@@ -8,8 +8,8 @@ changes do not need an issue.
 
 - Keep one issue for one behavior or runtime outcome.
 - Put attempts, failures, cleanup receipts, and final evidence on that issue.
-- Open another issue only when the behavior, target, authority, owner, or
-  independently reviewable change differs.
+- Open another issue only when the behavior, target, authority, or independently
+  reviewable change differs. An owner handoff stays on the same issue.
 - Use GitHub's native parent and blocked-by relationships when they help current
   coordination; do not duplicate them as mandatory body sections.
 
