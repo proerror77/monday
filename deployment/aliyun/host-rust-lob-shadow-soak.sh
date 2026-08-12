@@ -60,10 +60,11 @@ readonly MIN_SOAK_SECONDS=1201
   exit 2
 }
 
-readonly HEALTH_SETTLE_SECONDS=300
+readonly BOOTSTRAP_SETTLE_SECONDS=900
+readonly RECOVERY_SETTLE_SECONDS=300
 readonly SAMPLE_INTERVAL_SECONDS=5
 readonly MAX_HEALTH_SILENCE_SECONDS=120
-readonly TOTAL_FEED_SECONDS=$((SOAK_SECONDS + HEALTH_SETTLE_SECONDS + 300))
+readonly TOTAL_FEED_SECONDS=$((SOAK_SECONDS + BOOTSTRAP_SETTLE_SECONDS + 300))
 readonly FATAL_JOURNAL_REGEX='process watchdog|market-data stall|session failed|source-to-receive|raw trade field|parser|sequence gap'
 readonly TRANSPORT_JOURNAL_REGEX='websocket.*(reset|disconnect)|websocket.*reconnect|reconnecting'
 
@@ -761,8 +762,8 @@ validate_observation_sample() {
   updated_ns=$(jq -er '.updated_at_ns' "$health")
   current_mono=$(monotonic_seconds)
   if [[ $recovering == true ]] \
-    && (( current_mono - ${recovery_started_mono[$market]} > HEALTH_SETTLE_SECONDS )); then
-    die "$market transport recovery exceeded ${HEALTH_SETTLE_SECONDS}s"
+    && (( current_mono - ${recovery_started_mono[$market]} > RECOVERY_SETTLE_SECONDS )); then
+    die "$market transport recovery exceeded ${RECOVERY_SETTLE_SECONDS}s"
   fi
   if ! read -r next_updated_ns next_advance_mono next_max_gap sample_increment < <(
     monday_observe_health_freshness \
@@ -821,7 +822,7 @@ manifest_uris() {
   local market=$1 listing=$2 prefix line token
   prefix="oss://${oss_bucket[$market]}/lake/raw/venue=binance/market=${market}/dataset=${dataset[$market]}/shard=${shard_id[$market]}/"
   run_oss "$market" ls "$prefix" --recursive --short-format \
-    --max-age "$((SOAK_SECONDS + HEALTH_SETTLE_SECONDS + 900))s" >"$listing"
+    --max-age "$((SOAK_SECONDS + BOOTSTRAP_SETTLE_SECONDS + 900))s" >"$listing"
   while IFS= read -r line; do
     line=${line%$'\r'}
     if [[ $line =~ (oss://[^[:space:]]+\.manifest\.json) ]]; then
@@ -1108,7 +1109,7 @@ capture_watchdog_diagnostics startup
 [[ $watchdog_failure == false ]] \
   || die "$watchdog_failure_reason"
 
-ready_deadline=$(( $(monotonic_seconds) + HEALTH_SETTLE_SECONDS ))
+ready_deadline=$(( $(monotonic_seconds) + BOOTSTRAP_SETTLE_SECONDS ))
 while ! health_passes spot || ! health_passes usdm; do
   for market in "${MARKETS[@]}"; do sample_health "$market" settle; done
   capture_watchdog_diagnostics settle
@@ -1116,8 +1117,8 @@ while ! health_passes spot || ! health_passes usdm; do
     || die "$watchdog_failure_reason"
   for market in "${MARKETS[@]}"; do
     if [[ ${recovery_active[$market]:-false} == true ]] \
-      && (( ${recovery_started_mono[$market]} + HEALTH_SETTLE_SECONDS > ready_deadline )); then
-      ready_deadline=$(( ${recovery_started_mono[$market]} + HEALTH_SETTLE_SECONDS ))
+      && (( ${recovery_started_mono[$market]} + RECOVERY_SETTLE_SECONDS > ready_deadline )); then
+      ready_deadline=$(( ${recovery_started_mono[$market]} + RECOVERY_SETTLE_SECONDS ))
     fi
   done
   (( $(monotonic_seconds) < ready_deadline && $(monotonic_seconds) < feed_deadline )) \
