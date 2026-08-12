@@ -309,6 +309,10 @@ jobs:
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
           cache-to: type=gha,mode=max,scope=acr-${{ matrix.repository }}
+          # Alibaba ACR rejects BuildKit's OCI attestation referrer/config media
+          # type; source/artifact identity remains bound by labels and outputs.
+          provenance: false
+          sbom: false
           labels: |
             org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
 
