@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -91,6 +91,7 @@ struct Config {
     ws_shard_size: usize,
     snapshot_limit: u64,
     snapshot_requests_per_second: f64,
+    snapshot_producers: usize,
     segment_seconds: u64,
     spool_dir: PathBuf,
     max_buffered_diffs: usize,
@@ -389,6 +390,7 @@ impl Config {
             ws_shard_size: env_parse("WS_SHARD_SIZE", 100_usize)?.max(1),
             snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
             snapshot_requests_per_second: env_parse("SNAPSHOT_REQUESTS_PER_SECOND", 15_f64)?,
+            snapshot_producers: env_parse("SNAPSHOT_PRODUCERS", 8_usize)?.max(1),
             segment_seconds: env_parse("SEGMENT_SECONDS", 3600_u64)?.max(60),
             spool_dir: PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob")),
             max_buffered_diffs: env_parse("MAX_BUFFERED_DIFFS", 250_000_usize)?.max(1),
@@ -549,6 +551,24 @@ impl Config {
             .filter(|symbol| !excluded.contains(*symbol))
             .cloned()
             .collect()
+    }
+
+    /// Partition the active symbols across the configured snapshot producers so
+    /// the otherwise-sequential REST snapshot bootstrap runs concurrently. A
+    /// single sequential producer tops out near the per-symbol REST round-trip
+    /// latency, so 1377 symbols can never sync inside a short shadow segment;
+    /// sharding over N producers attacks that latency rather than the request
+    /// throttle. Round-robin assignment keeps per-producer work balanced and
+    /// never yields an empty shard (the producer count is capped at the symbol
+    /// count, which is already checked to be non-empty).
+    fn snapshot_producer_symbols(&self) -> Vec<Vec<String>> {
+        let symbols = self.active_symbols();
+        let producers = self.snapshot_producers.min(symbols.len().max(1));
+        let mut shards = vec![Vec::new(); producers];
+        for (index, symbol) in symbols.into_iter().enumerate() {
+            shards[index % producers].push(symbol);
+        }
+        shards
     }
 
     fn excluded_symbols(&self) -> Vec<String> {
@@ -1202,14 +1222,20 @@ async fn run_session(
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
     let expected_shards = stream_shards.len();
+    let snapshot_shards = config.snapshot_producer_symbols();
+    let snapshot_producers = snapshot_shards.len();
     let expected_rotation_producers = expected_shards
-        .checked_add(1)
+        .checked_add(snapshot_producers)
         .context("rotation producer count overflow")?;
     let expected_streams = stream_shards
         .iter()
         .map(|shard| shard.streams.len())
         .sum::<usize>();
-    let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_shards);
+    // One message per websocket shard, fanned out to every snapshot producer so
+    // each waits for full stream coverage before pulling REST snapshots. Every
+    // producer subscribes synchronously in the spawn loop below, before any
+    // websocket task is polled, so no connection notification can be missed.
+    let (stream_connected_tx, _) = broadcast::channel(expected_shards.max(1));
     for (producer_id, shard) in stream_shards.into_iter().enumerate() {
         let stall_timeout = shard.stall_timeout(config.stall_timeout);
         tasks.spawn(receive_url(
@@ -1225,17 +1251,20 @@ async fn run_session(
             rotation_resume_rx.clone(),
         ));
     }
-    drop(stream_connected_tx);
-    tasks.spawn(produce_snapshots_after_streams_connect(
-        config.clone(),
-        sender.clone(),
-        session_stop_rx.clone(),
-        stream_connected_rx,
-        expected_shards,
-        expected_shards,
-        rotation_pause_rx.clone(),
-        rotation_resume_rx.clone(),
-    ));
+    for (index, symbols) in snapshot_shards.into_iter().enumerate() {
+        tasks.spawn(produce_snapshots_after_streams_connect(
+            config.clone(),
+            sender.clone(),
+            session_stop_rx.clone(),
+            stream_connected_tx.subscribe(),
+            expected_shards,
+            expected_shards + index,
+            rotation_pause_rx.clone(),
+            rotation_resume_rx.clone(),
+            symbols,
+            index == 0,
+        ));
+    }
     let mut states = active_symbols
         .iter()
         .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
@@ -2645,7 +2674,7 @@ async fn wait_for_stream_reconnect(
 async fn receive_url(
     shard: StreamShard,
     sender: mpsc::Sender<Event>,
-    stream_connected: mpsc::Sender<Vec<String>>,
+    stream_connected: broadcast::Sender<Vec<String>>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
     subscription_proof_timeout: Duration,
@@ -2863,10 +2892,9 @@ async fn receive_url(
                             return Ok(exit);
                         }
                     } else {
-                        stream_connected
-                            .send(listed)
-                            .await
-                            .context("stream connection receiver dropped")?;
+                        // Fan the connection notification out to every snapshot
+                        // producer; a dropped receiver is not a producer failure.
+                        let _ = stream_connected.send(listed);
                         coverage_announced = true;
                     }
                     for event in proof_events.drain(..) {
@@ -3054,11 +3082,13 @@ async fn produce_snapshots_after_streams_connect(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
-    mut stream_connected: mpsc::Receiver<Vec<String>>,
+    mut stream_connected: broadcast::Receiver<Vec<String>>,
     expected_shards: usize,
     producer_id: usize,
     mut rotation_pause: watch::Receiver<u64>,
     mut rotation_resume: watch::Receiver<u64>,
+    symbols: Vec<String>,
+    announce_coverage: bool,
 ) -> anyhow::Result<TaskExit> {
     let mut shards = Vec::with_capacity(expected_shards);
     let mut last_pause_epoch = 0_u64;
@@ -3089,16 +3119,20 @@ async fn produce_snapshots_after_streams_connect(
             }
         }
     }
-    shards.sort();
-    match send_or_shutdown(
-        &sender,
-        Event::StreamCoverageVerified { shards },
-        &mut shutdown,
-    )
-    .await?
-    {
-        SendOutcome::Sent => {}
-        SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+    // Stream coverage is verified once by the lead producer; the other shards
+    // only wait on the same connection notifications before pulling snapshots.
+    if announce_coverage {
+        shards.sort();
+        match send_or_shutdown(
+            &sender,
+            Event::StreamCoverageVerified { shards },
+            &mut shutdown,
+        )
+        .await?
+        {
+            SendOutcome::Sent => {}
+            SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+        }
     }
     produce_snapshots(
         config,
@@ -3108,6 +3142,7 @@ async fn produce_snapshots_after_streams_connect(
         rotation_pause,
         rotation_resume,
         last_pause_epoch,
+        symbols,
     )
     .await
 }
@@ -3293,6 +3328,7 @@ fn event_from_frame_for_shard(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn produce_snapshots(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
@@ -3301,12 +3337,13 @@ async fn produce_snapshots(
     mut rotation_pause: watch::Receiver<u64>,
     mut rotation_resume: watch::Receiver<u64>,
     mut last_pause_epoch: u64,
+    symbols: Vec<String>,
 ) -> anyhow::Result<TaskExit> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
     let interval = Duration::from_secs_f64(1.0 / config.snapshot_requests_per_second.max(0.1));
-    'symbols: for symbol in config.active_symbols() {
+    'symbols: for symbol in symbols {
         let started = now_ns()?;
         let mut attempt = 0_usize;
         let mut retry_deadline = None;
@@ -5325,6 +5362,7 @@ mod tests {
             ws_shard_size: 100,
             snapshot_limit: 100,
             snapshot_requests_per_second: 15.0,
+            snapshot_producers: 8,
             segment_seconds: 3600,
             spool_dir: env::temp_dir(),
             max_buffered_diffs: 100,
@@ -5341,6 +5379,148 @@ mod tests {
             zstd_timeout: Duration::from_secs(30),
             oss_copy_timeout: Duration::from_secs(30),
         }
+    }
+
+    #[test]
+    fn snapshot_producer_symbols_shards_round_robin_without_empty_shards() {
+        let mut config = test_config("http://unused".into());
+        config.symbols = vec![
+            "AUSDT".into(),
+            "BUSDT".into(),
+            "CUSDT".into(),
+            "DUSDT".into(),
+            "EUSDT".into(),
+        ];
+        config.snapshot_producers = 2;
+        let shards = config.snapshot_producer_symbols();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(
+            shards[0],
+            vec!["AUSDT".to_owned(), "CUSDT".to_owned(), "EUSDT".to_owned()]
+        );
+        assert_eq!(shards[1], vec!["BUSDT".to_owned(), "DUSDT".to_owned()]);
+        assert_eq!(
+            shards.iter().flatten().count(),
+            5,
+            "every active symbol is assigned to exactly one producer"
+        );
+    }
+
+    #[test]
+    fn snapshot_producer_symbols_caps_producers_at_symbol_count() {
+        let mut config = test_config("http://unused".into());
+        config.symbols = vec!["BTCUSDT".into()];
+        config.snapshot_producers = 8;
+        let shards = config.snapshot_producer_symbols();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0], vec!["BTCUSDT".to_owned()]);
+    }
+
+    // Regression guard for the all-or-nothing snapshot bootstrap gate. A
+    // segment that closes before every declared symbol has synced must not be
+    // certified: it yields has_replay_safe_checkpoint=false, zero snapshot
+    // coverage, and the strict artifact verifier rejects it. This pins the
+    // production failure (a single sequential REST producer that could not
+    // sync 1377 symbols inside a short segment) so it is caught in `cargo
+    // test` instead of a 37-minute CI + install + soak.
+    #[test]
+    fn partially_synced_segment_is_replay_unsafe_and_zero_covered() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = tempfile::Builder::new()
+            .prefix("monday-partially-synced-segment-")
+            .tempdir()
+            .unwrap();
+        // macOS tempdirs live under a symlinked prefix; canonicalize so the
+        // triplet path check accepts the spool directory.
+        let spool_dir = std::fs::canonicalize(root.path()).unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = spool_dir;
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+
+        let mut budget = PendingBudget::new(2);
+        let mut states = HashMap::new();
+        // BTCUSDT reaches a synced, bridged order book.
+        let mut btc = OrderBookState::new("BTCUSDT", Market::Spot);
+        btc.install_snapshot(
+            &json!({
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["102", "1"]]
+            }),
+            &mut budget,
+        )
+        .unwrap();
+        btc.apply_diff(
+            DepthDiff {
+                symbol: "BTCUSDT".into(),
+                first_update_id: 101,
+                final_update_id: 101,
+                previous_update_id: None,
+                bids: vec![["100".into(), "2".into()]],
+                asks: vec![],
+            },
+            &mut budget,
+        )
+        .unwrap();
+        states.insert("BTCUSDT".to_owned(), btc);
+        // ETHUSDT is discovered but never receives a snapshot, so its order
+        // book remains unsynced when the segment closes.
+        states.insert("ETHUSDT".to_owned(), OrderBookState::new("ETHUSDT", Market::Spot));
+
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = trusted_process_state(&config.symbols);
+        archive_first_btc_aggregate_trade(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+        );
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &process_state,
+        )
+        .unwrap()
+        .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        assert_eq!(manifest["snapshot_ready_count"], 0);
+        assert_eq!(manifest["bridged_count"], 0);
+        assert_eq!(manifest["lob_continuity"]["declared_symbol_count"], 2);
+        assert_eq!(manifest["lob_continuity"]["covered_symbol_count"], 0);
+        assert_eq!(
+            manifest["lob_continuity"]["missing_symbols"],
+            json!(["BTCUSDT", "ETHUSDT"])
+        );
+
+        // The strict artifact verifier must reject the uncovered segment.
+        let manifest_sha256 = sha256_file(&artifacts.manifest).unwrap();
+        write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
+        let trust =
+            BinanceMarketTapeTrustAnchor::from_lower_hex(&artifacts.sha256, &manifest_sha256)
+                .unwrap();
+        let triplet = BinanceMarketTapeTriplet {
+            data: artifacts.data.clone(),
+            manifest: artifacts.manifest.clone(),
+            success: artifacts.success.clone(),
+        };
+        let sealed = seal_binance_market_tape_triplet(&triplet, &trust).unwrap();
+        let error = verify_binance_market_tape_for_strict_gate(vec![sealed])
+            .expect_err("a partially-synced segment must fail the strict verifier");
+        assert!(
+            error.to_string().contains("missing a replay-safe checkpoint"),
+            "{error}"
+        );
     }
 
     fn archive_first_btc_aggregate_trade(
@@ -5616,7 +5796,7 @@ mod tests {
         });
         let (sender, _receiver) = mpsc::channel(1);
         sender.send(Event::InitialSnapshotsComplete).await.unwrap();
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (stream_connected, _) = broadcast::channel(1);
         let (_shutdown_sender, shutdown) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
@@ -5684,7 +5864,7 @@ mod tests {
                 .unwrap();
         });
         let (sender, mut receiver) = mpsc::channel(4);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (stream_connected, _) = broadcast::channel(1);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
@@ -5818,7 +5998,7 @@ mod tests {
             }
         });
         let (sender, mut receiver) = mpsc::channel(8);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (stream_connected, _) = broadcast::channel(2);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
@@ -5888,7 +6068,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let (sender, mut receiver) = mpsc::channel(2);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (stream_connected, _) = broadcast::channel(1);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
@@ -5941,7 +6121,7 @@ mod tests {
             let _ = websocket.next().await;
         });
         let (sender, mut receiver) = mpsc::channel(2);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(1);
+        let (stream_connected, _) = broadcast::channel(1);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
@@ -6050,7 +6230,7 @@ mod tests {
             let _ = websocket.next().await;
         });
         let (sender, mut receiver) = mpsc::channel(8);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (stream_connected, _) = broadcast::channel(2);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
@@ -6164,7 +6344,7 @@ mod tests {
             let _ = websocket.next().await;
         });
         let (sender, mut receiver) = mpsc::channel(8);
-        let (stream_connected, _stream_connected_receiver) = mpsc::channel(2);
+        let (stream_connected, _) = broadcast::channel(2);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
@@ -7788,25 +7968,27 @@ mod tests {
             .unwrap();
         });
         let config = Arc::new(test_config(format!("http://{address}")));
+        let symbols = config.active_symbols();
         let (sender, mut receiver) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (connected_tx, connected_rx) = mpsc::channel(2);
+        let (connected_tx, _) = broadcast::channel(2);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
         let producer = tokio::spawn(produce_snapshots_after_streams_connect(
             config,
             sender,
             shutdown_rx,
-            connected_rx,
+            connected_tx.subscribe(),
             2,
             2,
             pause_rx,
             resume_rx,
+            symbols,
+            true,
         ));
 
         connected_tx
             .send(vec!["btcusdt@depth@100ms".into()])
-            .await
             .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), receiver.recv())
@@ -7817,7 +7999,6 @@ mod tests {
 
         connected_tx
             .send(vec!["btcusdt@aggTrade".into()])
-            .await
             .unwrap();
         assert!(matches!(
             receiver.recv().await,
@@ -7869,6 +8050,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let symbols = config.active_symbols();
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -7877,6 +8059,7 @@ mod tests {
             pause_rx,
             resume_rx,
             0,
+            symbols,
         ));
 
         assert!(matches!(
@@ -7926,6 +8109,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let symbols = config.active_symbols();
 
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
@@ -7935,6 +8119,7 @@ mod tests {
             pause_rx,
             resume_rx,
             0,
+            symbols,
         ));
 
         match receiver.recv().await {
@@ -8002,6 +8187,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let symbols = config.active_symbols();
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8010,6 +8196,7 @@ mod tests {
             pause_rx,
             resume_rx,
             0,
+            symbols,
         ));
 
         first_request_rx.await.unwrap();
@@ -8075,6 +8262,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let symbols = config.active_symbols();
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8083,6 +8271,7 @@ mod tests {
             pause_rx,
             resume_rx,
             0,
+            symbols,
         ));
 
         first_response_rx.await.unwrap();
@@ -8140,6 +8329,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let symbols = config.active_symbols();
         let producer = tokio::spawn(produce_snapshots(
             Arc::new(config),
             sender,
@@ -8148,6 +8338,7 @@ mod tests {
             pause_rx,
             resume_rx,
             0,
+            symbols,
         ));
 
         assert!(matches!(
