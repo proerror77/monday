@@ -1,39 +1,18 @@
 name: Engineering change
-description: Propose one independently mergeable and rollbackable improvement
-labels: ["enhancement", "needs-triage"]
+description: Record one independently verifiable improvement
+labels: ["enhancement"]
 body:
   - type: textarea
-    id: contract
+    id: outcome
     attributes:
-      label: Change contract
-      description: State one behavior and why it is needed.
+      label: Outcome
+      description: What observable behavior should change, and why?
     validations:
       required: true
   - type: textarea
-    id: acceptance
+    id: proof
     attributes:
-      label: Acceptance evidence
-      description: List externally observable checks, including a safety counterexample where applicable.
-    validations:
-      required: true
-  - type: textarea
-    id: dependencies
-    attributes:
-      label: Dependencies and merge order
-      description: Use GitHub native blocked-by relationships after publication; write None when independent.
-    validations:
-      required: true
-  - type: textarea
-    id: out_of_scope
-    attributes:
-      label: Out of scope
-      description: Name adjacent behavior and trust domains excluded from this issue.
-    validations:
-      required: true
-  - type: textarea
-    id: rollout
-    attributes:
-      label: Rollout and rollback impact
-      description: State the production impact or None.
+      label: Proof
+      description: What smallest check will prove the outcome?
     validations:
       required: true

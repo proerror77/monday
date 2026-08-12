@@ -161,30 +161,6 @@ jobs:
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 
-      - name: Test issue lifecycle workflow contract
-        working-directory: .
-        run: ruby .github/scripts/test-issue-lifecycle-workflow.rb
-
-      - name: Test issue lifecycle audit
-        working-directory: .
-        run: .github/scripts/test-issue-lifecycle-audit.sh
-
-      - name: Test issue lifecycle preflight capture
-        working-directory: .
-        run: .github/scripts/test-issue-lifecycle-preflight.sh
-
-      - name: Test issue lifecycle templates
-        working-directory: .
-        run: .github/scripts/test-issue-lifecycle-contract.sh
-
-      - name: Test issue lifecycle reconciliation workflow contract
-        working-directory: .
-        run: ruby .github/scripts/test-issue-lifecycle-reconcile-workflow.rb
-
-      - name: Test issue lifecycle status reconciliation
-        working-directory: .
-        run: .github/scripts/test-issue-lifecycle-status-reconcile.sh
-
   research-image-binaries:
     name: Research image binaries
     needs: image-smoke-scope

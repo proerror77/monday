@@ -21,9 +21,7 @@ run_case() {
 
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
-printf '%s\n' .github/workflows/issue-lifecycle.yml >"$tmp_dir/governance-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
-printf '%s\n' .github/scripts/issue-lifecycle-audit.rb >"$tmp_dir/governance-script.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' Makefile >"$tmp_dir/unknown-root.txt"
@@ -85,10 +83,8 @@ job_cases=(
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
   'root-node|pull_request|root-node.txt|ci/node-install'
-  'governance-workflow|pull_request|governance-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
-  'governance-script|pull_request|governance-script.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions'
@@ -116,7 +112,6 @@ done
 
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
-assert_security_jobs "$tmp_dir/governance-workflow.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
@@ -249,22 +244,6 @@ grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
 grep -Fqx '          if ((${#workflow_files[@]} == 0)); then' "$ploy_workflow"
 grep -Fqx '          "${HOME}/go/bin/actionlint" -color "${workflow_files[@]}"' "$ploy_workflow"
-grep -Fqx '      - name: Test issue lifecycle workflow contract' "$ploy_workflow"
-grep -A1 -F '      - name: Test issue lifecycle workflow contract' "$ploy_workflow" | grep -Fqx '        working-directory: .'
-grep -Fqx '        run: ruby .github/scripts/test-issue-lifecycle-workflow.rb' "$ploy_workflow"
-grep -Fqx '      - name: Test issue lifecycle audit' "$ploy_workflow"
-grep -A1 -F '      - name: Test issue lifecycle audit' "$ploy_workflow" | grep -Fqx '        working-directory: .'
-grep -Fqx '        run: .github/scripts/test-issue-lifecycle-audit.sh' "$ploy_workflow"
-grep -Fqx '      - name: Test issue lifecycle templates' "$ploy_workflow"
-grep -A1 -F '      - name: Test issue lifecycle templates' "$ploy_workflow" | grep -Fqx '        working-directory: .'
-grep -Fqx '        run: .github/scripts/test-issue-lifecycle-contract.sh' "$ploy_workflow"
-grep -Fqx '      - name: Test issue lifecycle reconciliation workflow contract' "$ploy_workflow"
-grep -A1 -F '      - name: Test issue lifecycle reconciliation workflow contract' "$ploy_workflow" | grep -Fqx '        working-directory: .'
-grep -Fqx '        run: ruby .github/scripts/test-issue-lifecycle-reconcile-workflow.rb' "$ploy_workflow"
-grep -Fqx '      - name: Test issue lifecycle status reconciliation' "$ploy_workflow"
-grep -A1 -F '      - name: Test issue lifecycle status reconciliation' "$ploy_workflow" | grep -Fqx '        working-directory: .'
-grep -Fqx '        run: .github/scripts/test-issue-lifecycle-status-reconcile.sh' "$ploy_workflow"
-
 # sccache must use the #559/#566 pattern (sccache-action + per-job local
 # cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
 # EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
