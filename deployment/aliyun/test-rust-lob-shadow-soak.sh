@@ -26,7 +26,17 @@ grep -Fq 'formal_gate:false,cutover:false,live:false' "$SOAK"
 grep -Fq 'receipt.json' "$SOAK"
 grep -Fq 'readback_start_ns[$market]=$updated_ns' "$SOAK"
 grep -Fq 'updated_ns >= ${recovery_started_ns[$market]}' "$SOAK"
-grep -Fq 'TOTAL_FEED_SECONDS=$((SOAK_SECONDS + HEALTH_SETTLE_SECONDS + 300))' "$SOAK"
+grep -Fxq 'readonly BOOTSTRAP_SETTLE_SECONDS=900' "$SOAK"
+grep -Fxq 'readonly RECOVERY_SETTLE_SECONDS=300' "$SOAK"
+grep -Fq 'TOTAL_FEED_SECONDS=$((SOAK_SECONDS + BOOTSTRAP_SETTLE_SECONDS + 300))' "$SOAK"
+grep -Fq 'current_mono - ${recovery_started_mono[$market]} > RECOVERY_SETTLE_SECONDS' "$SOAK"
+grep -Fq '${recovery_started_mono[$market]} + RECOVERY_SETTLE_SECONDS > ready_deadline' "$SOAK"
+grep -Fq 'ready_deadline=$(( $(monotonic_seconds) + BOOTSTRAP_SETTLE_SECONDS ))' "$SOAK"
+if grep -Fq 'HEALTH_SETTLE_SECONDS' "$SOAK"; then
+  printf 'shadow-soak retains the obsolete shared settle timeout\n' >&2
+  exit 1
+fi
+grep -Fq 'feed_deadline=$(( $(monotonic_seconds) + TOTAL_FEED_SECONDS ))' "$SOAK"
 grep -Fq 'MIN_SOAK_SECONDS=1201' "$SOAK"
 grep -Fq "sed -n '1,100p'" "$SOAK"
 grep -Fq 'if [[ $token == *.manifest.json && $token == lake/* ]]; then' "$SOAK"
@@ -47,5 +57,10 @@ fi
 stop_line=$(grep -n 'if ! stop_primaries_and_wait; then' "$SOAK" | cut -d: -f1)
 override_cleanup_line=$(grep -n 'rm -f -- "${override_file\[$market\]}"' "$SOAK" | cut -d: -f1)
 ((stop_line < override_cleanup_line))
+
+ready_loop_line=$(grep -n '^while ! health_passes spot || ! health_passes usdm; do$' "$SOAK" | cut -d: -f1)
+observation_start_line=$(grep -n '^observation_started_ns=$(date +%s%N)$' "$SOAK" | cut -d: -f1)
+soak_deadline_line=$(grep -n '^soak_deadline=\$(( \$(monotonic_seconds) + SOAK_SECONDS ))$' "$SOAK" | cut -d: -f1)
+((ready_loop_line < observation_start_line && observation_start_line < soak_deadline_line))
 
 printf 'Rust LOB shadow-soak contract passed\n'
