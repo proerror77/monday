@@ -21,6 +21,9 @@ mode_restore_block=$(sed -n \
 source_command_block=$(sed -n \
   '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --current-run-id /p' \
   "$workflow")
+acr_publish_block=$(sed -n \
+  '/^      - name: Build and push$/,/^      - name: Record immutable image$/p' \
+  "$workflow")
 
 grep -Fqx '            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt"},' "$workflow"
 grep -Fqx '  workflow_run:' "$workflow"
@@ -61,6 +64,8 @@ grep -Fqx '            "${{ needs.selector.outputs.source_sha }}" \' "$workflow"
 grep -Fqx '            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft' "$workflow"
 grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$workflow"
 grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
+grep -Fq '          provenance: false' <<<"$acr_publish_block"
+grep -Fq '          sbom: false' <<<"$acr_publish_block"
 grep -Fqx '  publish-source-test:' "$workflow"
 grep -Fqx "    if: needs.selector.outputs.publish_target == 'research-source-test'" "$workflow"
 grep -Fqx '      source_test_profile: ${{ steps.source.outputs.source_test_profile }}' "$workflow"
