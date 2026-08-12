@@ -5,15 +5,20 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
+PREFLIGHT="$SCRIPT_DIR/host-rust-lob-shadow-preflight.sh"
 UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
 INSTALLER="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 
 [[ -x $SOAK ]]
+[[ -x $PREFLIGHT ]]
 [[ $($SOAK --self-test) == 'shadow-soak self-test: ok' ]]
+[[ $($PREFLIGHT --self-test) == 'shadow-preflight self-test: ok' ]]
 
 grep -Fxq 'EnvironmentFile=-/run/monday/binance-lob-archiver-rust-%i-soak.env' "$UNIT"
 grep -Fq 'host-rust-lob-shadow-soak.sh' "$INSTALLER"
 grep -Fq '/opt/monday/bin/monday-rust-lob-shadow-soak' "$INSTALLER"
+grep -Fq 'host-rust-lob-shadow-preflight.sh' "$INSTALLER"
+grep -Fq '/opt/monday/bin/monday-rust-lob-shadow-preflight' "$INSTALLER"
 grep -Fq 'asset=host-rust-lob-shadow-soak.sh' "$SOAK"
 grep -Fq 'installed_asset=/opt/monday/bin/monday-rust-lob-shadow-soak' "$SOAK"
 grep -Fq 'for command in aliyun awk chmod chown' "$SOAK"
@@ -32,12 +37,28 @@ grep -Fq 'TOTAL_FEED_SECONDS=$((SOAK_SECONDS + BOOTSTRAP_SETTLE_SECONDS + 300))'
 grep -Fq 'current_mono - ${recovery_started_mono[$market]} > RECOVERY_SETTLE_SECONDS' "$SOAK"
 grep -Fq '${recovery_started_mono[$market]} + RECOVERY_SETTLE_SECONDS > ready_deadline' "$SOAK"
 grep -Fq 'ready_deadline=$(( $(monotonic_seconds) + BOOTSTRAP_SETTLE_SECONDS ))' "$SOAK"
+grep -Fxq 'readonly CORRECTNESS_SECONDS=300' "$SOAK"
+grep -Fxq 'readonly CORRECTNESS_SEGMENT_SECONDS=90' "$SOAK"
+grep -Fq 'CORRECTNESS_SECONDS >= 3 * CORRECTNESS_SEGMENT_SECONDS' "$SOAK"
+grep -Fq -- '--correctness' "$SOAK"
+grep -Fq 'RUN_MODE=correctness' "$SOAK"
+grep -Fq 'RUN_MODE=stability' "$SOAK"
+grep -Fq 'MIN_STABILITY_SOAK_SECONDS=1201' "$SOAK"
+grep -Fq 'SOAK_SECONDS=${2:-1800}' "$SOAK"
+grep -Fq 'required_segments=$MIN_READBACK_SEGMENTS' "$SOAK"
+grep -Fq 'MIN_READBACK_SEGMENTS=2' "$SOAK"
+grep -Fq 'tail -n "$required_segments"' "$SOAK"
+grep -Fq 'SEGMENT_SECONDS=%s' "$SOAK"
+grep -Fq 'run_mode:$run_mode' "$SOAK" || grep -Fq 'run_mode:$RUN_MODE' "$SOAK"
+grep -Fq 'preflight_receipt_sha256' "$SOAK"
+grep -Fq '.build_id == $build' "$SOAK"
 if grep -Fq 'HEALTH_SETTLE_SECONDS' "$SOAK"; then
   printf 'shadow-soak retains the obsolete shared settle timeout\n' >&2
   exit 1
 fi
 grep -Fq 'feed_deadline=$(( $(monotonic_seconds) + TOTAL_FEED_SECONDS ))' "$SOAK"
-grep -Fq 'MIN_SOAK_SECONDS=1201' "$SOAK"
+grep -Fq 'MIN_STABILITY_SOAK_SECONDS=1201' "$SOAK"
+grep -Fq 'MIN_READBACK_SEGMENTS=2' "$SOAK"
 grep -Fq "sed -n '1,100p'" "$SOAK"
 grep -Fq 'if [[ $token == *.manifest.json && $token == lake/* ]]; then' "$SOAK"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$SOAK"
@@ -48,6 +69,44 @@ grep -Fq 'transport reset after the final health sample' "$SOAK"
 grep -Fq 'journal-precleanup.txt' "$SOAK"
 grep -Fq 'capture_final_producer_diagnostics precleanup' "$SOAK"
 grep -Fq -- '--verify-raw-trade-continuity' "$SOAK"
+grep -Fq 'monday.rust_lob_shadow_preflight.v1' "$SOAK"
+grep -Fq 'sealed_triplets' "$PREFLIGHT"
+grep -Fq 'replay_identity_sha256' "$PREFLIGHT"
+grep -Fq 'strict_verifier' "$PREFLIGHT"
+grep -Fq 'checks:{candidate_identity:true,sealed_triplets:true,strict_verifier:true' "$PREFLIGHT"
+grep -Fq 'sealed-triplet strict verification failed' "$PREFLIGHT"
+grep -Fq 'run_strict_verifier "${verifier_args[@]}"' "$PREFLIGHT"
+grep -Fq 'triplet_identity_sha256' "$PREFLIGHT"
+grep -Fq 'TRIPLET_ROOT_CANONICAL' "$PREFLIGHT"
+grep -Fq 'assert_no_symlink_ancestors' "$PREFLIGHT"
+grep -Fq 'EXPECTED_REPLAY_IDENTITY_SHA256' "$PREFLIGHT"
+grep -Fq 'Usage: monday-rust-lob-shadow-preflight <candidate-sha256> <sealed-triplet-root> <expected-replay-identity-sha256>' "$PREFLIGHT"
+grep -Fq 'expected_replay_identity_sha256' "$PREFLIGHT"
+grep -Fq 'REPLAY_IDENTITY_BEFORE' "$PREFLIGHT"
+grep -Fq 'REPLAY_IDENTITY_AFTER' "$PREFLIGHT"
+grep -Fq 'systemd-run --quiet --wait --collect' "$PREFLIGHT"
+grep -Fq -- '--property=TimeoutStartSec=300' "$PREFLIGHT"
+grep -Fq -- '--property=MemoryHigh=5000M' "$PREFLIGHT"
+grep -Fq -- '--property=MemoryMax=6400M' "$PREFLIGHT"
+grep -Fq -- '--uid="$SERVICE_USER"' "$PREFLIGHT"
+grep -Fq -- 'binance-lob-archiver $SOURCE_REVISION' "$PREFLIGHT"
+if grep -Eq 'runuser --user "\$SERVICE_USER" -- "\$candidate_binary" --(require-lob|verify-(aggregate|raw)-trade)-continuity' "$PREFLIGHT"; then
+  printf 'preflight continuity verifier bypasses the bounded systemd helper\n' >&2
+  exit 1
+fi
+grep -Fq 'PREFLIGHT_EVIDENCE_ROOT' "$SOAK"
+grep -Fq 'preflight_receipt_canonical' "$SOAK"
+grep -Fq 'preflight receipt path is not canonical' "$SOAK"
+grep -Fq 'preflight_triplet_root' "$SOAK"
+grep -Fq 'preflight_replay_identity' "$SOAK"
+grep -Fq 'triplet_identity_sha256' "$SOAK"
+grep -Fq 'preflight_replay_identity=$(find' "$SOAK"
+grep -Fq 'preflight_run_id' "$SOAK"
+grep -Fq '.run_id == $run_id' "$SOAK"
+if grep -Eq 'checks\.(event_time|upload_contract)' "$PREFLIGHT" "$SOAK"; then
+  printf 'shadow preflight claims parser/upload checks it does not perform\n' >&2
+  exit 1
+fi
 if grep -Eq 'readonly[[:space:]]+(INSTANCE_ID|EXPECTED_PRODUCTION_[A-Za-z0-9_]*)[[:space:]]*=' "$SOAK" \
   || grep -Eq 'readonly CANDIDATE_SHA256=[a-f0-9]{64}$' "$SOAK"; then
   printf 'shadow-soak still hardcodes a run or production identity\n' >&2
@@ -62,5 +121,10 @@ ready_loop_line=$(grep -n '^while ! health_passes spot || ! health_passes usdm; 
 observation_start_line=$(grep -n '^observation_started_ns=$(date +%s%N)$' "$SOAK" | cut -d: -f1)
 soak_deadline_line=$(grep -n '^soak_deadline=\$(( \$(monotonic_seconds) + SOAK_SECONDS ))$' "$SOAK" | cut -d: -f1)
 ((ready_loop_line < observation_start_line && observation_start_line < soak_deadline_line))
+
+replay_before_line=$(grep -n '^REPLAY_IDENTITY_BEFORE=' "$PREFLIGHT" | cut -d: -f1)
+verify_spot_line=$(grep -n '^verify_market spot ' "$PREFLIGHT" | cut -d: -f1)
+replay_after_line=$(grep -n '^REPLAY_IDENTITY_AFTER=' "$PREFLIGHT" | cut -d: -f1)
+((replay_before_line < verify_spot_line && verify_spot_line < replay_after_line))
 
 printf 'Rust LOB shadow-soak contract passed\n'

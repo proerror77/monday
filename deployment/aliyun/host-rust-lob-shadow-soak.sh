@@ -42,23 +42,47 @@ if [[ ${1:-} == --self-test ]]; then
   self_test
   exit 0
 fi
-[[ $# -ge 1 && $# -le 2 ]] || {
-  printf 'usage: monday-rust-lob-shadow-soak <candidate-sha256> [seconds]\n' >&2
-  exit 2
-}
-readonly CANDIDATE_SHA256=$1
-readonly SOAK_SECONDS=${2:-1800}
-readonly MIN_SOAK_SECONDS=1201
+readonly CORRECTNESS_SECONDS=300
+readonly CORRECTNESS_SEGMENT_SECONDS=90
+RUN_MODE=stability
+PREFLIGHT_RECEIPT=
+if [[ ${1:-} == --correctness ]]; then
+  [[ $# -eq 3 ]] || {
+    printf 'usage: monday-rust-lob-shadow-soak --correctness <candidate-sha256> <preflight-receipt>\n' >&2
+    exit 2
+  }
+  RUN_MODE=correctness
+  CANDIDATE_SHA256=$2
+  PREFLIGHT_RECEIPT=$3
+  SOAK_SECONDS=$CORRECTNESS_SECONDS
+else
+  [[ $# -ge 1 && $# -le 2 ]] || {
+    printf 'usage: monday-rust-lob-shadow-soak <candidate-sha256> [seconds]\n' >&2
+    exit 2
+  }
+  CANDIDATE_SHA256=$1
+  SOAK_SECONDS=${2:-1800}
+fi
+readonly RUN_MODE CANDIDATE_SHA256 PREFLIGHT_RECEIPT SOAK_SECONDS
+readonly MIN_STABILITY_SOAK_SECONDS=1201
+readonly MIN_READBACK_SEGMENTS=2
+(( CORRECTNESS_SECONDS >= 3 * CORRECTNESS_SEGMENT_SECONDS )) \
+  || {
+    printf 'correctness observation budget must cover two complete post-start segments\n' >&2
+    exit 2
+  }
 [[ $CANDIDATE_SHA256 =~ ^[a-f0-9]{64}$ ]] || {
   printf 'candidate SHA must be 64 lowercase hexadecimal characters\n' >&2
   exit 2
 }
-[[ $SOAK_SECONDS =~ ^[1-9][0-9]*$ && $SOAK_SECONDS -ge $MIN_SOAK_SECONDS \
-  && $SOAK_SECONDS -le 7200 ]] || {
-  printf 'duration must be %s..7200 seconds for two observation segments\n' \
-    "$MIN_SOAK_SECONDS" >&2
-  exit 2
-}
+if [[ $RUN_MODE == stability ]]; then
+  [[ $SOAK_SECONDS =~ ^[1-9][0-9]*$ && $SOAK_SECONDS -ge $MIN_STABILITY_SOAK_SECONDS \
+    && $SOAK_SECONDS -le 7200 ]] || {
+    printf 'duration must be %s..7200 seconds for two observation segments\n' \
+      "$MIN_STABILITY_SOAK_SECONDS" >&2
+    exit 2
+  }
+fi
 
 readonly BOOTSTRAP_SETTLE_SECONDS=900
 readonly RECOVERY_SETTLE_SECONDS=300
@@ -72,6 +96,7 @@ readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly SHADOW_LINK=/opt/monday/bin/binance-lob-archiver-shadow
 readonly PRODUCTION_LINK=/opt/monday/bin/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/rust-lob-soaks
+readonly PREFLIGHT_EVIDENCE_ROOT=/data/monday/evidence/rust-lob-shadow-preflights
 readonly LOCK_FILE=/run/lock/monday-rust-lob-release.lock
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
@@ -175,6 +200,61 @@ readonly BUNDLE_SHA256 SOURCE_REVISION CANDIDATE_SIZE_BYTES CANDIDATE_BUILD_ID
 jq -e --arg artifact "$CANDIDATE_SHA256" --arg bundle "$BUNDLE_SHA256" \
   '.artifact_sha256 == $artifact and .deployment_bundle_sha256 == $bundle' \
   "$candidate_release_json" >/dev/null || die 'candidate release metadata mismatch'
+if [[ $RUN_MODE == correctness ]]; then
+  preflight_receipt_canonical=$(readlink -f -- "$PREFLIGHT_RECEIPT" 2>/dev/null || true)
+  [[ $PREFLIGHT_RECEIPT == "$preflight_receipt_canonical" ]] \
+    || die 'preflight receipt path is not canonical'
+  [[ $PREFLIGHT_RECEIPT =~ ^$PREFLIGHT_EVIDENCE_ROOT/$CANDIDATE_SHA256/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*/preflight\.json$ ]] \
+    || die 'preflight receipt path is outside the canonical evidence root'
+  preflight_receipt_run_root=${PREFLIGHT_RECEIPT%/preflight.json}
+  preflight_run_id=${preflight_receipt_run_root##*/}
+  preflight_triplet_root=$(jq -er '.triplet_root' "$PREFLIGHT_RECEIPT" 2>/dev/null || true)
+  [[ -n $preflight_triplet_root ]] || die 'preflight triplet root is missing'
+  preflight_triplet_root_canonical=$(readlink -f -- "$preflight_triplet_root" 2>/dev/null || true)
+  [[ $preflight_triplet_root == "$preflight_triplet_root_canonical" ]] \
+    || die 'preflight triplet root is not canonical'
+  direct_directory "$preflight_triplet_root" \
+    || die 'preflight triplet root is not a direct directory'
+  assert_no_symlink_ancestors "$preflight_triplet_root"
+  [[ -d $preflight_receipt_run_root && ! -L $preflight_receipt_run_root ]] \
+    || die 'preflight receipt run root is not a direct directory'
+  [[ -f $PREFLIGHT_RECEIPT && ! -L $PREFLIGHT_RECEIPT ]] \
+    || die 'correctness preflight receipt is missing or a symlink'
+  secure_regular_file "$PREFLIGHT_RECEIPT"
+  jq -e --arg candidate "$CANDIDATE_SHA256" --arg source "$SOURCE_REVISION" \
+    --arg bundle "$BUNDLE_SHA256" --arg build "$CANDIDATE_BUILD_ID" \
+    --arg run_id "$preflight_run_id" \
+    --arg triplet_root "$preflight_triplet_root" \
+    '.schema == "monday.rust_lob_shadow_preflight.v1" and .result == "passed"
+     and .formal_gate == false and .cutover == false and .live == false
+     and .candidate_sha256 == $candidate and .source_revision == $source
+     and .deployment_bundle_sha256 == $bundle and .build_id == $build
+     and .run_id == $run_id
+     and .triplet_root == $triplet_root
+     and (.expected_replay_identity_sha256 == .replay_identity_sha256)
+     and (.replay_identity_sha256|test("^[a-f0-9]{64}$"))
+     and (.triplet_identity_sha256|test("^[a-f0-9]{64}$"))
+     and .checks.candidate_identity == true and .checks.sealed_triplets == true
+     and .checks.strict_verifier == true and .checks.lob_continuity == true
+     and .checks.aggregate_trade_continuity == true and .checks.raw_trade_continuity == true' \
+    "$PREFLIGHT_RECEIPT" >/dev/null \
+    || die 'correctness preflight receipt does not match the frozen candidate identity'
+  preflight_replay_identity=$(find "$preflight_triplet_root" -type f \( -name '*.jsonl.zst' -o -name '*.manifest.json' -o -name '*._SUCCESS' \) \
+    -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+  receipt_replay_identity=$(jq -er '.replay_identity_sha256' "$PREFLIGHT_RECEIPT")
+  receipt_expected_replay_identity=$(jq -er '.expected_replay_identity_sha256' "$PREFLIGHT_RECEIPT")
+  [[ $preflight_replay_identity == "$receipt_replay_identity" ]] \
+    || die 'preflight sealed-triplet identity changed after receipt'
+  [[ $receipt_expected_replay_identity == "$receipt_replay_identity" ]] \
+    || die 'preflight receipt is not bound to its reviewed corpus digest'
+  preflight_triplet_identity=$(printf '%s\n' "$preflight_triplet_root" "$preflight_replay_identity" \
+    | sha256sum | awk '{print $1}')
+  receipt_triplet_identity=$(jq -er '.triplet_identity_sha256' "$PREFLIGHT_RECEIPT")
+  [[ $preflight_triplet_identity == "$receipt_triplet_identity" ]] \
+    || die 'preflight sealed-triplet root binding changed after receipt'
+  PREFLIGHT_RECEIPT_SHA256=$(sha256sum "$PREFLIGHT_RECEIPT" | awk '{print $1}')
+  readonly PREFLIGHT_RECEIPT_SHA256
+fi
 [[ -f $candidate_binary && -x $candidate_binary ]] || die 'candidate binary is not executable'
 secure_regular_file "$candidate_binary"
 printf '%s  %s\n' "$CANDIDATE_SHA256" "$candidate_binary" \
@@ -249,6 +329,12 @@ for asset in \
 done
 asset=host-rust-lob-shadow-soak.sh
 installed_asset=/opt/monday/bin/monday-rust-lob-shadow-soak
+secure_regular_file "$candidate_deployment/$asset"
+secure_regular_file "$installed_asset"
+cmp -s "$candidate_deployment/$asset" "$installed_asset" \
+  || die "installed shadow asset differs: $asset"
+asset=host-rust-lob-shadow-preflight.sh
+installed_asset=/opt/monday/bin/monday-rust-lob-shadow-preflight
 secure_regular_file "$candidate_deployment/$asset"
 secure_regular_file "$installed_asset"
 cmp -s "$candidate_deployment/$asset" "$installed_asset" \
@@ -399,13 +485,17 @@ jq -n --arg run_id "$evidence_run_id" --arg created_at "$run_created_at" \
   --arg source "$SOURCE_REVISION" --arg candidate "$CANDIDATE_SHA256" \
   --arg bundle "$BUNDLE_SHA256" --argjson candidate_size_bytes "$CANDIDATE_SIZE_BYTES" \
   --arg candidate_build_id "$CANDIDATE_BUILD_ID" --argjson soak_seconds "$SOAK_SECONDS" \
+  --arg run_mode "$RUN_MODE" --arg preflight_receipt "${PREFLIGHT_RECEIPT:-}" \
+  --arg preflight_receipt_sha256 "${PREFLIGHT_RECEIPT_SHA256:-}" \
   --argjson sample_interval_seconds "$SAMPLE_INTERVAL_SECONDS" \
   '{schema:"monday.rust_lob_shadow_soak_run.v1",run_id:$run_id,created_at:$created_at,
     soak_only:true,formal_gate:false,cutover:false,live:false,
     host:$host,
     source_revision:$source,candidate_sha256:$candidate,
     candidate_size_bytes:$candidate_size_bytes,candidate_build_id:$candidate_build_id,
-    deployment_bundle_sha256:$bundle,soak_seconds:$soak_seconds,
+    deployment_bundle_sha256:$bundle,run_mode:$run_mode,soak_seconds:$soak_seconds,
+    preflight_receipt:(if $preflight_receipt == "" then null else $preflight_receipt end),
+    preflight_receipt_sha256:(if $preflight_receipt_sha256 == "" then null else $preflight_receipt_sha256 end),
     sample_interval_seconds:$sample_interval_seconds}' >"$evidence_dir/run.json"
 chmod 0640 "$evidence_dir/run.json"
 : >"$evidence_dir/watchdog-events.ndjson"
@@ -861,8 +951,8 @@ verify_market_readback() {
   local file digest manifest_digest zst_uri success_uri stale_count observed_stale data_bytes readback_start
   local candidates="$tmp_dir/$market-candidates.tsv" selected="$tmp_dir/$market-selected.tsv"
   local segment_dir zst_path manifest_path success_path
-  local previous_path previous_digest previous_manifest_digest
   local -a strict_segments=()
+  local required_segments=$MIN_READBACK_SEGMENTS
   manifest_uris "$market" "$listing" >"$tmp_dir/$market-manifests.txt"
   : >"$candidates"
   while IFS= read -r uri; do
@@ -908,9 +998,9 @@ verify_market_readback() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$start_ns" "$end_ns" "$uri" "$file" \
       "$manifest_digest" >>"$candidates"
   done <"$tmp_dir/$market-manifests.txt"
-  [[ $(wc -l <"$candidates" | tr -d ' ') -ge 2 ]] \
-    || die "$market has fewer than two complete post-soak manifests"
-  sort -nr -k1,1 "$candidates" | tail -n 2 | sort -n -k1,1 >"$selected"
+  [[ $(wc -l <"$candidates" | tr -d ' ') -ge $required_segments ]] \
+    || die "$market has fewer than $required_segments complete post-soak manifests"
+  sort -nr -k1,1 "$candidates" | tail -n "$required_segments" | sort -n -k1,1 >"$selected"
   while IFS=$'\t' read -r start_ns end_ns uri file manifest_digest; do
     segment_dir="$tmp_dir/$market-segment-$start_ns"
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"
@@ -950,27 +1040,22 @@ verify_market_readback() {
     install -m 0640 "$manifest_path" "$evidence_dir/${market}-manifest-$start_ns.json"
     strict_segments+=("$zst_path" "$digest" "$manifest_digest")
   done <"$selected"
-  previous_path=${strict_segments[0]}
-  previous_digest=${strict_segments[1]}
-  previous_manifest_digest=${strict_segments[2]}
-  run_strict_verifier --require-lob-continuity \
-    --verify-segment "$previous_path" --segment-content-sha256 "$previous_digest" \
-    --segment-manifest-sha256 "$previous_manifest_digest" \
-    --verify-segment "${strict_segments[3]}" --segment-content-sha256 "${strict_segments[4]}" \
-    --segment-manifest-sha256 "${strict_segments[5]}" \
+  local -a continuity_args=(--verify-segment "${strict_segments[0]}" \
+    --segment-content-sha256 "${strict_segments[1]}" \
+    --segment-manifest-sha256 "${strict_segments[2]}")
+  if (( required_segments >= 2 )); then
+    continuity_args+=(--verify-segment "${strict_segments[3]}" \
+      --segment-content-sha256 "${strict_segments[4]}" \
+      --segment-manifest-sha256 "${strict_segments[5]}")
+  fi
+  run_strict_verifier --require-lob-continuity "${continuity_args[@]}" \
     >"$evidence_dir/${market}-lob-continuity.txt" 2>&1 \
     || die "$market strict LOB continuity verifier failed"
-  local -a aggregate_args=(--verify-aggregate-trade-continuity)
-  aggregate_args+=(--verify-segment "${strict_segments[0]}" --segment-content-sha256 "${strict_segments[1]}" \
-    --segment-manifest-sha256 "${strict_segments[2]}" --verify-segment "${strict_segments[3]}" \
-    --segment-content-sha256 "${strict_segments[4]}" --segment-manifest-sha256 "${strict_segments[5]}")
+  local -a aggregate_args=(--verify-aggregate-trade-continuity "${continuity_args[@]}")
   run_strict_verifier "${aggregate_args[@]}" \
     >"$evidence_dir/${market}-aggregate-continuity.txt" 2>&1 \
     || die "$market aggregate continuity verifier failed"
-  local -a raw_args=(--verify-raw-trade-continuity)
-  raw_args+=(--verify-segment "${strict_segments[0]}" --segment-content-sha256 "${strict_segments[1]}" \
-    --segment-manifest-sha256 "${strict_segments[2]}" --verify-segment "${strict_segments[3]}" \
-    --segment-content-sha256 "${strict_segments[4]}" --segment-manifest-sha256 "${strict_segments[5]}")
+  local -a raw_args=(--verify-raw-trade-continuity "${continuity_args[@]}")
   run_strict_verifier "${raw_args[@]}" \
     >"$evidence_dir/${market}-raw-trade-continuity.txt" 2>&1 \
     || die "$market raw-trade continuity verifier failed"
@@ -1076,16 +1161,32 @@ cleanup() {
   fi
   if [[ $cleanup_failure == true && $status == 0 ]]; then status=1; fi
   if [[ $status == 0 ]]; then
-    jq -n --arg result passed --arg finished_at "$end_iso" \
+    jq -n --arg result passed --arg finished_at "$end_iso" --arg mode "$RUN_MODE" \
+      --arg candidate "$CANDIDATE_SHA256" --arg source "$SOURCE_REVISION" \
+      --arg build "$CANDIDATE_BUILD_ID" \
+      --arg bundle "$BUNDLE_SHA256" \
+      --arg preflight_receipt "${PREFLIGHT_RECEIPT:-}" \
+      --arg preflight_receipt_sha256 "${PREFLIGHT_RECEIPT_SHA256:-}" \
       --arg run_spool "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id" \
       '{schema:"monday.rust_lob_shadow_soak_result.v1",result:$result,
-        formal_gate:false,cutover:false,live:false,finished_at:$finished_at,
+        mode:$mode,candidate_sha256:$candidate,source_revision:$source,build_id:$build,
+        deployment_bundle_sha256:$bundle,formal_gate:false,cutover:false,live:false,finished_at:$finished_at,
+        preflight_receipt:(if $preflight_receipt == "" then null else $preflight_receipt end),
+        preflight_receipt_sha256:(if $preflight_receipt_sha256 == "" then null else $preflight_receipt_sha256 end),
         run_spool:$run_spool}' >"$evidence_dir/receipt.json"
   else
-    jq -n --arg result STOP --arg finished_at "$end_iso" \
+    jq -n --arg result STOP --arg finished_at "$end_iso" --arg mode "$RUN_MODE" \
+      --arg candidate "$CANDIDATE_SHA256" --arg source "$SOURCE_REVISION" \
+      --arg build "$CANDIDATE_BUILD_ID" \
+      --arg bundle "$BUNDLE_SHA256" \
+      --arg preflight_receipt "${PREFLIGHT_RECEIPT:-}" \
+      --arg preflight_receipt_sha256 "${PREFLIGHT_RECEIPT_SHA256:-}" \
       --arg run_spool "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id" \
       '{schema:"monday.rust_lob_shadow_soak_result.v1",result:$result,
-        formal_gate:false,cutover:false,live:false,finished_at:$finished_at,
+        mode:$mode,candidate_sha256:$candidate,source_revision:$source,build_id:$build,
+        deployment_bundle_sha256:$bundle,formal_gate:false,cutover:false,live:false,finished_at:$finished_at,
+        preflight_receipt:(if $preflight_receipt == "" then null else $preflight_receipt end),
+        preflight_receipt_sha256:(if $preflight_receipt_sha256 == "" then null else $preflight_receipt_sha256 end),
         run_spool:$run_spool}' >"$evidence_dir/receipt.json"
   fi
   rm -rf -- "$tmp_dir"
@@ -1099,6 +1200,10 @@ assert_candidate_stable
 install -d -m 0755 "$OVERRIDE_ROOT"
 for market in "${MARKETS[@]}"; do
   printf 'SPOOL_DIR=%s\n' "${spool_dir[$market]}" >"$tmp_dir/$market-soak.env"
+  if [[ $RUN_MODE == correctness ]]; then
+    printf 'SEGMENT_SECONDS=%s\n' "$CORRECTNESS_SEGMENT_SECONDS" \
+      >>"$tmp_dir/$market-soak.env"
+  fi
   install -m 0640 "$tmp_dir/$market-soak.env" "${override_file[$market]}"
 done
 feed_deadline=$(( $(monotonic_seconds) + TOTAL_FEED_SECONDS ))

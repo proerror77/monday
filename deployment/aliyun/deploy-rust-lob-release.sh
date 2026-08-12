@@ -80,6 +80,7 @@ assets=(
   binance-lob-archiver-production-usdm.env
   binance-lob-archiver-rust-spot.env
   binance-lob-archiver-rust-usdm.env
+  host-rust-lob-shadow-preflight.sh
   host-rust-lob-shadow-soak.sh
   host-rust-lob-shadow-gate.sh
   host-rust-lob-cutover.sh
@@ -282,6 +283,8 @@ install -m 0640 "$release_deployment/binance-lob-archiver-rust-usdm.env" \
   /etc/monday/binance-lob-archiver-rust-usdm.env
 install -m 0755 "$release_deployment/host-rust-lob-shadow-soak.sh" \
   /opt/monday/bin/monday-rust-lob-shadow-soak
+install -m 0755 "$release_deployment/host-rust-lob-shadow-preflight.sh" \
+  /opt/monday/bin/monday-rust-lob-shadow-preflight
 
 ln -sfn "$release_binary" /opt/monday/bin/binance-lob-archiver-shadow
 printf '%s  %s\n' "$artifact_sha256" /opt/monday/bin/binance-lob-archiver-shadow \
