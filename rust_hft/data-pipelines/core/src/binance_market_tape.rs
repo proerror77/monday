@@ -402,10 +402,7 @@ impl DepthSourceClock {
         {
             anyhow::bail!("depth source clocks are reversed");
         }
-        validate_receive_clock(event_time_ms, received_at_ns, "depth")?;
-        if let Some(transaction_time_ms) = transaction_time_ms {
-            validate_receive_clock(transaction_time_ms, received_at_ns, "depth")?;
-        }
+        validate_receive_clock(event_time_ms, received_at_ns, "depth E")?;
         Ok(Self {
             symbol,
             first_update_id,
@@ -709,8 +706,12 @@ impl AggregateTrade {
         if trade_time_ms > event_time_ms {
             anyhow::bail!("aggregate trade source clocks are reversed");
         }
-        validate_receive_clock(event_time_ms, received_at_ns, "aggregate trade")?;
-        validate_receive_clock(trade_time_ms, received_at_ns, "aggregate trade")?;
+        validate_trade_clocks(
+            event_time_ms,
+            trade_time_ms,
+            received_at_ns,
+            "aggregate trade",
+        )?;
         Ok(Self {
             symbol,
             aggregate_trade_id,
@@ -844,8 +845,7 @@ impl RawTrade {
         if trade_time_ms > event_time_ms {
             anyhow::bail!("raw trade source clocks are reversed");
         }
-        validate_receive_clock(event_time_ms, received_at_ns, "raw trade")?;
-        validate_receive_clock(trade_time_ms, received_at_ns, "raw trade")?;
+        validate_trade_clocks(event_time_ms, trade_time_ms, received_at_ns, "raw trade")?;
         Ok(Self {
             symbol,
             trade_id,
@@ -1035,8 +1035,7 @@ impl ForceOrder {
         if trade_time_ms > event_time_ms {
             anyhow::bail!("force order source clocks are reversed");
         }
-        validate_receive_clock(event_time_ms, received_at_ns, "force order")?;
-        validate_receive_clock(trade_time_ms, received_at_ns, "force order")?;
+        validate_trade_clocks(event_time_ms, trade_time_ms, received_at_ns, "force order")?;
         Ok(Self {
             symbol,
             side: side.to_owned(),
@@ -1083,6 +1082,30 @@ fn validate_receive_clock(event_time_ms: u64, received_at_ns: u64, kind: &str) -
     let received_at_ms = received_at_ns / 1_000_000;
     if received_at_ms.saturating_sub(event_time_ms) > MAX_SOURCE_DELAY_MS {
         anyhow::bail!("{kind} source-to-receive delay exceeds the governed limit");
+    }
+    Ok(())
+}
+
+fn validate_trade_clocks(
+    event_time_ms: u64,
+    trade_time_ms: u64,
+    received_at_ns: u64,
+    kind: &str,
+) -> Result<()> {
+    let received_at_ms = received_at_ns / 1_000_000;
+    let recv_minus_event_ms = received_at_ms.saturating_sub(event_time_ms);
+    let event_minus_trade_ms = event_time_ms.saturating_sub(trade_time_ms);
+    let recv_minus_trade_ms = received_at_ms.saturating_sub(trade_time_ms);
+    if let Err(error) = validate_receive_clock(event_time_ms, received_at_ns, &format!("{kind} E"))
+    {
+        anyhow::bail!(
+            "{error:#}: recv_minus_event_ms={recv_minus_event_ms} event_minus_trade_ms={event_minus_trade_ms} recv_minus_trade_ms={recv_minus_trade_ms}"
+        );
+    }
+    if recv_minus_trade_ms > MAX_SOURCE_DELAY_MS {
+        anyhow::bail!(
+            "{kind} age exceeds the governed limit: recv_minus_event_ms={recv_minus_event_ms} event_minus_trade_ms={event_minus_trade_ms} recv_minus_trade_ms={recv_minus_trade_ms}",
+        );
     }
     Ok(())
 }
@@ -1428,14 +1451,12 @@ mod tests {
     }
 
     #[test]
-    fn depth_clock_rejects_stale_transaction_time_when_event_time_is_fresh() {
+    fn depth_clock_accepts_fresh_event_with_old_transaction_time() {
         assert!(DepthSourceClock::from_frame(
             &depth_frame(1_700_000_031_000, Some(1_700_000_000_999)),
             1_700_000_031_000_000_000,
         )
-        .unwrap_err()
-        .to_string()
-        .contains("delay"));
+        .is_ok());
     }
 
     #[test]
@@ -1480,13 +1501,16 @@ mod tests {
 
     #[test]
     fn aggregate_trade_rejects_stale_trade_time_when_event_time_is_fresh() {
-        assert!(AggregateTrade::from_frame(
+        let error = AggregateTrade::from_frame(
             &frame(1, 1_700_000_031_000, 1_700_000_000_999),
             1_700_000_031_000_000_000,
         )
         .unwrap_err()
-        .to_string()
-        .contains("delay"));
+        .to_string();
+        assert!(error.contains("aggregate trade age exceeds the governed limit"));
+        assert!(error.contains("recv_minus_event_ms=0"));
+        assert!(error.contains("event_minus_trade_ms=30001"));
+        assert!(error.contains("recv_minus_trade_ms=30001"));
     }
 
     #[test]
@@ -1633,6 +1657,16 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("delay"));
+        let error = RawTrade::from_frame(
+            &raw_trade_frame(1, 1_700_000_031_000, 1_700_000_000_999),
+            1_700_000_031_000_000_000,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("raw trade age exceeds the governed limit"));
+        assert!(error.contains("recv_minus_event_ms=0"));
+        assert!(error.contains("event_minus_trade_ms=30001"));
+        assert!(error.contains("recv_minus_trade_ms=30001"));
         let mut wrong_identity = raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
         wrong_identity["data"]["e"] = json!("aggTrade");
         assert!(
@@ -1963,6 +1997,16 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("delay"));
+        let error = ForceOrder::from_frame(
+            &force_order_frame(1_700_000_031_000, 1_700_000_000_999),
+            1_700_000_031_000_000_000,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("force order age exceeds the governed limit"));
+        assert!(error.contains("recv_minus_event_ms=0"));
+        assert!(error.contains("event_minus_trade_ms=30001"));
+        assert!(error.contains("recv_minus_trade_ms=30001"));
         let mut bad_side = force_order_frame(1_700_000_000_000, 1_700_000_000_000);
         bad_side["data"]["o"]["S"] = json!("HOLD");
         assert!(ForceOrder::from_frame(&bad_side, received_at_ns)

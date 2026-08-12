@@ -3029,18 +3029,7 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
         return Ok(Event::AggregateTrade { trade, frame });
     }
     if channel.eq_ignore_ascii_case("trade") {
-        let zero_price = frame
-            .get("data")
-            .unwrap_or(&frame)
-            .get("p")
-            .and_then(Value::as_str)
-            .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
-            == Some(rust_decimal::Decimal::ZERO);
-        let trade = if zero_price {
-            RawTrade::from_zero_price_frame(&frame, received_at_ns)?
-        } else {
-            RawTrade::from_frame(&frame, received_at_ns)?
-        };
+        let trade = raw_trade_from_frame(&frame, received_at_ns)?;
         return Ok(Event::RawTrade { trade, frame });
     }
     if channel.eq_ignore_ascii_case("bookTicker") {
@@ -3054,6 +3043,21 @@ fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> 
     anyhow::bail!("unsupported Binance research stream {stream}");
 }
 
+fn raw_trade_from_frame(frame: &Value, received_at_ns: u64) -> anyhow::Result<RawTrade> {
+    let zero_price = frame
+        .get("data")
+        .unwrap_or(frame)
+        .get("p")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+        == Some(rust_decimal::Decimal::ZERO);
+    if zero_price {
+        RawTrade::from_zero_price_frame(frame, received_at_ns)
+    } else {
+        RawTrade::from_frame(frame, received_at_ns)
+    }
+}
+
 fn event_from_frame_for_shard(
     frame: Value,
     received_at_ns: u64,
@@ -3063,8 +3067,36 @@ fn event_from_frame_for_shard(
         .get("stream")
         .and_then(Value::as_str)
         .and_then(|stream| stream.rsplit_once('@').map(|(_, channel)| channel));
+    let is_raw_trade = channel.is_some_and(|channel| channel.eq_ignore_ascii_case("trade"));
     if !channel.is_some_and(|channel| channel.eq_ignore_ascii_case("bookTicker")) {
-        return event_from_frame(frame, received_at_ns);
+        if !is_raw_trade {
+            return event_from_frame(frame, received_at_ns);
+        }
+        let trade = raw_trade_from_frame(&frame, received_at_ns).map_err(|error| {
+            let data = frame.get("data").unwrap_or(&frame);
+            let event_time_ms = data.get("E").and_then(Value::as_u64);
+            let trade_time_ms = data.get("T").and_then(Value::as_u64);
+            let value_or_missing = |value: Option<u64>| {
+                value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
+            };
+            anyhow::anyhow!(
+                "{error:#}; stream={} symbol={} E={} T={} received_at_ns={received_at_ns} recv_minus_event_ms={} event_minus_trade_ms={} recv_minus_trade_ms={} producer_id={producer_id} frame={frame}",
+                frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
+                data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
+                value_or_missing(event_time_ms),
+                value_or_missing(trade_time_ms),
+                value_or_missing(event_time_ms.map(|event_time_ms| {
+                    (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
+                })),
+                value_or_missing(event_time_ms.zip(trade_time_ms).map(
+                    |(event_time_ms, trade_time_ms)| event_time_ms.saturating_sub(trade_time_ms)
+                )),
+                value_or_missing(trade_time_ms.map(|trade_time_ms| {
+                    (received_at_ns / 1_000_000).saturating_sub(trade_time_ms)
+                })),
+            )
+        })?;
+        return Ok(Event::RawTrade { trade, frame });
     }
     let strict_error = match event_from_frame(frame.clone(), received_at_ns) {
         Ok(event) => return Ok(event),
@@ -6164,6 +6196,47 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported Binance research stream"));
+    }
+
+    #[test]
+    fn stale_raw_trade_error_preserves_source_clocks_and_original_frame() {
+        let received_at_ns = 1_700_000_031_000_000_000;
+        let event_time_ms = 1_700_000_000_000;
+        let trade_time_ms = event_time_ms - 10;
+        let producer_id = 7;
+        let frame =
+            observed_usdm_raw_trade_frame(9, event_time_ms, trade_time_ms, "101", "0.2", "NA");
+
+        let error = event_from_frame_for_shard(frame.clone(), received_at_ns, producer_id)
+            .expect_err("stale raw trade must remain fail closed")
+            .to_string();
+
+        for expected in [
+            "raw trade E source-to-receive delay exceeds the governed limit",
+            "stream=btcusdc@trade",
+            "symbol=BTCUSDC",
+            "E=1700000000000",
+            "T=1699999999990",
+            "received_at_ns=1700000031000000000",
+            "recv_minus_event_ms=31000",
+            "event_minus_trade_ms=10",
+            "recv_minus_trade_ms=31010",
+            "producer_id=7",
+            &format!("frame={frame}"),
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+
+        let mut frame = frame;
+        frame["data"]["E"] = json!(received_at_ns / 1_000_000 - 1);
+        let error = event_from_frame_for_shard(frame, received_at_ns, producer_id)
+            .expect_err("stale raw trade T clock must remain fail closed")
+            .to_string();
+        assert!(error.contains("raw trade age exceeds the governed limit"));
+        assert!(error.contains("recv_minus_event_ms=1"));
+        assert!(error.contains("event_minus_trade_ms=31009"));
+        assert!(error.contains("recv_minus_trade_ms=31010"));
+        assert!(!error.contains("raw trade E source-to-receive delay"));
     }
 
     #[test]
