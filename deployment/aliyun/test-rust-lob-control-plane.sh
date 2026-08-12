@@ -19,6 +19,7 @@ RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
 LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$LIB"
+"$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
 
 for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
   command -v "$command" >/dev/null 2>&1 || {

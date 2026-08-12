@@ -12,6 +12,7 @@ Group=hftcollector
 Environment=RUST_LOG=info
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env
+EnvironmentFile=-/run/monday/binance-lob-archiver-rust-%i-soak.env
 ExecStartPre=/opt/monday/bin/binance-lob-archiver-shadow --self-test
 ExecStart=/opt/monday/bin/binance-lob-archiver-shadow
 Restart=always
