@@ -743,8 +743,10 @@ its systemd unit, and its deployment tests are removed. A release now has three
 separate operations:
 
 1. install a digest-pinned candidate without touching production;
-2. run a candidate-specific one-hour full-catalog shadow gate;
-3. cut over only by consuming that gate's immutable evidence.
+2. validate sealed-triplet evidence, then run the candidate-specific correctness
+   Shadow (`--correctness`, fixed 300 seconds after the 900-second bootstrap);
+3. only after correctness passes, run the default 1,800-second stability Shadow;
+4. cut over only by consuming the formal Gate's immutable evidence.
 
 All host operations go through Alibaba Cloud Assistant from the local Alibaba
 Cloud CLI. The scripts reject regions other than Tokyo
@@ -796,6 +798,17 @@ isolated spools below, and isolated OSS datasets:
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
 | USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+
+The sealed-triplet preflight binds candidate source/bundle/build identity and
+independently verifies two Spot and two USD-M data/manifest/`_SUCCESS` triplets
+with the strict continuity verifiers. It does not claim to replay raw frames;
+the merged exact-frame parser E2E remains the parser evidence. The controller
+must supply the reviewed corpus receipt's expected replay identity as the
+preflight's third argument; the preflight never generates that trust anchor
+from the corpus it is about to verify. Correctness mode uses only its run-scoped
+`SEGMENT_SECONDS=90` override (two complete 90-second post-bootstrap segments
+fit inside the fixed 300-second observation); committed environments remain at
+600 seconds and stability/Gate behavior is unchanged.
 
 Each session proves the exact expected subscription set on every WebSocket
 shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. A
