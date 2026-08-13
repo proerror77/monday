@@ -244,6 +244,11 @@ if [[ $bundle_only == 1 ]]; then
   [[ -f $release_binary && ! -L $release_binary && -x $release_binary ]] \
     || { printf 'existing release binary is not a regular executable\n' >&2; exit 1; }
   printf '%s  %s\n' "$artifact_sha256" "$release_binary" | sha256sum --check --strict
+  if [[ -L /opt/monday/bin/binance-lob-archiver ]] \
+    && [[ $(readlink -f /opt/monday/bin/binance-lob-archiver) == "$release_binary" ]]; then
+    printf 'bundle-only refuses the active production digest: %s\n' "$artifact_sha256" >&2
+    exit 1
+  fi
   prior_meta_sha=$(sha256sum "$release_metadata" | awk '{print $1}')
   install -m 0644 "$release_metadata" "$release_dir/release.json.prev.${prior_meta_sha}"
   deploy_staging=$(mktemp -d "$release_dir/.deployment.new.XXXXXX")
@@ -253,11 +258,34 @@ if [[ $bundle_only == 1 ]]; then
     "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
     > "$meta_staging"
   chmod 0644 "$meta_staging"
-  rm -rf "$release_deployment"
-  mv -T "$deploy_staging" "$release_deployment"
+  # Replace the deployment and metadata transactionally: rename the prior
+  # copies aside, install the staged replacements, and only then drop the
+  # backups. If any step fails, restore the prior deployment and metadata so
+  # the release never holds a half-replaced bundle.
+  deployment_backup="$release_dir/.deployment.bak.$$"
+  metadata_backup="$release_dir/.release.json.bak.$$"
+  [[ -d $release_deployment && ! -L $release_deployment ]] \
+    || { printf 'existing release deployment is not a direct directory\n' >&2; exit 1; }
+  mv -T "$release_deployment" "$deployment_backup"
+  if ! mv -T "$deploy_staging" "$release_deployment"; then
+    mv -T "$deployment_backup" "$release_deployment" 2>/dev/null || true
+    exit 1
+  fi
   deploy_staging=
-  mv -T "$meta_staging" "$release_metadata"
+  if ! mv -T "$release_metadata" "$metadata_backup"; then
+    rm -rf "$release_deployment"
+    mv -T "$deployment_backup" "$release_deployment" 2>/dev/null || true
+    exit 1
+  fi
+  if ! mv -T "$meta_staging" "$release_metadata"; then
+    rm -rf "$release_deployment"
+    mv -T "$deployment_backup" "$release_deployment" 2>/dev/null || true
+    mv -T "$metadata_backup" "$release_metadata" 2>/dev/null || true
+    exit 1
+  fi
   meta_staging=
+  rm -rf "$deployment_backup"
+  rm -f "$metadata_backup"
 elif [[ -e $release_dir || -L $release_dir ]]; then
   [[ -d $release_dir && ! -L $release_dir && $(readlink -f "$release_dir") == "$release_dir" ]] \
     || { printf 'existing release path is indirect: %s\n' "$release_dir" >&2; exit 1; }
