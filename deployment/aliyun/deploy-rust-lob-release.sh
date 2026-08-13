@@ -53,6 +53,12 @@ if [[ ! "$BUNDLE_OSS_PREFIX" =~ ^oss://[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._/@+
   exit 2
 fi
 
+BUNDLE_ONLY=${BUNDLE_ONLY:-0}
+if [[ "$BUNDLE_ONLY" != '0' && "$BUNDLE_ONLY" != '1' ]]; then
+  printf 'BUNDLE_ONLY must be 0 or 1\n' >&2
+  exit 2
+fi
+
 ARTIFACT_SHA256=$(printf '%s' "$ARTIFACT_SHA256" | tr '[:upper:]' '[:lower:]')
 SOURCE_REVISION=$(printf '%s' "$SOURCE_REVISION" | tr '[:upper:]' '[:lower:]')
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -119,12 +125,13 @@ aliyun ossutil cp \
   "${aliyun_profile_args[@]}"
 
 printf -v remote_variables \
-  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\n' \
+  'artifact_uri=%q\nartifact_sha256=%q\nsource_revision=%q\nbundle_uri=%q\nbundle_sha256=%q\nbundle_only=%q\n' \
   "$ARTIFACT_OSS_URI" \
   "$ARTIFACT_SHA256" \
   "$SOURCE_REVISION" \
   "$BUNDLE_OSS_URI" \
-  "$BUNDLE_SHA256"
+  "$BUNDLE_SHA256" \
+  "$BUNDLE_ONLY"
 
 read -r -d '' remote_body <<'REMOTE_SCRIPT' || true
 set -euo pipefail
@@ -160,10 +167,18 @@ fi
 
 work_dir=$(mktemp -d)
 release_staging=
+deploy_staging=
+meta_staging=
 cleanup() {
   rm -rf "$work_dir"
   if [[ -n $release_staging && ( -e $release_staging || -L $release_staging ) ]]; then
     rm -rf "$release_staging"
+  fi
+  if [[ -n $deploy_staging && ( -e $deploy_staging || -L $deploy_staging ) ]]; then
+    rm -rf "$deploy_staging"
+  fi
+  if [[ -n $meta_staging && ( -e $meta_staging || -L $meta_staging ) ]]; then
+    rm -f "$meta_staging"
   fi
 }
 trap cleanup EXIT
@@ -214,7 +229,36 @@ for path in \
   fi
 done
 
-if [[ -e $release_dir || -L $release_dir ]]; then
+if [[ $bundle_only == 1 ]]; then
+  [[ -d $release_dir && ! -L $release_dir && $(readlink -f "$release_dir") == "$release_dir" ]] \
+    || { printf 'bundle-only requires an existing direct release directory: %s\n' "$release_dir" >&2; exit 1; }
+  [[ -f $release_metadata && ! -L $release_metadata ]] \
+    || { printf 'bundle-only requires existing release metadata: %s\n' "$release_metadata" >&2; exit 1; }
+  jq -e \
+    --arg artifact_uri "$artifact_uri" \
+    --arg artifact_sha256 "$artifact_sha256" \
+    '.artifact_uri == $artifact_uri
+      and .artifact_sha256 == $artifact_sha256' \
+    "$release_metadata" >/dev/null \
+    || { printf 'bundle-only requires an unchanged artifact identity\n' >&2; exit 1; }
+  [[ -f $release_binary && ! -L $release_binary && -x $release_binary ]] \
+    || { printf 'existing release binary is not a regular executable\n' >&2; exit 1; }
+  printf '%s  %s\n' "$artifact_sha256" "$release_binary" | sha256sum --check --strict
+  prior_meta_sha=$(sha256sum "$release_metadata" | awk '{print $1}')
+  install -m 0644 "$release_metadata" "$release_dir/release.json.prev.${prior_meta_sha}"
+  deploy_staging=$(mktemp -d "$release_dir/.deployment.new.XXXXXX")
+  cp -a "$bundle_dir/." "$deploy_staging/"
+  meta_staging=$(mktemp "$release_dir/.release.json.new.XXXXXX")
+  printf '{"artifact_uri":"%s","artifact_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
+    "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
+    > "$meta_staging"
+  chmod 0644 "$meta_staging"
+  rm -rf "$release_deployment"
+  mv -T "$deploy_staging" "$release_deployment"
+  deploy_staging=
+  mv -T "$meta_staging" "$release_metadata"
+  meta_staging=
+elif [[ -e $release_dir || -L $release_dir ]]; then
   [[ -d $release_dir && ! -L $release_dir && $(readlink -f "$release_dir") == "$release_dir" ]] \
     || { printf 'existing release path is indirect: %s\n' "$release_dir" >&2; exit 1; }
   [[ -f $release_metadata && ! -L $release_metadata ]] \
