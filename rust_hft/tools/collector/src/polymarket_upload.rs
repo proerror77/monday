@@ -71,14 +71,14 @@ const MAX_QUOTE_SOURCE_REGRESSION_MS: i64 = 30_000;
 // loop at hours).
 const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 // Wall-clock budget for the entire retry loop, covering command time AND
-// backoff sleeps. Must exceed the worst observed object-visibility lag on
-// this endpoint: a 109MiB multipart upload took ~150s to become HEAD-able
-// (2026-08-01T18:23 CST), failing a 12x5s loop at ~90s.
-const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(600);
+// backoff sleeps. It covers the observed ~150s object-visibility lag while
+// staying below the five-minute upload timers.
+const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(240);
 // Per-artifact verify-download retry: a just-PUT object can 404 NoSuchKey for
 // minutes on this endpoint (2026-08-02 production uploads), so each artifact
-// gets a bounded retry budget aligned with the gate script's 30x20s curve.
-const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 30;
+// gets a bounded retry budget that samples the full observed lag window.
+const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 40;
+const OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS: u64 = 4;
 pub const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_UPLOADS: usize = 4;
 // Fail-closed low-disk guard: a disk-full spool fails every upload attempt
@@ -90,7 +90,8 @@ const MAX_CONCURRENT_UPLOADS: usize = 4;
 // download temp dir).
 pub const DEFAULT_LOW_DISK_FLOOR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(not(test))]
-const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(20);
+const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration =
+    Duration::from_secs(OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS);
 #[cfg(test)]
 const OSS_VERIFY_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
 
@@ -3535,6 +3536,16 @@ mod tests {
             OSS_READBACK_MAX_WALL_CLOCK - Duration::from_secs(1)
         );
         assert!(remaining_success_readback_budget(OSS_READBACK_MAX_WALL_CLOCK).is_err());
+    }
+
+    #[test]
+    fn remote_readback_retry_window_fits_between_visibility_lag_and_timer() {
+        let backoff = Duration::from_secs(
+            OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS * (OSS_VERIFY_DOWNLOAD_ATTEMPTS - 1) as u64,
+        );
+        assert!(backoff >= Duration::from_secs(150));
+        assert!(OSS_READBACK_MAX_WALL_CLOCK >= Duration::from_secs(150));
+        assert!(OSS_READBACK_MAX_WALL_CLOCK < Duration::from_secs(300));
     }
 
     fn command_args(command: &Command) -> Vec<String> {
