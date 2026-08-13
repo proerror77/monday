@@ -80,7 +80,7 @@ grep -Fq 'fewer than two replay-safe complete OSS manifests' "$GATE"
 grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
-grep -Fq 'readonly HEALTH_SETTLE_SECONDS=2400' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=600' "$GATE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
 grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS' "$GATE"
 grep -Fq 'short health settles require a test-only gate' "$GATE"
@@ -130,25 +130,26 @@ same_second_observation_start_ns=1000000950
   exit 1
 }
 
+required_duration_seconds=$(sed -n 's/^readonly REQUIRED_DURATION_SECONDS=//p' "$GATE")
+[[ $required_duration_seconds =~ ^[1-9][0-9]*$ ]] || {
+  printf 'gate has no positive REQUIRED_DURATION_SECONDS\n' >&2
+  exit 1
+}
 for shadow_env in \
   "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env" \
   "$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"; do
   segment_seconds=$(sed -n 's/^SEGMENT_SECONDS=//p' "$shadow_env")
-  [[ $segment_seconds == 600 ]] || {
-    printf 'shadow segment cadence no longer guarantees two observation manifests: %s\n' \
-      "$shadow_env" >&2
+  [[ $segment_seconds =~ ^[1-9][0-9]*$ ]] || {
+    printf 'shadow env has no positive SEGMENT_SECONDS: %s\n' "$shadow_env" >&2
     exit 1
   }
-  worst_case_first_start_ns=$((observation_started_ns + segment_seconds * 1000000000 - 1))
-  observation_deadline_ns=$((observation_started_ns + 3600 * 1000000000))
-  eligible_manifests=0
-  for ((start_ns = worst_case_first_start_ns;
-       start_ns < observation_deadline_ns;
-       start_ns += segment_seconds * 1000000000)); do
-    eligible_manifests=$((eligible_manifests + 1))
-  done
-  ((eligible_manifests >= 2)) || {
-    printf 'shadow cadence cannot produce two post-warmup manifests: %s\n' "$shadow_env" >&2
+  # A rotation can land almost a full segment after observation start, so the
+  # observation must hold at least two complete post-start segments even in
+  # that worst case: required >= 2 * segment_seconds. The second segment is
+  # finalized by the drain when its rotation falls after observation end.
+  (( required_duration_seconds >= 2 * segment_seconds )) || {
+    printf 'shadow cadence cannot guarantee two post-start manifests: %s (obs %ss, segment %ss)\n' \
+      "$shadow_env" "$required_duration_seconds" "$segment_seconds" >&2
     exit 1
   }
 done

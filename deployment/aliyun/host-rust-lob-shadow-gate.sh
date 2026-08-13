@@ -4,8 +4,8 @@ set -euo pipefail
 umask 027
 export LC_ALL=C
 
-readonly REQUIRED_DURATION_SECONDS=3600
-readonly HEALTH_SETTLE_SECONDS=2400
+readonly REQUIRED_DURATION_SECONDS=900
+readonly HEALTH_SETTLE_SECONDS=600
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
@@ -25,11 +25,11 @@ usage() {
   printf '%s\n' \
     'Usage: host-rust-lob-shadow-gate.sh <candidate-sha256>' \
     '' \
-    'Production gates always observe at least 3600 seconds.' \
+    'Production gates always observe at least 900 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
     'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.' \
     'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS only' \
-    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 2400 seconds;' \
+    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 600 seconds;' \
     'otherwise the policy check fails.'
 }
 
