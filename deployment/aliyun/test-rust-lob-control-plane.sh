@@ -47,6 +47,24 @@ grep -Fq 'raw_trade_segments' "$GATE"
 grep -Fq 'book_ticker_count' "$GATE"
 grep -Fq 'force_order_count' "$GATE"
 grep -Fq 'tape_schema' "$GATE"
+book_ticker_validator=$(sed -n \
+  '/^[[:space:]]*def valid_book_ticker:/,/;[[:space:]]*$/p' "$GATE")
+spot_book_ticker='{"received_at_ns":1,"frame":{"data":{"u":1,"s":"CATIUSDT","b":"0.1","B":"2","a":"0.2","A":"3"}}}'
+usdm_book_ticker='{"received_at_ns":1,"frame":{"data":{"e":"bookTicker","E":2,"T":1,"u":1,"s":"BTCUSDT","b":"0.1","B":"2","a":"0.2","A":"3"}}}'
+jq -en --arg market spot --argjson row "$spot_book_ticker" \
+  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null
+jq -en --arg market usdm --argjson row "$usdm_book_ticker" \
+  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null
+if jq -en --arg market usdm --argjson row "$spot_book_ticker" \
+  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null; then
+  printf 'shadow gate accepted spot bookTicker shape for USD-M\n' >&2
+  exit 1
+fi
+if jq -en --arg market spot --argjson row "$usdm_book_ticker" \
+  "$book_ticker_validator \$row | valid_book_ticker" >/dev/null; then
+  printf 'shadow gate accepted USD-M bookTicker shape for spot\n' >&2
+  exit 1
+fi
 grep -Fq 'full_stream_coverage_verified' "$GATE"
 grep -Fq 'or (.full_stream_coverage_verified == true))' "$RUNTIME_POLICY"
 grep -Fq '"full_stream_coverage_verified"' "$LOB_ARCHIVER"
