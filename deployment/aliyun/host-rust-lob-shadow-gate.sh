@@ -949,6 +949,7 @@ verify_oss_round_trips() {
     manifest_symbol_count=$(jq -er '.symbols | length' "$manifest")
     family_counts=$(zstd -q -d -c "$zst_path" | jq -ec -n \
       --arg schema "$tape_schema" \
+      --arg market "$market" \
       --argjson symbol_count "$manifest_symbol_count" \
       --argjson stream_type_count "$stream_type_count" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
@@ -989,7 +990,16 @@ verify_oss_round_trips() {
       def valid_book_ticker:
         (.received_at_ns | type) == "number"
         and .received_at_ns >= 0
-        and (.frame.data.e == "bookTicker")
+        and (if $market == "spot" then
+          ((.frame.data | has("e")) | not)
+          and ((.frame.data | has("E")) | not)
+          and ((.frame.data | has("T")) | not)
+        elif $market == "usdm" then
+          (.frame.data.e == "bookTicker")
+          and (.frame.data.E | type) == "number"
+          and ((.frame.data.T == null)
+            or ((.frame.data.T | type) == "number" and .frame.data.T <= .frame.data.E))
+        else false end)
         and (.frame.data.s | type) == "string"
         and (.frame.data.s | length) > 0
         and (.frame.data.u | type) == "number"
@@ -1002,10 +1012,7 @@ verify_oss_round_trips() {
         and (.frame.data.a | type) == "string"
         and (.frame.data.a | length) > 0
         and (.frame.data.A | type) == "string"
-        and (.frame.data.A | length) > 0
-        and (.frame.data.E | type) == "number"
-        and ((.frame.data.T == null)
-          or ((.frame.data.T | type) == "number" and .frame.data.T <= .frame.data.E));
+        and (.frame.data.A | length) > 0;
       def valid_force_order:
         (.received_at_ns | type) == "number"
         and .received_at_ns >= 0
