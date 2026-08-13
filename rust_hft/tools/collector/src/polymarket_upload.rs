@@ -237,7 +237,12 @@ fn cpu_usage() -> CpuUsage {
     CpuUsage {
         // Archive jobs run in blocking worker threads. Thread-local CPU avoids
         // charging another concurrently archived tape to this phase.
+        #[cfg(target_os = "linux")]
         self_micros: rusage_micros(libc::RUSAGE_THREAD),
+        // RUSAGE_THREAD is not exported by the libc crate on macOS/BSD;
+        // process-local usage is the portable fallback there.
+        #[cfg(not(target_os = "linux"))]
+        self_micros: rusage_micros(libc::RUSAGE_SELF),
         // Child usage is process-wide on Linux. active_archives is emitted so
         // consumers can distinguish the exact single-archive case from an
         // overlapping diagnostic sample.
