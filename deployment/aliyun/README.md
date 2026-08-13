@@ -798,7 +798,7 @@ installed binary SHA, archives the prior `release.json` as
 `deployment_bundle_*` fields and `deployment_source_revision` of `release.json`.
 The binary is never replaced in this mode.
 
-The committed shadow environments use `SYMBOLS=ALL`, ten-minute segments, the
+The committed shadow environments use `SYMBOLS=ALL`, five-minute segments, the
 isolated spools below, and isolated OSS datasets:
 
 | Market | Shadow spool | Shadow dataset |
@@ -844,7 +844,7 @@ trade for a static symbol. Every segment must still contain at least one real
 `agg_trade` for its market dataset, and a v2 segment must additionally carry
 `raw_trade` and `book_ticker` events for the same scope.
 
-### 2. Run the 20-minute full-catalog gate
+### 2. Run the 15-minute full-catalog gate
 
 Start the gate through the same CLI wrapper:
 
@@ -859,7 +859,7 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 The host gate owns the complete transition. It verifies the candidate and
 `SYMBOLS=ALL`, drains any previous isolated shadow data, restarts both units,
 waits for initial full-catalog health, freezes both session IDs and catalog
-digests, and then uses monotonic time to observe at least 1,200 seconds. It fails unless all of
+digests, and then uses monotonic time to observe at least 900 seconds. It fails unless all of
 these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
