@@ -162,7 +162,7 @@ tape files or `upload-status.json`. It emits one JSON snapshot (or a human
 to journald tag `monday-collector-health`. Run with `--json` for machine output
 and `--dry-run` to avoid reading or writing the persistent delta state.
 
-The monitor has exactly four hard gates. Each is a breach: it fails closed into
+The monitor has exactly six hard gates. Each is a breach: it fails closed into
 the `monitor-collector-host` workflow issue and blocks `ok:true`.
 
 | Hard gate | Breach condition |
@@ -171,6 +171,8 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 7200s, bybit 5400s; each just above the lane's upload cadence — the polymarket lanes rotate tapes hourly, so the 5-minute upload timer is not a heartbeat) |
 | 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
+| 5. `/data` mount | `mountpoint -q /data` fails |
+| 6. Disk runway | `df -Pk /data` cannot report free space, free space is below 10%, or consecutive samples taken at least 300s apart project less than 21,600s to exhaustion while free space is below 25% |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock
@@ -183,13 +185,12 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 
 | Warning | Condition |
 | --- | --- |
-| `/data` disk | free < 25% (warn) or < 10% (critical) via `df -Pk /data` |
+| `/data` disk | free < 25% remains an early warning until two samples prove less than six hours of runway (including the first sample or no measurable consumption) |
 | Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
 | Upload lane units | upload/watchdog/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
 | Delay-gate trips | > 0 journald `source-to-receive delay exceeds the governed limit` lines per Binance unit in the last 15 minutes |
 | Fee snapshot failures | > 0 `Failed with result` journald lines per fee snapshot unit in the last 10 minutes |
-| `/data` mount | `mountpoint -q /data` fails (the monitor must DETECT a missing mount, not gate on it) |
 
 The persistent-service check deliberately does not warn on `NRestarts > 0`:
 both Binance archivers restart every six hours by design

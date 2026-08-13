@@ -8,7 +8,7 @@
 # accumulated while the only on-host monitor (polymarket-market-tape-upload-
 # watchdog.sh) self-healed without ever alerting a human.
 #
-# Health contract: exactly FOUR hard gates, each a breach that fails closed
+# Health contract: exactly SIX hard gates, each a breach that fails closed
 # into the monitor-collector-host workflow issue, plus the raw-ops Gate
 # containment contract:
 #   1. upload-status.json exists and parses for the mandated lanes
@@ -30,6 +30,10 @@
 #      .uploaded.json readback marker.
 #   4. failure_count must not grow between polls and last_error must be empty,
 #      uniformly across all upload lanes.
+#   5. /data must be a mounted filesystem.
+#   6. /data must have measurable free space. Below the warning threshold,
+#      two samples that project less than six hours to exhaustion are a breach;
+#      free space below the critical threshold breaches immediately.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -38,7 +42,7 @@
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
 # Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
-# trips, fee snapshot journal failures, disk space, and the /data mount.
+# trips and fee snapshot journal failures.
 # Warnings are reported in the JSON warnings array (and as warning: lines in
 # text mode) but never block ok:true.
 #
@@ -70,6 +74,8 @@ STATE_FILE="$STATE_DIR/state.json"
 HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
 DISK_CRIT_PERCENT=10
+DISK_RUNWAY_CRIT_SECONDS=21600
+DISK_RUNWAY_MIN_SAMPLE_SECONDS=300
 RESTART_MAX_DELTA=1
 # journalctl --since value; must be a timestamp journalctl can parse
 # ("15min" is rejected with "Failed to parse timestamp" and would read as a
@@ -247,15 +253,17 @@ unit_nrestarts() {
 
 check_mount() {
   data_mounted=0
-  if command -v mountpoint >/dev/null 2>&1; then
-    if mountpoint -q /data 2>/dev/null; then
+  if [ ! -L /data ]; then
+    if command -v mountpoint >/dev/null 2>&1; then
+      if mountpoint -q /data 2>/dev/null; then
+        data_mounted=1
+      fi
+    elif grep -q '[[:space:]]/data[[:space:]]' /proc/mounts 2>/dev/null; then
       data_mounted=1
     fi
-  elif grep -q '[[:space:]]/data[[:space:]]' /proc/mounts 2>/dev/null; then
-    data_mounted=1
   fi
   if [ "$data_mounted" -eq 0 ]; then
-    record_warning "mount: /data is not mounted"
+    record_breach "mount: /data is not mounted"
   fi
   mount_json=$(jq -n --argjson m "$(bool_json "$data_mounted")" '{data_mounted: $m}')
 }
@@ -263,17 +271,28 @@ check_mount() {
 check_disk() {
   disk_total_kib=0
   disk_avail_kib=0
+  disk_sample_seconds=0
+  disk_consumed_kib=0
+  disk_runway_json=null
+  disk_measurement_valid=1
+  if [ "$data_mounted" -eq 0 ]; then
+    disk_json=$(jq -n '{free_percent: 0, free_gb: 0, total_kib: 0, available_kib: 0,
+      sample_seconds: 0, consumed_kib: 0, runway_seconds: null,
+      warning: false, critical: false}')
+    return
+  fi
   df_out=$(df -Pk /data 2>/dev/null || true)
   disk_total_kib=$(printf '%s\n' "$df_out" | awk 'NR==2 {print $2; exit}')
   disk_avail_kib=$(printf '%s\n' "$df_out" | awk 'NR==2 {print $4; exit}')
-  case "$disk_total_kib" in (*[!0-9]*|'') disk_total_kib=0;; esac
-  case "$disk_avail_kib" in (*[!0-9]*|'') disk_avail_kib=0;; esac
-  if [ "$disk_total_kib" -eq 0 ]; then
+  case "$disk_total_kib" in (*[!0-9]*|'') disk_total_kib=0; disk_measurement_valid=0;; esac
+  case "$disk_avail_kib" in (*[!0-9]*|'') disk_avail_kib=0; disk_measurement_valid=0;; esac
+  [ "$disk_total_kib" -gt 0 ] || disk_measurement_valid=0
+  if [ "$disk_measurement_valid" -eq 0 ]; then
     disk_free_percent=0
     disk_free_gb=0
     disk_critical=1
     disk_warning=1
-    record_warning "disk: cannot determine /data free space (df unavailable)"
+    record_breach "disk: cannot determine /data free space (df unavailable)"
   else
     disk_free_percent=$((disk_avail_kib * 100 / disk_total_kib))
     disk_free_gb=$((disk_avail_kib / 1048576))
@@ -281,15 +300,55 @@ check_disk() {
     disk_warning=0
     if [ "$disk_free_percent" -lt "$DISK_CRIT_PERCENT" ]; then
       disk_critical=1
-      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below critical ${DISK_CRIT_PERCENT}%"
+      record_breach "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below critical ${DISK_CRIT_PERCENT}%"
     elif [ "$disk_free_percent" -lt "$DISK_WARN_PERCENT" ]; then
       disk_warning=1
       record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below warning ${DISK_WARN_PERCENT}%"
     fi
+
+    state_disk_total=$disk_total_kib
+    state_disk_avail=$disk_avail_kib
+    state_disk_sample=$NOW_SEC
+    if [ "$DRY_RUN" -eq 0 ]; then
+      prior_total=$(read_prior disk_total_kib)
+      prior_avail=$(read_prior disk_avail_kib)
+      prior_sample=$(read_prior disk_sample_at)
+      case "$prior_total" in (*[!0-9]*|'') prior_total="" ;; esac
+      case "$prior_avail" in (*[!0-9]*|'') prior_avail="" ;; esac
+      case "$prior_sample" in (*[!0-9]*|'') prior_sample="" ;; esac
+      if [ -n "$prior_total" ] && [ -n "$prior_avail" ] && [ -n "$prior_sample" ] \
+        && [ "$prior_total" -eq "$disk_total_kib" ]; then
+        disk_sample_seconds=$((NOW_SEC - prior_sample))
+        if [ "$disk_sample_seconds" -ge 0 ] \
+          && [ "$disk_sample_seconds" -lt "$DISK_RUNWAY_MIN_SAMPLE_SECONDS" ]; then
+          state_disk_total=$prior_total
+          state_disk_avail=$prior_avail
+          state_disk_sample=$prior_sample
+          disk_sample_seconds=0
+        elif [ "$disk_sample_seconds" -ge "$DISK_RUNWAY_MIN_SAMPLE_SECONDS" ] \
+          && [ "$prior_avail" -gt "$disk_avail_kib" ]; then
+          disk_consumed_kib=$((prior_avail - disk_avail_kib))
+          disk_runway=$((disk_avail_kib * disk_sample_seconds / disk_consumed_kib))
+          disk_runway_json=$disk_runway
+          if [ "$disk_free_percent" -lt "$DISK_WARN_PERCENT" ] \
+            && [ "$disk_runway" -lt "$DISK_RUNWAY_CRIT_SECONDS" ]; then
+            record_breach "disk: /data exhaustion runway ${disk_runway}s below ${DISK_RUNWAY_CRIT_SECONDS}s"
+          fi
+        else
+          disk_sample_seconds=0
+        fi
+      fi
+    fi
+    state_lines="$state_lines disk_total_kib=$state_disk_total disk_avail_kib=$state_disk_avail disk_sample_at=$state_disk_sample"
   fi
   disk_json=$(jq -n --argjson p "$disk_free_percent" --argjson g "$disk_free_gb" \
-    --argjson w "$(bool_json "$disk_warning")" --argjson c "$(bool_json "$disk_critical")" \
-    '{free_percent: $p, free_gb: $g, warning: $w, critical: $c}')
+    --argjson total "$disk_total_kib" --argjson available "$disk_avail_kib" \
+    --argjson sample "$disk_sample_seconds" --argjson consumed "$disk_consumed_kib" \
+    --argjson runway "$disk_runway_json" --argjson w "$(bool_json "$disk_warning")" \
+    --argjson c "$(bool_json "$disk_critical")" \
+    '{free_percent: $p, free_gb: $g, total_kib: $total, available_kib: $available,
+      sample_seconds: $sample, consumed_kib: $consumed, runway_seconds: $runway,
+      warning: $w, critical: $c}')
 }
 
 check_service() {

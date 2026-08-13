@@ -4,15 +4,18 @@
 # /tmp fixture trees with stubbed systemctl/df/journalctl/mountpoint/logger.
 # The script is read-only toward units, so the stubs never mutate anything.
 #
-# Contract under test: exactly four hard gates (breaches) —
+# Contract under test: exactly six hard gates (breaches) —
 #   1. upload-status.json exists and parses (binance-lob spot/usdm, binance-fee)
 #   2. last_success_at present and fresh per upload lane
 #   3. pending upload backlog bounded (count + oldest pending age)
 #   4. failure_count not growing, last_error empty (all lanes)
+#   5. /data is a mounted filesystem
+#   6. /data has measurable free space and at least six hours of exhaustion
+#      runway once it is below the warning threshold
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Everything else (units, timers, restarts,
-# health.json, delay-gate journal, disk, mount, fee snapshot journal) is a
+# health.json, delay-gate journal, fee snapshot journal) is a
 # warning: reported, never blocking ok:true.
 #
 # Usage: ./test-monday-collector-health.sh
@@ -33,6 +36,7 @@ err_file="$test_root/err"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
+DF_AVAIL_WARN=39200000       # 20% free (<25% warning, >=10% critical)
 DF_AVAIL_CRIT=9800000        # 5% free (<10% crit)
 
 pass_count=0
@@ -365,6 +369,7 @@ expect "healthy: no warning lines" "$(grep_not_out '^warning:'; echo $?)"
 expect "healthy: state file written" "$(if [ -f "$state_dir/state.json" ]; then echo 0; else echo 1; fi)"
 expect "healthy: state records nrestarts" "$(grep -q '^nrestarts|binance-lob-archiver-production@spot.service=4$' "$state_dir/state.json"; echo $?)"
 expect "healthy: state records failure_count" "$(grep -q '^failure_count|polymarket-market-tape-upload=0$' "$state_dir/state.json"; echo $?)"
+expect "healthy: state records disk sample" "$(grep -q '^disk_sample_at=[0-9][0-9]*$' "$state_dir/state.json"; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 2. Gate 1: missing upload-status.json on a mandated lane is a breach
@@ -669,7 +674,7 @@ expect "gate4 initial count: exit 1" "$(rc_is 1; echo $?)"
 expect "gate4 initial count: breach message" "$(grep_out 'polymarket-market-tape-upload: initial upload failure_count=2'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 12. Demoted: disk critical is a warning, not a breach
+# 12. Gate 6: disk critical is a breach
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -677,9 +682,59 @@ healthy_scenario
 healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
 run_health
-expect "disk critical: exit 0" "$(rc_is 0; echo $?)"
-expect "disk critical: ok:true" "$(grep_out '^ok:true$'; echo $?)"
-expect "disk critical: warning message" "$(grep_out '^warning: disk: /data free .* below critical 10%'; echo $?)"
+expect "disk critical: exit 1" "$(rc_is 1; echo $?)"
+expect "disk critical: breach message" "$(grep_out '^breach: disk: /data free .* below critical 10%'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_DF_TOTAL_KIB=0
+run_health
+expect "disk unavailable: exit 1" "$(rc_is 1; echo $?)"
+expect "disk unavailable: breach message" "$(grep_out '^breach: disk: cannot determine /data free space'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_DF_AVAIL_KIB=invalid
+run_health
+expect "disk invalid available: exit 1" "$(rc_is 1; echo $?)"
+expect "disk invalid available: unavailable breach" "$(grep_out '^breach: disk: cannot determine /data free space'; echo $?)"
+expect "disk invalid available: no critical-space breach" "$(grep_not_out '^breach: disk: /data free .* below critical'; echo $?)"
+expect "disk invalid available: no baseline persisted" "$(if grep -q '^disk_' "$state_dir/state.json"; then echo 1; else echo 0; fi)"
+
+# A low-but-stable disk is only a warning. A subsequent sample that proves less
+# than six hours of runway is a breach.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_DF_AVAIL_KIB=40000000
+run_health
+expect "disk runway: baseline warning only" "$(rc_is 0; echo $?)"
+baseline_sample=$(sed -n 's/^disk_sample_at=//p' "$state_dir/state.json")
+STUB_DF_AVAIL_KIB=35000000
+run_health
+expect "disk runway: short sample stays warning only" "$(rc_is 0; echo $?)"
+expect "disk runway: short sample preserves available baseline" "$(grep -q '^disk_avail_kib=40000000$' "$state_dir/state.json"; echo $?)"
+expect "disk runway: short sample preserves time baseline" "$(grep -q "^disk_sample_at=$baseline_sample$" "$state_dir/state.json"; echo $?)"
+prior_sample=$(( $(date +%s) - 900 ))
+sed "s/^disk_sample_at=.*/disk_sample_at=$prior_sample/" "$state_dir/state.json" \
+  > "$state_dir/state.json.$$"
+mv "$state_dir/state.json.$$" "$state_dir/state.json"
+STUB_DF_AVAIL_KIB=40000000
+run_health
+expect "disk runway: stable low disk stays warning only" "$(rc_is 0; echo $?)"
+prior_sample=$(( $(date +%s) - 900 ))
+sed "s/^disk_sample_at=.*/disk_sample_at=$prior_sample/" "$state_dir/state.json" \
+  > "$state_dir/state.json.$$"
+mv "$state_dir/state.json.$$" "$state_dir/state.json"
+STUB_DF_AVAIL_KIB=30000000
+run_health
+expect "disk runway: exit 1" "$(rc_is 1; echo $?)"
+expect "disk runway: breach message" "$(grep_out '^breach: disk: /data exhaustion runway .* below 21600s'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 13. Demoted: unit inactive / timer disabled / result failure are warnings
@@ -797,7 +852,7 @@ expect "fee snapshot failure: exit 0" "$(rc_is 0; echo $?)"
 expect "fee snapshot failure: warning message" "$(grep_out '^warning: .*recent snapshot failure'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 17. Demoted: /data unmounted is a warning
+# 17. Gate 5: /data unmounted is a breach
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -805,8 +860,10 @@ healthy_scenario
 healthy_fixtures
 STUB_MOUNTED=0
 run_health
-expect "mount: exit 0" "$(rc_is 0; echo $?)"
-expect "mount: warning message" "$(grep_out '^warning: mount: /data is not mounted'; echo $?)"
+expect "mount: exit 1" "$(rc_is 1; echo $?)"
+expect "mount: breach message" "$(grep_out '^breach: mount: /data is not mounted'; echo $?)"
+expect "mount: does not persist root disk baseline" "$(if grep -q '^disk_' "$state_dir/state.json"; then echo 1; else echo 0; fi)"
+expect "mount: symlink path fails closed" "$(grep -q 'if \[ ! -L /data \]; then' "$health_script"; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 18. State persistence failure stays a breach (gate 4 delta evidence)
@@ -950,6 +1007,7 @@ expect "json healthy: parses and shape valid" "$(json_query '
   and (.warnings | type) == "array"
   and (.warnings | length) == 0
   and (.checks.disk.free_percent | type) == "number"
+  and .checks.disk.runway_seconds == null
   and .checks.mount.data_mounted == true
   and .checks.units["binance-lob-archiver-production@spot.service"].active == true
   and .checks.units["bybit-options-archiver.service"].active == true
@@ -977,7 +1035,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
+STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
 STUB_JOURNAL_TRIPS=1
 run_health --json
 expect "json warnings: exit 0" "$(rc_is 0; echo $?)"
@@ -985,7 +1043,7 @@ expect "json warnings: ok:true with warnings" "$(json_query '
   .ok == true
   and (.breaches | length) == 0
   and (.warnings | length) >= 2
-  and (.warnings | any(contains("below critical")))
+  and (.warnings | any(contains("below warning")))
   and (.warnings | any(contains("delay-gate trip")))
 '; echo $?)"
 
