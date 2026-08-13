@@ -217,10 +217,12 @@ struct CpuUsage {
     child_micros: i128,
 }
 
+#[cfg(unix)]
 fn timeval_micros(value: libc::timeval) -> i128 {
     i128::from(value.tv_sec) * 1_000_000 + i128::from(value.tv_usec)
 }
 
+#[cfg(unix)]
 fn rusage_micros(who: libc::c_int) -> i128 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage initializes the supplied rusage on success.
@@ -234,15 +236,32 @@ fn rusage_micros(who: libc::c_int) -> i128 {
 }
 
 fn cpu_usage() -> CpuUsage {
-    CpuUsage {
-        // Archive jobs run in blocking worker threads. Thread-local CPU avoids
-        // charging another concurrently archived tape to this phase.
-        self_micros: rusage_micros(libc::RUSAGE_THREAD),
-        // Child usage is process-wide on Linux. active_archives is emitted so
-        // consumers can distinguish the exact single-archive case from an
-        // overlapping diagnostic sample.
-        child_micros: rusage_micros(libc::RUSAGE_CHILDREN),
-    }
+    #[cfg(unix)]
+    let cpu = {
+        CpuUsage {
+            // Archive jobs run in blocking worker threads. Thread-local CPU
+            // avoids charging another concurrently archived tape to this phase.
+            #[cfg(target_os = "linux")]
+            self_micros: rusage_micros(libc::RUSAGE_THREAD),
+            // RUSAGE_THREAD is not exported by the libc crate on macOS/BSD;
+            // process-local usage is the portable fallback there.
+            #[cfg(not(target_os = "linux"))]
+            self_micros: rusage_micros(libc::RUSAGE_SELF),
+            // Child usage is process-wide on Linux. active_archives is emitted
+            // so consumers can distinguish the exact single-archive case from
+            // an overlapping diagnostic sample.
+            child_micros: rusage_micros(libc::RUSAGE_CHILDREN),
+        }
+    };
+    // libc does not expose getrusage/rusage on non-Unix targets; emit zero CPU
+    // attribution there (the crate has no such target today, this is a
+    // compile-time guard only).
+    #[cfg(not(unix))]
+    let cpu = CpuUsage {
+        self_micros: 0,
+        child_micros: 0,
+    };
+    cpu
 }
 
 struct PhaseAttribution {

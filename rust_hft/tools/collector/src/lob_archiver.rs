@@ -143,8 +143,15 @@ impl PendingBudget {
 pub struct OrderBookState {
     pub symbol: String,
     pub market: Market,
-    bids: HashMap<String, String>,
-    asks: HashMap<String, String>,
+    /// Retained bid/ask levels as (price, quantity), kept sorted ascending by
+    /// price with unique prices. The compact Decimal pairs (16 bytes each) and
+    /// single contiguous Vec allocation replace a HashMap<String, String> that
+    /// spent 100+ bytes and a separate heap allocation per level; full-depth
+    /// USD-M books (thousands of levels per side) drove the old representation
+    /// to ~4.7 GiB and throttled the archiver under memory.high. All levels are
+    /// retained; only the in-memory encoding is denser.
+    bids: Vec<(Decimal, Decimal)>,
+    asks: Vec<(Decimal, Decimal)>,
     sync: BookSync,
     snapshot_installed: bool,
     pub synced: bool,
@@ -160,8 +167,8 @@ impl OrderBookState {
         Self {
             symbol: symbol.into().to_ascii_uppercase(),
             market,
-            bids: HashMap::new(),
-            asks: HashMap::new(),
+            bids: Vec::new(),
+            asks: Vec::new(),
             sync,
             snapshot_installed: false,
             synced: false,
@@ -330,42 +337,71 @@ impl OrderBookState {
     }
 }
 
-fn parse_snapshot_side(value: Option<&Value>) -> anyhow::Result<HashMap<String, String>> {
+fn parse_snapshot_side(value: Option<&Value>) -> anyhow::Result<Vec<(Decimal, Decimal)>> {
     let levels: Vec<[String; 2]> =
         serde_json::from_value(value.cloned().context("snapshot side is missing")?)?;
     validate_levels(&levels)?;
-    Ok(levels.into_iter().map(|[p, q]| (p, q)).collect())
+    let mut side: Vec<(Decimal, Decimal)> = levels
+        .into_iter()
+        .filter_map(|[price, quantity]| {
+            let price = Decimal::from_str(&price).ok()?;
+            let quantity = Decimal::from_str(&quantity).ok()?;
+            if quantity.is_zero() {
+                return None;
+            }
+            Some((price, quantity))
+        })
+        .collect();
+    side.sort_by_key(|(price, _)| *price);
+    Ok(side)
 }
 
-fn update_side(side: &mut HashMap<String, String>, levels: &[[String; 2]]) {
+fn update_side(side: &mut Vec<(Decimal, Decimal)>, levels: &[[String; 2]]) {
     for [price, quantity] in levels {
-        if quantity
-            .parse::<Decimal>()
-            .is_ok_and(|value| value.is_zero())
-        {
-            side.remove(price);
+        let Ok(price) = Decimal::from_str(price) else {
+            continue;
+        };
+        let Ok(quantity) = Decimal::from_str(quantity) else {
+            continue;
+        };
+        if quantity.is_zero() {
+            book_remove(side, price);
         } else {
-            side.insert(price.clone(), quantity.clone());
+            book_upsert(side, price, quantity);
         }
     }
 }
 
+/// Insert or replace the level at `price`, keeping the side sorted ascending
+/// by price with unique prices.
+fn book_upsert(side: &mut Vec<(Decimal, Decimal)>, price: Decimal, quantity: Decimal) {
+    match side.binary_search_by(|(p, _)| p.cmp(&price)) {
+        Ok(index) => side[index].1 = quantity,
+        Err(index) => side.insert(index, (price, quantity)),
+    }
+}
+
+fn book_remove(side: &mut Vec<(Decimal, Decimal)>, price: Decimal) {
+    if let Ok(index) = side.binary_search_by(|(p, _)| p.cmp(&price)) {
+        side.remove(index);
+    }
+}
+
+/// The side is always stored sorted ascending by price; bids are emitted
+/// highest-first (`descending == true`), asks lowest-first (`descending ==
+/// false`). Decimal round-trips Binance's fixed-decimal strings losslessly.
 fn sorted_levels(
-    side: &HashMap<String, String>,
+    side: &[(Decimal, Decimal)],
     descending: bool,
 ) -> anyhow::Result<Vec<[String; 2]>> {
-    let mut levels = side
+    let mut levels: Vec<[String; 2]> = side
         .iter()
-        .map(|(price, quantity)| Ok((Decimal::from_str(price)?, [price.clone(), quantity.clone()])))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    levels.sort_by(|left, right| {
-        if descending {
-            right.0.cmp(&left.0)
-        } else {
-            left.0.cmp(&right.0)
-        }
-    });
-    Ok(levels.into_iter().map(|(_, level)| level).collect())
+        .map(|(price, quantity)| [price.to_string(), quantity.to_string()])
+        .collect();
+    if descending {
+        levels.reverse();
+    }
+    Ok(levels)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1316,6 +1352,91 @@ mod tests {
     }
 
     #[test]
+    fn compact_book_retains_full_depth_and_roundtrips_decimal_strings() {
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        let mut budget = PendingBudget::new(10);
+        // A deep, out-of-order snapshot: all levels are retained and the
+        // checkpoint round-trips Binance's fixed-decimal strings losslessly.
+        let snapshot = json!({
+            "lastUpdateId": 100,
+            "bids": [
+                ["98.00000000", "3.00000000"],
+                ["100.00000000", "1.00000000"],
+                ["99.00000000", "2.00000000"],
+                ["97.50000000", "4.50000000"],
+            ],
+            "asks": [
+                ["103.00000000", "3.00000000"],
+                ["101.00000000", "1.00000000"],
+                ["102.00000000", "2.00000000"],
+            ],
+        });
+        state.install_snapshot(&snapshot, &mut budget).unwrap();
+        assert_eq!(state.bid_levels(), 4);
+        assert_eq!(state.ask_levels(), 3);
+
+        let checkpoint = state.checkpoint("session-1").unwrap();
+        // Bids are emitted highest-first, asks lowest-first, with exact
+        // decimal formatting preserved.
+        assert_eq!(
+            checkpoint.bids,
+            vec![
+                ["100.00000000".to_string(), "1.00000000".to_string()],
+                ["99.00000000".to_string(), "2.00000000".to_string()],
+                ["98.00000000".to_string(), "3.00000000".to_string()],
+                ["97.50000000".to_string(), "4.50000000".to_string()],
+            ]
+        );
+        assert_eq!(
+            checkpoint.asks,
+            vec![
+                ["101.00000000".to_string(), "1.00000000".to_string()],
+                ["102.00000000".to_string(), "2.00000000".to_string()],
+                ["103.00000000".to_string(), "3.00000000".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_book_applies_diffs_with_zero_quantity_removal() {
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        let mut budget = PendingBudget::new(10);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [
+                        ["100.00000000", "1.00000000"],
+                        ["99.00000000", "2.00000000"],
+                        ["98.00000000", "3.00000000"],
+                    ],
+                    "asks": [["101.00000000", "1.00000000"]],
+                }),
+                &mut budget,
+            )
+            .unwrap();
+
+        // A diff inserts a new mid-price level and removes the best bid.
+        let mut update = diff("BTCUSDT", 101, 102, None);
+        update.bids = vec![
+            ["99.50000000".to_string(), "5.00000000".to_string()],
+            ["100.00000000".to_string(), "0.00000000".to_string()],
+        ];
+        state.apply_diff(update, &mut budget).unwrap();
+
+        let checkpoint = state.checkpoint("session-1").unwrap();
+        assert_eq!(
+            checkpoint.bids,
+            vec![
+                ["99.50000000".to_string(), "5.00000000".to_string()],
+                ["99.00000000".to_string(), "2.00000000".to_string()],
+                ["98.00000000".to_string(), "3.00000000".to_string()],
+            ]
+        );
+        assert_eq!(state.bid_levels(), 3);
+    }
+
+    #[test]
     fn spot_bridges_snapshot_and_rejects_gap() {
         let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
         let mut budget = PendingBudget::new(10);
@@ -1418,8 +1539,8 @@ mod tests {
         let mut budget = PendingBudget::new(10);
         state.install_snapshot(&snapshot(100), &mut budget).unwrap();
         let mut update = diff("BTCUSDT", 101, 101, None);
-        update.bids = vec![["100.00000000".into(), "0.00000000".into()]];
-        update.asks = vec![["102.12345678".into(), "1.00000001".into()]];
+        update.bids = vec![["100.00000000".to_string(), "0.00000000".to_string()]];
+        update.asks = vec![["102.12345678".to_string(), "1.00000001".to_string()]];
         state.apply_diff(update, &mut budget).unwrap();
         let checkpoint = state.checkpoint("session-1").unwrap();
         assert!(checkpoint.bids.is_empty());
