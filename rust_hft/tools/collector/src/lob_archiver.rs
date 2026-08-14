@@ -817,11 +817,18 @@ pub fn write_success_marker(data: &Path, digest: &str) -> anyhow::Result<PathBuf
 pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifacts>> {
     let mut artifacts = Vec::new();
     for path in files_with_suffix(&config.spool_dir, ".jsonl.part")? {
-        let bytes = fs::read(&path)?;
-        if bytes.is_empty() {
+        let file = File::open(&path)?;
+        let file_len = usize::try_from(file.metadata()?.len())?;
+        if file_len == 0 {
+            drop(file);
             fs::remove_file(path)?;
             continue;
         }
+        // Stream rows instead of reading the whole part into memory: an
+        // interrupted hourly part can exceed host RAM, and an infallible
+        // `fs::read` allocation failure bricks every restart attempt.
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
         let mut counts = BTreeMap::new();
         let mut aggregate_trade_sequence = AggregateTradeSequenceValidator::default();
         let mut trade_summaries = AggregateTradeSummaryBuilder::default();
@@ -832,9 +839,16 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let mut detected_schema: Option<(bool, String)> = None;
         let mut quarantine = false;
         let mut raw_trade_incomplete_symbols = BTreeSet::new();
-        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("failed to read spool part {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
             let complete = line.last() == Some(&b'\n');
-            let parsed = serde_json::from_slice::<Value>(line);
+            let parsed = serde_json::from_slice::<Value>(&line);
             let valid = parsed.as_ref().is_ok_and(|value| {
                 value.is_object()
                     && value
@@ -843,7 +857,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                         .is_some()
             });
             if !complete || !valid {
-                invalid_at = Some((offset, offset + line.len() < bytes.len()));
+                invalid_at = Some((offset, offset + line.len() < file_len));
                 break;
             }
             let event = parsed.expect("validated JSON");
