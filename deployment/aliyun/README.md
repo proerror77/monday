@@ -358,7 +358,7 @@ advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
 health sample, while `deferred_trade_markets` makes bounded historical backfill
 explicit rather than silently claiming full-cycle trade coverage. Every Data API
 request, including a second pagination request for the same market, passes through a
-shared start-time pacer with at least 100ms between request starts. Up to four requests
+shared start-time pacer with at least 125ms between request starts. Up to four requests
 may remain in flight, and each processing chunk retains at most four market responses,
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
 absolute 180-second cycle deadline cancels stalled network work and fails closed.

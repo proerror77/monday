@@ -10,6 +10,7 @@ use hft_collector::polymarket_parity::{
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
+    DEFAULT_TRADE_REQUEST_SPACING_MS,
 };
 use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
@@ -73,7 +74,7 @@ enum Command {
         trade_finalization_lag_secs: i64,
         #[arg(long, default_value_t = 3)]
         trade_finalization_stable_polls: u64,
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = DEFAULT_TRADE_REQUEST_SPACING_MS)]
         per_market_delay_ms: u64,
         #[arg(long, default_value_t = DEFAULT_TAPE_MAX_BYTES)]
         tape_max_bytes: u64,
@@ -430,6 +431,7 @@ mod tests {
             max_markets,
             max_trade_polls_per_cycle,
             max_concurrent_trade_polls,
+            per_market_delay_ms,
             tape_max_bytes,
             ..
         } = command
@@ -444,6 +446,10 @@ mod tests {
         assert_eq!(
             max_concurrent_trade_polls,
             ReferenceConfig::default().max_concurrent_trade_polls
+        );
+        assert_eq!(
+            Duration::from_millis(per_market_delay_ms),
+            ReferenceConfig::default().per_market_delay
         );
         assert_eq!(tape_max_bytes, ReferenceConfig::default().tape_max_bytes);
     }
