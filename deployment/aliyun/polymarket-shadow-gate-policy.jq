@@ -347,6 +347,70 @@ and (.comparison_mode == "legacy_overlap" or (
   and (.baseline_runtime_stability_required == true
     or recovery_matches_gate)
 ))
+and (.trade_parity_reason | type == "string" and length > 0)
+and (.shadow_emission == "continuous"
+  or .shadow_emission == "finalization_deferred")
+and (.baseline_emission == "continuous"
+  or .baseline_emission == "finalization_deferred"
+  or .baseline_emission == "inactive")
+and (
+  (
+    .trade_parity_mode == "rust_self"
+    and .comparison_mode == "rust_self"
+    and .parity_verifier == null
+    and .finalization_progress == null
+    and (.checks | has("finalization_progress") | not)
+  )
+  or
+  (
+    .trade_parity_mode == "continuous_overlap"
+    and .comparison_mode == "legacy_overlap"
+    and (.shadow_emission == "continuous"
+      or .baseline_emission != "continuous")
+    and .parity_verifier == null
+    and .finalization_progress == null
+    and (.checks | has("finalization_progress") | not)
+  )
+  or
+  (
+    # Issue #868: a finalization-deferred shadow against a continuous-emission
+    # baseline cannot emit a mature trade inside the gate window. The adjudicated
+    # trade trio is accepted only when the raw verifier verdict shows the failure
+    # is confined to that family and the finalization pipeline engaged: the
+    # fresh-spool shadow tracked markets and observed at least one settled
+    # market in its bounded state during the observation.
+    .trade_parity_mode == "finalization_deferred_overlap"
+    and .comparison_mode == "legacy_overlap"
+    and .shadow_emission == "finalization_deferred"
+    and .baseline_emission == "continuous"
+    and .checks.finalization_progress == true
+    and (.finalization_progress.tracked_markets_start | nonnegative_integer)
+    and (.finalization_progress.settled_markets_start | nonnegative_integer)
+    and (.finalization_progress.stable_polls_start | nonnegative_integer)
+    and (.finalization_progress.tracked_markets_end | positive_integer)
+    and (.finalization_progress.settled_markets_end | nonnegative_integer)
+    and (.finalization_progress.stable_polls_end | nonnegative_integer)
+    and (.finalization_progress.settled_markets_max | positive_integer)
+    and (.finalization_progress.stable_polls_max | nonnegative_integer)
+    and (.finalization_progress.settled_markets_max
+      >= .finalization_progress.settled_markets_start)
+    and (.finalization_progress.settled_markets_max
+      >= .finalization_progress.settled_markets_end)
+    and (.finalization_progress.stable_polls_max
+      >= .finalization_progress.stable_polls_start)
+    and (.finalization_progress.stable_polls_max
+      >= .finalization_progress.stable_polls_end)
+    and (.parity_verifier.passed == ([.parity_verifier.checks[]] | all))
+    and .parity_verifier.checks.metadata_parity == true
+    and .parity_verifier.checks.settlement_parity == true
+    and .parity_verifier.checks.rotation_parity == true
+    and .parity_verifier.checks.asset_parity == true
+    and .parity_verifier.checks.dedupe_parity == true
+    and ([.parity_verifier.checks | to_entries[] | select(.value == false) | .key]
+      | all(. == "byte_parity" or . == "field_parity"
+        or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+  )
+)
 and (.metrics.oss_uploaded_segments | positive_integer)
 and (.metrics.oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.market_oss_uploaded_segments | positive_integer)
@@ -356,9 +420,15 @@ and (.metrics.market_oss_uploaded_segments
 and (.metrics.market_oss_canonical_uploaded_segments
   == .real_market_preflight.upload_summary.canonical_uploaded_segments)
 and (.metrics.rust_closed_tape_count | positive_integer)
-and (.metrics.rust_trade_count | positive_integer)
-and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
-and (.metrics.rust_only_trade_ids | type == "array")
+and (if .trade_parity_mode == "finalization_deferred_overlap" then
+  (.metrics.rust_trade_count | nonnegative_integer)
+  and (.metrics.legacy_only_trade_ids | type == "array")
+  and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
+else
+  (.metrics.rust_trade_count | positive_integer)
+  and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
+  and (.metrics.rust_only_trade_ids | type == "array")
+end)
 and (.metrics.rust_metadata_count | positive_integer)
 and (.metrics.legacy_only_metadata_ids | type == "array" and length == 0)
 and (.metrics.rust_only_metadata_ids | type == "array")

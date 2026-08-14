@@ -424,6 +424,19 @@ of reusing the settlement-oriented market-end projection, and those two context
 snapshots must have the same governed values even when the market is outside the
 normal metadata event projection. Evidence includes both trade-ID set differences
 and context-value mismatch market IDs.
+When the shadow defers trade emission until settlement plus the 1800-second
+finalization lag plus stable polls (post-#680 semantics) while the baseline
+emits trades continuously, no mature shadow trade can exist inside the gate
+window, so the trade coverage, field, and byte trio is unsatisfiable by
+construction. The gate then adjudicates that trio instead of requiring it from
+the verifier: settlement, metadata, rotation, asset, and dedupe parity must
+still pass, the shadow must not emit any trade the baseline lacks, the shadow
+finalization pipeline must engage during the observation (at least one settled
+market tracked in the bounded fresh-spool state, with tracked/settled/stable
+poll counters recorded), and the canonical upload still runs. The
+verdict records the applied trade parity mode, both detected emission modes,
+the raw verifier checks, and the reason (issue #868). When both sides share
+the same emission semantics, full trade parity applies unchanged.
 Settlement parity uses each market's end time with a 15-minute lookback and a
 10-minute maturity lag, because independent 30-second polling schedules can record
 the same closed market on opposite sides of a wall-clock boundary. Every mature
