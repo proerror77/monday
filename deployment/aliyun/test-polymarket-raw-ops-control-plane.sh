@@ -3571,6 +3571,12 @@ jq \
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    trade_parity_mode:"continuous_overlap",
+    trade_parity_reason:"shadow and baseline trade emission semantics match; full trade coverage, field, and byte parity applies",
+    shadow_emission:"continuous",
+    baseline_emission:"continuous",
+    parity_verifier:null,
+    finalization_progress:null,
     baseline_health_start_required:true,
     baseline_runtime_stability_required:true,
     baseline_health_completion_required:true,
@@ -3756,6 +3762,7 @@ if jq -e -f "$POLICY" \
   exit 1
 fi
 jq '.comparison_mode = "rust_self"
+  | .trade_parity_mode = "rust_self"
   | .metrics.legacy_trade_count = 0
   | .metrics.legacy_metadata_count = 0
   | .metrics.legacy_settlement_count = 0' \
@@ -3783,6 +3790,114 @@ jq -e -f "$POLICY" "$tmp_dir/health-optional-rust-self-gate.json" >/dev/null || 
   printf 'gate policy rejected a Rust-self gate with legacy health admission disabled\n' >&2
   exit 1
 }
+# Issue #868: a finalization-deferred shadow against a continuous-emission
+# baseline cannot emit a mature trade inside the gate window, so the trade
+# coverage/field/byte trio is adjudicated rather than required from the
+# verifier; every other parity family and the finalization progression
+# evidence remain fail-closed.
+jq '.trade_parity_mode = "finalization_deferred_overlap"
+  | .trade_parity_reason = "shadow defers trade emission until settlement plus the 1800-second finalization lag plus stable polls (post-#680) while the baseline emits trades continuously (pre-#680); trade coverage within a 3600-second gate is unsatisfiable by construction, so settlement, metadata, rotation, asset, and dedupe parity plus finalization progression and the canonical upload replace it"
+  | .shadow_emission = "finalization_deferred"
+  | .baseline_emission = "continuous"
+  | .checks += {finalization_progress:true}
+  | .parity_verifier = {passed:false, checks:{
+      byte_parity:false,metadata_parity:true,field_parity:false,
+      dedupe_parity:true,trade_coverage_parity:false,
+      trade_contract_parity:false,settlement_parity:true,
+      rotation_parity:true,asset_parity:true}}
+  | .finalization_progress = {
+      tracked_markets_start:160,settled_markets_start:0,stable_polls_start:0,
+      tracked_markets_end:161,settled_markets_end:112,stable_polls_end:5,
+      settled_markets_max:112,stable_polls_max:5}
+  | .metrics.rust_trade_count = 0
+  | .metrics.legacy_only_trade_ids = ["legacy-trade-1"]
+  | .metrics.rust_only_trade_ids = []' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/finalization-overlap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/finalization-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected finalization-deferred overlap evidence\n' >&2
+  exit 1
+}
+# Advancement through either channel alone is sufficient: a growing settled
+# maximum with flat stable polls, or a growing stable-poll maximum (zero until
+# the 1800-second lag elapses) with a flat settled maximum.
+jq '.finalization_progress.stable_polls_end = 0
+  | .finalization_progress.stable_polls_max = 0' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/settled-advanced-overlap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/settled-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected settled-only finalization advancement\n' >&2
+  exit 1
+}
+jq '.finalization_progress.settled_markets_start = 112
+  | .finalization_progress.settled_markets_end = 112' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/stable-polls-advanced-overlap-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/stable-polls-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected stable-poll-only finalization advancement\n' >&2
+  exit 1
+}
+for mutation in \
+  '.parity_verifier.checks.settlement_parity = false' \
+  '.parity_verifier.checks.metadata_parity = false' \
+  '.parity_verifier.passed = true' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.settled_markets_start = 112' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.stable_polls_end = 5
+    | .finalization_progress.stable_polls_max = 5
+    | .finalization_progress.settled_markets_start = 112
+    | .finalization_progress.settled_markets_end = 112' \
+  '.finalization_progress.settled_markets_max = 0' \
+  '.finalization_progress.settled_markets_max
+    = (.finalization_progress.settled_markets_end - 1)' \
+  '.finalization_progress.tracked_markets_end = 0' \
+  '.metrics.rust_only_trade_ids = ["rust-only-trade"]' \
+  '.metrics.rust_trade_count = -1' \
+  'del(.checks.finalization_progress)' \
+  '.trade_parity_mode = "continuous_overlap"' \
+  '.shadow_emission = "continuous"' \
+  '.baseline_emission = "finalization_deferred"' \
+  '.trade_parity_reason = ""'; do
+  jq "$mutation" "$tmp_dir/finalization-overlap-gate.json" \
+    >"$tmp_dir/forged-finalization-overlap-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-finalization-overlap-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged finalization-deferred overlap evidence\n' >&2
+    exit 1
+  fi
+done
+# A finalization-deferred shadow against a finalization-deferred baseline keeps
+# the full trade parity requirement; no adjudication applies.
+jq '.shadow_emission = "finalization_deferred"
+  | .baseline_emission = "finalization_deferred"' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/same-semantics-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/same-semantics-gate.json" >/dev/null || {
+  printf 'gate policy rejected same-semantics overlap evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  '.metrics.rust_trade_count = 0' \
+  '.metrics.legacy_only_trade_ids = ["legacy-trade-1"]' \
+  '.parity_verifier = {passed:false, checks:{trade_coverage_parity:false}}' \
+  '.checks += {finalization_progress:true}' \
+  '.checks.trade_coverage_parity = false'; do
+  jq "$mutation" "$tmp_dir/same-semantics-gate.json" \
+    >"$tmp_dir/forged-same-semantics-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-same-semantics-gate.json" >/dev/null; then
+    printf 'gate policy relaxed trade parity for same-semantics overlap\n' >&2
+    exit 1
+  fi
+done
+jq '.metrics.rust_trade_count = 0' "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/empty-shadow-trades-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/empty-shadow-trades-gate.json" >/dev/null; then
+  printf 'gate policy accepted an empty shadow trade set in continuous overlap\n' >&2
+  exit 1
+fi
 for mutation in \
   'del(.baseline_health_start_required)' \
   '.baseline_runtime_stability_required = false' \
@@ -4341,6 +4456,7 @@ candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
 EOF
 jq '.baseline_mode = "rust_bootstrap"
   | .comparison_mode = "rust_self"
+  | .trade_parity_mode = "rust_self"
   | .baseline_degraded = true
   | .metrics.legacy_trade_count = 0
   | .metrics.legacy_metadata_count = 0
@@ -5121,6 +5237,16 @@ if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]
 fi
 grep -Fq 'verify-shadow-parity' "$GATE"
 grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
+grep -Fq 'finalization_deferred_overlap' "$GATE"
+grep -Fq 'trade_parity_mode' "$GATE"
+grep -Fq 'collector_emission_mode' "$GATE"
+grep -Fq -- '--max-retained-trade-ids' "$GATE"
+grep -Fq 'shadow_finalization_counters' "$GATE"
+grep -Fxq 'shadow_state_max_counters=null' "$GATE"
+if grep -Eq '^[[:space:]]*shadow_state_max_counters=$' "$GATE"; then
+  printf 'Gate initializes the finalization maxima to an empty JSON value\n' >&2
+  exit 1
+fi
 if grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"; then
   printf 'Gate retains a legacy identity bypass after parity or OSS readback\n' >&2
   exit 1
