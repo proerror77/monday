@@ -58,8 +58,9 @@ avoiding unsafe copy/truncate operations and hourly WebSocket reconnect gaps. A
 new tape is seeded with the active `event_discovered` records before quotes, so
 token-to-event context remains independently replayable.
 
-Closed Polymarket sessions are validated, compressed, and uploaded every five
-minutes by `polymarket-market-tape-upload.timer`. The uploader ignores the active
+Closed Polymarket sessions are validated, compressed, and uploaded five minutes
+after the prior run finishes by `polymarket-market-tape-upload.timer`. The uploader
+ignores the active
 `market-updates.ndjson`, requires contiguous sequence numbers and monotonic record
 timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under the
 immutable `lake/raw/venue=polymarket/dataset=crypto_expiry/date=.../hour=.../sha256=<data-sha>/`
