@@ -45,6 +45,7 @@ const MAX_TRADE_ROWS_PER_SNAPSHOT: usize = 20_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
+pub const DEFAULT_TRADE_REQUEST_SPACING_MS: u64 = 125;
 // Default cap on one active tape's bytes before fail-closed rotation. At
 // tick-level recording a single UTC-hour tape reached 20-25 GiB (#655), and
 // upload processing needs ~1.6x the tape size of transient spool disk.
@@ -52,7 +53,7 @@ pub const DEFAULT_TAPE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // A nonzero cap below one record's order of magnitude would rotate every
 // write batch and flood the uploader with trivial tapes.
 const MIN_TAPE_MAX_BYTES: u64 = 1024 * 1024;
-const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(125);
+const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(DEFAULT_TRADE_REQUEST_SPACING_MS);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
@@ -4213,7 +4214,10 @@ mod tests {
             default.max_concurrent_trade_polls,
             DEFAULT_MAX_CONCURRENT_TRADE_POLLS
         );
-        assert_eq!(default.per_market_delay, Duration::from_millis(125));
+        assert_eq!(
+            default.per_market_delay,
+            Duration::from_millis(DEFAULT_TRADE_REQUEST_SPACING_MS)
+        );
         default.validate().unwrap();
 
         let malformed_market_id = ReferenceConfig {
