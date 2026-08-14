@@ -70,14 +70,13 @@ const MAX_QUOTE_SOURCE_REGRESSION_MS: i64 = 30_000;
 // 300s upload timeout (36 downloads x 300s would otherwise cap the retry
 // loop at hours).
 const OSS_READBACK_FILE_TIMEOUT: Duration = Duration::from_secs(60);
-// Wall-clock budget for the entire retry loop, covering command time AND
-// backoff sleeps. It covers the observed ~150s object-visibility lag while
-// staying below the five-minute upload timers.
+// Wall-clock budget for each visibility phase, covering command time AND
+// backoff sleeps. It covers the observed ~150s object-visibility lag.
 const OSS_READBACK_MAX_WALL_CLOCK: Duration = Duration::from_secs(240);
-// Per-artifact verify-download retry: a just-PUT object can 404 NoSuchKey for
-// minutes on this endpoint (2026-08-02 production uploads), so each artifact
-// gets a bounded retry budget that samples the full observed lag window.
-const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 40;
+// Data/manifest and _SUCCESS each sample the full visibility-lag window; the
+// upload timer schedules from service completion so these phases never overlap
+// another run.
+const OSS_VERIFY_DOWNLOAD_ATTEMPTS: usize = 60;
 const OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS: u64 = 4;
 pub const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_UPLOADS: usize = 4;
@@ -2607,13 +2606,6 @@ where
     Ok(())
 }
 
-fn remaining_success_readback_budget(readback_elapsed: Duration) -> Result<Duration> {
-    OSS_READBACK_MAX_WALL_CLOCK
-        .checked_sub(readback_elapsed)
-        .filter(|budget| !budget.is_zero())
-        .ok_or_else(|| anyhow!("remote _SUCCESS exceeded OSS readback wall-clock budget"))
-}
-
 fn upload_artifacts_with<F>(
     artifacts: &Artifacts,
     config: &UploadConfig,
@@ -2646,7 +2638,6 @@ where
                 upload_artifact_with(artifacts, source, config, force_keys.contains(name), runner)?;
             }
         }
-        let readback_started = std::time::Instant::now();
         let data_and_manifest = [artifacts.data.as_path(), artifacts.manifest.as_path()];
         {
             let _phase = PhaseAttribution::new("readback_data_manifest");
@@ -2658,8 +2649,6 @@ where
                 runner,
             )?;
         }
-        let success_readback_budget =
-            remaining_success_readback_budget(readback_started.elapsed())?;
         {
             let _phase = PhaseAttribution::new("put_success");
             upload_artifact_with(
@@ -2673,7 +2662,13 @@ where
         let success = [artifacts.success.as_path()];
         {
             let _phase = PhaseAttribution::new("readback_success");
-            verify_remote_paths_with(artifacts, config, &success, success_readback_budget, runner)?;
+            verify_remote_paths_with(
+                artifacts,
+                config,
+                &success,
+                OSS_READBACK_MAX_WALL_CLOCK,
+                runner,
+            )?;
         }
     }
     remove_artifacts(artifacts)?;
@@ -3530,20 +3525,12 @@ mod tests {
     }
 
     #[test]
-    fn reserves_success_readback_budget_before_publishing_marker() {
-        assert_eq!(
-            remaining_success_readback_budget(Duration::from_secs(1)).unwrap(),
-            OSS_READBACK_MAX_WALL_CLOCK - Duration::from_secs(1)
-        );
-        assert!(remaining_success_readback_budget(OSS_READBACK_MAX_WALL_CLOCK).is_err());
-    }
-
-    #[test]
-    fn remote_readback_retry_window_fits_between_visibility_lag_and_timer() {
+    fn remote_readback_retry_window_covers_visibility_lag() {
         let backoff = Duration::from_secs(
             OSS_VERIFY_DOWNLOAD_RETRY_DELAY_SECS * (OSS_VERIFY_DOWNLOAD_ATTEMPTS - 1) as u64,
         );
         assert!(backoff >= Duration::from_secs(150));
+        assert!(backoff < OSS_READBACK_MAX_WALL_CLOCK);
         assert!(OSS_READBACK_MAX_WALL_CLOCK >= Duration::from_secs(150));
         assert!(OSS_READBACK_MAX_WALL_CLOCK < Duration::from_secs(300));
     }
@@ -5447,23 +5434,44 @@ mod tests {
             &sample_rows(),
         );
         let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let data_name = artifacts
+            .data
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let success_name = artifacts
+            .success
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
         let mut remote = BTreeMap::<String, Vec<u8>>::new();
         let mut uploads = 0;
-        let mut post_upload_downloads = 0;
+        let mut data_readback_misses = 0;
+        let mut success_readback_misses = 0;
         let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
             let args = command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
             if args[2].starts_with("oss://") {
-                if uploads == 0 || post_upload_downloads == 0 {
-                    post_upload_downloads += usize::from(uploads > 0);
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                if uploads == 0
+                    || (name == data_name && data_readback_misses < 2)
+                    || (name == success_name && success_readback_misses < 2)
+                {
+                    data_readback_misses +=
+                        usize::from(uploads > 0 && name == data_name && data_readback_misses < 2);
+                    success_readback_misses += usize::from(
+                        uploads > 0 && name == success_name && success_readback_misses < 2,
+                    );
                     // Production 404s surface through run_checked with the
                     // NoSuchKey detail, which is the retryable class.
                     bail!("child process exited with exit status: 1: 404 NoSuchKey");
                 }
-                post_upload_downloads += 1;
-                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
                 fs::write(&args[3], &remote[name])?;
             } else {
                 let name = Path::new(&args[3])
@@ -5481,7 +5489,7 @@ mod tests {
         upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
 
         assert_eq!(uploads, 3);
-        assert_eq!(post_upload_downloads, 4);
+        assert_eq!((data_readback_misses, success_readback_misses), (2, 2));
         assert!(!source.exists());
     }
 

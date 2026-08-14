@@ -36,6 +36,12 @@
   and old green runs are not current truth.
 - Keep Code, CI, merge, release, runtime, and readback as separate states. Claim
   only the latest state backed by an exact SHA/digest and direct readback.
+- A production Gate protects its runtime transition. It is not a prerequisite
+  for development, code review, CI, merge, artifact publication, or a release
+  that does not cross that boundary. A failed Gate blocks only its cutover.
+- Default development and control-plane verification to the smallest targeted
+  check, normally no longer than 15 minutes. Run the full Gate once, immediately
+  before a candidate crosses the collector or runtime boundary it protects.
 - Keep each change independently testable and rollbackable. Do not mix Research,
   Governance, and Runtime.
 - Never replace missing real data with fixtures, fabricate completeness, weaken a
