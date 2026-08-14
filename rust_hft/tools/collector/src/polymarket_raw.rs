@@ -494,9 +494,10 @@ fn plan_market_detail_fetches(
             .iter()
             .filter_map(|(market_id, tracked)| {
                 let end_time = parse_optional_datetime(tracked.end_time.as_deref());
-                (!target_ids.contains(market_id)
-                    && end_time.is_none_or(|end| end <= now)
-                    && !(tracked.settled && tracked.trade_complete))
+                (end_time.is_none()
+                    || (!target_ids.contains(market_id)
+                        && end_time.is_some_and(|end| end <= now)
+                        && !(tracked.settled && tracked.trade_complete)))
                     .then(|| TradePollCandidate {
                         market_id: market_id.clone(),
                         priority: end_time.is_none()
@@ -2618,9 +2619,10 @@ impl ReferenceCollector {
             {
                 continue;
             }
-            let needs_detail = !targets.contains_key(&market_id)
-                && end_time.is_none_or(|end| end <= now)
-                && !(tracked.settled && tracked.trade_complete);
+            let needs_detail = end_time.is_none()
+                || (!targets.contains_key(&market_id)
+                    && end_time.is_some_and(|end| end <= now)
+                    && !(tracked.settled && tracked.trade_complete));
             if needs_detail && market_detail_plan.selected.contains(&market_id) {
                 tracked.last_market_detail_attempt_at = Some(retrieved_at.clone());
                 match market_detail_fetches
@@ -4499,6 +4501,31 @@ mod tests {
         }
         let second = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
         assert!(second.selected.contains("missing-c"));
+    }
+
+    #[test]
+    fn missing_end_time_recovery_includes_completed_and_current_markets() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let markets = BTreeMap::from([
+            (
+                "completed".to_owned(),
+                TrackedMarket {
+                    settled: true,
+                    trade_complete: true,
+                    ..TrackedMarket::default()
+                },
+            ),
+            ("current".to_owned(), TrackedMarket::default()),
+        ]);
+        let targets = BTreeSet::from(["current".to_owned()]);
+
+        let plan = plan_market_detail_fetches(&markets, &targets, now, 2);
+
+        assert_eq!(plan.priority, 2);
+        assert_eq!(
+            plan.selected,
+            BTreeSet::from(["completed".to_owned(), "current".to_owned()])
+        );
     }
 
     #[test]
