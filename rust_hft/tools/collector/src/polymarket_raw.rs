@@ -495,11 +495,13 @@ fn plan_market_detail_fetches(
             .filter_map(|(market_id, tracked)| {
                 let end_time = parse_optional_datetime(tracked.end_time.as_deref());
                 (!target_ids.contains(market_id)
-                    && end_time.is_some_and(|end| end <= now)
+                    && end_time.is_none_or(|end| end <= now)
                     && !(tracked.settled && tracked.trade_complete))
                     .then(|| TradePollCandidate {
                         market_id: market_id.clone(),
-                        priority: !tracked.settled || tracked.settlement_failure_since.is_some(),
+                        priority: end_time.is_none()
+                            || !tracked.settled
+                            || tracked.settlement_failure_since.is_some(),
                         last_success_at: parse_optional_datetime(
                             tracked.last_market_detail_attempt_at.as_deref(),
                         ),
@@ -2617,7 +2619,7 @@ impl ReferenceCollector {
                 continue;
             }
             let needs_detail = !targets.contains_key(&market_id)
-                && end_time.is_some_and(|end| end <= now)
+                && end_time.is_none_or(|end| end <= now)
                 && !(tracked.settled && tracked.trade_complete);
             if needs_detail && market_detail_plan.selected.contains(&market_id) {
                 tracked.last_market_detail_attempt_at = Some(retrieved_at.clone());
@@ -2998,12 +3000,9 @@ impl ReferenceCollector {
             ))
             .into());
         }
-        if !invalid_end_time_markets.is_empty() {
-            return Err(DataCompletenessError(format!(
-                "tracked markets with missing or invalid end time: {invalid_end_time_markets:?}"
-            ))
-            .into());
-        }
+        // Keep the health fail-closed while the bounded detail queue repairs
+        // recovered markets; exiting here would restart before the queue can
+        // advance and turn a recoverable backlog into a crash loop.
         if !stale_trade_markets.is_empty() {
             return Err(DataCompletenessError(format!(
                 "stale trade markets: {stale_trade_markets:?}"
@@ -4467,6 +4466,39 @@ mod tests {
             plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 8).selected,
             BTreeSet::from(["settled".to_owned()])
         );
+    }
+
+    #[test]
+    fn missing_end_time_recovery_is_bounded_and_rotates_backlog() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let tracked = || TrackedMarket {
+            settled: true,
+            trade_complete: false,
+            ..TrackedMarket::default()
+        };
+        let mut markets = BTreeMap::from([
+            ("missing-a".to_owned(), tracked()),
+            ("missing-b".to_owned(), tracked()),
+            ("missing-c".to_owned(), tracked()),
+        ]);
+
+        let first = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        assert_eq!(first.eligible, 3);
+        assert_eq!(first.priority, 3);
+        assert_eq!(first.priority_deferred, 1);
+        assert_eq!(
+            first.selected,
+            BTreeSet::from(["missing-a".to_owned(), "missing-b".to_owned()])
+        );
+
+        for market_id in &first.selected {
+            markets
+                .get_mut(market_id)
+                .unwrap()
+                .last_market_detail_attempt_at = Some(iso_z(now));
+        }
+        let second = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        assert!(second.selected.contains("missing-c"));
     }
 
     #[test]
