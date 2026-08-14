@@ -376,9 +376,10 @@ and (
     # Issue #868: a finalization-deferred shadow against a continuous-emission
     # baseline cannot emit a mature trade inside the gate window. The adjudicated
     # trade trio is accepted only when the raw verifier verdict shows the failure
-    # is confined to that family and the finalization pipeline engaged: the
-    # fresh-spool shadow tracked markets and observed at least one settled
-    # market in its bounded state during the observation.
+    # is confined to that family and the finalization pipeline demonstrably
+    # advanced: the stable-poll maximum is zero until the 1800-second lag
+    # elapses, so a positive growing maximum proves finalization ticked, and a
+    # growing settled maximum proves new settlements entered the bounded state.
     .trade_parity_mode == "finalization_deferred_overlap"
     and .comparison_mode == "legacy_overlap"
     and .shadow_emission == "finalization_deferred"
@@ -400,6 +401,11 @@ and (
       >= .finalization_progress.stable_polls_start)
     and (.finalization_progress.stable_polls_max
       >= .finalization_progress.stable_polls_end)
+    and ((.finalization_progress.stable_polls_max > 0
+        and (.finalization_progress.stable_polls_max
+          > .finalization_progress.stable_polls_start))
+      or (.finalization_progress.settled_markets_max
+        > .finalization_progress.settled_markets_start))
     and (.parity_verifier.passed == ([.parity_verifier.checks[]] | all))
     and .parity_verifier.checks.metadata_parity == true
     and .parity_verifier.checks.settlement_parity == true

@@ -3818,10 +3818,37 @@ jq -e -f "$POLICY" "$tmp_dir/finalization-overlap-gate.json" >/dev/null || {
   printf 'gate policy rejected finalization-deferred overlap evidence\n' >&2
   exit 1
 }
+# Advancement through either channel alone is sufficient: a growing settled
+# maximum with flat stable polls, or a growing stable-poll maximum (zero until
+# the 1800-second lag elapses) with a flat settled maximum.
+jq '.finalization_progress.stable_polls_end = 0
+  | .finalization_progress.stable_polls_max = 0' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/settled-advanced-overlap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/settled-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected settled-only finalization advancement\n' >&2
+  exit 1
+}
+jq '.finalization_progress.settled_markets_start = 112
+  | .finalization_progress.settled_markets_end = 112' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/stable-polls-advanced-overlap-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/stable-polls-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected stable-poll-only finalization advancement\n' >&2
+  exit 1
+}
 for mutation in \
   '.parity_verifier.checks.settlement_parity = false' \
   '.parity_verifier.checks.metadata_parity = false' \
   '.parity_verifier.passed = true' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.settled_markets_start = 112' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.stable_polls_end = 5
+    | .finalization_progress.stable_polls_max = 5
+    | .finalization_progress.settled_markets_start = 112
+    | .finalization_progress.settled_markets_end = 112' \
   '.finalization_progress.settled_markets_max = 0' \
   '.finalization_progress.settled_markets_max
     = (.finalization_progress.settled_markets_end - 1)' \
@@ -5212,8 +5239,14 @@ grep -Fq 'verify-shadow-parity' "$GATE"
 grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
 grep -Fq 'finalization_deferred_overlap' "$GATE"
 grep -Fq 'trade_parity_mode' "$GATE"
-grep -Fq 'emission_mode_from_health' "$GATE"
+grep -Fq 'collector_emission_mode' "$GATE"
+grep -Fq -- '--max-retained-trade-ids' "$GATE"
 grep -Fq 'shadow_finalization_counters' "$GATE"
+grep -Fxq 'shadow_state_max_counters=null' "$GATE"
+if grep -Eq '^[[:space:]]*shadow_state_max_counters=$' "$GATE"; then
+  printf 'Gate initializes the finalization maxima to an empty JSON value\n' >&2
+  exit 1
+fi
 if grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"; then
   printf 'Gate retains a legacy identity bypass after parity or OSS readback\n' >&2
   exit 1

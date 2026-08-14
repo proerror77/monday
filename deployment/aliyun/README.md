@@ -431,9 +431,13 @@ window, so the trade coverage, field, and byte trio is unsatisfiable by
 construction. The gate then adjudicates that trio instead of requiring it from
 the verifier: settlement, metadata, rotation, asset, and dedupe parity must
 still pass, the shadow must not emit any trade the baseline lacks, the shadow
-finalization pipeline must engage during the observation (at least one settled
-market tracked in the bounded fresh-spool state, with tracked/settled/stable
-poll counters recorded), and the canonical upload still runs. The
+finalization pipeline must demonstrably advance during the observation (a
+growing stable-poll maximum — zero until the lag elapses — or a growing settled
+maximum, from running-maxima samples of the bounded fresh-spool state), and the
+canonical upload still runs. Emission modes are classified by the
+collect-reference CLI contract: #680 removed the --max-retained-trade-ids flag
+exactly when deferred finalization replaced per-poll emission, and any probe
+uncertainty classifies continuous so full trade parity applies. The
 verdict records the applied trade parity mode, both detected emission modes,
 the raw verifier checks, and the reason (issue #868). When both sides share
 the same emission semantics, full trade parity applies unchanged.

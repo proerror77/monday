@@ -1292,16 +1292,28 @@ memory_events_json() {
 }
 
 # A post-#680 collector defers a market's trade emission until settlement plus
-# the 1800-second finalization lag plus consecutive stable polls, so its health
-# schema carries the bounded-state duplicate-trade counter. A continuous
-# baseline (legacy-Python or a pre-#680 Rust binary) has no such field.
-emission_mode_from_health() {
-  local health=$1
-  if [[ -f $health && ! -L $health ]] \
-    && jq -e 'has("duplicate_trade_rows")' "$health" >/dev/null 2>&1; then
-    printf '%s\n' finalization_deferred
-  else
+# the 1800-second finalization lag plus consecutive stable polls. The binding
+# signal is the collect-reference CLI contract: #680 removed the
+# --max-retained-trade-ids flag exactly when deferred finalization replaced
+# per-poll emission, so a binary whose help lacks the flag is post-#680. The
+# health schema's duplicate-trade counter only corroborates: it was added later
+# (post-#743), so it cannot classify a (#680,#743)-window binary. Any probe
+# uncertainty classifies continuous so full trade parity still applies
+# (fail-closed).
+collector_emission_mode() {
+  local binary=$1 help
+  if [[ ! -f $binary || -L $binary || ! -x $binary ]]; then
     printf '%s\n' continuous
+    return
+  fi
+  if ! help=$("$binary" collect-reference --help 2>/dev/null); then
+    printf '%s\n' continuous
+    return
+  fi
+  if grep -Fq -- '--max-retained-trade-ids' <<<"$help"; then
+    printf '%s\n' continuous
+  else
+    printf '%s\n' finalization_deferred
   fi
 }
 
@@ -1717,7 +1729,6 @@ last_health=
 last_health_change=$start_uptime
 shadow_state_start_counters=
 shadow_state_max_counters=null
-shadow_state_max_counters=
 last_legacy_health=
 last_legacy_health_change=$start_uptime
 legacy_api_error_started_at=
@@ -1829,8 +1840,8 @@ while :; do
     jq -e -f "$release_control_dir/${RUST_HEALTH_POLICY##*/}" "$health" >/dev/null \
       || die 'Rust shadow health is not fail-closed clean'
     # Rotated-out markets are evicted from the bounded state, so track running
-    # maxima: a settled market observed at any point proves the finalization
-    # pipeline engaged during this fresh-spool run (issue #868).
+    # maxima: the post-gate adjudication proves finalization advancement from
+    # these samples rather than from a single end snapshot (issue #868).
     shadow_state_counters=$(shadow_finalization_counters \
       "$shadow_spool/collector-state.json") \
       || die 'Rust shadow state has no valid finalization counters'
@@ -1972,12 +1983,12 @@ verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_inv
 stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
 [[ $stopped_shadow_restarts == 0 ]] \
   || die 'Rust shadow restarted between final verification and stop'
-shadow_emission=$(emission_mode_from_health "$shadow_spool/health.json")
+shadow_emission=$(collector_emission_mode "$release_binary")
 baseline_emission=continuous
 if [[ $baseline_recovery == true ]]; then
   baseline_emission=inactive
 elif [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap ]]; then
-  baseline_emission=$(emission_mode_from_health "$LEGACY_SPOOL/health.json")
+  baseline_emission=$(collector_emission_mode "$baseline_release_path")
 fi
 shadow_state_end_counters=$(shadow_finalization_counters \
   "$shadow_spool/collector-state.json") \
@@ -2052,14 +2063,19 @@ if [[ $trade_parity_mode == finalization_deferred_overlap ]]; then
     and .metrics.rust_trade_metadata_context_match == true
   ' "$parity_json" >/dev/null \
     || die 'parity failed outside the deferred-emission trade family'
+  # The pipeline must demonstrably advance, not merely exist: the stable-poll
+  # counter is zero until the 1800-second lag elapses, so a positive growing
+  # maximum proves finalization ticked; a growing settled maximum proves new
+  # settlements entered the bounded state despite eviction.
   jq -en --argjson start "$shadow_state_start_counters" \
     --argjson end "$shadow_state_end_counters" \
     --argjson maximum "$shadow_state_max_counters" '
     ($end.tracked_markets > 0)
-    and ($maximum.settled_markets >= 1)
-    and ($maximum.stable_polls >= $start.stable_polls)
+    and (($maximum.stable_polls > 0
+        and $maximum.stable_polls > $start.stable_polls)
+      or ($maximum.settled_markets > $start.settled_markets))
   ' >/dev/null \
-    || die 'Rust shadow finalization pipeline did not engage during the gate'
+    || die 'Rust shadow finalization pipeline did not advance during the gate'
   parity_verifier_json=$(jq -c '{passed:.passed, checks:.checks}' "$parity_json") \
     || die 'could not preserve the raw parity verifier verdict'
   finalization_progress_json=$(jq -cn \
