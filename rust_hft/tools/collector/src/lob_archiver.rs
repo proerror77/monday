@@ -814,6 +814,11 @@ pub fn write_success_marker(data: &Path, digest: &str) -> anyhow::Result<PathBuf
     Ok(success)
 }
 
+/// Upper bound for one recovered tape row. Rows are venue JSON frames
+/// (kilobytes at most); anything larger is corruption, and an unterminated
+/// multi-GB tail must not be buffered whole by `read_until`.
+const MAX_RECOVERY_ROW_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifacts>> {
     let mut artifacts = Vec::new();
     for path in files_with_suffix(&config.spool_dir, ".jsonl.part")? {
@@ -841,13 +846,20 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let mut raw_trade_incomplete_symbols = BTreeSet::new();
         loop {
             line.clear();
-            let read = reader
+            let read = (&mut reader)
+                .take(MAX_RECOVERY_ROW_BYTES as u64 + 2)
                 .read_until(b'\n', &mut line)
                 .with_context(|| format!("failed to read spool part {}", path.display()))?;
             if read == 0 {
                 break;
             }
             let complete = line.last() == Some(&b'\n');
+            if line.len() - usize::from(complete) > MAX_RECOVERY_ROW_BYTES {
+                // A row this large is corruption, not data; quarantine the
+                // part instead of buffering an unbounded unterminated tail.
+                quarantine = true;
+                break;
+            }
             let parsed = serde_json::from_slice::<Value>(&line);
             let valid = parsed.as_ref().is_ok_and(|value| {
                 value.is_object()
@@ -2139,6 +2151,31 @@ mod tests {
                 "case={name}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_quarantines_oversized_unterminated_row() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-oversized-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        // An unterminated tail far beyond the row cap must quarantine the
+        // part, not be buffered whole by read_until.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_RECOVERY_ROW_BYTES * 2])
+            .unwrap();
+        drop(file);
+
+        assert!(recover_parts(&config).unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(path.with_extension("part.corrupt").exists());
     }
 
     #[cfg(unix)]
