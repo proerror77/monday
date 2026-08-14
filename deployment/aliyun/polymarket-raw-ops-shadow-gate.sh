@@ -1294,7 +1294,7 @@ memory_events_json() {
 # A post-#680 collector defers a market's trade emission until settlement plus
 # the 1800-second finalization lag plus consecutive stable polls, so its health
 # schema carries the bounded-state duplicate-trade counter. A continuous
-# baseline (legacy Python or a pre-#680 Rust binary) has no such field.
+# baseline (legacy-Python or a pre-#680 Rust binary) has no such field.
 emission_mode_from_health() {
   local health=$1
   if [[ -f $health && ! -L $health ]] \
