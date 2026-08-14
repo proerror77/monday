@@ -4966,7 +4966,7 @@ jq -n '{
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:120,
   missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
-  trade_poll_budget:200,trade_poll_concurrency:4,trade_request_spacing_ms:100,
+  trade_poll_budget:200,trade_poll_concurrency:4,trade_request_spacing_ms:125,
   priority_trade_markets_before_market_details:108,
   market_detail_budget:4,market_detail_eligible:3,market_detail_priority:2,
   market_detail_selected:3,market_detail_deferred:0,market_detail_priority_deferred:0,
@@ -5035,7 +5035,7 @@ for mutation in \
   '.market_detail_priority_deferred = 1' \
   '.trade_poll_budget_after_market_details = 196' \
   'del(.trade_request_spacing_ms)' \
-  '.trade_request_spacing_ms = 99' \
+  '.trade_request_spacing_ms = 124' \
   '.priority_trade_markets = 107' \
   '.priority_trade_backlog = 1' \
   '.selected_trade_markets = 196' \

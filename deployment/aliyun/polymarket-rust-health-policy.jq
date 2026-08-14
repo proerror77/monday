@@ -26,7 +26,7 @@ and (.market_detail_deferred == (.market_detail_eligible - .market_detail_select
 and (.market_detail_priority_deferred == ([.market_detail_priority - .market_detail_budget, 0] | max))
 and (.trade_poll_budget_after_market_details | type == "number" and floor == . and . >= 0)
 and (.trade_poll_budget_after_market_details == (.trade_poll_budget - .market_detail_selected))
-and (.trade_request_spacing_ms | type == "number" and floor == . and . >= 100)
+and (.trade_request_spacing_ms | type == "number" and floor == . and . >= 125)
 and (.eligible_trade_markets | type == "number" and floor == . and . >= 0)
 and (.priority_trade_markets | type == "number" and floor == . and . >= 0)
 and (.selected_trade_markets | type == "number" and floor == . and . >= 0)

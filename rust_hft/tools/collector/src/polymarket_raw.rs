@@ -52,7 +52,7 @@ pub const DEFAULT_TAPE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // A nonzero cap below one record's order of magnitude would rotate every
 // write batch and flood the uploader with trivial tapes.
 const MIN_TAPE_MAX_BYTES: u64 = 1024 * 1024;
-const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(100);
+const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(125);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
@@ -4213,6 +4213,7 @@ mod tests {
             default.max_concurrent_trade_polls,
             DEFAULT_MAX_CONCURRENT_TRADE_POLLS
         );
+        assert_eq!(default.per_market_delay, Duration::from_millis(125));
         default.validate().unwrap();
 
         let malformed_market_id = ReferenceConfig {
