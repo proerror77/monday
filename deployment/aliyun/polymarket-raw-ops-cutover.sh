@@ -36,7 +36,7 @@ readonly LEGACY_REFERENCE_UPLOAD_EXEC="/usr/bin/python3 $LEGACY_UPLOADER --spool
 readonly REFERENCE_UPLOAD_EXEC="$ACTIVE_BINARY upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0"
 readonly MARKET_UPLOAD_EXEC="/usr/bin/env ZSTD_THREADS=1 $ACTIVE_BINARY upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 1"
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
-readonly STARTUP_RECOVERY_SECONDS=300
+readonly STARTUP_RECOVERY_SECONDS=600
 readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
 readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
