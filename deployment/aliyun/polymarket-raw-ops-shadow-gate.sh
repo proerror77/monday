@@ -1346,6 +1346,27 @@ shadow_finalization_counters() {
   ' "$state"
 }
 
+adjudicate_trade_parity() {
+  local mode=$1
+  jq --arg mode "$mode" '
+    .checks += (if $mode == "finalization_deferred_overlap" then {
+      byte_parity:true,
+      field_parity:true,
+      trade_coverage_parity:true,
+      trade_contract_parity:true,
+      finalization_progress:true
+    } elif $mode == "finalization_deferred_rust_self" then {
+      byte_parity:true,
+      field_parity:true,
+      dedupe_parity:true,
+      finalization_progress:true
+    } else {} end)
+    | .passed = ((if ($mode == "finalization_deferred_overlap"
+          or $mode == "finalization_deferred_rust_self")
+        then true else .passed end) and ([.checks[]] | all))
+  '
+}
+
 if [[ ${1:-} == --real-market-preflight-worker ]]; then
   [[ ${EUID} -eq 0 && $# -eq 5 ]] || exit 2
   real_market_segment_preflight "$2" "$3" "$4" "$5" || exit
@@ -2036,7 +2057,14 @@ comparison_mode=$(jq -er '
   .comparison_mode | select(. == "legacy_overlap" or . == "rust_self")' \
   "$parity_json") || die 'parity evidence has no valid comparison mode'
 trade_parity_reason='shadow and baseline trade emission semantics match; full trade coverage, field, and byte parity applies'
-if [[ $comparison_mode == rust_self ]]; then
+if [[ $comparison_mode == rust_self \
+  && $baseline_recovery == true \
+  && $baseline_emission == inactive \
+  && $shadow_emission == finalization_deferred ]] \
+  && ((parity_exit != 0)); then
+  trade_parity_mode=finalization_deferred_rust_self
+  trade_parity_reason='contained recovery has no baseline comparison rows and the finalization-deferred shadow emitted no mature trade inside the gate window; metadata, settlement, rotation, asset, trade contract and coverage, zero duplicates, finalization progression, and canonical upload replace the unsatisfiable nonempty-trade checks'
+elif [[ $comparison_mode == rust_self ]]; then
   trade_parity_mode=rust_self
   trade_parity_reason='baseline produced no comparison rows; Rust-self parity applies'
 elif [[ $shadow_emission == finalization_deferred \
@@ -2052,28 +2080,45 @@ else
 fi
 parity_verifier_json=null
 finalization_progress_json=null
-if [[ $trade_parity_mode == finalization_deferred_overlap ]]; then
+if [[ $trade_parity_mode == finalization_deferred_overlap \
+  || $trade_parity_mode == finalization_deferred_rust_self ]]; then
   # The verifier's failure is legitimate only when it is confined to the
-  # deferred-emission trade family and the shadow emitted no trade the
-  # baseline lacks.
-  jq -e '
+  # deferred-emission trade family. Overlap may omit baseline-only trades;
+  # contained Rust-self recovery must have no trades or duplicates at all.
+  jq --arg mode "$trade_parity_mode" -e '
     .checks.metadata_parity == true and .checks.settlement_parity == true
     and .checks.rotation_parity == true and .checks.asset_parity == true
-    and .checks.dedupe_parity == true
-    and ([.checks | to_entries[] | select(.value == false) | .key]
-      | all(. == "byte_parity" or . == "field_parity"
-        or . == "trade_coverage_parity" or . == "trade_contract_parity"))
     and .metrics.trade_shared_values_match == true
     and (.metrics.trade_shared_value_mismatch_ids | length == 0)
-    and (.metrics.rust_only_trade_ids | length == 0)
     and (.metrics.legacy_duplicate_trade_ids | length == 0)
     and (.metrics.rust_duplicate_trade_ids | length == 0)
-    and (.metrics.legacy_trade_count | type == "number" and floor == . and . > 0)
     and .metrics.trade_metadata_shared_values_match == true
     and .metrics.legacy_trade_metadata_context_match == true
     and .metrics.rust_trade_metadata_context_match == true
+    and (if $mode == "finalization_deferred_overlap" then
+      .checks.dedupe_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+      and (.metrics.rust_only_trade_ids | length == 0)
+      and (.metrics.legacy_trade_count
+        | type == "number" and floor == . and . > 0)
+    else
+      .checks.byte_parity == false
+      and .checks.field_parity == false
+      and .checks.dedupe_parity == false
+      and .checks.trade_coverage_parity == true
+      and .checks.trade_contract_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "dedupe_parity"))
+      and .metrics.legacy_trade_count == 0
+      and .metrics.rust_trade_count == 0
+      and (.metrics.legacy_only_trade_ids | length == 0)
+      and (.metrics.rust_only_trade_ids | length == 0)
+    end)
   ' "$parity_json" >/dev/null \
-    || die 'parity failed outside the deferred-emission trade family'
+    || die 'parity failed outside the adjudicated deferred-emission family'
   # The pipeline must demonstrably advance, not merely exist: the stable-poll
   # counter is zero until the 1800-second lag elapses, so a positive growing
   # maximum proves finalization ticked; a growing settled maximum proves new
@@ -2274,22 +2319,16 @@ jq \
       oss_readback_parity:true,
       market_oss_readback_parity:true,
       real_market_segment_preflight:true
-    } + (if $trade_parity_mode == "finalization_deferred_overlap" then {
-      byte_parity:true,
-      field_parity:true,
-      trade_coverage_parity:true,
-      trade_contract_parity:true,
-      finalization_progress:true
-    } else {} end)),
+    }),
     metrics:(.metrics + {
       oss_uploaded_segments:$uploaded_segments,
       oss_canonical_uploaded_segments:$canonical_uploaded_segments,
       market_oss_uploaded_segments:$market_uploaded_segments,
       market_oss_canonical_uploaded_segments:$market_canonical_uploaded_segments
     })
-  } | .passed = ((if $trade_parity_mode == "finalization_deferred_overlap"
-      then true else .passed end) and ([.checks[]] | all))' \
-  "$parity_json" >"$gate_tmp"
+  }' "$parity_json" \
+  | adjudicate_trade_parity "$trade_parity_mode" >"$gate_tmp" \
+  || die 'could not adjudicate the combined trade parity evidence'
 mv "$gate_tmp" "$gate_json"
 sync "$gate_json"
 

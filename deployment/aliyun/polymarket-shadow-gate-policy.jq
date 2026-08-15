@@ -375,17 +375,26 @@ and (
   )
   or
   (
-    # Issue #868: a finalization-deferred shadow against a continuous-emission
-    # baseline cannot emit a mature trade inside the gate window. The adjudicated
-    # trade trio is accepted only when the raw verifier verdict shows the failure
-    # is confined to that family and the finalization pipeline demonstrably
-    # advanced: the stable-poll maximum is zero until the 1800-second lag
-    # elapses, so a positive growing maximum proves finalization ticked, and a
-    # growing settled maximum proves new settlements entered the bounded state.
-    .trade_parity_mode == "finalization_deferred_overlap"
-    and .comparison_mode == "legacy_overlap"
-    and .shadow_emission == "finalization_deferred"
-    and .baseline_emission == "continuous"
+    # Issues #868 and #891: finalization-deferred collection cannot always emit
+    # a mature trade inside the gate window. Adjudication is limited to either
+    # continuous baseline overlap or a fully contained inactive-baseline
+    # recovery, and preserves the raw verifier verdict.
+    (
+      (
+        .trade_parity_mode == "finalization_deferred_overlap"
+        and .comparison_mode == "legacy_overlap"
+        and .shadow_emission == "finalization_deferred"
+        and .baseline_emission == "continuous"
+      )
+      or
+      (
+        .trade_parity_mode == "finalization_deferred_rust_self"
+        and .comparison_mode == "rust_self"
+        and .shadow_emission == "finalization_deferred"
+        and .baseline_emission == "inactive"
+        and recovery_matches_gate
+      )
+    )
     and .checks.finalization_progress == true
     and (.finalization_progress.tracked_markets_start | nonnegative_integer)
     and (.finalization_progress.settled_markets_start | nonnegative_integer)
@@ -413,10 +422,23 @@ and (
     and .parity_verifier.checks.settlement_parity == true
     and .parity_verifier.checks.rotation_parity == true
     and .parity_verifier.checks.asset_parity == true
-    and .parity_verifier.checks.dedupe_parity == true
-    and ([.parity_verifier.checks | to_entries[] | select(.value == false) | .key]
-      | all(. == "byte_parity" or . == "field_parity"
-        or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+    and (if .trade_parity_mode == "finalization_deferred_overlap" then
+      .parity_verifier.checks.dedupe_parity == true
+      and ([.parity_verifier.checks
+          | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+    else
+      .parity_verifier.checks.byte_parity == false
+      and .parity_verifier.checks.field_parity == false
+      and .parity_verifier.checks.dedupe_parity == false
+      and .parity_verifier.checks.trade_coverage_parity == true
+      and .parity_verifier.checks.trade_contract_parity == true
+      and ([.parity_verifier.checks
+          | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "dedupe_parity"))
+    end)
   )
 )
 and (.metrics.oss_uploaded_segments | positive_integer)
@@ -431,6 +453,10 @@ and (.metrics.rust_closed_tape_count | positive_integer)
 and (if .trade_parity_mode == "finalization_deferred_overlap" then
   (.metrics.rust_trade_count | nonnegative_integer)
   and (.metrics.legacy_only_trade_ids | type == "array")
+  and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
+elif .trade_parity_mode == "finalization_deferred_rust_self" then
+  .metrics.rust_trade_count == 0
+  and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
   and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
 else
   (.metrics.rust_trade_count | positive_integer)

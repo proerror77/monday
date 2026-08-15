@@ -3552,6 +3552,91 @@ jq -e '.passed == true and .comparison_mode == "rust_self"
   and .metrics.rust_metadata_count > 0
   and .metrics.rust_settlement_count > 0' "$rust_self_parity" >/dev/null
 
+rust_self_deferred="$tmp_dir/rust-self-deferred"
+cp -R "$rust" "$rust_self_deferred"
+jq -cs 'map(select(.update.kind != "polymarket_trade"))
+  | to_entries[] | .value.sequence = .key | .value' \
+  "$rust_self_deferred/market-updates.19700101T000400000000.ndjson" \
+  >"$rust_self_deferred/market-updates.rewritten"
+mv "$rust_self_deferred/market-updates.rewritten" \
+  "$rust_self_deferred/market-updates.19700101T000400000000.ndjson"
+if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
+  --legacy-spool "$legacy_empty" --rust-spool "$rust_self_deferred" \
+  --started-at-unix 100 --ended-at-unix 1000 \
+  --output "$tmp_dir/rust-self-deferred-parity.json" \
+  --allow-empty-legacy 2>/dev/null; then
+  printf 'Rust-self parity unexpectedly accepted a deferred zero-trade window\n' >&2
+  exit 1
+fi
+jq -e '.passed == false and .comparison_mode == "rust_self"
+  and .checks.byte_parity == false
+  and .checks.field_parity == false
+  and .checks.dedupe_parity == false
+  and .checks.metadata_parity == true
+  and .checks.settlement_parity == true
+  and .checks.rotation_parity == true
+  and .checks.asset_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .metrics.legacy_trade_count == 0
+  and .metrics.rust_trade_count == 0
+  and .metrics.legacy_duplicate_trade_ids == []
+  and .metrics.rust_duplicate_trade_ids == []' \
+  "$tmp_dir/rust-self-deferred-parity.json" >/dev/null
+
+trade_mode_contract="$tmp_dir/trade-mode-contract.sh"
+sed -n '/^trade_parity_reason=/,/^fi$/p' "$GATE" >"$trade_mode_contract"
+select_trade_mode() (
+  comparison_mode=$1
+  baseline_recovery=$2
+  baseline_emission=$3
+  shadow_emission=$4
+  parity_exit=$5
+  # shellcheck source=/dev/null
+  source "$trade_mode_contract"
+  printf '%s\n' "$trade_parity_mode"
+)
+[[ $(select_trade_mode rust_self true inactive finalization_deferred 1) \
+    == finalization_deferred_rust_self \
+  && $(select_trade_mode rust_self true inactive finalization_deferred 0) \
+    == rust_self \
+  && $(select_trade_mode rust_self false inactive finalization_deferred 1) \
+    == rust_self \
+  && $(select_trade_mode legacy_overlap false continuous finalization_deferred 1) \
+    == finalization_deferred_overlap \
+  && $(select_trade_mode legacy_overlap false continuous continuous 0) \
+    == continuous_overlap ]] || {
+  printf 'Gate selected an invalid trade parity mode\n' >&2
+  exit 1
+}
+
+adjudication_contract="$tmp_dir/trade-parity-adjudication.sh"
+sed -n '/^adjudicate_trade_parity()/,/^}/p' "$GATE" \
+  >"$adjudication_contract"
+# shellcheck source=/dev/null
+source "$adjudication_contract"
+adjudicate_trade_parity finalization_deferred_rust_self \
+  <"$tmp_dir/rust-self-deferred-parity.json" \
+  >"$tmp_dir/adjudicated-rust-self-deferred-parity.json"
+jq -e '.passed == true and ([.checks[]] | all)
+  and .checks.byte_parity == true
+  and .checks.field_parity == true
+  and .checks.dedupe_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .checks.finalization_progress == true' \
+  "$tmp_dir/adjudicated-rust-self-deferred-parity.json" >/dev/null
+adjudicate_trade_parity rust_self \
+  <"$tmp_dir/rust-self-deferred-parity.json" \
+  >"$tmp_dir/unadjudicated-rust-self-deferred-parity.json"
+jq -e '.passed == false
+  and .checks.byte_parity == false
+  and .checks.field_parity == false
+  and .checks.dedupe_parity == false
+  and (.checks | has("finalization_progress") | not)' \
+  "$tmp_dir/unadjudicated-rust-self-deferred-parity.json" >/dev/null
+
 rust_self_missing_settlement="$tmp_dir/rust-self-missing-settlement"
 cp -R "$rust" "$rust_self_missing_settlement"
 jq -c 'select(.update.kind != "market_settlement")' \
@@ -4617,6 +4702,48 @@ jq -e -f "$POLICY" "$tmp_dir/contained-recovery-gate.json" >/dev/null || {
   printf 'gate policy rejected a verified contained bootstrap recovery\n' >&2
   exit 1
 }
+jq '.trade_parity_mode = "finalization_deferred_rust_self"
+  | .trade_parity_reason = "contained recovery has no baseline comparison rows and the finalization-deferred shadow emitted no mature trade inside the gate window; metadata, settlement, rotation, asset, trade contract and coverage, zero duplicates, finalization progression, and canonical upload replace the unsatisfiable nonempty-trade checks"
+  | .shadow_emission = "finalization_deferred"
+  | .baseline_emission = "inactive"
+  | .checks += {finalization_progress:true}
+  | .parity_verifier = {passed:false, checks:{
+      byte_parity:false,metadata_parity:true,field_parity:false,
+      dedupe_parity:false,trade_coverage_parity:true,
+      trade_contract_parity:true,settlement_parity:true,
+      rotation_parity:true,asset_parity:true}}
+  | .finalization_progress = {
+      tracked_markets_start:160,settled_markets_start:0,stable_polls_start:0,
+      tracked_markets_end:161,settled_markets_end:112,stable_polls_end:5,
+      settled_markets_max:112,stable_polls_max:5}
+  | .metrics.rust_trade_count = 0
+  | .metrics.legacy_only_trade_ids = []
+  | .metrics.rust_only_trade_ids = []' \
+  "$tmp_dir/contained-recovery-gate.json" \
+  >"$tmp_dir/finalization-rust-self-recovery-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/finalization-rust-self-recovery-gate.json" >/dev/null || {
+  printf 'gate policy rejected contained finalization-deferred Rust-self evidence\n' >&2
+  exit 1
+}
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/finalization-rust-self-recovery-gate.json" \
+    >"$tmp_dir/forged-finalization-rust-self-$name.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-finalization-rust-self-$name.json" >/dev/null; then
+    printf 'finalization-deferred Rust-self policy accepted %s drift\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+raw_settlement|.parity_verifier.checks.settlement_parity = false
+raw_trade_coverage|.parity_verifier.checks.trade_coverage_parity = false
+raw_dedupe|.parity_verifier.checks.dedupe_parity = true
+rust_trade_count|.metrics.rust_trade_count = 1
+rust_duplicate|.metrics.rust_duplicate_trade_ids = ["duplicate"]
+no_progress|.finalization_progress.stable_polls_start = 5 | .finalization_progress.settled_markets_start = 112
+active_baseline|.baseline_emission = "continuous"
+missing_recovery|.recovery = null
+EOF
 jq '.recovery.baseline.invocation_id = ""' "$tmp_dir/contained-recovery-gate.json" \
   >"$tmp_dir/contained-recovery-empty-invocation.json"
 jq -e -f "$POLICY" "$tmp_dir/contained-recovery-empty-invocation.json" >/dev/null || {
