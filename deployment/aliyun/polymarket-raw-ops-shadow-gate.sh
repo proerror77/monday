@@ -393,11 +393,14 @@ verify_no_restart_after_cursor() {
   journalctl --sync || return 1
   journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
     | jq -s -e --arg expected "$expected_invocation_id" '
-      all(.[];
-        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
-        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
-        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
-      )
+      if $expected == "" then length == 0
+      else
+        all(.[];
+          ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+          and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+          and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+        )
+      end
     ' >/dev/null || return 1
 }
 
@@ -509,7 +512,9 @@ verify_recovery_binding() {
     and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
     and .baseline.drop_in_paths == []
     and (.baseline.restarts | type == "number" and floor == . and . >= 0)
-    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and (.baseline.invocation_id | type == "string"
+      and (. == "" or test("^[a-f0-9]{32}$")))
+    and (.baseline.journal_cursor | type == "string" and length > 0)
     and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
     and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and .baseline.binary_sha256 != $candidate
@@ -529,6 +534,7 @@ verify_recovery_admission() {
 verify_contained_recovery_baseline() {
   local recovery=$1 candidate=$2 source=$3 expected active_state main_pid
   local exec_argv fragment drop_ins restarts invocation binary_sha unit
+  local journal_cursor
   verify_recovery_binding "$recovery" "$candidate" "$source" || return 1
   expected=$(jq -c .baseline <<<"$recovery") || return 1
   active_state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT") || return 1
@@ -549,6 +555,11 @@ verify_contained_recovery_baseline() {
   secure_control_file "$RUST_ACTIVE_BINARY" || return 1
   binary_sha=$(sha256sum "$RUST_ACTIVE_BINARY" | awk '{print $1}') || return 1
   [[ $binary_sha == $(jq -er .binary_sha256 <<<"$expected") ]] || return 1
+  # The recorded journal position is the containment generation: any baseline
+  # start/stop/failure after admission appends unit records past the cursor,
+  # even when the process is gone again before the next sample.
+  journal_cursor=$(jq -er .journal_cursor <<<"$expected") || return 1
+  verify_no_restart_after_cursor "$LEGACY_UNIT" "$journal_cursor" "" || return 1
   for unit in polymarket-reference-upload.service polymarket-reference-upload.timer \
     polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
     [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
