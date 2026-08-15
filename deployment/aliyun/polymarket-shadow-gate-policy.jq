@@ -87,6 +87,7 @@ def contained_bootstrap_recovery($candidate; $source):
   and (.baseline.restarts | nonnegative_integer)
   and (.baseline.invocation_id | type == "string"
     and (. == "" or test("^[a-f0-9]{32}$")))
+  and (.baseline.journal_cursor | type == "string" and length > 0)
   and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
   and (.baseline.binary_sha256 | sha256)
   and .baseline.binary_sha256 != $candidate;

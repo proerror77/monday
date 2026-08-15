@@ -70,7 +70,7 @@ RECOVERY_PROBE_ROOT=$(prefix_path /data/monday/evidence/polymarket-candidate-pro
 readonly RECOVERY_PROBE_ROOT
 readonly CONTROL_LOCK="$RUN_ROOT/control.lock"
 
-for command in awk chmod cmp date flock install jq ln mkdir mv readlink rm sed sha256sum stat \
+for command in awk chmod cmp date flock install jq journalctl ln mkdir mv readlink rm sed sha256sum stat \
   sync systemctl tr; do
   command -v "$command" >/dev/null 2>&1 \
     || die "missing required command: $command"
@@ -713,7 +713,7 @@ read_baseline_identity() {
 
 recovery_baseline() {
   local candidate_sha=$1 active_state main_pid fragment drop_ins exec_argv
-  local restarts invocation binary_sha
+  local restarts invocation binary_sha journal_cursor
   active_state=$(systemctl_value "$COLLECTOR_UNIT" ActiveState) \
     || die 'cannot read contained baseline state'
   case "$active_state" in
@@ -746,13 +746,25 @@ recovery_baseline() {
   # recorded value is bound and re-checked verbatim downstream.
   [[ -z $invocation ]] || valid_invocation "$invocation" \
     || die 'contained baseline invocation ID is invalid'
+  # systemd also clears every per-unit timestamp/generation property when a
+  # simple unit deactivates (verified on 259.5), so the journal position is
+  # the only monotone containment generation available: any start, stop, or
+  # failure of the baseline after admission appends records past this cursor
+  # and is caught by the downstream live re-checks.
+  journalctl --sync \
+    || die 'cannot synchronize the contained baseline journal'
+  journal_cursor=$(journalctl --unit "$COLLECTOR_UNIT" --lines=0 --show-cursor \
+    --no-pager | sed -n 's/^-- cursor: //p')
+  [[ -n $journal_cursor ]] || die 'contained baseline journal cursor is empty'
   jq -cn --arg active_state "$active_state" --arg exec_start "$exec_argv" \
     --arg fragment_path "$fragment" --arg invocation_id "$invocation" \
+    --arg journal_cursor "$journal_cursor" \
     --arg binary_path "$RUST_ACTIVE_BINARY_PATH" --arg binary_sha256 "$binary_sha" \
     --argjson main_pid "$main_pid" --argjson restarts "$restarts" \
     '{active_state:$active_state,main_pid:$main_pid,exec_start:$exec_start,
       fragment_path:$fragment_path,drop_in_paths:[],restarts:$restarts,
-      invocation_id:$invocation_id,binary_path:$binary_path,binary_sha256:$binary_sha256}'
+      invocation_id:$invocation_id,journal_cursor:$journal_cursor,
+      binary_path:$binary_path,binary_sha256:$binary_sha256}'
 }
 
 verify_recovery_uploaders_stopped() {

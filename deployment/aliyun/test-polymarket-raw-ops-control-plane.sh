@@ -161,6 +161,8 @@ printf 'inactive\n' >"$supervisor_state/baseline-active"
 printf '0\n' >"$supervisor_state/baseline-main-pid"
 printf '2\n' >"$supervisor_state/baseline-restarts"
 printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
+printf '%s\n' 's=f117a34ab56114517b40bca1d5686544;i=c688f;b=5ae37843852646d4802319d80bea1205;m=3b5e870d04;t=6590d3b141564;x=c7af40f6aafe778' \
+  >"$supervisor_state/baseline-journal-cursor"
 printf '%s\n' '/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200' \
   >"$supervisor_state/baseline-exec"
 for uploader_unit in \
@@ -369,6 +371,22 @@ destination=${!#}
 exec /bin/rm "$@"
 EOF
 chmod 0755 "$supervisor_fake_bin/rm"
+cat >"$supervisor_fake_bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+read_state() { tr -d '\n' <"$FAKE_SYSTEMCTL_STATE/$1"; }
+case "$*" in
+  --sync)
+    exit 0
+    ;;
+  "--unit polymarket-reference-collector.service --lines=0 --show-cursor --no-pager")
+    printf '%s\n' "-- cursor: $(read_state baseline-journal-cursor)"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$supervisor_fake_bin/journalctl"
 
 flock_probe="$supervisor_tmp/flock-probe.lock"
 exec 7>"$flock_probe"
@@ -678,11 +696,13 @@ gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
   "$supervisor_source" "$supervisor_probe" >/dev/null
 empty_id_request="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_empty_id_invocation/request.json"
 jq -e '.recovery.baseline.invocation_id == ""
+  and (.recovery.baseline.journal_cursor | length > 0)
   and .recovery.baseline.active_state == "inactive"
   and .recovery.baseline.main_pid == 0
 ' "$empty_id_request" >/dev/null
 [[ $(admission_records_matching '
   .result == "admitted" and .baseline.invocation_id == ""
+  and (.baseline.journal_cursor | length > 0)
 ' | grep -c .) -eq 1 ]]
 gate_control cancel "$supervisor_candidate_sha" \
   "$supervisor_empty_id_invocation" >/dev/null
@@ -723,9 +743,12 @@ set_supervisor_state baseline-active inactive
 
 # A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
-sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE" >"$recovery_binding_contract"
-sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
-sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
+{
+  sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE"
+} >"$recovery_binding_contract"
 (
   set -euo pipefail
   RUST_ACTIVE_BINARY="$supervisor_baseline" LEGACY_UNIT=polymarket-reference-collector.service
@@ -735,6 +758,8 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
   recovery_restarts=2 recovery_invocation=$supervisor_baseline_invocation recovery_binary_sha=$supervisor_baseline_sha
   recovery_binary_secure=true
   recovery=$(jq -c .recovery "$supervisor_recovery_request")
+  recovery_journal_cursor=$(jq -er .baseline.journal_cursor <<<"$recovery")
+  recovery_journal_fixture=
   recovery_observed_epoch=1000 recovery_now=$recovery_observed_epoch
   date() {
     [[ $1 == -u ]] || { command date "$@"; return; }
@@ -748,12 +773,26 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
       *InvocationID*) printf '%s\n' "$recovery_invocation" ;; *) return 1 ;;
     esac
   }
+  journalctl() {
+    case "$*" in
+      --sync) return 0 ;;
+      "--unit $LEGACY_UNIT --after-cursor $recovery_journal_cursor --output=json --no-pager")
+        [[ -z $recovery_journal_fixture ]] || printf '%s\n' "$recovery_journal_fixture"
+        ;;
+      *) return 1 ;;
+    esac
+  }
   effective_exec_argv() { printf '%s\n' "$recovery_exec"; }
   secure_control_file() { [[ $recovery_binary_secure == true ]]; }
   sha256sum() { printf '%s  %s\n' "$recovery_binary_sha" "$1"; }
   # shellcheck source=/dev/null
   source "$recovery_binding_contract"
   verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_bad_cursor=$(jq -c '.baseline.journal_cursor = ""' <<<"$recovery")
+  if verify_recovery_binding "$recovery_bad_cursor" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery binding accepted an invalid journal cursor\n' >&2; exit 1
+  fi
   recovery_now=$((recovery_observed_epoch + 901))
   if verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"; then
     printf 'recovery admission accepted a stale probe\n' >&2; exit 1
@@ -775,6 +814,14 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
     "$supervisor_candidate_sha" "$supervisor_source"
   verify_contained_recovery_baseline "$recovery_empty_invocation" \
     "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_journal_fixture=$(jq -cn \
+    '{MESSAGE:"baseline started and stopped between samples"}')
+  if verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery identity check accepted a start-stop cycle after admission\n' >&2
+    exit 1
+  fi
+  recovery_journal_fixture=
   recovery_invocation=$supervisor_baseline_invocation
   if verify_contained_recovery_baseline "$recovery_empty_invocation" \
     "$supervisor_candidate_sha" "$supervisor_source"; then
@@ -2557,6 +2604,8 @@ gate_journal_contract=$(sed -n \
   printf 'shadow and cutover journal restart guards are missing or differ\n' >&2
   exit 1
 }
+grep -Fq 'verify_no_restart_after_cursor "$LEGACY_UNIT" "$journal_cursor" ""' "$GATE"
+grep -Fq 'verify_no_restart_after_cursor "$COLLECTOR_UNIT" "$journal_cursor" ""' "$CUTOVER"
 journal_contract="$tmp_dir/journal-contract.sh"
 printf '%s\n' "$cutover_journal_contract" >"$journal_contract"
 # shellcheck source=/dev/null
@@ -2612,6 +2661,18 @@ journal_failure_mode=none
 
 expected_invocation_id=$(printf '1%.0s' {1..32})
 other_invocation_id=$(printf '2%.0s' {1..32})
+journal_fixture=
+verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "" || {
+  printf 'journal containment guard rejected a quiet baseline\n' >&2
+  exit 1
+}
+journal_fixture=$(jq -cn '{MESSAGE:"baseline started and stopped between samples"}')
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" ""; then
+  printf 'journal containment guard accepted a start-stop cycle\n' >&2
+  exit 1
+fi
 journal_fixture=$(jq -cn '{MESSAGE_ID:"unrelated"}')
 verify_no_restart_after_cursor \
   "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id" || {
@@ -4534,6 +4595,7 @@ jq '
         exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
         fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
         drop_in_paths:[],restarts:2,invocation_id:("2" * 32),
+        journal_cursor:"s=f117a34ab56114517b40bca1d5686544;i=c688f;b=5ae37843852646d4802319d80bea1205;m=3b5e870d04;t=6590d3b141564;x=c7af40f6aafe778",
         binary_path:"/opt/monday/bin/polymarket-raw-ops",
         binary_sha256:(if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
       },
@@ -4574,6 +4636,7 @@ source_binding|.recovery.candidate_probe.source_revision = (if .deployment_sourc
 tagged_status|.recovery.candidate_probe.gamma.tagged_closed.http_status = 500
 baseline_active|.recovery.baseline.active_state = "active"
 baseline_invocation|.recovery.baseline.invocation_id = "not-an-invocation-id"
+baseline_journal_cursor|.recovery.baseline.journal_cursor = ""
 runtime_stability|.baseline_runtime_stability_required = true
 missing_recovery|.recovery = null
 baseline_is_candidate|.recovery.baseline.binary_sha256 = .candidate_sha256

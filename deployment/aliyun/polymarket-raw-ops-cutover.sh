@@ -671,11 +671,14 @@ verify_no_restart_after_cursor() {
   journalctl --sync || return 1
   journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
     | jq -s -e --arg expected "$expected_invocation_id" '
-      all(.[];
-        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
-        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
-        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
-      )
+      if $expected == "" then length == 0
+      else
+        all(.[];
+          ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+          and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+          and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+        )
+      end
     ' >/dev/null || return 1
 }
 
@@ -955,6 +958,7 @@ verify_bootstrap_rust_runtime() {
 verify_contained_bootstrap_recovery() {
   local recovery=$1 candidate_sha=$2 source_revision=$3 baseline
   local active_state main_pid fragment drop_ins exec_argv restarts invocation binary_sha unit
+  local journal_cursor
   jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
     .mode == "gamma_closed_200"
     and .candidate_probe.schema == "monday.polymarket_gamma_closed_200_recovery_probe.v1"
@@ -969,6 +973,7 @@ verify_contained_bootstrap_recovery() {
     and (.baseline.restarts | type == "number" and floor == . and . >= 0)
     and (.baseline.invocation_id | type == "string"
       and (. == "" or test("^[a-f0-9]{32}$")))
+    and (.baseline.journal_cursor | type == "string" and length > 0)
     and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
     and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and .baseline.binary_sha256 != $candidate
@@ -991,6 +996,11 @@ verify_contained_bootstrap_recovery() {
   secure_regular_file "$ACTIVE_BINARY" || return 1
   binary_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}') || return 1
   [[ $binary_sha == $(jq -er .binary_sha256 <<<"$baseline") ]] || return 1
+  # The recorded journal position is the containment generation: any baseline
+  # start/stop/failure after gate admission appends unit records past the
+  # cursor, even when the process is gone again before this re-check.
+  journal_cursor=$(jq -er .journal_cursor <<<"$baseline") || return 1
+  verify_no_restart_after_cursor "$COLLECTOR_UNIT" "$journal_cursor" "" || return 1
   for unit in "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER" \
     "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
     [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
