@@ -37,6 +37,7 @@ const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
+const MAX_STARTUP_DURATION: Duration = Duration::from_secs(300);
 const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -3049,7 +3050,7 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     let poll_interval = config.poll_interval;
     let stale_after = config.stale_after;
     let (_spool_lock, collector) =
-        initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
+        initialize_reference_collector_with_watchdog(MAX_STARTUP_DURATION, || {
             let spool_lock = ReferenceSpoolLock::acquire(&config.spool_dir)?;
             Ok((spool_lock, ReferenceCollector::new(config)?))
         })?;
@@ -3383,6 +3384,12 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "startup watchdog did not terminate the child promptly"
         );
+    }
+
+    #[test]
+    fn startup_recovery_has_its_own_bounded_watchdog_budget() {
+        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(300));
+        assert!(MAX_STARTUP_DURATION > MAX_CYCLE_DURATION);
     }
 
     #[test]

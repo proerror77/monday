@@ -5450,6 +5450,12 @@ cutover_health_silence_seconds=$(
     "$cutover_health_silence_seconds" >&2
   exit 1
 }
+grep -Fxq 'readonly STARTUP_RECOVERY_SECONDS=300' "$CUTOVER"
+grep -Fxq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$CUTOVER"
+grep -Fxq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$CUTOVER"
+grep -Fxq 'readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$CUTOVER"
+grep -Fq 'health_deadline=$((SECONDS + CUTOVER_HEALTH_TIMEOUT_SECONDS))' "$CUTOVER"
+grep -Fq 'while ((SECONDS < health_deadline)); do' "$CUTOVER"
 grep -Fq 'legacy_health_state=$(legacy_health_sample_state' "$GATE"
 grep -Fq '"$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}"' \
   "$GATE"
