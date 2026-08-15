@@ -716,6 +716,24 @@ atomic_install() {
   mv -Tf "$temporary" "$destination"
 }
 
+reset_failed_unit_if_needed() {
+  local unit=$1 active_state restarts
+  active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$unit") || return 1
+  [[ $restarts =~ ^[0-9]+$ ]] || return 1
+  case "$active_state" in
+    inactive)
+      [[ $restarts == 0 ]] || systemctl reset-failed "$unit" || return 1
+      ;;
+    failed)
+      systemctl reset-failed "$unit" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ $(systemctl show --property=ActiveState --value "$unit") == inactive \
+    && $(systemctl show --property=NRestarts --value "$unit") == 0 ]]
+}
+
 unit_active() {
   systemctl is-active --quiet "$1"
 }
@@ -1288,7 +1306,7 @@ restore_legacy() (
   sync -f /opt/monday
   systemctl daemon-reload
   if [[ $contained_recovery == true ]]; then
-    systemctl reset-failed "$COLLECTOR_UNIT"
+    reset_failed_unit_if_needed "$COLLECTOR_UNIT"
     systemctl stop "$COLLECTOR_UNIT"
     for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
       if jq -e --arg unit "$asset" '.units[$unit].enabled == true' \
@@ -1310,7 +1328,7 @@ restore_legacy() (
     printf '%s\n' "$evidence_dir"
     return
   fi
-  systemctl reset-failed "$COLLECTOR_UNIT"
+  reset_failed_unit_if_needed "$COLLECTOR_UNIT"
   [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
     || die 'legacy restart counter did not reset before rollback verification'
   started_epoch=$(date -u +%s)
@@ -1921,7 +1939,7 @@ systemctl daemon-reload
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit or timer identity differs from the gated configuration'
 
-systemctl reset-failed "$COLLECTOR_UNIT"
+reset_failed_unit_if_needed "$COLLECTOR_UNIT"
 [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
   || die 'collector restart counter did not reset before Rust verification'
 started_epoch=$(date -u +%s)
@@ -1974,7 +1992,7 @@ systemctl start "$REFERENCE_UPLOAD_UNIT"
   || die 'pinned OSS configuration changed during reference upload'
 verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
   || die 'Rust reference uploader did not complete successfully'
-systemctl reset-failed "$MARKET_UPLOAD_UNIT"
+reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"
 market_upload_invocation_before=$(systemctl show \
   --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
 systemctl start --no-block "$MARKET_UPLOAD_UNIT"

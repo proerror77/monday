@@ -5763,7 +5763,56 @@ legacy_stopped_equality_line=$(grep -n \
   | cut -d: -f1)
 cutover_clear_line=$(grep -n '^clear_health_before_restart "$evidence_dir" pre-cutover$' \
   "$CUTOVER" | cut -d: -f1)
-cutover_reset_line=$(grep -n '^systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+reset_function="$tmp_dir/cutover-reset-function.sh"
+awk '
+  /^reset_failed_unit_if_needed\(\) \{$/ {copy=1}
+  copy {print}
+  copy && /^}$/ {exit}
+' "$CUTOVER" >"$reset_function"
+[[ -s $reset_function ]] || {
+  printf 'cutover has no shared failure-state reset helper\n' >&2
+  exit 1
+}
+run_reset_case() (
+  local initial_state=$1 initial_restarts=$2 reset_allowed=$3
+  local expected_result=$4 expected_calls=$5
+  local current_state=$initial_state current_restarts=$initial_restarts
+  local reset_calls=0 result=failure property argument
+  # shellcheck disable=SC2317
+  systemctl() {
+    case "${1:-}" in
+      show)
+        property=
+        for argument in "$@"; do
+          [[ $argument == --property=* ]] && property=${argument#--property=}
+        done
+        case "$property" in
+          ActiveState) printf '%s\n' "$current_state" ;;
+          NRestarts) printf '%s\n' "$current_restarts" ;;
+          *) return 2 ;;
+        esac
+        ;;
+      reset-failed)
+        ((reset_calls += 1))
+        [[ $reset_allowed == true ]] || return 5
+        current_state=inactive
+        current_restarts=0
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  # shellcheck disable=SC1090
+  source "$reset_function"
+  reset_failed_unit_if_needed example.service && result=success
+  [[ $result == "$expected_result" && $reset_calls == "$expected_calls" ]]
+)
+run_reset_case inactive 0 false success 0
+run_reset_case failed 2 true success 1
+run_reset_case inactive 2 true success 1
+run_reset_case failed 0 false failure 1
+run_reset_case active 0 true failure 0
+
+cutover_reset_line=$(grep -n '^reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
@@ -5782,7 +5831,7 @@ cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER
   exit 1
 }
 rollback_reload_line=$(grep -n '^  systemctl daemon-reload$' "$CUTOVER" | cut -d: -f1)
-rollback_reset_line=$(grep -n '^  systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+rollback_reset_line=$(grep -n '^  reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 rollback_restart_line=$(grep -n '^  systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
@@ -5885,7 +5934,7 @@ grep -Fq 'systemctl start --no-block "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq \
   'verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before"' \
   "$CUTOVER"
-grep -Fq 'systemctl reset-failed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
+grep -Fq 'reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 [[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 3 ]]
 grep -Fq 'unit_active "$REFERENCE_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'unit_active "$MARKET_UPLOAD_TIMER"' "$CUTOVER"
