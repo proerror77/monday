@@ -37,7 +37,7 @@ const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
-const MAX_STARTUP_DURATION: Duration = Duration::from_secs(300);
+const MAX_STARTUP_DURATION: Duration = Duration::from_secs(600);
 const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -3388,7 +3388,7 @@ mod tests {
 
     #[test]
     fn startup_recovery_has_its_own_bounded_watchdog_budget() {
-        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(300));
+        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(600));
         assert!(MAX_STARTUP_DURATION > MAX_CYCLE_DURATION);
     }
 
