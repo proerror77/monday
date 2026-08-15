@@ -1,0 +1,28 @@
+[Unit]
+Description=Run the Monday OSS data-completeness reconciliation (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hftcollector
+Group=hftcollector
+Environment=HOME=/var/lib/hft-collector
+ExecStart=/opt/monday/bin/data-completeness-check.sh --json --output /var/lib/monday-data-completeness/report.json
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+StateDirectory=monday-data-completeness
+# The check only lists OSS prefixes over the internal endpoint.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
+Nice=10
+MemoryHigh=128M
+MemoryMax=256M

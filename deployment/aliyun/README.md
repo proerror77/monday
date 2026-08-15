@@ -243,6 +243,57 @@ systemctl status monday-collector-health.service --no-pager -n 5
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
 
+### Data completeness check
+
+`deployment/aliyun/data-completeness-check.sh` (#882) is a POSIX `sh`,
+read-only OSS reconciliation: it compares EXPECTED vs ACTUAL hour partitions
+in the `lake/raw/` lake for every production dataset and fails closed (exit 1)
+on any missing partition, triplet violation, or OSS listing failure. It guards
+against silent hour-level holes like the 2026-08-14 audit findings (a ~36-hour
+USD-M gap, scattered Bybit single-hour losses, Polymarket data stopping ~12
+hours before the reported outage).
+
+Governed datasets and their completeness rules:
+
+| Dataset | Lake prefix | Rule |
+| --- | --- | --- |
+| `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all/` | same triplet |
+| `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
+| `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
+| `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
+
+An hour is expected once it has ended and the per-dataset grace lag has passed
+(default 1 hour: the current hour is still collecting and the previous hour may
+still be in flight). Configuration: `COMPLETENESS_WINDOW_DAYS` (default 2),
+`COMPLETENESS_GRACE_HOURS` plus per-dataset
+`COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}`, and the
+usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. The JSON
+report (`--json`, or `--output FILE`) carries per-dataset `expected_hours`,
+`present_hours`, `missing_partitions`, `triplet_violations`,
+`latest_landed_hour`, and `lag_seconds`.
+`test-data-completeness-check.sh` is the self-contained offline contract test
+(stubbed `aliyun ossutil ls` over a fixture lake).
+
+Install (a governed runtime change, same controller/target/rollback template
+as the health monitor above):
+
+```bash
+sudo install -m 0755 deployment/aliyun/data-completeness-check.sh \
+  /opt/monday/bin/data-completeness-check.sh
+sudo install -m 0644 deployment/aliyun/data-completeness-check.service \
+  deployment/aliyun/data-completeness-check.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now data-completeness-check.timer
+```
+
+The timer runs hourly at :35 (after the :23 upload sweep); the oneshot writes
+its JSON report to `/var/lib/monday-data-completeness/report.json`. Rollback:
+`sudo systemctl disable --now data-completeness-check.timer`, remove the three
+installed files, `sudo rm -rf /var/lib/monday-data-completeness`, and
+`sudo systemctl daemon-reload`.
+
 ### Cloud Monitor disk alarm (PRIMARY)
 
 The on-host timer and the GitHub workflow cannot alert if the host is
