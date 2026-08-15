@@ -1,0 +1,13 @@
+[Unit]
+Description=Reconcile expected vs actual OSS hour partitions every hour
+
+[Timer]
+OnBootSec=5min
+# Segments finalize on the hour and the slowest upload sweep lands at :23, so
+# run mid-hour: every expected partition is then inside its grace lag.
+OnCalendar=*-*-* *:35:00
+Persistent=true
+Unit=data-completeness-check.service
+
+[Install]
+WantedBy=timers.target
