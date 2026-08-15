@@ -666,6 +666,35 @@ gate_control cancel "$supervisor_candidate_sha" \
 set_supervisor_state baseline-active inactive
 set_supervisor_state baseline-restarts 2
 
+# systemd clears the invocation ID of an inactive Type=simple baseline: a
+# clean stop clears it, and the governed reset-failed of a failed unit clears
+# it as well (observed on systemd 259). Admission binds the recorded empty
+# identity verbatim; a malformed ID remains refused.
+: >"$supervisor_state/baseline-invocation"
+supervisor_empty_id_invocation=$(printf '0%.0s' {1..32})
+set_supervisor_state invocation "$supervisor_empty_id_invocation"
+set_supervisor_state active inactive
+gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe" >/dev/null
+empty_id_request="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_empty_id_invocation/request.json"
+jq -e '.recovery.baseline.invocation_id == ""
+  and .recovery.baseline.active_state == "inactive"
+  and .recovery.baseline.main_pid == 0
+' "$empty_id_request" >/dev/null
+[[ $(admission_records_matching '
+  .result == "admitted" and .baseline.invocation_id == ""
+' | grep -c .) -eq 1 ]]
+gate_control cancel "$supervisor_candidate_sha" \
+  "$supervisor_empty_id_invocation" >/dev/null
+printf 'not-a-valid-invocation-id\n' >"$supervisor_state/baseline-invocation"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("invocation ID"))' \
+  | grep -c .) -ge 1 ]]
+printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
+set_supervisor_state baseline-restarts 2
+
 # Each failed uploader unit is admitted through a governed reset-failed inside
 # the control lock, exactly like the failed baseline.
 failed_uploader_letters=(c e f a)
@@ -737,6 +766,21 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
     printf 'recovery identity check accepted an insecure baseline binary\n' >&2; exit 1
   fi
   recovery_binary_secure=true
+  # A contained simple baseline has a systemd-cleared (empty) invocation ID:
+  # the recorded empty identity verifies against an empty live value, and an
+  # ID assigned by a later start is drift.
+  recovery_empty_invocation=$(jq -c '.baseline.invocation_id = ""' <<<"$recovery")
+  recovery_invocation=''
+  verify_recovery_binding "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"
+  verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_invocation=$supervisor_baseline_invocation
+  if verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery identity check accepted an assigned ID over recorded empty\n' >&2
+    exit 1
+  fi
   for recovery_drift in active fragment drop_ins exec restarts invocation binary; do
     recovery_active_state=inactive recovery_fragment=/etc/systemd/system/polymarket-reference-collector.service
     recovery_drop_ins='' recovery_exec='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
@@ -4511,6 +4555,12 @@ jq -e -f "$POLICY" "$tmp_dir/contained-recovery-gate.json" >/dev/null || {
   printf 'gate policy rejected a verified contained bootstrap recovery\n' >&2
   exit 1
 }
+jq '.recovery.baseline.invocation_id = ""' "$tmp_dir/contained-recovery-gate.json" \
+  >"$tmp_dir/contained-recovery-empty-invocation.json"
+jq -e -f "$POLICY" "$tmp_dir/contained-recovery-empty-invocation.json" >/dev/null || {
+  printf 'gate policy rejected a contained baseline with a systemd-cleared invocation ID\n' >&2
+  exit 1
+}
 while IFS='|' read -r name filter; do
   jq "$filter" "$tmp_dir/contained-recovery-gate.json" \
     >"$tmp_dir/contained-recovery-$name.json"
@@ -4523,6 +4573,7 @@ candidate_binding|.recovery.candidate_probe.candidate_sha256 = (if .candidate_sh
 source_binding|.recovery.candidate_probe.source_revision = (if .deployment_source_revision == ("0" * 40) then ("1" * 40) else ("0" * 40) end)
 tagged_status|.recovery.candidate_probe.gamma.tagged_closed.http_status = 500
 baseline_active|.recovery.baseline.active_state = "active"
+baseline_invocation|.recovery.baseline.invocation_id = "not-an-invocation-id"
 runtime_stability|.baseline_runtime_stability_required = true
 missing_recovery|.recovery = null
 baseline_is_candidate|.recovery.baseline.binary_sha256 = .candidate_sha256

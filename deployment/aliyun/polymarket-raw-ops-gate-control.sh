@@ -740,7 +740,12 @@ recovery_baseline() {
     || die 'contained baseline restart counter is invalid'
   invocation=$(systemctl_value "$COLLECTOR_UNIT" InvocationID) \
     || die 'cannot read contained baseline invocation ID'
-  valid_invocation "$invocation" || die 'contained baseline invocation ID is invalid'
+  # systemd reports an empty InvocationID for an inactive Type=simple unit
+  # (stop, and the governed reset-failed of a failed unit, both clear it), so
+  # the empty string is the expected identity of a contained baseline; the
+  # recorded value is bound and re-checked verbatim downstream.
+  [[ -z $invocation ]] || valid_invocation "$invocation" \
+    || die 'contained baseline invocation ID is invalid'
   jq -cn --arg active_state "$active_state" --arg exec_start "$exec_argv" \
     --arg fragment_path "$fragment" --arg invocation_id "$invocation" \
     --arg binary_path "$RUST_ACTIVE_BINARY_PATH" --arg binary_sha256 "$binary_sha" \

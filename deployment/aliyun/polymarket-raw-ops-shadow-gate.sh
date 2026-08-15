@@ -509,7 +509,8 @@ verify_recovery_binding() {
     and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
     and .baseline.drop_in_paths == []
     and (.baseline.restarts | type == "number" and floor == . and . >= 0)
-    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and (.baseline.invocation_id | type == "string"
+      and (. == "" or test("^[a-f0-9]{32}$")))
     and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
     and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and .baseline.binary_sha256 != $candidate
