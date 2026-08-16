@@ -2,11 +2,14 @@
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    CandidateEvaluation, DeploymentEnvelope, EngineKind, EvaluationProtocolV1,
+    CandidateEvaluation, CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
+    CexFourStageStrategyCandidateV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
+    CexSealedHoldoutClaimV1, DeploymentEnvelope, EngineKind, EvaluationProtocolV1,
     FormulaEvaluatorConfig, IterationVerdict, LearningDirective, LiveSmallEligibilityEvidence,
     LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration,
     ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision,
     SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
+    CEX_FINAL_PRECOMMIT_REGISTRY_KIND, CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND,
     ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
     SEALED_HOLDOUT_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
 };
@@ -77,6 +80,250 @@ fn mission_evaluation_protocol_binding(
         &mission_evaluation_protocol_revision_id(mission_id),
     )?;
     validate_mission_evaluation_protocol_revision(&revision, mission_id)
+}
+
+fn ensure_cex_search_open(connection: &Connection, mission_id: &str) -> Result<(), StoreError> {
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM registry_revisions WHERE registry_kind = ? AND asset_id = ?",
+            params![CEX_FINAL_PRECOMMIT_REGISTRY_KIND, mission_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error)?;
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(StoreError::Domain(
+            "CEX final precommit makes mission search and resume terminal".to_string(),
+        ))
+    }
+}
+
+fn require_registry_payload_reference(
+    connection: &Connection,
+    reference: &CexResearchContentRefV1,
+    registry_kind: &str,
+) -> Result<RegistryRevision, StoreError> {
+    reference.validate().map_err(domain_error)?;
+    let revision: RegistryRevision = read_json_row(
+        connection,
+        "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
+        &reference.id,
+    )?;
+    let payload_hash = canonical_json_hash(&revision.payload).map_err(domain_error)?;
+    if revision.registry_kind != registry_kind || payload_hash != reference.content_sha256 {
+        return Err(StoreError::Domain(format!(
+            "CEX final precommit reference {} expected {registry_kind}/{} but read {}/{}",
+            reference.id, reference.content_sha256, revision.registry_kind, payload_hash
+        )));
+    }
+    Ok(revision)
+}
+
+fn require_typed_registry_payload_reference<T>(
+    connection: &Connection,
+    reference: &CexResearchContentRefV1,
+    registry_kind: &str,
+) -> Result<T, StoreError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    reference.validate().map_err(domain_error)?;
+    let revision: RegistryRevision = read_json_row(
+        connection,
+        "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
+        &reference.id,
+    )?;
+    let payload: T = serde_json::from_value(revision.payload).map_err(serialization_error)?;
+    let payload_hash = canonical_json_hash(&payload).map_err(domain_error)?;
+    if revision.registry_kind != registry_kind || payload_hash != reference.content_sha256 {
+        return Err(StoreError::Domain(format!(
+            "CEX final precommit typed reference {} expected {registry_kind}/{} but read {}/{}",
+            reference.id, reference.content_sha256, revision.registry_kind, payload_hash
+        )));
+    }
+    Ok(payload)
+}
+
+fn validate_cex_precommit_dependencies(
+    connection: &Connection,
+    precommit: &CexFinalPrecommitV1,
+    strategy: &CexFourStageStrategyCandidateV1,
+) -> Result<(), StoreError> {
+    strategy
+        .validate_against_precommit(precommit)
+        .map_err(domain_error)?;
+    let mission_revision =
+        require_registry_payload_reference(connection, &precommit.mission, "cex_research_mission")?;
+    let control_mission: CexResearchMissionArtifactV1 =
+        serde_json::from_value(mission_revision.payload).map_err(serialization_error)?;
+    control_mission.validate().map_err(domain_error)?;
+    if control_mission.semantic_id().map_err(domain_error)? != precommit.mission.id
+        || control_mission.spec.inputs.snapshot != precommit.snapshot
+        || control_mission.spec.inputs.dataset != precommit.dataset
+        || control_mission.spec.inputs.partition != precommit.partition
+        || control_mission.spec.inputs.source != precommit.source
+        || control_mission.spec.policies.weight != precommit.weight_policy
+        || control_mission.spec.policies.evaluation != precommit.evaluation_protocol
+        || control_mission.spec.holdout.holdout_id != precommit.holdout_id
+        || control_mission.spec.holdout.state != precommit.holdout_state
+        || control_mission.spec.instrument.venue != strategy.venue
+        || control_mission.spec.instrument.market != strategy.market
+        || control_mission.spec.instrument.symbol != strategy.symbol
+    {
+        return Err(StoreError::Domain(
+            "CEX final precommit does not match its Mission inputs and policies".to_string(),
+        ));
+    }
+    let factor_bank: CexFactorBankRevisionV2 = require_typed_registry_payload_reference(
+        connection,
+        &precommit.factor_bank,
+        "cex_factor_bank",
+    )?;
+    factor_bank.validate().map_err(domain_error)?;
+    strategy
+        .validate_against_factor_bank(&factor_bank)
+        .map_err(domain_error)?;
+    for (reference, kind) in [
+        (&precommit.ridge_baseline, "cex_baseline_ridge"),
+        (&precommit.cart_baseline, "cex_baseline_cart"),
+    ] {
+        let baseline: CexBaselineArtifactV1 =
+            require_typed_registry_payload_reference(connection, reference, kind)?;
+        baseline.validate().map_err(domain_error)?;
+    }
+    require_registry_payload_reference(connection, &precommit.baseline_gate, "cex_baseline_gate")?;
+    let replay = require_registry_payload_reference(
+        connection,
+        &precommit.replay_receipt,
+        "cex_event_replay_receipt",
+    )?;
+    let replay_reference =
+        |field: &str| -> Result<CexResearchContentRefV1, StoreError> {
+            serde_json::from_value(replay.payload.get(field).cloned().ok_or_else(|| {
+                StoreError::Domain("CEX replay receipt is incomplete".to_string())
+            })?)
+            .map_err(serialization_error)
+        };
+    if replay.asset_id != precommit.mission.id
+        || replay.parent_revision_id.as_deref() != Some(precommit.four_stage_strategy.id.as_str())
+        || replay
+            .payload
+            .get("receipt_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.replay_receipt.id.as_str())
+        || replay
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.mission.id.as_str())
+        || replay_reference("strategy")? != precommit.four_stage_strategy
+        || replay_reference("dataset")? != precommit.dataset
+        || replay_reference("source")? != precommit.source
+        || replay
+            .payload
+            .pointer("/gate/passed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || replay
+            .payload
+            .get("holdout_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.holdout_id.as_str())
+        || replay
+            .payload
+            .get("holdout_state")
+            .and_then(serde_json::Value::as_str)
+            != Some("unopened")
+        || replay
+            .payload
+            .get("deployment_authority")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || replay
+            .payload
+            .get("order_submission_authority")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || replay
+            .payload
+            .get("capabilities_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.replay_capabilities_sha256.as_str())
+    {
+        return Err(StoreError::Domain(
+            "CEX replay receipt does not prove the exact passing precommit strategy".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cex_sealed_revision(
+    revision: &RegistryRevision,
+    claim: &CexSealedHoldoutClaimV1,
+    precommit: &CexFinalPrecommitV1,
+) -> Result<CandidateEvaluation, StoreError> {
+    let evaluation: CandidateEvaluation =
+        serde_json::from_value(revision.payload.get("evaluation").cloned().ok_or_else(|| {
+            StoreError::Domain("sealed evaluation receipt is incomplete".to_string())
+        })?)
+        .map_err(serialization_error)?;
+    evaluation.validate().map_err(domain_error)?;
+    let (_, protocol_hash) = evaluation.protocol_binding().map_err(domain_error)?;
+    let expected_precommit_hash = canonical_json_hash(precommit).map_err(domain_error)?;
+    if revision.revision_id
+        != sealed_evaluation_revision_id(&claim.candidate.id, SEALED_HOLDOUT_EVALUATOR_VERSION)
+        || revision.registry_kind != "sealed_evaluation"
+        || revision.asset_id != claim.candidate.id
+        || revision.parent_revision_id.as_deref() != Some(claim.claim_id.as_str())
+        || revision
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.mission_id.as_str())
+        || revision
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.candidate.content_sha256.as_str())
+        || revision
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.dataset_manifest_id.as_str())
+        || revision
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.evaluation_protocol.content_sha256.as_str())
+        || revision
+            .payload
+            .get("precommit_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.precommit.id.as_str())
+        || revision
+            .payload
+            .get("precommit_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_precommit_hash.as_str())
+        || revision
+            .payload
+            .get("sealed_access_claim_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.claim_id.as_str())
+        || revision
+            .payload
+            .get("holdout_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.holdout_id.as_str())
+        || evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+        || protocol_hash != claim.evaluation_protocol.content_sha256
+    {
+        return Err(StoreError::Domain(
+            "sealed evaluation receipt does not match the exact final precommit".to_string(),
+        ));
+    }
+    Ok(evaluation)
 }
 
 #[derive(Debug, Error)]
@@ -547,6 +794,7 @@ impl AlphaStore {
         candidate: Option<(&str, &CandidateArtifact)>,
         evaluation: Option<&EvaluationRecord>,
     ) -> Result<(), StoreError> {
+        ensure_cex_search_open(&self.connection, &iteration.mission_id)?;
         validate_iteration_records(iteration, candidate, evaluation)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
         let iteration_hash =
@@ -594,6 +842,7 @@ impl AlphaStore {
         checkpoint: &RunCheckpoint,
         allow_legacy_protocol_upgrade: bool,
     ) -> Result<(), StoreError> {
+        ensure_cex_search_open(&self.connection, &iteration.mission_id)?;
         validate_iteration_records(iteration, candidate, evaluation)?;
         validate_checkpoint_for_iteration(checkpoint, iteration)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
@@ -625,6 +874,7 @@ impl AlphaStore {
     }
 
     pub fn save_checkpoint(&mut self, checkpoint: &RunCheckpoint) -> Result<(), StoreError> {
+        ensure_cex_search_open(&self.connection, &checkpoint.mission_id)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
         let hash = upsert_checkpoint(&transaction, checkpoint, &self.integrity_key, false)?;
         append_journal(
@@ -961,6 +1211,342 @@ impl AlphaStore {
         )
     }
 
+    pub fn put_cex_final_precommit(
+        &mut self,
+        iteration: &ResearchIteration,
+        candidate_id: &str,
+        candidate: &CandidateArtifact,
+        evaluation: &EvaluationRecord,
+        precommit: &CexFinalPrecommitV1,
+    ) -> Result<RegistryRevision, StoreError> {
+        precommit.validate().map_err(domain_error)?;
+        validate_iteration_records(iteration, Some((candidate_id, candidate)), Some(evaluation))?;
+        let CandidateArtifact::CexFourStage(strategy) = candidate else {
+            return Err(StoreError::Domain(
+                "CEX final precommit requires a four-stage candidate".to_string(),
+            ));
+        };
+        strategy.validate().map_err(domain_error)?;
+        let mission = self.get_mission(&iteration.mission_id)?;
+        if mission.status != MissionStatus::Completed
+            || iteration.mission_id != precommit.mission.id
+            || iteration.engine != EngineKind::Mcts
+            || iteration.verdict != IterationVerdict::Keep
+            || mission.dataset_manifest_id != precommit.dataset_manifest_id
+        {
+            return Err(StoreError::Domain(
+                "CEX final precommit does not match its terminal mission".to_string(),
+            ));
+        }
+        if candidate_id != precommit.final_candidate.id
+            || strategy.precommit_id != precommit.precommit_id
+            || strategy.mission_id != precommit.mission.id
+        {
+            return Err(StoreError::Domain(
+                "CEX final precommit does not match its candidate identity".to_string(),
+            ));
+        }
+        if strategy.strategy_artifact_id != precommit.four_stage_strategy.id
+            || strategy.strategy_artifact_sha256 != precommit.four_stage_strategy.content_sha256
+        {
+            return Err(StoreError::Domain(
+                "CEX final precommit does not match its four-stage strategy content".to_string(),
+            ));
+        }
+        if strategy.evaluation_protocol_hash != precommit.evaluation_protocol.content_sha256 {
+            return Err(StoreError::Domain(
+                "CEX final precommit does not match its evaluation protocol".to_string(),
+            ));
+        }
+        let (_, candidate_hash) = encoded(candidate)?;
+        if candidate_hash != precommit.final_candidate.content_sha256 {
+            return Err(StoreError::Domain(
+                "CEX final candidate identity drifted".to_string(),
+            ));
+        }
+        let typed_evaluation: CandidateEvaluation =
+            serde_json::from_value(evaluation.payload.clone()).map_err(serialization_error)?;
+        typed_evaluation.validate().map_err(domain_error)?;
+        if evaluation.evaluation_id != precommit.final_walk_forward_evaluation.id
+            || canonical_json_hash(&typed_evaluation).map_err(domain_error)?
+                != precommit.final_walk_forward_evaluation.content_sha256
+        {
+            return Err(StoreError::Domain(
+                "CEX final walk-forward identity drifted".to_string(),
+            ));
+        }
+        let (_, protocol_hash) = typed_evaluation.protocol_binding().map_err(domain_error)?;
+        let strategy_artifact: serde_json::Value =
+            serde_json::from_str(&strategy.strategy_artifact_json).map_err(serialization_error)?;
+        let selected_evaluation: CandidateEvaluation = serde_json::from_value(
+            strategy_artifact
+                .pointer("/walk_forward_evidence/selected/evaluation")
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::Domain(
+                        "CEX four-stage candidate has no selected walk-forward evidence"
+                            .to_string(),
+                    )
+                })?,
+        )
+        .map_err(serialization_error)?;
+        if !typed_evaluation.passed
+            || typed_evaluation.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+            || typed_evaluation != selected_evaluation
+            || protocol_hash != precommit.evaluation_protocol.content_sha256
+            || typed_evaluation.formula_config().map_err(domain_error)?
+                != FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?
+        {
+            return Err(StoreError::Domain(
+                "CEX final candidate lacks its exact passing walk-forward evidence".to_string(),
+            ));
+        }
+        self.require_mission_evaluation_protocol(
+            &mission.mission_id,
+            typed_evaluation.protocol_binding().map_err(domain_error)?.0,
+        )?;
+        validate_cex_precommit_dependencies(&self.connection, precommit, strategy)?;
+
+        let revision = RegistryRevision {
+            revision_id: precommit.precommit_id.clone(),
+            registry_kind: CEX_FINAL_PRECOMMIT_REGISTRY_KIND.to_string(),
+            asset_id: precommit.mission.id.clone(),
+            parent_revision_id: Some(precommit.replay_receipt.id.clone()),
+            payload: serde_json::to_value(precommit).map_err(serialization_error)?,
+            created_at: iteration.created_at,
+        };
+        match self.get_registry_revision(&revision.revision_id) {
+            Ok(existing) => {
+                let stored_iteration: ResearchIteration = read_json_row(
+                    &self.connection,
+                    "SELECT payload_json, content_hash FROM iterations WHERE iteration_id = ?",
+                    &iteration.iteration_id,
+                )?;
+                let stored_candidate: CandidateArtifact = read_json_row(
+                    &self.connection,
+                    "SELECT payload_json, content_hash FROM candidate_artifacts WHERE candidate_id = ?",
+                    candidate_id,
+                )?;
+                let stored_evaluation: EvaluationRecord = read_json_row(
+                    &self.connection,
+                    "SELECT payload_json, content_hash FROM evaluation_artifacts WHERE evaluation_id = ?",
+                    &evaluation.evaluation_id,
+                )?;
+                if existing == revision
+                    && stored_iteration == *iteration
+                    && stored_candidate == *candidate
+                    && stored_evaluation == *evaluation
+                {
+                    return Ok(existing);
+                }
+                return Err(StoreError::Domain(
+                    "CEX final precommit conflicts with existing mission truth".to_string(),
+                ));
+            }
+            Err(StoreError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let competing = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM registry_revisions WHERE registry_kind = ? AND asset_id = ?",
+                params![CEX_FINAL_PRECOMMIT_REGISTRY_KIND, precommit.mission.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(database_error)?;
+        if competing != 0 {
+            return Err(StoreError::Domain(
+                "a Mission can have only one final precommit".to_string(),
+            ));
+        }
+
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        let iteration_hash = insert_iteration_records(
+            &transaction,
+            iteration,
+            Some((candidate_id, candidate)),
+            Some(evaluation),
+        )?;
+        let (revision_json, revision_hash) = encoded(&revision)?;
+        ensure_absent(
+            &transaction,
+            "registry_revisions",
+            "revision_id",
+            &revision.revision_id,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO registry_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    revision.revision_id,
+                    revision.registry_kind,
+                    revision.asset_id,
+                    revision.parent_revision_id,
+                    revision_json,
+                    revision_hash,
+                    revision.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(database_error)?;
+        append_journal(
+            &transaction,
+            Some(&iteration.mission_id),
+            "iteration_appended",
+            &iteration.iteration_id,
+            &iteration_hash,
+            iteration.created_at,
+        )?;
+        append_journal(
+            &transaction,
+            Some(&iteration.mission_id),
+            "cex_final_precommit_added",
+            &revision.revision_id,
+            &revision_hash,
+            revision.created_at,
+        )?;
+        transaction.commit().map_err(database_error)?;
+        Ok(revision)
+    }
+
+    pub fn claim_cex_sealed_holdout(
+        &mut self,
+        claim: &CexSealedHoldoutClaimV1,
+        at: DateTime<Utc>,
+    ) -> Result<Option<RegistryRevision>, StoreError> {
+        claim.validate().map_err(domain_error)?;
+        let precommit_revision = self.get_registry_revision(&claim.precommit.id)?;
+        let precommit: CexFinalPrecommitV1 =
+            serde_json::from_value(precommit_revision.payload.clone())
+                .map_err(serialization_error)?;
+        precommit.validate().map_err(domain_error)?;
+        if precommit_revision.registry_kind != CEX_FINAL_PRECOMMIT_REGISTRY_KIND
+            || precommit_revision.asset_id != claim.mission_id
+            || canonical_json_hash(&precommit).map_err(domain_error)?
+                != claim.precommit.content_sha256
+            || precommit.final_candidate != claim.candidate
+            || precommit.evaluation_protocol != claim.evaluation_protocol
+            || precommit.holdout_id != claim.holdout_id
+        {
+            return Err(StoreError::Domain(
+                "sealed holdout claim does not match the final precommit".to_string(),
+            ));
+        }
+        let sealed_id =
+            sealed_evaluation_revision_id(&claim.candidate.id, SEALED_HOLDOUT_EVALUATOR_VERSION);
+        match self.get_registry_revision(&sealed_id) {
+            Ok(existing) => {
+                validate_cex_sealed_revision(&existing, claim, &precommit)?;
+                return Ok(Some(existing));
+            }
+            Err(StoreError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let claim_revision = RegistryRevision {
+            revision_id: claim.claim_id.clone(),
+            registry_kind: CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND.to_string(),
+            asset_id: claim.mission_id.clone(),
+            parent_revision_id: Some(claim.precommit.id.clone()),
+            payload: serde_json::to_value(claim).map_err(serialization_error)?,
+            created_at: at,
+        };
+        match self.put_registry_revision(&claim_revision) {
+            Ok(()) => Ok(None),
+            Err(StoreError::DuplicateRecord) => {
+                let existing_claim = self.get_registry_revision(&claim.claim_id)?;
+                let stored: CexSealedHoldoutClaimV1 =
+                    serde_json::from_value(existing_claim.payload.clone())
+                        .map_err(serialization_error)?;
+                if existing_claim.registry_kind != CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND
+                    || stored != *claim
+                {
+                    return Err(StoreError::Domain(
+                        "sealed holdout opening conflicts with an existing claim".to_string(),
+                    ));
+                }
+                match self.get_registry_revision(&sealed_id) {
+                    Ok(existing) => {
+                        validate_cex_sealed_revision(&existing, claim, &precommit)?;
+                        Ok(Some(existing))
+                    }
+                    Err(StoreError::NotFound) => Err(StoreError::Domain(
+                        "sealed holdout is already claimed; concurrent or incomplete opening fails closed"
+                            .to_string(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn put_cex_sealed_evaluation(
+        &mut self,
+        claim: &CexSealedHoldoutClaimV1,
+        evaluation: &CandidateEvaluation,
+        at: DateTime<Utc>,
+    ) -> Result<RegistryRevision, StoreError> {
+        claim.validate().map_err(domain_error)?;
+        evaluation.validate().map_err(domain_error)?;
+        let (_, protocol_hash) = evaluation.protocol_binding().map_err(domain_error)?;
+        let claim_revision = self.get_registry_revision(&claim.claim_id)?;
+        let stored_claim: CexSealedHoldoutClaimV1 =
+            serde_json::from_value(claim_revision.payload.clone()).map_err(serialization_error)?;
+        let precommit_revision = self.get_registry_revision(&claim.precommit.id)?;
+        let precommit: CexFinalPrecommitV1 =
+            serde_json::from_value(precommit_revision.payload.clone())
+                .map_err(serialization_error)?;
+        let mission = self.get_mission(&claim.mission_id)?;
+        if claim_revision.registry_kind != CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND
+            || stored_claim != *claim
+            || evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+            || protocol_hash != claim.evaluation_protocol.content_sha256
+            || evaluation.formula_config().map_err(domain_error)?
+                != FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?
+        {
+            return Err(StoreError::Domain(
+                "sealed evaluation does not match its unique access claim".to_string(),
+            ));
+        }
+        let revision = RegistryRevision {
+            revision_id: sealed_evaluation_revision_id(
+                &claim.candidate.id,
+                SEALED_HOLDOUT_EVALUATOR_VERSION,
+            ),
+            registry_kind: "sealed_evaluation".to_string(),
+            asset_id: claim.candidate.id.clone(),
+            parent_revision_id: Some(claim.claim_id.clone()),
+            payload: serde_json::json!({
+                "mission_id": claim.mission_id,
+                "candidate_content_hash": claim.candidate.content_sha256,
+                "dataset_manifest_id": precommit.dataset_manifest_id,
+                "evaluation_protocol_hash": claim.evaluation_protocol.content_sha256,
+                "precommit_id": claim.precommit.id,
+                "precommit_content_hash": claim.precommit.content_sha256,
+                "sealed_access_claim_id": claim.claim_id,
+                "holdout_id": claim.holdout_id,
+                "evaluation": evaluation,
+            }),
+            created_at: at,
+        };
+        match self.get_registry_revision(&revision.revision_id) {
+            Ok(existing) => {
+                validate_cex_sealed_revision(&existing, claim, &precommit)?;
+                if existing == revision {
+                    Ok(existing)
+                } else {
+                    Err(StoreError::Domain(
+                        "sealed evaluation conflicts with the existing receipt".to_string(),
+                    ))
+                }
+            }
+            Err(StoreError::NotFound) => {
+                self.put_registry_revision(&revision)?;
+                Ok(revision)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn bind_mission_evaluation_protocol(
         &mut self,
         mission_id: &str,
@@ -1027,7 +1613,9 @@ impl AlphaStore {
         candidate_artifact: &CandidateArtifact,
     ) -> Result<Option<String>, StoreError> {
         let expected_version = match candidate_artifact {
-            CandidateArtifact::Formula(_) => WALK_FORWARD_EVALUATOR_VERSION,
+            CandidateArtifact::Formula(_) | CandidateArtifact::CexFourStage(_) => {
+                WALK_FORWARD_EVALUATOR_VERSION
+            }
             CandidateArtifact::OnnxModel(_) => ONNX_WALK_FORWARD_EVALUATOR_VERSION,
             _ => return Ok(None),
         };
@@ -1159,7 +1747,7 @@ impl AlphaStore {
         let expected_evaluator_config =
             FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?;
         let evaluator_matches_artifact = match &candidate_artifact {
-            CandidateArtifact::Formula(_) => {
+            CandidateArtifact::Formula(_) | CandidateArtifact::CexFourStage(_) => {
                 typed_evaluation.evaluator_version == SEALED_HOLDOUT_EVALUATOR_VERSION
             }
             CandidateArtifact::OnnxModel(_) => {
@@ -1227,6 +1815,36 @@ impl AlphaStore {
             return Err(StoreError::Domain(
                 "promotion evidence does not match sealed evaluation".to_string(),
             ));
+        }
+        if let CandidateArtifact::CexFourStage(strategy) = &candidate_artifact {
+            let precommit_revision = self.get_registry_revision(&strategy.precommit_id)?;
+            let precommit: CexFinalPrecommitV1 =
+                serde_json::from_value(precommit_revision.payload.clone())
+                    .map_err(serialization_error)?;
+            precommit.validate().map_err(domain_error)?;
+            validate_cex_precommit_dependencies(&self.connection, &precommit, strategy)?;
+            let claim =
+                CexSealedHoldoutClaimV1::from_precommit(&precommit).map_err(domain_error)?;
+            let claim_revision = self.get_registry_revision(&claim.claim_id)?;
+            let stored_claim: CexSealedHoldoutClaimV1 =
+                serde_json::from_value(claim_revision.payload.clone())
+                    .map_err(serialization_error)?;
+            if precommit_revision.registry_kind != CEX_FINAL_PRECOMMIT_REGISTRY_KIND
+                || precommit_revision.asset_id != promotion.mission_id
+                || precommit.final_candidate.id != bundle.candidate_id
+                || precommit.final_candidate.content_sha256 != bundle.candidate_content_hash
+                || precommit.dataset_manifest_id != bundle.dataset_manifest_id
+                || precommit.evaluation_protocol.content_sha256 != bundle.evaluation_protocol_hash
+                || precommit.four_stage_strategy.id != strategy.strategy_artifact_id
+                || precommit.four_stage_strategy.content_sha256 != strategy.strategy_artifact_sha256
+                || claim_revision.registry_kind != CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND
+                || stored_claim != claim
+            {
+                return Err(StoreError::Domain(
+                    "CEX promotion does not match its final precommit and access claim".to_string(),
+                ));
+            }
+            validate_cex_sealed_revision(&sealed, &claim, &precommit)?;
         }
 
         let (bundle_json, bundle_content_hash) = encoded(bundle)?;
@@ -1662,6 +2280,9 @@ impl AlphaStore {
                     CandidateArtifact::Formula(_),
                     SEALED_HOLDOUT_EVALUATOR_VERSION
                 ) | (
+                    CandidateArtifact::CexFourStage(_),
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ) | (
                     CandidateArtifact::OnnxModel(_),
                     ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
                 )
@@ -2071,6 +2692,7 @@ fn validate_strategy_scope(
             format!("{}:{symbol}", bundle.bundle_id)
         }
         StrategyBundleArtifact::Onnx { .. } => bundle.bundle_id.clone(),
+        StrategyBundleArtifact::CexFourStage { .. } => bundle.bundle_id.clone(),
     };
     if strategy_id != expected {
         return Err(StoreError::Domain(
@@ -2831,6 +3453,105 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn cex_final_precommit() -> CexFinalPrecommitV1 {
+        let reference = |id: &str| CexResearchContentRefV1 {
+            id: id.to_string(),
+            content_sha256: "a".repeat(64),
+        };
+        CexFinalPrecommitV1 {
+            schema_version: alpha_domain::CEX_FINAL_PRECOMMIT_SCHEMA_V1.to_string(),
+            precommit_id: String::new(),
+            mission: reference("mission-1"),
+            dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
+            snapshot: reference("snapshot-1"),
+            dataset: reference("dataset-1"),
+            partition: reference("partition-1"),
+            source: reference("source-1"),
+            factor_bank: reference("factor-bank-1"),
+            ridge_baseline: reference("ridge-1"),
+            cart_baseline: reference("cart-1"),
+            baseline_gate: reference("baseline-gate-1"),
+            mcts_checkpoint: reference("mcts-checkpoint-1"),
+            mcts_subset: reference("mcts-subset-1"),
+            weight_policy: reference("weight-policy-1"),
+            four_stage_strategy: reference("four-stage-strategy-1"),
+            combination_evidence: reference("combination-evidence-1"),
+            fixed_weights_sha256: "b".repeat(64),
+            replay_receipt: reference("replay-receipt-1"),
+            replay_capabilities_sha256: "c".repeat(64),
+            evaluation_protocol: reference("evaluation-protocol-1"),
+            final_candidate: reference("candidate-1"),
+            final_walk_forward_evaluation: reference("walk-forward-1"),
+            holdout_id: "holdout-1".to_string(),
+            holdout_state: alpha_domain::CexResearchHoldoutStateV1::Unopened,
+            implementation_source_revision: "d".repeat(40),
+            configuration_sha256: "e".repeat(64),
+            deployment_authority: false,
+            order_submission_authority: false,
+        }
+        .finalize()
+        .unwrap()
+    }
+
+    #[test]
+    fn concurrent_cex_sealed_holdout_claims_have_one_winner() {
+        let mut readback = AlphaStore::open_in_memory().unwrap();
+        let precommit = cex_final_precommit();
+        readback
+            .put_registry_revision(&RegistryRevision {
+                revision_id: precommit.precommit_id.clone(),
+                registry_kind: CEX_FINAL_PRECOMMIT_REGISTRY_KIND.to_string(),
+                asset_id: precommit.mission.id.clone(),
+                parent_revision_id: None,
+                payload: serde_json::to_value(&precommit).unwrap(),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit).unwrap();
+        let make_store = || AlphaStore {
+            path: readback.path.clone(),
+            connection: readback.connection.try_clone().unwrap(),
+            integrity_key: readback.integrity_key,
+        };
+        let mut first = make_store();
+        let mut second = make_store();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let at = Utc::now();
+
+        let (first_result, second_result) = std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first_claim = claim.clone();
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first.claim_cex_sealed_holdout(&first_claim, at)
+            });
+            let second_barrier = barrier.clone();
+            let second_claim = claim.clone();
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second.claim_cex_sealed_holdout(&second_claim, at)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let results = [first_result, second_result];
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(None)))
+                .count(),
+            1
+        );
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(
+            readback
+                .get_registry_revision(&claim.claim_id)
+                .unwrap()
+                .payload,
+            serde_json::to_value(claim).unwrap()
+        );
     }
 
     fn bind_evaluation_protocol(store: &mut AlphaStore) -> String {
