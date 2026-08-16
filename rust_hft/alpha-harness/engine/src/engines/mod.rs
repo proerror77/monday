@@ -1,4 +1,5 @@
 mod bayesian;
+mod factor_bank_mcts;
 mod gp;
 mod mcts;
 mod offline_rl;
@@ -7,6 +8,11 @@ use hft_search_kernel::DeterministicRng;
 
 pub(crate) use bayesian::solve;
 pub use bayesian::BayesianOptimizerEngine;
+pub use factor_bank_mcts::{
+    CexFactorBankMcts, CexFactorBankMctsCheckpointV1, CexFactorBankMctsResultV1,
+    CexFactorBankMctsStopReasonV1, CexFactorBankMctsTraceStepV1, CexFactorIdentityV1,
+    CexFactorSubsetActionV1, CexFactorSubsetV1, CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION,
+};
 pub use gp::GeneticProgrammingEngine;
 pub use mcts::{MctsEngine, MctsNodeSnapshot, MCTS_CHECKPOINT_VERSION};
 pub use offline_rl::{OfflineRlEngine, OfflineTrace};

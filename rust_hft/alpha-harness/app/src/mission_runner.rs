@@ -11,7 +11,11 @@ use alpha_domain::{
     CexResearchMissionArtifactV1, EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict,
     MissionCompletionPolicy, MissionStatus, ResearchMission, ValidatorMode,
 };
-use alpha_engine::{baselines::evaluate_cex_baselines, evaluation::prepare_dataset};
+use alpha_engine::{
+    baselines::evaluate_cex_baselines,
+    engines::{CexFactorBankMcts, CexFactorBankMctsStopReasonV1},
+    evaluation::{prepare_dataset, EngineContext},
+};
 use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -399,8 +403,17 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &control_mission,
         &baseline_policy,
         &factor_bank,
-        baseline_run,
+        &baseline_run,
     )?;
+    if baseline_run.gate.passed {
+        run_factor_bank_subset_search(
+            &results_dir,
+            &control_mission,
+            &factor_bank,
+            &baseline_run,
+            &baseline_context,
+        )?;
+    }
     let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
@@ -487,7 +500,7 @@ fn persist_baseline_evidence(
     control_mission: &CexResearchMissionArtifactV1,
     baseline_policy: &CexBaselinePolicyV1,
     factor_bank: &CexFactorBankRevisionV2,
-    run: alpha_engine::baselines::CexBaselineRun,
+    run: &alpha_engine::baselines::CexBaselineRun,
 ) -> anyhow::Result<()> {
     let alpha_engine::baselines::CexBaselineRun { ridge, cart, gate } = run;
     let asset_id = control_mission.spec.instrument.symbol.clone();
@@ -501,39 +514,43 @@ fn persist_baseline_evidence(
             registry_kind: CEX_BASELINE_GATE_REGISTRY_KIND.to_string(),
             asset_id,
             parent_revision_id: Some(factor_bank.revision_id.clone()),
-            payload: serde_json::to_value(&gate)?,
+            payload: serde_json::to_value(gate)?,
             created_at: Utc::now(),
         })?;
         data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
         return Ok(());
     }
 
-    let ridge = ridge.context("non-empty Factor Bank baseline is missing Ridge artifact")?;
-    let cart = cart.context("non-empty Factor Bank baseline is missing CART artifact")?;
+    let ridge = ridge
+        .as_ref()
+        .context("non-empty Factor Bank baseline is missing Ridge artifact")?;
+    let cart = cart
+        .as_ref()
+        .context("non-empty Factor Bank baseline is missing CART artifact")?;
     ridge.validate_binding(control_mission, baseline_policy, factor_bank)?;
     cart.validate_binding(control_mission, baseline_policy, factor_bank)?;
     gate.validate_binding(
         control_mission,
         baseline_policy,
         factor_bank,
-        Some(&ridge),
-        Some(&cart),
+        Some(ridge),
+        Some(cart),
     )?;
     for (artifact_id, registry_kind, payload) in [
         (
             ridge.artifact_id.clone(),
             CEX_BASELINE_RIDGE_REGISTRY_KIND,
-            serde_json::to_value(&ridge)?,
+            serde_json::to_value(ridge)?,
         ),
         (
             cart.artifact_id.clone(),
             CEX_BASELINE_CART_REGISTRY_KIND,
-            serde_json::to_value(&cart)?,
+            serde_json::to_value(cart)?,
         ),
         (
             gate.gate_id.clone(),
             CEX_BASELINE_GATE_REGISTRY_KIND,
-            serde_json::to_value(&gate)?,
+            serde_json::to_value(gate)?,
         ),
     ] {
         store.put_registry_revision(&RegistryRevision {
@@ -545,10 +562,60 @@ fn persist_baseline_evidence(
             created_at: Utc::now(),
         })?;
     }
-    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), &ridge)?;
-    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), &cart)?;
-    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
+    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), ridge)?;
+    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), cart)?;
+    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
     Ok(())
+}
+
+fn run_factor_bank_subset_search(
+    results_dir: &Path,
+    control_mission: &CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    baselines: &alpha_engine::baselines::CexBaselineRun,
+    context: &EngineContext<'_>,
+) -> anyhow::Result<()> {
+    let ridge = baselines
+        .ridge
+        .as_ref()
+        .context("passing baseline gate is missing Ridge evidence")?;
+    let cart = baselines
+        .cart
+        .as_ref()
+        .context("passing baseline gate is missing CART evidence")?;
+    let mut search = CexFactorBankMcts::new(
+        control_mission,
+        factor_bank,
+        ridge,
+        cart,
+        &baselines.gate,
+        context,
+    )
+    .map_err(anyhow::Error::msg)?;
+    loop {
+        let stop = search
+            .run(
+                context,
+                Some(control_mission.spec.search.max_new_iterations as u64),
+            )
+            .map_err(anyhow::Error::msg)?;
+        data_mission::write_json_atomic(
+            &results_dir.join("factor-subset-mcts-checkpoint.json"),
+            &search.checkpoint().map_err(anyhow::Error::msg)?,
+        )?;
+        if stop == CexFactorBankMctsStopReasonV1::Paused {
+            continue;
+        }
+        data_mission::write_json_atomic(
+            &results_dir.join("factor-subset-mcts-trace.json"),
+            &search.trace().map_err(anyhow::Error::msg)?,
+        )?;
+        data_mission::write_json_atomic(
+            &results_dir.join("factor-subset-mcts-result.json"),
+            &search.result().map_err(anyhow::Error::msg)?,
+        )?;
+        return Ok(());
+    }
 }
 
 fn build_factor_bank(
@@ -1014,12 +1081,13 @@ mod tests {
     use super::*;
     use crate::cli::ValidationArgs;
     use alpha_domain::{
-        CexResearchContentRefV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
-        CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
-        CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
-        CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionSpecV1,
-        CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
-        CexResearchVenueV1, EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
+        CexBaselineArtifactV1, CexBaselineGateV1, CexResearchContentRefV1,
+        CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchFalsificationTestV1,
+        CexResearchHoldoutStateV1, CexResearchHoldoutV1, CexResearchHypothesisTargetV1,
+        CexResearchHypothesisV1, CexResearchInputBindingsV1, CexResearchInstrumentV1,
+        CexResearchMarketV1, CexResearchMissionSpecV1, CexResearchOperationalMetadataV1,
+        CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1,
+        EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
@@ -1546,6 +1614,43 @@ mod tests {
         assert_eq!(gate["ridge_artifact_id"], ridge["artifact_id"]);
         assert_eq!(gate["cart_artifact_id"], cart["artifact_id"]);
         assert_eq!(gate["policy_hash"], policy_hash);
+        let subset_result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-result.json")).unwrap(),
+        )
+        .unwrap();
+        let subset_trace: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-trace.json")).unwrap(),
+        )
+        .unwrap();
+        let selected_factors = subset_result["selected"]["subset"]["factors"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            subset_result["schema_version"],
+            "cex-factor-bank-subset-mcts-result-v1"
+        );
+        assert_eq!(
+            subset_result["factor_bank_revision_id"],
+            ridge["factor_bank_revision_id"]
+        );
+        assert_eq!(subset_result["baseline_gate_id"], gate["gate_id"]);
+        assert!(!selected_factors.is_empty());
+        assert_eq!(
+            subset_result["selected"]["normalized_equal_abs_weight"]
+                .as_f64()
+                .unwrap()
+                * selected_factors.len() as f64,
+            1.0
+        );
+        assert!(!subset_trace.as_array().unwrap().is_empty());
+        assert!(subset_trace.as_array().unwrap().iter().all(|step| {
+            matches!(
+                step["action"]["action"].as_str(),
+                Some("add" | "remove" | "swap")
+            )
+        }));
+        assert!(results.join("factor-subset-mcts-checkpoint.json").exists());
+        assert!(!results.join("sealed-evaluations.jsonl").exists());
         let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
         let policy_revision = store.get_registry_revision(&policy_hash).unwrap();
         assert_eq!(
@@ -1565,6 +1670,184 @@ mod tests {
             policy_revision.payload,
             serde_json::to_value(&policy).unwrap()
         );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn factor_bank_mcts_resume_is_exact_and_rejects_bound_identity_drift() {
+        let mut fixture = fixture("factor-bank-mcts-resume");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        let ridge: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("ridge-baseline.json")).unwrap())
+                .unwrap();
+        let cart: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
+                .unwrap();
+        let gate: CexBaselineGateV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let context = dataset.engine_context();
+
+        let mut failed_ridge = ridge.clone();
+        failed_ridge.evaluation.passed = false;
+        assert!(CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &failed_ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .is_err());
+
+        let mut full = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        assert_ne!(
+            full.run(&context, None).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        let full_checkpoint = full.checkpoint().unwrap();
+        let full_trace = full.trace().unwrap();
+        let full_result = full.result().unwrap();
+
+        let mut chunked = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            chunked.run(&context, Some(1)).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        let paused = serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
+        let mut resumed = CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            paused.clone(),
+        )
+        .unwrap();
+        assert_ne!(
+            resumed.run(&context, None).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        assert_eq!(resumed.checkpoint().unwrap(), full_checkpoint);
+        assert_eq!(resumed.trace().unwrap(), full_trace);
+        assert_eq!(resumed.result().unwrap(), full_result);
+
+        for pointer in [
+            "/bindings/mission_id",
+            "/bindings/factor_bank_revision_id",
+            "/bindings/ridge_artifact_id",
+            "/bindings/cart_artifact_id",
+            "/bindings/baseline_gate_id",
+            "/bindings/implementation_version",
+        ] {
+            let mut drifted = paused.clone();
+            *drifted.pointer_mut(pointer).unwrap() = serde_json::json!("drifted");
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("identity drift must be rejected")
+            .contains("bindings drifted"));
+        }
+        for pointer in [
+            "/bindings/subset_policy/content_sha256",
+            "/bindings/weight_policy/content_sha256",
+            "/bindings/screening_policy/content_sha256",
+            "/bindings/scoring_policy/content_sha256",
+        ] {
+            let mut drifted = paused.clone();
+            *drifted.pointer_mut(pointer).unwrap() = serde_json::json!("0".repeat(64));
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("policy drift must be rejected")
+            .contains("bindings drifted"));
+        }
+        for (pointer, value) in [
+            ("/trace/0/action/factor_bank_revision_id", "other-bank"),
+            ("/trace/0/action/factor/factor_id", "unknown-factor"),
+            (
+                "/trace/0/action/factor/content_sha256",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let mut invalid = paused.clone();
+            *invalid.pointer_mut(pointer).unwrap() = serde_json::json!(value);
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                invalid,
+            )
+            .is_err());
+        }
+        let legacy_error = CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            serde_json::json!({ "kind": "Mcts", "version": 4, "state": {} }),
+        )
+        .err()
+        .expect("legacy Formula-MCTS checkpoint must be rejected");
+        assert!(legacy_error.contains("legacy Formula-MCTS checkpoint version 4"));
+        assert!(legacy_error.contains("cex-factor-bank-subset-mcts-v1"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -1627,7 +1910,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("Factor-Bank subset adapter (#601) is required"));
+            .contains("available only through content-bound mission execute"));
         let store = AlphaStore::open(&args.db).unwrap();
         assert_eq!(
             store.get_mission(&args.mission_id).unwrap().status,

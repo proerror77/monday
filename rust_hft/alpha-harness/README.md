@@ -12,8 +12,8 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
-| CEX `mission execute` | Implemented through GP, immutable Factor Bank, and deterministic Ridge/CART baselines | Create-once result bundle plus independent readback with an exact SHA-256 match |
-| Factor-Bank subset MCTS | Blocked by [#601](https://github.com/proerror77/monday/issues/601) | The CEX path fails closed before MCTS rather than falling back to Formula-MCTS |
+| CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
+| Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and selected equal-absolute-weight subset; sealed holdout remains closed |
 | Four-stage combination walk-forward | Blocked by [#602](https://github.com/proerror77/monday/issues/602) | No selected subset is compiled into the required Signal/Sizing/Risk/Execution artifact |
 | Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
 | Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
@@ -86,14 +86,16 @@ research fields, budgets, and costs from that artifact; they are not accepted
 as alternate execute flags. Unknown fields, Prediction Market fields, action
 requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
 feedback fail before Mission admission. `operational.submitted_at` is retained
-for audit but does not alter the semantic Mission identity. Execution currently
-stops after governed GP, immutable Factor Bank construction, and deterministic
-Ridge/CART baseline evaluation. It does not select a Factor Bank subset or emit
-the later four-stage strategy. Sealed-holdout evaluation requires the separate
-governed precommit boundary. This schema binds prior-evidence identities; later
-holdout and Paper/Shadow gates own receipt and signature verification.
+for audit but does not alter the semantic Mission identity. After both baselines
+pass, execution searches only canonical Factor Bank subsets through add, remove,
+and swap actions, scores mechanically oriented equal-absolute-weight signals on
+the research folds, and emits deterministic checkpoint, trace, and selected
+subset artifacts. It does not emit the later four-stage strategy. Sealed-holdout
+evaluation requires the separate governed precommit boundary. This schema binds
+prior-evidence identities; later holdout and Paper/Shadow gates own receipt and
+signature verification.
 
-For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The CLI accepts `mcts`, but the governed CEX path deliberately rejects it until #601 replaces Formula-growing MCTS with immutable Factor-Bank subset selection. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
+For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The low-level CLI rejects `mcts`; Factor-Bank subset MCTS is owned only by the content-bound `mission execute` seam. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -127,15 +129,13 @@ cargo run -p alpha-harness -- loop status \
   --loop-run-id loop-btc-1
 ```
 
-The durable LoopRun accepts only `mcts`, while the current CEX Mission path
-rejects MCTS pending #601. It is therefore not a runnable CEX golden path today.
-GP and LLM remain available through standalone `mission run` commands but cannot
-claim exact LoopRun resume. Bayesian and offline RL are rejected during
-preflight. The LoopRun records ordered stages, completion policy, child missions,
-and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human
-evidence pauses the loop instead of fabricating progress. An external scheduler
-may invoke this command after the Factor-Bank adapter exists, but invocation does
-not bypass stage evidence.
+The durable LoopRun still targets the retired Formula-MCTS proposal interface,
+so it is not a runnable CEX golden path. The content-bound `mission execute` path
+owns Factor-Bank subset MCTS and exact checkpoint resume. GP and LLM remain
+available through standalone `mission run` commands but cannot claim that
+acceptance path. Bayesian and offline RL are rejected during preflight. Missing
+evaluation, holdout, Paper, Shadow, or human evidence pauses LoopRun instead of
+fabricating progress; invocation does not bypass stage evidence.
 
 ## Prediction-Market Research
 

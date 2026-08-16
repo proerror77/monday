@@ -282,7 +282,7 @@ fn evaluate_factor_features(
     Ok((factor_ids, factors))
 }
 
-fn evaluate_factor_features_from_entries(
+pub(crate) fn evaluate_factor_features_from_entries(
     context: &EngineContext<'_>,
     entries: &[&alpha_domain::CexFactorBankEntryV1],
 ) -> Result<Vec<Vec<f64>>, String> {
