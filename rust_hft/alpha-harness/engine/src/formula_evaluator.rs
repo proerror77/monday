@@ -454,6 +454,10 @@ fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
             validate_live_formula(ast).map_err(|error| error.to_string())?;
             Ok(ast)
         }
+        CandidateArtifact::CexFourStage(strategy) => {
+            strategy.validate().map_err(|error| error.to_string())?;
+            Ok(&strategy.executable_formula)
+        }
         _ => Err("formula evaluator only accepts DSL formula artifacts".to_string()),
     }
 }
@@ -983,6 +987,10 @@ mod tests {
             evaluator
                 .evaluate(&candidate, &mutated.engine_context())
                 .unwrap()
+        );
+        assert_ne!(
+            evaluator.evaluate_sealed(&candidate, &original).unwrap(),
+            evaluator.evaluate_sealed(&candidate, &mutated).unwrap()
         );
     }
 

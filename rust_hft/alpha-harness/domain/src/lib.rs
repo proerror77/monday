@@ -28,6 +28,12 @@ pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
+pub const CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1: &str =
+    "cex-four-stage-strategy-candidate-v1";
+pub const CEX_FINAL_PRECOMMIT_SCHEMA_V1: &str = "cex-final-precommit-v1";
+pub const CEX_SEALED_HOLDOUT_CLAIM_SCHEMA_V1: &str = "cex-sealed-holdout-claim-v1";
+pub const CEX_FINAL_PRECOMMIT_REGISTRY_KIND: &str = "cex_final_precommit";
+pub const CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND: &str = "cex_sealed_holdout_claim";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -115,6 +121,8 @@ pub enum DomainError {
     InvalidCexFactorBank(&'static str),
     #[error("CEX baseline is invalid: {0}")]
     InvalidCexBaseline(&'static str),
+    #[error("CEX final precommit is invalid: {0}")]
+    InvalidCexFinalPrecommit(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -871,6 +879,13 @@ fn non_empty_unique(values: &[String]) -> bool {
 
 fn valid_content_sha256(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_source_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -3665,9 +3680,278 @@ impl OnnxModelCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFourStageStrategyCandidateV1 {
+    pub schema_version: String,
+    pub precommit_id: String,
+    pub mission_id: String,
+    pub strategy_artifact_id: String,
+    pub strategy_artifact_sha256: String,
+    pub strategy_artifact_json: String,
+    pub executable_formula_sha256: String,
+    pub executable_formula: FactorAst,
+    pub venue: CexResearchVenueV1,
+    pub market: CexResearchMarketV1,
+    pub symbol: String,
+    pub evaluation_protocol_hash: String,
+    pub deployment_authority: bool,
+    pub order_submission_authority: bool,
+}
+
+impl CexFourStageStrategyCandidateV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        precommit_id: String,
+        mission_id: String,
+        strategy_artifact_id: String,
+        strategy_artifact_json: String,
+        executable_formula: FactorAst,
+        venue: CexResearchVenueV1,
+        market: CexResearchMarketV1,
+        symbol: String,
+        evaluation_protocol_hash: String,
+    ) -> Result<Self, DomainError> {
+        let strategy_artifact_sha256 =
+            hex::encode(Sha256::digest(strategy_artifact_json.as_bytes()));
+        let executable_formula_sha256 = canonical_json_hash(&executable_formula)?;
+        let candidate = Self {
+            schema_version: CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1.to_string(),
+            precommit_id,
+            mission_id,
+            strategy_artifact_id,
+            strategy_artifact_sha256,
+            strategy_artifact_json,
+            executable_formula_sha256,
+            executable_formula,
+            venue,
+            market,
+            symbol,
+            evaluation_protocol_hash,
+            deployment_authority: false,
+            order_submission_authority: false,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let strategy_value: serde_json::Value = serde_json::from_str(&self.strategy_artifact_json)
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        let strategy = strategy_value
+            .as_object()
+            .ok_or(DomainError::InvalidStrategyBundle)?;
+        let execution = strategy
+            .get("execution")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DomainError::InvalidStrategyBundle)?;
+        let walk_forward = strategy
+            .get("walk_forward_evidence")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DomainError::InvalidStrategyBundle)?;
+        let evaluation_protocol = walk_forward
+            .get("evaluation_protocol")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(DomainError::InvalidStrategyBundle)?;
+        if self.schema_version != CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1
+            || self.precommit_id != format!("cex-final-precommit:{}", self.mission_id)
+            || [
+                self.mission_id.as_str(),
+                self.strategy_artifact_id.as_str(),
+                self.symbol.as_str(),
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+            || self.symbol != self.symbol.to_ascii_uppercase()
+            || !valid_content_sha256(&self.strategy_artifact_sha256)
+            || self.strategy_artifact_sha256
+                != hex::encode(Sha256::digest(self.strategy_artifact_json.as_bytes()))
+            || !valid_content_sha256(&self.executable_formula_sha256)
+            || self.executable_formula_sha256 != canonical_json_hash(&self.executable_formula)?
+            || !valid_content_sha256(&self.evaluation_protocol_hash)
+            || self.deployment_authority
+            || self.order_submission_authority
+            || strategy
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.strategy_artifact_id.as_str())
+            || strategy
+                .get("mission_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.mission_id.as_str())
+            || strategy
+                .get("deployment_authority")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || strategy
+                .get("order_submission_authority")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || strategy.get("signal").is_none()
+            || strategy.get("sizing").is_none()
+            || strategy.get("risk").is_none()
+            || execution.get("venue").and_then(serde_json::Value::as_str)
+                != Some(self.venue.as_str())
+            || execution.get("market").and_then(serde_json::Value::as_str)
+                != Some(self.market.as_str())
+            || execution.get("symbol").and_then(serde_json::Value::as_str)
+                != Some(self.symbol.as_str())
+            || evaluation_protocol
+                .get("content_sha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.evaluation_protocol_hash.as_str())
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        validate_live_formula(&self.executable_formula)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexFinalPrecommitV1 {
+    pub schema_version: String,
+    pub precommit_id: String,
+    pub mission: CexResearchContentRefV1,
+    pub dataset_manifest_id: ManifestId,
+    pub snapshot: CexResearchContentRefV1,
+    pub dataset: CexResearchContentRefV1,
+    pub partition: CexResearchContentRefV1,
+    pub source: CexResearchContentRefV1,
+    pub factor_bank: CexResearchContentRefV1,
+    pub ridge_baseline: CexResearchContentRefV1,
+    pub cart_baseline: CexResearchContentRefV1,
+    pub baseline_gate: CexResearchContentRefV1,
+    pub mcts_checkpoint: CexResearchContentRefV1,
+    pub mcts_subset: CexResearchContentRefV1,
+    pub weight_policy: CexResearchContentRefV1,
+    pub four_stage_strategy: CexResearchContentRefV1,
+    pub combination_evidence: CexResearchContentRefV1,
+    pub fixed_weights_sha256: String,
+    pub replay_receipt: CexResearchContentRefV1,
+    pub replay_capabilities_sha256: String,
+    pub evaluation_protocol: CexResearchContentRefV1,
+    pub final_candidate: CexResearchContentRefV1,
+    pub final_walk_forward_evaluation: CexResearchContentRefV1,
+    pub holdout_id: String,
+    pub holdout_state: CexResearchHoldoutStateV1,
+    pub implementation_source_revision: String,
+    pub configuration_sha256: String,
+    pub deployment_authority: bool,
+    pub order_submission_authority: bool,
+}
+
+impl CexFinalPrecommitV1 {
+    pub fn finalize(mut self) -> Result<Self, DomainError> {
+        self.precommit_id = format!("cex-final-precommit:{}", self.mission.id);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        for reference in [
+            &self.mission,
+            &self.snapshot,
+            &self.dataset,
+            &self.partition,
+            &self.source,
+            &self.factor_bank,
+            &self.ridge_baseline,
+            &self.cart_baseline,
+            &self.baseline_gate,
+            &self.mcts_checkpoint,
+            &self.mcts_subset,
+            &self.weight_policy,
+            &self.four_stage_strategy,
+            &self.combination_evidence,
+            &self.replay_receipt,
+            &self.evaluation_protocol,
+            &self.final_candidate,
+            &self.final_walk_forward_evaluation,
+        ] {
+            reference.validate()?;
+        }
+        self.dataset_manifest_id
+            .validate()
+            .map_err(|_| DomainError::InvalidCexFinalPrecommit("dataset manifest is invalid"))?;
+        if self.schema_version != CEX_FINAL_PRECOMMIT_SCHEMA_V1
+            || self.precommit_id != format!("cex-final-precommit:{}", self.mission.id)
+            || self.holdout_id.trim().is_empty()
+            || self.holdout_state != CexResearchHoldoutStateV1::Unopened
+            || !valid_content_sha256(&self.fixed_weights_sha256)
+            || !valid_content_sha256(&self.replay_capabilities_sha256)
+            || !valid_content_sha256(&self.configuration_sha256)
+            || !valid_source_revision(&self.implementation_source_revision)
+            || self.deployment_authority
+            || self.order_submission_authority
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "identity, holdout, code, configuration, or authority drifted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn content_reference(&self) -> Result<CexResearchContentRefV1, DomainError> {
+        self.validate()?;
+        Ok(CexResearchContentRefV1 {
+            id: self.precommit_id.clone(),
+            content_sha256: canonical_json_hash(self)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSealedHoldoutClaimV1 {
+    pub schema_version: String,
+    pub claim_id: String,
+    pub mission_id: String,
+    pub precommit: CexResearchContentRefV1,
+    pub candidate: CexResearchContentRefV1,
+    pub evaluation_protocol: CexResearchContentRefV1,
+    pub holdout_id: String,
+}
+
+impl CexSealedHoldoutClaimV1 {
+    pub fn from_precommit(precommit: &CexFinalPrecommitV1) -> Result<Self, DomainError> {
+        precommit.validate()?;
+        let claim = Self {
+            schema_version: CEX_SEALED_HOLDOUT_CLAIM_SCHEMA_V1.to_string(),
+            claim_id: format!("cex-sealed-holdout-claim:{}", precommit.mission.id),
+            mission_id: precommit.mission.id.clone(),
+            precommit: precommit.content_reference()?,
+            candidate: precommit.final_candidate.clone(),
+            evaluation_protocol: precommit.evaluation_protocol.clone(),
+            holdout_id: precommit.holdout_id.clone(),
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.precommit.validate()?;
+        self.candidate.validate()?;
+        self.evaluation_protocol.validate()?;
+        if self.schema_version != CEX_SEALED_HOLDOUT_CLAIM_SCHEMA_V1
+            || self.claim_id != format!("cex-sealed-holdout-claim:{}", self.mission_id)
+            || self.precommit.id != format!("cex-final-precommit:{}", self.mission_id)
+            || self.mission_id.trim().is_empty()
+            || self.holdout_id.trim().is_empty()
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "sealed holdout claim drifted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CandidateArtifact {
     Formula(FactorAst),
     OnnxModel(OnnxModelCandidate),
+    CexFourStage(CexFourStageStrategyCandidateV1),
     Program(serde_json::Value),
     ModelConfig(serde_json::Value),
     ModelArtifact(ArtifactRef),
@@ -3690,6 +3974,12 @@ impl CandidateArtifact {
                     model: model.clone(),
                 })
             }
+            Self::CexFourStage(strategy) => {
+                strategy.validate()?;
+                Ok(StrategyBundleArtifact::CexFourStage {
+                    strategy: strategy.clone(),
+                })
+            }
             Self::Program(_)
             | Self::ModelConfig(_)
             | Self::ModelArtifact(_)
@@ -3699,11 +3989,18 @@ impl CandidateArtifact {
     }
 }
 
-/// Runtime-loadable artifact schema. Governed evaluator v2 currently produces Formula only.
+/// Runtime-loadable artifact schema produced by governed promotion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StrategyBundleArtifact {
-    Formula { ast: FactorAst },
-    Onnx { model: OnnxModelCandidate },
+    Formula {
+        ast: FactorAst,
+    },
+    Onnx {
+        model: OnnxModelCandidate,
+    },
+    CexFourStage {
+        strategy: CexFourStageStrategyCandidateV1,
+    },
 }
 
 impl StrategyBundleArtifact {
@@ -3711,6 +4008,7 @@ impl StrategyBundleArtifact {
         match self {
             Self::Formula { ast } => validate_live_formula(ast).map(|_| ()).map_err(Into::into),
             Self::Onnx { model } => model.validate(),
+            Self::CexFourStage { strategy } => strategy.validate(),
         }
     }
 
@@ -3720,6 +4018,7 @@ impl StrategyBundleArtifact {
                 .validate()
                 .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Onnx { model } => model.validate(),
+            Self::CexFourStage { strategy } => strategy.validate(),
         }
     }
 }

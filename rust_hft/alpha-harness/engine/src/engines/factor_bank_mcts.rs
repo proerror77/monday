@@ -16,6 +16,7 @@ use alpha_domain::{
     FormulaEvaluatorConfig, SearchBudget, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
     WALK_FORWARD_EVALUATOR_VERSION,
 };
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 use hft_search_kernel::{
     backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
 };
@@ -986,12 +987,35 @@ impl CexCombinationResearchArtifactV1 {
         factor_bank: &CexFactorBankRevisionV2,
         rows: &[ResearchRow],
     ) -> Result<Vec<f64>, String> {
+        let formula = self.executable_formula(factor_bank)?;
+        let combined = evaluate_ast(&formula, rows)?;
+        if combined.iter().any(|value| !value.is_finite()) {
+            return Err("CEX replay strategy produced a non-finite signal".to_string());
+        }
+        Ok(combined
+            .into_iter()
+            .map(|signal| {
+                if signal.abs() <= self.sizing.zero_epsilon {
+                    0.0
+                } else {
+                    signal
+                        .signum()
+                        .clamp(self.sizing.min_position, self.sizing.max_position)
+                }
+            })
+            .collect())
+    }
+
+    pub fn executable_formula(
+        &self,
+        factor_bank: &CexFactorBankRevisionV2,
+    ) -> Result<FactorAst, String> {
         self.validate()?;
         factor_bank.validate().map_err(|error| error.to_string())?;
         if self.signal.parent != artifact_reference(&factor_bank.revision_id, factor_bank)? {
             return Err("CEX replay Factor Bank identity drifted".to_string());
         }
-        let mut combined = vec![0.0_f64; rows.len()];
+        let mut formula = FactorAst::Terminal(FactorTerminal::Constant("0".to_string()));
         for selected in &self.signal.factors {
             let entry = factor_bank
                 .entries
@@ -1008,28 +1032,21 @@ impl CexCombinationResearchArtifactV1 {
                 CexFactorOrientationV1::Positive => 1.0,
                 CexFactorOrientationV1::Negative => -1.0,
             };
-            for (combined, value) in combined
-                .iter_mut()
-                .zip(evaluate_ast(&entry.canonical_ast, rows)?)
-            {
-                *combined += orientation * selected.normalized_absolute_weight * value;
-            }
+            let weighted = FactorAst::call(
+                FactorOperator::Mul,
+                vec![
+                    FactorAst::Terminal(FactorTerminal::Constant(
+                        (orientation * selected.normalized_absolute_weight).to_string(),
+                    )),
+                    entry.canonical_ast.clone(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            formula = FactorAst::call(FactorOperator::Add, vec![formula, weighted])
+                .map_err(|error| error.to_string())?;
         }
-        if combined.iter().any(|value| !value.is_finite()) {
-            return Err("CEX replay strategy produced a non-finite signal".to_string());
-        }
-        Ok(combined
-            .into_iter()
-            .map(|signal| {
-                if signal.abs() <= self.sizing.zero_epsilon {
-                    0.0
-                } else {
-                    signal
-                        .signum()
-                        .clamp(self.sizing.min_position, self.sizing.max_position)
-                }
-            })
-            .collect())
+        validate_live_formula(&formula).map_err(|error| error.to_string())?;
+        Ok(formula)
     }
 
     fn expected_strategy_id(&self) -> Result<String, String> {
