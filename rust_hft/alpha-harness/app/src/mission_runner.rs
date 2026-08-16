@@ -1804,8 +1804,7 @@ mod tests {
             prepare_dataset(drifted_rows, &fixture.mission.spec.evaluation_protocol).unwrap();
         assert!(context_bound
             .run(&drifted_dataset.engine_context(), Some(1))
-            .err()
-            .expect("a different research dataset must fail before a search transition")
+            .expect_err("a different research dataset must fail before a search transition")
             .contains("research dataset identity drifted"));
 
         let mut full = CexFactorBankMcts::new(
