@@ -54,14 +54,6 @@ pub(crate) fn validated_walk_forward_candidates(
     validated_walk_forward_candidates_in_lineage(&lineage)
 }
 
-pub(crate) fn selected_walk_forward_candidate(
-    store: &AlphaStore,
-    mission_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let lineage = store.mission_lineage(mission_id)?;
-    Ok(selected_walk_forward_candidate_in_lineage(&lineage)?.map(|(candidate_id, _)| candidate_id))
-}
-
 fn validated_walk_forward_candidates_in_lineage(
     lineage: &MissionLineage,
 ) -> anyhow::Result<Vec<String>> {

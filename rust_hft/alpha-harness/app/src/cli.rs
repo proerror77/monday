@@ -366,6 +366,11 @@ pub struct ExecuteMissionArgs {
     pub feature_url: String,
     #[arg(long)]
     pub materialization_url: String,
+    /// Prior immutable Factor-Bank subset checkpoint for a fresh-work-directory resume.
+    #[arg(long, requires = "resume_sha256")]
+    pub resume_url: Option<String>,
+    #[arg(long, requires = "resume_url")]
+    pub resume_sha256: Option<String>,
     #[arg(long)]
     pub result_put_url: String,
     /// Independently authorized read URL for the immutable published result bundle.
@@ -1057,6 +1062,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--resume-url",
+            "checkpoint.json",
+            "--resume-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "--result-put-url",
             "results.zip",
             "--result-readback-url",
@@ -1108,6 +1117,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
         };
         assert_eq!(args.mission_url, "mission.json");
         assert_eq!(args.mission_sha256, "b".repeat(64));
+        assert!(args.resume_url.is_none());
+        assert!(args.resume_sha256.is_none());
 
         assert!(Cli::try_parse_from([
             "alpha-harness",

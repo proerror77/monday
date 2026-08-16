@@ -402,6 +402,61 @@ impl CexResearchPolicyBindingsV1 {
     }
 }
 
+pub const CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1: &str = "cex-equal-absolute-weight-policy-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexFactorWeightRuleV1 {
+    OrientedEqualAbsoluteSumToOne,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexEqualAbsoluteWeightPolicyV1 {
+    pub schema_version: String,
+    pub policy_id: String,
+    pub rule: CexFactorWeightRuleV1,
+}
+
+impl CexEqualAbsoluteWeightPolicyV1 {
+    pub fn controlled_v1(policy_id: impl Into<String>) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1.to_string(),
+            policy_id: policy_id.into(),
+            rule: CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1
+            || self.policy_id.trim().is_empty()
+            || self.rule != CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "equal-absolute weight policy drifted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        canonical_json_hash(self)
+    }
+
+    pub fn validate_binding(&self, binding: &CexResearchContentRefV1) -> Result<(), DomainError> {
+        binding.validate()?;
+        if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
+            return Err(DomainError::InvalidCexResearchMission(
+                "equal-absolute weight policy binding invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CexResearchEvidenceKindV1 {
@@ -481,6 +536,16 @@ pub struct CexResearchSearchPlanV1 {
     pub max_new_iterations: usize,
 }
 
+impl CexResearchSearchPlanV1 {
+    pub fn planned_gp_and_subset_trials(&self) -> Result<usize, DomainError> {
+        self.budget.validate()?;
+        self.budget
+            .max_candidates
+            .checked_mul(2)
+            .ok_or(DomainError::InvalidSearchBudget)
+    }
+}
+
 fn deserialize_cex_search_budget<'de, D>(deserializer: D) -> Result<SearchBudget, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -554,11 +619,17 @@ impl CexResearchMissionSpecV1 {
         }
         self.inputs.validate()?;
         self.policies.validate()?;
+        CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
+            .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
         self.evaluation_protocol.validate()?;
+        let screening_policy_sha256 = canonical_json_hash(&FormulaEvaluatorConfig::for_trials(
+            self.search.planned_gp_and_subset_trials()?,
+        )?)?;
         if self.search.max_new_iterations == 0
             || self.search.budget.max_tokens != 0
             || self.evaluation_protocol.labels != self.instrument.horizon
+            || self.policies.screening.content_sha256 != screening_policy_sha256
             || self.policies.evaluation.content_sha256 != self.evaluation_protocol.content_hash()?
             || self.policies.subset_search.content_sha256 != canonical_json_hash(&self.search)?
             || !non_empty_unique(&self.feature_fields)
@@ -4488,6 +4559,13 @@ mod tests {
             max_new_iterations: 1,
         };
         let evaluation_protocol = evaluation_protocol();
+        let screening_policy_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(search.planned_gp_and_subset_trials().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let weight_policy =
+            CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -4529,13 +4607,19 @@ mod tests {
                 },
                 policies: CexResearchPolicyBindingsV1 {
                     gp: reference("gp-policy-1", '1'),
-                    screening: reference("screening-policy-1", '2'),
+                    screening: CexResearchContentRefV1 {
+                        id: "screening-policy-1".to_string(),
+                        content_sha256: screening_policy_sha256,
+                    },
                     baseline: reference("baseline-policy-1", '3'),
                     subset_search: CexResearchContentRefV1 {
                         id: "subset-search-policy-1".to_string(),
                         content_sha256: canonical_json_hash(&search).unwrap(),
                     },
-                    weight: reference("weight-policy-1", '4'),
+                    weight: CexResearchContentRefV1 {
+                        id: weight_policy.policy_id.clone(),
+                        content_sha256: weight_policy.content_hash().unwrap(),
+                    },
                     evaluation: CexResearchContentRefV1 {
                         id: "evaluation-policy-1".to_string(),
                         content_sha256: evaluation_protocol.content_hash().unwrap(),
@@ -4596,6 +4680,20 @@ mod tests {
 
         assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
         assert!(serde_json::from_value::<SearchBudget>(shared_budget).is_ok());
+    }
+
+    #[test]
+    fn cex_mission_rejects_weight_or_combined_trial_policy_drift() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.policies.weight.content_sha256 = "4".repeat(64);
+        assert!(mission.validate().is_err());
+
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(mission.spec.search.budget.max_candidates).unwrap(),
+        )
+        .unwrap();
+        assert!(mission.validate().is_err());
     }
 
     #[test]

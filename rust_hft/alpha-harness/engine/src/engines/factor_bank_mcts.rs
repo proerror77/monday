@@ -6,9 +6,9 @@ use crate::{
     CandidateEvaluation,
 };
 use alpha_domain::{
-    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexFactorBankRevisionV2,
-    CexResearchContentRefV1, CexResearchMissionArtifactV1, FormulaEvaluatorConfig, SearchBudget,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexEqualAbsoluteWeightPolicyV1,
+    CexFactorBankRevisionV2, CexResearchContentRefV1, CexResearchMissionArtifactV1,
+    FormulaEvaluatorConfig, SearchBudget, WALK_FORWARD_EVALUATOR_VERSION,
 };
 use hft_search_kernel::{backpropagate, select_expandable, validate_tree, UctNode, UctStats};
 use serde::{Deserialize, Serialize};
@@ -259,9 +259,14 @@ impl CexFactorBankMcts {
     ) -> Result<Self, String> {
         validate_start(mission, factor_bank, ridge, cart, gate, context)?;
         let mission_id = mission.semantic_id().map_err(|error| error.to_string())?;
-        let evaluator_config =
-            FormulaEvaluatorConfig::for_trials(mission.spec.search.budget.max_candidates)
-                .map_err(|error| error.to_string())?;
+        let evaluator_config = FormulaEvaluatorConfig::for_trials(
+            mission
+                .spec
+                .search
+                .planned_gp_and_subset_trials()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         if canonical_json_hash(&evaluator_config).map_err(|error| error.to_string())?
             != mission.spec.policies.screening.content_sha256
         {
@@ -382,10 +387,19 @@ impl CexFactorBankMcts {
             let parent_id = select_expandable(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "Factor-Bank MCTS search space is exhausted".to_string())?;
-            let action_index = self
-                .checkpoint
-                .rng
-                .index(self.checkpoint.nodes[parent_id].remaining_actions.len());
+            let node = &self.checkpoint.nodes[parent_id];
+            let first_combination = (node.state.factors.len() == 1 && node.children.is_empty())
+                .then(|| {
+                    node.remaining_actions
+                        .iter()
+                        .position(|action| matches!(action, CexFactorSubsetActionV1::Add { .. }))
+                })
+                .flatten();
+            let action_index = first_combination.unwrap_or_else(|| {
+                self.checkpoint
+                    .rng
+                    .index(self.checkpoint.nodes[parent_id].remaining_actions.len())
+            });
             let action = self.checkpoint.nodes[parent_id]
                 .remaining_actions
                 .remove(action_index);
@@ -510,11 +524,14 @@ impl CexFactorBankMcts {
             .nodes
             .get(node_id)
             .ok_or_else(|| "Factor-Bank MCTS candidate node is missing".to_string())?;
-        let candidate_score = candidate
+        let candidate_evaluation = candidate
             .evaluation
             .as_ref()
-            .ok_or_else(|| "Factor-Bank MCTS candidate evaluation is missing".to_string())?
-            .score;
+            .ok_or_else(|| "Factor-Bank MCTS candidate evaluation is missing".to_string())?;
+        if !candidate_evaluation.passed {
+            return Ok(false);
+        }
+        let candidate_score = candidate_evaluation.score;
         let Some(selected_id) = self.checkpoint.selected_node_id else {
             return Ok(true);
         };
@@ -572,6 +589,7 @@ impl CexFactorBankMcts {
         .map_err(|error| error.to_string())?;
         let identities = factor_identity_map(&self.factor_bank)?;
         let mut seen = BTreeSet::new();
+        let mut legal_by_node = Vec::with_capacity(checkpoint.nodes.len());
         for (node_id, node) in checkpoint.nodes.iter().enumerate() {
             validate_state(
                 &node.state,
@@ -598,6 +616,7 @@ impl CexFactorBankMcts {
             {
                 return Err("Factor-Bank MCTS checkpoint actions are invalid".to_string());
             }
+            legal_by_node.push(legal);
             if node_id == 0 {
                 if node.parent.is_some() || node.action.is_some() || node.evaluation.is_some() {
                     return Err("Factor-Bank MCTS root is invalid".to_string());
@@ -644,6 +663,8 @@ impl CexFactorBankMcts {
         if seen != checkpoint.seen_state_sha256 {
             return Err("Factor-Bank MCTS seen-state index drifted".to_string());
         }
+        let mut consumed_actions = BTreeMap::<usize, BTreeSet<CexFactorSubsetActionV1>>::new();
+        let mut traced_nodes = BTreeSet::new();
         for (index, step) in checkpoint.trace.iter().enumerate() {
             if step.step != index as u64 + 1
                 || step.parent_node_id >= checkpoint.nodes.len()
@@ -655,6 +676,13 @@ impl CexFactorBankMcts {
                 )? != step.resulting_state
             {
                 return Err("Factor-Bank MCTS trace drifted".to_string());
+            }
+            if !consumed_actions
+                .entry(step.parent_node_id)
+                .or_default()
+                .insert(step.action.clone())
+            {
+                return Err("Factor-Bank MCTS trace repeats an action".to_string());
             }
             match &step.outcome {
                 TraceOutcomeV1::Evaluated {
@@ -669,7 +697,11 @@ impl CexFactorBankMcts {
                     let evaluation = node.evaluation.as_ref().ok_or_else(|| {
                         "Factor-Bank MCTS trace evaluation is missing".to_string()
                     })?;
-                    if node.state != step.resulting_state
+                    if *node_id == 0
+                        || !traced_nodes.insert(*node_id)
+                        || node.parent != Some(step.parent_node_id)
+                        || node.action.as_ref() != Some(&step.action)
+                        || node.state != step.resulting_state
                         || reward.to_bits() != evaluation.score.to_bits()
                         || *evaluation_sha256
                             != canonical_json_hash(evaluation).map_err(|error| error.to_string())?
@@ -684,12 +716,28 @@ impl CexFactorBankMcts {
                 }
             }
         }
+        if traced_nodes != (1..checkpoint.nodes.len()).collect() {
+            return Err("Factor-Bank MCTS trace does not bind every evaluated node".to_string());
+        }
+        for (node_id, node) in checkpoint.nodes.iter().enumerate() {
+            let consumed = consumed_actions.get(&node_id).cloned().unwrap_or_default();
+            let legal = &legal_by_node[node_id];
+            let expected_remaining = legal.difference(&consumed).cloned().collect::<Vec<_>>();
+            if !consumed.is_subset(legal) || node.remaining_actions != expected_remaining {
+                return Err("Factor-Bank MCTS untried actions drifted".to_string());
+            }
+        }
         let selected = checkpoint.selected_node_id;
         let expected_selected = checkpoint
             .nodes
             .iter()
             .enumerate()
             .skip(1)
+            .filter(|(_, node)| {
+                node.evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.passed)
+            })
             .min_by(|(_, left), (_, right)| {
                 let left_score = left.evaluation.as_ref().expect("validated node").score;
                 let right_score = right.evaluation.as_ref().expect("validated node").score;
@@ -723,6 +771,9 @@ fn validate_start(
     ridge.validate().map_err(|error| error.to_string())?;
     cart.validate().map_err(|error| error.to_string())?;
     gate.validate().map_err(|error| error.to_string())?;
+    CexEqualAbsoluteWeightPolicyV1::controlled_v1(mission.spec.policies.weight.id.clone())
+        .and_then(|policy| policy.validate_binding(&mission.spec.policies.weight))
+        .map_err(|error| error.to_string())?;
     if factor_bank.entries.is_empty()
         || factor_bank
             .gp_policy
@@ -834,6 +885,16 @@ fn legal_actions(
     max_subset_size: usize,
 ) -> Result<Vec<CexFactorSubsetActionV1>, String> {
     let identities = factor_identities(factor_bank)?;
+    if state.factors.is_empty() {
+        let factor = identities
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Factor Bank has no bootstrap factor".to_string())?;
+        return Ok(vec![CexFactorSubsetActionV1::Add {
+            factor_bank_revision_id: factor_bank.revision_id.clone(),
+            factor,
+        }]);
+    }
     let present = state.factors.iter().collect::<BTreeSet<_>>();
     let mut actions = Vec::new();
     if state.factors.len() < max_subset_size {

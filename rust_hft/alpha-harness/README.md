@@ -79,6 +79,12 @@ cargo run -p alpha-harness -- mission execute \
   --result-readback-url var/results/cex-mission-1.zip
 ```
 
+Resume a persisted subset-search checkpoint into a fresh work directory by
+adding `--resume-url <checkpoint.json>` and
+`--resume-sha256 <checkpoint-sha256>`. Restore validates the complete checkpoint
+against the newly reproduced Mission, Factor Bank, baselines, policies, and
+search state before another transition.
+
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and
 evaluation protocol, and typed prior-evidence references. The command derives
@@ -89,11 +95,13 @@ feedback fail before Mission admission. `operational.submitted_at` is retained
 for audit but does not alter the semantic Mission identity. After both baselines
 pass, execution searches only canonical Factor Bank subsets through add, remove,
 and swap actions, scores mechanically oriented equal-absolute-weight signals on
-the research folds, and emits deterministic checkpoint, trace, and selected
-subset artifacts. It does not emit the later four-stage strategy. Sealed-holdout
-evaluation requires the separate governed precommit boundary. This schema binds
-prior-evidence identities; later holdout and Paper/Shadow gates own receipt and
-signature verification.
+the research folds, and emits the typed weight policy plus deterministic
+checkpoint, trace, and selected-subset artifacts. GP screening and subset search
+share one multiplicity correction sized for both bounded candidate families;
+only passing subset evaluations are selectable. It does not emit the later
+four-stage strategy. Sealed-holdout evaluation requires the separate governed
+precommit boundary. This schema binds prior-evidence identities; later holdout
+and Paper/Shadow gates own receipt and signature verification.
 
 For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The low-level CLI rejects `mcts`; Factor-Bank subset MCTS is owned only by the content-bound `mission execute` seam. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
