@@ -530,6 +530,9 @@ impl MarketStream for BinanceMarketStream {
         info!("訂閱 Binance 市場數據，品種: {:?}", symbols);
 
         let uses_ws_snapshot_depth = Self::uses_ws_snapshot_depth();
+        if uses_ws_snapshot_depth {
+            websocket::validate_depth_frequency(self.usdm)?;
+        }
         if !uses_ws_snapshot_depth && (!self.caps.snapshot_crc || !self.caps.rest_fallback) {
             return Err(HftError::Config(
                 "Binance diff-depth requires the REST snapshot bridge; use partial20 for a WebSocket-only feed"
@@ -545,6 +548,9 @@ impl MarketStream for BinanceMarketStream {
         // Default mode is a WebSocket-only partial-depth snapshot stream. Full diff-depth mode is
         // opt-in and uses one rate-budgeted REST snapshot while explicitly buffering WS events.
         let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
+        if self.usdm {
+            ws_client = ws_client.with_usdm();
+        }
         let rest_client = self.rest_client.clone();
         let snapshot_enabled = !uses_ws_snapshot_depth;
         let snapshot_depth = Self::snapshot_depth(self.usdm);

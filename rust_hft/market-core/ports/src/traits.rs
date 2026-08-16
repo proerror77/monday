@@ -491,6 +491,16 @@ pub trait Strategy: Send + Sync {
         self.on_market_event(event, context.account)
     }
 
+    /// Optional wall-clock cadence for strategies whose research contract is time-bucketed.
+    fn clock_interval_micros(&self) -> Option<u64> {
+        None
+    }
+
+    /// Process one epoch-aligned clock boundary. Event-driven strategies ignore it by default.
+    fn on_clock(&mut self, _timestamp: Timestamp, _account: &AccountView) -> Vec<OrderIntent> {
+        Vec::new()
+    }
+
     /// 處理執行事件 (成交回報等)
     fn on_execution_event(
         &mut self,

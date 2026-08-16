@@ -60,6 +60,8 @@ pub struct ActivationRequest {
     pub bundle_hash: String,
     pub account_id: String,
     pub venue: String,
+    #[serde(default)]
+    pub market: Option<String>,
     pub instruments: Vec<String>,
     pub artifact: ActivationArtifact,
     pub mode: ActivationMode,
@@ -70,7 +72,7 @@ pub struct ActivationRequest {
 }
 
 pub trait RuntimeActivationAdapter {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String>;
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +162,7 @@ impl<'a> SystemConfigActivationAdapter<'a> {
 }
 
 impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String> {
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String> {
         let mut proposed = self.config.clone();
         let venue_matches = proposed
             .venues
@@ -195,6 +197,12 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
             }
         }
         apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;
+        request.market = match &self.bundle.artifact {
+            StrategyBundleArtifact::CexFourStage { strategy } => {
+                Some(strategy.market.as_str().to_string())
+            }
+            _ => None,
+        };
         *self.config = proposed;
         self.applied_modes.push(request.mode);
         Ok(())
@@ -219,6 +227,15 @@ fn validate_instrument_catalog(
                 "deployment instrument {instrument} is absent from the venue catalog"
             ));
         }
+    }
+    Ok(())
+}
+
+fn require_supported_cex_execution(cross_spread: bool) -> Result<(), String> {
+    if cross_spread {
+        return Err(
+            "four-stage CEX Paper/Shadow does not support cross-spread execution".to_string(),
+        );
     }
     Ok(())
 }
@@ -308,6 +325,7 @@ fn apply_strategy_bundle(
                         let contract = strategy
                             .runtime_contract()
                             .map_err(|error| error.to_string())?;
+                        require_supported_cex_execution(contract.cross_spread)?;
                         let tick_size = contract
                             .tick_size
                             .parse::<rust_decimal::Decimal>()
@@ -789,7 +807,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
                 return Err(error.into());
             }
         };
-        let request = match activation_request(&verified, self.runtime_paused) {
+        let mut request = match activation_request(&verified, self.runtime_paused) {
             Ok(request) => request,
             Err(error) => {
                 append_rejection(
@@ -808,7 +826,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
             reason: None,
             recorded_at: now,
         })?;
-        if let Err(error) = self.adapter.activate(&request) {
+        if let Err(error) = self.adapter.activate(&mut request) {
             self.audit.append(&RuntimeAuditEvent {
                 deployment_id: request.deployment_id.clone(),
                 phase: "configuration".to_string(),
@@ -891,6 +909,7 @@ fn activation_request(
         bundle_hash: verified.0.bundle_hash.clone(),
         account_id: verified.0.account_id.clone(),
         venue: verified.0.venue.clone(),
+        market: None,
         instruments: verified.0.instruments.clone(),
         artifact: *artifact,
         mode: *mode,
@@ -971,5 +990,13 @@ mod tests {
             activation_request(&verified, false),
             Err(IntakeError::ApprovalClassMismatch)
         ));
+    }
+
+    #[test]
+    fn cross_spread_cex_execution_is_not_admitted() {
+        assert!(require_supported_cex_execution(false).is_ok());
+        assert!(require_supported_cex_execution(true)
+            .unwrap_err()
+            .contains("does not support cross-spread execution"));
     }
 }

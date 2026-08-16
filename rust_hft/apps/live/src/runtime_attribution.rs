@@ -502,7 +502,14 @@ fn execution_attribution(
             if metadata.venue.eq_ignore_ascii_case("binance")
                 || metadata.venue.eq_ignore_ascii_case("binance_spot")
             {
-                metrics.insert("instrument_market_spot".to_string(), 1.0);
+                let market = match activation.market.as_deref() {
+                    None | Some("spot") => "spot",
+                    Some("usdm") => "usdm",
+                    Some(market) => {
+                        anyhow::bail!("unsupported Binance attribution market {market}")
+                    }
+                };
+                metrics.insert(format!("instrument_market_{market}"), 1.0);
             }
             let mut event = order_attribution(
                 activation,
@@ -1156,6 +1163,7 @@ mod tests {
             bundle_hash: "a".repeat(64),
             account_id: "account-1".to_string(),
             venue: "bitget".to_string(),
+            market: None,
             instruments: symbols.iter().map(|symbol| symbol.to_string()).collect(),
             artifact: ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -1392,6 +1400,43 @@ mod tests {
         assert_eq!(cancel.outcome, AttributionOutcome::Healthy);
         assert!(!state.orders.contains_key("reject-order"));
         assert!(!state.orders.contains_key("cancel-order"));
+    }
+
+    #[test]
+    fn binance_usdm_fill_evidence_preserves_the_bound_market() {
+        let mut activation = activation();
+        activation.venue = "binance".to_string();
+        activation.market = Some("usdm".to_string());
+        let mut state = AttributionState::new(&activation).unwrap();
+        execution_attribution(
+            &activation,
+            &mut state,
+            &order_new_for(
+                "usdm-fill",
+                "BTCUSDT",
+                Side::Buy,
+                "bundle-1:BTCUSDT",
+                Some(VenueId::BINANCE),
+            ),
+        )
+        .unwrap();
+
+        let fill = execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::Fill {
+                order_id: OrderId("usdm-fill".to_string()),
+                price: Price::from_f64(101.0).unwrap(),
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                timestamp: NOW_US + 1,
+                fill_id: "usdm-fill-1".to_string(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fill.metrics["instrument_market_usdm"], 1.0);
+        assert!(!fill.metrics.contains_key("instrument_market_spot"));
     }
 
     #[test]

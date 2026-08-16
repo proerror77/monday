@@ -22,7 +22,7 @@ struct RecordingAdapter {
 }
 
 impl RuntimeActivationAdapter for RecordingAdapter {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String> {
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String> {
         self.requests.push(request.clone());
         Ok(())
     }
@@ -399,6 +399,7 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
             .unwrap()
         };
         assert_eq!(request.mode, expected_mode);
+        assert_eq!(request.market.as_deref(), Some("usdm"));
     }
 
     assert_eq!(config.strategies.len(), 1);
@@ -780,7 +781,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
     let mut config = configured_runtime();
     let bundle = formula_bundle(now);
     let bundle_path = directory("featureless").join("bundle.json");
-    let request = ActivationRequest {
+    let mut request = ActivationRequest {
         deployment_id: "deployment-featureless".to_string(),
         asset_revision_id: bundle.candidate_id.clone(),
         promotion_id: "promotion-1".to_string(),
@@ -788,6 +789,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         bundle_hash: bundle.bundle_hash.clone(),
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
+        market: None,
         instruments: vec!["BTCUSDT".to_string()],
         artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
         mode: ActivationMode::Paper,
@@ -797,7 +799,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         max_slippage_bps: 5.0,
     };
     SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-        .activate(&request)
+        .activate(&mut request)
         .unwrap();
 
     assert!(runtime::SystemBuilder::new(config)
@@ -1119,7 +1121,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
 
     for value in [0.0, 1.5, 10_001.0, f64::INFINITY, f64::NAN] {
         let mut config = configured_runtime();
-        let request = ActivationRequest {
+        let mut request = ActivationRequest {
             deployment_id: "slippage-validation".to_string(),
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
@@ -1127,6 +1129,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             bundle_hash: bundle.bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
+            market: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -1136,7 +1139,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_slippage_bps: value,
         };
         let error = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&request)
+            .activate(&mut request)
             .unwrap_err();
         assert!(error.contains("finite integer in 1..=10000"));
         assert_eq!(config.engine.intent_max_slippage_bps, None);
@@ -1146,7 +1149,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
 
     for value in [1.0, 10_000.0] {
         let mut config = configured_runtime();
-        let request = ActivationRequest {
+        let mut request = ActivationRequest {
             deployment_id: "slippage-boundary".to_string(),
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
@@ -1154,6 +1157,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             bundle_hash: bundle.bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
+            market: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -1163,7 +1167,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_slippage_bps: value,
         };
         SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&request)
+            .activate(&mut request)
             .expect("inclusive slippage boundary");
         assert_eq!(config.engine.intent_max_slippage_bps, Some(value as i32));
         assert_eq!(
