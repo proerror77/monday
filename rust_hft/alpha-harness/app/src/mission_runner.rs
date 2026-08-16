@@ -14,10 +14,7 @@ use alpha_domain::{
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
-    engines::{
-        CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
-        CexFactorBankMctsStopReasonV1,
-    },
+    engines::{CexFactorBankMcts, CexFactorBankMctsCheckpointV1, CexFactorBankMctsStopReasonV1},
     evaluation::{prepare_dataset, EngineContext},
 };
 use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
@@ -691,16 +688,10 @@ fn run_factor_bank_subset_search(
             &results_dir.join("factor-subset-mcts-result.json"),
             &result,
         )?;
-        if result.selected.is_some() {
-            let strategy = CexCombinationResearchArtifactV1::new(
-                control_mission,
-                factor_bank,
-                ridge,
-                cart,
-                &baselines.gate,
-                &result,
-            )
-            .map_err(anyhow::Error::msg)?;
+        if let Some(strategy) = search
+            .combination_artifact(control_mission, ridge, cart, &baselines.gate)
+            .map_err(anyhow::Error::msg)?
+        {
             data_mission::write_json_atomic(
                 &results_dir.join("combination-walk-forward.json"),
                 &strategy,
@@ -1191,7 +1182,7 @@ mod tests {
         CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1,
         EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
-    use alpha_engine::engines::CexFactorBankMctsResultV1;
+    use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
         hft_research_manifest::CexArtifactTripletV2 {
@@ -1729,6 +1720,17 @@ mod tests {
             &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
         )
         .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let context = dataset.engine_context();
         let selected_factors = subset_result["selected"]["subset"]["factors"]
             .as_array()
             .unwrap();
@@ -1781,21 +1783,29 @@ mod tests {
                 &ridge_typed,
                 &cart_typed,
                 &gate_typed,
+                &context,
+                &checkpoint_artifact.checkpoint,
                 &subset_result_typed,
             )
             .unwrap();
         assert_eq!(
-            strategy,
-            CexCombinationResearchArtifactV1::new(
+            strategy.subset_checkpoint.content_sha256,
+            checkpoint_artifact.checkpoint_sha256
+        );
+        let mut forged_result = subset_result_typed.clone();
+        forged_result.checkpoint_sha256 = "0".repeat(64);
+        assert!(strategy
+            .validate_binding(
                 &fixture.mission,
                 &factor_bank_typed,
                 &ridge_typed,
                 &cart_typed,
                 &gate_typed,
-                &subset_result_typed,
+                &context,
+                &checkpoint_artifact.checkpoint,
+                &forged_result,
             )
-            .unwrap()
-        );
+            .is_err());
         let strategy_json = serde_json::to_value(&strategy).unwrap();
         assert_eq!(
             strategy_json["schema_version"],
@@ -1873,7 +1883,6 @@ mod tests {
             .selected
             .evaluation_sha256 = "0".repeat(64);
         assert!(bad_metric_identity.validate().is_err());
-        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
         let policy_revision = store.get_registry_revision(&policy_hash).unwrap();
         assert_eq!(
             policy_revision.registry_kind,

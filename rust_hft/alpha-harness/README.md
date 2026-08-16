@@ -110,7 +110,9 @@ equal-absolute Signal weights, sign-based bounded Sizing, evaluator-owned Risk
 limits, and the exact Binance bucketed-L2 cost/execution assumptions. The same
 artifact binds the selected walk-forward metrics and both mandatory baseline
 evaluations under one protocol while keeping the holdout unopened and carrying
-neither deployment nor order-submission authority. Sealed-holdout evaluation requires the separate governed
+neither deployment nor order-submission authority. Its selected result is
+accepted only after exact checkpoint replay derives the same terminal metadata,
+subset, and evaluation. Sealed-holdout evaluation requires the separate governed
 precommit boundary. This schema binds prior-evidence identities; later holdout
 and Paper/Shadow gates own receipt and signature verification.
 

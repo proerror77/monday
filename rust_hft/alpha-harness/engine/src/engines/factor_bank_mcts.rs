@@ -397,6 +397,7 @@ pub struct CexCombinationResearchArtifactV1 {
     pub strategy_id: String,
     pub mission_id: String,
     pub subset_result: CexResearchContentRefV1,
+    pub subset_checkpoint: CexResearchContentRefV1,
     pub signal: CexSignalStageV1,
     pub sizing: CexSizingStageV1,
     pub risk: CexRiskStageV1,
@@ -761,15 +762,20 @@ impl CexCombinationWalkForwardEvidenceV1 {
 }
 
 impl CexCombinationResearchArtifactV1 {
-    pub fn new(
+    fn from_validated_search(
         mission: &CexResearchMissionArtifactV1,
         factor_bank: &CexFactorBankRevisionV2,
         ridge: &CexBaselineArtifactV1,
         cart: &CexBaselineArtifactV1,
         gate: &CexBaselineGateV1,
         result: &CexFactorBankMctsResultV1,
+        checkpoint: &CexFactorBankMctsCheckpointV1,
     ) -> Result<Self, String> {
         validate_combination_sources(mission, factor_bank, ridge, cart, gate, result)?;
+        let checkpoint_sha256 = checkpoint.content_hash()?;
+        if checkpoint_sha256 != result.checkpoint_sha256 {
+            return Err("CEX combination checkpoint identity drifted".to_string());
+        }
         let selection = result.selected.as_ref().ok_or_else(|| {
             "CEX combination strategy requires a passing selected subset".to_string()
         })?;
@@ -830,6 +836,10 @@ impl CexCombinationResearchArtifactV1 {
             id: format!("cex-factor-bank-subset-mcts-result-{result_hash}"),
             content_sha256: result_hash,
         };
+        let subset_checkpoint = CexResearchContentRefV1 {
+            id: format!("cex-factor-bank-subset-mcts-checkpoint-{checkpoint_sha256}"),
+            content_sha256: checkpoint_sha256,
+        };
         let walk_forward_evidence = CexCombinationWalkForwardEvidenceV1::new(
             factor_bank.research_dataset.clone(),
             factor_bank.walk_forward_partition.clone(),
@@ -858,6 +868,7 @@ impl CexCombinationResearchArtifactV1 {
             strategy_id: String::new(),
             mission_id: result.mission_id.clone(),
             subset_result,
+            subset_checkpoint,
             signal,
             sizing,
             risk,
@@ -874,6 +885,9 @@ impl CexCombinationResearchArtifactV1 {
 
     pub fn validate(&self) -> Result<(), String> {
         self.subset_result
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.subset_checkpoint
             .validate()
             .map_err(|error| error.to_string())?;
         self.signal.validate()?;
@@ -900,6 +914,16 @@ impl CexCombinationResearchArtifactV1 {
             || self.mission_id.trim().is_empty()
             || self.deployment_authority
             || self.order_submission_authority
+            || self.subset_result.id
+                != format!(
+                    "cex-factor-bank-subset-mcts-result-{}",
+                    self.subset_result.content_sha256
+                )
+            || self.subset_checkpoint.id
+                != format!(
+                    "cex-factor-bank-subset-mcts-checkpoint-{}",
+                    self.subset_checkpoint.content_sha256
+                )
             || self.sizing.parent != self.signal.reference()?
             || self.risk.parent != self.sizing.reference()?
             || self.execution.parent != self.risk.reference()?
@@ -921,6 +945,7 @@ impl CexCombinationResearchArtifactV1 {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_binding(
         &self,
         mission: &CexResearchMissionArtifactV1,
@@ -928,10 +953,29 @@ impl CexCombinationResearchArtifactV1 {
         ridge: &CexBaselineArtifactV1,
         cart: &CexBaselineArtifactV1,
         gate: &CexBaselineGateV1,
+        context: &EngineContext<'_>,
+        checkpoint: &CexFactorBankMctsCheckpointV1,
         result: &CexFactorBankMctsResultV1,
     ) -> Result<(), String> {
         self.validate()?;
-        if self != &Self::new(mission, factor_bank, ridge, cart, gate, result)? {
+        let restored = CexFactorBankMcts::restore_json(
+            mission,
+            factor_bank,
+            ridge,
+            cart,
+            gate,
+            context,
+            serde_json::to_value(checkpoint).map_err(|error| error.to_string())?,
+        )?;
+        if restored.result()? != *result {
+            return Err(
+                "CEX combination subset result is not derived from its checkpoint".to_string(),
+            );
+        }
+        let expected = restored
+            .combination_artifact(mission, ridge, cart, gate)?
+            .ok_or_else(|| "CEX combination checkpoint has no passing selection".to_string())?;
+        if self != &expected {
             return Err("CEX combination research artifact binding drifted".to_string());
         }
         Ok(())
@@ -1287,6 +1331,30 @@ impl CexFactorBankMcts {
             selected,
             checkpoint_sha256: self.checkpoint.content_hash()?,
         })
+    }
+
+    pub fn combination_artifact(
+        &self,
+        mission: &CexResearchMissionArtifactV1,
+        ridge: &CexBaselineArtifactV1,
+        cart: &CexBaselineArtifactV1,
+        gate: &CexBaselineGateV1,
+    ) -> Result<Option<CexCombinationResearchArtifactV1>, String> {
+        self.validate_checkpoint()?;
+        let result = self.result()?;
+        if result.selected.is_none() {
+            return Ok(None);
+        }
+        CexCombinationResearchArtifactV1::from_validated_search(
+            mission,
+            &self.factor_bank,
+            ridge,
+            cart,
+            gate,
+            &result,
+            &self.checkpoint,
+        )
+        .map(Some)
     }
 
     fn selected_node(&self) -> Result<Option<&NodeV1>, String> {
