@@ -14,7 +14,7 @@ use alpha_domain::{
     FormulaEvaluatorConfig, SearchBudget, WALK_FORWARD_EVALUATOR_VERSION,
 };
 use hft_search_kernel::{
-    backpropagate, select_expandable_progressively, validate_tree, UctNode, UctStats,
+    backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +145,7 @@ struct NodeV1 {
     parent: Option<usize>,
     children: Vec<usize>,
     remaining_actions: Vec<CexFactorSubsetActionV1>,
+    subtree_has_expansion: bool,
     action: Option<CexFactorSubsetActionV1>,
     depth: usize,
     visits: u64,
@@ -178,6 +179,9 @@ impl UctNode for NodeV1 {
         self.visits = stats.visits();
         self.total_reward = stats.total_reward();
         self.best_reward = stats.best_reward();
+    }
+    fn subtree_is_expandable(&self) -> bool {
+        self.subtree_has_expansion
     }
 }
 
@@ -299,6 +303,7 @@ impl CexFactorBankMcts {
         bindings.validate()?;
         let root = CexFactorSubsetV1 { factors: vec![] };
         let root_hash = root.content_hash()?;
+        let root_actions = legal_actions(&root, factor_bank, bindings.max_subset_size)?;
         let checkpoint = CexFactorBankMctsCheckpointV1 {
             schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
             rng: DeterministicRng::new(bindings.seed),
@@ -306,7 +311,8 @@ impl CexFactorBankMcts {
                 state: root.clone(),
                 parent: None,
                 children: vec![],
-                remaining_actions: legal_actions(&root, factor_bank, bindings.max_subset_size)?,
+                subtree_has_expansion: !root_actions.is_empty(),
+                remaining_actions: root_actions,
                 action: None,
                 depth: 0,
                 visits: 0,
@@ -407,15 +413,20 @@ impl CexFactorBankMcts {
                 self.validate_checkpoint()?;
                 return Ok(CexFactorBankMctsStopReasonV1::Paused);
             }
-            if let Some(reason) = self.expected_terminal_reason()? {
+            if let Some(reason) = self.budget_terminal_reason() {
                 self.checkpoint.terminal_reason = Some(reason);
                 self.validate_checkpoint()?;
                 return Ok(reason);
             }
-            let parent_id =
+            let Some(parent_id) =
                 select_expandable_progressively(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
                     .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "Factor-Bank MCTS search space is exhausted".to_string())?;
+            else {
+                let reason = CexFactorBankMctsStopReasonV1::SearchSpaceExhausted;
+                self.checkpoint.terminal_reason = Some(reason);
+                self.validate_checkpoint()?;
+                return Ok(reason);
+            };
             let node = &self.checkpoint.nodes[parent_id];
             let first_deeper_combination = (node.state.factors.len()
                 < self.checkpoint.bindings.max_subset_size
@@ -456,6 +467,7 @@ impl CexFactorBankMcts {
                     resulting_state: state,
                     outcome: TraceOutcomeV1::Duplicate { state_sha256 },
                 });
+                self.refresh_subtree_expandability(parent_id)?;
                 continue;
             }
 
@@ -474,6 +486,7 @@ impl CexFactorBankMcts {
                 state: state.clone(),
                 parent: Some(parent_id),
                 children: vec![],
+                subtree_has_expansion: !remaining_actions.is_empty(),
                 remaining_actions,
                 action: Some(action.clone()),
                 depth,
@@ -483,7 +496,8 @@ impl CexFactorBankMcts {
                 evaluation: Some(evaluation),
             });
             self.checkpoint.nodes[parent_id].children.push(node_id);
-            backpropagate(&mut self.checkpoint.nodes, 0, node_id, reward)
+            self.refresh_subtree_expandability(parent_id)?;
+            backpropagate_lineage(&mut self.checkpoint.nodes, 0, node_id, reward)
                 .map_err(|error| error.to_string())?;
             self.checkpoint.candidates_evaluated += 1;
             if self.is_better_selection(node_id)? {
@@ -584,15 +598,8 @@ impl CexFactorBankMcts {
     }
 
     fn expected_terminal_reason(&self) -> Result<Option<CexFactorBankMctsStopReasonV1>, String> {
-        if self.checkpoint.candidates_evaluated >= self.checkpoint.bindings.budget.max_candidates {
-            return Ok(Some(
-                CexFactorBankMctsStopReasonV1::CandidateBudgetExhausted,
-            ));
-        }
-        if self.checkpoint.expansions_used >= self.checkpoint.bindings.budget.max_expansions {
-            return Ok(Some(
-                CexFactorBankMctsStopReasonV1::ExpansionBudgetExhausted,
-            ));
+        if let Some(reason) = self.budget_terminal_reason() {
+            return Ok(Some(reason));
         }
         Ok(
             select_expandable_progressively(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
@@ -600,6 +607,41 @@ impl CexFactorBankMcts {
                 .is_none()
                 .then_some(CexFactorBankMctsStopReasonV1::SearchSpaceExhausted),
         )
+    }
+
+    fn budget_terminal_reason(&self) -> Option<CexFactorBankMctsStopReasonV1> {
+        if self.checkpoint.candidates_evaluated >= self.checkpoint.bindings.budget.max_candidates {
+            Some(CexFactorBankMctsStopReasonV1::CandidateBudgetExhausted)
+        } else if self.checkpoint.expansions_used >= self.checkpoint.bindings.budget.max_expansions
+        {
+            Some(CexFactorBankMctsStopReasonV1::ExpansionBudgetExhausted)
+        } else {
+            None
+        }
+    }
+
+    fn refresh_subtree_expandability(&mut self, mut node_id: usize) -> Result<(), String> {
+        loop {
+            let node = self
+                .checkpoint
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| "Factor-Bank MCTS expansion lineage is missing".to_string())?;
+            let expected = !node.remaining_actions.is_empty()
+                || node
+                    .children
+                    .iter()
+                    .any(|&child_id| self.checkpoint.nodes[child_id].subtree_has_expansion);
+            if node.subtree_has_expansion == expected {
+                return Ok(());
+            }
+            let parent = node.parent;
+            self.checkpoint.nodes[node_id].subtree_has_expansion = expected;
+            let Some(parent_id) = parent else {
+                return Ok(());
+            };
+            node_id = parent_id;
+        }
     }
 
     fn validate_checkpoint(&self) -> Result<(), String> {
@@ -629,6 +671,19 @@ impl CexFactorBankMcts {
             usize::try_from(checkpoint.bindings.budget.max_expansions).unwrap_or(usize::MAX),
         )
         .map_err(|error| error.to_string())?;
+        let mut subtree_has_expansion = vec![false; checkpoint.nodes.len()];
+        for node_id in (0..checkpoint.nodes.len()).rev() {
+            let node = &checkpoint.nodes[node_id];
+            let expected = !node.remaining_actions.is_empty()
+                || node
+                    .children
+                    .iter()
+                    .any(|&child_id| subtree_has_expansion[child_id]);
+            if node.subtree_has_expansion != expected {
+                return Err("Factor-Bank MCTS expansion index drifted".to_string());
+            }
+            subtree_has_expansion[node_id] = expected;
+        }
         let identities = factor_identity_map(&self.factor_bank)?;
         let mut seen = BTreeSet::new();
         let mut legal_by_node = Vec::with_capacity(checkpoint.nodes.len());

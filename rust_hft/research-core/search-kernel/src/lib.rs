@@ -106,6 +106,9 @@ pub trait UctNode {
     fn depth(&self) -> usize;
     fn stats(&self) -> Result<UctStats, UctError>;
     fn replace_stats(&mut self, stats: UctStats);
+    fn subtree_is_expandable(&self) -> bool {
+        self.is_expandable()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +208,6 @@ pub fn select_expandable_progressively<N: UctNode>(
     if !exploration.is_finite() || exploration < 0.0 {
         return Err(UctError::InvalidExploration);
     }
-    validate_tree(nodes, root, usize::MAX)?;
     select_progressively(nodes, root, exploration)
 }
 
@@ -239,37 +241,56 @@ fn select_progressively<N: UctNode>(
     root: usize,
     exploration: f64,
 ) -> Result<Option<usize>, UctError> {
-    let mut selected = vec![None; nodes.len()];
-    for node_id in (0..nodes.len()).rev() {
-        let node = &nodes[node_id];
+    let root_node = nodes.get(root).ok_or(UctError::InvalidNode(root))?;
+    if root_node.parent().is_some() || root_node.depth() != 0 {
+        return Err(UctError::InvalidTopology(root));
+    }
+    if !root_node.subtree_is_expandable() {
+        return Ok(None);
+    }
+
+    let mut node_id = root;
+    loop {
+        let node = nodes.get(node_id).ok_or(UctError::InvalidNode(node_id))?;
+        let stats = node.stats()?;
         let expandable = node.is_expandable();
         let next_child = u64::try_from(node.children().len())
             .unwrap_or(u64::MAX)
             .saturating_add(1);
-        if expandable
-            && next_child.saturating_mul(next_child) <= node.stats()?.visits().saturating_add(1)
-        {
-            selected[node_id] = Some(node_id);
-            continue;
+        if expandable && next_child.saturating_mul(next_child) <= stats.visits().saturating_add(1) {
+            return Ok(Some(node_id));
         }
 
-        let parent_visits = node.stats()?.visits();
+        let parent_visits = stats.visits();
+        // ponytail: scan siblings on the chosen path; cache scores only if measured branching dominates.
         let mut best = None;
         for &child_id in node.children() {
-            if let Some(expandable_id) = selected[child_id] {
-                let score = uct_score(nodes, child_id, parent_visits, exploration)?;
-                if best.is_none_or(|(_, best_score)| {
-                    score.total_cmp(&best_score) != std::cmp::Ordering::Less
-                }) {
-                    best = Some((expandable_id, score));
-                }
+            let child = nodes.get(child_id).ok_or(UctError::InvalidNode(child_id))?;
+            if child_id <= node_id
+                || child.parent() != Some(node_id)
+                || child.depth() != node.depth() + 1
+            {
+                return Err(UctError::InvalidTopology(node_id));
+            }
+            if !child.subtree_is_expandable() {
+                continue;
+            }
+            let score = uct_score(nodes, child_id, parent_visits, exploration)?;
+            if best.is_none_or(|(_, best_score)| {
+                score.total_cmp(&best_score) != std::cmp::Ordering::Less
+            }) {
+                best = Some((child_id, score));
             }
         }
-        selected[node_id] = best
-            .map(|(expandable_id, _)| expandable_id)
-            .or_else(|| expandable.then_some(node_id));
+        if let Some((child_id, _)) = best {
+            node_id = child_id;
+            continue;
+        }
+        if expandable {
+            return Ok(Some(node_id));
+        }
+        return Err(UctError::InvalidTopology(node_id));
     }
-    Ok(selected[root])
 }
 
 fn uct_score<N: UctNode>(
@@ -321,6 +342,53 @@ pub fn backpropagate<N: UctNode>(
     Ok(())
 }
 
+/// Updates only the selected lineage after the adapter has validated the full
+/// append-only tree at its checkpoint boundary.
+pub fn backpropagate_lineage<N: UctNode>(
+    nodes: &mut [N],
+    root: usize,
+    leaf: usize,
+    reward: f64,
+) -> Result<(), UctError> {
+    if !reward.is_finite() {
+        return Err(UctError::InvalidReward);
+    }
+    let root_node = nodes.get(root).ok_or(UctError::InvalidNode(root))?;
+    if root_node.parent().is_some() || root_node.depth() != 0 {
+        return Err(UctError::InvalidTopology(root));
+    }
+
+    let mut lineage = Vec::new();
+    let mut current = leaf;
+    loop {
+        let node = nodes.get(current).ok_or(UctError::InvalidNode(current))?;
+        lineage.push(current);
+        if current == root {
+            break;
+        }
+        let parent_id = node.parent().ok_or(UctError::InvalidTopology(current))?;
+        let parent = nodes
+            .get(parent_id)
+            .ok_or(UctError::InvalidNode(parent_id))?;
+        if parent_id >= current
+            || !parent.children().contains(&current)
+            || node.depth() != parent.depth() + 1
+        {
+            return Err(UctError::InvalidTopology(current));
+        }
+        current = parent_id;
+    }
+
+    let updated = lineage
+        .iter()
+        .map(|&node_id| nodes[node_id].stats()?.record(reward))
+        .collect::<Result<Vec<_>, UctError>>()?;
+    for (node_id, stats) in lineage.into_iter().zip(updated) {
+        nodes[node_id].replace_stats(stats);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +398,7 @@ mod tests {
         parent: Option<usize>,
         children: Vec<usize>,
         expandable: bool,
+        subtree_expandable: bool,
         depth: usize,
         stats: UctStats,
     }
@@ -353,6 +422,9 @@ mod tests {
         fn replace_stats(&mut self, stats: UctStats) {
             self.stats = stats;
         }
+        fn subtree_is_expandable(&self) -> bool {
+            self.subtree_expandable
+        }
     }
 
     #[test]
@@ -368,6 +440,7 @@ mod tests {
                 parent: None,
                 children: vec![1],
                 expandable: false,
+                subtree_expandable: true,
                 depth: 0,
                 stats: UctStats::from_parts(1, 0.2, Some(0.2)).unwrap(),
             },
@@ -375,6 +448,7 @@ mod tests {
                 parent: Some(0),
                 children: vec![],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 1,
                 stats: UctStats::default(),
             },
@@ -398,6 +472,7 @@ mod tests {
                 parent: None,
                 children: vec![1, 2],
                 expandable: false,
+                subtree_expandable: true,
                 depth: 0,
                 stats: UctStats::from_parts(2, 0.0, Some(0.0)).unwrap(),
             },
@@ -405,6 +480,7 @@ mod tests {
                 parent: Some(0),
                 children: vec![],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 1,
                 stats: UctStats::from_parts(1, 0.0, Some(0.0)).unwrap(),
             },
@@ -412,6 +488,7 @@ mod tests {
                 parent: Some(0),
                 children: vec![],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 1,
                 stats: UctStats::from_parts(1, -0.0, Some(-0.0)).unwrap(),
             },
@@ -427,6 +504,7 @@ mod tests {
                 parent: None,
                 children: vec![1],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 0,
                 stats: UctStats::from_parts(2, 0.4, Some(0.2)).unwrap(),
             },
@@ -434,6 +512,7 @@ mod tests {
                 parent: Some(0),
                 children: vec![],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 1,
                 stats: UctStats::from_parts(1, 0.2, Some(0.2)).unwrap(),
             },
@@ -447,6 +526,7 @@ mod tests {
 
         let mut exhausted_child = nodes;
         exhausted_child[1].expandable = false;
+        exhausted_child[1].subtree_expandable = false;
         assert_eq!(
             select_expandable_progressively(&exhausted_child, 0, 1.4).unwrap(),
             Some(0)
@@ -463,6 +543,7 @@ mod tests {
                     .then(|| vec![node_id + 1])
                     .unwrap_or_default(),
                 expandable: node_id + 1 == depth,
+                subtree_expandable: true,
                 depth: node_id,
                 stats: UctStats::default(),
             })
@@ -475,12 +556,73 @@ mod tests {
     }
 
     #[test]
+    fn progressive_path_operations_skip_unselected_subtrees() {
+        let invalid_stats = UctStats {
+            visits: 1,
+            total_reward: f64::NAN,
+            best_reward: Some(f64::NAN),
+        };
+        let mut nodes = vec![
+            Node {
+                parent: None,
+                children: vec![1, 2],
+                expandable: false,
+                subtree_expandable: true,
+                depth: 0,
+                stats: UctStats::from_parts(2, 2.0, Some(2.0)).unwrap(),
+            },
+            Node {
+                parent: Some(0),
+                children: vec![3],
+                expandable: false,
+                subtree_expandable: true,
+                depth: 1,
+                stats: UctStats::from_parts(1, 2.0, Some(2.0)).unwrap(),
+            },
+            Node {
+                parent: Some(0),
+                children: vec![4],
+                expandable: false,
+                subtree_expandable: true,
+                depth: 1,
+                stats: UctStats::from_parts(1, 0.0, Some(0.0)).unwrap(),
+            },
+            Node {
+                parent: Some(1),
+                children: vec![],
+                expandable: true,
+                subtree_expandable: true,
+                depth: 2,
+                stats: UctStats::default(),
+            },
+            Node {
+                parent: Some(2),
+                children: vec![],
+                expandable: true,
+                subtree_expandable: true,
+                depth: 2,
+                stats: invalid_stats,
+            },
+        ];
+
+        assert_eq!(
+            select_expandable_progressively(&nodes, 0, 1.4).unwrap(),
+            Some(3)
+        );
+        backpropagate_lineage(&mut nodes, 0, 3, 0.5).unwrap();
+        assert_eq!(nodes[3].stats.visits(), 1);
+        assert_eq!(nodes[4].stats.visits(), invalid_stats.visits());
+        assert!(nodes[4].stats.total_reward().is_nan());
+    }
+
+    #[test]
     fn rejects_an_expandable_cycle_before_mutating_rewards() {
         let mut nodes = vec![
             Node {
                 parent: None,
                 children: vec![1],
                 expandable: false,
+                subtree_expandable: true,
                 depth: 0,
                 stats: UctStats::default(),
             },
@@ -488,6 +630,7 @@ mod tests {
                 parent: Some(0),
                 children: vec![2],
                 expandable: true,
+                subtree_expandable: true,
                 depth: 1,
                 stats: UctStats::default(),
             },
@@ -495,6 +638,7 @@ mod tests {
                 parent: Some(1),
                 children: vec![1],
                 expandable: false,
+                subtree_expandable: false,
                 depth: 2,
                 stats: UctStats::default(),
             },
@@ -514,6 +658,7 @@ mod tests {
             parent: None,
             children: vec![],
             expandable: true,
+            subtree_expandable: true,
             depth: 0,
             stats: original,
         }];

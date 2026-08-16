@@ -13,7 +13,7 @@ use alpha_domain::{
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
-    engines::{CexFactorBankMcts, CexFactorBankMctsStopReasonV1},
+    engines::{CexFactorBankMcts, CexFactorBankMctsCheckpointV1, CexFactorBankMctsStopReasonV1},
     evaluation::{prepare_dataset, EngineContext},
 };
 use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
@@ -47,6 +47,8 @@ const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
+    "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
@@ -85,6 +87,40 @@ struct ExecutionReport<'a> {
     bundle_bytes: u64,
     bundle_sha256: String,
     readback_bundle_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MctsCheckpointArtifactV1 {
+    schema_version: String,
+    checkpoint_sha256: String,
+    checkpoint: CexFactorBankMctsCheckpointV1,
+}
+
+impl MctsCheckpointArtifactV1 {
+    fn new(checkpoint: CexFactorBankMctsCheckpointV1) -> anyhow::Result<Self> {
+        let checkpoint_sha256 = checkpoint.content_hash().map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            schema_version: MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION.to_string(),
+            checkpoint_sha256,
+            checkpoint,
+        })
+    }
+
+    fn verified_checkpoint(
+        self,
+        expected_sha256: &str,
+    ) -> anyhow::Result<CexFactorBankMctsCheckpointV1> {
+        if self.schema_version != MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION
+            || self.checkpoint_sha256
+                != self.checkpoint.content_hash().map_err(anyhow::Error::msg)?
+            || self.checkpoint_sha256
+                != normalized_sha256("MCTS resume checkpoint", expected_sha256)?
+        {
+            bail!("MCTS resume checkpoint content SHA256 mismatch");
+        }
+        Ok(self.checkpoint)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -169,14 +205,12 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             &checkpoint_path,
             MAX_MCTS_CHECKPOINT_BYTES,
         )?;
-        let checkpoint = serde_json::from_slice(&std::fs::read(checkpoint_path)?)
-            .context("MCTS resume checkpoint is invalid JSON")?;
-        if canonical_json_hash(&checkpoint)?
-            != normalized_sha256("MCTS resume checkpoint", resume_sha256)?
-        {
-            bail!("MCTS resume checkpoint content SHA256 mismatch");
-        }
-        Some(checkpoint)
+        let artifact: MctsCheckpointArtifactV1 =
+            serde_json::from_slice(&std::fs::read(checkpoint_path)?)
+                .context("MCTS resume checkpoint is invalid JSON")?;
+        Some(serde_json::to_value(
+            artifact.verified_checkpoint(resume_sha256)?,
+        )?)
     } else {
         None
     };
@@ -635,9 +669,11 @@ fn run_factor_bank_subset_search(
         let stop = search
             .run(context, Some(MCTS_CHECKPOINT_INTERVAL))
             .map_err(anyhow::Error::msg)?;
+        let checkpoint =
+            MctsCheckpointArtifactV1::new(search.checkpoint().map_err(anyhow::Error::msg)?)?;
         data_mission::write_json_atomic_bounded(
             &results_dir.join("factor-subset-mcts-checkpoint.json"),
-            &search.checkpoint().map_err(anyhow::Error::msg)?,
+            &checkpoint,
             MAX_MCTS_CHECKPOINT_BYTES,
         )?;
         if stop == CexFactorBankMctsStopReasonV1::Paused {
@@ -1670,6 +1706,10 @@ mod tests {
             &std::fs::read(results.join("factor-subset-mcts-trace.json")).unwrap(),
         )
         .unwrap();
+        let checkpoint_artifact: MctsCheckpointArtifactV1 = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
+        )
+        .unwrap();
         let selected_factors = subset_result["selected"]["subset"]["factors"]
             .as_array()
             .unwrap();
@@ -1682,6 +1722,10 @@ mod tests {
             ridge["factor_bank_revision_id"]
         );
         assert_eq!(subset_result["baseline_gate_id"], gate["gate_id"]);
+        assert_eq!(
+            subset_result["checkpoint_sha256"],
+            checkpoint_artifact.checkpoint_sha256
+        );
         assert!(!selected_factors.is_empty());
         assert_eq!(
             subset_result["selected"]["normalized_equal_abs_weight"]
@@ -1837,6 +1881,7 @@ mod tests {
         let mut missing_untried_action =
             serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
         missing_untried_action["nodes"][0]["remaining_actions"] = serde_json::json!([]);
+        missing_untried_action["nodes"][0]["subtree_has_expansion"] = serde_json::json!(false);
         assert!(CexFactorBankMcts::restore_json(
             &fixture.mission,
             &factor_bank,
@@ -1854,6 +1899,23 @@ mod tests {
             CexFactorBankMctsStopReasonV1::Paused
         );
         let paused = serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
+        let mut expansion_index_drift = paused.clone();
+        expansion_index_drift["nodes"][0]["subtree_has_expansion"] = serde_json::json!(!paused
+            ["nodes"][0]["subtree_has_expansion"]
+            .as_bool()
+            .unwrap());
+        assert!(CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            expansion_index_drift,
+        )
+        .err()
+        .expect("the persisted expansion index must be verified")
+        .contains("expansion index drifted"));
         let mut rng_drift = paused.clone();
         rng_drift["rng"] = serde_json::json!(rng_drift["rng"].as_u64().unwrap() ^ 1);
         let mut stats_drift = paused.clone();
@@ -1992,8 +2054,14 @@ mod tests {
         assert!(legacy_error.contains("cex-factor-bank-subset-mcts-v1"));
 
         let resume_path = fixture.root.join("paused-factor-subset-mcts.json");
-        std::fs::write(&resume_path, serde_json::to_vec_pretty(&paused).unwrap()).unwrap();
-        let resume_content_sha256 = canonical_json_hash(&paused).unwrap();
+        let resume_artifact =
+            MctsCheckpointArtifactV1::new(serde_json::from_value(paused.clone()).unwrap()).unwrap();
+        let resume_content_sha256 = resume_artifact.checkpoint_sha256.clone();
+        std::fs::write(
+            &resume_path,
+            serde_json::to_vec_pretty(&resume_artifact).unwrap(),
+        )
+        .unwrap();
         assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
         fixture.args.work_dir = fixture.root.join("work-resumed");
         fixture.args.result_put_url = fixture
@@ -2075,10 +2143,15 @@ mod tests {
             .unwrap();
         let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
         let context = dataset.engine_context();
-        let mut checkpoint: serde_json::Value = serde_json::from_slice(
+        let checkpoint_artifact: MctsCheckpointArtifactV1 = serde_json::from_slice(
             &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            checkpoint_artifact.checkpoint_sha256,
+            checkpoint_artifact.checkpoint.content_hash().unwrap()
+        );
+        let mut checkpoint = serde_json::to_value(checkpoint_artifact.checkpoint).unwrap();
         let mut failed_combination: CandidateEvaluation =
             serde_json::from_value(checkpoint["nodes"][2]["evaluation"].clone()).unwrap();
         failed_combination.passed = false;
