@@ -263,8 +263,7 @@ impl MessageConverter {
         if stream_msg.stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(stream_msg.data.clone()) {
                 let previous_update_id = update.previous_final_update_id;
-                return Self::convert_depth_update(update)
-                    .map(MarketEvent::Update)
+                return Self::convert_depth_stream_event(&stream_msg.stream, update)
                     .map(|event| ParsedMarketEvent {
                         event,
                         previous_update_id,
@@ -290,8 +289,7 @@ impl MessageConverter {
             ));
         } else if stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(data.clone()) {
-                let book_update = Self::convert_depth_update(update)?;
-                return Ok(Some(MarketEvent::Update(book_update)));
+                return Self::convert_depth_stream_event(stream, update).map(Some);
             }
             if let Ok(snapshot) = Self::parse_value::<DepthSnapshot>(data.clone()) {
                 let symbol = stream
@@ -407,6 +405,25 @@ impl MessageConverter {
             timestamps: MarketDataTimestamps::default(),
         })
     }
+
+    fn convert_depth_stream_event(stream: &str, update: DepthUpdate) -> HftResult<MarketEvent> {
+        let update = Self::convert_depth_update(update)?;
+        if stream
+            .split('@')
+            .any(|channel| matches!(channel, "depth5" | "depth10" | "depth20"))
+        {
+            return Ok(MarketEvent::Snapshot(MarketSnapshot {
+                symbol: update.symbol,
+                timestamp: update.timestamp,
+                bids: update.bids,
+                asks: update.asks,
+                sequence: update.sequence,
+                source_venue: update.source_venue,
+                timestamps: update.timestamps,
+            }));
+        }
+        Ok(MarketEvent::Update(update))
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +525,25 @@ mod tests {
             .unwrap()
             .expect("trade event");
         assert!(matches!(event, MarketEvent::Trade(_)));
+    }
+
+    #[test]
+    fn usdm_partial_depth_is_a_snapshot() {
+        let message = r#"{
+            "stream":"btcusdt@depth20@100ms",
+            "data":{
+                "e":"depthUpdate","E":123456789,"s":"BTCUSDT",
+                "U":100,"u":101,"pu":99,
+                "b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]
+            }
+        }"#;
+
+        let mut bytes = message.as_bytes().to_vec();
+        let parsed = MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes)
+            .unwrap()
+            .expect("partial depth event");
+        assert_eq!(parsed.previous_update_id, Some(99));
+        assert!(matches!(parsed.event, MarketEvent::Snapshot(_)));
     }
 
     #[test]
