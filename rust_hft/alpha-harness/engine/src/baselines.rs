@@ -219,12 +219,21 @@ fn validate_context_identity(
     evaluation_policy: &CexResearchContentRefV1,
     target: &CexResearchHypothesisTargetV1,
 ) -> Result<(), String> {
-    if target.name.trim().is_empty()
-        || target.horizon != context.protocol().labels
-        || factor_bank.research_dataset.validate().is_err()
+    if target.name.trim().is_empty() || target.horizon != context.protocol().labels {
+        return Err("baseline target identity is invalid".to_string());
+    }
+    validate_cex_context_bindings(context, factor_bank, evaluation_policy)
+}
+
+pub(crate) fn validate_cex_context_bindings(
+    context: &EngineContext<'_>,
+    factor_bank: &CexFactorBankRevisionV2,
+    evaluation_policy: &CexResearchContentRefV1,
+) -> Result<(), String> {
+    if factor_bank.research_dataset.validate().is_err()
         || factor_bank.walk_forward_partition.validate().is_err()
     {
-        return Err("baseline target or Factor Bank identity is invalid".to_string());
+        return Err("Factor Bank context identity is invalid".to_string());
     }
     let dataset_hash = canonical_json_hash(&context.rows())
         .map_err(|error| format!("research dataset identity failed: {error}"))?;

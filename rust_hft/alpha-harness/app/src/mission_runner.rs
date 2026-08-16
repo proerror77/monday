@@ -47,6 +47,8 @@ const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+// ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
+const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
 #[derive(Debug, Deserialize)]
 struct Materialization {
@@ -631,10 +633,7 @@ fn run_factor_bank_subset_search(
     .map_err(anyhow::Error::msg)?;
     loop {
         let stop = search
-            .run(
-                context,
-                Some(control_mission.spec.search.max_new_iterations as u64),
-            )
+            .run(context, Some(MCTS_CHECKPOINT_INTERVAL))
             .map_err(anyhow::Error::msg)?;
         data_mission::write_json_atomic(
             &results_dir.join("factor-subset-mcts-checkpoint.json"),
@@ -1754,7 +1753,8 @@ mod tests {
         let rows = manifest
             .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
             .unwrap();
-        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let dataset =
+            prepare_dataset(rows.clone(), &fixture.mission.spec.evaluation_protocol).unwrap();
         let context = dataset.engine_context();
 
         let mut failed_ridge = ridge.clone();
@@ -1768,6 +1768,45 @@ mod tests {
             &context,
         )
         .is_err());
+
+        let mut other_lineage_bank = factor_bank.clone();
+        other_lineage_bank.search_lineage_id = "other-search-lineage".to_string();
+        other_lineage_bank.revision_id.clear();
+        other_lineage_bank.revision_id = format!(
+            "cex-factor-bank-{}",
+            canonical_json_hash(&other_lineage_bank).unwrap()
+        );
+        other_lineage_bank.validate().unwrap();
+        assert!(CexFactorBankMcts::new(
+            &fixture.mission,
+            &other_lineage_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .err()
+        .expect("a Factor Bank from another search lineage must fail closed")
+        .contains("producer bindings drifted"));
+
+        let mut context_bound = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        let mut drifted_rows = rows;
+        drifted_rows[0].label += 0.000_001;
+        let drifted_dataset =
+            prepare_dataset(drifted_rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        assert!(context_bound
+            .run(&drifted_dataset.engine_context(), Some(1))
+            .err()
+            .expect("a different research dataset must fail before a search transition")
+            .contains("research dataset identity drifted"));
 
         let mut full = CexFactorBankMcts::new(
             &fixture.mission,

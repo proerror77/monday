@@ -1,6 +1,9 @@
 use super::DeterministicRng;
 use crate::{
-    baselines::{evaluate_factor_features_from_entries, verify_cex_baseline_artifact},
+    baselines::{
+        evaluate_factor_features_from_entries, validate_cex_context_bindings,
+        verify_cex_baseline_artifact,
+    },
     evaluation::EngineContext,
     formula_evaluator::FormulaEvaluator,
     CandidateEvaluation,
@@ -386,7 +389,11 @@ impl CexFactorBankMcts {
         max_new_transitions: Option<u64>,
     ) -> Result<CexFactorBankMctsStopReasonV1, String> {
         self.validate_checkpoint()?;
-        validate_context_policy(context, &self.checkpoint.bindings.scoring_policy)?;
+        validate_cex_context_bindings(
+            context,
+            &self.factor_bank,
+            &self.checkpoint.bindings.scoring_policy,
+        )?;
         if let Some(reason) = self.checkpoint.terminal_reason {
             return Ok(reason);
         }
@@ -810,6 +817,7 @@ fn validate_start(
         .and_then(|policy| policy.validate_binding(&mission.spec.policies.weight))
         .map_err(|error| error.to_string())?;
     if factor_bank.entries.is_empty()
+        || factor_bank.search_lineage_id != mission.spec.search_lineage_id
         || factor_bank
             .gp_policy
             .validate_binding(&mission.spec.policies.gp)
@@ -838,22 +846,7 @@ fn validate_start(
     }
     verify_cex_baseline_artifact(context, factor_bank, ridge)?;
     verify_cex_baseline_artifact(context, factor_bank, cart)?;
-    validate_context_policy(context, &mission.spec.policies.evaluation)
-}
-
-fn validate_context_policy(
-    context: &EngineContext<'_>,
-    scoring_policy: &CexResearchContentRefV1,
-) -> Result<(), String> {
-    if context
-        .protocol()
-        .content_hash()
-        .map_err(|error| error.to_string())?
-        != scoring_policy.content_sha256
-    {
-        return Err("Factor-Bank MCTS scoring context drifted".to_string());
-    }
-    Ok(())
+    validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
 }
 
 fn factor_identities(
