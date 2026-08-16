@@ -635,9 +635,10 @@ fn run_factor_bank_subset_search(
         let stop = search
             .run(context, Some(MCTS_CHECKPOINT_INTERVAL))
             .map_err(anyhow::Error::msg)?;
-        data_mission::write_json_atomic(
+        data_mission::write_json_atomic_bounded(
             &results_dir.join("factor-subset-mcts-checkpoint.json"),
             &search.checkpoint().map_err(anyhow::Error::msg)?,
+            MAX_MCTS_CHECKPOINT_BYTES,
         )?;
         if stop == CexFactorBankMctsStopReasonV1::Paused {
             continue;

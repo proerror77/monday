@@ -14,9 +14,38 @@ use hft_research_manifest::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    io::BufRead,
+    io::{BufRead, Write},
     path::{Component, Path, PathBuf},
 };
+
+struct BoundedWriter<W> {
+    inner: W,
+    remaining: u64,
+    max_bytes: u64,
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let allowed = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if allowed == 0 && !buffer.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "serialized JSON exceeds maximum {} bytes",
+                self.max_bytes
+            )));
+        }
+        let written = self.inner.write(&buffer[..allowed])?;
+        self.remaining = self
+            .remaining
+            .saturating_sub(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 pub async fn acquire_and_register(
     store: &mut AlphaStore,
@@ -774,8 +803,23 @@ pub(crate) fn persist_output_file(
 }
 
 pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    write_json_atomic_bounded(path, value, u64::MAX)
+}
+
+pub fn write_json_atomic_bounded(
+    path: &Path,
+    value: &impl serde::Serialize,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
     let mut temporary = temporary_output_file(path, ".monday-json-")?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), value)?;
+    serde_json::to_writer_pretty(
+        BoundedWriter {
+            inner: temporary.as_file_mut(),
+            remaining: max_bytes,
+            max_bytes,
+        },
+        value,
+    )?;
     temporary.as_file().sync_all()?;
     persist_output_file(temporary, path, "JSON evidence")
 }
@@ -842,6 +886,19 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn write_json_atomic_bounded_rejects_oversized_output() {
+        let root = tempfile::tempdir().expect("create bounded JSON output test root");
+        let path = root.path().join("evidence.json");
+
+        let error =
+            write_json_atomic_bounded(&path, &serde_json::json!({"status": "too large"}), 8)
+                .expect_err("oversized JSON evidence must fail before publication");
+
+        assert!(error.to_string().contains("maximum 8 bytes"));
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
