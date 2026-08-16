@@ -2,6 +2,7 @@
 
 FROM rust:1.91-bookworm AS builder
 
+ARG SOURCE_REVISION
 WORKDIR /work
 ENV RUST_MIN_STACK=33554432
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +17,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    cargo --config 'build.rustc-wrapper=""' build \
+    test "${#SOURCE_REVISION}" -eq 40 \
+    && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
     --release \
     --locked \
     -p hft-backtest \

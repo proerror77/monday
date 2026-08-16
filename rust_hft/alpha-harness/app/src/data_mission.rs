@@ -2,6 +2,7 @@ use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1};
 use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
+use chrono::{DateTime, Utc};
 use hft_collector::{
     acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
@@ -662,6 +663,16 @@ fn load_feature_research_rows(
         .collect()
 }
 
+pub(crate) fn feature_available_times(
+    manifest: &FeatureDatasetManifest,
+) -> anyhow::Result<Vec<DateTime<Utc>>> {
+    Ok(read_feature_rows(manifest)
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .map(|row| row.feature_available_time)
+        .collect())
+}
+
 pub(crate) fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     let absolute_path = if path.is_absolute() {
         path.to_path_buf()
@@ -1011,6 +1022,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded[0].available_time, rows[0].label_available_time);
+        assert_eq!(
+            feature_available_times(&manifest).unwrap(),
+            rows.iter()
+                .map(|row| row.feature_available_time)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(loaded[0].features["lob_imbalance"], 0.0);
         assert_eq!(loaded[0].features["onchain_flow"], 0.0);
         assert_eq!(loaded[0].funding_bps, 2.0);

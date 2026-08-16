@@ -12,10 +12,18 @@ use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements}
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(test)]
+pub(crate) const BUILD_SOURCE_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+#[cfg(not(test))]
+pub(crate) const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
+    Some(value) => value,
+    None => "unbound-source-revision",
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "alpha-harness",
-    version,
+    version = BUILD_SOURCE_REVISION,
     about = "Bounded Loop Engineer alpha research control plane"
 )]
 pub struct Cli {
@@ -374,12 +382,6 @@ pub struct ExecuteMissionArgs {
     pub replay_manifest_url: String,
     #[arg(long)]
     pub replay_manifest_sha256: String,
-    /// Exact Git commit compiled into the admitted research image.
-    #[arg(long)]
-    pub implementation_source_revision: String,
-    /// Immutable admitted research image identity (`sha256:<64 lowercase hex>`).
-    #[arg(long)]
-    pub image_identity: String,
     /// Prior immutable Factor-Bank subset checkpoint for a fresh-work-directory resume.
     #[arg(long, requires = "resume_sha256")]
     pub resume_url: Option<String>,
@@ -811,10 +813,6 @@ mod tests {
             "missing-replay-manifest.json".to_owned(),
             "--replay-manifest-sha256".to_owned(),
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
-            "--implementation-source-revision".to_owned(),
-            "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
-            "--image-identity".to_owned(),
-            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
             "--result-put-url".to_owned(),
             result.clone(),
             "--result-readback-url".to_owned(),
@@ -1097,10 +1095,6 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "replay-manifest.json",
             "--replay-manifest-sha256",
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            "--implementation-source-revision",
-            "ffffffffffffffffffffffffffffffffffffffff",
-            "--image-identity",
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "--resume-url",
             "checkpoint.json",
             "--resume-sha256",
@@ -1149,10 +1143,6 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "replay-manifest.json",
             "--replay-manifest-sha256",
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            "--implementation-source-revision",
-            "ffffffffffffffffffffffffffffffffffffffff",
-            "--image-identity",
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "--result-put-url",
             "results.zip",
             "--result-readback-url",
@@ -1193,10 +1183,6 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "replay-manifest.json",
             "--replay-manifest-sha256",
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            "--implementation-source-revision",
-            "ffffffffffffffffffffffffffffffffffffffff",
-            "--image-identity",
-            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "--result-put-url",
             "results.zip",
             "--result-readback-url",

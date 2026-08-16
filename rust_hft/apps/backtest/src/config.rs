@@ -14,6 +14,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
+use crate::{
+    engine::{
+        TargetPositionDecision, TargetPositionReplay, TargetPositionReplayConfig,
+        TargetPositionReplayMetrics,
+    },
+    event::EventEnvelope,
+};
+
 const CANONICAL_PARQUET_SCHEMA: &str =
     "timestamp_us:int64,sequence:int64,event:utf8,payload_json:utf8";
 const CANONICAL_PARQUET_MESSAGE: &str = "
@@ -828,6 +836,59 @@ pub fn verify_canonical_replay_artifact(
     start_ts: Option<i64>,
     end_ts: Option<i64>,
 ) -> anyhow::Result<VerifiedCanonicalReplay> {
+    let (manifest, manifest_sha256, artifact_sha256) = verify_canonical_manifest_and_artifact(
+        artifact_path,
+        manifest_path,
+        expected_artifact_sha256,
+        expected_manifest_sha256,
+    )?;
+    let (bytes, replay_rows) = read_canonical_parquet(artifact_path, &manifest, start_ts, end_ts)?;
+    Ok(VerifiedCanonicalReplay {
+        bytes,
+        evidence: canonical_replay_evidence(
+            manifest,
+            manifest_sha256,
+            artifact_sha256,
+            replay_rows,
+        ),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_and_replay_canonical_target_positions(
+    artifact_path: &Path,
+    manifest_path: &Path,
+    expected_artifact_sha256: &str,
+    expected_manifest_sha256: &str,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+) -> anyhow::Result<(CanonicalReplayEvidence, TargetPositionReplayMetrics)> {
+    let (manifest, manifest_sha256, artifact_sha256) = verify_canonical_manifest_and_artifact(
+        artifact_path,
+        manifest_path,
+        Some(expected_artifact_sha256),
+        expected_manifest_sha256,
+    )?;
+    let mut replay = TargetPositionReplay::new(decisions, config)?;
+    let replay_rows =
+        visit_canonical_parquet(artifact_path, &manifest, start_ts, end_ts, |event| {
+            replay.observe(&event)
+        })?;
+    let metrics = replay.finish()?;
+    Ok((
+        canonical_replay_evidence(manifest, manifest_sha256, artifact_sha256, replay_rows),
+        metrics,
+    ))
+}
+
+fn verify_canonical_manifest_and_artifact(
+    artifact_path: &Path,
+    manifest_path: &Path,
+    expected_artifact_sha256: Option<&str>,
+    expected_manifest_sha256: &str,
+) -> anyhow::Result<(CanonicalParquetManifest, String, String)> {
     let expected_manifest_sha256 = valid_sha256(
         expected_manifest_sha256,
         "canonical replay manifest SHA-256",
@@ -856,9 +917,7 @@ pub fn verify_canonical_replay_artifact(
     if manifest.artifact_path.file_name() != artifact_path.file_name() {
         bail!("canonical replay path does not match manifest artifact_path");
     }
-    let artifact_bytes = fs::read(artifact_path)
-        .with_context(|| format!("cannot read canonical replay: {}", artifact_path.display()))?;
-    let artifact_sha256 = hex::encode(Sha256::digest(&artifact_bytes));
+    let artifact_sha256 = sha256_file(artifact_path)?;
     if artifact_sha256 != manifest.artifact_sha256
         || expected_artifact_sha256
             .map(|expected| valid_sha256(expected, "canonical replay artifact SHA-256"))
@@ -867,25 +926,30 @@ pub fn verify_canonical_replay_artifact(
     {
         bail!("canonical replay artifact SHA-256 mismatch");
     }
-    let (bytes, replay_rows) = read_canonical_parquet(artifact_path, &manifest, start_ts, end_ts)?;
-    Ok(VerifiedCanonicalReplay {
-        bytes,
-        evidence: CanonicalReplayEvidence {
-            manifest_sha256,
-            artifact_sha256,
-            mission_id: manifest.mission_id,
-            market: manifest.market,
-            symbol: manifest.symbol,
-            dataset: manifest.dataset,
-            modalities: manifest.modalities,
-            source_revision: manifest.source_revision,
-            source_segments: manifest.source_segments,
-            rows: manifest.rows,
-            replay_rows,
-            first_event_time_us: manifest.first_event_time_us,
-            last_event_time_us: manifest.last_event_time_us,
-        },
-    })
+    Ok((manifest, manifest_sha256, artifact_sha256))
+}
+
+fn canonical_replay_evidence(
+    manifest: CanonicalParquetManifest,
+    manifest_sha256: String,
+    artifact_sha256: String,
+    replay_rows: usize,
+) -> CanonicalReplayEvidence {
+    CanonicalReplayEvidence {
+        manifest_sha256,
+        artifact_sha256,
+        mission_id: manifest.mission_id,
+        market: manifest.market,
+        symbol: manifest.symbol,
+        dataset: manifest.dataset,
+        modalities: manifest.modalities,
+        source_revision: manifest.source_revision,
+        source_segments: manifest.source_segments,
+        rows: manifest.rows,
+        replay_rows,
+        first_event_time_us: manifest.first_event_time_us,
+        last_event_time_us: manifest.last_event_time_us,
+    }
 }
 
 fn read_canonical_parquet(
@@ -894,6 +958,23 @@ fn read_canonical_parquet(
     start_ts: Option<i64>,
     end_ts: Option<i64>,
 ) -> anyhow::Result<(Vec<u8>, usize)> {
+    let mut output = Vec::new();
+    let replay_rows =
+        visit_canonical_parquet(artifact_path, manifest, start_ts, end_ts, |event| {
+            serde_json::to_writer(&mut output, &event)?;
+            output.push(b'\n');
+            Ok(())
+        })?;
+    Ok((output, replay_rows))
+}
+
+fn visit_canonical_parquet(
+    artifact_path: &Path,
+    manifest: &CanonicalParquetManifest,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+    mut visitor: impl FnMut(EventEnvelope) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
     let reader = SerializedFileReader::new(File::open(artifact_path)?)?;
     let required_schema = parse_message_type(CANONICAL_PARQUET_MESSAGE)?;
     let schema_descriptor = reader.metadata().file_metadata().schema_descr_ptr();
@@ -902,7 +983,6 @@ fn read_canonical_parquet(
         bail!("canonical Parquet schema does not match the manifest contract");
     }
 
-    let mut output = Vec::new();
     let mut rows = 0_usize;
     let mut replay_rows = 0_usize;
     let mut first_timestamp = None;
@@ -947,8 +1027,10 @@ fn read_canonical_parquet(
         if start_ts.is_none_or(|start| timestamp_us >= start)
             && end_ts.is_none_or(|end| timestamp_us <= end)
         {
-            serde_json::to_writer(&mut output, &value)?;
-            output.push(b'\n');
+            visitor(
+                serde_json::from_value(value)
+                    .context("canonical Parquet payload does not match its event type")?,
+            )?;
             replay_rows = replay_rows
                 .checked_add(1)
                 .context("canonical Parquet replay row count overflow")?;
@@ -975,7 +1057,22 @@ fn read_canonical_parquet(
     {
         bail!("canonical Parquet coverage does not match its manifest");
     }
-    Ok((output, replay_rows))
+    Ok(replay_rows)
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(path)
+        .with_context(|| format!("cannot read canonical replay: {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn valid_sha256<'a>(value: &'a str, field: &str) -> anyhow::Result<&'a str> {

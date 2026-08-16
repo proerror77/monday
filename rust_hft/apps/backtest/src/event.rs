@@ -1,8 +1,8 @@
 use std::io::BufRead;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EventEnvelope {
     #[serde(alias = "timestamp")]
     pub ts: i64,
@@ -12,7 +12,7 @@ pub struct EventEnvelope {
     pub payload: EventPayload,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventPayload {
     #[serde(alias = "snapshot")]
@@ -27,7 +27,7 @@ pub enum EventPayload {
     },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TradeSide {
     #[serde(alias = "BUY")]
@@ -36,7 +36,7 @@ pub enum TradeSide {
     Sell,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Level {
     pub price: f64,
     pub quantity: f64,

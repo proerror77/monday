@@ -1,6 +1,7 @@
 use crate::{
     cli::{
         print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
+        BUILD_SOURCE_REVISION,
     },
     data_mission, mission, prediction_dispatch,
 };
@@ -26,11 +27,12 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 use hft_backtest::{
     config::{
-        verify_canonical_replay_artifact, CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
+        verify_and_replay_canonical_target_positions, CanonicalReplayEvidence,
+        CanonicalSourceSegmentEvidence,
     },
     engine::{
-        replay_target_positions, TargetPositionDecision, TargetPositionReplayConfig,
-        TargetPositionReplayMetrics, TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
+        TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
+        TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
     },
 };
 use hft_research_manifest::{
@@ -150,7 +152,6 @@ struct CexEventReplayReceiptV1 {
     decision_sha256: String,
     decision_scope: String,
     implementation_source_revision: String,
-    image_identity: String,
     replay_engine_version: String,
     metrics: TargetPositionReplayMetrics,
     capabilities: CexReplayCapabilitiesV1,
@@ -185,8 +186,8 @@ impl CexEventReplayReceiptV1 {
             || self.mission_id.trim().is_empty()
             || self.replay_config_sha256 != canonical_json_hash(&self.replay_config)?
             || self.decision_scope != "pre_holdout_research_rows"
-            || !valid_git_revision(&self.implementation_source_revision)
-            || immutable_sha256_identity("CEX replay image", &self.image_identity).is_err()
+            || self.implementation_source_revision != BUILD_SOURCE_REVISION
+            || !valid_git_revision(BUILD_SOURCE_REVISION)
             || self.replay_engine_version != TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION
             || self.metrics.decision_count == 0
             || self.capabilities.clock_semantics != "recorded_userspace_receive_time_us"
@@ -622,6 +623,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let baseline_dataset_manifest =
         data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
     let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
+    let feature_available_times = data_mission::feature_available_times(&feature_manifest)?;
+    if feature_available_times.len() != baseline_rows.len() {
+        bail!("CEX feature availability clock does not match the admitted dataset");
+    }
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
     let baseline_context = baseline_dataset.engine_context();
     let baseline_run = evaluate_cex_baselines(
@@ -665,14 +670,13 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
                 &materialization_sha256,
                 &factor_bank,
                 &baseline_context,
+                &feature_available_times[..baseline_context.rows().len()],
                 strategy,
                 &replay_policy,
                 &replay_artifact_path,
                 &replay_artifact_sha256,
                 &replay_manifest_path,
                 &args.replay_manifest_sha256,
-                &args.implementation_source_revision,
-                &args.image_identity,
             )
         })
         .transpose()?;
@@ -907,14 +911,13 @@ fn run_cex_event_replay(
     materialization_sha256: &str,
     factor_bank: &CexFactorBankRevisionV2,
     context: &EngineContext<'_>,
+    feature_available_times: &[chrono::DateTime<Utc>],
     strategy: &CexCombinationResearchArtifactV1,
     policy: &CexEventReplayPolicyV1,
     replay_artifact_path: &Path,
     replay_artifact_sha256: &str,
     replay_manifest_path: &Path,
     replay_manifest_sha256: &str,
-    implementation_source_revision: &str,
-    image_identity: &str,
 ) -> anyhow::Result<CexEventReplayReceiptV1> {
     policy.validate_binding(&mission.spec.policies.replay)?;
     if mission.spec.inputs.materialization.content_sha256 != materialization_sha256 {
@@ -923,12 +926,14 @@ fn run_cex_event_replay(
     let positions = strategy
         .target_positions(factor_bank, context.rows())
         .map_err(anyhow::Error::msg)?;
-    let decisions = context
-        .rows()
+    if feature_available_times.len() != positions.len() {
+        bail!("CEX replay feature clock does not match the selected strategy rows");
+    }
+    let decisions = feature_available_times
         .iter()
         .zip(positions)
-        .map(|(row, target_position)| TargetPositionDecision {
-            timestamp_us: row.available_time.timestamp_micros(),
+        .map(|(available_time, target_position)| TargetPositionDecision {
+            timestamp_us: available_time.timestamp_micros(),
             target_position,
         })
         .collect::<Vec<_>>();
@@ -940,37 +945,21 @@ fn run_cex_event_replay(
         .last()
         .context("CEX event replay has no pre-holdout decisions")?
         .timestamp_us;
+    let max_decision_delay_us = policy
+        .max_decision_delay_millis
+        .checked_mul(1_000)
+        .context("CEX replay decision delay overflow")?;
+    let replay_end_time = last_decision_time
+        .checked_add(i64::try_from(max_decision_delay_us)?)
+        .context("CEX replay end time overflow")?;
     let replay_manifest_sha256 = normalized_sha256("CEX replay manifest", replay_manifest_sha256)?;
-    let verified = verify_canonical_replay_artifact(
-        replay_artifact_path,
-        replay_manifest_path,
-        Some(replay_artifact_sha256),
-        &replay_manifest_sha256,
-        None,
-        Some(last_decision_time),
-    )?;
-    validate_replay_materialization_binding(
-        &verified.evidence,
-        mission,
-        materialization,
-        first_decision_time,
-        last_decision_time,
-    )?;
-    let trade_tape_declared = verified
-        .evidence
-        .modalities
-        .iter()
-        .any(|modality| matches!(modality.as_str(), "trade" | "aggregate_trade"));
     let max_depth_levels = materialization
         .top_depth
         .max(strategy.risk.capacity_depth_levels)
         .max(policy.required_depth_levels);
     let replay_config = TargetPositionReplayConfig {
         max_depth_levels,
-        max_decision_delay_us: policy
-            .max_decision_delay_millis
-            .checked_mul(1_000)
-            .context("CEX replay decision delay overflow")?,
+        max_decision_delay_us,
         position_notional_usd: strategy.risk.position_notional_usd,
         fee_bps: strategy.execution.costs.fee_bps,
         rebate_bps: strategy.execution.costs.rebate_bps,
@@ -979,12 +968,28 @@ fn run_cex_event_replay(
         additional_slippage_bps: strategy.execution.costs.slippage_bps,
         cross_spread: strategy.execution.costs.cross_spread,
         capacity_depth_levels: strategy.risk.capacity_depth_levels,
-        trade_tape_declared,
+        trade_tape_declared: false,
     };
-    let metrics = replay_target_positions(&verified.bytes, &decisions, &replay_config)?;
+    let (replay_evidence, metrics) = verify_and_replay_canonical_target_positions(
+        replay_artifact_path,
+        replay_manifest_path,
+        replay_artifact_sha256,
+        &replay_manifest_sha256,
+        None,
+        Some(replay_end_time),
+        &decisions,
+        &replay_config,
+    )?;
+    validate_replay_materialization_binding(
+        &replay_evidence,
+        mission,
+        materialization,
+        first_decision_time,
+        last_decision_time,
+    )?;
     let capabilities = CexReplayCapabilitiesV1 {
         clock_semantics: policy.clock_semantics.clone(),
-        modalities: verified.evidence.modalities.clone(),
+        modalities: replay_evidence.modalities.clone(),
         min_bid_depth_levels: metrics.min_bid_depth_levels,
         max_bid_depth_levels: metrics.max_bid_depth_levels,
         min_ask_depth_levels: metrics.min_ask_depth_levels,
@@ -1054,8 +1059,7 @@ fn run_cex_event_replay(
         replay_config,
         decision_sha256: canonical_json_hash(&decisions)?,
         decision_scope: "pre_holdout_research_rows".to_string(),
-        implementation_source_revision: implementation_source_revision.to_string(),
-        image_identity: image_identity.to_string(),
+        implementation_source_revision: BUILD_SOURCE_REVISION.to_string(),
         replay_engine_version: TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION.to_string(),
         metrics,
         capabilities,
@@ -1248,10 +1252,9 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
     normalized_sha256("Mission", &args.mission_sha256)?;
     normalized_sha256("CEX replay artifact", &args.replay_artifact_sha256)?;
     normalized_sha256("CEX replay manifest", &args.replay_manifest_sha256)?;
-    if !valid_git_revision(&args.implementation_source_revision) {
-        bail!("CEX replay implementation source revision is invalid");
+    if !valid_git_revision(BUILD_SOURCE_REVISION) {
+        bail!("alpha-harness was built without an exact source revision");
     }
-    immutable_sha256_identity("CEX replay image", &args.image_identity)?;
     resume_source(args)?;
     validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
     Ok(())
@@ -1455,17 +1458,6 @@ pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<Stri
         bail!("{label} SHA256 is invalid");
     }
     Ok(value)
-}
-
-fn immutable_sha256_identity(label: &str, value: &str) -> anyhow::Result<String> {
-    let digest = value
-        .strip_prefix("sha256:")
-        .with_context(|| format!("{label} must use a sha256: identity"))?;
-    let normalized = format!("sha256:{}", normalized_sha256(label, digest)?);
-    if value != normalized {
-        bail!("{label} must be a lowercase immutable SHA256 identity");
-    }
-    Ok(normalized)
 }
 
 fn valid_git_revision(value: &str) -> bool {
@@ -2349,6 +2341,11 @@ mod tests {
         .unwrap();
         replay_receipt.validate().unwrap();
         assert!(replay_receipt.gate.passed);
+        assert_eq!(replay_receipt.metrics.max_decision_delay_us, 100);
+        assert_eq!(
+            replay_receipt.implementation_source_revision,
+            BUILD_SOURCE_REVISION
+        );
         assert_eq!(replay_receipt.strategy.id, strategy.artifact_id);
         assert_eq!(
             replay_receipt.source.content_sha256,
@@ -3561,7 +3558,7 @@ message binance_replay {
                 )
                 .unwrap()
             } else {
-                (first_feature_time + ChronoDuration::seconds(index - 1)).timestamp_micros()
+                (first_feature_time + ChronoDuration::seconds(index - 1)).timestamp_micros() + 100
             });
             sequences.push(index + 1);
             events.push(if index == 0 {
@@ -4030,8 +4027,6 @@ message binance_replay {
             replay_artifact_sha256,
             replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
             replay_manifest_sha256,
-            implementation_source_revision: "a".repeat(40),
-            image_identity: format!("sha256:{}", "b".repeat(64)),
             resume_url: None,
             resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
