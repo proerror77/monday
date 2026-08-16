@@ -201,6 +201,11 @@ authenticated task and input identities. Mission v4 has no implicit v2 mapping o
 resume path; Issue #320 owns construction of its opaque admission handle after
 independent cohort, snapshot, and policy readback. The module retains its existing
 `LlmPriorSpec` and does not import the alpha-harness Rust domain or loop runtime.
+The current executable capability is intentionally narrower than the v4 schema:
+normal research still deserializes and runs Mission v2, while Mission v4 is
+accepted only by the bounded `pipeline_smoke` path. A v4 `research_trial` is
+blocked until it uses the same authenticated admission, evaluator, checkpoint,
+immutable publication, and readback chain without a v2 fallback.
 Instead, the module has
 its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
 `monday-prediction-research` as its precompiled process entrypoint, because an
