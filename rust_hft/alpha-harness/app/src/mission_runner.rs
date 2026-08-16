@@ -10,6 +10,7 @@ use alpha_domain::{
     CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1,
     CexGpPolicyV1, CexResearchMissionArtifactV1, EvaluationCostsV1, FormulaEvaluatorConfig,
     IterationVerdict, MissionCompletionPolicy, MissionStatus, ResearchMission, ValidatorMode,
+    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
@@ -46,7 +47,6 @@ const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
@@ -203,7 +203,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             &client,
             resume_url,
             &checkpoint_path,
-            MAX_MCTS_CHECKPOINT_BYTES,
+            MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
         )?;
         let artifact: MctsCheckpointArtifactV1 =
             serde_json::from_slice(&std::fs::read(checkpoint_path)?)
@@ -674,7 +674,7 @@ fn run_factor_bank_subset_search(
         data_mission::write_json_atomic_bounded(
             &results_dir.join("factor-subset-mcts-checkpoint.json"),
             &checkpoint,
-            MAX_MCTS_CHECKPOINT_BYTES,
+            MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
         )?;
         if stop == CexFactorBankMctsStopReasonV1::Paused {
             continue;

@@ -369,7 +369,7 @@ pub struct ExecuteMissionArgs {
     /// Prior immutable Factor-Bank subset checkpoint for a fresh-work-directory resume.
     #[arg(long, requires = "resume_sha256")]
     pub resume_url: Option<String>,
-    /// Canonical checkpoint content SHA-256 emitted by the subset-search result.
+    /// Canonical SHA-256 from the checkpoint artifact's `checkpoint_sha256` field.
     #[arg(long, requires = "resume_url")]
     pub resume_sha256: Option<String>,
     #[arg(long)]

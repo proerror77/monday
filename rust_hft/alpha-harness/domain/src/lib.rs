@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
+pub const MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v4";
 pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v4";
 pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v1";
@@ -599,6 +600,32 @@ pub struct CexResearchMissionSpecV1 {
 }
 
 impl CexResearchMissionSpecV1 {
+    fn subset_checkpoint_upper_bound_bytes(&self) -> Option<u64> {
+        const FIXED_BYTES: u64 = 1024 * 1024;
+        const FACTOR_BYTES: u64 = 1024;
+        const ACTION_BYTES: u64 = 4 * 1024;
+        const FOLD_BYTES: u64 = 16 * 1024;
+        const NODE_FIXED_BYTES: u64 = 128 * 1024;
+        const TRACE_FIXED_BYTES: u64 = 16 * 1024;
+
+        let factors = u64::try_from(self.search.budget.max_candidates).ok()?;
+        let folds = u64::try_from(self.evaluation_protocol.walk_forward.fold_count).ok()?;
+        let nodes = factors.checked_add(1)?;
+        let actions_per_node = factors
+            .checked_mul(factors)?
+            .checked_add(factors.checked_mul(2)?)?;
+        let mission_bytes = u64::try_from(serde_json::to_vec(self).ok()?.len()).ok()?;
+        let node_bytes = NODE_FIXED_BYTES
+            .checked_add(factors.checked_mul(FACTOR_BYTES)?)?
+            .checked_add(actions_per_node.checked_mul(ACTION_BYTES)?)?
+            .checked_add(folds.checked_mul(FOLD_BYTES)?)?;
+        let trace_bytes = TRACE_FIXED_BYTES.checked_add(factors.checked_mul(FACTOR_BYTES)?)?;
+        FIXED_BYTES
+            .checked_add(mission_bytes.checked_mul(4)?)?
+            .checked_add(nodes.checked_mul(node_bytes)?)?
+            .checked_add(self.search.budget.max_expansions.checked_mul(trace_bytes)?)
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
         if [
             self.objective.as_str(),
@@ -623,6 +650,14 @@ impl CexResearchMissionSpecV1 {
             .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
         self.evaluation_protocol.validate()?;
+        if self
+            .subset_checkpoint_upper_bound_bytes()
+            .is_none_or(|bytes| bytes > MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES)
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "subset search cannot emit a resumable checkpoint within 64 MiB",
+            ));
+        }
         let screening_policy_sha256 = canonical_json_hash(&FormulaEvaluatorConfig::for_trials(
             self.search.planned_gp_and_subset_trials()?,
         )?)?;
@@ -4714,6 +4749,33 @@ mod tests {
 
             assert!(mission.validate().is_err());
         }
+    }
+
+    #[test]
+    fn cex_mission_rejects_an_oversized_subset_checkpoint_plan_at_admission() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.search.budget.max_candidates = 64;
+        mission.spec.search.budget.max_expansions = 4_096;
+        mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(
+                mission.spec.search.planned_gp_and_subset_trials().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&mission.spec.search).unwrap();
+
+        assert!(
+            mission.spec.subset_checkpoint_upper_bound_bytes().unwrap()
+                > MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES
+        );
+        assert!(matches!(
+            mission.validate(),
+            Err(DomainError::InvalidCexResearchMission(
+                "subset search cannot emit a resumable checkpoint within 64 MiB"
+            ))
+        ));
     }
 
     #[test]
