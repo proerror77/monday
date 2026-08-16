@@ -127,6 +127,17 @@ fn formula_bundle(now: chrono::DateTime<Utc>) -> StrategyBundle {
     bundle
 }
 
+fn cex_four_stage_bundle() -> StrategyBundle {
+    serde_json::from_str(include_str!("fixtures/cex-four-stage-bundle.json")).unwrap()
+}
+
+fn bind_bundle(mut envelope: DeploymentEnvelope, bundle: &StrategyBundle) -> DeploymentEnvelope {
+    envelope.asset_revision_id = bundle.candidate_id.clone();
+    envelope.bundle_id = bundle.bundle_id.clone();
+    envelope.bundle_hash = bundle.bundle_hash.clone();
+    envelope
+}
+
 fn onnx_bundle(
     now: chrono::DateTime<Utc>,
     uri: &str,
@@ -329,6 +340,181 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
+fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("four-stage-cex-handoff");
+    let bundle = cex_four_stage_bundle();
+    let bundle_path = directory.join("bundle.json");
+    let mut config = configured_runtime();
+    config.venues[0].inst_type = Some("usdm".to_string());
+
+    for (suffix, intent, approval, expected_mode) in [
+        (
+            "paper",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Paper,
+            ActivationMode::Paper,
+        ),
+        (
+            "shadow",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::Shadow,
+            ActivationMode::Shadow,
+        ),
+    ] {
+        let signed = sign_envelope(
+            bind_bundle(
+                envelope(
+                    now,
+                    &format!("cex-{suffix}"),
+                    &format!("nonce-cex-{suffix}"),
+                    intent,
+                    approval,
+                ),
+                &bundle,
+            ),
+            "key-1",
+            &key,
+        )
+        .unwrap();
+        let request = {
+            let mut adapter =
+                SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+            intake(
+                &signed,
+                &trusted,
+                &policy(&signed.envelope),
+                now,
+                &directory,
+                &mut adapter,
+            )
+            .unwrap()
+        };
+        assert_eq!(request.mode, expected_mode);
+    }
+
+    assert_eq!(config.strategies.len(), 1);
+    assert!(matches!(
+        &config.strategies[0].strategy_type,
+        runtime::StrategyType::Formula
+    ));
+    let runtime = runtime::SystemBuilder::new(config.clone())
+        .auto_register_adapters_strict()
+        .unwrap()
+        .build();
+    assert_eq!(
+        runtime.engine.try_lock().unwrap().strategy_instance_ids(),
+        vec![format!("{}:BTCUSDT", bundle.bundle_id)]
+    );
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-market-drift",
+                "nonce-cex-market-drift",
+                AllowedIntentType::StartPaper,
+                ApprovalClass::Paper,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut wrong_market = configured_runtime();
+    wrong_market.venues[0].inst_type = Some("spot".to_string());
+    let mut adapter = SystemConfigActivationAdapter::new(&mut wrong_market, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("runtime venue, market, or instrument"));
+    assert!(wrong_market.strategies.is_empty());
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-live-small",
+                "nonce-cex-live-small",
+                AllowedIntentType::StartLiveSmall,
+                ApprovalClass::HumanApprovedLiveSmall,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("live-small activation is disabled"));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn paper_and_shadow_require_their_exact_approval_class() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("exact-approval-class");
+
+    for (suffix, intent, approval) in [
+        (
+            "paper-with-shadow",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Shadow,
+        ),
+        (
+            "shadow-with-live",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::HumanApprovedLiveSmall,
+        ),
+    ] {
+        let signed = sign_envelope(
+            envelope(now, suffix, &format!("nonce-{suffix}"), intent, approval),
+            "key-1",
+            &key,
+        )
+        .unwrap();
+        let mut adapter = RecordingAdapter::default();
+        assert!(matches!(
+            intake(
+                &signed,
+                &trusted,
+                &policy(&signed.envelope),
+                now,
+                &directory,
+                &mut adapter,
+            ),
+            Err(hft_live::deployment_envelope::IntakeError::ApprovalClassMismatch)
+        ));
+        assert!(adapter.requests.is_empty());
+    }
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 #[cfg(feature = "formula-strategy")]
 async fn shadow_activation_waits_for_market_then_produces_loop_consumable_evidence() {
@@ -498,7 +684,9 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
         .lines()
         .map(|line| {
             let signed: SignedRuntimeAttributionEvent = serde_json::from_str(line).unwrap();
-            verify_runtime_attribution_event(&signed, &trusted_feedback).unwrap()
+            verify_runtime_attribution_event(&signed, &trusted_feedback)
+                .unwrap()
+                .into_event()
         })
         .collect::<Vec<_>>();
     assert!(events

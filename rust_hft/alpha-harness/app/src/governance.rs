@@ -10,8 +10,8 @@ use alpha_domain::{
     canonical_json_hash, deployment_scope_hash, sign_envelope, verify_runtime_attribution_event,
     ApprovalClass, CandidateArtifact, DeploymentEnvelope, EngineKind, IterationVerdict,
     MissionStatus, MissionTerminalReason, OnnxModelCandidate, PromotionRecord, ResearchIteration,
-    RuntimeAttributionEvent, SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision,
-    SignedRuntimeAttributionEvent, StrategyBundle, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+    SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision, SignedRuntimeAttributionEvent,
+    StrategyBundle, VerifiedRuntimeAttributionEvent, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
     ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
@@ -975,7 +975,7 @@ pub fn ingest_feedback_log(args: FeedbackLogArgs) -> anyhow::Result<()> {
 fn parse_runtime_attribution_log(
     contents: &str,
     trusted_keys: &BTreeMap<String, VerifyingKey>,
-) -> anyhow::Result<Vec<RuntimeAttributionEvent>> {
+) -> anyhow::Result<Vec<VerifiedRuntimeAttributionEvent>> {
     let mut events = Vec::new();
     for (index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
@@ -1087,8 +1087,8 @@ mod tests {
     use alpha_domain::{
         sign_runtime_attribution_event, AllowedIntentType, EvaluationCostsV1,
         EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
-        MissionCompletionPolicy, ResearchMission, SearchBudget, TensorElementType, TensorSpec,
-        ValidatorMode, LOB_ONNX_PREPROCESSING_VERSION,
+        MissionCompletionPolicy, ResearchMission, RuntimeAttributionEvent, SearchBudget,
+        TensorElementType, TensorSpec, ValidatorMode, LOB_ONNX_PREPROCESSING_VERSION,
     };
     use alpha_engine::evaluation::ResearchRow;
     use alpha_store::{StoredCandidate, StoredEvaluation};
@@ -1740,7 +1740,11 @@ mod tests {
         let signed = sign_runtime_attribution_event(event.clone(), "feedback-1", &key).unwrap();
         let valid = serde_json::to_string(&signed).unwrap();
         assert_eq!(
-            parse_runtime_attribution_log(&valid, &trusted).unwrap(),
+            parse_runtime_attribution_log(&valid, &trusted)
+                .unwrap()
+                .into_iter()
+                .map(VerifiedRuntimeAttributionEvent::into_event)
+                .collect::<Vec<_>>(),
             vec![event.clone()]
         );
         assert!(

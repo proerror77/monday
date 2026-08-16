@@ -3427,6 +3427,27 @@ pub struct SignedRuntimeAttributionEvent {
     pub signature_hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedRuntimeAttributionEvent(RuntimeAttributionEvent);
+
+impl VerifiedRuntimeAttributionEvent {
+    pub fn event(&self) -> &RuntimeAttributionEvent {
+        &self.0
+    }
+
+    pub fn into_event(self) -> RuntimeAttributionEvent {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedRuntimeAttributionEvent {
+    type Target = RuntimeAttributionEvent;
+
+    fn deref(&self) -> &Self::Target {
+        self.event()
+    }
+}
+
 pub fn sign_runtime_attribution_event(
     event: RuntimeAttributionEvent,
     key_id: impl Into<String>,
@@ -3448,7 +3469,7 @@ pub fn sign_runtime_attribution_event(
 pub fn verify_runtime_attribution_event(
     signed: &SignedRuntimeAttributionEvent,
     trusted_keys: &BTreeMap<String, VerifyingKey>,
-) -> Result<RuntimeAttributionEvent, DomainError> {
+) -> Result<VerifiedRuntimeAttributionEvent, DomainError> {
     signed.event.validate()?;
     require_text("runtime attribution key_id", &signed.key_id)?;
     let expected_hash = canonical_json_hash(&signed.event)?;
@@ -3464,7 +3485,7 @@ pub fn verify_runtime_attribution_event(
         .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
     key.verify(signed.content_hash.as_bytes(), &signature)
         .map_err(|_| DomainError::InvalidAttributionSignature)?;
-    Ok(signed.event.clone())
+    Ok(VerifiedRuntimeAttributionEvent(signed.event.clone()))
 }
 
 pub fn runtime_stage_is_healthy(
@@ -5874,7 +5895,9 @@ mod tests {
         let trusted = BTreeMap::from([("feedback-1".to_string(), key.verifying_key())]);
 
         assert_eq!(
-            verify_runtime_attribution_event(&signed, &trusted).unwrap(),
+            verify_runtime_attribution_event(&signed, &trusted)
+                .unwrap()
+                .into_event(),
             event
         );
         assert_eq!(

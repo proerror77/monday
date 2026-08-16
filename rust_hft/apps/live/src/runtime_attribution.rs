@@ -2143,7 +2143,9 @@ mod tests {
             .map(|line| {
                 let signed: alpha_domain::SignedRuntimeAttributionEvent =
                     serde_json::from_str(line).unwrap();
-                alpha_domain::verify_runtime_attribution_event(&signed, &trusted).unwrap()
+                alpha_domain::verify_runtime_attribution_event(&signed, &trusted)
+                    .unwrap()
+                    .into_event()
             })
             .collect();
         assert!(events

@@ -260,7 +260,43 @@ fn apply_strategy_bundle(
     };
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
-        (ActivationArtifact::Formula, StrategyBundleArtifact::Formula { ast }) => {
+        (ActivationArtifact::Formula, artifact) => {
+            let ast = match artifact {
+                StrategyBundleArtifact::Formula { ast } => ast,
+                StrategyBundleArtifact::CexFourStage { strategy } => {
+                    let [instrument] = request.instruments.as_slice() else {
+                        return Err(
+                            "four-stage CEX deployment requires exactly one instrument".to_string()
+                        );
+                    };
+                    let runtime_market = config
+                        .venues
+                        .iter()
+                        .find(|venue| {
+                            venue.name.eq_ignore_ascii_case(&request.venue)
+                                && venue.account_id.as_deref().unwrap_or(&venue.name)
+                                    == request.account_id
+                        })
+                        .and_then(|venue| venue.inst_type.as_deref());
+                    if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
+                        || instrument != &strategy.symbol
+                        || runtime_market.is_none_or(|market| {
+                            !market.eq_ignore_ascii_case(strategy.market.as_str())
+                        })
+                    {
+                        return Err(
+                            "four-stage CEX bundle does not match the runtime venue, market, or instrument"
+                                .to_string(),
+                        );
+                    }
+                    &strategy.executable_formula
+                }
+                _ => {
+                    return Err(
+                        "deployment artifact intent does not match the strategy bundle".to_string(),
+                    )
+                }
+            };
             let ids = symbols
                 .iter()
                 .map(|symbol| format!("{strategy_name}:{}", symbol.as_str()))
@@ -781,18 +817,11 @@ fn activation_request(
         return Err(IntakeError::DuplicateInstrument);
     }
     let approved = match mode {
-        ActivationMode::Paper => matches!(
-            verified.0.approval_class,
-            ApprovalClass::Paper | ApprovalClass::Shadow | ApprovalClass::HumanApprovedLiveSmall
-        ),
-        ActivationMode::Shadow => matches!(
-            verified.0.approval_class,
-            ApprovalClass::Shadow | ApprovalClass::HumanApprovedLiveSmall
-        ),
-        ActivationMode::LiveSmall => matches!(
-            verified.0.approval_class,
-            ApprovalClass::HumanApprovedLiveSmall
-        ),
+        ActivationMode::Paper => verified.0.approval_class == ApprovalClass::Paper,
+        ActivationMode::Shadow => verified.0.approval_class == ApprovalClass::Shadow,
+        ActivationMode::LiveSmall => {
+            verified.0.approval_class == ApprovalClass::HumanApprovedLiveSmall
+        }
     };
     if !approved {
         return Err(IntakeError::ApprovalClassMismatch);
