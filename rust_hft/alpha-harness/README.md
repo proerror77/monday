@@ -14,7 +14,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | --- | --- | --- |
 | CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
 | Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
-| Four-stage combination walk-forward | Blocked by [#602](https://github.com/proerror77/monday/issues/602) | No selected subset is compiled into the required Signal/Sizing/Risk/Execution artifact |
+| Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
 | Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
 | Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
 | Signed Paper/Shadow intake | Blocked by [#605](https://github.com/proerror77/monday/issues/605) | The generic signed boundary exists; no four-stage CEX bundle reaches it yet |
@@ -104,8 +104,15 @@ checkpoint, trace, and terminal-result artifacts. GP screening and subset search
 share one multiplicity correction sized for both bounded candidate families;
 only passing subset evaluations are selectable; a terminal search with no
 passing subset publishes `selected: null` instead of dropping the negative
-result. It does not emit the later
-four-stage strategy. Sealed-holdout evaluation requires the separate governed
+result. A passing selection also emits `combination-walk-forward.json`: four
+content-addressed stages linked from the immutable Factor Bank through fixed
+equal-absolute Signal weights, sign-based bounded Sizing, evaluator-owned Risk
+limits, and the exact Binance bucketed-L2 cost/execution assumptions. The same
+artifact binds the selected walk-forward metrics and both mandatory baseline
+evaluations under one protocol while keeping the holdout unopened and carrying
+neither deployment nor order-submission authority. Its selected result is
+accepted only after exact checkpoint replay derives the same terminal metadata,
+subset, and evaluation. Sealed-holdout evaluation requires the separate governed
 precommit boundary. This schema binds prior-evidence identities; later holdout
 and Paper/Shadow gates own receipt and signature verification.
 

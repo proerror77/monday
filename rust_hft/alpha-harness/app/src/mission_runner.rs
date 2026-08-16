@@ -683,10 +683,20 @@ fn run_factor_bank_subset_search(
             &results_dir.join("factor-subset-mcts-trace.json"),
             &search.trace().map_err(anyhow::Error::msg)?,
         )?;
+        let result = search.result().map_err(anyhow::Error::msg)?;
         data_mission::write_json_atomic(
             &results_dir.join("factor-subset-mcts-result.json"),
-            &search.result().map_err(anyhow::Error::msg)?,
+            &result,
         )?;
+        if let Some(strategy) = search
+            .combination_artifact(control_mission, ridge, cart, &baselines.gate)
+            .map_err(anyhow::Error::msg)?
+        {
+            data_mission::write_json_atomic(
+                &results_dir.join("combination-walk-forward.json"),
+                &strategy,
+            )?;
+        }
         return Ok(());
     }
 }
@@ -1172,7 +1182,7 @@ mod tests {
         CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1,
         EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
-    use alpha_engine::engines::CexFactorBankMctsResultV1;
+    use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
         hft_research_manifest::CexArtifactTripletV2 {
@@ -1710,6 +1720,17 @@ mod tests {
             &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
         )
         .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let context = dataset.engine_context();
         let selected_factors = subset_result["selected"]["subset"]["factors"]
             .as_array()
             .unwrap();
@@ -1743,7 +1764,125 @@ mod tests {
         }));
         assert!(results.join("factor-subset-mcts-checkpoint.json").exists());
         assert!(!results.join("sealed-evaluations.jsonl").exists());
-        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let factor_bank_typed: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        let ridge_typed: CexBaselineArtifactV1 = serde_json::from_value(ridge.clone()).unwrap();
+        let cart_typed: CexBaselineArtifactV1 = serde_json::from_value(cart.clone()).unwrap();
+        let gate_typed: CexBaselineGateV1 = serde_json::from_value(gate.clone()).unwrap();
+        let subset_result_typed: CexFactorBankMctsResultV1 =
+            serde_json::from_value(subset_result.clone()).unwrap();
+        let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(
+            &std::fs::read(results.join("combination-walk-forward.json")).unwrap(),
+        )
+        .unwrap();
+        strategy
+            .validate_binding(
+                &fixture.mission,
+                &factor_bank_typed,
+                &ridge_typed,
+                &cart_typed,
+                &gate_typed,
+                &context,
+                &checkpoint_artifact.checkpoint,
+                &subset_result_typed,
+            )
+            .unwrap();
+        assert_eq!(
+            strategy.subset_checkpoint.content_sha256,
+            checkpoint_artifact.checkpoint_sha256
+        );
+        let mut forged_result = subset_result_typed.clone();
+        forged_result.checkpoint_sha256 = "0".repeat(64);
+        assert!(strategy
+            .validate_binding(
+                &fixture.mission,
+                &factor_bank_typed,
+                &ridge_typed,
+                &cart_typed,
+                &gate_typed,
+                &context,
+                &checkpoint_artifact.checkpoint,
+                &forged_result,
+            )
+            .is_err());
+        let strategy_json = serde_json::to_value(&strategy).unwrap();
+        assert_eq!(
+            strategy_json["schema_version"],
+            "cex-combination-research-artifact-v1"
+        );
+        assert_eq!(strategy_json["deployment_authority"], false);
+        assert_eq!(strategy_json["order_submission_authority"], false);
+        assert_eq!(strategy_json["signal"]["normalization"], "none_required");
+        assert_eq!(
+            strategy_json["signal"]["combination_rule"],
+            "oriented_equal_absolute_sum_to_one"
+        );
+        assert_eq!(
+            strategy_json["sizing"]["rule"],
+            "zero_within_machine_epsilon_else_sign"
+        );
+        assert_eq!(strategy_json["risk"]["immutable"], true);
+        assert_eq!(strategy_json["execution"]["venue"], "binance");
+        assert_eq!(strategy_json["execution"]["symbol"], "BTCUSDT");
+        assert_eq!(
+            strategy_json["execution"]["event_modality"],
+            "bucketed_point_in_time_l2_features"
+        );
+        assert_eq!(
+            strategy_json["walk_forward_evidence"]["holdout_state"],
+            "unopened"
+        );
+        assert_eq!(
+            strategy_json["walk_forward_evidence"]["ridge"]["kind"],
+            "ridge_baseline"
+        );
+        assert_eq!(
+            strategy_json["walk_forward_evidence"]["cart"]["kind"],
+            "cart_baseline"
+        );
+        let selected_metrics =
+            &strategy_json["walk_forward_evidence"]["selected"]["evaluation"]["metrics"];
+        assert!(selected_metrics["predictive"].is_object());
+        for metric in [
+            "total_turnover",
+            "mean_net_return",
+            "cumulative_net_return",
+            "max_drawdown",
+            "net_sharpe",
+        ] {
+            assert!(selected_metrics[metric].is_number());
+        }
+
+        let mut bad_link = strategy.clone();
+        bad_link.sizing.parent = bad_link.subset_result.clone();
+        assert!(bad_link.validate().is_err());
+        let mut bad_weight = strategy.clone();
+        bad_weight.signal.factors[0].normalized_absolute_weight = 0.5;
+        assert!(bad_weight.validate().is_err());
+        let mut bad_factor = strategy.clone();
+        bad_factor.signal.factors[0].factor.factor_id = "unknown-factor".to_string();
+        assert!(bad_factor.validate().is_err());
+        let mut bad_orientation = strategy.clone();
+        bad_orientation.signal.factors[0].orientation =
+            match bad_orientation.signal.factors[0].orientation {
+                alpha_domain::CexFactorOrientationV1::Positive => {
+                    alpha_domain::CexFactorOrientationV1::Negative
+                }
+                alpha_domain::CexFactorOrientationV1::Negative => {
+                    alpha_domain::CexFactorOrientationV1::Positive
+                }
+            };
+        assert!(bad_orientation.validate().is_err());
+        let mut bad_policy = strategy.clone();
+        bad_policy.signal.weight_policy.id.push_str("-drifted");
+        assert!(bad_policy.validate().is_err());
+        let mut bad_metric_identity = strategy.clone();
+        bad_metric_identity
+            .walk_forward_evidence
+            .selected
+            .evaluation_sha256 = "0".repeat(64);
+        assert!(bad_metric_identity.validate().is_err());
         let policy_revision = store.get_registry_revision(&policy_hash).unwrap();
         assert_eq!(
             policy_revision.registry_kind,
