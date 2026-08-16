@@ -119,11 +119,13 @@ impl FormulaStrategy {
         if current.bucket == previous.bucket {
             return None;
         }
-        Some(if timestamp.is_multiple_of(interval) {
+        let mut decision = if timestamp.is_multiple_of(interval) {
             current
         } else {
             previous
-        })
+        };
+        decision.bucket = current.bucket;
+        Some(decision)
     }
 
     fn evaluate_event(&self, event: &MarketEvent) -> Option<(f64, Option<hft_core::VenueId>)> {
@@ -1145,6 +1147,36 @@ mod tests {
         let boundary = strategy.on_market_event(&snapshot_at(3, 1, 1_100_000), &account);
         assert_eq!(boundary.len(), 1);
         assert_eq!(boundary[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn target_position_retries_from_the_emission_bucket_after_empty_buckets() {
+        let mut target = config(field("book_imbalance"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+
+        assert!(strategy
+            .on_market_event(&snapshot_at(3, 1, 100_000), &account)
+            .is_empty());
+        assert_eq!(
+            strategy
+                .on_market_event(&snapshot_at(3, 1, 3_100_000), &account)
+                .len(),
+            1
+        );
+        assert!(strategy
+            .on_market_event(&snapshot_at(3, 1, 4_100_000), &account)
+            .is_empty());
+        assert_eq!(
+            strategy
+                .on_market_event(&snapshot_at(3, 1, 5_100_000), &account)
+                .len(),
+            1
+        );
     }
 
     #[test]
