@@ -1978,6 +1978,11 @@ impl CexFactorBankRevisionV2 {
             ));
         }
         self.gp_policy.validate()?;
+        if self.attempts.len() > self.gp_policy.budget.max_candidates {
+            return Err(DomainError::InvalidCexFactorBank(
+                "screening attempts exceed the frozen GP candidate budget",
+            ));
+        }
         self.screening_policy.validate()?;
         self.evaluation_policy.validate()?;
         self.research_dataset.validate()?;
@@ -5216,6 +5221,29 @@ mod tests {
         rebind_factor_bank(&mut revision);
 
         assert!(revision.validate().is_err());
+    }
+
+    #[test]
+    fn factor_bank_rejects_attempts_above_the_frozen_gp_budget() {
+        let mut revision = factor_bank();
+        for index in 2..=5 {
+            let mut attempt = revision.attempts[0].clone();
+            attempt.candidate_id = format!("candidate-{index}");
+            attempt.post_warmup_coverage_rows = 0;
+            attempt.verdict = CexFactorScreeningVerdictV1::Rejected;
+            attempt.rejection_codes = vec![CexFactorRejectionCodeV1::EngineFailure];
+            attempt.rejection_details = vec!["engine failed".to_string()];
+            attempt.evaluation = None;
+            revision.attempts.push(attempt);
+        }
+        rebind_factor_bank(&mut revision);
+
+        assert!(matches!(
+            revision.validate(),
+            Err(DomainError::InvalidCexFactorBank(
+                "screening attempts exceed the frozen GP candidate budget"
+            ))
+        ));
     }
 
     #[test]

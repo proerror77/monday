@@ -192,7 +192,7 @@ pub fn select_expandable<N: UctNode>(
         return Err(UctError::InvalidExploration);
     }
     validate_tree(nodes, root, usize::MAX)?;
-    select_from(nodes, root, exploration, false)
+    select_from(nodes, root, exploration)
 }
 
 /// Selects with deterministic square-root progressive widening, falling back
@@ -206,31 +206,23 @@ pub fn select_expandable_progressively<N: UctNode>(
         return Err(UctError::InvalidExploration);
     }
     validate_tree(nodes, root, usize::MAX)?;
-    select_from(nodes, root, exploration, true)
+    select_progressively(nodes, root, exploration)
 }
 
 fn select_from<N: UctNode>(
     nodes: &[N],
     node_id: usize,
     exploration: f64,
-    progressive: bool,
 ) -> Result<Option<usize>, UctError> {
     let node = nodes.get(node_id).ok_or(UctError::InvalidNode(node_id))?;
-    let expandable = node.is_expandable();
-    let next_child = u64::try_from(node.children().len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    if expandable
-        && (!progressive
-            || next_child.saturating_mul(next_child) <= node.stats()?.visits().saturating_add(1))
-    {
+    if node.is_expandable() {
         return Ok(Some(node_id));
     }
 
     let parent_visits = node.stats()?.visits();
     let mut best = None;
     for &child_id in node.children() {
-        if let Some(expandable_id) = select_from(nodes, child_id, exploration, progressive)? {
+        if let Some(expandable_id) = select_from(nodes, child_id, exploration)? {
             let score = uct_score(nodes, child_id, parent_visits, exploration)?;
             if best.is_none_or(|(_, best_score)| {
                 score.total_cmp(&best_score) != std::cmp::Ordering::Less
@@ -239,9 +231,45 @@ fn select_from<N: UctNode>(
             }
         }
     }
-    Ok(best
-        .map(|(expandable_id, _)| expandable_id)
-        .or_else(|| (progressive && expandable).then_some(node_id)))
+    Ok(best.map(|(expandable_id, _)| expandable_id))
+}
+
+fn select_progressively<N: UctNode>(
+    nodes: &[N],
+    root: usize,
+    exploration: f64,
+) -> Result<Option<usize>, UctError> {
+    let mut selected = vec![None; nodes.len()];
+    for node_id in (0..nodes.len()).rev() {
+        let node = &nodes[node_id];
+        let expandable = node.is_expandable();
+        let next_child = u64::try_from(node.children().len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if expandable
+            && next_child.saturating_mul(next_child) <= node.stats()?.visits().saturating_add(1)
+        {
+            selected[node_id] = Some(node_id);
+            continue;
+        }
+
+        let parent_visits = node.stats()?.visits();
+        let mut best = None;
+        for &child_id in node.children() {
+            if let Some(expandable_id) = selected[child_id] {
+                let score = uct_score(nodes, child_id, parent_visits, exploration)?;
+                if best.is_none_or(|(_, best_score)| {
+                    score.total_cmp(&best_score) != std::cmp::Ordering::Less
+                }) {
+                    best = Some((expandable_id, score));
+                }
+            }
+        }
+        selected[node_id] = best
+            .map(|(expandable_id, _)| expandable_id)
+            .or_else(|| expandable.then_some(node_id));
+    }
+    Ok(selected[root])
 }
 
 fn uct_score<N: UctNode>(
@@ -422,6 +450,27 @@ mod tests {
         assert_eq!(
             select_expandable_progressively(&exhausted_child, 0, 1.4).unwrap(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn progressive_selection_handles_a_deep_tree_without_recursion() {
+        let depth = 10_000;
+        let nodes = (0..depth)
+            .map(|node_id| Node {
+                parent: (node_id > 0).then(|| node_id - 1),
+                children: (node_id + 1 < depth)
+                    .then(|| vec![node_id + 1])
+                    .unwrap_or_default(),
+                expandable: node_id + 1 == depth,
+                depth: node_id,
+                stats: UctStats::default(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            select_expandable_progressively(&nodes, 0, 1.4).unwrap(),
+            Some(depth - 1)
         );
     }
 
