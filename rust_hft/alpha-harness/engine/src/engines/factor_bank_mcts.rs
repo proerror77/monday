@@ -9,9 +9,12 @@ use crate::{
     CandidateEvaluation,
 };
 use alpha_domain::{
-    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexEqualAbsoluteWeightPolicyV1,
-    CexFactorBankRevisionV2, CexResearchContentRefV1, CexResearchMissionArtifactV1,
-    FormulaEvaluatorConfig, SearchBudget, WALK_FORWARD_EVALUATOR_VERSION,
+    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
+    CexEqualAbsoluteWeightPolicyV1, CexFactorBankRevisionV2, CexFactorOrientationV1,
+    CexFactorWeightRuleV1, CexResearchContentRefV1, CexResearchHoldoutStateV1, CexResearchMarketV1,
+    CexResearchMissionArtifactV1, CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1,
+    FormulaEvaluatorConfig, SearchBudget, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
+    WALK_FORWARD_EVALUATOR_VERSION,
 };
 use hft_search_kernel::{
     backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
@@ -22,6 +25,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION: &str = "cex-factor-bank-subset-mcts-v1";
 const CHECKPOINT_SCHEMA_VERSION: &str = "cex-factor-bank-subset-mcts-checkpoint-v1";
 const RESULT_SCHEMA_VERSION: &str = "cex-factor-bank-subset-mcts-result-v1";
+const SIGNAL_STAGE_SCHEMA_VERSION: &str = "cex-combination-signal-stage-v1";
+const SIZING_STAGE_SCHEMA_VERSION: &str = "cex-combination-sizing-stage-v1";
+const RISK_STAGE_SCHEMA_VERSION: &str = "cex-combination-risk-stage-v1";
+const EXECUTION_STAGE_SCHEMA_VERSION: &str = "cex-combination-execution-stage-v1";
+const WALK_FORWARD_EVIDENCE_SCHEMA_VERSION: &str = "cex-combination-walk-forward-evidence-v1";
+const COMBINATION_ARTIFACT_SCHEMA_VERSION: &str = "cex-combination-research-artifact-v1";
 const UCT_EXPLORATION: f64 = std::f64::consts::SQRT_2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -251,6 +260,729 @@ pub struct CexFactorBankMctsResultV1 {
     pub candidates_evaluated: usize,
     pub selected: Option<CexFactorBankMctsSelectionV1>,
     pub checkpoint_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexCombinationNormalizationV1 {
+    NoneRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexSignalThresholdPolicyV1 {
+    Zero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexSizingRuleV1 {
+    ZeroWithinMachineEpsilonElseSign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchOrderSemanticsV1 {
+    ValidationBucketTargetPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexResearchEventModalityV1 {
+    BucketedPointInTimeL2Features,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexCombinationEvaluationKindV1 {
+    SelectedSubset,
+    RidgeBaseline,
+    CartBaseline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSignalFactorV1 {
+    pub factor: CexFactorIdentityV1,
+    pub orientation: CexFactorOrientationV1,
+    pub normalized_absolute_weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSignalStageV1 {
+    pub schema_version: String,
+    pub content_sha256: String,
+    pub parent: CexResearchContentRefV1,
+    pub subset_policy: CexResearchContentRefV1,
+    pub weight_policy: CexResearchContentRefV1,
+    pub factors: Vec<CexSignalFactorV1>,
+    pub combination_rule: CexFactorWeightRuleV1,
+    pub normalization: CexCombinationNormalizationV1,
+    pub threshold_policy: CexSignalThresholdPolicyV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexSizingStageV1 {
+    pub schema_version: String,
+    pub content_sha256: String,
+    pub parent: CexResearchContentRefV1,
+    pub rule: CexSizingRuleV1,
+    pub zero_epsilon: f64,
+    pub min_position: f64,
+    pub max_position: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexRiskStageV1 {
+    pub schema_version: String,
+    pub content_sha256: String,
+    pub parent: CexResearchContentRefV1,
+    pub evaluator_policy: CexResearchContentRefV1,
+    pub immutable: bool,
+    pub max_abs_position: f64,
+    pub position_notional_usd: f64,
+    pub max_drawdown: f64,
+    pub capacity_depth_levels: usize,
+    pub max_book_depth_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexExecutionStageV1 {
+    pub schema_version: String,
+    pub content_sha256: String,
+    pub parent: CexResearchContentRefV1,
+    pub evaluation_policy: CexResearchContentRefV1,
+    pub venue: CexResearchVenueV1,
+    pub market: CexResearchMarketV1,
+    pub symbol: String,
+    pub order_semantics: CexResearchOrderSemanticsV1,
+    pub event_modality: CexResearchEventModalityV1,
+    pub costs: EvaluationCostsV1,
+    pub horizon: EvaluationLabelSpecV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexCombinationEvaluationEvidenceV1 {
+    pub kind: CexCombinationEvaluationKindV1,
+    pub source_artifact: CexResearchContentRefV1,
+    pub evaluation_sha256: String,
+    pub evaluation: CandidateEvaluation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexCombinationWalkForwardEvidenceV1 {
+    pub schema_version: String,
+    pub content_sha256: String,
+    pub research_dataset: CexResearchContentRefV1,
+    pub walk_forward_partition: CexResearchContentRefV1,
+    pub evaluation_protocol: CexResearchContentRefV1,
+    pub holdout_id: String,
+    pub holdout_state: CexResearchHoldoutStateV1,
+    pub selected: CexCombinationEvaluationEvidenceV1,
+    pub ridge: CexCombinationEvaluationEvidenceV1,
+    pub cart: CexCombinationEvaluationEvidenceV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexCombinationResearchArtifactV1 {
+    pub schema_version: String,
+    pub artifact_id: String,
+    pub strategy_id: String,
+    pub mission_id: String,
+    pub subset_result: CexResearchContentRefV1,
+    pub signal: CexSignalStageV1,
+    pub sizing: CexSizingStageV1,
+    pub risk: CexRiskStageV1,
+    pub execution: CexExecutionStageV1,
+    pub walk_forward_evidence: CexCombinationWalkForwardEvidenceV1,
+    pub deployment_authority: bool,
+    pub order_submission_authority: bool,
+}
+
+impl CexSignalStageV1 {
+    fn new(
+        parent: CexResearchContentRefV1,
+        subset_policy: CexResearchContentRefV1,
+        weight_policy: CexResearchContentRefV1,
+        factors: Vec<CexSignalFactorV1>,
+    ) -> Result<Self, String> {
+        let mut stage = Self {
+            schema_version: SIGNAL_STAGE_SCHEMA_VERSION.to_string(),
+            content_sha256: String::new(),
+            parent,
+            subset_policy,
+            weight_policy,
+            factors,
+            combination_rule: CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne,
+            normalization: CexCombinationNormalizationV1::NoneRequired,
+            threshold_policy: CexSignalThresholdPolicyV1::Zero,
+        };
+        stage.content_sha256 = stage.expected_content_sha256()?;
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.parent.validate().map_err(|error| error.to_string())?;
+        self.subset_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.weight_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let expected_weight = 1.0 / self.factors.len().max(1) as f64;
+        if self.schema_version != SIGNAL_STAGE_SCHEMA_VERSION
+            || self.content_sha256 != self.expected_content_sha256()?
+            || self.factors.is_empty()
+            || self
+                .factors
+                .windows(2)
+                .any(|pair| pair[0].factor.factor_id >= pair[1].factor.factor_id)
+            || self.factors.iter().any(|factor| {
+                factor.factor.factor_id.trim().is_empty()
+                    || !valid_sha256(&factor.factor.content_sha256)
+                    || factor.normalized_absolute_weight.to_bits() != expected_weight.to_bits()
+            })
+            || self.combination_rule != CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne
+            || self.normalization != CexCombinationNormalizationV1::NoneRequired
+            || self.threshold_policy != CexSignalThresholdPolicyV1::Zero
+        {
+            return Err("CEX combination Signal stage is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, String> {
+        self.validate()?;
+        Ok(stage_reference(
+            "cex-combination-signal-stage",
+            &self.content_sha256,
+        ))
+    }
+
+    fn expected_content_sha256(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        canonical_json_hash(&semantic).map_err(|error| error.to_string())
+    }
+}
+
+impl CexSizingStageV1 {
+    fn new(parent: CexResearchContentRefV1) -> Result<Self, String> {
+        let mut stage = Self {
+            schema_version: SIZING_STAGE_SCHEMA_VERSION.to_string(),
+            content_sha256: String::new(),
+            parent,
+            rule: CexSizingRuleV1::ZeroWithinMachineEpsilonElseSign,
+            zero_epsilon: f64::EPSILON,
+            min_position: -1.0,
+            max_position: 1.0,
+        };
+        stage.content_sha256 = stage.expected_content_sha256()?;
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.parent.validate().map_err(|error| error.to_string())?;
+        if self.schema_version != SIZING_STAGE_SCHEMA_VERSION
+            || self.content_sha256 != self.expected_content_sha256()?
+            || self.rule != CexSizingRuleV1::ZeroWithinMachineEpsilonElseSign
+            || self.zero_epsilon.to_bits() != f64::EPSILON.to_bits()
+            || self.min_position.to_bits() != (-1.0_f64).to_bits()
+            || self.max_position.to_bits() != 1.0_f64.to_bits()
+        {
+            return Err("CEX combination Sizing stage is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, String> {
+        self.validate()?;
+        Ok(stage_reference(
+            "cex-combination-sizing-stage",
+            &self.content_sha256,
+        ))
+    }
+
+    fn expected_content_sha256(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        canonical_json_hash(&semantic).map_err(|error| error.to_string())
+    }
+}
+
+impl CexRiskStageV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        parent: CexResearchContentRefV1,
+        evaluator_policy: CexResearchContentRefV1,
+        position_notional_usd: f64,
+        max_drawdown: f64,
+        capacity_depth_levels: usize,
+        max_book_depth_fraction: f64,
+    ) -> Result<Self, String> {
+        let mut stage = Self {
+            schema_version: RISK_STAGE_SCHEMA_VERSION.to_string(),
+            content_sha256: String::new(),
+            parent,
+            evaluator_policy,
+            immutable: true,
+            max_abs_position: 1.0,
+            position_notional_usd,
+            max_drawdown,
+            capacity_depth_levels,
+            max_book_depth_fraction,
+        };
+        stage.content_sha256 = stage.expected_content_sha256()?;
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.parent.validate().map_err(|error| error.to_string())?;
+        self.evaluator_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let capacity_disabled = self.position_notional_usd == 0.0
+            && self.capacity_depth_levels == 0
+            && self.max_book_depth_fraction == 0.0;
+        let capacity_enabled = self.position_notional_usd.is_finite()
+            && self.position_notional_usd > 0.0
+            && self.capacity_depth_levels > 0
+            && self.max_book_depth_fraction.is_finite()
+            && self.max_book_depth_fraction > 0.0
+            && self.max_book_depth_fraction <= 1.0;
+        if self.schema_version != RISK_STAGE_SCHEMA_VERSION
+            || self.content_sha256 != self.expected_content_sha256()?
+            || !self.immutable
+            || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
+            || !self.max_drawdown.is_finite()
+            || self.max_drawdown <= 0.0
+            || self.max_drawdown > 1.0
+            || !(capacity_disabled || capacity_enabled)
+        {
+            return Err("CEX combination Risk stage is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, String> {
+        self.validate()?;
+        Ok(stage_reference(
+            "cex-combination-risk-stage",
+            &self.content_sha256,
+        ))
+    }
+
+    fn expected_content_sha256(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        canonical_json_hash(&semantic).map_err(|error| error.to_string())
+    }
+}
+
+impl CexExecutionStageV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        parent: CexResearchContentRefV1,
+        evaluation_policy: CexResearchContentRefV1,
+        venue: CexResearchVenueV1,
+        market: CexResearchMarketV1,
+        symbol: String,
+        costs: EvaluationCostsV1,
+        horizon: EvaluationLabelSpecV1,
+    ) -> Result<Self, String> {
+        let mut stage = Self {
+            schema_version: EXECUTION_STAGE_SCHEMA_VERSION.to_string(),
+            content_sha256: String::new(),
+            parent,
+            evaluation_policy,
+            venue,
+            market,
+            symbol,
+            order_semantics: CexResearchOrderSemanticsV1::ValidationBucketTargetPosition,
+            event_modality: CexResearchEventModalityV1::BucketedPointInTimeL2Features,
+            costs,
+            horizon,
+        };
+        stage.content_sha256 = stage.expected_content_sha256()?;
+        stage.validate()?;
+        Ok(stage)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.parent.validate().map_err(|error| error.to_string())?;
+        self.evaluation_policy
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.schema_version != EXECUTION_STAGE_SCHEMA_VERSION
+            || self.content_sha256 != self.expected_content_sha256()?
+            || self.symbol.trim().is_empty()
+            || self.symbol != self.symbol.to_ascii_uppercase()
+            || self.order_semantics != CexResearchOrderSemanticsV1::ValidationBucketTargetPosition
+            || self.event_modality != CexResearchEventModalityV1::BucketedPointInTimeL2Features
+            || self.horizon.horizon_buckets == 0
+            || self.horizon.observation_frequency_millis == 0
+        {
+            return Err("CEX combination Execution stage is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, String> {
+        self.validate()?;
+        Ok(stage_reference(
+            "cex-combination-execution-stage",
+            &self.content_sha256,
+        ))
+    }
+
+    fn expected_content_sha256(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        canonical_json_hash(&semantic).map_err(|error| error.to_string())
+    }
+}
+
+impl CexCombinationEvaluationEvidenceV1 {
+    fn new(
+        kind: CexCombinationEvaluationKindV1,
+        source_artifact: CexResearchContentRefV1,
+        evaluation: CandidateEvaluation,
+    ) -> Result<Self, String> {
+        let evidence = Self {
+            kind,
+            source_artifact,
+            evaluation_sha256: canonical_json_hash(&evaluation)
+                .map_err(|error| error.to_string())?,
+            evaluation,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.source_artifact
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.evaluation
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.evaluation_sha256
+            != canonical_json_hash(&self.evaluation).map_err(|error| error.to_string())?
+        {
+            return Err("CEX combination evaluation identity drifted".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl CexCombinationWalkForwardEvidenceV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        research_dataset: CexResearchContentRefV1,
+        walk_forward_partition: CexResearchContentRefV1,
+        evaluation_protocol: CexResearchContentRefV1,
+        holdout_id: String,
+        holdout_state: CexResearchHoldoutStateV1,
+        selected: CexCombinationEvaluationEvidenceV1,
+        ridge: CexCombinationEvaluationEvidenceV1,
+        cart: CexCombinationEvaluationEvidenceV1,
+    ) -> Result<Self, String> {
+        let mut evidence = Self {
+            schema_version: WALK_FORWARD_EVIDENCE_SCHEMA_VERSION.to_string(),
+            content_sha256: String::new(),
+            research_dataset,
+            walk_forward_partition,
+            evaluation_protocol,
+            holdout_id,
+            holdout_state,
+            selected,
+            ridge,
+            cart,
+        };
+        evidence.content_sha256 = evidence.expected_content_sha256()?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for reference in [
+            &self.research_dataset,
+            &self.walk_forward_partition,
+            &self.evaluation_protocol,
+        ] {
+            reference.validate().map_err(|error| error.to_string())?;
+        }
+        self.selected.validate()?;
+        self.ridge.validate()?;
+        self.cart.validate()?;
+        let evaluations = [
+            &self.selected.evaluation,
+            &self.ridge.evaluation,
+            &self.cart.evaluation,
+        ];
+        if self.schema_version != WALK_FORWARD_EVIDENCE_SCHEMA_VERSION
+            || self.content_sha256 != self.expected_content_sha256()?
+            || self.holdout_id.trim().is_empty()
+            || self.holdout_state != CexResearchHoldoutStateV1::Unopened
+            || self.selected.kind != CexCombinationEvaluationKindV1::SelectedSubset
+            || self.ridge.kind != CexCombinationEvaluationKindV1::RidgeBaseline
+            || self.cart.kind != CexCombinationEvaluationKindV1::CartBaseline
+            || self.selected.evaluation.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+            || self.ridge.evaluation.evaluator_version
+                != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || self.cart.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || evaluations.iter().any(|evaluation| {
+                !evaluation.passed
+                    || evaluation.protocol_binding().map_or(true, |(_, hash)| {
+                        hash != self.evaluation_protocol.content_sha256
+                    })
+            })
+        {
+            return Err("CEX combination walk-forward evidence is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    fn expected_content_sha256(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        canonical_json_hash(&semantic).map_err(|error| error.to_string())
+    }
+}
+
+impl CexCombinationResearchArtifactV1 {
+    pub fn new(
+        mission: &CexResearchMissionArtifactV1,
+        factor_bank: &CexFactorBankRevisionV2,
+        ridge: &CexBaselineArtifactV1,
+        cart: &CexBaselineArtifactV1,
+        gate: &CexBaselineGateV1,
+        result: &CexFactorBankMctsResultV1,
+    ) -> Result<Self, String> {
+        validate_combination_sources(mission, factor_bank, ridge, cart, gate, result)?;
+        let selection = result.selected.as_ref().ok_or_else(|| {
+            "CEX combination strategy requires a passing selected subset".to_string()
+        })?;
+        let factors = selection
+            .subset
+            .factors
+            .iter()
+            .map(|factor| {
+                let entry = factor_bank
+                    .entries
+                    .iter()
+                    .find(|entry| entry.factor_id == factor.factor_id)
+                    .ok_or_else(|| "CEX combination selected an unknown Factor ID".to_string())?;
+                Ok(CexSignalFactorV1 {
+                    factor: factor.clone(),
+                    orientation: entry.orientation,
+                    normalized_absolute_weight: selection.normalized_equal_abs_weight,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let factor_bank_ref = artifact_reference(&factor_bank.revision_id, factor_bank)?;
+        let signal = CexSignalStageV1::new(
+            factor_bank_ref,
+            mission.spec.policies.subset_search.clone(),
+            mission.spec.policies.weight.clone(),
+            factors,
+        )?;
+        let sizing = CexSizingStageV1::new(signal.reference()?)?;
+        let evaluator_config = selection
+            .evaluation
+            .formula_config()
+            .map_err(|error| error.to_string())?;
+        let protocol = selection
+            .evaluation
+            .protocol_binding()
+            .map_err(|error| error.to_string())?
+            .0
+            .clone();
+        let risk = CexRiskStageV1::new(
+            sizing.reference()?,
+            mission.spec.policies.screening.clone(),
+            protocol.costs.position_notional_usd,
+            evaluator_config.max_drawdown,
+            protocol.costs.capacity_depth_levels,
+            protocol.costs.max_book_depth_fraction,
+        )?;
+        let execution = CexExecutionStageV1::new(
+            risk.reference()?,
+            mission.spec.policies.evaluation.clone(),
+            mission.spec.instrument.venue.clone(),
+            mission.spec.instrument.market.clone(),
+            mission.spec.instrument.symbol.clone(),
+            protocol.costs.clone(),
+            protocol.labels.clone(),
+        )?;
+        let result_hash = canonical_json_hash(result).map_err(|error| error.to_string())?;
+        let subset_result = CexResearchContentRefV1 {
+            id: format!("cex-factor-bank-subset-mcts-result-{result_hash}"),
+            content_sha256: result_hash,
+        };
+        let walk_forward_evidence = CexCombinationWalkForwardEvidenceV1::new(
+            factor_bank.research_dataset.clone(),
+            factor_bank.walk_forward_partition.clone(),
+            mission.spec.policies.evaluation.clone(),
+            mission.spec.holdout.holdout_id.clone(),
+            mission.spec.holdout.state,
+            CexCombinationEvaluationEvidenceV1::new(
+                CexCombinationEvaluationKindV1::SelectedSubset,
+                subset_result.clone(),
+                selection.evaluation.clone(),
+            )?,
+            CexCombinationEvaluationEvidenceV1::new(
+                CexCombinationEvaluationKindV1::RidgeBaseline,
+                artifact_reference(&ridge.artifact_id, ridge)?,
+                ridge.evaluation.clone(),
+            )?,
+            CexCombinationEvaluationEvidenceV1::new(
+                CexCombinationEvaluationKindV1::CartBaseline,
+                artifact_reference(&cart.artifact_id, cart)?,
+                cart.evaluation.clone(),
+            )?,
+        )?;
+        let mut artifact = Self {
+            schema_version: COMBINATION_ARTIFACT_SCHEMA_VERSION.to_string(),
+            artifact_id: String::new(),
+            strategy_id: String::new(),
+            mission_id: result.mission_id.clone(),
+            subset_result,
+            signal,
+            sizing,
+            risk,
+            execution,
+            walk_forward_evidence,
+            deployment_authority: false,
+            order_submission_authority: false,
+        };
+        artifact.strategy_id = artifact.expected_strategy_id()?;
+        artifact.artifact_id = artifact.expected_artifact_id()?;
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.subset_result
+            .validate()
+            .map_err(|error| error.to_string())?;
+        self.signal.validate()?;
+        self.sizing.validate()?;
+        self.risk.validate()?;
+        self.execution.validate()?;
+        self.walk_forward_evidence.validate()?;
+        let protocol = self
+            .walk_forward_evidence
+            .selected
+            .evaluation
+            .protocol_binding()
+            .map_err(|error| error.to_string())?
+            .0;
+        let evaluator_config = self
+            .walk_forward_evidence
+            .selected
+            .evaluation
+            .formula_config()
+            .map_err(|error| error.to_string())?;
+        if self.schema_version != COMBINATION_ARTIFACT_SCHEMA_VERSION
+            || self.artifact_id != self.expected_artifact_id()?
+            || self.strategy_id != self.expected_strategy_id()?
+            || self.mission_id.trim().is_empty()
+            || self.deployment_authority
+            || self.order_submission_authority
+            || self.sizing.parent != self.signal.reference()?
+            || self.risk.parent != self.sizing.reference()?
+            || self.execution.parent != self.risk.reference()?
+            || self.subset_result != self.walk_forward_evidence.selected.source_artifact
+            || self.execution.evaluation_policy != self.walk_forward_evidence.evaluation_protocol
+            || self.execution.costs != protocol.costs
+            || self.execution.horizon != protocol.labels
+            || self.risk.evaluator_policy.content_sha256
+                != canonical_json_hash(&evaluator_config).map_err(|error| error.to_string())?
+            || self.risk.max_drawdown.to_bits() != evaluator_config.max_drawdown.to_bits()
+            || self.risk.position_notional_usd.to_bits()
+                != protocol.costs.position_notional_usd.to_bits()
+            || self.risk.capacity_depth_levels != protocol.costs.capacity_depth_levels
+            || self.risk.max_book_depth_fraction.to_bits()
+                != protocol.costs.max_book_depth_fraction.to_bits()
+        {
+            return Err("CEX combination research artifact is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn validate_binding(
+        &self,
+        mission: &CexResearchMissionArtifactV1,
+        factor_bank: &CexFactorBankRevisionV2,
+        ridge: &CexBaselineArtifactV1,
+        cart: &CexBaselineArtifactV1,
+        gate: &CexBaselineGateV1,
+        result: &CexFactorBankMctsResultV1,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if self != &Self::new(mission, factor_bank, ridge, cart, gate, result)? {
+            return Err("CEX combination research artifact binding drifted".to_string());
+        }
+        Ok(())
+    }
+
+    fn expected_strategy_id(&self) -> Result<String, String> {
+        let identity = serde_json::json!({
+            "mission_id": self.mission_id,
+            "signal": self.signal.reference()?,
+            "sizing": self.sizing.reference()?,
+            "risk": self.risk.reference()?,
+            "execution": self.execution.reference()?,
+        });
+        Ok(format!(
+            "cex-combination-strategy-{}",
+            canonical_json_hash(&identity).map_err(|error| error.to_string())?
+        ))
+    }
+
+    fn expected_artifact_id(&self) -> Result<String, String> {
+        let mut semantic = self.clone();
+        semantic.artifact_id.clear();
+        Ok(format!(
+            "cex-combination-research-artifact-{}",
+            canonical_json_hash(&semantic).map_err(|error| error.to_string())?
+        ))
+    }
+}
+
+fn stage_reference(prefix: &str, content_sha256: &str) -> CexResearchContentRefV1 {
+    CexResearchContentRefV1 {
+        id: format!("{prefix}-{content_sha256}"),
+        content_sha256: content_sha256.to_string(),
+    }
+}
+
+fn artifact_reference(
+    id: &str,
+    artifact: &impl Serialize,
+) -> Result<CexResearchContentRefV1, String> {
+    Ok(CexResearchContentRefV1 {
+        id: id.to_string(),
+        content_sha256: canonical_json_hash(artifact).map_err(|error| error.to_string())?,
+    })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub struct CexFactorBankMcts {
@@ -863,6 +1595,19 @@ fn validate_start(
     gate: &CexBaselineGateV1,
     context: &EngineContext<'_>,
 ) -> Result<(), String> {
+    validate_source_bindings(mission, factor_bank, ridge, cart, gate)?;
+    verify_cex_baseline_artifact(context, factor_bank, ridge)?;
+    verify_cex_baseline_artifact(context, factor_bank, cart)?;
+    validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
+}
+
+fn validate_source_bindings(
+    mission: &CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    ridge: &CexBaselineArtifactV1,
+    cart: &CexBaselineArtifactV1,
+    gate: &CexBaselineGateV1,
+) -> Result<(), String> {
     mission.validate().map_err(|error| error.to_string())?;
     factor_bank.validate().map_err(|error| error.to_string())?;
     ridge.validate().map_err(|error| error.to_string())?;
@@ -899,9 +1644,66 @@ fn validate_start(
     if !gate.passed || !ridge.evaluation.passed || !cart.evaluation.passed {
         return Err("Factor-Bank MCTS requires both passing baseline artifacts".to_string());
     }
-    verify_cex_baseline_artifact(context, factor_bank, ridge)?;
-    verify_cex_baseline_artifact(context, factor_bank, cart)?;
-    validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
+    Ok(())
+}
+
+fn validate_combination_sources(
+    mission: &CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    ridge: &CexBaselineArtifactV1,
+    cart: &CexBaselineArtifactV1,
+    gate: &CexBaselineGateV1,
+    result: &CexFactorBankMctsResultV1,
+) -> Result<(), String> {
+    validate_source_bindings(mission, factor_bank, ridge, cart, gate)?;
+    let selection = result
+        .selected
+        .as_ref()
+        .ok_or_else(|| "CEX combination strategy requires a passing selected subset".to_string())?;
+    let identities = factor_identity_map(factor_bank)?;
+    validate_state(
+        &selection.subset,
+        &identities,
+        false,
+        factor_bank.entries.len(),
+    )?;
+    selection
+        .evaluation
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let evaluator_config = selection
+        .evaluation
+        .formula_config()
+        .map_err(|error| error.to_string())?;
+    let expected_weight = 1.0 / selection.subset.factors.len() as f64;
+    if result.schema_version != RESULT_SCHEMA_VERSION
+        || result.implementation_version != CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION
+        || result.mission_id != mission.semantic_id().map_err(|error| error.to_string())?
+        || result.factor_bank_revision_id != factor_bank.revision_id
+        || result.baseline_gate_id != gate.gate_id
+        || result.terminal_reason == CexFactorBankMctsStopReasonV1::Paused
+        || result.expansions_used == 0
+        || result.candidates_evaluated == 0
+        || u64::try_from(result.candidates_evaluated)
+            .map_or(true, |count| count > result.expansions_used)
+        || !valid_sha256(&result.checkpoint_sha256)
+        || !selection.evaluation.passed
+        || selection.evaluation.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+        || selection.normalized_equal_abs_weight.to_bits() != expected_weight.to_bits()
+        || selection
+            .evaluation
+            .protocol_binding()
+            .map_or(true, |(_, hash)| {
+                hash != mission.spec.policies.evaluation.content_sha256
+            })
+        || canonical_json_hash(&evaluator_config).map_err(|error| error.to_string())?
+            != mission.spec.policies.screening.content_sha256
+        || ridge.model_kind != CexBaselineModelKindV1::Ridge
+        || cart.model_kind != CexBaselineModelKindV1::ShallowCart
+    {
+        return Err("CEX combination source evidence is invalid".to_string());
+    }
+    Ok(())
 }
 
 fn factor_identities(
