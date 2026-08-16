@@ -620,10 +620,7 @@ fn l2_strategy_context_excludes_a_newer_quote_overlay() {
         .expect("delta accepted");
     engine.tick().expect("delta tick");
 
-    assert_eq!(
-        *captured.lock().expect("capture lock"),
-        vec![(21, 100.0)]
-    );
+    assert_eq!(*captured.lock().expect("capture lock"), vec![(21, 100.0)]);
 }
 
 #[test]
