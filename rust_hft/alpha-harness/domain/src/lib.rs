@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
+pub const MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v4";
 pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v4";
 pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v1";
@@ -402,6 +403,61 @@ impl CexResearchPolicyBindingsV1 {
     }
 }
 
+pub const CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1: &str = "cex-equal-absolute-weight-policy-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CexFactorWeightRuleV1 {
+    OrientedEqualAbsoluteSumToOne,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexEqualAbsoluteWeightPolicyV1 {
+    pub schema_version: String,
+    pub policy_id: String,
+    pub rule: CexFactorWeightRuleV1,
+}
+
+impl CexEqualAbsoluteWeightPolicyV1 {
+    pub fn controlled_v1(policy_id: impl Into<String>) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1.to_string(),
+            policy_id: policy_id.into(),
+            rule: CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1
+            || self.policy_id.trim().is_empty()
+            || self.rule != CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "equal-absolute weight policy drifted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        canonical_json_hash(self)
+    }
+
+    pub fn validate_binding(&self, binding: &CexResearchContentRefV1) -> Result<(), DomainError> {
+        binding.validate()?;
+        if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
+            return Err(DomainError::InvalidCexResearchMission(
+                "equal-absolute weight policy binding invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CexResearchEvidenceKindV1 {
@@ -481,6 +537,16 @@ pub struct CexResearchSearchPlanV1 {
     pub max_new_iterations: usize,
 }
 
+impl CexResearchSearchPlanV1 {
+    pub fn planned_gp_and_subset_trials(&self) -> Result<usize, DomainError> {
+        self.budget.validate()?;
+        self.budget
+            .max_candidates
+            .checked_mul(2)
+            .ok_or(DomainError::InvalidSearchBudget)
+    }
+}
+
 fn deserialize_cex_search_budget<'de, D>(deserializer: D) -> Result<SearchBudget, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -534,6 +600,32 @@ pub struct CexResearchMissionSpecV1 {
 }
 
 impl CexResearchMissionSpecV1 {
+    fn subset_checkpoint_upper_bound_bytes(&self) -> Option<u64> {
+        const FIXED_BYTES: u64 = 1024 * 1024;
+        const FACTOR_BYTES: u64 = 1024;
+        const ACTION_BYTES: u64 = 4 * 1024;
+        const FOLD_BYTES: u64 = 16 * 1024;
+        const NODE_FIXED_BYTES: u64 = 128 * 1024;
+        const TRACE_FIXED_BYTES: u64 = 16 * 1024;
+
+        let factors = u64::try_from(self.search.budget.max_candidates).ok()?;
+        let folds = u64::try_from(self.evaluation_protocol.walk_forward.fold_count).ok()?;
+        let nodes = factors.checked_add(1)?;
+        let actions_per_node = factors
+            .checked_mul(factors)?
+            .checked_add(factors.checked_mul(2)?)?;
+        let mission_bytes = u64::try_from(serde_json::to_vec(self).ok()?.len()).ok()?;
+        let node_bytes = NODE_FIXED_BYTES
+            .checked_add(factors.checked_mul(FACTOR_BYTES)?)?
+            .checked_add(actions_per_node.checked_mul(ACTION_BYTES)?)?
+            .checked_add(folds.checked_mul(FOLD_BYTES)?)?;
+        let trace_bytes = TRACE_FIXED_BYTES.checked_add(factors.checked_mul(FACTOR_BYTES)?)?;
+        FIXED_BYTES
+            .checked_add(mission_bytes.checked_mul(4)?)?
+            .checked_add(nodes.checked_mul(node_bytes)?)?
+            .checked_add(self.search.budget.max_expansions.checked_mul(trace_bytes)?)
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
         if [
             self.objective.as_str(),
@@ -554,11 +646,27 @@ impl CexResearchMissionSpecV1 {
         }
         self.inputs.validate()?;
         self.policies.validate()?;
+        CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
+            .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
         self.evaluation_protocol.validate()?;
+        if self
+            .subset_checkpoint_upper_bound_bytes()
+            .is_none_or(|bytes| bytes > MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES)
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "subset search cannot emit a resumable checkpoint within 64 MiB",
+            ));
+        }
+        let screening_policy_sha256 = canonical_json_hash(&FormulaEvaluatorConfig::for_trials(
+            self.search.planned_gp_and_subset_trials()?,
+        )?)?;
         if self.search.max_new_iterations == 0
+            || self.search.budget.max_expansions == 0
             || self.search.budget.max_tokens != 0
+            || self.search.budget.max_seconds != 0
             || self.evaluation_protocol.labels != self.instrument.horizon
+            || self.policies.screening.content_sha256 != screening_policy_sha256
             || self.policies.evaluation.content_sha256 != self.evaluation_protocol.content_hash()?
             || self.policies.subset_search.content_sha256 != canonical_json_hash(&self.search)?
             || !non_empty_unique(&self.feature_fields)
@@ -1905,6 +2013,11 @@ impl CexFactorBankRevisionV2 {
             ));
         }
         self.gp_policy.validate()?;
+        if self.attempts.len() > self.gp_policy.budget.max_candidates {
+            return Err(DomainError::InvalidCexFactorBank(
+                "screening attempts exceed the frozen GP candidate budget",
+            ));
+        }
         self.screening_policy.validate()?;
         self.evaluation_policy.validate()?;
         self.research_dataset.validate()?;
@@ -4483,11 +4596,18 @@ mod tests {
                 max_candidates: 2,
                 max_expansions: 2,
                 max_tokens: 0,
-                max_seconds: 30,
+                max_seconds: 0,
             },
             max_new_iterations: 1,
         };
         let evaluation_protocol = evaluation_protocol();
+        let screening_policy_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(search.planned_gp_and_subset_trials().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let weight_policy =
+            CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -4529,13 +4649,19 @@ mod tests {
                 },
                 policies: CexResearchPolicyBindingsV1 {
                     gp: reference("gp-policy-1", '1'),
-                    screening: reference("screening-policy-1", '2'),
+                    screening: CexResearchContentRefV1 {
+                        id: "screening-policy-1".to_string(),
+                        content_sha256: screening_policy_sha256,
+                    },
                     baseline: reference("baseline-policy-1", '3'),
                     subset_search: CexResearchContentRefV1 {
                         id: "subset-search-policy-1".to_string(),
                         content_sha256: canonical_json_hash(&search).unwrap(),
                     },
-                    weight: reference("weight-policy-1", '4'),
+                    weight: CexResearchContentRefV1 {
+                        id: weight_policy.policy_id.clone(),
+                        content_sha256: weight_policy.content_hash().unwrap(),
+                    },
                     evaluation: CexResearchContentRefV1 {
                         id: "evaluation-policy-1".to_string(),
                         content_sha256: evaluation_protocol.content_hash().unwrap(),
@@ -4596,6 +4722,60 @@ mod tests {
 
         assert!(serde_json::from_value::<CexResearchMissionArtifactV1>(value).is_err());
         assert!(serde_json::from_value::<SearchBudget>(shared_budget).is_ok());
+    }
+
+    #[test]
+    fn cex_mission_rejects_weight_or_combined_trial_policy_drift() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.policies.weight.content_sha256 = "4".repeat(64);
+        assert!(mission.validate().is_err());
+
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(mission.spec.search.budget.max_candidates).unwrap(),
+        )
+        .unwrap();
+        assert!(mission.validate().is_err());
+    }
+
+    #[test]
+    fn cex_mission_requires_a_deterministic_expansion_budget() {
+        for (max_expansions, max_seconds) in [(0, 1), (2, 1)] {
+            let mut mission = cex_mission_artifact(Utc::now());
+            mission.spec.search.budget.max_expansions = max_expansions;
+            mission.spec.search.budget.max_seconds = max_seconds;
+            mission.spec.policies.subset_search.content_sha256 =
+                canonical_json_hash(&mission.spec.search).unwrap();
+
+            assert!(mission.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn cex_mission_rejects_an_oversized_subset_checkpoint_plan_at_admission() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.search.budget.max_candidates = 64;
+        mission.spec.search.budget.max_expansions = 4_096;
+        mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(
+                mission.spec.search.planned_gp_and_subset_trials().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&mission.spec.search).unwrap();
+
+        assert!(
+            mission.spec.subset_checkpoint_upper_bound_bytes().unwrap()
+                > MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES
+        );
+        assert!(matches!(
+            mission.validate(),
+            Err(DomainError::InvalidCexResearchMission(
+                "subset search cannot emit a resumable checkpoint within 64 MiB"
+            ))
+        ));
     }
 
     #[test]
@@ -5103,6 +5283,29 @@ mod tests {
         rebind_factor_bank(&mut revision);
 
         assert!(revision.validate().is_err());
+    }
+
+    #[test]
+    fn factor_bank_rejects_attempts_above_the_frozen_gp_budget() {
+        let mut revision = factor_bank();
+        for index in 2..=5 {
+            let mut attempt = revision.attempts[0].clone();
+            attempt.candidate_id = format!("candidate-{index}");
+            attempt.post_warmup_coverage_rows = 0;
+            attempt.verdict = CexFactorScreeningVerdictV1::Rejected;
+            attempt.rejection_codes = vec![CexFactorRejectionCodeV1::EngineFailure];
+            attempt.rejection_details = vec!["engine failed".to_string()];
+            attempt.evaluation = None;
+            revision.attempts.push(attempt);
+        }
+        rebind_factor_bank(&mut revision);
+
+        assert!(matches!(
+            revision.validate(),
+            Err(DomainError::InvalidCexFactorBank(
+                "screening attempts exceed the frozen GP candidate budget"
+            ))
+        ));
     }
 
     #[test]

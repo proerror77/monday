@@ -2,16 +2,21 @@ use crate::{
     cli::{
         print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
     },
-    data_mission, governance, mission, prediction_dispatch,
+    data_mission, mission, prediction_dispatch,
 };
 use alpha_domain::{
     canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselinePolicyV1,
-    CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1,
-    CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1, CexGpPolicyV1,
-    CexResearchMissionArtifactV1, EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict,
-    MissionCompletionPolicy, MissionStatus, ResearchMission, ValidatorMode,
+    CexEqualAbsoluteWeightPolicyV1, CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2,
+    CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1,
+    CexGpPolicyV1, CexResearchMissionArtifactV1, EvaluationCostsV1, FormulaEvaluatorConfig,
+    IterationVerdict, MissionCompletionPolicy, MissionStatus, ResearchMission, ValidatorMode,
+    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
 };
-use alpha_engine::{baselines::evaluate_cex_baselines, evaluation::prepare_dataset};
+use alpha_engine::{
+    baselines::evaluate_cex_baselines,
+    engines::{CexFactorBankMcts, CexFactorBankMctsCheckpointV1, CexFactorBankMctsStopReasonV1},
+    evaluation::{prepare_dataset, EngineContext},
+};
 use alpha_store::{AlphaStore, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -42,6 +47,10 @@ const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
+const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
+    "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
+// ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
+const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
 #[derive(Debug, Deserialize)]
 struct Materialization {
@@ -78,6 +87,40 @@ struct ExecutionReport<'a> {
     bundle_bytes: u64,
     bundle_sha256: String,
     readback_bundle_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MctsCheckpointArtifactV1 {
+    schema_version: String,
+    checkpoint_sha256: String,
+    checkpoint: CexFactorBankMctsCheckpointV1,
+}
+
+impl MctsCheckpointArtifactV1 {
+    fn new(checkpoint: CexFactorBankMctsCheckpointV1) -> anyhow::Result<Self> {
+        let checkpoint_sha256 = checkpoint.content_hash().map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            schema_version: MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION.to_string(),
+            checkpoint_sha256,
+            checkpoint,
+        })
+    }
+
+    fn verified_checkpoint(
+        self,
+        expected_sha256: &str,
+    ) -> anyhow::Result<CexFactorBankMctsCheckpointV1> {
+        if self.schema_version != MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION
+            || self.checkpoint_sha256
+                != self.checkpoint.content_hash().map_err(anyhow::Error::msg)?
+            || self.checkpoint_sha256
+                != normalized_sha256("MCTS resume checkpoint", expected_sha256)?
+        {
+            bail!("MCTS resume checkpoint content SHA256 mismatch");
+        }
+        Ok(self.checkpoint)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +197,23 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let mission_path = input_dir.join("mission.json");
     let feature_path = input_dir.join("features.jsonl");
     let materialization_path = input_dir.join("materialization.json");
+    let resume_checkpoint = if let Some((resume_url, resume_sha256)) = resume_source(&args)? {
+        let checkpoint_path = input_dir.join("factor-subset-mcts-resume.json");
+        fetch_to_file(
+            &client,
+            resume_url,
+            &checkpoint_path,
+            MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+        )?;
+        let artifact: MctsCheckpointArtifactV1 =
+            serde_json::from_slice(&std::fs::read(checkpoint_path)?)
+                .context("MCTS resume checkpoint is invalid JSON")?;
+        Some(serde_json::to_value(
+            artifact.verified_checkpoint(resume_sha256)?,
+        )?)
+    } else {
+        None
+    };
     let (_, mission_sha256) =
         fetch_to_file(&client, &args.mission_url, &mission_path, MAX_MISSION_BYTES)?;
     if mission_sha256 != normalized_sha256("Mission", &args.mission_sha256)? {
@@ -191,6 +251,11 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
     baseline_policy.validate_binding(&control_mission.spec.policies.baseline)?;
     data_mission::write_json_atomic(&results_dir.join("baseline-policy.json"), &baseline_policy)?;
+    let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(
+        control_mission.spec.policies.weight.id.clone(),
+    )?;
+    weight_policy.validate_binding(&control_mission.spec.policies.weight)?;
+    data_mission::write_json_atomic(&results_dir.join("weight-policy.json"), &weight_policy)?;
     let mission_id = control_mission.semantic_id()?;
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
@@ -309,10 +374,15 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         baseline_artifact_id: None,
         validation_mode: ValidatorMode::MissionValidator,
         validator_spec: serde_json::json!({
-            "multiple_testing_trials": control_mission.spec.search.budget.max_candidates
+            "multiple_testing_trials": control_mission
+                .spec
+                .search
+                .planned_gp_and_subset_trials()?
         }),
         search_budget: control_mission.spec.search.budget.clone(),
-        completion_policy: MissionCompletionPolicy::default(),
+        completion_policy: MissionCompletionPolicy {
+            min_kept_candidates: control_mission.spec.search.budget.max_candidates,
+        },
         prompt_snapshot_id: None,
         search_policy_snapshot_id: control_mission.spec.policies.gp.id.clone(),
         status: MissionStatus::Pending,
@@ -399,8 +469,20 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &control_mission,
         &baseline_policy,
         &factor_bank,
-        baseline_run,
+        &baseline_run,
     )?;
+    if baseline_run.gate.passed {
+        run_factor_bank_subset_search(
+            &results_dir,
+            &control_mission,
+            &factor_bank,
+            &baseline_run,
+            &baseline_context,
+            resume_checkpoint,
+        )?;
+    } else if resume_checkpoint.is_some() {
+        bail!("MCTS resume checkpoint requires a passing baseline gate");
+    }
     let checkpoint = match store.get_checkpoint(&mission_id) {
         Ok(checkpoint) => Some(checkpoint),
         Err(StoreError::NotFound) => None,
@@ -424,15 +506,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             "evaluations": lineage.evaluations,
         }),
     )?;
-    let selected = governance::selected_walk_forward_candidate(&store, &mission_id)?;
     drop(store);
-    std::fs::write(
-        results_dir.join("kept-candidates.txt"),
-        selected
-            .iter()
-            .map(|candidate| format!("{candidate}\n"))
-            .collect::<String>(),
-    )?;
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
@@ -449,7 +523,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     }
     print_json(&ExecutionReport {
         mission_id: &mission_id,
-        engine: engine_name(engine),
+        engine: "gp_then_factor_bank_subset_mcts",
         bundle_bytes,
         bundle_sha256,
         readback_bundle_sha256: readback_sha256,
@@ -487,7 +561,7 @@ fn persist_baseline_evidence(
     control_mission: &CexResearchMissionArtifactV1,
     baseline_policy: &CexBaselinePolicyV1,
     factor_bank: &CexFactorBankRevisionV2,
-    run: alpha_engine::baselines::CexBaselineRun,
+    run: &alpha_engine::baselines::CexBaselineRun,
 ) -> anyhow::Result<()> {
     let alpha_engine::baselines::CexBaselineRun { ridge, cart, gate } = run;
     let asset_id = control_mission.spec.instrument.symbol.clone();
@@ -501,39 +575,43 @@ fn persist_baseline_evidence(
             registry_kind: CEX_BASELINE_GATE_REGISTRY_KIND.to_string(),
             asset_id,
             parent_revision_id: Some(factor_bank.revision_id.clone()),
-            payload: serde_json::to_value(&gate)?,
+            payload: serde_json::to_value(gate)?,
             created_at: Utc::now(),
         })?;
         data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
         return Ok(());
     }
 
-    let ridge = ridge.context("non-empty Factor Bank baseline is missing Ridge artifact")?;
-    let cart = cart.context("non-empty Factor Bank baseline is missing CART artifact")?;
+    let ridge = ridge
+        .as_ref()
+        .context("non-empty Factor Bank baseline is missing Ridge artifact")?;
+    let cart = cart
+        .as_ref()
+        .context("non-empty Factor Bank baseline is missing CART artifact")?;
     ridge.validate_binding(control_mission, baseline_policy, factor_bank)?;
     cart.validate_binding(control_mission, baseline_policy, factor_bank)?;
     gate.validate_binding(
         control_mission,
         baseline_policy,
         factor_bank,
-        Some(&ridge),
-        Some(&cart),
+        Some(ridge),
+        Some(cart),
     )?;
     for (artifact_id, registry_kind, payload) in [
         (
             ridge.artifact_id.clone(),
             CEX_BASELINE_RIDGE_REGISTRY_KIND,
-            serde_json::to_value(&ridge)?,
+            serde_json::to_value(ridge)?,
         ),
         (
             cart.artifact_id.clone(),
             CEX_BASELINE_CART_REGISTRY_KIND,
-            serde_json::to_value(&cart)?,
+            serde_json::to_value(cart)?,
         ),
         (
             gate.gate_id.clone(),
             CEX_BASELINE_GATE_REGISTRY_KIND,
-            serde_json::to_value(&gate)?,
+            serde_json::to_value(gate)?,
         ),
     ] {
         store.put_registry_revision(&RegistryRevision {
@@ -545,10 +623,72 @@ fn persist_baseline_evidence(
             created_at: Utc::now(),
         })?;
     }
-    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), &ridge)?;
-    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), &cart)?;
-    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
+    data_mission::write_json_atomic(&results_dir.join("ridge-baseline.json"), ridge)?;
+    data_mission::write_json_atomic(&results_dir.join("cart-baseline.json"), cart)?;
+    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
     Ok(())
+}
+
+fn run_factor_bank_subset_search(
+    results_dir: &Path,
+    control_mission: &CexResearchMissionArtifactV1,
+    factor_bank: &CexFactorBankRevisionV2,
+    baselines: &alpha_engine::baselines::CexBaselineRun,
+    context: &EngineContext<'_>,
+    resume_checkpoint: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let ridge = baselines
+        .ridge
+        .as_ref()
+        .context("passing baseline gate is missing Ridge evidence")?;
+    let cart = baselines
+        .cart
+        .as_ref()
+        .context("passing baseline gate is missing CART evidence")?;
+    let mut search = match resume_checkpoint {
+        Some(checkpoint) => CexFactorBankMcts::restore_json(
+            control_mission,
+            factor_bank,
+            ridge,
+            cart,
+            &baselines.gate,
+            context,
+            checkpoint,
+        ),
+        None => CexFactorBankMcts::new(
+            control_mission,
+            factor_bank,
+            ridge,
+            cart,
+            &baselines.gate,
+            context,
+        ),
+    }
+    .map_err(anyhow::Error::msg)?;
+    loop {
+        let stop = search
+            .run(context, Some(MCTS_CHECKPOINT_INTERVAL))
+            .map_err(anyhow::Error::msg)?;
+        let checkpoint =
+            MctsCheckpointArtifactV1::new(search.checkpoint().map_err(anyhow::Error::msg)?)?;
+        data_mission::write_json_atomic_bounded(
+            &results_dir.join("factor-subset-mcts-checkpoint.json"),
+            &checkpoint,
+            MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+        )?;
+        if stop == CexFactorBankMctsStopReasonV1::Paused {
+            continue;
+        }
+        data_mission::write_json_atomic(
+            &results_dir.join("factor-subset-mcts-trace.json"),
+            &search.trace().map_err(anyhow::Error::msg)?,
+        )?;
+        data_mission::write_json_atomic(
+            &results_dir.join("factor-subset-mcts-result.json"),
+            &search.result().map_err(anyhow::Error::msg)?,
+        )?;
+        return Ok(());
+    }
 }
 
 fn build_factor_bank(
@@ -683,8 +823,28 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("Mission execution paths and URLs are required");
     }
     normalized_sha256("Mission", &args.mission_sha256)?;
+    resume_source(args)?;
     validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
     Ok(())
+}
+
+fn resume_source(args: &ExecuteMissionArgs) -> anyhow::Result<Option<(&str, &str)>> {
+    let url = args
+        .resume_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let sha256 = args
+        .resume_sha256
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match (url, sha256) {
+        (None, None) => Ok(None),
+        (Some(url), Some(sha256)) => {
+            normalized_sha256("MCTS resume checkpoint", sha256)?;
+            Ok(Some((url, sha256)))
+        }
+        _ => bail!("MCTS resume checkpoint URL and SHA256 must be supplied together"),
+    }
 }
 
 fn validate_result_readback_binding(
@@ -999,28 +1159,20 @@ pub(crate) fn configured_sibling_binary(environment: &str, name: &str) -> anyhow
     Ok(path)
 }
 
-fn engine_name(engine: EngineChoice) -> &'static str {
-    match engine {
-        EngineChoice::Gp => "gp",
-        EngineChoice::Mcts => "mcts",
-        EngineChoice::Bayesian => "bayesian",
-        EngineChoice::OfflineRl => "offline-rl",
-        EngineChoice::Llm => "llm",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::ValidationArgs;
     use alpha_domain::{
-        CexResearchContentRefV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
-        CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
-        CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
-        CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionSpecV1,
-        CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
-        CexResearchVenueV1, EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
+        CexBaselineArtifactV1, CexBaselineGateV1, CexResearchContentRefV1,
+        CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchFalsificationTestV1,
+        CexResearchHoldoutStateV1, CexResearchHoldoutV1, CexResearchHypothesisTargetV1,
+        CexResearchHypothesisV1, CexResearchInputBindingsV1, CexResearchInstrumentV1,
+        CexResearchMarketV1, CexResearchMissionSpecV1, CexResearchOperationalMetadataV1,
+        CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1,
+        EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
+    use alpha_engine::engines::CexFactorBankMctsResultV1;
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
         hft_research_manifest::CexArtifactTripletV2 {
@@ -1546,6 +1698,51 @@ mod tests {
         assert_eq!(gate["ridge_artifact_id"], ridge["artifact_id"]);
         assert_eq!(gate["cart_artifact_id"], cart["artifact_id"]);
         assert_eq!(gate["policy_hash"], policy_hash);
+        let subset_result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-result.json")).unwrap(),
+        )
+        .unwrap();
+        let subset_trace: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-trace.json")).unwrap(),
+        )
+        .unwrap();
+        let checkpoint_artifact: MctsCheckpointArtifactV1 = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
+        )
+        .unwrap();
+        let selected_factors = subset_result["selected"]["subset"]["factors"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            subset_result["schema_version"],
+            "cex-factor-bank-subset-mcts-result-v1"
+        );
+        assert_eq!(
+            subset_result["factor_bank_revision_id"],
+            ridge["factor_bank_revision_id"]
+        );
+        assert_eq!(subset_result["baseline_gate_id"], gate["gate_id"]);
+        assert_eq!(
+            subset_result["checkpoint_sha256"],
+            checkpoint_artifact.checkpoint_sha256
+        );
+        assert!(!selected_factors.is_empty());
+        assert_eq!(
+            subset_result["selected"]["normalized_equal_abs_weight"]
+                .as_f64()
+                .unwrap()
+                * selected_factors.len() as f64,
+            1.0
+        );
+        assert!(!subset_trace.as_array().unwrap().is_empty());
+        assert!(subset_trace.as_array().unwrap().iter().all(|step| {
+            matches!(
+                step["action"]["action"].as_str(),
+                Some("add" | "remove" | "swap")
+            )
+        }));
+        assert!(results.join("factor-subset-mcts-checkpoint.json").exists());
+        assert!(!results.join("sealed-evaluations.jsonl").exists());
         let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
         let policy_revision = store.get_registry_revision(&policy_hash).unwrap();
         assert_eq!(
@@ -1565,6 +1762,443 @@ mod tests {
             policy_revision.payload,
             serde_json::to_value(&policy).unwrap()
         );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn factor_bank_mcts_resume_is_exact_and_rejects_bound_identity_drift() {
+        let mut fixture = fixture("factor-bank-mcts-resume");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        let ridge: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("ridge-baseline.json")).unwrap())
+                .unwrap();
+        let cart: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
+                .unwrap();
+        let gate: CexBaselineGateV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset =
+            prepare_dataset(rows.clone(), &fixture.mission.spec.evaluation_protocol).unwrap();
+        let context = dataset.engine_context();
+
+        let mut failed_ridge = ridge.clone();
+        failed_ridge.evaluation.passed = false;
+        assert!(CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &failed_ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .is_err());
+
+        let mut other_lineage_bank = factor_bank.clone();
+        other_lineage_bank.search_lineage_id = "other-search-lineage".to_string();
+        other_lineage_bank.revision_id.clear();
+        other_lineage_bank.revision_id = format!(
+            "cex-factor-bank-{}",
+            canonical_json_hash(&other_lineage_bank).unwrap()
+        );
+        other_lineage_bank.validate().unwrap();
+        assert!(CexFactorBankMcts::new(
+            &fixture.mission,
+            &other_lineage_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .err()
+        .expect("a Factor Bank from another search lineage must fail closed")
+        .contains("producer bindings drifted"));
+
+        let mut context_bound = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        let mut drifted_rows = rows;
+        drifted_rows[0].label += 0.000_001;
+        let drifted_dataset =
+            prepare_dataset(drifted_rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        assert!(context_bound
+            .run(&drifted_dataset.engine_context(), Some(1))
+            .expect_err("a different research dataset must fail before a search transition")
+            .contains("research dataset identity drifted"));
+
+        let mut full = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        assert_ne!(
+            full.run(&context, None).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        let full_checkpoint = full.checkpoint().unwrap();
+        let full_trace = full.trace().unwrap();
+        let full_result = full.result().unwrap();
+
+        let mut chunked = CexFactorBankMcts::new(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+        )
+        .unwrap();
+        let mut missing_untried_action =
+            serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
+        missing_untried_action["nodes"][0]["remaining_actions"] = serde_json::json!([]);
+        missing_untried_action["nodes"][0]["subtree_has_expansion"] = serde_json::json!(false);
+        assert!(CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            missing_untried_action,
+        )
+        .err()
+        .expect("a checkpoint cannot delete untried actions")
+        .contains("untried actions drifted"));
+        assert_eq!(
+            chunked.run(&context, Some(1)).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        let paused = serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
+        let mut expansion_index_drift = paused.clone();
+        expansion_index_drift["nodes"][0]["subtree_has_expansion"] = serde_json::json!(!paused
+            ["nodes"][0]["subtree_has_expansion"]
+            .as_bool()
+            .unwrap());
+        assert!(CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            expansion_index_drift,
+        )
+        .err()
+        .expect("the persisted expansion index must be verified")
+        .contains("expansion index drifted"));
+        let mut rng_drift = paused.clone();
+        rng_drift["rng"] = serde_json::json!(rng_drift["rng"].as_u64().unwrap() ^ 1);
+        let mut stats_drift = paused.clone();
+        let reward = stats_drift["nodes"][0]["total_reward"].as_f64().unwrap() + 1.0;
+        stats_drift["nodes"][0]["total_reward"] = serde_json::json!(reward);
+        stats_drift["nodes"][0]["best_reward"] = serde_json::json!(reward);
+        for drifted in [rng_drift, stats_drift] {
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("derived checkpoint state must replay exactly")
+            .contains("restored replay drifted"));
+        }
+        for (usage, limit) in [
+            ("candidates_evaluated", "max_candidates"),
+            ("expansions_used", "max_expansions"),
+        ] {
+            let mut over_budget = paused.clone();
+            over_budget[usage] =
+                serde_json::json!(over_budget["bindings"]["budget"][limit].as_u64().unwrap() + 1);
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                over_budget,
+            )
+            .err()
+            .expect("checkpoint usage cannot exceed its frozen budget")
+            .contains("exceeds its frozen budget"));
+        }
+        let mut resumed = CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            paused.clone(),
+        )
+        .unwrap();
+        assert_ne!(
+            resumed.run(&context, None).unwrap(),
+            CexFactorBankMctsStopReasonV1::Paused
+        );
+        assert_eq!(resumed.checkpoint().unwrap(), full_checkpoint);
+        assert_eq!(resumed.trace().unwrap(), full_trace);
+        assert_eq!(resumed.result().unwrap(), full_result);
+
+        for pointer in [
+            "/bindings/mission_id",
+            "/bindings/factor_bank_revision_id",
+            "/bindings/ridge_artifact_id",
+            "/bindings/cart_artifact_id",
+            "/bindings/baseline_gate_id",
+            "/bindings/implementation_version",
+        ] {
+            let mut drifted = paused.clone();
+            *drifted.pointer_mut(pointer).unwrap() = serde_json::json!("drifted");
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("identity drift must be rejected")
+            .contains("bindings drifted"));
+        }
+        for pointer in [
+            "/bindings/subset_policy/content_sha256",
+            "/bindings/weight_policy/content_sha256",
+            "/bindings/screening_policy/content_sha256",
+            "/bindings/scoring_policy/content_sha256",
+        ] {
+            let mut drifted = paused.clone();
+            *drifted.pointer_mut(pointer).unwrap() = serde_json::json!("0".repeat(64));
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("policy drift must be rejected")
+            .contains("bindings drifted"));
+        }
+        for (pointer, value) in [
+            ("/trace/0/action/factor_bank_revision_id", "other-bank"),
+            ("/trace/0/action/factor/factor_id", "unknown-factor"),
+            (
+                "/trace/0/action/factor/content_sha256",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let mut invalid = paused.clone();
+            *invalid.pointer_mut(pointer).unwrap() = serde_json::json!(value);
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                invalid,
+            )
+            .is_err());
+        }
+        let legacy_error = CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            serde_json::json!({ "kind": "Mcts", "version": 4, "state": {} }),
+        )
+        .err()
+        .expect("legacy Formula-MCTS checkpoint must be rejected");
+        assert!(legacy_error.contains("legacy Formula-MCTS checkpoint version 4"));
+        assert!(legacy_error.contains("cex-factor-bank-subset-mcts-v1"));
+
+        let resume_path = fixture.root.join("paused-factor-subset-mcts.json");
+        let resume_artifact =
+            MctsCheckpointArtifactV1::new(serde_json::from_value(paused.clone()).unwrap()).unwrap();
+        let resume_content_sha256 = resume_artifact.checkpoint_sha256.clone();
+        std::fs::write(
+            &resume_path,
+            serde_json::to_vec_pretty(&resume_artifact).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
+        fixture.args.work_dir = fixture.root.join("work-resumed");
+        fixture.args.result_put_url = fixture
+            .root
+            .join("result-resumed.zip")
+            .to_string_lossy()
+            .into();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        fixture.args.resume_url = Some(resume_path.to_string_lossy().into_owned());
+        fixture.args.resume_sha256 = Some(resume_content_sha256);
+        execute(fixture.args.clone()).unwrap();
+        let resumed_result: CexFactorBankMctsResultV1 = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .args
+                    .work_dir
+                    .join("results/factor-subset-mcts-result.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed_result, full_result);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn factor_bank_mcts_reaches_full_depth_under_a_full_factor_bank_budget() {
+        let mut fixture = fixture("factor-bank-mcts-full-depth-budget");
+        fixture
+            .mission
+            .spec
+            .feature_fields
+            .push("mid_price".to_string());
+        fixture.mission.spec.search.budget.max_candidates = 3;
+        fixture.mission.spec.search.budget.max_expansions = 3;
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.features.insert("spread_bps".to_string(), direction);
+            row.features
+                .insert("mid_price".to_string(), direction * 0.25);
+            row.label = direction * 0.001;
+        });
+
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        assert_eq!(factor_bank.entries.len(), 3);
+        let trace: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-trace.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(trace.iter().any(|step| {
+            step["resulting_state"]["factors"]
+                .as_array()
+                .is_some_and(|factors| factors.len() == 3)
+        }));
+
+        let ridge: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("ridge-baseline.json")).unwrap())
+                .unwrap();
+        let cart: CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
+                .unwrap();
+        let gate: CexBaselineGateV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json")).unwrap())
+                .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let context = dataset.engine_context();
+        let checkpoint_artifact: MctsCheckpointArtifactV1 = serde_json::from_slice(
+            &std::fs::read(results.join("factor-subset-mcts-checkpoint.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_artifact.checkpoint_sha256,
+            checkpoint_artifact.checkpoint.content_hash().unwrap()
+        );
+        let mut checkpoint = serde_json::to_value(checkpoint_artifact.checkpoint).unwrap();
+        let mut failed_combination: CandidateEvaluation =
+            serde_json::from_value(checkpoint["nodes"][2]["evaluation"].clone()).unwrap();
+        failed_combination.passed = false;
+        failed_combination.failure_reasons = vec!["drawdown gate failed".to_string()];
+        failed_combination.metrics.folds[0].max_drawdown = 1.0;
+        failed_combination.metrics.max_drawdown = failed_combination
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.max_drawdown)
+            .fold(0.0_f64, f64::max);
+        failed_combination.validate().unwrap();
+        checkpoint["nodes"][2]["evaluation"] = serde_json::to_value(&failed_combination).unwrap();
+        let evaluation_sha256 = canonical_json_hash(&failed_combination).unwrap();
+        let combination_step = checkpoint["trace"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["outcome"]["node_id"] == 2)
+            .unwrap();
+        combination_step["outcome"]["evaluation_sha256"] = serde_json::json!(evaluation_sha256);
+        checkpoint["selected_node_id"] = serde_json::json!(2);
+        assert!(CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            checkpoint.clone(),
+        )
+        .err()
+        .expect("a failed subset cannot remain selected")
+        .contains("selected subset drifted"));
+        checkpoint["selected_node_id"] = serde_json::json!(1);
+        assert!(CexFactorBankMcts::restore_json(
+            &fixture.mission,
+            &factor_bank,
+            &ridge,
+            &cart,
+            &gate,
+            &context,
+            checkpoint,
+        )
+        .err()
+        .expect("self-consistent fabricated evaluations must be rejected")
+        .contains("restored replay drifted"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -1627,7 +2261,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("Factor-Bank subset adapter (#601) is required"));
+            .contains("available only through content-bound mission execute"));
         let store = AlphaStore::open(&args.db).unwrap();
         assert_eq!(
             store.get_mission(&args.mission_id).unwrap().status,
@@ -2447,6 +3081,8 @@ mod tests {
         )
         .unwrap();
         let baseline_policy = CexBaselinePolicyV1::controlled_v1("baseline-policy-1").unwrap();
+        let weight_policy =
+            CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -2523,7 +3159,10 @@ mod tests {
                         id: "subset-search-policy-1".to_string(),
                         content_sha256: canonical_json_hash(&search).unwrap(),
                     },
-                    weight: reference("weight-policy-1", '4'),
+                    weight: CexResearchContentRefV1 {
+                        id: weight_policy.policy_id.clone(),
+                        content_sha256: weight_policy.content_hash().unwrap(),
+                    },
                     evaluation: CexResearchContentRefV1 {
                         id: "evaluation-policy-1".to_string(),
                         content_sha256: evaluation_protocol.content_hash().unwrap(),
@@ -2553,7 +3192,10 @@ mod tests {
             },
         };
         mission.spec.policies.screening.content_sha256 = canonical_json_hash(
-            &FormulaEvaluatorConfig::for_trials(mission.spec.search.budget.max_candidates).unwrap(),
+            &FormulaEvaluatorConfig::for_trials(
+                mission.spec.search.planned_gp_and_subset_trials().unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         mission.validate().unwrap();
@@ -2566,6 +3208,8 @@ mod tests {
             mission_sha256: sha256_file(&mission_path).unwrap(),
             feature_url: feature_path.to_string_lossy().into_owned(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),
+            resume_url: None,
+            resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
             result_readback_url: result_path.to_string_lossy().into_owned(),
         };
@@ -2664,11 +3308,24 @@ mod tests {
             fixture.mission.spec.policies.baseline.content_sha256 =
                 baseline_policy.content_hash().unwrap();
         }
+        if let Ok(weight_policy) = CexEqualAbsoluteWeightPolicyV1::controlled_v1(
+            fixture.mission.spec.policies.weight.id.clone(),
+        ) {
+            fixture.mission.spec.policies.weight.content_sha256 =
+                weight_policy.content_hash().unwrap();
+        }
         fixture.mission.spec.policies.subset_search.content_sha256 =
             canonical_json_hash(&fixture.mission.spec.search).unwrap();
         fixture.mission.spec.policies.screening.content_sha256 = canonical_json_hash(
-            &FormulaEvaluatorConfig::for_trials(fixture.mission.spec.search.budget.max_candidates)
-                .unwrap(),
+            &FormulaEvaluatorConfig::for_trials(
+                fixture
+                    .mission
+                    .spec
+                    .search
+                    .planned_gp_and_subset_trials()
+                    .unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         fixture.mission.spec.policies.evaluation.content_sha256 = fixture

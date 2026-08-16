@@ -29,7 +29,8 @@ const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
-const CEX_MCTS_CANDIDATE_SPACE_ID: &str = "live-factor-ast-add-secondary-v1";
+const CEX_FACTOR_BANK_MCTS_OPERATOR_ERROR: &str =
+    "CEX Factor-Bank subset MCTS is available only through content-bound mission execute";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,9 +118,7 @@ fn execute_mission_inner(
             &walk_forward_partition,
             &evaluation_protocol_hash,
         )?;
-        bail!(
-            "MCTS candidate space {CEX_MCTS_CANDIDATE_SPACE_ID} is not authorized for CEX Factor Bank missions; Factor-Bank subset adapter (#601) is required"
-        );
+        bail!(CEX_FACTOR_BANK_MCTS_OPERATOR_ERROR);
     }
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
     let proposal_engine = build_engine(args, &dataset, &mission, governed_gp)?;
@@ -426,9 +425,7 @@ fn build_engine(
                     .map_err(anyhow::Error::msg)?,
             ),
         },
-        EngineChoice::Mcts => bail!(
-            "MCTS candidate space {CEX_MCTS_CANDIDATE_SPACE_ID} is not authorized for CEX Factor Bank missions; Factor-Bank subset adapter (#601) is required"
-        ),
+        EngineChoice::Mcts => bail!(CEX_FACTOR_BANK_MCTS_OPERATOR_ERROR),
         EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
         EngineChoice::OfflineRl => {
             let path = args
