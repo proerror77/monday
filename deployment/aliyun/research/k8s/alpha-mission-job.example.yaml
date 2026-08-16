@@ -44,61 +44,26 @@ spec:
             - execute
             - --work-dir
             - /work
+            - --mission-url
+            - $(MISSION_URL)
+            - --mission-sha256
+            - $(MISSION_SHA256)
             - --feature-url
             - $(FEATURE_URL)
             - --materialization-url
             - $(MATERIALIZATION_URL)
-            - --materialization-sha256
-            - $(MATERIALIZATION_SHA256)
             - --result-put-url
             - $(RESULT_PUT_URL)
-            - --data-mission-id
-            - $(DATA_MISSION_ID)
-            - --mission-id
-            - $(MISSION_ID)
-            - --engine
-            - mcts
-            - --seed
-            - $(SEED)
-            - --feature-fields
-            - book_imbalance
-            - --label-horizon-buckets
-            - "5"
-            - --observation-frequency-millis
-            - "1000"
-            - --max-candidates
-            - "1"
-            - --max-expansions
-            - "1"
-            - --max-seconds
-            - "300"
-            - --max-new-iterations
-            - "1"
-            - --objective
-            - Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M
-            - --hypothesis-scope
-            - Top-of-book imbalance at a five-second horizon
-            - --initial-train-rows
-            - "800"
-            - --validation-rows
-            - "240"
-            - --fold-count
-            - "3"
-            - --purge-rows
-            - "5"
-            - --embargo-rows
-            - "5"
-            - --sealed-holdout-rows
-            - "300"
-            - --fee-bps
-            - "2.0"
-            - --funding-bps
-            - "0.0"
-            - --latency-bps
-            - "0.5"
-            - --slippage-bps
-            - "0.0"
+            - --result-readback-url
+            - $(RESULT_READBACK_URL)
           env:
+            - name: MISSION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: mission-url
+            - name: MISSION_SHA256
+              value: REPLACE_MISSION_SHA256
             - name: FEATURE_URL
               valueFrom:
                 secretKeyRef:
@@ -109,19 +74,16 @@ spec:
                 secretKeyRef:
                   name: REPLACE_URL_SECRET_NAME
                   key: result-put-url
+            - name: RESULT_READBACK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: result-readback-url
             - name: MATERIALIZATION_URL
               valueFrom:
                 secretKeyRef:
                   name: REPLACE_URL_SECRET_NAME
                   key: materialization-url
-            - name: MATERIALIZATION_SHA256
-              value: REPLACE_MATERIALIZATION_SHA256
-            - name: DATA_MISSION_ID
-              value: REPLACE_DATA_MISSION_ID
-            - name: MISSION_ID
-              value: REPLACE_MISSION_ID
-            - name: SEED
-              value: "7"
           resources:
             requests:
               cpu: "3500m"

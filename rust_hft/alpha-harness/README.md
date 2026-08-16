@@ -12,7 +12,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
-| CEX `mission execute` | Implemented through GP, immutable Factor Bank, and deterministic Ridge/CART baselines | Create-once result bundle with a locally computed SHA-256; independent result readback is not yet implemented |
+| CEX `mission execute` | Implemented through GP, immutable Factor Bank, and deterministic Ridge/CART baselines | Create-once result bundle plus independent readback with an exact SHA-256 match |
 | Factor-Bank subset MCTS | Blocked by [#601](https://github.com/proerror77/monday/issues/601) | The CEX path fails closed before MCTS rather than falling back to Formula-MCTS |
 | Four-stage combination walk-forward | Blocked by [#602](https://github.com/proerror77/monday/issues/602) | No selected subset is compiled into the required Signal/Sizing/Risk/Execution artifact |
 | Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
@@ -75,7 +75,8 @@ cargo run -p alpha-harness -- mission execute \
   --mission-sha256 "$MISSION_SHA256" \
   --feature-url var/materializations/features.jsonl \
   --materialization-url var/materializations/materialization.json \
-  --result-put-url var/results/cex-mission-1.zip
+  --result-put-url var/results/cex-mission-1.zip \
+  --result-readback-url var/results/cex-mission-1.zip
 ```
 
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed

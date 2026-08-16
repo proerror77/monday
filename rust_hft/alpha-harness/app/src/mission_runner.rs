@@ -2,7 +2,7 @@ use crate::{
     cli::{
         print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
     },
-    data_mission, governance, mission,
+    data_mission, governance, mission, prediction_dispatch,
 };
 use alpha_domain::{
     canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselinePolicyV1,
@@ -77,6 +77,7 @@ struct ExecutionReport<'a> {
     engine: &'static str,
     bundle_bytes: u64,
     bundle_sha256: String,
+    readback_bundle_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,11 +437,22 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
+    let readback_bundle = input_dir.join("published-result-readback.zip");
+    let (_, readback_sha256) = fetch_to_file(
+        &client,
+        &args.result_readback_url,
+        &readback_bundle,
+        bundle_bytes,
+    )?;
+    if readback_sha256 != bundle_sha256 {
+        bail!("published CEX result readback SHA256 mismatch");
+    }
     print_json(&ExecutionReport {
         mission_id: &mission_id,
         engine: engine_name(engine),
         bundle_bytes,
         bundle_sha256,
+        readback_bundle_sha256: readback_sha256,
     })
 }
 
@@ -663,6 +675,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
             args.feature_url.as_str(),
             args.materialization_url.as_str(),
             args.result_put_url.as_str(),
+            args.result_readback_url.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -670,6 +683,42 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("Mission execution paths and URLs are required");
     }
     normalized_sha256("Mission", &args.mission_sha256)?;
+    validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
+    Ok(())
+}
+
+fn validate_result_readback_binding(
+    result_put_url: &str,
+    result_readback_url: &str,
+) -> anyhow::Result<()> {
+    let put_is_remote =
+        result_put_url.starts_with("http://") || result_put_url.starts_with("https://");
+    let readback_is_remote =
+        result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
+    let same_object = match (put_is_remote, readback_is_remote) {
+        (true, true) => {
+            prediction_dispatch::canonical_https_object("CEX result", result_put_url)?
+                == prediction_dispatch::canonical_https_object(
+                    "CEX result readback",
+                    result_readback_url,
+                )?
+        }
+        (false, false) => {
+            Path::new(
+                result_put_url
+                    .strip_prefix("file://")
+                    .unwrap_or(result_put_url),
+            ) == Path::new(
+                result_readback_url
+                    .strip_prefix("file://")
+                    .unwrap_or(result_readback_url),
+            )
+        }
+        _ => false,
+    };
+    if !same_object {
+        bail!("CEX result readback URL must identify the same immutable result object");
+    }
     Ok(())
 }
 
@@ -1975,6 +2024,7 @@ mod tests {
         resign_mission(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-2");
         fixture.args.result_put_url = fixture.root.join("result-2.zip").to_string_lossy().into();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
 
@@ -1989,6 +2039,7 @@ mod tests {
         rebind_mission_inputs(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-3");
         fixture.args.result_put_url = fixture.root.join("result-3.zip").to_string_lossy().into();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
         std::fs::remove_dir_all(fixture.root).unwrap();
@@ -2101,6 +2152,31 @@ mod tests {
         .expect_err("a missing bundle must fail before publication");
 
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn execute_rejects_a_result_readback_for_another_object() {
+        let mut fixture = fixture("result-readback-object-mismatch");
+        let readback = fixture.root.join("another-result.zip");
+        fixture.args.result_readback_url = readback.to_string_lossy().into_owned();
+
+        let error =
+            execute(fixture.args.clone()).expect_err("readback of another object must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("CEX result readback URL must identify the same immutable result object"));
+        assert!(!fixture.result_path.exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn cex_result_readback_accepts_distinct_signatures_for_the_same_object() {
+        validate_result_readback_binding(
+            "https://oss-internal/results/attempt-1/results.zip?upload=x",
+            "https://oss-internal/results/attempt-1/results.zip?read=x",
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -2491,6 +2567,7 @@ mod tests {
             feature_url: feature_path.to_string_lossy().into_owned(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),
             result_put_url: result_path.to_string_lossy().into_owned(),
+            result_readback_url: result_path.to_string_lossy().into_owned(),
         };
         Fixture {
             root,

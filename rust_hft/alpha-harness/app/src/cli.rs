@@ -368,6 +368,9 @@ pub struct ExecuteMissionArgs {
     pub materialization_url: String,
     #[arg(long)]
     pub result_put_url: String,
+    /// Independently authorized read URL for the immutable published result bundle.
+    #[arg(long)]
+    pub result_readback_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -781,6 +784,8 @@ mod tests {
             "--materialization-url".to_owned(),
             missing_materialization,
             "--result-put-url".to_owned(),
+            result.clone(),
+            "--result-readback-url".to_owned(),
             result,
         ])
         .unwrap();
@@ -1054,6 +1059,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "materialization.json",
             "--result-put-url",
             "results.zip",
+            "--result-readback-url",
+            "results.zip",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -1088,6 +1095,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "materialization.json",
             "--result-put-url",
             "results.zip",
+            "--result-readback-url",
+            "results.zip",
         ])
         .expect("content-bound Mission transport must be accepted");
 
@@ -1115,6 +1124,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "--materialization-url",
             "materialization.json",
             "--result-put-url",
+            "results.zip",
+            "--result-readback-url",
             "results.zip",
             "--objective",
             "alternate authority",
