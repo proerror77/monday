@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::mem;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config::{
@@ -14,6 +14,324 @@ use crate::config::{
 use crate::event::{EventEnvelope, EventPayload, EventStream, Level, TradeSide};
 
 const MICROS_IN_SECOND: f64 = 1_000_000.0;
+const BPS: f64 = 10_000.0;
+
+pub const TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION: &str =
+    "hft-backtest-target-position-replay-v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPositionDecision {
+    pub timestamp_us: i64,
+    pub target_position: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPositionReplayConfig {
+    pub max_depth_levels: usize,
+    pub max_decision_delay_us: u64,
+    pub position_notional_usd: f64,
+    pub fee_bps: f64,
+    pub rebate_bps: f64,
+    pub funding_bps: f64,
+    pub latency_bps: f64,
+    pub additional_slippage_bps: f64,
+    pub cross_spread: bool,
+    pub capacity_depth_levels: usize,
+    pub trade_tape_declared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPositionReplayMetrics {
+    pub event_count: usize,
+    pub snapshot_events: usize,
+    pub l2_update_events: usize,
+    pub trade_events: usize,
+    pub decision_count: usize,
+    pub position_changes: usize,
+    pub first_event_time_us: i64,
+    pub last_event_time_us: i64,
+    pub max_decision_delay_us: u64,
+    pub min_bid_depth_levels: usize,
+    pub max_bid_depth_levels: usize,
+    pub min_ask_depth_levels: usize,
+    pub max_ask_depth_levels: usize,
+    pub total_turnover: f64,
+    pub mean_net_return: f64,
+    pub cumulative_net_return: f64,
+    pub max_drawdown: f64,
+    pub net_sharpe: f64,
+    pub max_abs_position: f64,
+    pub max_same_side_depth_fraction: Option<f64>,
+}
+
+pub fn replay_target_positions(
+    event_bytes: &[u8],
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+) -> Result<TargetPositionReplayMetrics> {
+    let mut replay = TargetPositionReplay::new(decisions, config)?;
+    let stream = EventStream::new(BufReader::new(Cursor::new(event_bytes)), None, None, true);
+    for event in stream {
+        replay.observe(&event?)?;
+    }
+    replay.finish()
+}
+
+pub(crate) struct TargetPositionReplay<'a> {
+    decisions: &'a [TargetPositionDecision],
+    config: &'a TargetPositionReplayConfig,
+    book: OrderBook,
+    seeded: bool,
+    decision_index: usize,
+    event_count: usize,
+    snapshot_events: usize,
+    l2_update_events: usize,
+    trade_events: usize,
+    position_changes: usize,
+    first_event_time_us: Option<i64>,
+    last_event_time_us: Option<i64>,
+    max_decision_delay_us: u64,
+    min_bid_depth_levels: usize,
+    max_bid_depth_levels: usize,
+    min_ask_depth_levels: usize,
+    max_ask_depth_levels: usize,
+    position: f64,
+    marked_mid: Option<f64>,
+    total_turnover: f64,
+    max_same_side_depth_fraction: Option<f64>,
+    returns: Vec<f64>,
+}
+
+impl<'a> TargetPositionReplay<'a> {
+    pub(crate) fn new(
+        decisions: &'a [TargetPositionDecision],
+        config: &'a TargetPositionReplayConfig,
+    ) -> Result<Self> {
+        validate_target_replay_inputs(decisions, config)?;
+        Ok(Self {
+            decisions,
+            config,
+            book: OrderBook::new(config.max_depth_levels),
+            seeded: false,
+            decision_index: 0,
+            event_count: 0,
+            snapshot_events: 0,
+            l2_update_events: 0,
+            trade_events: 0,
+            position_changes: 0,
+            first_event_time_us: None,
+            last_event_time_us: None,
+            max_decision_delay_us: 0,
+            min_bid_depth_levels: usize::MAX,
+            max_bid_depth_levels: 0,
+            min_ask_depth_levels: usize::MAX,
+            max_ask_depth_levels: 0,
+            position: 0.0,
+            marked_mid: None,
+            total_turnover: 0.0,
+            max_same_side_depth_fraction: config.capacity_depth_levels.gt(&0).then_some(0.0),
+            returns: Vec::with_capacity(decisions.len()),
+        })
+    }
+
+    pub(crate) fn observe(&mut self, event: &EventEnvelope) -> Result<()> {
+        self.event_count = self
+            .event_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("target-position replay event count overflow"))?;
+        self.first_event_time_us.get_or_insert(event.ts);
+        self.last_event_time_us = Some(event.ts);
+        match &event.payload {
+            EventPayload::Snapshot { bids, asks } => {
+                self.book.apply_snapshot(event.ts, bids, asks);
+                self.seeded = true;
+                self.snapshot_events += 1;
+            }
+            EventPayload::L2Update { bids, asks } => {
+                if !self.seeded {
+                    anyhow::bail!("target-position replay received an L2 update before a snapshot");
+                }
+                self.book.apply_delta(event.ts, bids, asks);
+                self.l2_update_events += 1;
+            }
+            EventPayload::Trade { .. } => {
+                if !self.config.trade_tape_declared {
+                    anyhow::bail!("target-position replay tape contains undeclared trade events");
+                }
+                self.trade_events += 1;
+            }
+        }
+        if self.seeded {
+            let (bid_levels, ask_levels) = self.book.depth_level_counts();
+            self.min_bid_depth_levels = self.min_bid_depth_levels.min(bid_levels);
+            self.max_bid_depth_levels = self.max_bid_depth_levels.max(bid_levels);
+            self.min_ask_depth_levels = self.min_ask_depth_levels.min(ask_levels);
+            self.max_ask_depth_levels = self.max_ask_depth_levels.max(ask_levels);
+            if let Some(mid) = self.book.mid_price() {
+                while self.decision_index < self.decisions.len()
+                    && self.decisions[self.decision_index].timestamp_us <= event.ts
+                {
+                    let decision = &self.decisions[self.decision_index];
+                    let delay = u64::try_from(event.ts - decision.timestamp_us).map_err(|_| {
+                        anyhow::anyhow!("target-position replay decision clock reversed")
+                    })?;
+                    if delay > self.config.max_decision_delay_us {
+                        anyhow::bail!("target-position replay decision exceeded its maximum delay");
+                    }
+                    self.max_decision_delay_us = self.max_decision_delay_us.max(delay);
+                    let change = decision.target_position - self.position;
+                    let turnover = change.abs();
+                    if turnover > f64::EPSILON {
+                        self.position_changes += 1;
+                        if let Some(max_fraction) = &mut self.max_same_side_depth_fraction {
+                            let depth_notional = self
+                                .book
+                                .same_side_depth(change, self.config.capacity_depth_levels)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "target-position replay has no same-side depth for a position change"
+                                    )
+                                })?
+                                * mid;
+                            if depth_notional <= 0.0 {
+                                anyhow::bail!(
+                                    "target-position replay has non-positive same-side depth"
+                                );
+                            }
+                            *max_fraction = (*max_fraction)
+                                .max(self.config.position_notional_usd * turnover / depth_notional);
+                        }
+                    }
+                    self.total_turnover += turnover;
+                    let gross_return = self
+                        .marked_mid
+                        .map(|previous_mid| self.position * (mid / previous_mid - 1.0))
+                        .unwrap_or(0.0);
+                    let spread_cost_bps = if self.config.cross_spread {
+                        self.book.spread_bps().ok_or_else(|| {
+                            anyhow::anyhow!("target-position replay has no spread")
+                        })? / 2.0
+                    } else {
+                        0.0
+                    };
+                    let transaction_cost = turnover
+                        * (self.config.fee_bps - self.config.rebate_bps
+                            + self.config.latency_bps
+                            + self.config.additional_slippage_bps
+                            + spread_cost_bps)
+                        / BPS;
+                    let funding_cost = self.position.abs() * self.config.funding_bps / BPS;
+                    self.returns
+                        .push(gross_return - transaction_cost - funding_cost);
+                    self.marked_mid = Some(mid);
+                    self.position = decision.target_position;
+                    self.decision_index += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<TargetPositionReplayMetrics> {
+        if self.decision_index != self.decisions.len() {
+            anyhow::bail!("target-position replay tape ended before all decisions");
+        }
+        if self.config.trade_tape_declared && self.trade_events == 0 {
+            anyhow::bail!("target-position replay manifest declares trades but none were replayed");
+        }
+        let first_event_time_us = self
+            .first_event_time_us
+            .context("target-position replay is empty")?;
+        let last_event_time_us = self
+            .last_event_time_us
+            .context("target-position replay is empty")?;
+        let cumulative_net_return = self.returns.iter().sum::<f64>();
+        let mean_net_return = cumulative_net_return / self.returns.len() as f64;
+        let variance = self
+            .returns
+            .iter()
+            .map(|value| (value - mean_net_return).powi(2))
+            .sum::<f64>()
+            / self.returns.len() as f64;
+        let net_sharpe = if variance > 0.0 {
+            mean_net_return / variance.sqrt() * (self.returns.len() as f64).sqrt()
+        } else {
+            0.0
+        };
+        let mut equity = 1.0_f64;
+        let mut peak = 1.0_f64;
+        let mut max_drawdown = 0.0_f64;
+        for value in &self.returns {
+            equity += value;
+            peak = peak.max(equity);
+            if peak > f64::EPSILON {
+                max_drawdown = max_drawdown.max((peak - equity) / peak);
+            }
+        }
+        Ok(TargetPositionReplayMetrics {
+            event_count: self.event_count,
+            snapshot_events: self.snapshot_events,
+            l2_update_events: self.l2_update_events,
+            trade_events: self.trade_events,
+            decision_count: self.decisions.len(),
+            position_changes: self.position_changes,
+            first_event_time_us,
+            last_event_time_us,
+            max_decision_delay_us: self.max_decision_delay_us,
+            min_bid_depth_levels: self.min_bid_depth_levels,
+            max_bid_depth_levels: self.max_bid_depth_levels,
+            min_ask_depth_levels: self.min_ask_depth_levels,
+            max_ask_depth_levels: self.max_ask_depth_levels,
+            total_turnover: self.total_turnover,
+            mean_net_return,
+            cumulative_net_return,
+            max_drawdown,
+            net_sharpe,
+            max_abs_position: self
+                .decisions
+                .iter()
+                .map(|decision| decision.target_position.abs())
+                .fold(0.0, f64::max),
+            max_same_side_depth_fraction: self.max_same_side_depth_fraction,
+        })
+    }
+}
+
+fn validate_target_replay_inputs(
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+) -> Result<()> {
+    let costs = [
+        config.position_notional_usd,
+        config.fee_bps,
+        config.rebate_bps,
+        config.funding_bps,
+        config.latency_bps,
+        config.additional_slippage_bps,
+    ];
+    let capacity_disabled =
+        config.position_notional_usd == 0.0 && config.capacity_depth_levels == 0;
+    let capacity_enabled = config.position_notional_usd > 0.0 && config.capacity_depth_levels > 0;
+    if decisions.is_empty()
+        || decisions
+            .windows(2)
+            .any(|pair| pair[0].timestamp_us >= pair[1].timestamp_us)
+        || decisions.iter().any(|decision| {
+            !decision.target_position.is_finite() || decision.target_position.abs() > 1.0
+        })
+        || config.max_depth_levels == 0
+        || config.max_decision_delay_us == 0
+        || costs.iter().any(|value| !value.is_finite() || *value < 0.0)
+        || !(capacity_disabled || capacity_enabled)
+        || config.capacity_depth_levels > config.max_depth_levels
+    {
+        anyhow::bail!("target-position replay inputs are invalid");
+    }
+    Ok(())
+}
 
 pub struct BacktestEngine {
     cfg: BacktestConfig,
@@ -287,23 +605,24 @@ impl OrderBook {
     fn apply_snapshot(&mut self, ts: i64, bids: &[Level], asks: &[Level]) -> (f64, f64) {
         self.bids.clear();
         self.asks.clear();
-        for level in bids.iter().take(self.max_levels) {
+        for level in bids {
             if level.quantity > 0.0 {
                 self.bids.insert(OrderedFloat(level.price), level.quantity);
             }
         }
-        for level in asks.iter().take(self.max_levels) {
+        for level in asks {
             if level.quantity > 0.0 {
                 self.asks.insert(OrderedFloat(level.price), level.quantity);
             }
         }
+        self.trim_to_max_levels();
         let delta = self.update_best_sizes();
         self.last_ts = Some(ts);
         delta
     }
 
     fn apply_delta(&mut self, ts: i64, bids: &[Level], asks: &[Level]) -> (f64, f64) {
-        for level in bids.iter().take(self.max_levels) {
+        for level in bids {
             let key = OrderedFloat(level.price);
             if level.quantity <= 0.0 {
                 self.bids.remove(&key);
@@ -311,7 +630,7 @@ impl OrderBook {
                 self.bids.insert(key, level.quantity);
             }
         }
-        for level in asks.iter().take(self.max_levels) {
+        for level in asks {
             let key = OrderedFloat(level.price);
             if level.quantity <= 0.0 {
                 self.asks.remove(&key);
@@ -319,6 +638,7 @@ impl OrderBook {
                 self.asks.insert(key, level.quantity);
             }
         }
+        self.trim_to_max_levels();
         let delta = self.update_best_sizes();
         self.last_ts = Some(ts);
         delta
@@ -331,6 +651,15 @@ impl OrderBook {
             .map(|(p, q)| (p.into_inner(), *q))
     }
 
+    fn trim_to_max_levels(&mut self) {
+        while self.bids.len() > self.max_levels {
+            self.bids.pop_first();
+        }
+        while self.asks.len() > self.max_levels {
+            self.asks.pop_last();
+        }
+    }
+
     fn best_ask(&self) -> Option<(f64, f64)> {
         self.asks.iter().next().map(|(p, q)| (p.into_inner(), *q))
     }
@@ -339,6 +668,27 @@ impl OrderBook {
         match (self.best_bid(), self.best_ask()) {
             (Some((bid, _)), Some((ask, _))) if ask >= bid => Some((bid + ask) / 2.0),
             _ => None,
+        }
+    }
+
+    fn spread_bps(&self) -> Option<f64> {
+        let (bid, _) = self.best_bid()?;
+        let (ask, _) = self.best_ask()?;
+        let mid = self.mid_price()?;
+        (mid > 0.0).then_some((ask - bid) / mid * BPS)
+    }
+
+    fn depth_level_counts(&self) -> (usize, usize) {
+        (self.bids.len(), self.asks.len())
+    }
+
+    fn same_side_depth(&self, position_change: f64, levels: usize) -> Option<f64> {
+        if position_change > 0.0 {
+            Some(self.asks.values().take(levels).copied().sum())
+        } else if position_change < 0.0 {
+            Some(self.bids.values().rev().take(levels).copied().sum())
+        } else {
+            None
         }
     }
 
@@ -1312,6 +1662,89 @@ mod tests {
             risk: RiskConfig::default(),
             output: OutputConfig::default(),
         }
+    }
+
+    #[test]
+    fn target_position_replay_is_deterministic_and_snapshot_gated() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[\"100\",\"10\"],[\"99\",\"10\"]],\"asks\":[[\"101\",\"10\"],[\"102\",\"10\"]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[\"100\",\"9\"],[\"98\",\"7\"]],\"asks\":[[\"101\",\"11\"],[\"103\",\"7\"]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[\"100\",\"8\"]],\"asks\":[[\"101\",\"12\"]]}\n",
+        );
+        let decisions = vec![
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: -1.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            position_notional_usd: 0.0,
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            additional_slippage_bps: 0.25,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let first = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
+        let second = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.snapshot_events, 1);
+        assert_eq!(first.l2_update_events, 2);
+        assert_eq!(first.trade_events, 0);
+        assert_eq!(first.decision_count, 2);
+        assert_eq!(first.max_bid_depth_levels, 1);
+        assert_eq!(first.max_ask_depth_levels, 1);
+        let unseeded = "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"l2_update\",\"bids\":[[100,1]],\"asks\":[[101,1]]}\n";
+        assert!(
+            replay_target_positions(unseeded.as_bytes(), &decisions[..1], &config)
+                .unwrap_err()
+                .to_string()
+                .contains("before a snapshot")
+        );
+    }
+
+    #[test]
+    fn target_position_replay_uses_relative_drawdown_without_a_final_interval() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
+            "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[109,0],[99,10]],\"asks\":[[111,0],[101,10]]}\n",
+        );
+        let decisions =
+            [1_000_000, 2_000_000, 3_000_000].map(|timestamp_us| TargetPositionDecision {
+                timestamp_us,
+                target_position: 1.0,
+            });
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 10.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let metrics = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
+        let expected_gain = 0.1 - 0.001;
+        let expected_loss = 100.0 / 110.0 - 1.0 - 0.001;
+        assert!((metrics.cumulative_net_return - (expected_gain + expected_loss)).abs() < 1e-12);
+        assert!((metrics.max_drawdown - (-expected_loss / (1.0 + expected_gain))).abs() < 1e-12);
     }
 
     #[test]

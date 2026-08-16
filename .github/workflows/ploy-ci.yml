@@ -221,11 +221,12 @@ jobs:
       - name: Build research image binaries
         run: |
           set -euo pipefail
-          cargo build \
+          MONDAY_SOURCE_REVISION="$GITHUB_SHA" cargo build \
             --release \
             --locked \
             -p hft-backtest \
             -p alpha-harness
+          test "$(target/release/alpha-harness --version)" = "alpha-harness $GITHUB_SHA"
           cargo build \
             --release \
             --locked \
@@ -314,6 +315,10 @@ jobs:
             --entrypoint /usr/local/bin/monday-prediction-research \
             monday-research-smoke:local \
             --print-policy-snapshot-id | grep -Eq '^sha256:[0-9a-f]{64}$'
+          docker run --rm \
+            --entrypoint /usr/local/bin/alpha-harness \
+            monday-research-smoke:local \
+            --version | grep -Fqx "alpha-harness $GITHUB_SHA"
           docker run --rm \
             --entrypoint /usr/local/bin/alpha-harness \
             monday-research-smoke:local \

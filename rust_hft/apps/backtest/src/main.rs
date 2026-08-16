@@ -1,6 +1,3 @@
-mod config;
-mod engine;
-mod event;
 mod sweep;
 
 use std::path::{Path, PathBuf};
@@ -10,8 +7,8 @@ use clap::Parser;
 use sha2::Digest;
 use tracing::info;
 
-use config::{BacktestConfig, BacktestInputEvidence, OutputConfig, StrategyConfig};
-use engine::{BacktestEngine, BacktestResult, SummaryMetrics, TradeRecord};
+use hft_backtest::config::{BacktestConfig, BacktestInputEvidence, OutputConfig, StrategyConfig};
+use hft_backtest::engine::{BacktestEngine, BacktestResult, SummaryMetrics, TradeRecord};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "L3 事件重放回測模板", long_about = None)]

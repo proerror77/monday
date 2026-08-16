@@ -52,6 +52,14 @@ spec:
             - $(FEATURE_URL)
             - --materialization-url
             - $(MATERIALIZATION_URL)
+            - --replay-artifact-url
+            - $(REPLAY_ARTIFACT_URL)
+            - --replay-artifact-sha256
+            - $(REPLAY_ARTIFACT_SHA256)
+            - --replay-manifest-url
+            - $(REPLAY_MANIFEST_URL)
+            - --replay-manifest-sha256
+            - $(REPLAY_MANIFEST_SHA256)
             - --result-put-url
             - $(RESULT_PUT_URL)
             - --result-readback-url
@@ -84,6 +92,20 @@ spec:
                 secretKeyRef:
                   name: REPLACE_URL_SECRET_NAME
                   key: materialization-url
+            - name: REPLAY_ARTIFACT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: replay-artifact-url
+            - name: REPLAY_ARTIFACT_SHA256
+              value: REPLACE_REPLAY_ARTIFACT_SHA256
+            - name: REPLAY_MANIFEST_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: replay-manifest-url
+            - name: REPLAY_MANIFEST_SHA256
+              value: REPLACE_REPLAY_MANIFEST_SHA256
           resources:
             requests:
               cpu: "3500m"

@@ -1,8 +1,8 @@
 use std::io::BufRead;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EventEnvelope {
     #[serde(alias = "timestamp")]
     pub ts: i64,
@@ -12,7 +12,7 @@ pub struct EventEnvelope {
     pub payload: EventPayload,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventPayload {
     #[serde(alias = "snapshot")]
@@ -27,7 +27,7 @@ pub enum EventPayload {
     },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TradeSide {
     #[serde(alias = "BUY")]
@@ -36,7 +36,7 @@ pub enum TradeSide {
     Sell,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Level {
     pub price: f64,
     pub quantity: f64,
@@ -51,23 +51,36 @@ impl<'de> Deserialize<'de> for Level {
         #[serde(untagged)]
         enum Repr {
             Array([f64; 2]),
+            StringArray([String; 2]),
             Object { price: f64, quantity: f64 },
             ObjectAlt { price: f64, qty: f64 },
             ObjectSide { p: f64, q: f64 },
         }
 
-        match Repr::deserialize(deserializer)? {
-            Repr::Array([price, quantity]) => Ok(Level { price, quantity }),
-            Repr::Object { price, quantity } => Ok(Level { price, quantity }),
-            Repr::ObjectAlt { price, qty } => Ok(Level {
+        let level = match Repr::deserialize(deserializer)? {
+            Repr::Array([price, quantity]) => Level { price, quantity },
+            Repr::StringArray([price, quantity]) => Level {
+                price: price.parse().map_err(serde::de::Error::custom)?,
+                quantity: quantity.parse().map_err(serde::de::Error::custom)?,
+            },
+            Repr::Object { price, quantity } => Level { price, quantity },
+            Repr::ObjectAlt { price, qty } => Level {
                 price,
                 quantity: qty,
-            }),
-            Repr::ObjectSide { p, q } => Ok(Level {
+            },
+            Repr::ObjectSide { p, q } => Level {
                 price: p,
                 quantity: q,
-            }),
+            },
+        };
+        if !level.price.is_finite()
+            || level.price <= 0.0
+            || !level.quantity.is_finite()
+            || level.quantity < 0.0
+        {
+            return Err(serde::de::Error::custom("invalid L2 price or quantity"));
         }
+        Ok(level)
     }
 }
 

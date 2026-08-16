@@ -12,10 +12,18 @@ use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements}
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(test)]
+pub(crate) const BUILD_SOURCE_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+#[cfg(not(test))]
+pub(crate) const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
+    Some(value) => value,
+    None => "unbound-source-revision",
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "alpha-harness",
-    version,
+    version = BUILD_SOURCE_REVISION,
     about = "Bounded Loop Engineer alpha research control plane"
 )]
 pub struct Cli {
@@ -366,6 +374,14 @@ pub struct ExecuteMissionArgs {
     pub feature_url: String,
     #[arg(long)]
     pub materialization_url: String,
+    #[arg(long)]
+    pub replay_artifact_url: String,
+    #[arg(long)]
+    pub replay_artifact_sha256: String,
+    #[arg(long)]
+    pub replay_manifest_url: String,
+    #[arg(long)]
+    pub replay_manifest_sha256: String,
     /// Prior immutable Factor-Bank subset checkpoint for a fresh-work-directory resume.
     #[arg(long, requires = "resume_sha256")]
     pub resume_url: Option<String>,
@@ -789,6 +805,14 @@ mod tests {
             missing_features,
             "--materialization-url".to_owned(),
             missing_materialization,
+            "--replay-artifact-url".to_owned(),
+            "missing-replay.parquet".to_owned(),
+            "--replay-artifact-sha256".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            "--replay-manifest-url".to_owned(),
+            "missing-replay-manifest.json".to_owned(),
+            "--replay-manifest-sha256".to_owned(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
             "--result-put-url".to_owned(),
             result.clone(),
             "--result-readback-url".to_owned(),
@@ -1063,6 +1087,14 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "--resume-url",
             "checkpoint.json",
             "--resume-sha256",
@@ -1103,6 +1135,14 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "--result-put-url",
             "results.zip",
             "--result-readback-url",
@@ -1135,6 +1175,14 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "--result-put-url",
             "results.zip",
             "--result-readback-url",

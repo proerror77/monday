@@ -404,6 +404,7 @@ impl CexResearchPolicyBindingsV1 {
 }
 
 pub const CEX_EQUAL_ABSOLUTE_WEIGHT_POLICY_SCHEMA_V1: &str = "cex-equal-absolute-weight-policy-v1";
+pub const CEX_EVENT_REPLAY_POLICY_SCHEMA_V1: &str = "cex-event-replay-policy-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -452,6 +453,86 @@ impl CexEqualAbsoluteWeightPolicyV1 {
         if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
             return Err(DomainError::InvalidCexResearchMission(
                 "equal-absolute weight policy binding invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexEventReplayPolicyV1 {
+    pub schema_version: String,
+    pub policy_id: String,
+    pub clock_semantics: String,
+    pub min_book_events: usize,
+    pub min_l2_updates: usize,
+    pub min_decisions: usize,
+    pub required_depth_levels: usize,
+    pub max_decision_delay_millis: u64,
+    pub require_trade_tape: bool,
+    pub require_queue_position: bool,
+    pub require_partial_fills: bool,
+    pub require_market_impact: bool,
+    pub require_true_capacity: bool,
+}
+
+impl CexEventReplayPolicyV1 {
+    pub fn controlled_v1(
+        policy_id: impl Into<String>,
+        required_depth_levels: usize,
+        observation_frequency_millis: u64,
+    ) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: CEX_EVENT_REPLAY_POLICY_SCHEMA_V1.to_string(),
+            policy_id: policy_id.into(),
+            clock_semantics: "recorded_userspace_receive_time_us".to_string(),
+            min_book_events: 2,
+            min_l2_updates: 1,
+            min_decisions: 1,
+            required_depth_levels,
+            max_decision_delay_millis: observation_frequency_millis,
+            require_trade_tape: false,
+            require_queue_position: false,
+            require_partial_fills: false,
+            require_market_impact: false,
+            require_true_capacity: false,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != CEX_EVENT_REPLAY_POLICY_SCHEMA_V1
+            || self.policy_id.trim().is_empty()
+            || self.clock_semantics != "recorded_userspace_receive_time_us"
+            || self.min_book_events < 2
+            || self.min_l2_updates == 0
+            || self.min_decisions == 0
+            || self.required_depth_levels == 0
+            || self.max_decision_delay_millis == 0
+            || self.require_queue_position
+            || self.require_partial_fills
+            || self.require_market_impact
+            || self.require_true_capacity
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "event replay policy is invalid or claims an unsupported capability",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        canonical_json_hash(self)
+    }
+
+    pub fn validate_binding(&self, binding: &CexResearchContentRefV1) -> Result<(), DomainError> {
+        binding.validate()?;
+        if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
+            return Err(DomainError::InvalidCexResearchMission(
+                "event replay policy binding invalid",
             ));
         }
         Ok(())
@@ -4608,6 +4689,12 @@ mod tests {
         .unwrap();
         let weight_policy =
             CexEqualAbsoluteWeightPolicyV1::controlled_v1("weight-policy-1").unwrap();
+        let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+            "replay-policy-1",
+            5,
+            evaluation_protocol.labels.observation_frequency_millis,
+        )
+        .unwrap();
         let reference = |id: &str, byte: char| CexResearchContentRefV1 {
             id: id.to_string(),
             content_sha256: byte.to_string().repeat(64),
@@ -4666,7 +4753,10 @@ mod tests {
                         id: "evaluation-policy-1".to_string(),
                         content_sha256: evaluation_protocol.content_hash().unwrap(),
                     },
-                    replay: reference("replay-policy-1", '5'),
+                    replay: CexResearchContentRefV1 {
+                        id: replay_policy.policy_id.clone(),
+                        content_sha256: replay_policy.content_hash().unwrap(),
+                    },
                     holdout: reference("holdout-policy-1", '6'),
                 },
                 evidence: vec![CexResearchEvidenceRefV1 {
@@ -4690,6 +4780,22 @@ mod tests {
                 submitted_at: Some(submitted_at),
             },
         }
+    }
+
+    #[test]
+    fn cex_event_replay_policy_rejects_unsupported_capability_claims() {
+        let policy = CexEventReplayPolicyV1::controlled_v1("replay-policy", 5, 1_000).unwrap();
+        policy.validate().unwrap();
+
+        let mut queue_claim = policy.clone();
+        queue_claim.require_queue_position = true;
+        assert!(queue_claim.validate().is_err());
+
+        let binding = CexResearchContentRefV1 {
+            id: policy.policy_id.clone(),
+            content_sha256: policy.content_hash().unwrap(),
+        };
+        policy.validate_binding(&binding).unwrap();
     }
 
     #[test]

@@ -190,9 +190,13 @@ jobs:
           cache-all-crates: true
 
       - name: Build research runner binaries
+        env:
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
-          cargo build --release --locked -p hft-backtest -p alpha-harness
+          MONDAY_SOURCE_REVISION="$SOURCE_REVISION" \
+            cargo build --release --locked -p hft-backtest -p alpha-harness
+          test "$(target/release/alpha-harness --version)" = "alpha-harness $SOURCE_REVISION"
           cargo build --release --locked -p hft-collector --bin lob-pit-materializer --bin binance-replay-parquet-materializer
           CARGO_TARGET_DIR=target/prediction-markets \
             cargo build \
@@ -400,6 +404,8 @@ jobs:
               test -x "/usr/local/bin/$binary"
             done
           '
+          docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
+            --version | grep -Fqx "alpha-harness $SOURCE_REVISION"
           docker run --rm \
             --entrypoint /usr/local/bin/monday-prediction-research \
             "$IMAGE" \

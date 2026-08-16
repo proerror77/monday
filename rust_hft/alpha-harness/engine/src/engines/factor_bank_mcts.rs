@@ -4,8 +4,8 @@ use crate::{
         evaluate_factor_features_from_entries, validate_cex_context_bindings,
         verify_cex_baseline_artifact,
     },
-    evaluation::EngineContext,
-    formula_evaluator::FormulaEvaluator,
+    evaluation::{EngineContext, ResearchRow},
+    formula_evaluator::{evaluate_ast, FormulaEvaluator},
     CandidateEvaluation,
 };
 use alpha_domain::{
@@ -979,6 +979,57 @@ impl CexCombinationResearchArtifactV1 {
             return Err("CEX combination research artifact binding drifted".to_string());
         }
         Ok(())
+    }
+
+    pub fn target_positions(
+        &self,
+        factor_bank: &CexFactorBankRevisionV2,
+        rows: &[ResearchRow],
+    ) -> Result<Vec<f64>, String> {
+        self.validate()?;
+        factor_bank.validate().map_err(|error| error.to_string())?;
+        if self.signal.parent != artifact_reference(&factor_bank.revision_id, factor_bank)? {
+            return Err("CEX replay Factor Bank identity drifted".to_string());
+        }
+        let mut combined = vec![0.0_f64; rows.len()];
+        for selected in &self.signal.factors {
+            let entry = factor_bank
+                .entries
+                .iter()
+                .find(|entry| entry.factor_id == selected.factor.factor_id)
+                .ok_or_else(|| "CEX replay selected an unknown Factor ID".to_string())?;
+            if selected.factor.content_sha256
+                != canonical_json_hash(entry).map_err(|error| error.to_string())?
+                || selected.orientation != entry.orientation
+            {
+                return Err("CEX replay factor identity drifted".to_string());
+            }
+            let orientation = match selected.orientation {
+                CexFactorOrientationV1::Positive => 1.0,
+                CexFactorOrientationV1::Negative => -1.0,
+            };
+            for (combined, value) in combined
+                .iter_mut()
+                .zip(evaluate_ast(&entry.canonical_ast, rows)?)
+            {
+                *combined += orientation * selected.normalized_absolute_weight * value;
+            }
+        }
+        if combined.iter().any(|value| !value.is_finite()) {
+            return Err("CEX replay strategy produced a non-finite signal".to_string());
+        }
+        Ok(combined
+            .into_iter()
+            .map(|signal| {
+                if signal.abs() <= self.sizing.zero_epsilon {
+                    0.0
+                } else {
+                    signal
+                        .signum()
+                        .clamp(self.sizing.min_position, self.sizing.max_position)
+                }
+            })
+            .collect())
     }
 
     fn expected_strategy_id(&self) -> Result<String, String> {
