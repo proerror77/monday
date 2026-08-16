@@ -8,6 +8,23 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 - `alpha-engine`: GP, MCTS, Bayesian search, offline Q-learning, OpenAI-compatible proposals/critics, causal DSL evaluation, checkpointing, and learning.
 - `alpha-harness`: Agent-facing CLI.
 
+## Current Capability
+
+| Contract | Status | Current terminal evidence |
+| --- | --- | --- |
+| CEX `mission execute` | Implemented through GP, immutable Factor Bank, and deterministic Ridge/CART baselines | Create-once result bundle with a locally computed SHA-256; independent result readback is not yet implemented |
+| Factor-Bank subset MCTS | Blocked by [#601](https://github.com/proerror77/monday/issues/601) | The CEX path fails closed before MCTS rather than falling back to Formula-MCTS |
+| Four-stage combination walk-forward | Blocked by [#602](https://github.com/proerror77/monday/issues/602) | No selected subset is compiled into the required Signal/Sizing/Risk/Execution artifact |
+| Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
+| Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
+| Signed Paper/Shadow intake | Blocked by [#605](https://github.com/proerror77/monday/issues/605) | The generic signed boundary exists; no four-stage CEX bundle reaches it yet |
+| Exact-main CEX run and readback | Blocked by [#606](https://github.com/proerror77/monday/issues/606) | No complete single-instrument result bundle has crossed every boundary above |
+| Prediction Mission v2/v4 | Transitional | v2 remains the research-run path; v4 is admitted only for `pipeline_smoke`, not `research_trial` |
+
+`mission execute` is the CEX operator acceptance seam. Low-level Mission and
+LoopRun commands remain diagnostics and implementation surfaces; they are not
+alternate evidence paths around the blocked contracts above.
+
 ## Data Mission
 
 ```bash
@@ -68,13 +85,14 @@ research fields, budgets, and costs from that artifact; they are not accepted
 as alternate execute flags. Unknown fields, Prediction Market fields, action
 requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
 feedback fail before Mission admission. `operational.submitted_at` is retained
-for audit but does not alter the semantic Mission identity. Execution stops
-after research candidate selection; sealed-holdout evaluation requires the
-separate governed precommit boundary. This schema binds prior-evidence
-identities; later holdout and Paper/Shadow gates own receipt and signature
-verification.
+for audit but does not alter the semantic Mission identity. Execution currently
+stops after governed GP, immutable Factor Bank construction, and deterministic
+Ridge/CART baseline evaluation. It does not select a Factor Bank subset or emit
+the later four-stage strategy. Sealed-holdout evaluation requires the separate
+governed precommit boundary. This schema binds prior-evidence identities; later
+holdout and Paper/Shadow gates own receipt and signature verification.
 
-For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
+For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The CLI accepts `mcts`, but the governed CEX path deliberately rejects it until #601 replaces Formula-growing MCTS with immutable Factor-Bank subset selection. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -89,7 +107,7 @@ For an LLM mission, `objective` and `hypothesis_scope` are the governed research
 
 ## Bounded LoopRun
 
-Run or resume a durable staged goal with the same command:
+The durable state contract has the following command shape:
 
 ```bash
 cargo run -p alpha-harness -- loop run \
@@ -108,7 +126,15 @@ cargo run -p alpha-harness -- loop status \
   --loop-run-id loop-btc-1
 ```
 
-The durable LoopRun accepts only `mcts`, the live-capable engine with a versioned exact-state checkpoint. GP and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. Bayesian and offline RL are rejected during preflight. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
+The durable LoopRun accepts only `mcts`, while the current CEX Mission path
+rejects MCTS pending #601. It is therefore not a runnable CEX golden path today.
+GP and LLM remain available through standalone `mission run` commands but cannot
+claim exact LoopRun resume. Bayesian and offline RL are rejected during
+preflight. The LoopRun records ordered stages, completion policy, child missions,
+and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human
+evidence pauses the loop instead of fabricating progress. An external scheduler
+may invoke this command after the Factor-Bank adapter exists, but invocation does
+not bypass stage evidence.
 
 ## Prediction-Market Research
 
@@ -145,7 +171,8 @@ alpha-harness prediction execute \
   --mission-sha256 "$MISSION_SHA256" \
   --snapshot-url 'https://signed-snapshot-get-url' \
   --snapshot-sha256 "$SNAPSHOT_ARCHIVE_SHA256" \
-  --result-put-url 'https://signed-results-put-url'
+  --result-put-url 'https://signed-results-put-url' \
+  --result-readback-url 'https://signed-results-get-url'
 ```
 
 Workers may add `--snapshot-cache-dir /cache/research-snapshots` to reuse a
