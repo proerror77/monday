@@ -61,7 +61,7 @@ fn cli_replays_local_canonical_parquet_without_raw_sources_and_records_evidence(
             "file": "missing.raw.ndjson.zst",
             "sha256": source_sha,
             "collector_manifest_sha256": "2".repeat(64),
-            "success_marker_sha256": "3".repeat(64),
+            "success_marker_sha256": sha256(format!("{source_sha}\n").as_bytes()),
             "start_received_at_ns": 1,
             "end_received_at_ns": 2,
             "events": 1
