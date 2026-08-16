@@ -36,6 +36,10 @@ const TRADE_ID_VERSION: &str = "v2";
 const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
+// gamma-api /markets/keyset 500s on wide closed-market windows while every
+// <=6h sub-window of the same range returns 200 (upstream regression), so
+// closed-lane discovery iterates contiguous chunks of at most this span.
+const GAMMA_DISCOVERY_WINDOW_CHUNK_SECS: i64 = 21_600;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
 const MAX_STARTUP_DURATION: Duration = Duration::from_secs(600);
 const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
@@ -1701,6 +1705,7 @@ impl GammaLane {
 struct GammaLaneDiscovery {
     seen: usize,
     targets: Vec<Value>,
+    target_ids: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -1768,30 +1773,43 @@ fn append_gamma_page(
     discovery.targets.extend(
         page.iter()
             .filter(|market| target_market(market, symbols).is_some())
+            .filter(|market| match market.get("id").and_then(Value::as_str) {
+                // Adjacent discovery chunks share a boundary timestamp, so a
+                // market can appear in two consecutive pages.
+                Some(id) => discovery.target_ids.insert(id.to_owned()),
+                None => true,
+            })
             .cloned(),
     );
     Ok(next_cursor)
 }
 
-fn gamma_discovery_params(
-    config: &ReferenceConfig,
+fn gamma_discovery_windows(
     now: DateTime<Utc>,
+    lookback_secs: i64,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let end = now + TimeDelta::minutes(30);
+    let mut start = now - TimeDelta::seconds(lookback_secs);
+    let mut windows = Vec::new();
+    while start < end {
+        let chunk_end = std::cmp::min(
+            start + TimeDelta::seconds(GAMMA_DISCOVERY_WINDOW_CHUNK_SECS),
+            end,
+        );
+        windows.push((start, chunk_end));
+        start = chunk_end;
+    }
+    windows
+}
+
+fn gamma_discovery_params(
     closed: bool,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
 ) -> Vec<(String, String)> {
-    let lookback_secs = if closed {
-        config.settlement_lookback_secs
-    } else {
-        config.market_lookback_secs
-    };
     vec![
-        (
-            "end_date_min".to_owned(),
-            iso_z(now - TimeDelta::seconds(lookback_secs)),
-        ),
-        (
-            "end_date_max".to_owned(),
-            iso_z(now + TimeDelta::minutes(30)),
-        ),
+        ("end_date_min".to_owned(), iso_z(window_start)),
+        ("end_date_max".to_owned(), iso_z(window_end)),
         ("closed".to_owned(), closed.to_string()),
         ("tag_id".to_owned(), CRYPTO_TAG_ID.to_string()),
         ("related_tags".to_owned(), "false".to_owned()),
@@ -2451,46 +2469,54 @@ impl ReferenceCollector {
 
         let mut discovery = GammaDiscovery::default();
         for lane in [GammaLane::Open, GammaLane::Closed] {
-            let base = gamma_discovery_params(&self.config, now, lane.is_closed());
-            let mut cursor: Option<String> = None;
-            let mut seen_cursors = BTreeSet::new();
-            loop {
-                let mut params = base.clone();
-                if let Some(cursor) = cursor.as_ref() {
-                    params.push(("after_cursor".to_owned(), cursor.clone()));
-                }
-                let payload = match self.get_json(&self.endpoints.gamma_markets, &params).await {
-                    Ok(payload) => payload,
-                    Err(error)
-                        if lane.is_closed()
-                            && error
-                                .downcast_ref::<reqwest::Error>()
-                                .and_then(reqwest::Error::status)
-                                == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) =>
-                    {
-                        let fallback_params = params
-                            .iter()
-                            .filter(|(key, _)| key != "tag_id")
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        self.get_json(&self.endpoints.gamma_markets, &fallback_params)
-                            .await?
+            let lookback_secs = if lane.is_closed() {
+                self.config.settlement_lookback_secs
+            } else {
+                self.config.market_lookback_secs
+            };
+            for (window_start, window_end) in gamma_discovery_windows(now, lookback_secs) {
+                let base = gamma_discovery_params(lane.is_closed(), window_start, window_end);
+                let mut cursor: Option<String> = None;
+                let mut seen_cursors = BTreeSet::new();
+                loop {
+                    let mut params = base.clone();
+                    if let Some(cursor) = cursor.as_ref() {
+                        params.push(("after_cursor".to_owned(), cursor.clone()));
                     }
-                    Err(error) => return Err(error),
-                };
-                cursor = discovery.append_page(
-                    lane,
-                    &payload,
-                    &self.symbols,
-                    self.config.max_markets,
-                )?;
-                let Some(next_cursor) = cursor.as_ref() else {
-                    break;
-                };
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    return Err(completeness_error(format!(
-                        "Gamma keyset cursor repeated: {next_cursor}"
-                    )));
+                    let payload = match self.get_json(&self.endpoints.gamma_markets, &params).await
+                    {
+                        Ok(payload) => payload,
+                        Err(error)
+                            if lane.is_closed()
+                                && error
+                                    .downcast_ref::<reqwest::Error>()
+                                    .and_then(reqwest::Error::status)
+                                    == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) =>
+                        {
+                            let fallback_params = params
+                                .iter()
+                                .filter(|(key, _)| key != "tag_id")
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            self.get_json(&self.endpoints.gamma_markets, &fallback_params)
+                                .await?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    cursor = discovery.append_page(
+                        lane,
+                        &payload,
+                        &self.symbols,
+                        self.config.max_markets,
+                    )?;
+                    let Some(next_cursor) = cursor.as_ref() else {
+                        break;
+                    };
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        return Err(completeness_error(format!(
+                            "Gamma keyset cursor repeated: {next_cursor}"
+                        )));
+                    }
                 }
             }
         }
@@ -3558,7 +3584,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut requests = Vec::new();
-            while requests.len() < 3 && Instant::now() < deadline {
+            while requests.len() < 7 && Instant::now() < deadline {
                 let (mut connection, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3604,7 +3630,18 @@ mod tests {
                 connection.write_all(body).unwrap();
                 connection.flush().unwrap();
             }
-            assert_eq!(requests, ["discovery", "discovery", "trade"]);
+            assert_eq!(
+                requests,
+                [
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "trade"
+                ]
+            );
         });
 
         let temp = TestDir::new();
@@ -3662,7 +3699,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..6 {
                 let (mut connection, _) = listener.accept().unwrap();
                 let mut request = [0_u8; 2_048];
                 let _ = connection.read(&mut request).unwrap();
@@ -4668,10 +4705,27 @@ mod tests {
             settlement_lookback_secs: 86_400,
             ..ReferenceConfig::default()
         };
-        let open = gamma_discovery_params(&config, now, false)
+        let open_windows = gamma_discovery_windows(now, config.market_lookback_secs);
+        let closed_windows = gamma_discovery_windows(now, config.settlement_lookback_secs);
+        assert_eq!(open_windows.len(), 1);
+        assert_eq!(open_windows[0].0, now - TimeDelta::seconds(7_200));
+        assert_eq!(open_windows[0].1, now + TimeDelta::minutes(30));
+        assert_eq!(closed_windows.len(), 5);
+        assert_eq!(closed_windows[0].0, now - TimeDelta::seconds(86_400));
+        for pair in closed_windows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "chunks must be contiguous");
+        }
+        for (start, end) in &closed_windows {
+            assert!(*end - *start <= TimeDelta::seconds(GAMMA_DISCOVERY_WINDOW_CHUNK_SECS));
+        }
+        assert_eq!(
+            closed_windows.last().unwrap().1,
+            now + TimeDelta::minutes(30)
+        );
+        let open = gamma_discovery_params(false, open_windows[0].0, open_windows[0].1)
             .into_iter()
             .collect::<BTreeMap<_, _>>();
-        let closed = gamma_discovery_params(&config, now, true)
+        let closed = gamma_discovery_params(true, closed_windows[0].0, closed_windows[0].1)
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         assert_eq!(open["closed"], "false");
@@ -4693,7 +4747,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut requests = Vec::new();
-            while requests.len() < 5 && Instant::now() < deadline {
+            while requests.len() < 9 && Instant::now() < deadline {
                 let (mut connection, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4729,7 +4783,7 @@ mod tests {
                         assert_eq!(params["closed"], "true");
                         assert_eq!(params["tag_id"], "21");
                         assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
-                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-14T08:00:00.000000Z");
                         requests.push(params);
                         connection
                             .write_all(b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
@@ -4740,7 +4794,7 @@ mod tests {
                         assert_eq!(params["closed"], "true");
                         assert!(!params.contains_key("tag_id"));
                         assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
-                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-14T08:00:00.000000Z");
                         serde_json::to_vec(&json!({
                             "markets": [
                                 market(
@@ -4760,6 +4814,19 @@ mod tests {
                             "next_cursor": "",
                         }))
                         .unwrap()
+                    }
+                    5..=8 => {
+                        assert_eq!(params["closed"], "true");
+                        assert_eq!(params["tag_id"], "21");
+                        let (min, max) = match request_index {
+                            5 => ("2026-07-14T08:00:00.000000Z", "2026-07-14T14:00:00.000000Z"),
+                            6 => ("2026-07-14T14:00:00.000000Z", "2026-07-14T20:00:00.000000Z"),
+                            7 => ("2026-07-14T20:00:00.000000Z", "2026-07-15T02:00:00.000000Z"),
+                            _ => ("2026-07-15T02:00:00.000000Z", "2026-07-15T02:30:00.000000Z"),
+                        };
+                        assert_eq!(params["end_date_min"], min);
+                        assert_eq!(params["end_date_max"], max);
+                        serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
                     }
                     _ => unreachable!(),
                 };
@@ -4794,13 +4861,257 @@ mod tests {
         let markets =
             result.expect("a final closed-lane 500 must use the bounded untagged fallback");
 
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 9);
         assert_eq!(
             markets.len(),
             1,
             "untagged fallback must retain target filtering"
         );
         assert_eq!(markets[0]["id"], "market-1");
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_chunks_the_window_and_dedupes_boundary_markets() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut windows = Vec::new();
+            let mut accepted = 0;
+            while accepted < 6 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let path = read_http_request_path(&mut connection);
+                let params = path
+                    .split_once('?')
+                    .map(|(_, query)| {
+                        query
+                            .split('&')
+                            .map(|pair| {
+                                let (key, value) = pair.split_once('=').unwrap();
+                                (
+                                    urlencoding::decode(key).unwrap().into_owned(),
+                                    urlencoding::decode(value).unwrap().into_owned(),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap();
+                let body = if params["closed"] == "true" {
+                    windows.push((
+                        params["end_date_min"].clone(),
+                        params["end_date_max"].clone(),
+                    ));
+                    let markets = match windows.len() {
+                        // The same market ends exactly on the boundary shared by
+                        // chunks 1 and 2, so both pages legitimately return it.
+                        1 | 2 => vec![market(
+                            "Bitcoin Up or Down - 5 minutes",
+                            "2026-07-14T07:55:00Z",
+                            "2026-07-14T08:00:00Z",
+                        )],
+                        _ => Vec::new(),
+                    };
+                    serde_json::to_vec(&json!({"markets": markets, "next_cursor": ""})).unwrap()
+                } else {
+                    assert_eq!(params["end_date_min"], "2026-07-15T00:00:00.000000Z");
+                    assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                    serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
+                };
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+            }
+            windows
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let markets = collector.discover_markets(now).await.unwrap();
+        let windows = server.join().unwrap();
+
+        assert_eq!(
+            windows
+                .iter()
+                .map(|(min, max)| (min.as_str(), max.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("2026-07-14T02:00:00.000000Z", "2026-07-14T08:00:00.000000Z"),
+                ("2026-07-14T08:00:00.000000Z", "2026-07-14T14:00:00.000000Z"),
+                ("2026-07-14T14:00:00.000000Z", "2026-07-14T20:00:00.000000Z"),
+                ("2026-07-14T20:00:00.000000Z", "2026-07-15T02:00:00.000000Z"),
+                ("2026-07-15T02:00:00.000000Z", "2026-07-15T02:30:00.000000Z"),
+            ]
+        );
+        assert_eq!(markets.len(), 1, "boundary market must be deduped");
+        assert_eq!(markets[0]["id"], "market-1");
+    }
+
+    #[tokio::test]
+    async fn gamma_discovery_fails_closed_when_a_cursor_repeats_within_a_chunk() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0;
+            while accepted < 3 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let _ = read_http_request_path(&mut connection);
+                let body = if accepted == 1 {
+                    serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
+                } else {
+                    serde_json::to_vec(&json!({
+                        "markets": [market(
+                            "Bitcoin Up or Down - 5 minutes",
+                            "2026-07-14T07:55:00Z",
+                            "2026-07-14T08:00:00Z",
+                        )],
+                        "next_cursor": "cursor-1",
+                    }))
+                    .unwrap()
+                };
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+            }
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let error = collector.discover_markets(now).await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            format!("{error:#}").contains("Gamma keyset cursor repeated: cursor-1"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_fails_closed_when_a_mid_lane_chunk_keeps_failing() {
+        const RETRYABLE_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        const EMPTY_PAGE: &[u8] = br#"{"markets":[],"next_cursor":""}"#;
+
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0;
+            while accepted < 9 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let path = read_http_request_path(&mut connection);
+                let chunk_three = path
+                    .split_once('?')
+                    .map(|(_, query)| {
+                        query.split('&').any(|pair| {
+                            pair.split_once('=').is_some_and(|(key, value)| {
+                                key == "end_date_min"
+                                    && urlencoding::decode(value).unwrap()
+                                        == "2026-07-14T14:00:00.000000Z"
+                            })
+                        })
+                    })
+                    .unwrap_or(false);
+                if chunk_three {
+                    // The tagged request exhausts its retries, then the untagged
+                    // fallback exhausts its own bounded retries too.
+                    connection.write_all(RETRYABLE_500).unwrap();
+                } else {
+                    write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        EMPTY_PAGE.len()
+                    )
+                    .unwrap();
+                    connection.write_all(EMPTY_PAGE).unwrap();
+                }
+            }
+            accepted
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let result = collector.discover_markets(now).await;
+        let accepted = server.join().unwrap();
+
+        assert!(result.is_err(), "a failing mid-lane chunk must fail closed");
+        assert_eq!(
+            accepted, 9,
+            "open + chunks 1-2 + chunk 3 tagged retries + untagged retries"
+        );
     }
 
     #[tokio::test]
