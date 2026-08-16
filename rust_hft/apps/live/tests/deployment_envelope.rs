@@ -127,10 +127,12 @@ fn formula_bundle(now: chrono::DateTime<Utc>) -> StrategyBundle {
     bundle
 }
 
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
 fn cex_four_stage_bundle() -> StrategyBundle {
     serde_json::from_str(include_str!("fixtures/cex-four-stage-bundle.json")).unwrap()
 }
 
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
 fn bind_bundle(mut envelope: DeploymentEnvelope, bundle: &StrategyBundle) -> DeploymentEnvelope {
     envelope.asset_revision_id = bundle.candidate_id.clone();
     envelope.bundle_id = bundle.bundle_id.clone();
