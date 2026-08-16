@@ -1260,7 +1260,9 @@ impl SystemRuntime {
         }
 
         if require_authoritative_balances {
-            let control = self.execution_control_handle();
+            let control = self
+                .execution_control_handle()
+                .with_response_timeout(std::time::Duration::from_secs(120));
             let startup_reconciliation = async {
                 control.pause_trading().await?;
                 let mut report = control.reconcile(true).await?;
@@ -1284,6 +1286,26 @@ impl SystemRuntime {
                             exchange_only = report.order_report.exchange_only.len(),
                             local_only = report.order_report.local_only.len(),
                             quantity_mismatch = report.order_report.qty_mismatch.len(),
+                            balance_errors = ?report
+                                .balance_report
+                                .as_ref()
+                                .map(|balances| &balances.client_errors),
+                            balance_missing_valuations = ?report
+                                .balance_report
+                                .as_ref()
+                                .map(|balances| &balances.missing_valuations),
+                            position_errors = ?report
+                                .position_report
+                                .as_ref()
+                                .map(|positions| &positions.client_errors),
+                            fill_errors = ?report
+                                .fill_report
+                                .as_ref()
+                                .map(|fills| &fills.client_errors),
+                            exchange_only_fills = report
+                                .fill_report
+                                .as_ref()
+                                .map_or(0, |fills| fills.exchange_only_fill_ids.len()),
                             "authoritative account is not reconciled; starting no-strategy operator control with execution intake paused"
                         );
                         return Ok::<(), HftError>(());
@@ -1364,10 +1386,16 @@ impl SystemRuntime {
         if self.config.engine.reconcile_interval_ms > 0 && self.exec_control_tx.is_some() {
             let interval_ms = self.config.engine.reconcile_interval_ms;
             let include_balances = require_authoritative_balances;
-            let control = self.execution_control_handle();
+            let control = if include_balances {
+                self.execution_control_handle()
+                    .with_response_timeout(std::time::Duration::from_secs(120))
+            } else {
+                self.execution_control_handle()
+            };
             self.tasks.push(tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await;
                 loop {
                     interval.tick().await;

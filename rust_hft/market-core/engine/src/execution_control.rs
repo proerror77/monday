@@ -126,6 +126,11 @@ impl ExecutionControlHandle {
         self
     }
 
+    pub fn with_response_timeout(mut self, response_timeout: Duration) -> Self {
+        self.response_timeout = response_timeout;
+        self
+    }
+
     pub fn with_operation_gate(mut self, operation_gate: Arc<Mutex<()>>) -> Self {
         self.operation_gate = operation_gate;
         self

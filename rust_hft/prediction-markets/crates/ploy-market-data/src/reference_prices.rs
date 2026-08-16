@@ -1,13 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::RwLock;
+
+pub const CHAINLINK_TWAP_WINDOW_SECS: u64 = 60;
+const REFERENCE_PRICE_HISTORY_CAPACITY: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReferencePriceSource {
     Binance,
+    // ponytail: Chainlink is the canonical 60s TWAP while only one window is consumed;
+    // split the source identity when a market rule requires another window.
     Chainlink,
     Pyth,
 }
@@ -64,11 +71,28 @@ pub struct ReferencePriceSnapshot {
     pub is_carried_forward: bool,
 }
 
-pub type ReferencePriceRegistry = Arc<RwLock<HashMap<ReferencePriceKey, ReferencePriceSnapshot>>>;
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChainlinkTwapPrice {
+    pub symbol: String,
+    pub timestamp: i64,
+    pub value: Decimal,
+    pub full_accuracy_value: String,
+    pub window_s: u64,
+}
+
+pub type ReferencePriceRegistry =
+    Arc<RwLock<HashMap<ReferencePriceKey, VecDeque<ReferencePriceSnapshot>>>>;
 
 #[must_use]
 pub fn new_reference_price_registry() -> ReferencePriceRegistry {
     Arc::new(RwLock::new(HashMap::new()))
+}
+
+#[must_use]
+pub fn parse_chainlink_twap_price(payload: &Value) -> Option<ChainlinkTwapPrice> {
+    serde_json::from_value::<ChainlinkTwapPrice>(payload.clone())
+        .ok()
+        .filter(|price| price.window_s == CHAINLINK_TWAP_WINDOW_SECS)
 }
 
 #[must_use]
@@ -109,7 +133,17 @@ pub async fn upsert_reference_price(
     snapshot: ReferencePriceSnapshot,
 ) {
     let mut guard = registry.write().await;
-    guard.insert(snapshot.key.clone(), snapshot);
+    let history = guard.entry(snapshot.key.clone()).or_default();
+    if history
+        .back()
+        .is_some_and(|current| current.source_timestamp > snapshot.source_timestamp)
+    {
+        return;
+    }
+    history.push_back(snapshot);
+    if history.len() > REFERENCE_PRICE_HISTORY_CAPACITY {
+        history.pop_front();
+    }
 }
 
 pub async fn latest_reference_price(
@@ -122,19 +156,40 @@ pub async fn latest_reference_price(
         symbol: normalize_reference_symbol(symbol),
     };
     let guard = registry.read().await;
-    guard.get(&key).cloned()
+    guard.get(&key).and_then(|history| history.back()).cloned()
+}
+
+pub async fn reference_price_at(
+    registry: &ReferencePriceRegistry,
+    source: ReferencePriceSource,
+    symbol: &str,
+    timestamp: DateTime<Utc>,
+) -> Option<ReferencePriceSnapshot> {
+    let key = ReferencePriceKey {
+        source,
+        symbol: normalize_reference_symbol(symbol),
+    };
+    let guard = registry.read().await;
+    guard.get(&key).and_then(|history| {
+        history
+            .iter()
+            .rev()
+            .find(|snapshot| snapshot.source_timestamp == timestamp)
+            .cloned()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         infer_pyth_asset_class, latest_reference_price, market_symbol_to_binance_symbol,
-        market_symbol_to_chainlink_symbol, new_reference_price_registry, pyth_symbol,
-        upsert_reference_price, ReferenceAssetClass, ReferencePriceKey, ReferencePriceSnapshot,
-        ReferencePriceSource,
+        market_symbol_to_chainlink_symbol, new_reference_price_registry,
+        parse_chainlink_twap_price, pyth_symbol, reference_price_at, upsert_reference_price,
+        ReferenceAssetClass, ReferencePriceKey, ReferencePriceSnapshot, ReferencePriceSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal_macros::dec;
+    use serde_json::json;
 
     #[test]
     fn normalizes_supported_symbol_families() {
@@ -156,6 +211,24 @@ mod tests {
             infer_pyth_asset_class("WTI"),
             ReferenceAssetClass::Commodity
         );
+    }
+
+    #[test]
+    fn parses_only_chainlink_sixty_second_twap_payloads() {
+        let payload = json!({
+            "symbol": "btc/usd",
+            "timestamp": 1_786_868_400_000_i64,
+            "value": 65000.5,
+            "full_accuracy_value": "65000500000000000000000",
+            "window_s": 60
+        });
+        let price = parse_chainlink_twap_price(&payload).expect("60-second TWAP should parse");
+        assert_eq!(price.value, dec!(65000.5));
+        assert_eq!(price.full_accuracy_value, "65000500000000000000000");
+
+        let mut thirty_seconds = payload;
+        thirty_seconds["window_s"] = json!(30);
+        assert!(parse_chainlink_twap_price(&thirty_seconds).is_none());
     }
 
     #[tokio::test]
@@ -182,5 +255,15 @@ mod tests {
         assert_eq!(found.value, dec!(67234.50));
         assert_eq!(found.key.symbol, "btc/usd");
         assert_eq!(found.received_at, snapshot.received_at);
+
+        let at_source_time = reference_price_at(
+            &registry,
+            ReferencePriceSource::Chainlink,
+            "BTC/USD",
+            snapshot.source_timestamp,
+        )
+        .await
+        .expect("timestamped snapshot should exist");
+        assert_eq!(at_source_time.value, dec!(67234.50));
     }
 }

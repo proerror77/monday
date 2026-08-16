@@ -4,7 +4,7 @@ This directory deploys the deterministic Rust runtime. It does not deploy an LLM
 
 ## Supported Artifacts
 
-- `docker/Dockerfile.trading`: release `hft-live` image with Formula strategy, Bitget, metrics, ClickHouse, Redis, and gRPC support.
+- `docker/Dockerfile.trading`: release `hft-live` image with Formula strategy, Bitget, Polymarket, metrics, ClickHouse, Redis, and gRPC support.
 - `k8s/trading-engine.yaml`: signed envelope, bundle, runtime policy, trusted keys, runtime feedback signer, durable nonce/audit/feedback state, readiness, and gRPC auth wiring.
 - `k8s/configmaps.yaml`: canonical quotes-only, simulated-execution startup configuration.
 - `k8s/deployment-authority.yaml.example`: schema-only runtime policy/public-key template; populate it outside Git.
@@ -29,7 +29,7 @@ docker build \
   .
 ```
 
-The builder uses Rust 1.91, `--release --locked`, and the production `clickhouse,redis,grpc` feature graph. BuildKit caches Cargo registry and target artifacts, but the final binary is copied out of the cache before the runtime stage. The runtime image runs as the unprivileged `hft` user and contains only the binary, CA certificates, health-check client, and required runtime libraries.
+The builder uses Rust 1.91, `--release --locked`, and the production `clickhouse,redis,grpc,polymarket` feature graph. BuildKit caches Cargo registry and target artifacts, but the final binary is copied out of the cache before the runtime stage. The runtime image runs as the unprivileged `hft` user and contains only the binary, CA certificates, health-check client, and required runtime libraries.
 
 ## Required External Inputs
 

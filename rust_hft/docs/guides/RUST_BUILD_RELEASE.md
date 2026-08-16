@@ -108,7 +108,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p hft-live
 
 ## 容器發布形態
 
-Canonical production image: `deployment/docker/Dockerfile.trading`. It builds `hft-live` with `--release --locked` and the `clickhouse,redis,grpc` graph, installs `protobuf-compiler` for the gRPC build, and uses BuildKit registry/target caches. The compiled binary is copied out of the cache mount before the runtime stage.
+Canonical production image: `deployment/docker/Dockerfile.trading`. It builds `hft-live` with `--release --locked` and the `clickhouse,redis,grpc,polymarket` graph, installs `protobuf-compiler` for the gRPC build, and uses BuildKit registry/target caches. The compiled binary is copied out of the cache mount before the runtime stage.
 
 ```bash
 docker build \

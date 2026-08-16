@@ -19,7 +19,7 @@ use polymarket_client_sdk::clob::ws::types::response::OrderBookLevel;
 use polymarket_client_sdk::clob::ws::{BookUpdate, Client as ClobWsClient};
 use polymarket_client_sdk::gamma::types::request::MarketByIdRequest;
 use polymarket_client_sdk::gamma::Client as GammaClient;
-use polymarket_client_sdk::rtds::Client as RtdsClient;
+use polymarket_client_sdk::rtds::{Client as RtdsClient, Subscription};
 use polymarket_client_sdk::ws::config::{Config as PolymarketWsConfig, ReconnectConfig};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,9 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::reference_prices::{
-    latest_reference_price, market_symbol_to_chainlink_symbol, new_reference_price_registry,
-    normalize_reference_symbol, upsert_reference_price, ReferenceAssetClass, ReferencePriceKey,
-    ReferencePriceRegistry, ReferencePriceSnapshot, ReferencePriceSource,
+    market_symbol_to_chainlink_symbol, new_reference_price_registry, normalize_reference_symbol,
+    parse_chainlink_twap_price, reference_price_at, upsert_reference_price, ReferenceAssetClass,
+    ReferencePriceKey, ReferencePriceRegistry, ReferencePriceSnapshot, ReferencePriceSource,
 };
 
 /// Configuration for the quote collector.
@@ -1118,17 +1118,21 @@ impl QuoteCollector {
                 .map(|s| market_symbol_to_chainlink_symbol(s))
                 .collect();
 
-            info!(symbols = ?symbols_chainlink, "Starting Chainlink price feed");
+            info!(symbols = ?symbols_chainlink, "Starting Chainlink 60-second TWAP price feed");
 
             let client = RtdsClient::new(
                 POLYMARKET_RTDS_WS_ENDPOINT,
                 collector_market_data_ws_config(),
             )
             .expect("collector RTDS WebSocket config should be valid");
-            let stream = match client.subscribe_chainlink_prices(None) {
+            let subscription = Subscription::builder()
+                .topic("crypto_prices_twap_sixty".to_string())
+                .msg_type("update".to_string())
+                .build();
+            let stream = match client.subscribe_raw(subscription) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(error = %e, "Failed to subscribe to Chainlink prices");
+                    error!(error = %e, "Failed to subscribe to Chainlink 60-second TWAP prices");
                     return;
                 }
             };
@@ -1138,7 +1142,12 @@ impl QuoteCollector {
 
             while let Some(result) = stream.next().await {
                 match result {
-                    Ok(chainlink_price) => {
+                    Ok(message) => {
+                        let Some(chainlink_price) = parse_chainlink_twap_price(&message.payload)
+                        else {
+                            warn!(topic = %message.topic, "Invalid Chainlink 60-second TWAP payload");
+                            continue;
+                        };
                         if !symbols_chainlink.contains(&chainlink_price.symbol) {
                             continue;
                         }
@@ -1155,7 +1164,9 @@ impl QuoteCollector {
                                 },
                                 asset_class: ReferenceAssetClass::Crypto,
                                 value: chainlink_price.value,
-                                full_accuracy_value: None,
+                                full_accuracy_value: Some(
+                                    chainlink_price.full_accuracy_value.clone(),
+                                ),
                                 source_timestamp: ts,
                                 received_at: Utc::now(),
                                 is_carried_forward: false,
@@ -1169,7 +1180,7 @@ impl QuoteCollector {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Chainlink price stream error");
+                        warn!(error = %e, "Chainlink 60-second TWAP price stream error");
                     }
                 }
             }
@@ -1248,12 +1259,13 @@ impl QuoteCollector {
                         sleep(StdDuration::from_millis(wait_ms as u64)).await;
                     }
 
-                    // Get Chainlink price
+                    // Use only the signed TWAP observation at the exact market boundary.
                     let chainlink_symbol = market_symbol_to_chainlink_symbol(&symbol);
-                    let price = latest_reference_price(
+                    let price = reference_price_at(
                         &registry,
                         ReferencePriceSource::Chainlink,
                         &chainlink_symbol,
+                        start_time,
                     )
                     .await
                     .map(|snapshot| snapshot.value);

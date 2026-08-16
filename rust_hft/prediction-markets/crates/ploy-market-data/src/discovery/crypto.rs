@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::discovery::types::{MarketDescriptor, MarketFamily, MarketSemantics, SettlementSource};
 use crate::reference_prices::{
-    latest_reference_price, market_symbol_to_chainlink_symbol, ReferencePriceRegistry,
+    market_symbol_to_chainlink_symbol, reference_price_at, ReferencePriceRegistry,
     ReferencePriceSource,
 };
 
@@ -84,14 +84,18 @@ async fn normalize_crypto_market(
     let (up_token, down_token) = semantic_up_down_tokens(market, token_ids)?;
     let reference_symbol = market_symbol_to_chainlink_symbol(strategy_symbol);
 
-    let price_to_beat = latest_reference_price(
-        reference_prices,
-        ReferencePriceSource::Chainlink,
-        &reference_symbol,
-    )
-    .await
-    .map(|snapshot| snapshot.value)
-    .or_else(|| usable_metadata_threshold(market.group_item_threshold.as_deref()));
+    let price_to_beat = match market_start_time {
+        Some(start_time) => reference_price_at(
+            reference_prices,
+            ReferencePriceSource::Chainlink,
+            &reference_symbol,
+            start_time,
+        )
+        .await
+        .map(|snapshot| snapshot.value),
+        None => None,
+    }
+    .or_else(|| usable_metadata_threshold(market.group_item_threshold.as_deref()))?;
 
     let descriptor = MarketDescriptor {
         market_family: MarketFamily::Crypto,
@@ -130,7 +134,7 @@ async fn normalize_crypto_market(
         end_time,
         window_secs,
         market_window_secs: market_window_secs.expect("validated allowed market window"),
-        price_to_beat,
+        price_to_beat: Some(price_to_beat),
         raw_event: event.and_then(event_to_value),
         raw_market: serde_json::to_value(market).ok()?,
     })
@@ -329,6 +333,22 @@ mod tests {
     #[tokio::test]
     async fn keeps_fifteen_minute_crypto_markets() {
         let registry = new_reference_price_registry();
+        upsert_reference_price(
+            &registry,
+            ReferencePriceSnapshot {
+                key: ReferencePriceKey {
+                    source: ReferencePriceSource::Chainlink,
+                    symbol: "btc/usd".to_string(),
+                },
+                asset_class: ReferenceAssetClass::Crypto,
+                value: dec!(67234.50),
+                full_accuracy_value: Some("67234500000000000000000".to_string()),
+                source_timestamp: Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 0).unwrap(),
+                received_at: Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 1).unwrap(),
+                is_carried_forward: false,
+            },
+        )
+        .await;
 
         let market: polymarket_client_sdk::gamma::types::response::Market =
             serde_json::from_value(json!({
@@ -362,6 +382,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skips_crypto_market_without_exact_opening_reference() {
+        let registry = new_reference_price_registry();
+        let market: polymarket_client_sdk::gamma::types::response::Market =
+            serde_json::from_value(json!({
+                "id": "market-without-opening-reference",
+                "question": "Will Bitcoin be up or down in 5 minutes?",
+                "endDate": "2026-04-06T00:05:00Z",
+                "startDate": "2026-04-06T00:00:00Z",
+                "groupItemThreshold": "0",
+                "clobTokenIds": "[\"111\",\"222\"]",
+                "active": true,
+                "acceptingOrders": true
+            }))
+            .unwrap();
+
+        let discovered = discover_crypto_markets(
+            &[market],
+            &["BTCUSDT".to_string()],
+            &registry,
+            Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 30).unwrap(),
+        )
+        .await;
+
+        assert!(discovered.is_empty());
+    }
+
+    #[tokio::test]
     async fn ignores_crypto_markets_that_have_not_started() {
         let registry = new_reference_price_registry();
         let market: polymarket_client_sdk::gamma::types::response::Market =
@@ -390,6 +437,22 @@ mod tests {
     #[tokio::test]
     async fn maps_crypto_tokens_by_outcome_semantics_not_array_order() {
         let registry = new_reference_price_registry();
+        upsert_reference_price(
+            &registry,
+            ReferencePriceSnapshot {
+                key: ReferencePriceKey {
+                    source: ReferencePriceSource::Chainlink,
+                    symbol: "btc/usd".to_string(),
+                },
+                asset_class: ReferenceAssetClass::Crypto,
+                value: dec!(67234.50),
+                full_accuracy_value: Some("67234500000000000000000".to_string()),
+                source_timestamp: Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 0).unwrap(),
+                received_at: Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 1).unwrap(),
+                is_carried_forward: false,
+            },
+        )
+        .await;
 
         let market: polymarket_client_sdk::gamma::types::response::Market =
             serde_json::from_value(json!({

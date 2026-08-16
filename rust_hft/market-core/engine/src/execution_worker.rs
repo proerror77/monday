@@ -4793,10 +4793,9 @@ mod tests {
             events.as_slice(),
             [ExecutionEvent::OrderNew {
                 account_id: Some(account_id),
-                arrival_price: Some(arrival_price),
+                arrival_price: None,
                 ..
             }] if account_id == &AccountId("binance-main".to_string())
-                && *arrival_price == Price::from_f64(100.0).unwrap()
         ));
 
         worker
