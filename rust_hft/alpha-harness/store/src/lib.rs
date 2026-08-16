@@ -110,12 +110,12 @@ fn require_registry_payload_reference(
         "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
         &reference.id,
     )?;
-    if revision.registry_kind != registry_kind
-        || canonical_json_hash(&revision.payload).map_err(domain_error)? != reference.content_sha256
-    {
-        return Err(StoreError::Domain(
-            "CEX final precommit references drifted registry evidence".to_string(),
-        ));
+    let payload_hash = canonical_json_hash(&revision.payload).map_err(domain_error)?;
+    if revision.registry_kind != registry_kind || payload_hash != reference.content_sha256 {
+        return Err(StoreError::Domain(format!(
+            "CEX final precommit reference {} expected {registry_kind}/{} but read {}/{}",
+            reference.id, reference.content_sha256, revision.registry_kind, payload_hash
+        )));
     }
     Ok(revision)
 }
@@ -128,12 +128,19 @@ fn require_typed_registry_payload_reference<T>(
 where
     T: DeserializeOwned + Serialize,
 {
-    let revision = require_registry_payload_reference(connection, reference, registry_kind)?;
+    reference.validate().map_err(domain_error)?;
+    let revision: RegistryRevision = read_json_row(
+        connection,
+        "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
+        &reference.id,
+    )?;
     let payload: T = serde_json::from_value(revision.payload).map_err(serialization_error)?;
-    if canonical_json_hash(&payload).map_err(domain_error)? != reference.content_sha256 {
-        return Err(StoreError::Domain(
-            "CEX final precommit references drifted typed evidence".to_string(),
-        ));
+    let payload_hash = canonical_json_hash(&payload).map_err(domain_error)?;
+    if revision.registry_kind != registry_kind || payload_hash != reference.content_sha256 {
+        return Err(StoreError::Domain(format!(
+            "CEX final precommit typed reference {} expected {registry_kind}/{} but read {}/{}",
+            reference.id, reference.content_sha256, revision.registry_kind, payload_hash
+        )));
     }
     Ok(payload)
 }
