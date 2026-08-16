@@ -516,6 +516,8 @@ pub enum StrategyParams {
         signal_threshold: f64,
         #[serde(default)]
         target_position: bool,
+        #[serde(default)]
+        evaluation_interval_millis: Option<u64>,
     },
     Onnx {
         model_path: String,

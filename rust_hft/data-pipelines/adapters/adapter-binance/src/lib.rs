@@ -14,7 +14,7 @@ use ports::events::MarketSnapshot;
 use ports::{
     BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream, TrackedMarketEvent,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -39,6 +39,21 @@ const REST_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_se
 struct QueuedMarketEvent {
     generation: u64,
     event: TrackedMarketEvent,
+}
+
+struct ParsedTrackedMarketEvent {
+    event: MarketEvent,
+    tracker: LatencyTracker,
+    previous_update_id: Option<u64>,
+}
+
+impl ParsedTrackedMarketEvent {
+    fn into_tracked(self) -> TrackedMarketEvent {
+        TrackedMarketEvent {
+            event: self.event,
+            tracker: self.tracker,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,20 +145,31 @@ fn multiplex_market_events(
 #[derive(Debug, Default)]
 struct DepthSequenceTracker {
     last_update_ids: HashMap<Symbol, u64>,
+    synchronized_usdm_updates: HashSet<Symbol>,
+    usdm: bool,
 }
 
 impl DepthSequenceTracker {
-    fn from_snapshots<'a>(snapshots: impl IntoIterator<Item = &'a MarketSnapshot>) -> Self {
+    fn from_snapshots<'a>(
+        snapshots: impl IntoIterator<Item = &'a MarketSnapshot>,
+        usdm: bool,
+    ) -> Self {
         Self {
             last_update_ids: snapshots
                 .into_iter()
                 .map(|snapshot| (snapshot.symbol.clone(), snapshot.sequence))
                 .collect(),
+            synchronized_usdm_updates: HashSet::new(),
+            usdm,
         }
     }
 
     /// Returns `true` when the event must be forwarded and `false` for a stale depth event.
-    fn validate_and_advance(&mut self, event: &MarketEvent) -> HftResult<bool> {
+    fn validate_and_advance(
+        &mut self,
+        event: &MarketEvent,
+        previous_update_id: Option<u64>,
+    ) -> HftResult<bool> {
         let MarketEvent::Update(BookUpdate {
             symbol,
             first_sequence,
@@ -172,6 +198,23 @@ impl DepthSequenceTracker {
                 first,
                 sequence
             )));
+        }
+        if self.usdm {
+            let previous_update_id = previous_update_id.ok_or_else(|| {
+                HftError::Network(format!(
+                    "Binance USD-M depth update omitted pu for {}",
+                    symbol.as_str()
+                ))
+            })?;
+            if self.synchronized_usdm_updates.contains(symbol) && previous_update_id != previous {
+                return Err(HftError::Network(format!(
+                    "Binance USD-M depth pu gap for {}: expected {}, received {}",
+                    symbol.as_str(),
+                    previous,
+                    previous_update_id
+                )));
+            }
+            self.synchronized_usdm_updates.insert(symbol.clone());
         }
         self.last_update_ids.insert(symbol.clone(), *sequence);
         Ok(true)
@@ -292,12 +335,21 @@ impl BinanceMarketStream {
             .unwrap_or(DEFAULT_SYNC_BUFFER_CAPACITY)
     }
 
-    fn snapshot_depth() -> u16 {
-        std::env::var("BINANCE_SNAPSHOT_DEPTH")
+    fn snapshot_depth(usdm: bool) -> u16 {
+        let configured = std::env::var("BINANCE_SNAPSHOT_DEPTH")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
             .filter(|depth| matches!(*depth, 100 | 500 | 1000 | 5000))
-            .unwrap_or(5000)
+            .unwrap_or(if usdm { 1000 } else { 5000 });
+        Self::cap_snapshot_depth(configured, usdm)
+    }
+
+    fn cap_snapshot_depth(configured: u16, usdm: bool) -> u16 {
+        if usdm {
+            configured.min(1000)
+        } else {
+            configured
+        }
     }
 
     fn uses_ws_snapshot_depth() -> bool {
@@ -349,14 +401,13 @@ impl BinanceMarketStream {
     async fn get_initial_snapshots(
         rest_client: &BinanceRestClient,
         symbols: &[Symbol],
+        snapshot_depth: u16,
     ) -> HftResult<Vec<(MarketSnapshot, u64)>> {
         let mut snapshots = Vec::new();
 
         for symbol in symbols {
             info!("獲取 {:?} 的初始快照", symbol);
-            let depth = rest_client
-                .get_depth(symbol, Some(Self::snapshot_depth()))
-                .await?;
+            let depth = rest_client.get_depth(symbol, Some(snapshot_depth)).await?;
             let timestamp = now_micros();
 
             let snapshot =
@@ -371,14 +422,15 @@ impl BinanceMarketStream {
     fn parse_tracked_socket_event(
         bytes: bytes::Bytes,
         mut metrics: WsMessageMetrics,
-    ) -> HftResult<Option<TrackedMarketEvent>> {
+    ) -> HftResult<Option<ParsedTrackedMarketEvent>> {
         let mut bytes = match bytes.try_into_mut() {
             Ok(bytes) => bytes,
             Err(bytes) => BytesMut::from(bytes.as_ref()),
         };
-        let event = MessageConverter::parse_stream_message_bytes(&mut bytes)?;
+        let parsed = MessageConverter::parse_stream_message_bytes_with_metadata(&mut bytes)?;
         metrics.mark_parsed();
-        Ok(event.map(|mut event| {
+        Ok(parsed.map(|parsed| {
+            let mut event = parsed.event;
             let mut tracker =
                 LatencyTracker::from_userspace_websocket_message_delivery(metrics.received_at_us);
             tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
@@ -409,7 +461,11 @@ impl BinanceMarketStream {
                 }
             }
 
-            TrackedMarketEvent { event, tracker }
+            ParsedTrackedMarketEvent {
+                event,
+                tracker,
+                previous_update_id: parsed.previous_update_id,
+            }
         }))
     }
 
@@ -418,8 +474,12 @@ impl BinanceMarketStream {
         rest_client: &BinanceRestClient,
         symbols: &[Symbol],
         buffer_capacity: usize,
-    ) -> HftResult<(Vec<(MarketSnapshot, u64)>, VecDeque<TrackedMarketEvent>)> {
-        let snapshot_future = Self::get_initial_snapshots(rest_client, symbols);
+        snapshot_depth: u16,
+    ) -> HftResult<(
+        Vec<(MarketSnapshot, u64)>,
+        VecDeque<ParsedTrackedMarketEvent>,
+    )> {
+        let snapshot_future = Self::get_initial_snapshots(rest_client, symbols, snapshot_depth);
         tokio::pin!(snapshot_future);
         let mut buffered_events = VecDeque::with_capacity(buffer_capacity.min(1024));
 
@@ -487,6 +547,8 @@ impl MarketStream for BinanceMarketStream {
         let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
         let rest_client = self.rest_client.clone();
         let snapshot_enabled = !uses_ws_snapshot_depth;
+        let snapshot_depth = Self::snapshot_depth(self.usdm);
+        let usdm = self.usdm;
         let sync_buffer_capacity = Self::sync_buffer_capacity();
         let auto_reconnect = self.caps.auto_reconnect;
         let is_connected = Arc::clone(&self.is_connected);
@@ -519,6 +581,7 @@ impl MarketStream for BinanceMarketStream {
                                     &rest_client,
                                     &symbols,
                                     sync_buffer_capacity,
+                                    snapshot_depth,
                                 )
                                 .await
                             }
@@ -542,6 +605,7 @@ impl MarketStream for BinanceMarketStream {
                             let mut sequence_tracker = snapshot_enabled.then(|| {
                                 DepthSequenceTracker::from_snapshots(
                                     snapshots.iter().map(|(snapshot, _)| snapshot),
+                                    usdm,
                                 )
                             });
                             'generation: {
@@ -573,7 +637,10 @@ impl MarketStream for BinanceMarketStream {
 
                                 while let Some(event) = buffered_events.pop_front() {
                                     let forward = match sequence_tracker.as_mut() {
-                                        Some(tracker) => tracker.validate_and_advance(&event.event),
+                                        Some(tracker) => tracker.validate_and_advance(
+                                            &event.event,
+                                            event.previous_update_id,
+                                        ),
                                         None => Ok(true),
                                     };
                                     match forward {
@@ -581,7 +648,7 @@ impl MarketStream for BinanceMarketStream {
                                             match try_queue_market_event(
                                                 &tx,
                                                 &task_generation,
-                                                event,
+                                                event.into_tracked(),
                                             ) {
                                                 Ok(()) => {}
                                                 Err(QueuePublishError::Closed) => return,
@@ -624,7 +691,10 @@ impl MarketStream for BinanceMarketStream {
                                                 Ok(Some(event)) => {
                                                     let forward = match sequence_tracker.as_mut() {
                                                         Some(tracker) => tracker
-                                                            .validate_and_advance(&event.event),
+                                                            .validate_and_advance(
+                                                                &event.event,
+                                                                event.previous_update_id,
+                                                            ),
                                                         None => Ok(true),
                                                     };
                                                     match forward {
@@ -632,7 +702,7 @@ impl MarketStream for BinanceMarketStream {
                                                             match try_queue_market_event(
                                                                 &tx,
                                                                 &task_generation,
-                                                                event,
+                                                                event.into_tracked(),
                                                             ) {
                                                                 Ok(()) => {}
                                                                 Err(QueuePublishError::Closed) => {
@@ -978,7 +1048,7 @@ mod tests {
             source_venue: Some(hft_core::VenueId::BINANCE),
             timestamps: Default::default(),
         }];
-        let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots);
+        let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots, false);
         let update = |first_sequence, sequence| {
             MarketEvent::Update(BookUpdate {
                 symbol: symbol.clone(),
@@ -993,9 +1063,59 @@ mod tests {
             })
         };
 
-        assert!(!tracker.validate_and_advance(&update(90, 100)).unwrap());
-        assert!(tracker.validate_and_advance(&update(99, 101)).unwrap());
-        assert!(tracker.validate_and_advance(&update(103, 103)).is_err());
+        assert!(!tracker
+            .validate_and_advance(&update(90, 100), None)
+            .unwrap());
+        assert!(tracker
+            .validate_and_advance(&update(99, 101), None)
+            .unwrap());
+        assert!(tracker
+            .validate_and_advance(&update(103, 103), None)
+            .is_err());
+    }
+
+    #[test]
+    fn usdm_diff_depth_requires_each_pu_to_match_the_previous_u() {
+        let symbol = Symbol::new("BTCUSDT");
+        let snapshots = vec![MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: 1,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            sequence: 100,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+            timestamps: Default::default(),
+        }];
+        let update = |first_sequence, sequence| {
+            MarketEvent::Update(BookUpdate {
+                symbol: symbol.clone(),
+                timestamp: 2,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                first_sequence: Some(first_sequence),
+                sequence,
+                is_snapshot: false,
+                source_venue: Some(hft_core::VenueId::BINANCE),
+                timestamps: Default::default(),
+            })
+        };
+        let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots, true);
+
+        assert!(tracker
+            .validate_and_advance(&update(99, 101), Some(98))
+            .unwrap());
+        assert!(tracker
+            .validate_and_advance(&update(102, 103), Some(101))
+            .unwrap());
+        assert!(tracker
+            .validate_and_advance(&update(103, 104), Some(100))
+            .is_err());
+    }
+
+    #[test]
+    fn usdm_rest_snapshot_depth_never_exceeds_one_thousand() {
+        assert_eq!(BinanceMarketStream::cap_snapshot_depth(5000, true), 1000);
+        assert_eq!(BinanceMarketStream::cap_snapshot_depth(5000, false), 5000);
     }
 
     #[test]
@@ -1122,8 +1242,9 @@ mod tests {
         };
 
         let depth = parse(
-            br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":123456789,"s":"BTCUSDT","U":100,"u":101,"b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]}}"#,
+            br#"{"stream":"btcusdt@depth","data":{"e":"depthUpdate","E":123456789,"s":"BTCUSDT","U":100,"u":101,"pu":99,"b":[["45000.00","0.1"]],"a":[["45100.00","0.2"]]}}"#,
         );
+        assert_eq!(depth.previous_update_id, Some(99));
         assert_eq!(
             depth
                 .event

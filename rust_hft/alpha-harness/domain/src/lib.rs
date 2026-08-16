@@ -4127,6 +4127,12 @@ pub struct CexFourStageStrategyCandidateV1 {
     pub order_submission_authority: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CexFourStageRuntimeContractV1 {
+    pub zero_epsilon: f64,
+    pub observation_frequency_millis: u64,
+}
+
 impl CexFourStageStrategyCandidateV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -4200,6 +4206,16 @@ impl CexFourStageStrategyCandidateV1 {
         }
         validate_live_formula(&self.executable_formula)?;
         Ok(())
+    }
+
+    pub fn runtime_contract(&self) -> Result<CexFourStageRuntimeContractV1, DomainError> {
+        self.validate()?;
+        let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        Ok(CexFourStageRuntimeContractV1 {
+            zero_epsilon: strategy.sizing.zero_epsilon,
+            observation_frequency_millis: strategy.execution.horizon.observation_frequency_millis,
+        })
     }
 
     pub fn validate_against_factor_bank(

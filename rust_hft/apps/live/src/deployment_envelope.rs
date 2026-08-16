@@ -261,8 +261,8 @@ fn apply_strategy_bundle(
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
         (ActivationArtifact::Formula, artifact) => {
-            let (ast, target_position, order_notional) = match artifact {
-                StrategyBundleArtifact::Formula { ast } => (ast, false, total_notional),
+            let (ast, target_position, signal_threshold, interval_ms) = match artifact {
+                StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None),
                 StrategyBundleArtifact::CexFourStage { strategy } => {
                     let [instrument] = request.instruments.as_slice() else {
                         return Err(
@@ -303,12 +303,15 @@ fn apply_strategy_bundle(
                         );
                     }
                     venue.simulate_execution = true;
-                    // ponytail: half the signed exposure permits a direct +target/-target
-                    // reversal without exceeding the signed one-order notional ceiling.
-                    let order_notional = total_notional
-                        .checked_div(rust_decimal::Decimal::from(2))
-                        .ok_or_else(|| "four-stage CEX target notional is invalid".to_string())?;
-                    (&strategy.executable_formula, true, order_notional)
+                    let contract = strategy
+                        .runtime_contract()
+                        .map_err(|error| error.to_string())?;
+                    (
+                        &strategy.executable_formula,
+                        true,
+                        contract.zero_epsilon,
+                        Some(contract.observation_frequency_millis),
+                    )
                 }
                 _ => {
                     return Err(
@@ -327,9 +330,10 @@ fn apply_strategy_bundle(
                     symbols,
                     params: runtime::StrategyParams::Formula {
                         ast: ast.clone(),
-                        max_order_notional: order_notional,
-                        signal_threshold: 0.0,
+                        max_order_notional: total_notional,
+                        signal_threshold,
                         target_position,
+                        evaluation_interval_millis: interval_ms,
                     },
                     risk_limits,
                 },

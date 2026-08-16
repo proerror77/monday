@@ -409,14 +409,18 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     ));
     let runtime::StrategyParams::Formula {
         max_order_notional,
+        signal_threshold,
         target_position,
+        evaluation_interval_millis,
         ..
     } = &config.strategies[0].params
     else {
         panic!("four-stage bundle did not produce Formula params")
     };
     assert!(*target_position);
-    assert_eq!(*max_order_notional, rust_decimal::Decimal::from(250));
+    assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
+    assert_eq!(signal_threshold.to_bits(), f64::EPSILON.to_bits());
+    assert_eq!(*evaluation_interval_millis, Some(1_000));
     let runtime = runtime::SystemBuilder::new(config.clone())
         .auto_register_adapters_strict()
         .unwrap()
