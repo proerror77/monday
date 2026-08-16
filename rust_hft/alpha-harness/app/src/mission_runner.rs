@@ -176,6 +176,7 @@ struct CexEventReplayReceiptV1 {
     replay_engine_version: String,
     metrics: TargetPositionReplayMetrics,
     capabilities: CexReplayCapabilitiesV1,
+    capabilities_sha256: String,
     gate: CexReplayGateV1,
     holdout_id: String,
     holdout_state: CexResearchHoldoutStateV1,
@@ -185,6 +186,7 @@ struct CexEventReplayReceiptV1 {
 
 impl CexEventReplayReceiptV1 {
     fn finalize(mut self) -> anyhow::Result<Self> {
+        self.capabilities_sha256 = canonical_json_hash(&self.capabilities)?;
         self.receipt_id = self.expected_receipt_id()?;
         self.validate()?;
         Ok(self)
@@ -211,6 +213,7 @@ impl CexEventReplayReceiptV1 {
             || !valid_git_revision(BUILD_SOURCE_REVISION)
             || self.replay_engine_version != TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION
             || self.metrics.decision_count == 0
+            || self.capabilities_sha256 != canonical_json_hash(&self.capabilities)?
             || self.capabilities.clock_semantics != "recorded_userspace_receive_time_us"
             || self.capabilities.modalities != ["lob"]
             || self.capabilities.min_bid_depth_levels != self.metrics.min_bid_depth_levels
@@ -960,9 +963,9 @@ fn finalize_cex_candidate(
         dataset: control_mission.spec.inputs.dataset.clone(),
         partition: control_mission.spec.inputs.partition.clone(),
         source: control_mission.spec.inputs.source.clone(),
-        factor_bank: registry_content_reference(&factor_bank.revision_id, factor_bank)?,
-        ridge_baseline: registry_content_reference(&ridge.artifact_id, ridge)?,
-        cart_baseline: registry_content_reference(&cart.artifact_id, cart)?,
+        factor_bank: strategy.signal.parent.clone(),
+        ridge_baseline: strategy.walk_forward_evidence.ridge.source_artifact.clone(),
+        cart_baseline: strategy.walk_forward_evidence.cart.source_artifact.clone(),
         baseline_gate: registry_content_reference(&baselines.gate.gate_id, &baselines.gate)?,
         mcts_checkpoint: strategy.subset_checkpoint.clone(),
         mcts_subset: strategy.subset_result.clone(),
@@ -974,7 +977,7 @@ fn finalize_cex_candidate(
         },
         fixed_weights_sha256: canonical_json_hash(&strategy.signal.factors)?,
         replay_receipt: replay_reference,
-        replay_capabilities_sha256: canonical_json_hash(&replay.capabilities)?,
+        replay_capabilities_sha256: replay.capabilities_sha256.clone(),
         evaluation_protocol: control_mission.spec.policies.evaluation.clone(),
         final_candidate: CexResearchContentRefV1 {
             id: candidate_id.clone(),
@@ -1482,6 +1485,7 @@ fn run_cex_event_replay(
         replay_engine_version: TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION.to_string(),
         metrics,
         capabilities,
+        capabilities_sha256: String::new(),
         gate,
         holdout_id: mission.spec.holdout.holdout_id.clone(),
         holdout_state: mission.spec.holdout.state,
@@ -2841,6 +2845,62 @@ mod tests {
             stored_precommit.payload,
             serde_json::to_value(&precommit).unwrap()
         );
+        let mut failed_replay_receipt = replay_receipt.clone();
+        failed_replay_receipt.gate.passed = false;
+        failed_replay_receipt
+            .gate
+            .failures
+            .push("test replay failure".to_string());
+        let failed_replay_receipt = failed_replay_receipt.finalize().unwrap();
+        let failed_replay_payload = serde_json::to_value(&failed_replay_receipt).unwrap();
+        let failed_replay = CexResearchContentRefV1 {
+            id: failed_replay_receipt.receipt_id,
+            content_sha256: canonical_json_hash(&failed_replay_payload).unwrap(),
+        };
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: failed_replay.id.clone(),
+                registry_kind: CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND.to_string(),
+                asset_id: precommit.mission.id.clone(),
+                parent_revision_id: Some(precommit.four_stage_strategy.id.clone()),
+                payload: failed_replay_payload,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let mut drifted_precommit = precommit.clone();
+        drifted_precommit.replay_receipt = failed_replay;
+        let final_lineage = store.mission_lineage(&precommit.mission.id).unwrap();
+        let final_iteration = final_lineage
+            .iterations
+            .iter()
+            .find(|iteration| {
+                iteration.candidate_artifact_id.as_deref()
+                    == Some(precommit.final_candidate.id.as_str())
+            })
+            .unwrap();
+        let final_candidate = final_lineage
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == precommit.final_candidate.id)
+            .unwrap();
+        let final_evaluation = final_lineage
+            .evaluations
+            .iter()
+            .find(|evaluation| {
+                evaluation.record.evaluation_id == precommit.final_walk_forward_evaluation.id
+            })
+            .unwrap();
+        assert!(store
+            .put_cex_final_precommit(
+                final_iteration,
+                &final_candidate.candidate_id,
+                &final_candidate.artifact,
+                &final_evaluation.record,
+                &drifted_precommit,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exact passing precommit strategy"));
 
         let claim: CexSealedHoldoutClaimV1 = serde_json::from_slice(
             &std::fs::read(results.join("sealed-holdout-claim.json")).unwrap(),
@@ -2907,6 +2967,26 @@ mod tests {
             .unwrap(),
             strategy
         );
+        let mut invalid_structure = bundled_strategy.clone();
+        let mut invalid_strategy: serde_json::Value =
+            serde_json::from_str(&invalid_structure.strategy_artifact_json).unwrap();
+        invalid_strategy["signal"] = serde_json::Value::Null;
+        invalid_structure.strategy_artifact_json =
+            serde_json::to_string(&invalid_strategy).unwrap();
+        invalid_structure.strategy_artifact_sha256 = hex::encode(Sha256::digest(
+            invalid_structure.strategy_artifact_json.as_bytes(),
+        ));
+        assert!(invalid_structure.validate().is_err());
+        let mut mismatched_formula = bundled_strategy.clone();
+        mismatched_formula.executable_formula = hft_factor_dsl::FactorAst::Terminal(
+            hft_factor_dsl::FactorTerminal::Field("mid_price".to_string()),
+        );
+        mismatched_formula.executable_formula_sha256 =
+            canonical_json_hash(&mismatched_formula.executable_formula).unwrap();
+        mismatched_formula.validate().unwrap();
+        assert!(mismatched_formula
+            .validate_against_factor_bank(&factor_bank_typed)
+            .is_err());
         assert_eq!(
             store.get_strategy_bundle(&bundle.bundle_id).unwrap(),
             bundle

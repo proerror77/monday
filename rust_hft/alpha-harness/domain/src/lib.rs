@@ -3679,6 +3679,414 @@ impl OnnxModelCandidate {
     }
 }
 
+const CEX_COMBINATION_SIGNAL_STAGE_SCHEMA_V1: &str = "cex-combination-signal-stage-v1";
+const CEX_COMBINATION_SIZING_STAGE_SCHEMA_V1: &str = "cex-combination-sizing-stage-v1";
+const CEX_COMBINATION_RISK_STAGE_SCHEMA_V1: &str = "cex-combination-risk-stage-v1";
+const CEX_COMBINATION_EXECUTION_STAGE_SCHEMA_V1: &str = "cex-combination-execution-stage-v1";
+const CEX_COMBINATION_WALK_FORWARD_SCHEMA_V1: &str = "cex-combination-walk-forward-evidence-v1";
+const CEX_COMBINATION_STRATEGY_SCHEMA_V1: &str = "cex-combination-research-artifact-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageFactorIdentityV1 {
+    factor_id: String,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageSignalFactorV1 {
+    factor: CexFourStageFactorIdentityV1,
+    orientation: CexFactorOrientationV1,
+    normalized_absolute_weight: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageNormalizationV1 {
+    NoneRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageThresholdPolicyV1 {
+    Zero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageSizingRuleV1 {
+    ZeroWithinMachineEpsilonElseSign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageOrderSemanticsV1 {
+    ValidationBucketTargetPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageEventModalityV1 {
+    BucketedPointInTimeL2Features,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CexFourStageEvaluationKindV1 {
+    SelectedSubset,
+    RidgeBaseline,
+    CartBaseline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageSignalV1 {
+    schema_version: String,
+    content_sha256: String,
+    parent: CexResearchContentRefV1,
+    subset_policy: CexResearchContentRefV1,
+    weight_policy: CexResearchContentRefV1,
+    factors: Vec<CexFourStageSignalFactorV1>,
+    combination_rule: CexFactorWeightRuleV1,
+    normalization: CexFourStageNormalizationV1,
+    threshold_policy: CexFourStageThresholdPolicyV1,
+}
+
+impl CexFourStageSignalV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        for reference in [&self.parent, &self.subset_policy, &self.weight_policy] {
+            reference.validate()?;
+        }
+        let expected_weight = 1.0 / self.factors.len().max(1) as f64;
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        if self.schema_version != CEX_COMBINATION_SIGNAL_STAGE_SCHEMA_V1
+            || self.content_sha256 != canonical_json_hash(&semantic)?
+            || self.factors.is_empty()
+            || self
+                .factors
+                .windows(2)
+                .any(|pair| pair[0].factor.factor_id >= pair[1].factor.factor_id)
+            || self.factors.iter().any(|factor| {
+                factor.factor.factor_id.trim().is_empty()
+                    || !valid_content_sha256(&factor.factor.content_sha256)
+                    || factor.normalized_absolute_weight.to_bits() != expected_weight.to_bits()
+            })
+            || self.combination_rule != CexFactorWeightRuleV1::OrientedEqualAbsoluteSumToOne
+            || self.normalization != CexFourStageNormalizationV1::NoneRequired
+            || self.threshold_policy != CexFourStageThresholdPolicyV1::Zero
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, DomainError> {
+        self.validate()?;
+        Ok(CexResearchContentRefV1 {
+            id: format!("cex-combination-signal-stage-{}", self.content_sha256),
+            content_sha256: self.content_sha256.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageSizingV1 {
+    schema_version: String,
+    content_sha256: String,
+    parent: CexResearchContentRefV1,
+    rule: CexFourStageSizingRuleV1,
+    zero_epsilon: f64,
+    min_position: f64,
+    max_position: f64,
+}
+
+impl CexFourStageSizingV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        self.parent.validate()?;
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        if self.schema_version != CEX_COMBINATION_SIZING_STAGE_SCHEMA_V1
+            || self.content_sha256 != canonical_json_hash(&semantic)?
+            || self.rule != CexFourStageSizingRuleV1::ZeroWithinMachineEpsilonElseSign
+            || self.zero_epsilon.to_bits() != f64::EPSILON.to_bits()
+            || self.min_position.to_bits() != (-1.0_f64).to_bits()
+            || self.max_position.to_bits() != 1.0_f64.to_bits()
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, DomainError> {
+        self.validate()?;
+        Ok(CexResearchContentRefV1 {
+            id: format!("cex-combination-sizing-stage-{}", self.content_sha256),
+            content_sha256: self.content_sha256.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageRiskV1 {
+    schema_version: String,
+    content_sha256: String,
+    parent: CexResearchContentRefV1,
+    evaluator_policy: CexResearchContentRefV1,
+    immutable: bool,
+    max_abs_position: f64,
+    position_notional_usd: f64,
+    max_drawdown: f64,
+    capacity_depth_levels: usize,
+    max_book_depth_fraction: f64,
+}
+
+impl CexFourStageRiskV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        self.parent.validate()?;
+        self.evaluator_policy.validate()?;
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        let capacity_disabled = self.position_notional_usd == 0.0
+            && self.capacity_depth_levels == 0
+            && self.max_book_depth_fraction == 0.0;
+        let capacity_enabled = self.position_notional_usd.is_finite()
+            && self.position_notional_usd > 0.0
+            && self.capacity_depth_levels > 0
+            && self.max_book_depth_fraction.is_finite()
+            && self.max_book_depth_fraction > 0.0
+            && self.max_book_depth_fraction <= 1.0;
+        if self.schema_version != CEX_COMBINATION_RISK_STAGE_SCHEMA_V1
+            || self.content_sha256 != canonical_json_hash(&semantic)?
+            || !self.immutable
+            || self.max_abs_position.to_bits() != 1.0_f64.to_bits()
+            || !self.max_drawdown.is_finite()
+            || self.max_drawdown <= 0.0
+            || self.max_drawdown > 1.0
+            || !(capacity_disabled || capacity_enabled)
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, DomainError> {
+        self.validate()?;
+        Ok(CexResearchContentRefV1 {
+            id: format!("cex-combination-risk-stage-{}", self.content_sha256),
+            content_sha256: self.content_sha256.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageExecutionV1 {
+    schema_version: String,
+    content_sha256: String,
+    parent: CexResearchContentRefV1,
+    evaluation_policy: CexResearchContentRefV1,
+    venue: CexResearchVenueV1,
+    market: CexResearchMarketV1,
+    symbol: String,
+    order_semantics: CexFourStageOrderSemanticsV1,
+    event_modality: CexFourStageEventModalityV1,
+    costs: EvaluationCostsV1,
+    horizon: EvaluationLabelSpecV1,
+}
+
+impl CexFourStageExecutionV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        self.parent.validate()?;
+        self.evaluation_policy.validate()?;
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        if self.schema_version != CEX_COMBINATION_EXECUTION_STAGE_SCHEMA_V1
+            || self.content_sha256 != canonical_json_hash(&semantic)?
+            || self.symbol.trim().is_empty()
+            || self.symbol != self.symbol.to_ascii_uppercase()
+            || self.order_semantics != CexFourStageOrderSemanticsV1::ValidationBucketTargetPosition
+            || self.event_modality != CexFourStageEventModalityV1::BucketedPointInTimeL2Features
+            || self.horizon.horizon_buckets == 0
+            || self.horizon.observation_frequency_millis == 0
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+
+    fn reference(&self) -> Result<CexResearchContentRefV1, DomainError> {
+        self.validate()?;
+        Ok(CexResearchContentRefV1 {
+            id: format!("cex-combination-execution-stage-{}", self.content_sha256),
+            content_sha256: self.content_sha256.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageEvaluationV1 {
+    kind: CexFourStageEvaluationKindV1,
+    source_artifact: CexResearchContentRefV1,
+    evaluation_sha256: String,
+    evaluation: CandidateEvaluation,
+}
+
+impl CexFourStageEvaluationV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        self.source_artifact.validate()?;
+        self.evaluation.validate()?;
+        if self.evaluation_sha256 != canonical_json_hash(&self.evaluation)? {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageWalkForwardV1 {
+    schema_version: String,
+    content_sha256: String,
+    research_dataset: CexResearchContentRefV1,
+    walk_forward_partition: CexResearchContentRefV1,
+    evaluation_protocol: CexResearchContentRefV1,
+    holdout_id: String,
+    holdout_state: CexResearchHoldoutStateV1,
+    selected: CexFourStageEvaluationV1,
+    ridge: CexFourStageEvaluationV1,
+    cart: CexFourStageEvaluationV1,
+}
+
+impl CexFourStageWalkForwardV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        for reference in [
+            &self.research_dataset,
+            &self.walk_forward_partition,
+            &self.evaluation_protocol,
+        ] {
+            reference.validate()?;
+        }
+        self.selected.validate()?;
+        self.ridge.validate()?;
+        self.cart.validate()?;
+        let mut semantic = self.clone();
+        semantic.content_sha256.clear();
+        let evaluations = [
+            &self.selected.evaluation,
+            &self.ridge.evaluation,
+            &self.cart.evaluation,
+        ];
+        if self.schema_version != CEX_COMBINATION_WALK_FORWARD_SCHEMA_V1
+            || self.content_sha256 != canonical_json_hash(&semantic)?
+            || self.holdout_id.trim().is_empty()
+            || self.holdout_state != CexResearchHoldoutStateV1::Unopened
+            || self.selected.kind != CexFourStageEvaluationKindV1::SelectedSubset
+            || self.ridge.kind != CexFourStageEvaluationKindV1::RidgeBaseline
+            || self.cart.kind != CexFourStageEvaluationKindV1::CartBaseline
+            || self.selected.evaluation.evaluator_version != WALK_FORWARD_EVALUATOR_VERSION
+            || self.ridge.evaluation.evaluator_version
+                != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || self.cart.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || evaluations.iter().any(|evaluation| {
+                !evaluation.passed
+                    || evaluation.protocol_binding().map_or(true, |(_, hash)| {
+                        hash != self.evaluation_protocol.content_sha256
+                    })
+            })
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CexFourStageStrategyV1 {
+    schema_version: String,
+    artifact_id: String,
+    strategy_id: String,
+    mission_id: String,
+    subset_result: CexResearchContentRefV1,
+    subset_checkpoint: CexResearchContentRefV1,
+    signal: CexFourStageSignalV1,
+    sizing: CexFourStageSizingV1,
+    risk: CexFourStageRiskV1,
+    execution: CexFourStageExecutionV1,
+    walk_forward_evidence: CexFourStageWalkForwardV1,
+    deployment_authority: bool,
+    order_submission_authority: bool,
+}
+
+impl CexFourStageStrategyV1 {
+    fn validate(&self) -> Result<(), DomainError> {
+        self.subset_result.validate()?;
+        self.subset_checkpoint.validate()?;
+        self.signal.validate()?;
+        self.sizing.validate()?;
+        self.risk.validate()?;
+        self.execution.validate()?;
+        self.walk_forward_evidence.validate()?;
+        let protocol = self
+            .walk_forward_evidence
+            .selected
+            .evaluation
+            .protocol_binding()?
+            .0;
+        let evaluator_config = self
+            .walk_forward_evidence
+            .selected
+            .evaluation
+            .formula_config()?;
+        let strategy_identity = serde_json::json!({
+            "mission_id": self.mission_id,
+            "signal": self.signal.reference()?,
+            "sizing": self.sizing.reference()?,
+            "risk": self.risk.reference()?,
+            "execution": self.execution.reference()?,
+        });
+        let expected_strategy_id = format!(
+            "cex-combination-strategy-{}",
+            canonical_json_hash(&strategy_identity)?
+        );
+        let mut semantic = self.clone();
+        semantic.artifact_id.clear();
+        let expected_artifact_id = format!(
+            "cex-combination-research-artifact-{}",
+            canonical_json_hash(&semantic)?
+        );
+        if self.schema_version != CEX_COMBINATION_STRATEGY_SCHEMA_V1
+            || self.artifact_id != expected_artifact_id
+            || self.strategy_id != expected_strategy_id
+            || self.mission_id.trim().is_empty()
+            || self.deployment_authority
+            || self.order_submission_authority
+            || self.sizing.parent != self.signal.reference()?
+            || self.risk.parent != self.sizing.reference()?
+            || self.execution.parent != self.risk.reference()?
+            || self.subset_result != self.walk_forward_evidence.selected.source_artifact
+            || self.execution.evaluation_policy != self.walk_forward_evidence.evaluation_protocol
+            || self.execution.costs != protocol.costs
+            || self.execution.horizon != protocol.labels
+            || self.risk.evaluator_policy.content_sha256 != canonical_json_hash(&evaluator_config)?
+            || self.risk.max_drawdown.to_bits() != evaluator_config.max_drawdown.to_bits()
+            || self.risk.position_notional_usd.to_bits()
+                != protocol.costs.position_notional_usd.to_bits()
+            || self.risk.capacity_depth_levels != protocol.costs.capacity_depth_levels
+            || self.risk.max_book_depth_fraction.to_bits()
+                != protocol.costs.max_book_depth_fraction.to_bits()
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFourStageStrategyCandidateV1 {
@@ -3735,23 +4143,9 @@ impl CexFourStageStrategyCandidateV1 {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        let strategy_value: serde_json::Value = serde_json::from_str(&self.strategy_artifact_json)
+        let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
-        let strategy = strategy_value
-            .as_object()
-            .ok_or(DomainError::InvalidStrategyBundle)?;
-        let execution = strategy
-            .get("execution")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(DomainError::InvalidStrategyBundle)?;
-        let walk_forward = strategy
-            .get("walk_forward_evidence")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(DomainError::InvalidStrategyBundle)?;
-        let evaluation_protocol = walk_forward
-            .get("evaluation_protocol")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(DomainError::InvalidStrategyBundle)?;
+        strategy.validate()?;
         if self.schema_version != CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1
             || self.precommit_id != format!("cex-final-precommit:{}", self.mission_id)
             || [
@@ -3770,39 +4164,127 @@ impl CexFourStageStrategyCandidateV1 {
             || !valid_content_sha256(&self.evaluation_protocol_hash)
             || self.deployment_authority
             || self.order_submission_authority
+            || strategy.artifact_id != self.strategy_artifact_id
+            || strategy.mission_id != self.mission_id
+            || strategy.execution.venue != self.venue
+            || strategy.execution.market != self.market
+            || strategy.execution.symbol != self.symbol
             || strategy
-                .get("artifact_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(self.strategy_artifact_id.as_str())
-            || strategy
-                .get("mission_id")
-                .and_then(serde_json::Value::as_str)
-                != Some(self.mission_id.as_str())
-            || strategy
-                .get("deployment_authority")
-                .and_then(serde_json::Value::as_bool)
-                != Some(false)
-            || strategy
-                .get("order_submission_authority")
-                .and_then(serde_json::Value::as_bool)
-                != Some(false)
-            || strategy.get("signal").is_none()
-            || strategy.get("sizing").is_none()
-            || strategy.get("risk").is_none()
-            || execution.get("venue").and_then(serde_json::Value::as_str)
-                != Some(self.venue.as_str())
-            || execution.get("market").and_then(serde_json::Value::as_str)
-                != Some(self.market.as_str())
-            || execution.get("symbol").and_then(serde_json::Value::as_str)
-                != Some(self.symbol.as_str())
-            || evaluation_protocol
-                .get("content_sha256")
-                .and_then(serde_json::Value::as_str)
-                != Some(self.evaluation_protocol_hash.as_str())
+                .walk_forward_evidence
+                .evaluation_protocol
+                .content_sha256
+                != self.evaluation_protocol_hash
         {
             return Err(DomainError::InvalidStrategyBundle);
         }
         validate_live_formula(&self.executable_formula)?;
+        Ok(())
+    }
+
+    pub fn validate_against_factor_bank(
+        &self,
+        factor_bank: &CexFactorBankRevisionV2,
+    ) -> Result<(), DomainError> {
+        self.validate()?;
+        factor_bank.validate()?;
+        let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        let expected_parent = CexResearchContentRefV1 {
+            id: factor_bank.revision_id.clone(),
+            content_sha256: canonical_json_hash(factor_bank)?,
+        };
+        if strategy.signal.parent != expected_parent {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        let mut formula = FactorAst::Terminal(FactorTerminal::Constant("0".to_string()));
+        for selected in &strategy.signal.factors {
+            let entry = factor_bank
+                .entries
+                .iter()
+                .find(|entry| entry.factor_id == selected.factor.factor_id)
+                .ok_or(DomainError::InvalidStrategyBundle)?;
+            if selected.factor.content_sha256 != canonical_json_hash(entry)?
+                || selected.orientation != entry.orientation
+            {
+                return Err(DomainError::InvalidStrategyBundle);
+            }
+            let orientation = match selected.orientation {
+                CexFactorOrientationV1::Positive => 1.0,
+                CexFactorOrientationV1::Negative => -1.0,
+            };
+            let weighted = FactorAst::call(
+                FactorOperator::Mul,
+                vec![
+                    FactorAst::Terminal(FactorTerminal::Constant(
+                        (orientation * selected.normalized_absolute_weight).to_string(),
+                    )),
+                    entry.canonical_ast.clone(),
+                ],
+            )
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+            formula = FactorAst::call(FactorOperator::Add, vec![formula, weighted])
+                .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        }
+        validate_live_formula(&formula)?;
+        if formula != self.executable_formula {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_precommit(
+        &self,
+        precommit: &CexFinalPrecommitV1,
+    ) -> Result<(), DomainError> {
+        self.validate()?;
+        precommit.validate()?;
+        let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        let combination_sha256 = canonical_json_hash(&strategy.walk_forward_evidence)?;
+        if self.precommit_id != precommit.precommit_id
+            || self.mission_id != precommit.mission.id
+            || self.strategy_artifact_id != precommit.four_stage_strategy.id
+            || self.strategy_artifact_sha256 != precommit.four_stage_strategy.content_sha256
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "four-stage identity drifted",
+            ));
+        }
+        if strategy.subset_checkpoint != precommit.mcts_checkpoint
+            || strategy.subset_result != precommit.mcts_subset
+            || strategy.signal.parent != precommit.factor_bank
+            || strategy.signal.weight_policy != precommit.weight_policy
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "search lineage drifted",
+            ));
+        }
+        if strategy.walk_forward_evidence.evaluation_protocol != precommit.evaluation_protocol
+            || strategy.walk_forward_evidence.holdout_id != precommit.holdout_id
+            || strategy.walk_forward_evidence.holdout_state != precommit.holdout_state
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "walk-forward protocol or holdout identity drifted",
+            ));
+        }
+        if strategy.walk_forward_evidence.ridge.source_artifact != precommit.ridge_baseline
+            || strategy.walk_forward_evidence.cart.source_artifact != precommit.cart_baseline
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "baseline identity drifted",
+            ));
+        }
+        if precommit.combination_evidence
+            != (CexResearchContentRefV1 {
+                id: format!("cex-combination-walk-forward-evidence-{combination_sha256}"),
+                content_sha256: combination_sha256,
+            })
+            || canonical_json_hash(&strategy.signal.factors)? != precommit.fixed_weights_sha256
+        {
+            return Err(DomainError::InvalidCexFinalPrecommit(
+                "combination or weight identity drifted",
+            ));
+        }
         Ok(())
     }
 }
