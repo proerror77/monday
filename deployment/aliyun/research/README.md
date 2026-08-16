@@ -252,7 +252,8 @@ The image contains seven stable entrypoints:
 - `/usr/local/bin/monday-prediction-snapshot`
 
 `k8s/alpha-mission-job.example.yaml` is the current blessed BTCUSDT top-of-book
-MCTS baseline against a pre-materialized PIT feature file. The one-time signed
+GP screening and baseline Mission against a pre-materialized PIT feature file.
+It stops before the blocked Factor-Bank subset MCTS stage. The one-time signed
 OSS URLs belong in a Kubernetes Secret and must never be committed. Use distinct
 DuckDB files and result objects per parallel Mission; a later single-writer
 aggregator may merge their immutable evidence.

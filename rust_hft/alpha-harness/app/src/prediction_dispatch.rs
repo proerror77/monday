@@ -1217,7 +1217,7 @@ fn image_digest(image: &str) -> anyhow::Result<String> {
     normalized_sha256("prediction image", digest)
 }
 
-fn canonical_https_object(label: &str, value: &str) -> anyhow::Result<String> {
+pub(crate) fn canonical_https_object(label: &str, value: &str) -> anyhow::Result<String> {
     if value != value.trim() || value.chars().any(char::is_control) {
         bail!("{label} URL must not contain surrounding whitespace or control characters");
     }

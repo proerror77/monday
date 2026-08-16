@@ -2,7 +2,7 @@ use crate::{
     cli::{
         print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
     },
-    data_mission, governance, mission,
+    data_mission, governance, mission, prediction_dispatch,
 };
 use alpha_domain::{
     canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselinePolicyV1,
@@ -683,6 +683,42 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("Mission execution paths and URLs are required");
     }
     normalized_sha256("Mission", &args.mission_sha256)?;
+    validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
+    Ok(())
+}
+
+fn validate_result_readback_binding(
+    result_put_url: &str,
+    result_readback_url: &str,
+) -> anyhow::Result<()> {
+    let put_is_remote =
+        result_put_url.starts_with("http://") || result_put_url.starts_with("https://");
+    let readback_is_remote =
+        result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
+    let same_object = match (put_is_remote, readback_is_remote) {
+        (true, true) => {
+            prediction_dispatch::canonical_https_object("CEX result", result_put_url)?
+                == prediction_dispatch::canonical_https_object(
+                    "CEX result readback",
+                    result_readback_url,
+                )?
+        }
+        (false, false) => {
+            Path::new(
+                result_put_url
+                    .strip_prefix("file://")
+                    .unwrap_or(result_put_url),
+            ) == Path::new(
+                result_readback_url
+                    .strip_prefix("file://")
+                    .unwrap_or(result_readback_url),
+            )
+        }
+        _ => false,
+    };
+    if !same_object {
+        bail!("CEX result readback URL must identify the same immutable result object");
+    }
     Ok(())
 }
 
@@ -2119,20 +2155,28 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_a_published_result_readback_with_different_bytes() {
-        let mut fixture = fixture("result-readback-mismatch");
-        let readback = fixture.root.join("tampered-readback.zip");
-        std::fs::write(&readback, "different immutable object").unwrap();
+    fn execute_rejects_a_result_readback_for_another_object() {
+        let mut fixture = fixture("result-readback-object-mismatch");
+        let readback = fixture.root.join("another-result.zip");
         fixture.args.result_readback_url = readback.to_string_lossy().into_owned();
 
-        let error = execute(fixture.args.clone())
-            .expect_err("a different published readback must fail closed");
+        let error =
+            execute(fixture.args.clone()).expect_err("readback of another object must fail closed");
 
         assert!(error
             .to_string()
-            .contains("published CEX result readback SHA256 mismatch"));
-        assert!(fixture.result_path.exists());
+            .contains("CEX result readback URL must identify the same immutable result object"));
+        assert!(!fixture.result_path.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn cex_result_readback_accepts_distinct_signatures_for_the_same_object() {
+        validate_result_readback_binding(
+            "https://oss-internal/results/attempt-1/results.zip?upload=x",
+            "https://oss-internal/results/attempt-1/results.zip?read=x",
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
