@@ -13,7 +13,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
 | CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
-| Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and selected equal-absolute-weight subset; sealed holdout remains closed |
+| Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Four-stage combination walk-forward | Blocked by [#602](https://github.com/proerror77/monday/issues/602) | No selected subset is compiled into the required Signal/Sizing/Risk/Execution artifact |
 | Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
 | Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
@@ -83,7 +83,8 @@ Resume a persisted subset-search checkpoint into a fresh work directory by
 adding `--resume-url <checkpoint.json>` and
 `--resume-sha256 <checkpoint-sha256>`. Restore validates the complete checkpoint
 against the newly reproduced Mission, Factor Bank, baselines, policies, and
-search state before another transition.
+search state before another transition, then recomputes every restored subset
+evaluation from the reproduced research context.
 
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and
@@ -96,9 +97,11 @@ for audit but does not alter the semantic Mission identity. After both baselines
 pass, execution searches only canonical Factor Bank subsets through add, remove,
 and swap actions, scores mechanically oriented equal-absolute-weight signals on
 the research folds, and emits the typed weight policy plus deterministic
-checkpoint, trace, and selected-subset artifacts. GP screening and subset search
+checkpoint, trace, and terminal-result artifacts. GP screening and subset search
 share one multiplicity correction sized for both bounded candidate families;
-only passing subset evaluations are selectable. It does not emit the later
+only passing subset evaluations are selectable; a terminal search with no
+passing subset publishes `selected: null` instead of dropping the negative
+result. It does not emit the later
 four-stage strategy. Sealed-holdout evaluation requires the separate governed
 precommit boundary. This schema binds prior-evidence identities; later holdout
 and Paper/Shadow gates own receipt and signature verification.

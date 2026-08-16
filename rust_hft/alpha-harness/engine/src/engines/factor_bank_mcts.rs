@@ -238,7 +238,7 @@ pub struct CexFactorBankMctsResultV1 {
     pub terminal_reason: CexFactorBankMctsStopReasonV1,
     pub expansions_used: u64,
     pub candidates_evaluated: usize,
-    pub selected: CexFactorBankMctsSelectionV1,
+    pub selected: Option<CexFactorBankMctsSelectionV1>,
     pub checkpoint_sha256: String,
 }
 
@@ -356,6 +356,7 @@ impl CexFactorBankMcts {
         }
         search.checkpoint = checkpoint;
         search.validate_checkpoint()?;
+        search.validate_restored_evaluations(context)?;
         Ok(search)
     }
 
@@ -488,11 +489,16 @@ impl CexFactorBankMcts {
             .checkpoint
             .terminal_reason
             .ok_or_else(|| "Factor-Bank MCTS search is not terminal".to_string())?;
-        let node = self.selected_node()?;
-        let evaluation = node
-            .evaluation
-            .clone()
-            .ok_or_else(|| "Factor-Bank MCTS selected node has no evaluation".to_string())?;
+        let selected = match self.selected_node()? {
+            Some(node) => Some(CexFactorBankMctsSelectionV1 {
+                subset: node.state.clone(),
+                normalized_equal_abs_weight: 1.0 / node.state.factors.len() as f64,
+                evaluation: node.evaluation.clone().ok_or_else(|| {
+                    "Factor-Bank MCTS selected node has no evaluation".to_string()
+                })?,
+            }),
+            None => None,
+        };
         Ok(CexFactorBankMctsResultV1 {
             schema_version: RESULT_SCHEMA_VERSION.to_string(),
             implementation_version: CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION.to_string(),
@@ -502,20 +508,21 @@ impl CexFactorBankMcts {
             terminal_reason,
             expansions_used: self.checkpoint.expansions_used,
             candidates_evaluated: self.checkpoint.candidates_evaluated,
-            selected: CexFactorBankMctsSelectionV1 {
-                subset: node.state.clone(),
-                normalized_equal_abs_weight: 1.0 / node.state.factors.len() as f64,
-                evaluation,
-            },
+            selected,
             checkpoint_sha256: self.checkpoint.content_hash()?,
         })
     }
 
-    fn selected_node(&self) -> Result<&NodeV1, String> {
+    fn selected_node(&self) -> Result<Option<&NodeV1>, String> {
         self.checkpoint
             .selected_node_id
-            .and_then(|node_id| self.checkpoint.nodes.get(node_id))
-            .ok_or_else(|| "Factor-Bank MCTS selected no subset".to_string())
+            .map(|node_id| {
+                self.checkpoint
+                    .nodes
+                    .get(node_id)
+                    .ok_or_else(|| "Factor-Bank MCTS selected node is missing".to_string())
+            })
+            .transpose()
     }
 
     fn is_better_selection(&self, node_id: usize) -> Result<bool, String> {
@@ -753,6 +760,22 @@ impl CexFactorBankMcts {
             && checkpoint.terminal_reason != self.expected_terminal_reason()?
         {
             return Err("Factor-Bank MCTS terminal reason drifted".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_restored_evaluations(&self, context: &EngineContext<'_>) -> Result<(), String> {
+        validate_context_policy(context, &self.checkpoint.bindings.scoring_policy)?;
+        for node in self.checkpoint.nodes.iter().skip(1) {
+            let restored = node
+                .evaluation
+                .as_ref()
+                .ok_or_else(|| "Factor-Bank MCTS restored node has no evaluation".to_string())?;
+            let recomputed =
+                evaluate_subset(context, &self.factor_bank, &node.state, &self.evaluator)?;
+            if restored != &recomputed {
+                return Err("Factor-Bank MCTS restored evaluation drifted".to_string());
+            }
         }
         Ok(())
     }
@@ -1055,5 +1078,23 @@ mod tests {
                 .insert(forbidden.to_string(), serde_json::json!(1.0));
             assert!(serde_json::from_value::<CexFactorSubsetActionV1>(value).is_err());
         }
+    }
+
+    #[test]
+    fn result_schema_preserves_a_terminal_no_selection_outcome() {
+        let result = CexFactorBankMctsResultV1 {
+            schema_version: RESULT_SCHEMA_VERSION.to_string(),
+            implementation_version: CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION.to_string(),
+            mission_id: "mission-1".to_string(),
+            factor_bank_revision_id: "bank-1".to_string(),
+            baseline_gate_id: "gate-1".to_string(),
+            terminal_reason: CexFactorBankMctsStopReasonV1::CandidateBudgetExhausted,
+            expansions_used: 1,
+            candidates_evaluated: 1,
+            selected: None,
+            checkpoint_sha256: "a".repeat(64),
+        };
+
+        assert!(serde_json::to_value(result).unwrap()["selected"].is_null());
     }
 }

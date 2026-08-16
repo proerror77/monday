@@ -2025,7 +2025,7 @@ mod tests {
         .expect("a failed subset cannot remain selected")
         .contains("selected subset drifted"));
         checkpoint["selected_node_id"] = serde_json::json!(1);
-        let restored = CexFactorBankMcts::restore_json(
+        assert!(CexFactorBankMcts::restore_json(
             &fixture.mission,
             &factor_bank,
             &ridge,
@@ -2034,8 +2034,9 @@ mod tests {
             &context,
             checkpoint,
         )
-        .unwrap();
-        assert!(restored.result().unwrap().selected.evaluation.passed);
+        .err()
+        .expect("self-consistent fabricated evaluations must be rejected")
+        .contains("restored evaluation drifted"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
