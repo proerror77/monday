@@ -1981,14 +1981,21 @@ mod tests {
     }
 
     #[test]
-    fn factor_bank_mcts_reserves_candidate_budget_for_a_combination() {
-        let mut fixture = fixture("factor-bank-mcts-combination-budget");
-        fixture.mission.spec.search.budget.max_candidates = 2;
-        fixture.mission.spec.search.budget.max_expansions = 2;
+    fn factor_bank_mcts_reaches_full_depth_under_a_full_factor_bank_budget() {
+        let mut fixture = fixture("factor-bank-mcts-full-depth-budget");
+        fixture
+            .mission
+            .spec
+            .feature_fields
+            .push("mid_price".to_string());
+        fixture.mission.spec.search.budget.max_candidates = 3;
+        fixture.mission.spec.search.budget.max_expansions = 3;
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
             row.features.insert("spread_bps".to_string(), direction);
+            row.features
+                .insert("mid_price".to_string(), direction * 0.25);
             row.label = direction * 0.001;
         });
 
@@ -1998,7 +2005,7 @@ mod tests {
         let factor_bank: CexFactorBankRevisionV2 =
             serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
                 .unwrap();
-        assert_eq!(factor_bank.entries.len(), 2);
+        assert_eq!(factor_bank.entries.len(), 3);
         let trace: Vec<serde_json::Value> = serde_json::from_slice(
             &std::fs::read(results.join("factor-subset-mcts-trace.json")).unwrap(),
         )
@@ -2006,7 +2013,7 @@ mod tests {
         assert!(trace.iter().any(|step| {
             step["resulting_state"]["factors"]
                 .as_array()
-                .is_some_and(|factors| factors.len() > 1)
+                .is_some_and(|factors| factors.len() == 3)
         }));
 
         let ridge: CexBaselineArtifactV1 =

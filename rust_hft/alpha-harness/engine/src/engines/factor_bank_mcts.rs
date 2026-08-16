@@ -10,7 +10,9 @@ use alpha_domain::{
     CexFactorBankRevisionV2, CexResearchContentRefV1, CexResearchMissionArtifactV1,
     FormulaEvaluatorConfig, SearchBudget, WALK_FORWARD_EVALUATOR_VERSION,
 };
-use hft_search_kernel::{backpropagate, select_expandable, validate_tree, UctNode, UctStats};
+use hft_search_kernel::{
+    backpropagate, select_expandable_progressively, validate_tree, UctNode, UctStats,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -359,12 +361,12 @@ impl CexFactorBankMcts {
         restored.checkpoint = checkpoint.clone();
         restored.validate_checkpoint()?;
 
-        // ponytail: bounded one-step replay is O(trace²); refactor only if approved budgets make restore measurable.
         let mut replayed = Self::new(mission, factor_bank, ridge, cart, gate, context)?;
-        for _ in &checkpoint.trace {
-            if replayed.run(context, Some(1))? != CexFactorBankMctsStopReasonV1::Paused {
-                return Err("Factor-Bank MCTS restored trace extends past termination".to_string());
-            }
+        if checkpoint.expansions_used > 0
+            && replayed.run(context, Some(checkpoint.expansions_used))?
+                != CexFactorBankMctsStopReasonV1::Paused
+        {
+            return Err("Factor-Bank MCTS restored trace extends past termination".to_string());
         }
         if checkpoint.terminal_reason.is_some() {
             if replayed.expected_terminal_reason()?.is_none() {
@@ -403,18 +405,21 @@ impl CexFactorBankMcts {
                 self.validate_checkpoint()?;
                 return Ok(reason);
             }
-            let parent_id = select_expandable(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Factor-Bank MCTS search space is exhausted".to_string())?;
+            let parent_id =
+                select_expandable_progressively(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Factor-Bank MCTS search space is exhausted".to_string())?;
             let node = &self.checkpoint.nodes[parent_id];
-            let first_combination = (node.state.factors.len() == 1 && node.children.is_empty())
-                .then(|| {
-                    node.remaining_actions
-                        .iter()
-                        .position(|action| matches!(action, CexFactorSubsetActionV1::Add { .. }))
-                })
-                .flatten();
-            let action_index = first_combination.unwrap_or_else(|| {
+            let first_deeper_combination = (node.state.factors.len()
+                < self.checkpoint.bindings.max_subset_size
+                && node.children.is_empty())
+            .then(|| {
+                node.remaining_actions
+                    .iter()
+                    .position(|action| matches!(action, CexFactorSubsetActionV1::Add { .. }))
+            })
+            .flatten();
+            let action_index = first_deeper_combination.unwrap_or_else(|| {
                 self.checkpoint
                     .rng
                     .index(self.checkpoint.nodes[parent_id].remaining_actions.len())
@@ -583,7 +588,7 @@ impl CexFactorBankMcts {
             ));
         }
         Ok(
-            select_expandable(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
+            select_expandable_progressively(&self.checkpoint.nodes, 0, UCT_EXPLORATION)
                 .map_err(|error| error.to_string())?
                 .is_none()
                 .then_some(CexFactorBankMctsStopReasonV1::SearchSpaceExhausted),
