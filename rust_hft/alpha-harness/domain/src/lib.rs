@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hft_factor_dsl::{
     validate_live_formula, FactorAst, FactorOperator, FactorTerminal, LiveFormulaCapabilityError,
 };
-use hft_research_manifest::{ArtifactRef, ManifestId};
+use hft_research_manifest::{ArtifactRef, CexInstrumentRulesV2, ManifestId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4122,15 +4122,20 @@ pub struct CexFourStageStrategyCandidateV1 {
     pub venue: CexResearchVenueV1,
     pub market: CexResearchMarketV1,
     pub symbol: String,
+    pub instrument_rules: CexInstrumentRulesV2,
     pub evaluation_protocol_hash: String,
     pub deployment_authority: bool,
     pub order_submission_authority: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CexFourStageRuntimeContractV1 {
     pub zero_epsilon: f64,
     pub observation_frequency_millis: u64,
+    pub tick_size: String,
+    pub step_size: String,
+    pub min_notional: String,
+    pub cross_spread: bool,
 }
 
 impl CexFourStageStrategyCandidateV1 {
@@ -4144,6 +4149,7 @@ impl CexFourStageStrategyCandidateV1 {
         venue: CexResearchVenueV1,
         market: CexResearchMarketV1,
         symbol: String,
+        instrument_rules: CexInstrumentRulesV2,
         evaluation_protocol_hash: String,
     ) -> Result<Self, DomainError> {
         let strategy_artifact_sha256 =
@@ -4161,6 +4167,7 @@ impl CexFourStageStrategyCandidateV1 {
             venue,
             market,
             symbol,
+            instrument_rules,
             evaluation_protocol_hash,
             deployment_authority: false,
             order_submission_authority: false,
@@ -4173,6 +4180,9 @@ impl CexFourStageStrategyCandidateV1 {
         let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
         strategy.validate()?;
+        self.instrument_rules
+            .validate()
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
         if self.schema_version != CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1
             || self.precommit_id != format!("cex-final-precommit:{}", self.mission_id)
             || [
@@ -4215,6 +4225,10 @@ impl CexFourStageStrategyCandidateV1 {
         Ok(CexFourStageRuntimeContractV1 {
             zero_epsilon: strategy.sizing.zero_epsilon,
             observation_frequency_millis: strategy.execution.horizon.observation_frequency_millis,
+            tick_size: self.instrument_rules.tick_size.clone(),
+            step_size: self.instrument_rules.step_size.clone(),
+            min_notional: self.instrument_rules.min_notional.clone(),
+            cross_spread: strategy.execution.costs.cross_spread,
         })
     }
 

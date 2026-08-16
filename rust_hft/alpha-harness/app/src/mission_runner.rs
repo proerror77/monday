@@ -40,8 +40,9 @@ use hft_backtest::{
     },
 };
 use hft_research_manifest::{
-    CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2, ManifestId,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
+    CexInstrumentRulesV2, CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2,
+    ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
 };
 use reqwest::{
     blocking::Client,
@@ -734,6 +735,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
                 &baseline_policy,
                 &weight_policy,
                 &replay_policy,
+                &materialization.snapshot.instrument_rules,
             )?)
         }
         _ => None,
@@ -820,6 +822,7 @@ fn finalize_cex_candidate(
     baseline_policy: &CexBaselinePolicyV1,
     weight_policy: &CexEqualAbsoluteWeightPolicyV1,
     replay_policy: &CexEventReplayPolicyV1,
+    instrument_rules: &CexInstrumentRulesV2,
 ) -> anyhow::Result<CexFinalizationReportV1> {
     let ridge = baselines
         .ridge
@@ -861,6 +864,7 @@ fn finalize_cex_candidate(
         control_mission.spec.instrument.venue.clone(),
         control_mission.spec.instrument.market.clone(),
         control_mission.spec.instrument.symbol.clone(),
+        instrument_rules.clone(),
         control_mission
             .spec
             .policies

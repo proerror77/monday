@@ -1803,6 +1803,9 @@ mod tests {
                     signal_threshold: 0.0,
                     target_position: false,
                     evaluation_interval_millis: None,
+                    target_venue: None,
+                    venue_spec: None,
+                    cross_spread: None,
                 });
                 assert_eq!(iteration.verdict, IterationVerdict::Keep);
                 assert!(validate_live_formula(ast).is_ok());

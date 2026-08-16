@@ -194,6 +194,7 @@ fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn 
             signal_threshold,
             target_position,
             evaluation_interval_millis,
+            execution_contract,
         } = &_config.params
         else {
             return Err(StrategyFactoryError::InvalidParams(format!(
@@ -215,6 +216,13 @@ fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn 
                     signal_threshold: *signal_threshold,
                     target_position: *target_position,
                     evaluation_interval_millis: *evaluation_interval_millis,
+                    target_venue: execution_contract.as_ref().map(|contract| contract.venue),
+                    venue_spec: execution_contract
+                        .as_ref()
+                        .map(|contract| contract.venue_spec.clone()),
+                    cross_spread: execution_contract
+                        .as_ref()
+                        .map(|contract| contract.cross_spread),
                 })
                 .map(|strategy| Box::new(strategy) as Box<dyn StrategyTrait>)
                 .map_err(|error| StrategyFactoryError::BuildFailure(error.to_string()).into())

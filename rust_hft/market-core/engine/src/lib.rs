@@ -1106,12 +1106,17 @@ impl Engine {
                                 self.stats.data_integrity_gaps =
                                     self.stats.data_integrity_gaps.saturating_add(1);
                             }
+                            let canonical_l2 = matches!(
+                                &event,
+                                ports::MarketEvent::Snapshot(_) | ports::MarketEvent::Update(_)
+                            );
                             let book = Self::event_venue_symbol(&event).and_then(|key| {
-                                self.aggregation_engine
-                                    .orderbooks
-                                    .get(&key)
-                                    .cloned()
-                                    .map(|snapshot| (key.venue, snapshot))
+                                let snapshot = if canonical_l2 {
+                                    self.aggregation_engine.canonical_top_n(&key)
+                                } else {
+                                    self.aggregation_engine.orderbooks.get(&key).cloned()
+                                }?;
+                                Some((key.venue, snapshot))
                             });
                             self.pending_market_events.push(PendingMarketEvent {
                                 event,

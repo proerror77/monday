@@ -261,64 +261,96 @@ fn apply_strategy_bundle(
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
         (ActivationArtifact::Formula, artifact) => {
-            let (ast, target_position, signal_threshold, interval_ms) = match artifact {
-                StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None),
-                StrategyBundleArtifact::CexFourStage { strategy } => {
-                    let [instrument] = request.instruments.as_slice() else {
-                        return Err(
-                            "four-stage CEX deployment requires exactly one instrument".to_string()
-                        );
-                    };
-                    let venue = config
-                        .venues
-                        .iter_mut()
-                        .find(|venue| {
-                            venue.name.eq_ignore_ascii_case(&request.venue)
-                                && venue.account_id.as_deref().unwrap_or(&venue.name)
-                                    == request.account_id
-                        })
-                        .ok_or_else(|| {
-                            "four-stage CEX deployment has no exact runtime venue/account"
-                                .to_string()
+            let (ast, target_position, signal_threshold, interval_ms, execution_contract) =
+                match artifact {
+                    StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None, None),
+                    StrategyBundleArtifact::CexFourStage { strategy } => {
+                        let [instrument] = request.instruments.as_slice() else {
+                            return Err(
+                                "four-stage CEX deployment requires exactly one instrument"
+                                    .to_string(),
+                            );
+                        };
+                        let venue = config
+                            .venues
+                            .iter_mut()
+                            .find(|venue| {
+                                venue.name.eq_ignore_ascii_case(&request.venue)
+                                    && venue.account_id.as_deref().unwrap_or(&venue.name)
+                                        == request.account_id
+                            })
+                            .ok_or_else(|| {
+                                "four-stage CEX deployment has no exact runtime venue/account"
+                                    .to_string()
+                            })?;
+                        if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
+                            || instrument != &strategy.symbol
+                            || venue.inst_type.as_deref().is_none_or(|market| {
+                                !market.eq_ignore_ascii_case(strategy.market.as_str())
+                            })
+                        {
+                            return Err(
+                                "four-stage CEX bundle does not match the runtime venue, market, or instrument"
+                                    .to_string(),
+                            );
+                        }
+                        if strategy.market.as_str() != "usdm"
+                            || !matches!(venue.venue_type, runtime::VenueType::Binance)
+                            || venue.rest.as_deref() != Some("https://fapi.binance.com")
+                            || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
+                        {
+                            return Err(
+                                "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
+                                    .to_string(),
+                            );
+                        }
+                        venue.simulate_execution = true;
+                        let contract = strategy
+                            .runtime_contract()
+                            .map_err(|error| error.to_string())?;
+                        let tick_size = contract
+                            .tick_size
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| "sealed CEX tick size is invalid".to_string())?;
+                        let step_size = contract
+                            .step_size
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| "sealed CEX step size is invalid".to_string())?;
+                        let min_notional = contract
+                            .min_notional
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| {
+                            "sealed CEX minimum notional is invalid".to_string()
                         })?;
-                    if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
-                        || instrument != &strategy.symbol
-                        || venue.inst_type.as_deref().is_none_or(|market| {
-                            !market.eq_ignore_ascii_case(strategy.market.as_str())
-                        })
-                    {
-                        return Err(
-                            "four-stage CEX bundle does not match the runtime venue, market, or instrument"
-                                .to_string(),
-                        );
+                        (
+                            &strategy.executable_formula,
+                            true,
+                            contract.zero_epsilon,
+                            Some(contract.observation_frequency_millis),
+                            Some(runtime::FormulaExecutionContract {
+                                venue: hft_core::VenueId::BINANCE,
+                                venue_spec: ports::VenueSpec {
+                                    name: "BINANCE".to_string(),
+                                    tick_size: hft_core::Price(tick_size),
+                                    lot_size: hft_core::Quantity(step_size),
+                                    min_qty: hft_core::Quantity(step_size),
+                                    max_quantity: None,
+                                    min_notional,
+                                    maker_fee_bps: None,
+                                    taker_fee_bps: None,
+                                    rate_limit: None,
+                                },
+                                cross_spread: contract.cross_spread,
+                            }),
+                        )
                     }
-                    if strategy.market.as_str() != "usdm"
-                        || !matches!(venue.venue_type, runtime::VenueType::Binance)
-                        || venue.rest.as_deref() != Some("https://fapi.binance.com")
-                        || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
-                    {
+                    _ => {
                         return Err(
-                            "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
+                            "deployment artifact intent does not match the strategy bundle"
                                 .to_string(),
-                        );
+                        )
                     }
-                    venue.simulate_execution = true;
-                    let contract = strategy
-                        .runtime_contract()
-                        .map_err(|error| error.to_string())?;
-                    (
-                        &strategy.executable_formula,
-                        true,
-                        contract.zero_epsilon,
-                        Some(contract.observation_frequency_millis),
-                    )
-                }
-                _ => {
-                    return Err(
-                        "deployment artifact intent does not match the strategy bundle".to_string(),
-                    )
-                }
-            };
+                };
             let ids = symbols
                 .iter()
                 .map(|symbol| format!("{strategy_name}:{}", symbol.as_str()))
@@ -334,6 +366,7 @@ fn apply_strategy_bundle(
                         signal_threshold,
                         target_position,
                         evaluation_interval_millis: interval_ms,
+                        execution_contract,
                     },
                     risk_limits,
                 },

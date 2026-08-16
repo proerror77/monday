@@ -2,8 +2,9 @@
 //! 注意：優先重用 shared_config 既有型別，僅保留 runtime 專屬欄位。
 
 use engine::dataflow::FlipPolicy;
-use hft_core::Symbol;
+use hft_core::{Symbol, VenueId};
 use hft_factor_dsl::FactorAst;
+use ports::VenueSpec;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -488,6 +489,13 @@ pub enum StrategyType {
     LobFlowGrid,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormulaExecutionContract {
+    pub venue: VenueId,
+    pub venue_spec: VenueSpec,
+    pub cross_spread: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrategyParams {
     Trend {
@@ -518,6 +526,8 @@ pub enum StrategyParams {
         target_position: bool,
         #[serde(default)]
         evaluation_interval_millis: Option<u64>,
+        #[serde(default)]
+        execution_contract: Option<FormulaExecutionContract>,
     },
     Onnx {
         model_path: String,

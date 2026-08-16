@@ -468,8 +468,8 @@ pub struct L2BookView<'a> {
     pub ask_quantities: &'a [FixedQuantity],
 }
 
-/// Stable strategy input. `book` is present when the event identifies a venue and symbol
-/// whose canonical L2 state is currently synchronized.
+/// Stable strategy input. Snapshot/update events carry canonical L2; quote events may carry the
+/// real-time BBO overlay used by strategies that explicitly consume that modality.
 #[derive(Debug, Clone, Copy)]
 pub struct StrategyContext<'a> {
     pub account: &'a AccountView,
@@ -549,7 +549,7 @@ pub enum RiskDecision {
 }
 
 /// 交易所規格（作為穩定契約的一部分）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VenueSpec {
     pub name: String,
     // 精度/步進

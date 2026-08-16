@@ -412,6 +412,7 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
         signal_threshold,
         target_position,
         evaluation_interval_millis,
+        execution_contract,
         ..
     } = &config.strategies[0].params
     else {
@@ -421,6 +422,23 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
     assert_eq!(signal_threshold.to_bits(), f64::EPSILON.to_bits());
     assert_eq!(*evaluation_interval_millis, Some(1_000));
+    let execution_contract = execution_contract
+        .as_ref()
+        .expect("four-stage bundle must preserve its sealed execution contract");
+    assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE);
+    assert_eq!(
+        execution_contract.venue_spec.tick_size.0,
+        rust_decimal::Decimal::new(1, 1)
+    );
+    assert_eq!(
+        execution_contract.venue_spec.lot_size.0,
+        rust_decimal::Decimal::new(1, 3)
+    );
+    assert_eq!(
+        execution_contract.venue_spec.min_notional,
+        rust_decimal::Decimal::from(5)
+    );
+    assert!(!execution_contract.cross_spread);
     let runtime = runtime::SystemBuilder::new(config.clone())
         .auto_register_adapters_strict()
         .unwrap()
