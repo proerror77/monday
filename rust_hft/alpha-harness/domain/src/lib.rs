@@ -627,7 +627,9 @@ impl CexResearchMissionSpecV1 {
             self.search.planned_gp_and_subset_trials()?,
         )?)?;
         if self.search.max_new_iterations == 0
+            || self.search.budget.max_expansions == 0
             || self.search.budget.max_tokens != 0
+            || self.search.budget.max_seconds != 0
             || self.evaluation_protocol.labels != self.instrument.horizon
             || self.policies.screening.content_sha256 != screening_policy_sha256
             || self.policies.evaluation.content_sha256 != self.evaluation_protocol.content_hash()?
@@ -4554,7 +4556,7 @@ mod tests {
                 max_candidates: 2,
                 max_expansions: 2,
                 max_tokens: 0,
-                max_seconds: 30,
+                max_seconds: 0,
             },
             max_new_iterations: 1,
         };
@@ -4694,6 +4696,19 @@ mod tests {
         )
         .unwrap();
         assert!(mission.validate().is_err());
+    }
+
+    #[test]
+    fn cex_mission_requires_a_deterministic_expansion_budget() {
+        for (max_expansions, max_seconds) in [(0, 1), (2, 1)] {
+            let mut mission = cex_mission_artifact(Utc::now());
+            mission.spec.search.budget.max_expansions = max_expansions;
+            mission.spec.search.budget.max_seconds = max_seconds;
+            mission.spec.policies.subset_search.content_sha256 =
+                canonical_json_hash(&mission.spec.search).unwrap();
+
+            assert!(mission.validate().is_err());
+        }
     }
 
     #[test]

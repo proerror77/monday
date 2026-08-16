@@ -81,10 +81,10 @@ cargo run -p alpha-harness -- mission execute \
 
 Resume a persisted subset-search checkpoint into a fresh work directory by
 adding `--resume-url <checkpoint.json>` and
-`--resume-sha256 <checkpoint-sha256>`. Restore validates the complete checkpoint
-against the newly reproduced Mission, Factor Bank, baselines, policies, and
-search state before another transition, then recomputes every restored subset
-evaluation from the reproduced research context.
+`--resume-sha256 <checkpoint-content-sha256>` using the digest emitted in the
+subset result. Restore deterministically replays the complete trace against the
+newly reproduced Mission, Factor Bank, baselines, policies, and research context
+before accepting any persisted RNG, tree statistics, evaluation, or selection.
 
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and

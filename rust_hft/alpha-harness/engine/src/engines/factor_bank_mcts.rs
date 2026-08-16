@@ -116,6 +116,7 @@ impl BindingsV1 {
             || self.max_subset_size < self.min_subset_size
             || self.budget.max_expansions == 0
             || self.budget.max_tokens != 0
+            || self.budget.max_seconds != 0
         {
             return Err("Factor-Bank MCTS bindings are invalid".to_string());
         }
@@ -215,7 +216,8 @@ pub struct CexFactorBankMctsCheckpointV1 {
 
 impl CexFactorBankMctsCheckpointV1 {
     pub fn content_hash(&self) -> Result<String, String> {
-        canonical_json_hash(self).map_err(|error| error.to_string())
+        let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        canonical_json_hash(&value).map_err(|error| error.to_string())
     }
 }
 
@@ -344,20 +346,36 @@ impl CexFactorBankMcts {
         }
         let checkpoint: CexFactorBankMctsCheckpointV1 = serde_json::from_value(value)
             .map_err(|error| format!("invalid Factor-Bank MCTS checkpoint: {error}"))?;
-        let mut search = Self::new(mission, factor_bank, ridge, cart, gate, context)?;
+        let mut restored = Self::new(mission, factor_bank, ridge, cart, gate, context)?;
         if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
             return Err(format!(
                 "Factor-Bank MCTS checkpoint version {} is incompatible with {CHECKPOINT_SCHEMA_VERSION}",
                 checkpoint.schema_version
             ));
         }
-        if checkpoint.bindings != search.checkpoint.bindings {
+        if checkpoint.bindings != restored.checkpoint.bindings {
             return Err("Factor-Bank MCTS checkpoint bindings drifted".to_string());
         }
-        search.checkpoint = checkpoint;
-        search.validate_checkpoint()?;
-        search.validate_restored_evaluations(context)?;
-        Ok(search)
+        restored.checkpoint = checkpoint.clone();
+        restored.validate_checkpoint()?;
+
+        // ponytail: bounded one-step replay is O(trace²); refactor only if approved budgets make restore measurable.
+        let mut replayed = Self::new(mission, factor_bank, ridge, cart, gate, context)?;
+        for _ in &checkpoint.trace {
+            if replayed.run(context, Some(1))? != CexFactorBankMctsStopReasonV1::Paused {
+                return Err("Factor-Bank MCTS restored trace extends past termination".to_string());
+            }
+        }
+        if checkpoint.terminal_reason.is_some() {
+            if replayed.expected_terminal_reason()?.is_none() {
+                return Err("Factor-Bank MCTS restored terminal state drifted".to_string());
+            }
+            replayed.run(context, None)?;
+        }
+        if replayed.checkpoint != checkpoint {
+            return Err("Factor-Bank MCTS restored replay drifted".to_string());
+        }
+        Ok(replayed)
     }
 
     pub fn run(
@@ -581,6 +599,11 @@ impl CexFactorBankMcts {
         self.factor_bank
             .validate()
             .map_err(|error| error.to_string())?;
+        if checkpoint.candidates_evaluated > checkpoint.bindings.budget.max_candidates
+            || checkpoint.expansions_used > checkpoint.bindings.budget.max_expansions
+        {
+            return Err("Factor-Bank MCTS checkpoint exceeds its frozen budget".to_string());
+        }
         if checkpoint.bindings.factor_bank_revision_id != self.factor_bank.revision_id
             || checkpoint.bindings.max_subset_size != self.factor_bank.entries.len()
             || checkpoint.expansions_used != checkpoint.trace.len() as u64
@@ -760,22 +783,6 @@ impl CexFactorBankMcts {
             && checkpoint.terminal_reason != self.expected_terminal_reason()?
         {
             return Err("Factor-Bank MCTS terminal reason drifted".to_string());
-        }
-        Ok(())
-    }
-
-    fn validate_restored_evaluations(&self, context: &EngineContext<'_>) -> Result<(), String> {
-        validate_context_policy(context, &self.checkpoint.bindings.scoring_policy)?;
-        for node in self.checkpoint.nodes.iter().skip(1) {
-            let restored = node
-                .evaluation
-                .as_ref()
-                .ok_or_else(|| "Factor-Bank MCTS restored node has no evaluation".to_string())?;
-            let recomputed =
-                evaluate_subset(context, &self.factor_bank, &node.state, &self.evaluator)?;
-            if restored != &recomputed {
-                return Err("Factor-Bank MCTS restored evaluation drifted".to_string());
-            }
         }
         Ok(())
     }

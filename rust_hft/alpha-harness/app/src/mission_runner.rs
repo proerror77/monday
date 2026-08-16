@@ -161,19 +161,20 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let materialization_path = input_dir.join("materialization.json");
     let resume_checkpoint = if let Some((resume_url, resume_sha256)) = resume_source(&args)? {
         let checkpoint_path = input_dir.join("factor-subset-mcts-resume.json");
-        let (_, actual_sha256) = fetch_to_file(
+        fetch_to_file(
             &client,
             resume_url,
             &checkpoint_path,
             MAX_MCTS_CHECKPOINT_BYTES,
         )?;
-        if actual_sha256 != normalized_sha256("MCTS resume checkpoint", resume_sha256)? {
-            bail!("MCTS resume checkpoint SHA256 mismatch");
+        let checkpoint = serde_json::from_slice(&std::fs::read(checkpoint_path)?)
+            .context("MCTS resume checkpoint is invalid JSON")?;
+        if canonical_json_hash(&checkpoint)?
+            != normalized_sha256("MCTS resume checkpoint", resume_sha256)?
+        {
+            bail!("MCTS resume checkpoint content SHA256 mismatch");
         }
-        Some(
-            serde_json::from_slice(&std::fs::read(checkpoint_path)?)
-                .context("MCTS resume checkpoint is invalid JSON")?,
-        )
+        Some(checkpoint)
     } else {
         None
     };
@@ -1814,6 +1815,46 @@ mod tests {
             CexFactorBankMctsStopReasonV1::Paused
         );
         let paused = serde_json::to_value(chunked.checkpoint().unwrap()).unwrap();
+        let mut rng_drift = paused.clone();
+        rng_drift["rng"] = serde_json::json!(rng_drift["rng"].as_u64().unwrap() ^ 1);
+        let mut stats_drift = paused.clone();
+        let reward = stats_drift["nodes"][0]["total_reward"].as_f64().unwrap() + 1.0;
+        stats_drift["nodes"][0]["total_reward"] = serde_json::json!(reward);
+        stats_drift["nodes"][0]["best_reward"] = serde_json::json!(reward);
+        for drifted in [rng_drift, stats_drift] {
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                drifted,
+            )
+            .err()
+            .expect("derived checkpoint state must replay exactly")
+            .contains("restored replay drifted"));
+        }
+        for (usage, limit) in [
+            ("candidates_evaluated", "max_candidates"),
+            ("expansions_used", "max_expansions"),
+        ] {
+            let mut over_budget = paused.clone();
+            over_budget[usage] =
+                serde_json::json!(over_budget["bindings"]["budget"][limit].as_u64().unwrap() + 1);
+            assert!(CexFactorBankMcts::restore_json(
+                &fixture.mission,
+                &factor_bank,
+                &ridge,
+                &cart,
+                &gate,
+                &context,
+                over_budget,
+            )
+            .err()
+            .expect("checkpoint usage cannot exceed its frozen budget")
+            .contains("exceeds its frozen budget"));
+        }
         let mut resumed = CexFactorBankMcts::restore_json(
             &fixture.mission,
             &factor_bank,
@@ -1913,6 +1954,8 @@ mod tests {
 
         let resume_path = fixture.root.join("paused-factor-subset-mcts.json");
         std::fs::write(&resume_path, serde_json::to_vec_pretty(&paused).unwrap()).unwrap();
+        let resume_content_sha256 = canonical_json_hash(&paused).unwrap();
+        assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
         fixture.args.work_dir = fixture.root.join("work-resumed");
         fixture.args.result_put_url = fixture
             .root
@@ -1921,7 +1964,7 @@ mod tests {
             .into();
         fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         fixture.args.resume_url = Some(resume_path.to_string_lossy().into_owned());
-        fixture.args.resume_sha256 = Some(sha256_file(&resume_path).unwrap());
+        fixture.args.resume_sha256 = Some(resume_content_sha256);
         execute(fixture.args.clone()).unwrap();
         let resumed_result: CexFactorBankMctsResultV1 = serde_json::from_slice(
             &std::fs::read(
@@ -2036,7 +2079,7 @@ mod tests {
         )
         .err()
         .expect("self-consistent fabricated evaluations must be rejected")
-        .contains("restored evaluation drifted"));
+        .contains("restored replay drifted"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
