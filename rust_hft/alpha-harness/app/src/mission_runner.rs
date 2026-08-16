@@ -77,6 +77,7 @@ struct ExecutionReport<'a> {
     engine: &'static str,
     bundle_bytes: u64,
     bundle_sha256: String,
+    readback_bundle_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,11 +437,22 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
+    let readback_bundle = input_dir.join("published-result-readback.zip");
+    let (_, readback_sha256) = fetch_to_file(
+        &client,
+        &args.result_readback_url,
+        &readback_bundle,
+        bundle_bytes,
+    )?;
+    if readback_sha256 != bundle_sha256 {
+        bail!("published CEX result readback SHA256 mismatch");
+    }
     print_json(&ExecutionReport {
         mission_id: &mission_id,
         engine: engine_name(engine),
         bundle_bytes,
         bundle_sha256,
+        readback_bundle_sha256: readback_sha256,
     })
 }
 
@@ -663,6 +675,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
             args.feature_url.as_str(),
             args.materialization_url.as_str(),
             args.result_put_url.as_str(),
+            args.result_readback_url.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -1975,6 +1988,7 @@ mod tests {
         resign_mission(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-2");
         fixture.args.result_put_url = fixture.root.join("result-2.zip").to_string_lossy().into();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
 
@@ -1989,6 +2003,7 @@ mod tests {
         rebind_mission_inputs(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-3");
         fixture.args.result_put_url = fixture.root.join("result-3.zip").to_string_lossy().into();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
         std::fs::remove_dir_all(fixture.root).unwrap();
@@ -2101,6 +2116,23 @@ mod tests {
         .expect_err("a missing bundle must fail before publication");
 
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn execute_rejects_a_published_result_readback_with_different_bytes() {
+        let mut fixture = fixture("result-readback-mismatch");
+        let readback = fixture.root.join("tampered-readback.zip");
+        std::fs::write(&readback, "different immutable object").unwrap();
+        fixture.args.result_readback_url = readback.to_string_lossy().into_owned();
+
+        let error = execute(fixture.args.clone())
+            .expect_err("a different published readback must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("published CEX result readback SHA256 mismatch"));
+        assert!(fixture.result_path.exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[cfg(unix)]
@@ -2491,6 +2523,7 @@ mod tests {
             feature_url: feature_path.to_string_lossy().into_owned(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),
             result_put_url: result_path.to_string_lossy().into_owned(),
+            result_readback_url: result_path.to_string_lossy().into_owned(),
         };
         Fixture {
             root,
