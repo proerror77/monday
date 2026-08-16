@@ -204,6 +204,7 @@ pub struct BinanceMarketStream {
     is_connected: Arc<AtomicBool>,
     last_heartbeat: Arc<AtomicU64>,
     ws_base_url: String,
+    usdm: bool,
 }
 
 impl Default for BinanceMarketStream {
@@ -220,6 +221,7 @@ impl BinanceMarketStream {
             is_connected: Arc::new(AtomicBool::new(false)),
             last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
+            usdm: false,
         }
     }
 
@@ -230,6 +232,7 @@ impl BinanceMarketStream {
             is_connected: Arc::new(AtomicBool::new(false)),
             last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
+            usdm: false,
         }
     }
 
@@ -242,6 +245,35 @@ impl BinanceMarketStream {
     pub fn with_rest_base_url(mut self, url: impl Into<String>) -> Self {
         self.rest_client = BinanceRestClient::with_base_url(url);
         self
+    }
+
+    pub fn with_usdm(mut self) -> Self {
+        self.rest_client = self.rest_client.with_usdm();
+        self.usdm = true;
+        self
+    }
+
+    fn validate_instrument_product(&self, instrument: &InstrumentSpec) -> HftResult<()> {
+        match (self.usdm, instrument.product_type) {
+            (false, ProductType::Spot | ProductType::TokenizedSecuritySpot)
+            | (true, ProductType::Perp) => Ok(()),
+            (true, _) => Err(HftError::Network(format!(
+                "Binance USD-M market data requires a perpetual instrument: {}",
+                instrument.symbol
+            ))),
+            (false, ProductType::Futures | ProductType::Perp) => Err(HftError::Network(format!(
+                "Binance derivatives market data must use the USD-M adapter: {}",
+                instrument.symbol
+            ))),
+            (false, ProductType::BrokerageEquity) => Err(HftError::Network(format!(
+                "Binance brokerage equities market data must use an equities adapter: {}",
+                instrument.symbol
+            ))),
+            (false, ProductType::PredictionMarket) => Err(HftError::Network(format!(
+                "Binance prediction markets must use the W3W Prediction REST API: {}",
+                instrument.symbol
+            ))),
+        }
     }
 
     fn event_queue_capacity() -> usize {
@@ -692,27 +724,7 @@ impl MarketStream for BinanceMarketStream {
         }
 
         for instrument in &instruments {
-            match instrument.product_type {
-                ProductType::Spot | ProductType::TokenizedSecuritySpot => {}
-                ProductType::Futures | ProductType::Perp => {
-                    return Err(HftError::Network(format!(
-                        "Binance derivatives market data must use a derivatives adapter: {}",
-                        instrument.symbol
-                    )));
-                }
-                ProductType::BrokerageEquity => {
-                    return Err(HftError::Network(format!(
-                        "Binance brokerage equities market data must use an equities adapter: {}",
-                        instrument.symbol
-                    )));
-                }
-                ProductType::PredictionMarket => {
-                    return Err(HftError::Network(format!(
-                        "Binance prediction markets must use the W3W Prediction REST API: {}",
-                        instrument.symbol
-                    )));
-                }
-            }
+            self.validate_instrument_product(instrument)?;
         }
 
         info!("訂閱 Binance 商品市場數據: {:?}", instruments);
@@ -733,21 +745,7 @@ impl MarketStream for BinanceMarketStream {
             return Err(HftError::new("商品列表不能為空"));
         }
         for instrument in &instruments {
-            if !matches!(
-                instrument.product_type,
-                ProductType::Spot | ProductType::TokenizedSecuritySpot
-            ) {
-                return Err(HftError::Network(format!(
-                    "Binance {} market data must use its dedicated adapter: {}",
-                    match instrument.product_type {
-                        ProductType::Futures | ProductType::Perp => "derivatives",
-                        ProductType::BrokerageEquity => "brokerage equities",
-                        ProductType::PredictionMarket => "prediction",
-                        _ => unreachable!(),
-                    },
-                    instrument.symbol
-                )));
-            }
+            self.validate_instrument_product(instrument)?;
         }
         self.subscribe_tracked(
             instruments
@@ -930,6 +928,21 @@ mod tests {
 
         let result = stream.subscribe_instruments(vec![instrument]).await;
         assert!(matches!(result, Err(err) if err.to_string().contains("equities adapter")));
+    }
+
+    #[test]
+    fn instrument_product_must_match_spot_or_usdm_mode() {
+        let spot = InstrumentSpec::crypto_spot(Symbol::new("BTCUSDT"), hft_core::VenueId::BINANCE);
+        let mut perp = spot.clone();
+        perp.product_type = ProductType::Perp;
+
+        let spot_stream = BinanceMarketStream::new();
+        assert!(spot_stream.validate_instrument_product(&spot).is_ok());
+        assert!(spot_stream.validate_instrument_product(&perp).is_err());
+
+        let usdm_stream = BinanceMarketStream::new().with_usdm();
+        assert!(usdm_stream.validate_instrument_product(&perp).is_ok());
+        assert!(usdm_stream.validate_instrument_product(&spot).is_err());
     }
 
     #[test]

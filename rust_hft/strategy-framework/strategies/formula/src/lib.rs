@@ -18,6 +18,7 @@ pub struct FormulaStrategyConfig {
     pub ast: FactorAst,
     pub max_order_notional: Decimal,
     pub signal_threshold: f64,
+    pub target_position: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub struct FormulaStrategy {
     config: FormulaStrategyConfig,
     domain: EventDomain,
     signal_state: SignalState,
+    signal_initialized: bool,
 }
 
 impl FormulaStrategy {
@@ -65,6 +67,7 @@ impl FormulaStrategy {
             config,
             domain,
             signal_state: SignalState::Neutral,
+            signal_initialized: false,
         })
     }
 
@@ -102,7 +105,8 @@ impl FormulaStrategy {
         &mut self,
         signal: f64,
         target_venue: hft_core::VenueId,
-        executable_price: impl FnOnce(Side) -> Option<Decimal>,
+        account: &AccountView,
+        executable_price: impl Fn(Side) -> Option<Decimal>,
     ) -> Vec<OrderIntent> {
         let next_state = if signal > self.config.signal_threshold {
             SignalState::Buy
@@ -111,27 +115,74 @@ impl FormulaStrategy {
         } else {
             SignalState::Neutral
         };
-        if next_state == SignalState::Neutral {
+        if !self.config.target_position && next_state == SignalState::Neutral {
             self.signal_state = SignalState::Neutral;
+            self.signal_initialized = true;
             return Vec::new();
         }
-        if next_state == self.signal_state {
+        if self.signal_initialized && next_state == self.signal_state {
             return Vec::new();
         }
-        let side = match next_state {
-            SignalState::Buy => Side::Buy,
-            SignalState::Sell => Side::Sell,
-            SignalState::Neutral => unreachable!(),
+        let (side, raw_quantity) = if self.config.target_position {
+            let current = account
+                .positions
+                .get(&self.config.symbol)
+                .map(|position| position.quantity.0)
+                .unwrap_or(Decimal::ZERO);
+            let target = match next_state {
+                SignalState::Neutral => Decimal::ZERO,
+                SignalState::Buy | SignalState::Sell => {
+                    let target_side = match next_state {
+                        SignalState::Buy => Side::Buy,
+                        SignalState::Sell => Side::Sell,
+                        SignalState::Neutral => unreachable!(),
+                    };
+                    let Some(price) =
+                        executable_price(target_side).filter(|price| *price > Decimal::ZERO)
+                    else {
+                        return Vec::new();
+                    };
+                    let Some(quantity) = self.config.max_order_notional.checked_div(price) else {
+                        return Vec::new();
+                    };
+                    if next_state == SignalState::Buy {
+                        quantity
+                    } else {
+                        -quantity
+                    }
+                }
+            };
+            let delta = target - current;
+            if delta == Decimal::ZERO {
+                self.signal_state = next_state;
+                self.signal_initialized = true;
+                return Vec::new();
+            }
+            if delta > Decimal::ZERO {
+                (Side::Buy, delta)
+            } else {
+                (Side::Sell, -delta)
+            }
+        } else {
+            let side = match next_state {
+                SignalState::Buy => Side::Buy,
+                SignalState::Sell => Side::Sell,
+                SignalState::Neutral => unreachable!(),
+            };
+            let Some(price) = executable_price(side).filter(|price| *price > Decimal::ZERO) else {
+                return Vec::new();
+            };
+            let Some(quantity) = self
+                .config
+                .max_order_notional
+                .checked_div(price)
+                .filter(|quantity| *quantity > Decimal::ZERO)
+            else {
+                return Vec::new();
+            };
+            (side, quantity)
         };
         let Some(limit_price) = executable_price(side).filter(|price| *price > Decimal::ZERO)
-        else {
-            return Vec::new();
-        };
-        let Some(raw_quantity) = self
-            .config
-            .max_order_notional
-            .checked_div(limit_price)
-            .filter(|quantity| *quantity > Decimal::ZERO)
         else {
             return Vec::new();
         };
@@ -148,7 +199,8 @@ impl FormulaStrategy {
         }
 
         self.signal_state = next_state;
-        let intent = if target_venue == hft_core::VenueId::POLYMARKET {
+        self.signal_initialized = true;
+        let mut intent = if target_venue == hft_core::VenueId::POLYMARKET {
             OrderIntent::prediction_market(
                 self.config.symbol.clone(),
                 side,
@@ -171,6 +223,9 @@ impl FormulaStrategy {
                 Some(target_venue),
             )
         };
+        if self.config.target_position {
+            intent.product_type = hft_core::ProductType::Perp;
+        }
         vec![intent]
     }
 }
@@ -189,14 +244,16 @@ enum SignalState {
 }
 
 impl Strategy for FormulaStrategy {
-    fn on_market_event(&mut self, event: &MarketEvent, _account: &AccountView) -> Vec<OrderIntent> {
+    fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent> {
         let Some((signal, source_venue)) = self.evaluate_event(event) else {
             return Vec::new();
         };
         let Some(target_venue) = source_venue else {
             return Vec::new();
         };
-        self.emit_signal(signal, target_venue, |side| executable_price(event, side))
+        self.emit_signal(signal, target_venue, account, |side| {
+            executable_price(event, side)
+        })
     }
 
     fn on_market_event_with_context(
@@ -231,7 +288,7 @@ impl Strategy for FormulaStrategy {
         };
         let best_bid = Price::from(*best_bid).0;
         let best_ask = Price::from(*best_ask).0;
-        self.emit_signal(signal, book.venue, |side| match side {
+        self.emit_signal(signal, book.venue, context.account, |side| match side {
             Side::Buy => Some(best_ask),
             Side::Sell => Some(best_bid),
         })
@@ -441,6 +498,7 @@ mod tests {
             ast,
             max_order_notional: Decimal::from(100),
             signal_threshold: 0.1,
+            target_position: false,
         }
     }
 
@@ -773,6 +831,45 @@ mod tests {
         assert_eq!(intents(&mut strategy, &buy).len(), 1);
         assert_eq!(intents(&mut strategy, &snapshot(1, 3))[0].side, Side::Sell);
         assert!(intents(&mut strategy, &snapshot(1, 3)).is_empty());
+    }
+
+    #[test]
+    fn target_position_mode_reverses_and_closes_with_position_deltas() {
+        let long_quantity = Decimal::from(50).checked_div(Decimal::from(101)).unwrap();
+        let mut account = AccountView::default();
+        account.positions.insert(
+            Symbol::from("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::from("BTCUSDT"),
+                quantity: Quantity(long_quantity),
+                avg_price: Price(Decimal::from(101)),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+        let mut target = config(field("book_imbalance"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = 0.2;
+        target.target_position = true;
+        let mut strategy = FormulaStrategy::new(target.clone()).unwrap();
+
+        let reversal = strategy.on_market_event(&snapshot(1, 3), &account);
+        assert_eq!(reversal.len(), 1);
+        assert_eq!(reversal[0].side, Side::Sell);
+        assert_eq!(reversal[0].product_type, ProductType::Perp);
+        assert_eq!(
+            reversal[0].quantity.0,
+            long_quantity + Decimal::from(50).checked_div(Decimal::from(99)).unwrap()
+        );
+        assert!(strategy
+            .on_market_event(&snapshot(1, 3), &account)
+            .is_empty());
+
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let close = strategy.on_market_event(&snapshot(1, 1), &account);
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].side, Side::Sell);
+        assert_eq!(close[0].quantity.0, long_quantity);
     }
 
     #[test]

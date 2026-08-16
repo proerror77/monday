@@ -261,26 +261,29 @@ fn apply_strategy_bundle(
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
         (ActivationArtifact::Formula, artifact) => {
-            let ast = match artifact {
-                StrategyBundleArtifact::Formula { ast } => ast,
+            let (ast, target_position, order_notional) = match artifact {
+                StrategyBundleArtifact::Formula { ast } => (ast, false, total_notional),
                 StrategyBundleArtifact::CexFourStage { strategy } => {
                     let [instrument] = request.instruments.as_slice() else {
                         return Err(
                             "four-stage CEX deployment requires exactly one instrument".to_string()
                         );
                     };
-                    let runtime_market = config
+                    let venue = config
                         .venues
-                        .iter()
+                        .iter_mut()
                         .find(|venue| {
                             venue.name.eq_ignore_ascii_case(&request.venue)
                                 && venue.account_id.as_deref().unwrap_or(&venue.name)
                                     == request.account_id
                         })
-                        .and_then(|venue| venue.inst_type.as_deref());
+                        .ok_or_else(|| {
+                            "four-stage CEX deployment has no exact runtime venue/account"
+                                .to_string()
+                        })?;
                     if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
                         || instrument != &strategy.symbol
-                        || runtime_market.is_none_or(|market| {
+                        || venue.inst_type.as_deref().is_none_or(|market| {
                             !market.eq_ignore_ascii_case(strategy.market.as_str())
                         })
                     {
@@ -289,7 +292,23 @@ fn apply_strategy_bundle(
                                 .to_string(),
                         );
                     }
-                    &strategy.executable_formula
+                    if strategy.market.as_str() != "usdm"
+                        || !matches!(venue.venue_type, runtime::VenueType::Binance)
+                        || venue.rest.as_deref() != Some("https://fapi.binance.com")
+                        || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
+                    {
+                        return Err(
+                            "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
+                                .to_string(),
+                        );
+                    }
+                    venue.simulate_execution = true;
+                    // ponytail: half the signed exposure permits a direct +target/-target
+                    // reversal without exceeding the signed one-order notional ceiling.
+                    let order_notional = total_notional
+                        .checked_div(rust_decimal::Decimal::from(2))
+                        .ok_or_else(|| "four-stage CEX target notional is invalid".to_string())?;
+                    (&strategy.executable_formula, true, order_notional)
                 }
                 _ => {
                     return Err(
@@ -308,8 +327,9 @@ fn apply_strategy_bundle(
                     symbols,
                     params: runtime::StrategyParams::Formula {
                         ast: ast.clone(),
-                        max_order_notional: total_notional,
+                        max_order_notional: order_notional,
                         signal_threshold: 0.0,
+                        target_position,
                     },
                     risk_limits,
                 },

@@ -1801,6 +1801,7 @@ mod tests {
                     ast: ast.clone(),
                     max_order_notional: Decimal::ONE,
                     signal_threshold: 0.0,
+                    target_position: false,
                 });
                 assert_eq!(iteration.verdict, IterationVerdict::Keep);
                 assert!(validate_live_formula(ast).is_ok());

@@ -901,6 +901,13 @@ impl SystemRuntime {
                             if let Some(rest_url) = &cfg.rest {
                                 stream = stream.with_rest_base_url(rest_url.clone());
                             }
+                            if cfg
+                                .inst_type
+                                .as_deref()
+                                .is_some_and(|market| market.eq_ignore_ascii_case("usdm"))
+                            {
+                                stream = stream.with_usdm();
+                            }
                         }
                         let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
                         self.engine.lock().await.register_event_consumer(consumer);

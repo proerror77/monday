@@ -514,6 +514,8 @@ pub enum StrategyParams {
         ast: FactorAst,
         max_order_notional: Decimal,
         signal_threshold: f64,
+        #[serde(default)]
+        target_position: bool,
     },
     Onnx {
         model_path: String,

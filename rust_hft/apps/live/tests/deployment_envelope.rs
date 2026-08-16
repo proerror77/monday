@@ -353,6 +353,8 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     let bundle_path = directory.join("bundle.json");
     let mut config = configured_runtime();
     config.venues[0].inst_type = Some("usdm".to_string());
+    config.venues[0].rest = Some("https://fapi.binance.com".to_string());
+    config.venues[0].ws_public = Some("wss://fstream.binance.com/ws".to_string());
 
     for (suffix, intent, approval, expected_mode) in [
         (
@@ -400,10 +402,21 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     }
 
     assert_eq!(config.strategies.len(), 1);
+    assert!(config.venues[0].simulate_execution);
     assert!(matches!(
         &config.strategies[0].strategy_type,
         runtime::StrategyType::Formula
     ));
+    let runtime::StrategyParams::Formula {
+        max_order_notional,
+        target_position,
+        ..
+    } = &config.strategies[0].params
+    else {
+        panic!("four-stage bundle did not produce Formula params")
+    };
+    assert!(*target_position);
+    assert_eq!(*max_order_notional, rust_decimal::Decimal::from(250));
     let runtime = runtime::SystemBuilder::new(config.clone())
         .auto_register_adapters_strict()
         .unwrap()
@@ -443,6 +456,38 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     .to_string()
     .contains("runtime venue, market, or instrument"));
     assert!(wrong_market.strategies.is_empty());
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-spot-endpoints",
+                "nonce-cex-spot-endpoints",
+                AllowedIntentType::StartPaper,
+                ApprovalClass::Paper,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut spot_endpoints = configured_runtime();
+    spot_endpoints.venues[0].inst_type = Some("usdm".to_string());
+    let mut adapter =
+        SystemConfigActivationAdapter::new(&mut spot_endpoints, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("canonical fapi and fstream endpoints"));
+    assert!(spot_endpoints.strategies.is_empty());
 
     let signed = sign_envelope(
         bind_bundle(

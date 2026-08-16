@@ -192,6 +192,7 @@ fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn 
             ast,
             max_order_notional,
             signal_threshold,
+            target_position,
         } = &_config.params
         else {
             return Err(StrategyFactoryError::InvalidParams(format!(
@@ -211,6 +212,7 @@ fn create_formula_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn 
                     ast: ast.clone(),
                     max_order_notional: *max_order_notional,
                     signal_threshold: *signal_threshold,
+                    target_position: *target_position,
                 })
                 .map(|strategy| Box::new(strategy) as Box<dyn StrategyTrait>)
                 .map_err(|error| StrategyFactoryError::BuildFailure(error.to_string()).into())
