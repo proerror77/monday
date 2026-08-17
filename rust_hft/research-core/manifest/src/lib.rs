@@ -430,7 +430,7 @@ impl CexReplaySnapshotV3 {
     }
 }
 
-/// Credential-free research snapshot. Account-specific fees belong to runtime calibration;
+/// Credential-free USD-M research snapshot. Account-specific fees belong to runtime calibration;
 /// reproducible research costs are declared by the content-hashed Mission evaluation policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -460,14 +460,17 @@ impl CexReplaySnapshotV4 {
                 "symbol is not canonical",
             ));
         }
-        let mut required = BTreeSet::from([
+        if self.instrument_type != "usdm" {
+            return Err(ManifestError::InvalidCexReplaySnapshot(
+                "credential-free replay snapshot supports USD-M only",
+            ));
+        }
+        let required = BTreeSet::from([
             CEX_MODALITY_LOB.to_string(),
             CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            CEX_MODALITY_FUNDING.to_string(),
+            CEX_MODALITY_OPEN_INTEREST.to_string(),
         ]);
-        if self.instrument_type == "usdm" {
-            required.insert(CEX_MODALITY_FUNDING.to_string());
-            required.insert(CEX_MODALITY_OPEN_INTEREST.to_string());
-        }
         validate_snapshot_core(
             &self.schema_version,
             CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
@@ -500,8 +503,8 @@ impl CexReplaySnapshotV4 {
         {
             return Err(invalid("PIT instrument rules evidence is invalid"));
         }
-        match (&self.instrument_type[..], &self.derivatives_reference) {
-            ("usdm", Some(reference))
+        match &self.derivatives_reference {
+            Some(reference)
                 if pit_series_covers(
                     &reference.funding,
                     self.first_event_time,
@@ -511,7 +514,6 @@ impl CexReplaySnapshotV4 {
                     self.first_event_time,
                     label_available_through,
                 ) && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
-            ("spot", None) => {}
             _ => return Err(invalid("derivatives reference evidence is invalid")),
         }
         Ok(())
@@ -1213,6 +1215,24 @@ mod tests {
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(!encoded.contains("runtime_account_id"));
         assert!(!encoded.contains("account_fingerprint"));
+    }
+
+    #[test]
+    fn credential_free_snapshot_rejects_spot() {
+        let mut snapshot = cex_snapshot();
+        snapshot.instrument_type = "spot".to_string();
+        snapshot.required_modalities = BTreeSet::from([
+            CEX_MODALITY_LOB.to_string(),
+            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+        ]);
+        snapshot.derivatives_reference = None;
+
+        assert_eq!(
+            snapshot.validate().unwrap_err(),
+            ManifestError::InvalidCexReplaySnapshot(
+                "credential-free replay snapshot supports USD-M only"
+            )
+        );
     }
 
     #[test]
