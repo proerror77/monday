@@ -280,6 +280,21 @@ else
     || die 'monotonic observation duration is too short'
 fi
 
+health="$spool/health.json"
+secure_data_file "$health"
+health_snapshot=$(jq -c . "$health")
+health_data=$(jq -er '.data_path | select(type == "string")' <<<"$health_snapshot")
+[[ $health_data == "$spool/"* ]] || die 'health data path escapes the shadow spool'
+health_manifest="$health_data.manifest.json"
+secure_data_file "$health_data"
+secure_data_file "$health_manifest"
+health_observed=$(jq -er \
+  '.observed_at_ns | select(type == "number" and . == floor)' "$health_manifest")
+[[ $health_observed =~ ^[1-9][0-9]*$ ]] \
+  || die 'health references an artifact with an invalid observation time'
+((health_observed >= start_ns && health_observed <= end_ns + MAX_ARTIFACT_GAP_NS)) \
+  || die 'health references an artifact outside the completed gate window'
+
 temp_dir=$(mktemp -d)
 cleanup() {
   rm -rf -- "$temp_dir"
@@ -296,7 +311,7 @@ while IFS= read -r manifest; do
   secure_data_file "$manifest"
   observed=$(jq -er '.observed_at_ns | select(type == "number" and . == floor)' "$manifest")
   [[ $observed =~ ^[1-9][0-9]*$ ]] || die "invalid artifact observation time: $manifest"
-  ((observed >= start_ns && observed <= end_ns)) || continue
+  ((observed >= start_ns && observed <= health_observed)) || continue
   data=${manifest%.manifest.json}
   success="$data._SUCCESS"
   secure_data_file "$data"
@@ -343,8 +358,6 @@ max_gap_ns=$(jq -er '[range(1; length) as $i |
   || die 'artifact observation span is shorter than the gate duration'
 ((max_gap_ns <= MAX_ARTIFACT_GAP_NS)) || die 'artifact gap exceeds 90 seconds'
 
-health="$spool/health.json"
-secure_data_file "$health"
 latest_data_sha=$(jq -er '.[-1].data_sha256' <<<"$artifacts")
 latest_manifest_sha=$(jq -er '.[-1].manifest_sha256' <<<"$artifacts")
 latest_observed=$(jq -er '.[-1].observed_at_ns' <<<"$artifacts")
@@ -354,7 +367,7 @@ latest_data=$(find "$spool" -type f -name reference.ndjson.manifest.json \
 latest_data=${latest_data%.manifest.json}
 jq -e --arg schema "$HEALTH_SCHEMA" --arg data "$latest_data_sha" \
   --arg manifest "$latest_manifest_sha" --arg path "$latest_data" \
-  --argjson observed "$latest_observed" '
+  --argjson observed "$latest_observed" --argjson end "$end_ns" '
   .schema == $schema and .status == "healthy"
   and .source_origin == "https://fapi.binance.com"
   and .api_error_count == 0 and .total_api_errors == 0
@@ -364,10 +377,13 @@ jq -e --arg schema "$HEALTH_SCHEMA" --arg data "$latest_data_sha" \
   and (.last_success_at_ns | type == "number" and . == floor)
   and .last_success_at_ns >= $observed
   and .last_success_at_ns - $observed <= 90000000000
-' "$health" >/dev/null || die 'health is stale, erroneous, or not bound to the latest artifact'
+  and .last_success_at_ns >= ($end - 90000000000)
+  and .last_success_at_ns <= ($end + 90000000000)
+' <<<"$health_snapshot" >/dev/null \
+  || die 'health is stale, erroneous, or not bound to the latest artifact'
 health_evidence=$(jq '{schema,status,source_origin,api_error_count,total_api_errors,
   artifact_error_count,total_artifact_errors,last_success_at_ns,data_sha256,
-  manifest_sha256}' "$health")
+  manifest_sha256}' <<<"$health_snapshot")
 
 capture_identity end
 [[ $end_pid == "$start_pid" && $end_restarts == "$start_restarts" \
