@@ -293,7 +293,7 @@ COLLECTOR_UNIT=collector.service
 UPLOAD_TIMER=upload.timer
 runtime_expected=/release/binance-usdm-reference-collector
 runtime_restart_count=42
-# shellcheck disable=SC2329 # Invoked by the extracted production validator.
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
 systemctl() {
   case "$1" in
     is-active|is-enabled) return 0 ;;
@@ -307,14 +307,16 @@ systemctl() {
     *) return 1 ;;
   esac
 }
-# shellcheck disable=SC2329 # Invoked by the extracted production validator.
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
 readlink() { printf '%s\n' "$runtime_expected"; }
+# shellcheck disable=SC2218 # Function is extracted above with eval.
 runtime_matches_collector "$runtime_expected" true false
 if runtime_matches_collector "$runtime_expected" true true; then
   printf '%s\n' 'fresh candidate accepted a non-zero restart count' >&2
   exit 1
 fi
 runtime_restart_count=0
+# shellcheck disable=SC2218 # Function is extracted above with eval.
 runtime_matches_collector "$runtime_expected" true true
 unset -f systemctl readlink runtime_matches_collector
 
