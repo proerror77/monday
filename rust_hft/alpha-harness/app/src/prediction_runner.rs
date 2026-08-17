@@ -1117,7 +1117,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-mission.json");
@@ -1186,7 +1186,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-forged-mission.json");
@@ -1223,7 +1223,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-mission.json");
@@ -1498,7 +1498,7 @@ mod tests {
             "snapshot_contract_id": snapshot_contract_id,
             "snapshot_hash": snapshot_digest,
             "search_policy_snapshot_id": policy_identity,
-            "search_budget": {"max_candidates": 1, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 1, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         std::fs::write(&mission_path, &mission_bytes).unwrap();

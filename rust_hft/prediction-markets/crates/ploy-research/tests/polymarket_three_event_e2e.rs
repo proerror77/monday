@@ -672,7 +672,6 @@ fn mission(
         search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
         search_budget: PredictionSearchBudget {
             max_candidates: usize::from(!pipeline_smoke),
-            max_llm_calls: usize::from(!pipeline_smoke),
             max_seconds: 30,
         },
     }

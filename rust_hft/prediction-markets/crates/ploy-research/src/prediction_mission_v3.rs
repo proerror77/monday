@@ -223,9 +223,9 @@ pub fn validate_prediction_mission_v3(mission: &PredictionResearchMissionV3) -> 
     )?;
     validate_prediction_search_budget(&mission.search_budget)?;
     if mission.run_mode == PredictionRunMode::PipelineSmoke
-        && (mission.search_budget.max_candidates != 0 || mission.search_budget.max_llm_calls != 0)
+        && mission.search_budget.max_candidates != 0
     {
-        return Err("pipeline_smoke search budget must not request candidates or LLM calls".into());
+        return Err("pipeline_smoke search budget must not request candidates".into());
     }
     let baseline = BTreeSet::from([PredictionMissionCapability::PolymarketChainlink]);
     let full = BTreeSet::from([
@@ -460,7 +460,6 @@ mod tests {
             "search_policy_snapshot_id": sha('6'),
             "search_budget": {
                 "max_candidates": 8,
-                "max_llm_calls": 1,
                 "max_seconds": 60
             }
         })
@@ -657,6 +656,18 @@ mod tests {
     }
 
     #[test]
+    fn v4_rejects_retired_proposal_provider_budget() {
+        let mut mission = settlement_mission();
+        mission["search_budget"]["max_llm_calls"] = serde_json::json!(1);
+
+        assert!(
+            parse_prediction_mission_json(&serde_json::to_vec(&mission).unwrap())
+                .unwrap_err()
+                .contains("max_llm_calls")
+        );
+    }
+
+    #[test]
     fn mission_identity_binds_every_decision_field() {
         let base = parse_v3(settlement_mission());
         let mut variants = Vec::new();
@@ -673,7 +684,6 @@ mod tests {
         let mut changed = base.clone();
         changed.run_mode = PredictionRunMode::PipelineSmoke;
         changed.search_budget.max_candidates = 0;
-        changed.search_budget.max_llm_calls = 0;
         variants.push(changed);
         let mut changed = base.clone();
         changed.authority_profile = PredictionAuthorityProfile::PolymarketChainlinkBinance;

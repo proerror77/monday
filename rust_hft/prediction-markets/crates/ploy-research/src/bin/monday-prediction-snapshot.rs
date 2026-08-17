@@ -1019,7 +1019,7 @@ mod tests {
             "snapshot_contract_id": format!("sha256:{}", "7".repeat(64)),
             "snapshot_hash": "0".repeat(16),
             "search_policy_snapshot_id": format!("sha256:{}", "8".repeat(64)),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 60},
+            "search_budget": {"max_candidates": 0, "max_seconds": 60},
             })
             .to_string(),
         );
