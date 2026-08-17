@@ -198,11 +198,23 @@ expect_failure() {
 }
 
 setup_fixture positive
+write_artifact "$root" "$((start_ns + 4000000000))" post-window-health
+latest_manifest=$(find "$spool" -name reference.ndjson.manifest.json -type f \
+  | sort | tail -n 1)
+latest_data=${latest_manifest%.manifest.json}
+latest_data_sha=$(jq -r .sha256 "$latest_manifest")
+latest_manifest_sha=$(sha256sum "$latest_manifest" | awk '{print $1}')
+jq --arg path "$latest_data" --arg data "$latest_data_sha" \
+  --arg manifest "$latest_manifest_sha" \
+  --argjson success "$((start_ns + 4500000000))" '
+  .data_path=$path | .data_sha256=$data | .manifest_sha256=$manifest
+  | .last_attempt_at_ns=$success | .last_success_at_ns=$success
+' "$spool/health.json" >"$spool/health.tmp" && mv "$spool/health.tmp" "$spool/health.json"
 gate_json=$(run_gate)
 jq -e '
   .schema == "monday.binance_usdm_reference_shadow_gate.v1"
   and .passed == false and .production_eligible == false
-  and .duration_seconds == 2 and .artifact_count == 3
+  and .duration_seconds == 2 and .artifact_count == 4
   and .service.active == true and .service.restart_count == 0
   and all(.artifacts[]; .canonical_readback and .content_rows_verified)
 ' "$gate_json" >/dev/null
