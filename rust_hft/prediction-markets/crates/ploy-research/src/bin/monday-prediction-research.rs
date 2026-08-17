@@ -12,9 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ploy_research::prediction_loop::{
-    current_prediction_policy_snapshot_id, ProposalCallOutput, ProposalClient,
-};
+use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
 use ploy_research::prediction_mcts_authenticated::{
     run_or_resume_authenticated_prediction_mcts_trial, BuiltInAuthenticatedPredictionMctsEvaluator,
 };
@@ -337,17 +335,6 @@ fn run_pipeline_smoke(
     })
 }
 
-struct NoNetworkProposalClient {
-    calls: usize,
-}
-
-impl ProposalClient for NoNetworkProposalClient {
-    fn propose(&mut self, _prompt: &str, _timeout: Duration) -> Result<ProposalCallOutput, String> {
-        self.calls += 1;
-        Err("the baseline ResearchTrial forbids proposal-provider calls".into())
-    }
-}
-
 fn run_research_trial(
     mission_path: &Path,
     snapshot_dir: &Path,
@@ -362,19 +349,14 @@ fn run_research_trial(
     let snapshot = admit_snapshot(snapshot_dir, admitted)?;
     let inputs = authenticate_prediction_mission_v3_inputs(&snapshot, &mission)?;
     let mission_admission = admit_prediction_mission_v3(&mission, &inputs, None)?;
-    let mut client = NoNetworkProposalClient { calls: 0 };
     let run = run_or_resume_authenticated_prediction_mcts_trial(
         &mission,
         &mission_admission,
         &snapshot,
         &admitted.immutable_image_identity,
         output_dir,
-        &mut client,
         &mut BuiltInAuthenticatedPredictionMctsEvaluator,
     )?;
-    if client.calls != 0 {
-        return Err("baseline ResearchTrial attempted a proposal-provider call".into());
-    }
     Ok(ResearchTrialSummary {
         schema_version: "monday.prediction.research_trial.result.v1",
         status: "completed",
@@ -483,7 +465,7 @@ mod tests {
             "snapshot_contract_id": format!("sha256:{}", "4".repeat(64)),
             "snapshot_hash": "5".repeat(16),
             "search_policy_snapshot_id": format!("sha256:{}", "3".repeat(64)),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         }))
         .unwrap()
     }
