@@ -202,7 +202,18 @@ pub struct PredictionSnapshotArgs {
 #[derive(Debug, Subcommand)]
 enum CandidateCommand {
     List(MissionStatusArgs),
+    Show(CandidateShowArgs),
     RegisterOnnx(Box<RegisterOnnxArgs>),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CandidateShowArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub candidate_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -715,6 +726,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
+            CandidateCommand::Show(args) => governance::candidate_show(args),
             CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(*args),
         },
         Command::Evaluate(args) => governance::evaluate(args),
@@ -1203,6 +1215,40 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--objective",
             "alternate authority",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_candidate_show() {
+        let cli = Cli::try_parse_from([
+            "alpha-harness",
+            "candidate",
+            "show",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--candidate-id",
+            "candidate-1",
+        ])
+        .unwrap();
+        let Command::Candidate {
+            command: CandidateCommand::Show(args),
+        } = cli.command
+        else {
+            panic!("expected candidate show command")
+        };
+        assert_eq!(args.mission_id, "mission-1");
+        assert_eq!(args.candidate_id, "candidate-1");
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "candidate",
+            "show",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
         ])
         .is_err());
     }

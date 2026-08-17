@@ -287,6 +287,7 @@ fn write_summary_csv(
         "max_drawdown",
         "max_position",
         "open_position_qty",
+        "net_sharpe",
         "input_manifest_sha256",
         "effective_config_sha256",
         "source_revision",
@@ -301,6 +302,7 @@ fn write_summary_csv(
         format!("{:.6}", summary.max_drawdown),
         format!("{:.6}", summary.max_position),
         format!("{:.6}", summary.open_position_qty),
+        format!("{:.6}", summary.net_sharpe),
         evidence.manifest_sha256.clone(),
         evidence.config_sha256.clone(),
         evidence.source_revision.clone(),
@@ -330,6 +332,7 @@ fn print_summary(summary: &SummaryMetrics) {
     info!("最大回撤: {:.6}", summary.max_drawdown);
     info!("最高持倉: {:.6}", summary.max_position);
     info!("未平倉殘量: {:.6}", summary.open_position_qty);
+    info!("淨夏普 (逐筆, 未年化): {:.6}", summary.net_sharpe);
 }
 
 #[cfg(test)]
@@ -377,6 +380,7 @@ mod tests {
                 max_drawdown: 0.0,
                 max_position: 0.0,
                 open_position_qty: 0.0,
+                net_sharpe: 0.0,
             },
             input_evidence: Some(BacktestInputEvidence {
                 manifest_sha256: "a".repeat(64),

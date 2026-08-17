@@ -556,6 +556,29 @@ impl AlphaStore {
         Ok(store)
     }
 
+    /// Opens an existing database through a DuckDB read-only connection. Unlike
+    /// [`Self::open`] this never creates directories, database files, or
+    /// integrity key material, and never runs migrations.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(StoreError::Database(format!(
+                "database {} does not exist",
+                path.display()
+            )));
+        }
+        let config = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .map_err(database_error)?;
+        let connection = Connection::open_with_flags(path, config).map_err(database_error)?;
+        let integrity_key = load_existing_integrity_key(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection,
+            integrity_key,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -3228,17 +3251,37 @@ fn verify_authentication_tag(
         .map_err(|_| StoreError::AuthenticityMismatch)
 }
 
+fn integrity_key_from_env() -> Result<Option<[u8; INTEGRITY_KEY_BYTES]>, StoreError> {
+    let Some(value) = std::env::var_os(INTEGRITY_KEY_ENV) else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be valid UTF-8 hex"))
+    })?;
+    let bytes = hex::decode(value.trim())
+        .map_err(|_| StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be 32-byte hex")))?;
+    bytes
+        .try_into()
+        .map(Some)
+        .map_err(|_| StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be 32-byte hex")))
+}
+
+fn load_existing_integrity_key(path: &Path) -> Result<[u8; INTEGRITY_KEY_BYTES], StoreError> {
+    if let Some(key) = integrity_key_from_env()? {
+        return Ok(key);
+    }
+    let key_path = integrity_key_path(path);
+    read_integrity_key(&key_path)?.ok_or_else(|| {
+        StoreError::Database(format!(
+            "integrity key {} does not exist",
+            key_path.display()
+        ))
+    })
+}
+
 fn load_or_create_integrity_key(path: &Path) -> Result<[u8; INTEGRITY_KEY_BYTES], StoreError> {
-    if let Some(value) = std::env::var_os(INTEGRITY_KEY_ENV) {
-        let value = value.into_string().map_err(|_| {
-            StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be valid UTF-8 hex"))
-        })?;
-        let bytes = hex::decode(value.trim()).map_err(|_| {
-            StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be 32-byte hex"))
-        })?;
-        return bytes
-            .try_into()
-            .map_err(|_| StoreError::Database(format!("{INTEGRITY_KEY_ENV} must be 32-byte hex")));
+    if let Some(key) = integrity_key_from_env()? {
+        return Ok(key);
     }
 
     let key_path = integrity_key_path(path);
