@@ -273,15 +273,102 @@ grep -Fq 'V2 backlog remains after the old uploader drain' "$cutover"
 grep -Fq 'restore_old_production' "$cutover"
 grep -Fq 'previous-release-restored' "$cutover"
 grep -Fq "validate_upload_env \"\$UPLOAD_ENV\"" "$cutover"
-grep -Fq 'UPLOADER_RELEASE_ROOT=/opt/monday/releases/binance-usdm-reference-upload' "$cutover"
-grep -Fq "OLD_UPLOADER_RELEASE_SHA256=\${BASH_REMATCH[1]}" "$cutover"
-grep -Fq "OLD_UPLOADER_SHA256 == \"\$OLD_UPLOADER_RELEASE_SHA256\"" "$cutover"
+grep -Fq 'validate_old_release_uploader' "$cutover"
+grep -Fq 'previous_uploader_sha256:' "$cutover"
+if grep -Fq 'previous_uploader_release_sha256' "$cutover"; then
+  printf '%s\n' 'cutover receipt retained the obsolete standalone uploader release identity' >&2
+  exit 1
+fi
 grep -Fq 'CANDIDATE_MAY_HAVE_WRITTEN=1' "$cutover"
 grep -Fq "controller: \$controller" "$cutover"
-grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true" "$cutover"
+grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true false" "$cutover"
 grep -Fq "systemctl disable \"\$COLLECTOR_UNIT\" \"\$UPLOAD_TIMER\"" "$cutover"
 grep -Fq "! systemctl is-active --quiet \"\$UPLOAD_SERVICE\"" "$cutover"
 grep -Fq 'quarantine_reference_staging' "$cutover"
+
+# A long-lived baseline accumulates planned RuntimeMaxSec restarts.
+# Only the freshly started candidate and rollback process must remain unrestarted.
+eval "$(awk '/^runtime_matches_collector\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
+COLLECTOR_UNIT=collector.service
+UPLOAD_TIMER=upload.timer
+runtime_expected=/release/binance-usdm-reference-collector
+runtime_restart_count=42
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
+systemctl() {
+  case "$1" in
+    is-active|is-enabled) return 0 ;;
+    show)
+      case " $* " in
+        *' --property=NRestarts '*) printf '%s\n' "$runtime_restart_count" ;;
+        *' --property=MainPID '*) printf '4242\n' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
+readlink() { printf '%s\n' "$runtime_expected"; }
+# shellcheck disable=SC2218 # Function is extracted above with eval.
+runtime_matches_collector "$runtime_expected" true false
+if runtime_matches_collector "$runtime_expected" true true; then
+  printf '%s\n' 'fresh candidate accepted a non-zero restart count' >&2
+  exit 1
+fi
+runtime_restart_count=0
+# shellcheck disable=SC2218 # Function is extracted above with eval.
+runtime_matches_collector "$runtime_expected" true true
+unset -f systemctl readlink runtime_matches_collector
+
+# A release installed by this cutover keeps collector and uploader together.
+# Exercise the real upgrade identity validator against that first-cutover shape.
+eval "$(awk '/^validate_old_release_uploader\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
+first_release_root="$tmp_dir/first-cutover-releases"
+first_release="$first_release_root/$candidate"
+mkdir -p "$first_release"
+cp "$collector_fixture" "$first_release/binance-usdm-reference-collector"
+printf '#!/bin/sh\nexit 0\n' >"$first_release/binance-usdm-reference-upload"
+chmod 0755 "$first_release/binance-usdm-reference-upload"
+first_uploader="$first_release/binance-usdm-reference-upload"
+first_uploader_sha=$(sha256sum "$first_uploader" | awk '{print $1}')
+printf '%s  binance-usdm-reference-upload\n' "$first_uploader_sha" \
+  >"$first_release/binance-usdm-reference-upload.sha256"
+# shellcheck disable=SC2034 # Read by the extracted production validator.
+RELEASE_ROOT=$first_release_root
+# shellcheck disable=SC2034 # Read by the extracted production validator.
+OLD_RELEASE_SHA256=$candidate
+OLD_UPLOADER=$first_uploader
+OLD_UPLOADER_SHA256=
+# shellcheck disable=SC2317,SC2329 # Invoked by the extracted production validator.
+secure_regular_file() {
+  [[ -f $1 && ! -L $1 && ${untrusted_path:-} != "$1" ]] \
+    || fail "untrusted fixture: $1"
+}
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+validate_old_release_uploader
+[[ $OLD_UPLOADER_SHA256 == "$first_uploader_sha" ]]
+
+if (untrusted_path="$first_release/binance-usdm-reference-upload.sha256"; \
+  validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted an untrusted uploader sidecar' >&2
+  exit 1
+fi
+
+legacy_release="$tmp_dir/legacy-uploader-release/$first_uploader_sha"
+mkdir -p "$legacy_release"
+cp "$OLD_UPLOADER" "$legacy_release/binance-usdm-reference-upload"
+# shellcheck disable=SC2030 # Deliberately isolate the rejected path fixture.
+if (OLD_UPLOADER="$legacy_release/binance-usdm-reference-upload"; \
+  validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted a non-collocated uploader' >&2
+  exit 1
+fi
+
+printf 'tampered\n' >>"$first_uploader"
+if (validate_old_release_uploader >/dev/null 2>&1); then
+  printf '%s\n' 'upgrade preflight accepted uploader drift from its sidecar' >&2
+  exit 1
+fi
 
 drain_line=$(grep -n 'STEP=drain-v2-with-old-uploader' "$cutover" | cut -d: -f1)
 switch_line=$(grep -n 'STEP=switch-production-symlink' "$cutover" | cut -d: -f1)
@@ -345,7 +432,9 @@ atomic_install() { printf 'install %s\n' "$3" >>"$rollback_trace"; }
 atomic_symlink() { printf 'symlink %s\n' "$2" >>"$rollback_trace"; }
 systemctl() { :; }
 health_ready_for_release() { printf 'health-readback\n' >>"$rollback_trace"; }
-runtime_matches_collector() { printf 'runtime %s %s\n' "$1" "$2" >>"$rollback_trace"; }
+runtime_matches_collector() {
+  printf 'runtime %s %s %s\n' "$1" "$2" "$3" >>"$rollback_trace"
+}
 readlink() {
   local path=${!#}
   [[ $path == "$COLLECTOR_LINK" ]] && printf '%s\n' "$OLD_COLLECTOR" \
@@ -368,8 +457,8 @@ restore_old_production
 grep -Fq 'symlink /collector-link' "$rollback_trace"
 grep -Fq 'symlink /uploader-link' "$rollback_trace"
 grep -Fq 'health-readback' "$rollback_trace"
-grep -Fq 'runtime /old/collector false' "$rollback_trace"
-grep -Fq 'runtime /old/collector true' "$rollback_trace"
+grep -Fq 'runtime /old/collector false true' "$rollback_trace"
+grep -Fq 'runtime /old/collector true true' "$rollback_trace"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
 grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \
