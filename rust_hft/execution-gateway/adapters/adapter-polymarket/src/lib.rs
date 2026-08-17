@@ -19,10 +19,10 @@ use hft_core::{
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::request::{
-    BalanceAllowanceRequest, MidpointRequest, OrdersRequest, TradesRequest,
+    BalanceAllowanceRequest, OrdersRequest, TradesRequest,
 };
 use polymarket_client_sdk::clob::types::response::{
-    CancelOrdersResponse, FeeDetails, OpenOrderResponse, TradeResponse,
+    CancelOrdersResponse, FeeDetails, OpenOrderResponse, OrderSummary, TradeResponse,
 };
 use polymarket_client_sdk::clob::types::{
     Amount, AssetType, OrderStatusType, OrderType as PolymarketOrderType, Side as PolymarketSide,
@@ -53,7 +53,7 @@ use tokio::task::JoinHandle;
 const TERMINAL_CURSOR: &str = "LTE=";
 const USER_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_WS_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
-const USDC_SCALE: u32 = 6;
+const PUSD_SCALE: u32 = 6;
 const RECONCILE_OVERLAP_US: u64 = 60_000_000;
 const TERMINAL_TOMBSTONE_TTL_US: u64 = 24 * 60 * 60 * 1_000_000;
 const MAX_TERMINAL_TOMBSTONES: usize = 4_096;
@@ -767,6 +767,12 @@ struct PreparedOrder {
     immediate: bool,
 }
 
+#[derive(Default)]
+struct OpenOrderReservations {
+    collateral: Decimal,
+    conditional: HashMap<U256, Decimal>,
+}
+
 enum SubmissionSuccessEvent {
     OrderAck,
     OrderModified {
@@ -1168,6 +1174,7 @@ impl PolymarketExecutionClient {
                 .await
                 .map_err(|error| HftError::InvalidOrder(error.to_string()))?
         } else {
+            let post_only = is_post_only_order_type(&prepared.order_type);
             client
                 .limit_order()
                 .token_id(prepared.token_id)
@@ -1175,6 +1182,7 @@ impl PolymarketExecutionClient {
                 .size(prepared.quantity)
                 .price(prepared.price)
                 .order_type(prepared.order_type)
+                .post_only(post_only)
                 .metadata(metadata)
                 .build()
                 .await
@@ -1293,26 +1301,32 @@ impl PolymarketExecutionClient {
             polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest::builder()
                 .token_id(token_id)
                 .build();
+        let initial_book = client
+            .order_book(&book_request)
+            .await
+            .map_err(map_sdk_error)?;
+        load_fee_schedules_for_markets(
+            client,
+            HashSet::from([initial_book.market]),
+            &self.fee_schedules,
+        )
+        .await?;
+        // Fee metadata can take several seconds on a cache miss. Refresh the complete book so
+        // price, tick, minimum size, and balance routing come from one current venue snapshot.
         let book = client
             .order_book(&book_request)
             .await
             .map_err(map_sdk_error)?;
-        load_fee_schedules_for_markets(client, HashSet::from([book.market]), &self.fee_schedules)
-            .await?;
-        // Fee metadata can take several seconds on a cache miss. Read the executable reference
-        // only after that request completes so slippage is never priced from the stale midpoint.
-        let midpoint = client
-            .midpoint(&MidpointRequest::builder().token_id(token_id).build())
-            .await
-            .map_err(map_sdk_error)?;
         validate_live_envelope_fresh(envelope, "after venue preparation")?;
         let tick = book.tick_size.as_decimal();
+        let executable_reference =
+            executable_reference_price(&book.bids, &book.asks, envelope.intent.side)?;
         let (price, order_type, immediate) = execution_price_policy(
             envelope.intent.order_type,
             envelope.intent.time_in_force,
             envelope.intent.price,
             envelope.intent.side,
-            midpoint.mid,
+            executable_reference,
             max_slippage_bps,
             tick,
         )?;
@@ -1350,7 +1364,7 @@ impl PolymarketExecutionClient {
                     .asset_type(AssetType::Collateral)
                     .build(),
                 quantity * price,
-                "USDC",
+                "pUSD",
             ),
             PolymarketSide::Sell => (
                 BalanceAllowanceRequest::builder()
@@ -1366,15 +1380,26 @@ impl PolymarketExecutionClient {
                 ))
             }
         };
+        let reservations = open_order_reservations(&load_all_orders(client).await?)?;
         let balance = client
             .balance_allowance(request)
             .await
             .map_err(map_sdk_error)?;
-        let available = match side {
+        let reserved = match side {
+            PolymarketSide::Buy => reservations.collateral,
+            PolymarketSide::Sell => reservations
+                .conditional
+                .get(&token_id)
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+            _ => unreachable!("side was validated above"),
+        };
+        let total = match side {
             PolymarketSide::Buy => raw_balance_to_units(balance.balance)?,
             PolymarketSide::Sell => conditional_balance_to_shares(balance.balance)?,
             _ => unreachable!("side was validated above"),
         };
+        let available = available_after_reservation(total, reserved, label)?;
         if available < required_units {
             return Err(HftError::InsufficientBalance(format!(
                 "Polymarket {label}: required={required_units}, available={available}"
@@ -1550,12 +1575,34 @@ fn required_max_slippage_bps(value: Option<i32>) -> HftResult<i32> {
     Ok(value)
 }
 
+fn executable_reference_price(
+    bids: &[OrderSummary],
+    asks: &[OrderSummary],
+    side: Side,
+) -> HftResult<Decimal> {
+    let reference = match side {
+        Side::Buy => asks.iter().map(|level| level.price).min(),
+        Side::Sell => bids.iter().map(|level| level.price).max(),
+    };
+    reference
+        .filter(|price| *price > Decimal::ZERO && *price < Decimal::ONE)
+        .ok_or_else(|| {
+            HftError::InvalidOrder(format!(
+                "Polymarket has no executable {} reference price",
+                match side {
+                    Side::Buy => "ask",
+                    Side::Sell => "bid",
+                }
+            ))
+        })
+}
+
 fn execution_price_policy(
     order_type: HftOrderType,
     time_in_force: TimeInForce,
     intent_price: Option<Price>,
     side: Side,
-    midpoint: Decimal,
+    executable_reference: Decimal,
     max_slippage_bps: i32,
     tick: Decimal,
 ) -> HftResult<(Decimal, PolymarketOrderType, bool)> {
@@ -1564,7 +1611,13 @@ fn execution_price_policy(
             let price = intent_price.ok_or_else(|| {
                 HftError::InvalidOrder("Polymarket LIMIT requires a price".to_string())
             })?;
-            validate_limit_price_against_midpoint(price.0, midpoint, side, max_slippage_bps, tick)?;
+            validate_limit_price_against_reference(
+                price.0,
+                executable_reference,
+                side,
+                max_slippage_bps,
+                tick,
+            )?;
             let (order_type, immediate) = match time_in_force {
                 TimeInForce::GTC => (PolymarketOrderType::GTC, false),
                 TimeInForce::IOC => (PolymarketOrderType::FAK, true),
@@ -1582,27 +1635,34 @@ fn execution_price_policy(
                     ))
                 }
             };
-            let price = slippage_price(midpoint, side, max_slippage_bps, tick)?;
+            let price = slippage_price(executable_reference, side, max_slippage_bps, tick)?;
             Ok((price, order_type, true))
         }
     }
 }
 
-fn validate_limit_price_against_midpoint(
+fn is_post_only_order_type(order_type: &PolymarketOrderType) -> bool {
+    matches!(
+        order_type,
+        PolymarketOrderType::GTC | PolymarketOrderType::GTD
+    )
+}
+
+fn validate_limit_price_against_reference(
     price: Decimal,
-    midpoint: Decimal,
+    reference: Decimal,
     side: Side,
     max_slippage_bps: i32,
     tick: Decimal,
 ) -> HftResult<()> {
-    let boundary = slippage_price(midpoint, side, max_slippage_bps, tick)?;
+    let boundary = slippage_price(reference, side, max_slippage_bps, tick)?;
     let outside_boundary = match side {
         Side::Buy => price > boundary,
         Side::Sell => price < boundary,
     };
     if outside_boundary {
         return Err(HftError::Risk(format!(
-            "Polymarket LIMIT price {price} exceeds signed {max_slippage_bps} bps boundary {boundary} from midpoint {midpoint}"
+            "Polymarket LIMIT price {price} exceeds signed {max_slippage_bps} bps boundary {boundary} from executable reference {reference}"
         )));
     }
     if price <= Decimal::ZERO
@@ -1795,7 +1855,7 @@ fn units_to_raw(value: Decimal) -> HftResult<U256> {
     if value < Decimal::ZERO {
         return Err(HftError::Parse("negative Polymarket amount".to_string()));
     }
-    let scaled = (value * Decimal::from(10_u64.pow(USDC_SCALE))).ceil();
+    let scaled = (value * Decimal::from(10_u64.pow(PUSD_SCALE))).ceil();
     U256::from_str(&scaled.to_string())
         .map_err(|error| HftError::Parse(format!("Polymarket amount is out of range: {error}")))
 }
@@ -1806,7 +1866,7 @@ fn raw_balance_to_units(value: Decimal) -> HftResult<Decimal> {
             "Polymarket returned invalid raw balance: {value}"
         )));
     }
-    Ok(value / Decimal::from(10_u64.pow(USDC_SCALE)))
+    Ok(value / Decimal::from(10_u64.pow(PUSD_SCALE)))
 }
 
 fn conditional_balance_to_shares(value: Decimal) -> HftResult<Decimal> {
@@ -1816,7 +1876,7 @@ fn conditional_balance_to_shares(value: Decimal) -> HftResult<Decimal> {
         )));
     }
     if value.scale() == 0 {
-        Ok(value / Decimal::from(10_u64.pow(USDC_SCALE)))
+        Ok(value / Decimal::from(10_u64.pow(PUSD_SCALE)))
     } else {
         Ok(value)
     }
@@ -1914,6 +1974,44 @@ async fn load_all_orders(client: &AuthenticatedClient) -> HftResult<Vec<OpenOrde
         cursor = Some(page.next_cursor);
     }
     Ok(orders)
+}
+
+fn open_order_reservations(orders: &[OpenOrderResponse]) -> HftResult<OpenOrderReservations> {
+    let mut reservations = OpenOrderReservations::default();
+    for order in orders {
+        let remaining = order.original_size - order.size_matched;
+        if remaining < Decimal::ZERO {
+            return Err(HftError::Parse(format!(
+                "Polymarket open order {} has matched size above original size",
+                order.id
+            )));
+        }
+        match order.side {
+            PolymarketSide::Buy => reservations.collateral += remaining * order.price,
+            PolymarketSide::Sell => {
+                *reservations.conditional.entry(order.asset_id).or_default() += remaining;
+            }
+            _ => {
+                return Err(HftError::Parse(format!(
+                    "Polymarket open order {} has an unknown side",
+                    order.id
+                )))
+            }
+        }
+    }
+    Ok(reservations)
+}
+
+fn available_after_reservation(
+    total: Decimal,
+    reserved: Decimal,
+    label: &str,
+) -> HftResult<Decimal> {
+    total.checked_sub(reserved).filter(|value| *value >= Decimal::ZERO).ok_or_else(|| {
+        HftError::Execution(format!(
+            "Polymarket {label} open-order reservation exceeds balance: total={total}, reserved={reserved}"
+        ))
+    })
 }
 
 async fn load_all_trades(
@@ -4062,6 +4160,7 @@ impl ExecutionClient for PolymarketExecutionClient {
 
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
         let client = self.authenticated()?;
+        let reservations = open_order_reservations(&load_all_orders(client).await?)?;
         let collateral = client
             .balance_allowance(
                 BalanceAllowanceRequest::builder()
@@ -4071,10 +4170,11 @@ impl ExecutionClient for PolymarketExecutionClient {
             .await
             .map_err(map_sdk_error)?;
         let cash = raw_balance_to_units(collateral.balance)?;
+        let available_cash = available_after_reservation(cash, reservations.collateral, "pUSD")?;
         let mut balances = vec![AccountBalance {
-            asset: "USDC".to_string(),
-            available: cash,
-            frozen: Decimal::ZERO,
+            asset: "pUSD".to_string(),
+            available: available_cash,
+            frozen: reservations.collateral,
             total: cash,
             usd_value: Some(cash),
         }];
@@ -4082,13 +4182,25 @@ impl ExecutionClient for PolymarketExecutionClient {
             self.load_positions()
                 .await?
                 .into_iter()
-                .map(|position| AccountBalance {
-                    asset: format!("OUTCOME:{}", position.asset),
-                    available: position.size,
-                    frozen: Decimal::ZERO,
-                    total: position.size,
-                    usd_value: Some(position.current_value),
-                }),
+                .map(|position| {
+                    let frozen = reservations
+                        .conditional
+                        .get(&position.asset)
+                        .copied()
+                        .unwrap_or(Decimal::ZERO);
+                    Ok(AccountBalance {
+                        asset: format!("OUTCOME:{}", position.asset),
+                        available: available_after_reservation(
+                            position.size,
+                            frozen,
+                            "conditional token",
+                        )?,
+                        frozen,
+                        total: position.size,
+                        usd_value: Some(position.current_value),
+                    })
+                })
+                .collect::<HftResult<Vec<_>>>()?,
         );
         Ok(balances)
     }
@@ -4355,17 +4467,28 @@ mod tests {
     }
 
     fn rest_open_order(venue_id: &str) -> OpenOrderResponse {
+        rest_open_order_with(venue_id, "123", "BUY", "5", "0", "0.5")
+    }
+
+    fn rest_open_order_with(
+        venue_id: &str,
+        asset_id: &str,
+        side: &str,
+        original_size: &str,
+        size_matched: &str,
+        price: &str,
+    ) -> OpenOrderResponse {
         serde_json::from_value(serde_json::json!({
             "id": venue_id,
             "status": "LIVE",
             "owner": api_key(),
             "maker_address": "0x2222222222222222222222222222222222222222",
             "market": B256::ZERO.to_string(),
-            "asset_id": "123",
-            "side": "BUY",
-            "original_size": "5",
-            "size_matched": "0",
-            "price": "0.5",
+            "asset_id": asset_id,
+            "side": side,
+            "original_size": original_size,
+            "size_matched": size_matched,
+            "price": price,
             "associate_trades": [],
             "outcome": "YES",
             "created_at": 1_705_322_096,
@@ -4793,7 +4916,40 @@ mod tests {
     }
 
     #[test]
-    fn all_supported_order_types_enforce_signed_midpoint_slippage_boundaries() {
+    fn executable_reference_uses_best_ask_for_buys_and_best_bid_for_sells() {
+        let bids = vec![
+            OrderSummary::builder()
+                .price(Decimal::new(34, 2))
+                .size(Decimal::TEN)
+                .build(),
+            OrderSummary::builder()
+                .price(Decimal::new(36, 2))
+                .size(Decimal::TEN)
+                .build(),
+        ];
+        let asks = vec![
+            OrderSummary::builder()
+                .price(Decimal::new(42, 2))
+                .size(Decimal::TEN)
+                .build(),
+            OrderSummary::builder()
+                .price(Decimal::new(40, 2))
+                .size(Decimal::TEN)
+                .build(),
+        ];
+
+        assert_eq!(
+            executable_reference_price(&bids, &asks, Side::Buy).unwrap(),
+            Decimal::new(40, 2)
+        );
+        assert_eq!(
+            executable_reference_price(&bids, &asks, Side::Sell).unwrap(),
+            Decimal::new(36, 2)
+        );
+    }
+
+    #[test]
+    fn all_supported_order_types_enforce_signed_executable_slippage_boundaries() {
         let midpoint = Decimal::new(5, 1);
         let tick = Decimal::new(1, 3);
         let bps = required_max_slippage_bps(Some(100)).unwrap();
@@ -4923,6 +5079,38 @@ mod tests {
             },
         );
         assert!(validate_final_order_quantity(&missing_quantity, Decimal::from(5)).is_err());
+    }
+
+    #[test]
+    fn gtc_limits_are_post_only_and_open_orders_freeze_inventory() {
+        assert!(is_post_only_order_type(&PolymarketOrderType::GTC));
+        assert!(is_post_only_order_type(&PolymarketOrderType::GTD));
+        assert!(!is_post_only_order_type(&PolymarketOrderType::FAK));
+        assert!(!is_post_only_order_type(&PolymarketOrderType::FOK));
+
+        let orders = vec![
+            rest_open_order_with("buy-1", "123", "BUY", "5", "1", "0.5"),
+            rest_open_order_with("buy-2", "456", "BUY", "2", "0", "0.25"),
+            rest_open_order_with("sell-1", "123", "SELL", "7", "2", "0.6"),
+        ];
+        let reservations = open_order_reservations(&orders).unwrap();
+        assert_eq!(reservations.collateral, Decimal::new(25, 1));
+        assert_eq!(reservations.conditional[&U256::from(123)], Decimal::from(5));
+        assert_eq!(
+            available_after_reservation(Decimal::from(10), reservations.collateral, "pUSD")
+                .unwrap(),
+            Decimal::new(75, 1)
+        );
+        assert!(available_after_reservation(
+            Decimal::from(4),
+            reservations.conditional[&U256::from(123)],
+            "conditional token",
+        )
+        .is_err());
+        assert!(open_order_reservations(&[rest_open_order_with(
+            "invalid", "123", "SELL", "1", "2", "0.5",
+        )])
+        .is_err());
     }
 
     #[test]

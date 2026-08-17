@@ -126,6 +126,11 @@ impl ExecutionControlHandle {
         self
     }
 
+    pub fn with_response_timeout(mut self, response_timeout: Duration) -> Self {
+        self.response_timeout = response_timeout;
+        self
+    }
+
     pub fn with_operation_gate(mut self, operation_gate: Arc<Mutex<()>>) -> Self {
         self.operation_gate = operation_gate;
         self
@@ -656,7 +661,7 @@ impl ExecutionControlHandle {
                 .filter(|balance| {
                     matches!(
                         balance.asset.to_ascii_uppercase().as_str(),
-                        "USD" | "USDC" | "USDC.E" | "USDT"
+                        "USD" | "USDC" | "USDC.E" | "USDT" | "PUSD"
                     )
                 })
                 .map(|balance| balance.total)
@@ -2845,7 +2850,7 @@ mod tests {
                 account_id: Some(hft_core::AccountId("polymarket-main".to_string())),
                 open_orders: Ok(open_orders),
                 balances: Some(Ok(vec![balance(
-                    "USDC",
+                    "pUSD",
                     Decimal::from(80),
                     Some(Decimal::from(80)),
                 )])),
@@ -2872,7 +2877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pristine_polymarket_account_bootstrap_imports_authoritative_cash_and_positions() {
+    async fn pristine_polymarket_account_bootstrap_imports_pusd_cash_and_positions() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.set_portfolio_manager(Box::new(TestPortfolio::default()));
         let engine = Arc::new(Mutex::new(engine));

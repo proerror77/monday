@@ -37,8 +37,8 @@ use tracing::{debug, error, info, warn};
 use crate::collector::POLYMARKET_CLOB_WS_ENDPOINT;
 use crate::reference_prices::{
     infer_pyth_asset_class, market_symbol_to_binance_symbol, normalize_reference_symbol,
-    pyth_symbol, upsert_reference_price, ReferenceAssetClass, ReferencePriceKey,
-    ReferencePriceRegistry, ReferencePriceSnapshot, ReferencePriceSource,
+    parse_chainlink_twap_price, pyth_symbol, upsert_reference_price, ReferenceAssetClass,
+    ReferencePriceKey, ReferencePriceRegistry, ReferencePriceSnapshot, ReferencePriceSource,
 };
 
 const POLYMARKET_RTDS_WS_ENDPOINT: &str = "wss://ws-live-data.polymarket.com";
@@ -1865,10 +1865,10 @@ pub fn spawn_quote_feed_until(
     })
 }
 
-/// Spawn a task that subscribes to Chainlink price feeds via RTDS WebSocket.
+/// Spawn a task that subscribes to Chainlink 60-second TWAP prices via RTDS WebSocket.
 ///
 /// Used to capture S0 (open price) at eventStartTime for 5M markets.
-/// Polymarket uses Chainlink as the canonical price source for settlement.
+/// Current Polymarket 5M/15M crypto markets use this feed for their resolution baseline.
 ///
 /// Prices are stored in the shared cache for scanner to use when creating EventDiscovered.
 pub fn spawn_chainlink_feed(
@@ -1895,12 +1895,14 @@ pub fn spawn_chainlink_feed(
         let client = RtdsClient::new(POLYMARKET_RTDS_WS_ENDPOINT, rtds_market_data_ws_config())
             .expect("RTDS market-data config should be valid");
 
-        // Subscribe to all Chainlink symbols (None = all, Some(vec) = specific)
-        // For now subscribe to all since we only have 7 symbols
-        let stream = match client.subscribe_chainlink_prices(None) {
+        let subscription = Subscription::builder()
+            .topic("crypto_prices_twap_sixty".to_string())
+            .msg_type("update".to_string())
+            .build();
+        let stream = match client.subscribe_raw(subscription) {
             Ok(s) => s,
             Err(e) => {
-                error!(error = %e, "Failed to subscribe to chainlink_prices");
+                error!(error = %e, "Failed to subscribe to Chainlink 60-second TWAP prices");
                 return;
             }
         };
@@ -1910,7 +1912,11 @@ pub fn spawn_chainlink_feed(
 
         while let Some(result) = stream.next().await {
             match result {
-                Ok(chainlink_price) => {
+                Ok(message) => {
+                    let Some(chainlink_price) = parse_chainlink_twap_price(&message.payload) else {
+                        warn!(topic = %message.topic, "Invalid Chainlink 60-second TWAP payload");
+                        continue;
+                    };
                     // Filter to only our symbols
                     if !symbols_chainlink.contains(&chainlink_price.symbol) {
                         continue;
@@ -1930,7 +1936,7 @@ pub fn spawn_chainlink_feed(
                             },
                             asset_class: ReferenceAssetClass::Crypto,
                             value: chainlink_price.value,
-                            full_accuracy_value: None,
+                            full_accuracy_value: Some(chainlink_price.full_accuracy_value.clone()),
                             source_timestamp: ts,
                             received_at,
                             is_carried_forward: false,
@@ -1945,7 +1951,9 @@ pub fn spawn_chainlink_feed(
                         source: Arc::from(ReferencePriceSource::Chainlink.as_str()),
                         asset_class: Arc::from(ReferenceAssetClass::Crypto.as_str()),
                         price: chainlink_price.value,
-                        full_accuracy_value: None,
+                        full_accuracy_value: Some(Arc::from(
+                            chainlink_price.full_accuracy_value.as_str(),
+                        )),
                         is_carried_forward: false,
                         received_at: Some(received_at),
                         ts,
@@ -1991,7 +1999,7 @@ pub fn spawn_chainlink_feed(
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "RTDS chainlink_prices stream error");
+                    warn!(error = %e, "RTDS Chainlink 60-second TWAP stream error");
                     // Don't exit on transient errors, let SDK handle reconnection
                 }
             }
