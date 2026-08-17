@@ -8,9 +8,10 @@ use hft_collector::{
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
 use hft_research_manifest::{
-    CexReplayDatasetManifestV1, CexReplayDatasetManifestV3, CexReplaySnapshotV1,
-    CexReplaySnapshotV3, CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1,
-    CEX_REPLAY_DATASET_SCHEMA_V3,
+    CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
+    CexReplaySnapshotV1, CexReplaySnapshotV2, CexReplaySnapshotV3, CEX_REPLAY_DATASET_KIND,
+    CEX_REPLAY_DATASET_SCHEMA_V1, CEX_REPLAY_DATASET_SCHEMA_V2, CEX_REPLAY_DATASET_SCHEMA_V3,
+    CEX_REPLAY_SNAPSHOT_SCHEMA_V3,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -170,6 +171,35 @@ fn validate_cex_replay_features(
     Ok(())
 }
 
+fn validate_cex_replay_features_v2(
+    snapshot: &CexReplaySnapshotV2,
+    features: &FeatureDatasetManifest,
+) -> anyhow::Result<()> {
+    snapshot.validate()?;
+    validate_cex_replay_features(
+        &CexReplaySnapshotV3 {
+            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
+            venue: snapshot.venue.clone(),
+            instrument_type: snapshot.instrument_type.clone(),
+            symbol: snapshot.symbol.clone(),
+            replay_clock: snapshot.replay_clock.clone(),
+            required_modalities: snapshot.required_modalities.clone(),
+            source_segments: snapshot.source_segments.clone(),
+            first_event_time: snapshot.first_event_time,
+            last_event_time: snapshot.last_event_time,
+            feature_artifact_sha256: snapshot.feature_artifact_sha256.clone(),
+            feature_availability_policy: snapshot.feature_availability_policy.clone(),
+            bucket_ms: snapshot.bucket_ms,
+            label_horizon_buckets: snapshot.label_horizon_buckets,
+            top_depth: snapshot.top_depth,
+            instrument_rules: snapshot.instrument_rules.clone(),
+            fee_schedule: snapshot.fee_schedule.clone(),
+            derivatives_reference: snapshot.derivatives_reference.clone(),
+        },
+        features,
+    )
+}
+
 fn validate_cex_replay_features_v1(
     snapshot: &CexReplaySnapshotV1,
     features: &FeatureDatasetManifest,
@@ -234,6 +264,7 @@ pub enum RegisteredResearchDataset {
 
 pub enum CexReplayAdmission {
     V1(Box<CexReplayDatasetManifestV1>),
+    V2(Box<CexReplayDatasetManifestV2>),
     V3(Box<CexReplayDatasetManifestV3>),
 }
 
@@ -241,6 +272,7 @@ impl CexReplayAdmission {
     fn manifest_id(&self) -> &str {
         match self {
             Self::V1(manifest) => &manifest.manifest_id,
+            Self::V2(manifest) => &manifest.manifest_id,
             Self::V3(manifest) => &manifest.manifest_id,
         }
     }
@@ -248,6 +280,7 @@ impl CexReplayAdmission {
     fn symbol(&self) -> &str {
         match self {
             Self::V1(manifest) => &manifest.snapshot.symbol,
+            Self::V2(manifest) => &manifest.snapshot.symbol,
             Self::V3(manifest) => &manifest.snapshot.symbol,
         }
     }
@@ -278,9 +311,9 @@ impl RegisteredResearchDataset {
                 false,
             ),
             Self::CexReplay {
-                admission: CexReplayAdmission::V1(_),
+                admission: CexReplayAdmission::V1(_) | CexReplayAdmission::V2(_),
                 ..
-            } => bail!("historical V1 CEX replay evidence is read-only and cannot execute"),
+            } => bail!("historical CEX replay evidence is read-only and cannot execute"),
             Self::CexReplay {
                 admission: CexReplayAdmission::V3(manifest),
                 features,
@@ -413,6 +446,21 @@ pub fn read_registered_research_dataset(
                     fields.2,
                 )
             }
+            CEX_REPLAY_DATASET_SCHEMA_V2 => {
+                let manifest: CexReplayDatasetManifestV2 = serde_json::from_value(value.clone())?;
+                manifest.validate()?;
+                let fields = (
+                    manifest.manifest_id.clone(),
+                    manifest.feature_manifest_id.clone(),
+                    manifest.snapshot.symbol.clone(),
+                );
+                (
+                    CexReplayAdmission::V2(Box::new(manifest)),
+                    fields.0,
+                    fields.1,
+                    fields.2,
+                )
+            }
             CEX_REPLAY_DATASET_SCHEMA_V3 => {
                 let manifest: CexReplayDatasetManifestV3 = serde_json::from_value(value.clone())?;
                 manifest.validate()?;
@@ -445,6 +493,9 @@ pub fn read_registered_research_dataset(
         match &admission {
             CexReplayAdmission::V1(manifest) => {
                 validate_cex_replay_features_v1(&manifest.snapshot, &features)?
+            }
+            CexReplayAdmission::V2(manifest) => {
+                validate_cex_replay_features_v2(&manifest.snapshot, &features)?
             }
             CexReplayAdmission::V3(manifest) => {
                 validate_cex_replay_features(&manifest.snapshot, &features)?

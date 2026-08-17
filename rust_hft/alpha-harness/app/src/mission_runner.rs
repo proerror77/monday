@@ -40,9 +40,9 @@ use hft_backtest::{
     },
 };
 use hft_research_manifest::{
-    CexInstrumentRulesV2, CexReplayDatasetManifestV3, CexReplaySnapshotV1, CexReplaySnapshotV3,
-    ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4,
+    CexInstrumentRulesV2, CexReplayDatasetManifestV3, CexReplaySnapshotV1, CexReplaySnapshotV2,
+    CexReplaySnapshotV3, ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4,
 };
 use reqwest::{
     blocking::Client,
@@ -1173,6 +1173,17 @@ fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
             .context("historical V2 materialization snapshot is invalid")?;
             snapshot.validate().map_err(anyhow::Error::new)?;
             bail!("historical V2 materialization is read-only and cannot execute")
+        }
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
+            let snapshot: CexReplaySnapshotV2 = serde_json::from_value(
+                value
+                    .get("snapshot")
+                    .cloned()
+                    .context("historical V3 materialization has no snapshot")?,
+            )
+            .context("historical V3 materialization snapshot is invalid")?;
+            snapshot.validate().map_err(anyhow::Error::new)?;
+            bail!("historical V3 materialization is read-only and cannot execute")
         }
         _ => bail!("materialization kind or schema is unsupported"),
     }
@@ -5056,6 +5067,48 @@ message binance_replay {
         assert!(error
             .to_string()
             .contains("historical V2 materialization is read-only"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn historical_v3_materialization_decodes_read_only() {
+        let fixture = fixture("historical-v3-read-only");
+        let mut value = fixture.materialization.clone();
+        value["schema_version"] = serde_json::json!(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3);
+        let snapshot = value["snapshot"].as_object_mut().unwrap();
+        snapshot.insert(
+            "schema_version".to_string(),
+            serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2),
+        );
+        let first_event_time: chrono::DateTime<Utc> =
+            serde_json::from_value(snapshot["first_event_time"].clone()).unwrap();
+        snapshot.insert(
+            "latency_cost".to_string(),
+            serde_json::json!({
+                "method": "verified_order_lifecycle_realized_slippage",
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "runtime_account_id": "binance-main",
+                "account_fingerprint": "9".repeat(64),
+                "evidence": cex_triplet('8'),
+                "first_observed_at": first_event_time - ChronoDuration::seconds(2),
+                "last_observed_at": first_event_time - ChronoDuration::seconds(1),
+                "available_at": first_event_time - ChronoDuration::seconds(1),
+                "observations": 160,
+                "p50_ns": 1_000_000,
+                "p95_ns": 2_000_000,
+                "p99_ns": 3_000_000,
+                "p50_cost_bps": "0.1",
+                "p95_cost_bps": "0.5",
+                "p99_cost_bps": "0.6"
+            }),
+        );
+
+        let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("historical V3 materialization is read-only"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
