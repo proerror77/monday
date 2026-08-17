@@ -400,6 +400,13 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
         };
         assert_eq!(request.mode, expected_mode);
         assert_eq!(request.market.as_deref(), Some("usdm"));
+        let costs = request
+            .cex_execution_costs
+            .as_ref()
+            .expect("four-stage activation must preserve sealed costs");
+        assert_eq!(costs.fee_bps, 2.0);
+        assert_eq!(costs.latency_bps, 0.5);
+        assert_eq!(costs.funding_bps, 0.0);
     }
 
     assert_eq!(config.strategies.len(), 1);
@@ -790,6 +797,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
         market: None,
+        cex_execution_costs: None,
         instruments: vec!["BTCUSDT".to_string()],
         artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
         mode: ActivationMode::Paper,
@@ -1130,6 +1138,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             market: None,
+            cex_execution_costs: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -1158,6 +1167,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             market: None,
+            cex_execution_costs: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,

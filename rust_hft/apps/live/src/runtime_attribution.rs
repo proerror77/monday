@@ -5,7 +5,10 @@ use std::time::Duration;
 use crate::deployment_envelope::{
     ActivationArtifact, ActivationMode, ActivationRequest, RuntimeFeedbackLog,
 };
-use alpha_domain::{AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent};
+use alpha_domain::{
+    AttributionKind, AttributionMode, AttributionOutcome, EvaluationCostsV1,
+    RuntimeAttributionEvent,
+};
 use chrono::{DateTime, Utc};
 use engine::{aggregation::MarketView, RuntimeTruthStatus};
 use hft_core::{Side, Symbol, VenueId, VenueSymbol};
@@ -61,6 +64,7 @@ struct AttributionState {
     invalid_order_ids: HashSet<String>,
     targets: BTreeMap<String, StrategyTarget>,
     ledgers: BTreeMap<String, StrategyLedger>,
+    modeled_transaction_cost_bps: Option<Decimal>,
     valuation_started: bool,
     permanently_invalid: Option<String>,
 }
@@ -68,6 +72,7 @@ struct AttributionState {
 #[derive(Debug)]
 struct StrategyLedger {
     realized_pnl: Decimal,
+    modeled_execution_cost: Decimal,
     positions: BTreeMap<String, PositionLedger>,
     high_water_mark: Decimal,
     max_drawdown_pct: f64,
@@ -84,6 +89,10 @@ struct StrategySnapshotMetrics {
     gross_realized_pnl: Decimal,
     gross_unrealized_pnl: Decimal,
     gross_total_pnl: Decimal,
+    modeled_execution_cost: Decimal,
+    net_realized_pnl: Decimal,
+    net_unrealized_pnl: Decimal,
+    net_total_pnl: Decimal,
     session_equity: Decimal,
     session_high_water_mark: Decimal,
     session_drawdown_pct: f64,
@@ -197,6 +206,7 @@ impl RuntimeAttributionObserver {
 impl AttributionState {
     fn new(activation: &ActivationRequest) -> anyhow::Result<Self> {
         let targets = strategy_targets(activation)?;
+        let modeled_transaction_cost_bps = modeled_transaction_cost_bps(activation)?;
         let ledgers = targets
             .iter()
             .map(|(strategy_id, target)| {
@@ -204,6 +214,7 @@ impl AttributionState {
                     strategy_id.clone(),
                     StrategyLedger {
                         realized_pnl: Decimal::ZERO,
+                        modeled_execution_cost: Decimal::ZERO,
                         positions: BTreeMap::new(),
                         high_water_mark: target.risk_capital,
                         max_drawdown_pct: 0.0,
@@ -216,6 +227,7 @@ impl AttributionState {
             invalid_order_ids: HashSet::new(),
             targets,
             ledgers,
+            modeled_transaction_cost_bps,
             valuation_started: false,
             permanently_invalid: None,
         })
@@ -238,7 +250,15 @@ impl AttributionState {
 }
 
 impl StrategyLedger {
-    fn apply_fill(&mut self, symbol: &str, side: Side, price: Decimal, quantity: Decimal) {
+    fn apply_fill(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        modeled_execution_cost: Decimal,
+    ) {
+        self.modeled_execution_cost += modeled_execution_cost;
         let signed_quantity = signed_quantity(side, quantity);
         let position = self.positions.entry(symbol.to_string()).or_default();
         position.apply_fill(signed_quantity, price, &mut self.realized_pnl);
@@ -268,7 +288,10 @@ impl StrategyLedger {
 
         let gross_realized_pnl = self.realized_pnl;
         let gross_total_pnl = gross_realized_pnl + gross_unrealized_pnl;
-        let session_equity = target.risk_capital + gross_total_pnl;
+        let net_realized_pnl = gross_realized_pnl - self.modeled_execution_cost;
+        let net_unrealized_pnl = gross_unrealized_pnl;
+        let net_total_pnl = net_realized_pnl + net_unrealized_pnl;
+        let session_equity = target.risk_capital + net_total_pnl;
         if session_equity > self.high_water_mark {
             self.high_water_mark = session_equity;
         }
@@ -284,6 +307,10 @@ impl StrategyLedger {
             gross_realized_pnl,
             gross_unrealized_pnl,
             gross_total_pnl,
+            modeled_execution_cost: self.modeled_execution_cost,
+            net_realized_pnl,
+            net_unrealized_pnl,
+            net_total_pnl,
             session_equity,
             session_high_water_mark: self.high_water_mark,
             session_drawdown_pct,
@@ -429,6 +456,7 @@ fn execution_attribution(
             timestamp,
             fill_id,
         } => {
+            let modeled_transaction_cost_bps = state.modeled_transaction_cost_bps;
             let Some(metadata) = state.orders.get_mut(&order_id.0) else {
                 return Ok(None);
             };
@@ -443,10 +471,20 @@ fn execution_attribution(
             if !metadata.seen_fill_ids.insert(source_id.clone()) {
                 return Ok(None);
             }
+            let modeled_execution_cost = modeled_transaction_cost_bps
+                .map(|cost_bps| modeled_fill_cost(price.0, quantity.0, cost_bps))
+                .transpose()?
+                .unwrap_or(Decimal::ZERO);
             let metadata = metadata.clone();
             if state.permanently_invalid.is_none() {
                 if let Some(ledger) = state.ledgers.get_mut(&metadata.strategy_id) {
-                    ledger.apply_fill(&metadata.symbol, metadata.side, price.0, quantity.0);
+                    ledger.apply_fill(
+                        &metadata.symbol,
+                        metadata.side,
+                        price.0,
+                        quantity.0,
+                        modeled_execution_cost,
+                    );
                 }
             }
             let mut metrics = BTreeMap::new();
@@ -458,6 +496,16 @@ fn execution_attribution(
                 "fill_quantity".to_string(),
                 finite_metric("fill_quantity", quantity.to_f64())?,
             );
+            if let Some(cost_bps) = modeled_transaction_cost_bps {
+                metrics.insert(
+                    "modeled_transaction_cost_bps".to_string(),
+                    decimal_metric("modeled_transaction_cost_bps", cost_bps)?,
+                );
+                metrics.insert(
+                    "modeled_execution_cost".to_string(),
+                    decimal_metric("modeled_execution_cost", modeled_execution_cost)?,
+                );
+            }
             if let Some(value) = metadata.timing.write_to_private_ack_us {
                 metrics.insert("write_to_private_ack_us".to_string(), value as f64);
             }
@@ -824,7 +872,7 @@ fn valid_portfolio_attribution(
     observed_at: DateTime<Utc>,
 ) -> anyhow::Result<RuntimeAttributionEvent> {
     let mut event = portfolio_event(activation, target, observed_at, AttributionOutcome::Healthy);
-    event.metrics = snapshot_metrics(target, snapshot)?;
+    event.metrics = snapshot_metrics(activation, target, snapshot)?;
     Ok(event)
 }
 
@@ -874,10 +922,12 @@ fn portfolio_event(
 }
 
 fn snapshot_metrics(
+    activation: &ActivationRequest,
     target: &StrategyTarget,
     snapshot: StrategySnapshotMetrics,
 ) -> anyhow::Result<BTreeMap<String, f64>> {
-    let mut metrics = coverage_metrics(target.risk_capital, true, true, false, true)?;
+    let cost_complete = activation.cex_execution_costs.is_some();
+    let mut metrics = coverage_metrics(target.risk_capital, true, true, cost_complete, true)?;
     metrics.insert(
         "gross_realized_pnl".to_string(),
         decimal_metric("gross_realized_pnl", snapshot.gross_realized_pnl)?,
@@ -889,6 +939,22 @@ fn snapshot_metrics(
     metrics.insert(
         "gross_total_pnl".to_string(),
         decimal_metric("gross_total_pnl", snapshot.gross_total_pnl)?,
+    );
+    metrics.insert(
+        "modeled_execution_cost".to_string(),
+        decimal_metric("modeled_execution_cost", snapshot.modeled_execution_cost)?,
+    );
+    metrics.insert(
+        "net_realized_pnl".to_string(),
+        decimal_metric("net_realized_pnl", snapshot.net_realized_pnl)?,
+    );
+    metrics.insert(
+        "net_unrealized_pnl".to_string(),
+        decimal_metric("net_unrealized_pnl", snapshot.net_unrealized_pnl)?,
+    );
+    metrics.insert(
+        "net_total_pnl".to_string(),
+        decimal_metric("net_total_pnl", snapshot.net_total_pnl)?,
     );
     metrics.insert(
         "session_equity".to_string(),
@@ -909,6 +975,9 @@ fn snapshot_metrics(
             Some(snapshot.session_max_drawdown_pct),
         )?,
     );
+    if let Some(costs) = activation.cex_execution_costs.as_ref() {
+        append_sealed_cost_metrics(&mut metrics, costs)?;
+    }
     Ok(metrics)
 }
 
@@ -942,6 +1011,14 @@ fn coverage_metrics(
     );
     metrics.insert(
         "fee_coverage_complete".to_string(),
+        if fee_complete {
+            COVERAGE_COMPLETE
+        } else {
+            COVERAGE_MISSING
+        },
+    );
+    metrics.insert(
+        "execution_cost_coverage_complete".to_string(),
         if fee_complete {
             COVERAGE_COMPLETE
         } else {
@@ -1043,6 +1120,63 @@ fn strategy_targets(
     }
 
     Ok(targets)
+}
+
+fn modeled_transaction_cost_bps(activation: &ActivationRequest) -> anyhow::Result<Option<Decimal>> {
+    let Some(costs) = activation.cex_execution_costs.as_ref() else {
+        return Ok(None);
+    };
+    if [
+        costs.fee_bps,
+        costs.rebate_bps,
+        costs.funding_bps,
+        costs.latency_bps,
+        costs.slippage_bps,
+    ]
+    .iter()
+    .any(|value| !value.is_finite() || *value < 0.0)
+        || costs.cross_spread
+        || costs.funding_bps != 0.0
+    {
+        anyhow::bail!("runtime attribution received unsupported sealed CEX costs");
+    }
+    let cost_bps = costs.fee_bps - costs.rebate_bps + costs.latency_bps + costs.slippage_bps;
+    Ok(Some(Decimal::from_f64_retain(cost_bps).ok_or_else(
+        || anyhow::anyhow!("runtime attribution modeled transaction cost is not finite"),
+    )?))
+}
+
+fn modeled_fill_cost(
+    price: Decimal,
+    quantity: Decimal,
+    cost_bps: Decimal,
+) -> anyhow::Result<Decimal> {
+    price
+        .checked_mul(quantity)
+        .and_then(|notional| notional.checked_mul(cost_bps))
+        .and_then(|cost| cost.checked_div(Decimal::from(10_000)))
+        .ok_or_else(|| anyhow::anyhow!("runtime attribution modeled execution cost overflowed"))
+}
+
+fn append_sealed_cost_metrics(
+    metrics: &mut BTreeMap<String, f64>,
+    costs: &EvaluationCostsV1,
+) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("sealed_fee_bps", costs.fee_bps),
+        ("sealed_rebate_bps", costs.rebate_bps),
+        ("sealed_funding_bps", costs.funding_bps),
+        ("sealed_latency_bps", costs.latency_bps),
+        ("sealed_slippage_bps", costs.slippage_bps),
+        ("sealed_position_notional_usd", costs.position_notional_usd),
+        (
+            "sealed_max_book_depth_fraction",
+            costs.max_book_depth_fraction,
+        ),
+    ] {
+        metrics.insert(name.to_string(), finite_metric(name, Some(value))?);
+    }
+    Ok(())
 }
 
 fn base_attribution(
@@ -1164,6 +1298,7 @@ mod tests {
             account_id: "account-1".to_string(),
             venue: "bitget".to_string(),
             market: None,
+            cex_execution_costs: None,
             instruments: symbols.iter().map(|symbol| symbol.to_string()).collect(),
             artifact: ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -1698,6 +1833,7 @@ mod tests {
         assert_eq!(btc.metrics["gross_total_pnl"], 5.0);
         assert_eq!(btc.metrics["session_equity"], 505.0);
         assert_eq!(btc.metrics["fee_coverage_complete"], 0.0);
+        assert_eq!(btc.metrics["execution_cost_coverage_complete"], 0.0);
 
         let eth = event_for(&events, "bundle-1:ETHUSDT");
         assert_eq!(eth.symbol.as_deref(), Some("ETHUSDT"));
@@ -1782,6 +1918,53 @@ mod tests {
             1.0
         );
         assert_eq!(event.metrics["authoritative_account_equity"], 0.0);
+    }
+
+    #[test]
+    fn sealed_cex_costs_reduce_net_runtime_pnl_and_complete_coverage() {
+        let mut activation = activation();
+        activation.cex_execution_costs = Some(EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        });
+        let mut state = AttributionState::new(&activation).unwrap();
+        execution_attribution(&activation, &mut state, &order_new("cost-order")).unwrap();
+        let fill = execution_attribution(
+            &activation,
+            &mut state,
+            &ExecutionEvent::Fill {
+                order_id: OrderId("cost-order".to_string()),
+                price: Price::from_f64(100.0).unwrap(),
+                quantity: Quantity::from_f64(2.0).unwrap(),
+                timestamp: NOW_US,
+                fill_id: "cost-fill".to_string(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!((fill.metrics["modeled_execution_cost"] - 0.05).abs() < f64::EPSILON);
+
+        let snapshot = snapshot_events(
+            &activation,
+            &mut state,
+            &market_with_mid(&[("BTCUSDT", 100.0)]),
+        )
+        .remove(0);
+        assert_eq!(snapshot.metrics["gross_total_pnl"], 0.0);
+        assert!((snapshot.metrics["modeled_execution_cost"] - 0.05).abs() < f64::EPSILON);
+        assert!((snapshot.metrics["net_total_pnl"] + 0.05).abs() < f64::EPSILON);
+        assert!((snapshot.metrics["session_equity"] - 499.95).abs() < f64::EPSILON);
+        assert_eq!(snapshot.metrics["sealed_fee_bps"], 2.0);
+        assert_eq!(snapshot.metrics["sealed_latency_bps"], 0.5);
+        assert_eq!(snapshot.metrics["fee_coverage_complete"], 1.0);
+        assert_eq!(snapshot.metrics["execution_cost_coverage_complete"], 1.0);
     }
 
     #[test]

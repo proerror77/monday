@@ -1,6 +1,6 @@
 use alpha_domain::{
     sign_runtime_attribution_event, verify_envelope, AllowedIntentType, ApprovalClass, DomainError,
-    RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
+    EvaluationCostsV1, RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
     SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact, VerifiedDeploymentEnvelope,
     MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
 };
@@ -62,6 +62,8 @@ pub struct ActivationRequest {
     pub venue: String,
     #[serde(default)]
     pub market: Option<String>,
+    #[serde(default)]
+    pub cex_execution_costs: Option<EvaluationCostsV1>,
     pub instruments: Vec<String>,
     pub artifact: ActivationArtifact,
     pub mode: ActivationMode,
@@ -231,18 +233,38 @@ fn validate_instrument_catalog(
     Ok(())
 }
 
-fn require_supported_cex_execution(cross_spread: bool) -> Result<(), String> {
-    if cross_spread {
+fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), String> {
+    if costs.cross_spread {
         return Err(
             "four-stage CEX Paper/Shadow does not support cross-spread execution".to_string(),
+        );
+    }
+    // ponytail: non-zero funding needs a point-in-time runtime funding feed; admit it only after
+    // that feed can debit every research bucket deterministically.
+    if costs.funding_bps != 0.0 {
+        return Err(
+            "four-stage CEX Paper/Shadow does not support non-zero funding costs".to_string(),
         );
     }
     Ok(())
 }
 
+fn bound_notional_by_sealed_capacity(
+    notional: rust_decimal::Decimal,
+    costs: &EvaluationCostsV1,
+) -> Result<rust_decimal::Decimal, String> {
+    if !costs.capacity_enabled() {
+        return Ok(notional);
+    }
+    Ok(notional.min(positive_decimal(
+        "sealed position_notional_usd",
+        costs.position_notional_usd,
+    )?))
+}
+
 fn apply_strategy_bundle(
     config: &mut runtime::SystemConfig,
-    request: &ActivationRequest,
+    request: &mut ActivationRequest,
     bundle: &StrategyBundle,
     bundle_path: &Path,
 ) -> Result<(), String> {
@@ -262,7 +284,22 @@ fn apply_strategy_bundle(
     if hard_notional <= rust_decimal::Decimal::ZERO {
         return Err("runtime hard notional limit disables strategy activation".to_string());
     }
-    let total_notional = hard_notional.min(requested_notional).min(requested_symbol);
+    let mut total_notional = hard_notional.min(requested_notional).min(requested_symbol);
+    let cex_contract = match (&request.artifact, &bundle.artifact) {
+        (ActivationArtifact::Formula, StrategyBundleArtifact::CexFourStage { strategy }) => Some(
+            strategy
+                .runtime_contract()
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => None,
+    };
+    if let Some(contract) = cex_contract.as_ref() {
+        require_supported_cex_execution(&contract.costs)?;
+        total_notional = bound_notional_by_sealed_capacity(total_notional, &contract.costs)?;
+        request.cex_execution_costs = Some(contract.costs.clone());
+    } else {
+        request.cex_execution_costs = None;
+    }
     let symbols = request
         .instruments
         .iter()
@@ -322,10 +359,9 @@ fn apply_strategy_bundle(
                             );
                         }
                         venue.simulate_execution = true;
-                        let contract = strategy
-                            .runtime_contract()
-                            .map_err(|error| error.to_string())?;
-                        require_supported_cex_execution(contract.cross_spread)?;
+                        let contract = cex_contract
+                            .as_ref()
+                            .expect("CEX Formula artifact has a validated runtime contract");
                         let tick_size = contract
                             .tick_size
                             .parse::<rust_decimal::Decimal>()
@@ -358,7 +394,7 @@ fn apply_strategy_bundle(
                                     taker_fee_bps: None,
                                     rate_limit: None,
                                 },
-                                cross_spread: contract.cross_spread,
+                                cross_spread: contract.costs.cross_spread,
                             }),
                         )
                     }
@@ -910,6 +946,7 @@ fn activation_request(
         account_id: verified.0.account_id.clone(),
         venue: verified.0.venue.clone(),
         market: None,
+        cex_execution_costs: None,
         instruments: verified.0.instruments.clone(),
         artifact: *artifact,
         mode: *mode,
@@ -994,9 +1031,53 @@ mod tests {
 
     #[test]
     fn cross_spread_cex_execution_is_not_admitted() {
-        assert!(require_supported_cex_execution(false).is_ok());
-        assert!(require_supported_cex_execution(true)
+        let mut costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        assert!(require_supported_cex_execution(&costs).is_ok());
+        costs.cross_spread = true;
+        assert!(require_supported_cex_execution(&costs)
             .unwrap_err()
             .contains("does not support cross-spread execution"));
+        costs.cross_spread = false;
+        costs.funding_bps = 0.1;
+        assert!(require_supported_cex_execution(&costs)
+            .unwrap_err()
+            .contains("does not support non-zero funding costs"));
+    }
+
+    #[test]
+    fn sealed_capacity_caps_runtime_notional() {
+        let mut costs = EvaluationCostsV1 {
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let requested = rust_decimal::Decimal::from(500);
+        assert_eq!(
+            bound_notional_by_sealed_capacity(requested, &costs).unwrap(),
+            requested
+        );
+        costs.position_notional_usd = 100.0;
+        costs.capacity_depth_levels = 5;
+        costs.max_book_depth_fraction = 0.1;
+        assert_eq!(
+            bound_notional_by_sealed_capacity(requested, &costs).unwrap(),
+            rust_decimal::Decimal::from(100)
+        );
     }
 }

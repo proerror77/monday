@@ -2195,7 +2195,10 @@ mod tests {
                     account_id: None,
                     venue: None,
                     symbol: None,
-                    metrics: BTreeMap::new(),
+                    metrics: BTreeMap::from([(
+                        "sealed_execution_cost_coverage_required".to_string(),
+                        1.0,
+                    )]),
                     reason: None,
                     observed_at: now,
                 },
@@ -2214,6 +2217,8 @@ mod tests {
                     symbol: Some("BTCUSDT".to_string()),
                     metrics: BTreeMap::from([
                         ("gross_pnl_coverage_complete".to_string(), 1.0),
+                        ("fee_coverage_complete".to_string(), 1.0),
+                        ("execution_cost_coverage_complete".to_string(), 1.0),
                         ("mark_coverage_complete".to_string(), 1.0),
                     ]),
                     reason: None,

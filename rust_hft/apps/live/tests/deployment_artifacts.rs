@@ -153,6 +153,7 @@ fn production_config_accepts_the_governed_paper_target() {
         account_id: "bitget_main".to_string(),
         venue: "bitget".to_string(),
         market: None,
+        cex_execution_costs: None,
         instruments: vec!["BTCUSDT".to_string()],
         artifact: ActivationArtifact::Formula,
         mode: ActivationMode::Paper,

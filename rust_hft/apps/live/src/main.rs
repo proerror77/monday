@@ -434,7 +434,14 @@ fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyho
         account_id: Some(request.account_id.clone()),
         venue: Some(request.venue.clone()),
         symbol: None,
-        metrics: std::collections::BTreeMap::new(),
+        metrics: std::collections::BTreeMap::from([(
+            "sealed_execution_cost_coverage_required".to_string(),
+            if request.cex_execution_costs.is_some() {
+                1.0
+            } else {
+                0.0
+            },
+        )]),
         reason: None,
         observed_at,
     })?;

@@ -3496,6 +3496,7 @@ pub fn runtime_stage_is_healthy(
     #[derive(Default)]
     struct DeploymentHealth {
         activated: bool,
+        cost_coverage_required: bool,
         unhealthy: bool,
         strategies: BTreeMap<String, StrategyHealth>,
     }
@@ -3503,6 +3504,7 @@ pub fn runtime_stage_is_healthy(
     #[derive(Default)]
     struct StrategyHealth {
         healthy_snapshot: bool,
+        cost_covered_snapshot: bool,
         fill: bool,
     }
 
@@ -3528,6 +3530,10 @@ pub fn runtime_stage_is_healthy(
             && event.outcome == AttributionOutcome::Activated
         {
             health.activated = true;
+            health.cost_coverage_required |= event
+                .metrics
+                .get("sealed_execution_cost_coverage_required")
+                .is_some_and(|value| value.is_finite() && *value >= 1.0);
         }
         if event.outcome == AttributionOutcome::Healthy
             && event.kind == AttributionKind::PortfolioSnapshot
@@ -3535,11 +3541,10 @@ pub fn runtime_stage_is_healthy(
                 || portfolio_snapshot_has_authoritative_truth(event))
         {
             if let Some(strategy_id) = event.strategy_id.as_ref() {
-                health
-                    .strategies
-                    .entry(strategy_id.clone())
-                    .or_default()
-                    .healthy_snapshot = true;
+                let strategy = health.strategies.entry(strategy_id.clone()).or_default();
+                strategy.healthy_snapshot = true;
+                strategy.cost_covered_snapshot |=
+                    portfolio_snapshot_has_complete_cost_coverage(event);
             }
         }
         if event.kind == AttributionKind::Fill {
@@ -3556,14 +3561,29 @@ pub fn runtime_stage_is_healthy(
     by_deployment.values().any(|health| {
         !health.unhealthy
             && health.activated
-            && health
-                .strategies
-                .values()
-                .any(|strategy| strategy.healthy_snapshot && strategy.fill)
+            && health.strategies.values().any(|strategy| {
+                strategy.fill
+                    && if health.cost_coverage_required {
+                        strategy.cost_covered_snapshot
+                    } else {
+                        strategy.healthy_snapshot
+                    }
+            })
     })
 }
 
 const MAX_RUNTIME_RECONCILIATION_AGE_US: f64 = 30_000_000.0;
+
+fn portfolio_snapshot_has_complete_cost_coverage(event: &RuntimeAttributionEvent) -> bool {
+    ["fee_coverage_complete", "execution_cost_coverage_complete"]
+        .iter()
+        .all(|name| {
+            event
+                .metrics
+                .get(*name)
+                .is_some_and(|value| value.is_finite() && *value >= 1.0)
+        })
+}
 
 fn portfolio_snapshot_has_authoritative_truth(event: &RuntimeAttributionEvent) -> bool {
     let metric_is_one = |name: &str| {
@@ -4135,7 +4155,7 @@ pub struct CexFourStageRuntimeContractV1 {
     pub tick_size: String,
     pub step_size: String,
     pub min_notional: String,
-    pub cross_spread: bool,
+    pub costs: EvaluationCostsV1,
 }
 
 impl CexFourStageStrategyCandidateV1 {
@@ -4228,7 +4248,7 @@ impl CexFourStageStrategyCandidateV1 {
             tick_size: self.instrument_rules.tick_size.clone(),
             step_size: self.instrument_rules.step_size.clone(),
             min_notional: self.instrument_rules.min_notional.clone(),
-            cross_spread: strategy.execution.costs.cross_spread,
+            costs: strategy.execution.costs,
         })
     }
 
@@ -5944,7 +5964,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_requires_reconciliation_truth_only_for_live_small() {
+    fn runtime_health_requires_cost_coverage_and_live_small_reconciliation_truth() {
         let now = Utc::now();
         let scoped = |id: &str,
                       kind: AttributionKind,
@@ -5972,6 +5992,9 @@ mod tests {
             AttributionOutcome::Activated,
             None,
         )];
+        events[0]
+            .metrics
+            .insert("sealed_execution_cost_coverage_required".to_string(), 1.0);
         assert!(!runtime_stage_is_healthy(
             &events,
             "candidate-1",
@@ -5989,6 +6012,18 @@ mod tests {
             AttributionOutcome::Healthy,
             Some("strategy-1"),
         ));
+        assert!(!runtime_stage_is_healthy(
+            &events,
+            "candidate-1",
+            AttributionMode::Shadow
+        ));
+        let snapshot = events.last_mut().unwrap();
+        snapshot
+            .metrics
+            .insert("fee_coverage_complete".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("execution_cost_coverage_complete".to_string(), 1.0);
         assert!(runtime_stage_is_healthy(
             &events,
             "candidate-1",
