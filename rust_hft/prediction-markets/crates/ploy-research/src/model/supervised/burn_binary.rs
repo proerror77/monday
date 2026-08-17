@@ -1559,7 +1559,6 @@ mod tests {
             search_policy_snapshot_id: format!("sha256:{}", "2".repeat(64)),
             search_budget: PredictionSearchBudget {
                 max_candidates: 6,
-                max_llm_calls: 2,
                 max_seconds: 900,
             },
         };

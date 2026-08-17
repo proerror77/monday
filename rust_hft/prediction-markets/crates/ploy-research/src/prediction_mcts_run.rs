@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::factors_v2::SettlementProbabilityComponentProfile;
 use crate::prediction_loop::{
-    build_prediction_prompt, current_prediction_policy_snapshot_id, validate_prediction_mission,
-    validate_prediction_proposal, LoopRunStatus, LoopRunSummary, PredictionProposal,
-    PredictionResearchMission, ProposalClient, ProposedProbabilityBlend,
+    current_prediction_policy_snapshot_id, validate_prediction_mission, LoopRunStatus,
+    LoopRunSummary, PredictionResearchMission, ProposedProbabilityBlend,
 };
 use crate::prediction_loop_fs::{
     atomic_write_json, canonical_json_bytes, next_attempt_dir, read_json, sha256_hex,
@@ -22,8 +21,8 @@ use crate::prediction_mcts::{
 };
 use crate::prediction_mission_v3::{AdmittedPredictionMissionV3, PredictionResearchMissionV3};
 
-const RUN_STATE_VERSION: u32 = 6;
-const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v5";
+const RUN_STATE_VERSION: u32 = 7;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v6";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -91,9 +90,6 @@ struct PredictionMctsRunState {
     run_started_unix_millis: u64,
     deadline_unix_millis: u64,
     baseline_complete: bool,
-    advisor_call_consumed: bool,
-    advisor: Option<Vec<ProposedProbabilityBlend>>,
-    advisor_failure: Option<String>,
     checkpoint: Option<PredictionMctsCheckpoint>,
     checkpoint_artifact: Option<ArtifactRef>,
     #[serde(default)]
@@ -283,31 +279,25 @@ impl PredictionMctsRunState {
 /// Run the shared-kernel prediction controller after the caller has validated
 /// the immutable snapshot against the mission. Evaluator failures are durable
 /// pauses; rerunning with the same mission resumes the exact pending candidate.
-pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEvaluator>(
+pub fn run_or_resume_prediction_mcts<E: PredictionMctsRunEvaluator>(
     mission: PredictionResearchMission,
     snapshot_dir: &Path,
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
 ) -> Result<LoopRunSummary, String> {
     run_or_resume_prediction_mcts_with_component_profile(
         mission,
         snapshot_dir,
         output_dir,
-        client,
         evaluator,
         SettlementProbabilityComponentProfile::FullSurface,
     )
 }
 
-pub fn run_or_resume_prediction_mcts_with_component_profile<
-    C: ProposalClient,
-    E: PredictionMctsRunEvaluator,
->(
+pub fn run_or_resume_prediction_mcts_with_component_profile<E: PredictionMctsRunEvaluator>(
     mission: PredictionResearchMission,
     snapshot_dir: &Path,
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
 ) -> Result<LoopRunSummary, String> {
@@ -317,21 +307,18 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<
         identity,
         snapshot_dir,
         output_dir,
-        client,
         evaluator,
         component_profile,
     )
 }
 
 pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
-    C: ProposalClient,
     E: PredictionMctsRunEvaluator,
 >(
     mission: PredictionResearchMission,
     identity: PredictionMctsIdentity,
     snapshot_dir: &Path,
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
 ) -> Result<LoopRunSummary, String> {
@@ -342,7 +329,6 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
         None,
         snapshot_dir,
         output_dir,
-        client,
         evaluator,
         component_profile,
         None,
@@ -350,15 +336,11 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_or_resume_authenticated_prediction_mcts<
-    C: ProposalClient,
-    E: PredictionMctsRunEvaluator,
->(
+pub(crate) fn run_or_resume_authenticated_prediction_mcts<E: PredictionMctsRunEvaluator>(
     mission: PredictionResearchMission,
     identity: PredictionMctsIdentity,
     admitted: (&PredictionResearchMissionV3, &AdmittedPredictionMissionV3),
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
     immutable_image_identity: &str,
@@ -369,7 +351,6 @@ pub(crate) fn run_or_resume_authenticated_prediction_mcts<
         Some(admitted),
         Path::new("authenticated-snapshot-view"),
         output_dir,
-        client,
         evaluator,
         component_profile,
         Some(immutable_image_identity),
@@ -377,13 +358,12 @@ pub(crate) fn run_or_resume_authenticated_prediction_mcts<
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEvaluator>(
+fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
     mission: PredictionResearchMission,
     identity: PredictionMctsIdentity,
     admitted: Option<(&PredictionResearchMissionV3, &AdmittedPredictionMissionV3)>,
     snapshot_dir: &Path,
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
     immutable_image_identity: Option<&str>,
@@ -430,9 +410,6 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             run_started_unix_millis,
             deadline_unix_millis,
             baseline_complete: false,
-            advisor_call_consumed: false,
-            advisor: None,
-            advisor_failure: None,
             checkpoint: None,
             checkpoint_artifact: None,
             budget_exhausted: false,
@@ -486,60 +463,12 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         ));
     }
 
-    if state.advisor.is_none() {
-        let advice = if component_profile
-            == SettlementProbabilityComponentProfile::MarketMidpointOnly
-        {
-            state.advisor_failure = Some(
-                "reduced-authority baseline has no LLM-expandable probability components"
-                    .to_string(),
-            );
-            Vec::new()
-        } else if mission.search_budget.max_llm_calls == 0 {
-            Vec::new()
-        } else if state.advisor_call_consumed {
-            return Err(
-                "prediction MCTS advisor call was interrupted before durable response".to_string(),
-            );
-        } else {
-            state.advisor_call_consumed = true;
-            checkpoint(&state_path, &mut state)?;
-            let prompt =
-                build_prediction_prompt(&mission, mission.search_budget.max_candidates, &[]);
-            match client.propose(&prompt, remaining_time(&state)) {
-                Ok(response) => {
-                    match serde_json::from_str::<PredictionProposal>(&response.raw_response)
-                        .map_err(|error| format!("strict proposal JSON rejected: {error}"))
-                        .and_then(|proposal| {
-                            validate_prediction_proposal(
-                                proposal,
-                                mission.search_budget.max_candidates,
-                            )
-                        }) {
-                        Ok(blends) => blends.into_iter().map(proposed_blend).collect(),
-                        Err(reason) => {
-                            state.advisor_failure = Some(reason);
-                            Vec::new()
-                        }
-                    }
-                }
-                Err(reason) => {
-                    state.advisor_failure = Some(reason);
-                    Vec::new()
-                }
-            }
-        };
-        state.advisor = Some(advice);
-        checkpoint(&state_path, &mut state)?;
-    }
-
     let mut engine = if let Some((sealed_mission, admitted)) = admitted {
         PredictionMctsEngine::new_with_admitted_mission(
             sealed_mission,
             admitted,
             &mission,
             baseline_blend(component_profile),
-            state.advisor.clone().unwrap_or_default(),
             MCTS_SEED,
             MCTS_EXPLORATION,
             MCTS_MAX_DEPTH,
@@ -550,7 +479,6 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
             &mission,
             identity,
             baseline_blend(component_profile),
-            state.advisor.clone().unwrap_or_default(),
             MCTS_SEED,
             MCTS_EXPLORATION,
             MCTS_MAX_DEPTH,
@@ -578,10 +506,9 @@ fn run_or_resume_prediction_mcts_core<C: ProposalClient, E: PredictionMctsRunEva
         let candidate = if let Some(pending) = state.pending.clone() {
             pending
         } else {
-            if !engine.has_expandable_candidate()? {
+            let Some(candidate) = engine.propose()? else {
                 break;
-            }
-            let candidate = engine.propose()?;
+            };
             state.pending = Some(candidate.clone());
             state.checkpoint = Some(engine.checkpoint()?);
             checkpoint(&state_path, &mut state)?;
@@ -786,18 +713,6 @@ fn baseline_blend(
     }
 }
 
-fn proposed_blend(blend: crate::LlmProbabilityBlendSpec) -> ProposedProbabilityBlend {
-    ProposedProbabilityBlend {
-        name: blend.name,
-        hypothesis: blend.hypothesis,
-        market_midpoint_weight: blend.market_midpoint_weight,
-        chainlink_digital_weight: blend.chainlink_digital_weight,
-        distance_lob_vol_weight: blend.distance_lob_vol_weight,
-        event_surface_weight: blend.event_surface_weight,
-        existing_model_weight: blend.existing_model_weight,
-    }
-}
-
 fn training_loss(evaluation: &PredictionMctsEvaluation) -> f64 {
     -evaluation
         .training
@@ -825,10 +740,7 @@ fn summary(
     LoopRunSummary {
         mission_id: mission.mission_id.clone(),
         status,
-        llm_calls_used: usize::from(state.advisor_call_consumed),
         candidates_evaluated: state.training.len(),
-        iterations_completed: state.training.len(),
-        keep_models: Vec::new(),
         reason: state.pause_reason.clone(),
         state_path: state_path.to_path_buf(),
     }
@@ -874,8 +786,7 @@ mod tests {
     use super::*;
     use crate::prediction_loop::{
         current_prediction_policy_snapshot_id, research_brief_snapshot_id, LoopRunStatus,
-        PredictionSearchBudget, ProposalCallOutput, PREDICTION_LOOP_TARGET,
-        PREDICTION_MISSION_SCHEMA_VERSION,
+        PredictionSearchBudget, PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
     };
     use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
     use crate::prediction_mcts::{PredictionMctsCandidate, PredictionMctsIdentity};
@@ -886,7 +797,7 @@ mod tests {
         PREDICTION_MISSION_V3_SCHEMA_VERSION,
     };
 
-    fn mission(max_candidates: usize, max_llm_calls: usize) -> PredictionResearchMission {
+    fn mission(max_candidates: usize) -> PredictionResearchMission {
         let mut mission = PredictionResearchMission {
             schema_version: PREDICTION_MISSION_SCHEMA_VERSION.to_string(),
             mission_id: "btc-5m-runner-test".to_string(),
@@ -903,43 +814,11 @@ mod tests {
             search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
             search_budget: PredictionSearchBudget {
                 max_candidates,
-                max_llm_calls,
                 max_seconds: 60,
             },
         };
         mission.prompt_snapshot_id = research_brief_snapshot_id(&mission);
         mission
-    }
-
-    struct FakeClient {
-        calls: usize,
-    }
-
-    impl ProposalClient for FakeClient {
-        fn propose(
-            &mut self,
-            _prompt: &str,
-            _timeout: Duration,
-        ) -> Result<ProposalCallOutput, String> {
-            self.calls += 1;
-            Ok(ProposalCallOutput {
-                raw_response: serde_json::json!({
-                    "probability_blends": [{
-                        "name": "advisor",
-                        "hypothesis": "bounded advisor",
-                        "market_midpoint_weight": 1.0,
-                        "chainlink_digital_weight": 1.0,
-                        "distance_lob_vol_weight": 1.0,
-                        "event_surface_weight": 1.0,
-                        "existing_model_weight": 1.0
-                    }]
-                })
-                .to_string(),
-                provider: "test".to_string(),
-                model: "test".to_string(),
-                usage: serde_json::json!({}),
-            })
-        }
     }
 
     #[derive(Default)]
@@ -1036,45 +915,40 @@ mod tests {
     }
 
     #[test]
-    fn baseline_only_runs_once_without_llm_or_held_out() {
+    fn baseline_only_runs_once_without_held_out() {
         let output = temp_dir("baseline");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
 
         let summary = run_or_resume_prediction_mcts(
-            mission(0, 0),
+            mission(0),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("baseline-only run");
 
         assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
-        assert_eq!(client.calls, 0);
         assert_eq!(evaluator.calls, ["baseline"]);
     }
 
     #[test]
     fn resume_reuses_the_exact_pending_candidate() {
         let output = temp_dir("resume");
-        let mut client = FakeClient { calls: 0 };
         let mut first = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         let first_summary = run_or_resume_prediction_mcts(
-            mission(2, 1),
+            mission(2),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut first,
         )
         .expect("retryable pause");
         assert_eq!(first_summary.status, LoopRunStatus::Paused);
         let selection_error = authenticated_selection_evidence(
             &output,
-            &PredictionMctsIdentity::from_mission(&mission(2, 1)).unwrap(),
+            &PredictionMctsIdentity::from_mission(&mission(2)).unwrap(),
         )
         .expect_err("held-out evidence must remain unavailable before selection");
         assert!(selection_error.contains("before candidate selection"));
@@ -1082,30 +956,26 @@ mod tests {
 
         let mut resumed = FakeEvaluator::default();
         let summary = run_or_resume_prediction_mcts(
-            mission(2, 1),
+            mission(2),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut resumed,
         )
         .expect("resume pending candidate");
 
         assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
         assert_eq!(resumed.candidate_ids[0], pending);
-        assert_eq!(client.calls, 1, "resume must not repeat advisor call");
     }
 
     #[test]
     fn held_out_runs_once_after_all_training_candidates() {
         let output = temp_dir("held-out");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
 
         run_or_resume_prediction_mcts(
-            mission(2, 1),
+            mission(2),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("search run");
@@ -1118,23 +988,46 @@ mod tests {
         assert_eq!(evaluator.candidate_ids[2], evaluator.candidate_ids[0]);
         assert_eq!(
             evaluator.candidate_ids[0].split(':').next().unwrap(),
-            PredictionMctsIdentity::from_mission(&mission(2, 1))
+            PredictionMctsIdentity::from_mission(&mission(2))
                 .unwrap()
                 .mission_id
         );
     }
 
     #[test]
+    fn deterministic_tree_exhaustion_still_selects_and_runs_held_out() {
+        let output = temp_dir("tree-exhaustion");
+        let mut evaluator = FakeEvaluator::default();
+
+        let summary = run_or_resume_prediction_mcts(
+            mission(64),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut evaluator,
+        )
+        .expect("novelty exhaustion is a normal terminal condition");
+
+        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.candidates_evaluated, 55);
+        assert_eq!(
+            evaluator
+                .calls
+                .iter()
+                .filter(|call| call.as_str() == "held_out")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn runner_writes_a_stable_read_only_checkpoint_artifact() {
         let output = temp_dir("checkpoint-artifact");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
 
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("search run");
@@ -1146,11 +1039,11 @@ mod tests {
         assert_eq!(artifact["training"].as_array().unwrap().len(), 1);
         assert_eq!(
             artifact["prompt_snapshot_id"],
-            mission(1, 1).prompt_snapshot_id
+            mission(1).prompt_snapshot_id
         );
         assert_eq!(
             artifact["search_policy_snapshot_id"],
-            mission(1, 1).search_policy_snapshot_id
+            mission(1).search_policy_snapshot_id
         );
         assert!(artifact["training"][0].get("held_out_settlement").is_none());
         assert!(artifact["training"][0].get("execution").is_none());
@@ -1161,10 +1054,9 @@ mod tests {
             .contains(&sha256_hex(&first)));
 
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("resume completed run");
@@ -1175,16 +1067,14 @@ mod tests {
     #[test]
     fn runner_omits_auxiliary_evidence_without_rejecting_the_training_result() {
         let output = temp_dir("auxiliary-evidence");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator {
             ..Default::default()
         };
 
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("auxiliary evidence must not block training checkpoint publication");
@@ -1199,16 +1089,14 @@ mod tests {
     #[test]
     fn runner_rejects_forged_pending_candidate_before_evaluation() {
         let output = temp_dir("forged-pending-artifact");
-        let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
         )
         .expect("pause with a durable pending candidate");
@@ -1221,10 +1109,9 @@ mod tests {
 
         let mut resumed = FakeEvaluator::default();
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut resumed,
         )
         .expect_err("forged pending candidate must be rejected before evaluation");
@@ -1235,16 +1122,14 @@ mod tests {
     #[test]
     fn runner_publishes_deadline_exhaustion_as_a_terminal_phase() {
         let output = temp_dir("deadline-exhausted-artifact");
-        let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
         )
         .expect("pause with incomplete training");
@@ -1257,10 +1142,9 @@ mod tests {
 
         let mut resumed = FakeEvaluator::default();
         let summary = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut resumed,
         )
         .expect("expired run returns a terminal summary");
@@ -1276,16 +1160,14 @@ mod tests {
     #[test]
     fn read_only_projection_does_not_change_when_an_unobserved_deadline_passes() {
         let output = temp_dir("stable-before-deadline");
-        let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
         )
         .expect("pause with a durable checkpoint");
@@ -1302,52 +1184,47 @@ mod tests {
     }
 
     #[test]
-    fn runner_rejects_v2_state_after_typed_training_evidence_upgrade() {
-        let output = temp_dir("legacy-component-profile");
-        let mut client = FakeClient { calls: 0 };
+    fn runner_rejects_v6_state_after_provider_state_removal() {
+        let output = temp_dir("legacy-provider-state");
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
         )
-        .expect("pause with a durable v2 state");
+        .expect("pause with a durable v7 state");
 
         let state_path = output.join("prediction-mcts-state.json");
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        legacy["version"] = serde_json::json!(2);
+        legacy["version"] = serde_json::json!(6);
         std::fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut FakeEvaluator::default(),
         )
-        .expect_err("v2 state must not resume under typed training evidence");
+        .expect_err("v6 provider state must not resume after provider removal");
         assert!(error.contains("incompatible state version"));
     }
 
     #[test]
     fn runner_rejects_a_v3_state_missing_its_typed_identity() {
         let output = temp_dir("missing-typed-identity");
-        let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
         };
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
         )
         .expect("pause with a durable v3 state");
@@ -1359,10 +1236,9 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
 
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut FakeEvaluator::default(),
         )
         .expect_err("typed state identity is mandatory once version 3 is written");
@@ -1372,13 +1248,11 @@ mod tests {
     #[test]
     fn runner_rejects_a_selected_candidate_missing_from_training() {
         let output = temp_dir("forged-selected-artifact");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("completed run");
@@ -1390,10 +1264,9 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
 
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect_err("selected candidate must be backed by a training record");
@@ -1403,13 +1276,11 @@ mod tests {
     #[test]
     fn runner_rejects_task_mismatched_persisted_training_evidence() {
         let output = temp_dir("task-mismatched-training");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("completed run");
@@ -1438,10 +1309,9 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
 
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect_err("task-mismatched persisted evidence must fail closed");
@@ -1452,10 +1322,9 @@ mod tests {
             ["mean_brier_score"] = serde_json::json!(1.5);
         std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect_err("invalid persisted reward must fail closed");
@@ -1465,13 +1334,11 @@ mod tests {
     #[test]
     fn runner_rejects_a_checkpoint_with_a_mismatched_identity_before_rewriting_it() {
         let output = temp_dir("forged-checkpoint-artifact");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("search run");
@@ -1486,10 +1353,9 @@ mod tests {
         std::fs::write(&state_path, &forged).unwrap();
 
         let error = run_or_resume_prediction_mcts(
-            mission(1, 1),
+            mission(1),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect_err("forged checkpoint must be rejected");
@@ -1504,14 +1370,12 @@ mod tests {
     #[test]
     fn reduced_profile_selects_its_only_canonical_candidate() {
         let output = temp_dir("reduced-profile-tree-exhaustion");
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
 
         run_or_resume_prediction_mcts_with_component_profile(
-            mission(8, 1),
+            mission(8),
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
         )
@@ -1525,15 +1389,13 @@ mod tests {
     #[test]
     fn selection_evidence_rejects_a_state_newer_than_its_checkpoint_artifact() {
         let output = temp_dir("selection-checkpoint-mismatch");
-        let configured = mission(2, 1);
+        let configured = mission(2);
         let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         run_or_resume_prediction_mcts(
             configured,
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("completed run");
@@ -1558,15 +1420,13 @@ mod tests {
         assert_eq!(roundtripped.to_bits(), checkpoint_reward.to_bits());
 
         let output = temp_dir("selection-evidence-digests");
-        let configured = mission(1, 1);
+        let configured = mission(1);
         let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         run_or_resume_prediction_mcts(
             configured,
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
         )
         .expect("completed run");
@@ -1618,11 +1478,10 @@ mod tests {
     #[test]
     fn resume_rejects_a_different_immutable_evaluator_image() {
         let output = temp_dir("immutable-image-resume");
-        let configured = mission(1, 1);
+        let configured = mission(1);
         let identity = PredictionMctsIdentity::from_mission(&configured).unwrap();
         let image_a = format!("sha256:{}", "a".repeat(64));
         let image_b = format!("sha256:{}", "b".repeat(64));
-        let mut client = FakeClient { calls: 0 };
         let mut paused = FakeEvaluator {
             fail_training: VecDeque::from([true]),
             ..Default::default()
@@ -1633,7 +1492,6 @@ mod tests {
             None,
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut paused,
             SettlementProbabilityComponentProfile::FullSurface,
             Some(&image_a),
@@ -1646,7 +1504,6 @@ mod tests {
             None,
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut FakeEvaluator::default(),
             SettlementProbabilityComponentProfile::FullSurface,
             Some(&image_b),
@@ -1658,7 +1515,7 @@ mod tests {
     #[test]
     fn sealed_v4_run_rejects_an_unadmitted_legacy_bridge_before_writing_state() {
         let output = temp_dir("sealed-v4-namespace");
-        let mut bridge = mission(0, 0);
+        let mut bridge = mission(0);
         bridge.mission_id = "btc-5m-up".to_string();
         bridge.objective = "Unadmitted objective drift".to_string();
         bridge.data_snapshot_id = format!("sha256:{}", "5".repeat(64));
@@ -1684,14 +1541,12 @@ mod tests {
         };
         let identity = PredictionMctsIdentity::from_admitted_mission(&admitted).unwrap();
         let isolated_output = task_output_dir(&output, &identity).unwrap();
-        let mut client = FakeClient { calls: 0 };
         let mut evaluator = FakeEvaluator::default();
         let error = run_or_resume_prediction_mcts_with_identity_and_component_profile(
             bridge,
             identity,
             Path::new("unused-snapshot"),
             &output,
-            &mut client,
             &mut evaluator,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
         )
@@ -1705,7 +1560,7 @@ mod tests {
     #[test]
     fn sealed_run_binds_held_out_artifact_before_result_seal() {
         let output = temp_dir("sealed-held-out-artifact");
-        let bridge = mission(1, 1);
+        let bridge = mission(1);
         let sealed = PredictionResearchMissionV3 {
             schema_version: PREDICTION_MISSION_V3_SCHEMA_VERSION.to_string(),
             mission_id: bridge.mission_id.clone(),
@@ -1748,14 +1603,12 @@ mod tests {
         let identity = PredictionMctsIdentity::from_admitted_mission(&admitted).unwrap();
         let task_output = task_output_dir(&output, &identity).unwrap();
         let image = format!("sha256:{}", "a".repeat(64));
-        let mut client = FakeClient { calls: 0 };
 
         run_or_resume_authenticated_prediction_mcts(
             bridge.clone(),
             identity.clone(),
             (&sealed, &admitted),
             &output,
-            &mut client,
             &mut FakeEvaluator::default(),
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
             &image,
@@ -1776,7 +1629,6 @@ mod tests {
             identity,
             (&sealed, &admitted),
             &output,
-            &mut client,
             &mut FakeEvaluator::default(),
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
             &image,
