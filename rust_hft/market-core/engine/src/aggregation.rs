@@ -898,6 +898,14 @@ impl AggregationEngine {
         None
     }
 
+    pub(crate) fn canonical_top_n(&self, key: &VenueSymbol) -> Option<Arc<TopNSnapshot>> {
+        // ponytail: rebuild only for L2 strategy events; cache a second Top-N map if profiling
+        // shows this one-symbol Paper/Shadow copy matters.
+        self.canonical_books
+            .get(key)
+            .map(|book| Arc::new(book.top_n(self.top_n)))
+    }
+
     pub fn cleanup_stale_data(&mut self, current_time: Timestamp) {
         // 清理過期的訂單簿
         self.canonical_books.retain(|_, book| {

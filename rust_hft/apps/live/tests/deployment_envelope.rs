@@ -22,7 +22,7 @@ struct RecordingAdapter {
 }
 
 impl RuntimeActivationAdapter for RecordingAdapter {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String> {
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String> {
         self.requests.push(request.clone());
         Ok(())
     }
@@ -125,6 +125,19 @@ fn formula_bundle(now: chrono::DateTime<Utc>) -> StrategyBundle {
     .unwrap();
     bundle.bundle_hash = bundle.calculated_hash().unwrap();
     bundle
+}
+
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
+fn cex_four_stage_bundle() -> StrategyBundle {
+    serde_json::from_str(include_str!("fixtures/cex-four-stage-bundle.json")).unwrap()
+}
+
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
+fn bind_bundle(mut envelope: DeploymentEnvelope, bundle: &StrategyBundle) -> DeploymentEnvelope {
+    envelope.asset_revision_id = bundle.candidate_id.clone();
+    envelope.bundle_id = bundle.bundle_id.clone();
+    envelope.bundle_hash = bundle.bundle_hash.clone();
+    envelope
 }
 
 fn onnx_bundle(
@@ -329,6 +342,257 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
+fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("four-stage-cex-handoff");
+    let bundle = cex_four_stage_bundle();
+    let bundle_path = directory.join("bundle.json");
+    let mut config = configured_runtime();
+    config.venues[0].inst_type = Some("usdm".to_string());
+    config.venues[0].rest = Some("https://fapi.binance.com".to_string());
+    config.venues[0].ws_public = Some("wss://fstream.binance.com/ws".to_string());
+
+    for (suffix, intent, approval, expected_mode) in [
+        (
+            "paper",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Paper,
+            ActivationMode::Paper,
+        ),
+        (
+            "shadow",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::Shadow,
+            ActivationMode::Shadow,
+        ),
+    ] {
+        let signed = sign_envelope(
+            bind_bundle(
+                envelope(
+                    now,
+                    &format!("cex-{suffix}"),
+                    &format!("nonce-cex-{suffix}"),
+                    intent,
+                    approval,
+                ),
+                &bundle,
+            ),
+            "key-1",
+            &key,
+        )
+        .unwrap();
+        let request = {
+            let mut adapter =
+                SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+            intake(
+                &signed,
+                &trusted,
+                &policy(&signed.envelope),
+                now,
+                &directory,
+                &mut adapter,
+            )
+            .unwrap()
+        };
+        assert_eq!(request.mode, expected_mode);
+        assert_eq!(request.market.as_deref(), Some("usdm"));
+        assert_eq!(request.max_notional, 500.0);
+        let costs = request
+            .cex_execution_costs
+            .as_ref()
+            .expect("four-stage activation must preserve sealed costs");
+        assert_eq!(costs.fee_bps, 2.0);
+        assert_eq!(costs.latency_bps, 0.5);
+        assert_eq!(costs.funding_bps, 0.0);
+    }
+
+    assert_eq!(config.strategies.len(), 1);
+    assert!(config.venues[0].simulate_execution);
+    assert!(matches!(
+        &config.strategies[0].strategy_type,
+        runtime::StrategyType::Formula
+    ));
+    let runtime::StrategyParams::Formula {
+        max_order_notional,
+        signal_threshold,
+        target_position,
+        evaluation_interval_millis,
+        execution_contract,
+        ..
+    } = &config.strategies[0].params
+    else {
+        panic!("four-stage bundle did not produce Formula params")
+    };
+    assert!(*target_position);
+    assert_eq!(*max_order_notional, rust_decimal::Decimal::from(500));
+    assert_eq!(signal_threshold.to_bits(), f64::EPSILON.to_bits());
+    assert_eq!(*evaluation_interval_millis, Some(1_000));
+    let execution_contract = execution_contract
+        .as_ref()
+        .expect("four-stage bundle must preserve its sealed execution contract");
+    assert_eq!(execution_contract.venue, hft_core::VenueId::BINANCE);
+    assert_eq!(
+        execution_contract.venue_spec.tick_size.0,
+        rust_decimal::Decimal::new(1, 1)
+    );
+    assert_eq!(
+        execution_contract.venue_spec.lot_size.0,
+        rust_decimal::Decimal::new(1, 3)
+    );
+    assert_eq!(
+        execution_contract.venue_spec.min_notional,
+        rust_decimal::Decimal::from(5)
+    );
+    assert!(!execution_contract.cross_spread);
+    let runtime = runtime::SystemBuilder::new(config.clone())
+        .auto_register_adapters_strict()
+        .unwrap()
+        .build();
+    assert_eq!(
+        runtime.engine.try_lock().unwrap().strategy_instance_ids(),
+        vec![format!("{}:BTCUSDT", bundle.bundle_id)]
+    );
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-market-drift",
+                "nonce-cex-market-drift",
+                AllowedIntentType::StartPaper,
+                ApprovalClass::Paper,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut wrong_market = configured_runtime();
+    wrong_market.venues[0].inst_type = Some("spot".to_string());
+    let mut adapter = SystemConfigActivationAdapter::new(&mut wrong_market, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("runtime venue, market, or instrument"));
+    assert!(wrong_market.strategies.is_empty());
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-spot-endpoints",
+                "nonce-cex-spot-endpoints",
+                AllowedIntentType::StartPaper,
+                ApprovalClass::Paper,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut spot_endpoints = configured_runtime();
+    spot_endpoints.venues[0].inst_type = Some("usdm".to_string());
+    let mut adapter =
+        SystemConfigActivationAdapter::new(&mut spot_endpoints, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("canonical fapi and fstream endpoints"));
+    assert!(spot_endpoints.strategies.is_empty());
+
+    let signed = sign_envelope(
+        bind_bundle(
+            envelope(
+                now,
+                "cex-live-small",
+                "nonce-cex-live-small",
+                AllowedIntentType::StartLiveSmall,
+                ApprovalClass::HumanApprovedLiveSmall,
+            ),
+            &bundle,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("live-small activation is disabled"));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn paper_and_shadow_require_their_exact_approval_class() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("exact-approval-class");
+
+    for (suffix, intent, approval) in [
+        (
+            "paper-with-shadow",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Shadow,
+        ),
+        (
+            "shadow-with-live",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::HumanApprovedLiveSmall,
+        ),
+    ] {
+        let signed = sign_envelope(
+            envelope(now, suffix, &format!("nonce-{suffix}"), intent, approval),
+            "key-1",
+            &key,
+        )
+        .unwrap();
+        let mut adapter = RecordingAdapter::default();
+        assert!(matches!(
+            intake(
+                &signed,
+                &trusted,
+                &policy(&signed.envelope),
+                now,
+                &directory,
+                &mut adapter,
+            ),
+            Err(hft_live::deployment_envelope::IntakeError::ApprovalClassMismatch)
+        ));
+        assert!(adapter.requests.is_empty());
+    }
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 #[cfg(feature = "formula-strategy")]
 async fn shadow_activation_waits_for_market_then_produces_loop_consumable_evidence() {
@@ -498,7 +762,9 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
         .lines()
         .map(|line| {
             let signed: SignedRuntimeAttributionEvent = serde_json::from_str(line).unwrap();
-            verify_runtime_attribution_event(&signed, &trusted_feedback).unwrap()
+            verify_runtime_attribution_event(&signed, &trusted_feedback)
+                .unwrap()
+                .into_event()
         })
         .collect::<Vec<_>>();
     assert!(events
@@ -523,7 +789,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
     let mut config = configured_runtime();
     let bundle = formula_bundle(now);
     let bundle_path = directory("featureless").join("bundle.json");
-    let request = ActivationRequest {
+    let mut request = ActivationRequest {
         deployment_id: "deployment-featureless".to_string(),
         asset_revision_id: bundle.candidate_id.clone(),
         promotion_id: "promotion-1".to_string(),
@@ -531,6 +797,8 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         bundle_hash: bundle.bundle_hash.clone(),
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
+        market: None,
+        cex_execution_costs: None,
         instruments: vec!["BTCUSDT".to_string()],
         artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
         mode: ActivationMode::Paper,
@@ -540,7 +808,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         max_slippage_bps: 5.0,
     };
     SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-        .activate(&request)
+        .activate(&mut request)
         .unwrap();
 
     assert!(runtime::SystemBuilder::new(config)
@@ -862,7 +1130,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
 
     for value in [0.0, 1.5, 10_001.0, f64::INFINITY, f64::NAN] {
         let mut config = configured_runtime();
-        let request = ActivationRequest {
+        let mut request = ActivationRequest {
             deployment_id: "slippage-validation".to_string(),
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
@@ -870,6 +1138,8 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             bundle_hash: bundle.bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
+            market: None,
+            cex_execution_costs: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -879,7 +1149,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_slippage_bps: value,
         };
         let error = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&request)
+            .activate(&mut request)
             .unwrap_err();
         assert!(error.contains("finite integer in 1..=10000"));
         assert_eq!(config.engine.intent_max_slippage_bps, None);
@@ -889,7 +1159,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
 
     for value in [1.0, 10_000.0] {
         let mut config = configured_runtime();
-        let request = ActivationRequest {
+        let mut request = ActivationRequest {
             deployment_id: "slippage-boundary".to_string(),
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
@@ -897,6 +1167,8 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             bundle_hash: bundle.bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
+            market: None,
+            cex_execution_costs: None,
             instruments: vec!["BTCUSDT".to_string()],
             artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
             mode: ActivationMode::Paper,
@@ -906,7 +1178,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_slippage_bps: value,
         };
         SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&request)
+            .activate(&mut request)
             .expect("inclusive slippage boundary");
         assert_eq!(config.engine.intent_max_slippage_bps, Some(value as i32));
         assert_eq!(

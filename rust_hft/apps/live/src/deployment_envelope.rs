@@ -1,11 +1,12 @@
 use alpha_domain::{
     sign_runtime_attribution_event, verify_envelope, AllowedIntentType, ApprovalClass, DomainError,
-    RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
+    EvaluationCostsV1, RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
     SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact, VerifiedDeploymentEnvelope,
     MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -60,6 +61,10 @@ pub struct ActivationRequest {
     pub bundle_hash: String,
     pub account_id: String,
     pub venue: String,
+    #[serde(default)]
+    pub market: Option<String>,
+    #[serde(default)]
+    pub cex_execution_costs: Option<EvaluationCostsV1>,
     pub instruments: Vec<String>,
     pub artifact: ActivationArtifact,
     pub mode: ActivationMode,
@@ -70,7 +75,7 @@ pub struct ActivationRequest {
 }
 
 pub trait RuntimeActivationAdapter {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String>;
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +165,7 @@ impl<'a> SystemConfigActivationAdapter<'a> {
 }
 
 impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
-    fn activate(&mut self, request: &ActivationRequest) -> Result<(), String> {
+    fn activate(&mut self, request: &mut ActivationRequest) -> Result<(), String> {
         let mut proposed = self.config.clone();
         let venue_matches = proposed
             .venues
@@ -195,6 +200,12 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
             }
         }
         apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;
+        request.market = match &self.bundle.artifact {
+            StrategyBundleArtifact::CexFourStage { strategy } => {
+                Some(strategy.market.as_str().to_string())
+            }
+            _ => None,
+        };
         *self.config = proposed;
         self.applied_modes.push(request.mode);
         Ok(())
@@ -223,9 +234,38 @@ fn validate_instrument_catalog(
     Ok(())
 }
 
+fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), String> {
+    if costs.cross_spread {
+        return Err(
+            "four-stage CEX Paper/Shadow does not support cross-spread execution".to_string(),
+        );
+    }
+    // ponytail: non-zero funding needs a point-in-time runtime funding feed; admit it only after
+    // that feed can debit every research bucket deterministically.
+    if costs.funding_bps != 0.0 {
+        return Err(
+            "four-stage CEX Paper/Shadow does not support non-zero funding costs".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn bound_notional_by_sealed_capacity(
+    notional: rust_decimal::Decimal,
+    costs: &EvaluationCostsV1,
+) -> Result<rust_decimal::Decimal, String> {
+    if !costs.capacity_enabled() {
+        return Ok(notional);
+    }
+    Ok(notional.min(positive_decimal(
+        "sealed position_notional_usd",
+        costs.position_notional_usd,
+    )?))
+}
+
 fn apply_strategy_bundle(
     config: &mut runtime::SystemConfig,
-    request: &ActivationRequest,
+    request: &mut ActivationRequest,
     bundle: &StrategyBundle,
     bundle_path: &Path,
 ) -> Result<(), String> {
@@ -245,7 +285,25 @@ fn apply_strategy_bundle(
     if hard_notional <= rust_decimal::Decimal::ZERO {
         return Err("runtime hard notional limit disables strategy activation".to_string());
     }
-    let total_notional = hard_notional.min(requested_notional).min(requested_symbol);
+    let mut total_notional = hard_notional.min(requested_notional).min(requested_symbol);
+    let cex_contract = match (&request.artifact, &bundle.artifact) {
+        (ActivationArtifact::Formula, StrategyBundleArtifact::CexFourStage { strategy }) => Some(
+            strategy
+                .runtime_contract()
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => None,
+    };
+    if let Some(contract) = cex_contract.as_ref() {
+        require_supported_cex_execution(&contract.costs)?;
+        total_notional = bound_notional_by_sealed_capacity(total_notional, &contract.costs)?;
+        request.max_notional = total_notional
+            .to_f64()
+            .ok_or_else(|| "effective CEX notional cannot be represented at runtime".to_string())?;
+        request.cex_execution_costs = Some(contract.costs.clone());
+    } else {
+        request.cex_execution_costs = None;
+    }
     let symbols = request
         .instruments
         .iter()
@@ -260,7 +318,97 @@ fn apply_strategy_bundle(
     };
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
-        (ActivationArtifact::Formula, StrategyBundleArtifact::Formula { ast }) => {
+        (ActivationArtifact::Formula, artifact) => {
+            let (ast, target_position, signal_threshold, interval_ms, execution_contract) =
+                match artifact {
+                    StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None, None),
+                    StrategyBundleArtifact::CexFourStage { strategy } => {
+                        let [instrument] = request.instruments.as_slice() else {
+                            return Err(
+                                "four-stage CEX deployment requires exactly one instrument"
+                                    .to_string(),
+                            );
+                        };
+                        let venue = config
+                            .venues
+                            .iter_mut()
+                            .find(|venue| {
+                                venue.name.eq_ignore_ascii_case(&request.venue)
+                                    && venue.account_id.as_deref().unwrap_or(&venue.name)
+                                        == request.account_id
+                            })
+                            .ok_or_else(|| {
+                                "four-stage CEX deployment has no exact runtime venue/account"
+                                    .to_string()
+                            })?;
+                        if !request.venue.eq_ignore_ascii_case(strategy.venue.as_str())
+                            || instrument != &strategy.symbol
+                            || venue.inst_type.as_deref().is_none_or(|market| {
+                                !market.eq_ignore_ascii_case(strategy.market.as_str())
+                            })
+                        {
+                            return Err(
+                                "four-stage CEX bundle does not match the runtime venue, market, or instrument"
+                                    .to_string(),
+                            );
+                        }
+                        if strategy.market.as_str() != "usdm"
+                            || !matches!(venue.venue_type, runtime::VenueType::Binance)
+                            || venue.rest.as_deref() != Some("https://fapi.binance.com")
+                            || venue.ws_public.as_deref() != Some("wss://fstream.binance.com/ws")
+                        {
+                            return Err(
+                                "four-stage CEX Paper/Shadow requires Binance USD-M with canonical fapi and fstream endpoints"
+                                    .to_string(),
+                            );
+                        }
+                        venue.simulate_execution = true;
+                        let contract = cex_contract
+                            .as_ref()
+                            .expect("CEX Formula artifact has a validated runtime contract");
+                        let tick_size = contract
+                            .tick_size
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| "sealed CEX tick size is invalid".to_string())?;
+                        let step_size = contract
+                            .step_size
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| "sealed CEX step size is invalid".to_string())?;
+                        let min_notional = contract
+                            .min_notional
+                            .parse::<rust_decimal::Decimal>()
+                            .map_err(|_| {
+                            "sealed CEX minimum notional is invalid".to_string()
+                        })?;
+                        (
+                            &strategy.executable_formula,
+                            true,
+                            contract.zero_epsilon,
+                            Some(contract.observation_frequency_millis),
+                            Some(runtime::FormulaExecutionContract {
+                                venue: hft_core::VenueId::BINANCE,
+                                venue_spec: ports::VenueSpec {
+                                    name: "BINANCE".to_string(),
+                                    tick_size: hft_core::Price(tick_size),
+                                    lot_size: hft_core::Quantity(step_size),
+                                    min_qty: hft_core::Quantity(step_size),
+                                    max_quantity: None,
+                                    min_notional,
+                                    maker_fee_bps: None,
+                                    taker_fee_bps: None,
+                                    rate_limit: None,
+                                },
+                                cross_spread: contract.costs.cross_spread,
+                            }),
+                        )
+                    }
+                    _ => {
+                        return Err(
+                            "deployment artifact intent does not match the strategy bundle"
+                                .to_string(),
+                        )
+                    }
+                };
             let ids = symbols
                 .iter()
                 .map(|symbol| format!("{strategy_name}:{}", symbol.as_str()))
@@ -273,7 +421,10 @@ fn apply_strategy_bundle(
                     params: runtime::StrategyParams::Formula {
                         ast: ast.clone(),
                         max_order_notional: total_notional,
-                        signal_threshold: 0.0,
+                        signal_threshold,
+                        target_position,
+                        evaluation_interval_millis: interval_ms,
+                        execution_contract,
                     },
                     risk_limits,
                 },
@@ -696,7 +847,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
                 return Err(error.into());
             }
         };
-        let request = match activation_request(&verified, self.runtime_paused) {
+        let mut request = match activation_request(&verified, self.runtime_paused) {
             Ok(request) => request,
             Err(error) => {
                 append_rejection(
@@ -715,7 +866,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
             reason: None,
             recorded_at: now,
         })?;
-        if let Err(error) = self.adapter.activate(&request) {
+        if let Err(error) = self.adapter.activate(&mut request) {
             self.audit.append(&RuntimeAuditEvent {
                 deployment_id: request.deployment_id.clone(),
                 phase: "configuration".to_string(),
@@ -781,18 +932,11 @@ fn activation_request(
         return Err(IntakeError::DuplicateInstrument);
     }
     let approved = match mode {
-        ActivationMode::Paper => matches!(
-            verified.0.approval_class,
-            ApprovalClass::Paper | ApprovalClass::Shadow | ApprovalClass::HumanApprovedLiveSmall
-        ),
-        ActivationMode::Shadow => matches!(
-            verified.0.approval_class,
-            ApprovalClass::Shadow | ApprovalClass::HumanApprovedLiveSmall
-        ),
-        ActivationMode::LiveSmall => matches!(
-            verified.0.approval_class,
-            ApprovalClass::HumanApprovedLiveSmall
-        ),
+        ActivationMode::Paper => verified.0.approval_class == ApprovalClass::Paper,
+        ActivationMode::Shadow => verified.0.approval_class == ApprovalClass::Shadow,
+        ActivationMode::LiveSmall => {
+            verified.0.approval_class == ApprovalClass::HumanApprovedLiveSmall
+        }
     };
     if !approved {
         return Err(IntakeError::ApprovalClassMismatch);
@@ -805,6 +949,8 @@ fn activation_request(
         bundle_hash: verified.0.bundle_hash.clone(),
         account_id: verified.0.account_id.clone(),
         venue: verified.0.venue.clone(),
+        market: None,
+        cex_execution_costs: None,
         instruments: verified.0.instruments.clone(),
         artifact: *artifact,
         mode: *mode,
@@ -885,5 +1031,57 @@ mod tests {
             activation_request(&verified, false),
             Err(IntakeError::ApprovalClassMismatch)
         ));
+    }
+
+    #[test]
+    fn cross_spread_cex_execution_is_not_admitted() {
+        let mut costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        assert!(require_supported_cex_execution(&costs).is_ok());
+        costs.cross_spread = true;
+        assert!(require_supported_cex_execution(&costs)
+            .unwrap_err()
+            .contains("does not support cross-spread execution"));
+        costs.cross_spread = false;
+        costs.funding_bps = 0.1;
+        assert!(require_supported_cex_execution(&costs)
+            .unwrap_err()
+            .contains("does not support non-zero funding costs"));
+    }
+
+    #[test]
+    fn sealed_capacity_caps_runtime_notional() {
+        let mut costs = EvaluationCostsV1 {
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let requested = rust_decimal::Decimal::from(500);
+        assert_eq!(
+            bound_notional_by_sealed_capacity(requested, &costs).unwrap(),
+            requested
+        );
+        costs.position_notional_usd = 100.0;
+        costs.capacity_depth_levels = 5;
+        costs.max_book_depth_fraction = 0.1;
+        assert_eq!(
+            bound_notional_by_sealed_capacity(requested, &costs).unwrap(),
+            rust_decimal::Decimal::from(100)
+        );
     }
 }

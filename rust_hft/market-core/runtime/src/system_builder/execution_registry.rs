@@ -246,8 +246,11 @@ impl SystemBuilder {
     }
 
     #[cfg(feature = "adapter-binance-data")]
-    pub(crate) fn register_binance_adapters(mut self, venue: &VenueConfig) -> Self {
+    pub(crate) fn register_binance_adapters(self, venue: &VenueConfig) -> Self {
         info!("註冊 Binance 適配器");
+        if venue.simulate_execution {
+            return self.register_simulated_execution_client(hft_core::VenueId::BINANCE);
+        }
         #[cfg(feature = "adapter-binance-execution")]
         {
             use adapter_binance_execution as binance_exec;
@@ -278,13 +281,16 @@ impl SystemBuilder {
                 .account_id
                 .as_ref()
                 .map(|s| hft_core::AccountId(s.clone()));
-            self = self.register_execution_client_with_key(
+            self.register_execution_client_with_key(
                 execution_client,
                 hft_core::VenueId::BINANCE,
                 account,
-            );
+            )
         }
-        self
+        #[cfg(not(feature = "adapter-binance-execution"))]
+        {
+            self
+        }
     }
 
     #[cfg(not(feature = "adapter-binance-data"))]
