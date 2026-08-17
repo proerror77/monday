@@ -6,6 +6,7 @@ use alpha_domain::{
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -296,6 +297,9 @@ fn apply_strategy_bundle(
     if let Some(contract) = cex_contract.as_ref() {
         require_supported_cex_execution(&contract.costs)?;
         total_notional = bound_notional_by_sealed_capacity(total_notional, &contract.costs)?;
+        request.max_notional = total_notional
+            .to_f64()
+            .ok_or_else(|| "effective CEX notional cannot be represented at runtime".to_string())?;
         request.cex_execution_costs = Some(contract.costs.clone());
     } else {
         request.cex_execution_costs = None;

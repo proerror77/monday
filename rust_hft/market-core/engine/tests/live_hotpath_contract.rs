@@ -136,6 +136,7 @@ struct ArbitrageCaptureStrategy {
 
 struct ContextSequenceCaptureStrategy {
     captured: Arc<Mutex<Vec<(u64, f64)>>>,
+    bucketed: bool,
 }
 
 impl Strategy for ContextSequenceCaptureStrategy {
@@ -168,6 +169,10 @@ impl Strategy for ContextSequenceCaptureStrategy {
         _account: &AccountView,
     ) -> Vec<OrderIntent> {
         Vec::new()
+    }
+
+    fn clock_interval_micros(&self) -> Option<u64> {
+        self.bucketed.then_some(u64::MAX)
     }
 
     fn name(&self) -> &str {
@@ -564,14 +569,20 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
 }
 
 #[test]
-fn l2_strategy_context_excludes_a_newer_quote_overlay() {
+fn only_bucketed_strategies_exclude_a_newer_quote_overlay() {
     let mut config = EngineConfig::default();
     config.ingestion.stale_threshold_us = 1_000_000;
     let mut engine = Engine::new(config);
     let ingester = engine.create_event_ingester_pair();
     let captured = Arc::new(Mutex::new(Vec::new()));
+    let overlaid = Arc::new(Mutex::new(Vec::new()));
     engine.register_strategy(ContextSequenceCaptureStrategy {
         captured: Arc::clone(&captured),
+        bucketed: true,
+    });
+    engine.register_strategy(ContextSequenceCaptureStrategy {
+        captured: Arc::clone(&overlaid),
+        bucketed: false,
     });
     let symbol = Symbol::new("BTCUSDT");
 
@@ -621,6 +632,7 @@ fn l2_strategy_context_excludes_a_newer_quote_overlay() {
     engine.tick().expect("delta tick");
 
     assert_eq!(*captured.lock().expect("capture lock"), vec![(21, 100.0)]);
+    assert_eq!(*overlaid.lock().expect("capture lock"), vec![(25, 99.0)]);
 }
 
 #[test]
@@ -910,6 +922,7 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     engine.register_strategy(ContextSequenceCaptureStrategy {
         captured: Arc::clone(&captured),
+        bucketed: true,
     });
     let symbol = Symbol::new("BTCUSDT");
     ingester

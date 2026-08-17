@@ -468,8 +468,8 @@ pub struct L2BookView<'a> {
     pub ask_quantities: &'a [FixedQuantity],
 }
 
-/// Stable strategy input. Snapshot/update events carry canonical L2; quote events may carry the
-/// real-time BBO overlay used by strategies that explicitly consume that modality.
+/// Stable strategy input. Time-bucketed strategies receive canonical L2 for snapshot/update
+/// events; event-driven strategies retain the published book, including newer BBO overlays.
 #[derive(Debug, Clone, Copy)]
 pub struct StrategyContext<'a> {
     pub account: &'a AccountView,
@@ -480,7 +480,7 @@ pub trait Strategy: Send + Sync {
     /// 處理市場事件，返回交易意圖
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent>;
 
-    /// Process an event with the engine's latest canonical L2 state.
+    /// Process an event with the point-in-time L2 state selected by the strategy contract.
     ///
     /// Existing non-LOB strategies remain source-compatible through this default implementation.
     fn on_market_event_with_context(

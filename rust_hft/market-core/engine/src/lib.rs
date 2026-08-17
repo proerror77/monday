@@ -217,8 +217,10 @@ struct PendingMarketEvent {
     /// Local adapter-boundary timestamp used for latency and order lifecycle validation.
     received_at: Timestamp,
     capture_boundary: hft_core::LatencyCaptureBoundary,
-    /// Canonical L2 immediately after this event was applied, before any later batched delta.
+    /// Published L2 immediately after this event was applied, including any newer BBO overlay.
     book: Option<(VenueId, Arc<TopNSnapshot>)>,
+    /// Canonical L2 before BBO overlays, used only by bucketed research-contract strategies.
+    canonical_book: Option<(VenueId, Arc<TopNSnapshot>)>,
 }
 
 fn gcd(mut left: u64, mut right: u64) -> u64 {
@@ -856,6 +858,7 @@ impl Engine {
                 received_at: now,
                 capture_boundary: hft_core::LatencyCaptureBoundary::Unspecified,
                 book: None,
+                canonical_book: None,
             },
         );
     }
@@ -1178,19 +1181,29 @@ impl Engine {
                                 &event,
                                 ports::MarketEvent::Snapshot(_) | ports::MarketEvent::Update(_)
                             );
-                            let book = Self::event_venue_symbol(&event).and_then(|key| {
-                                let snapshot = if canonical_l2 {
-                                    self.aggregation_engine.canonical_top_n(&key)
-                                } else {
-                                    self.aggregation_engine.orderbooks.get(&key).cloned()
-                                }?;
-                                Some((key.venue, snapshot))
+                            let key = Self::event_venue_symbol(&event);
+                            let book = key.as_ref().and_then(|key| {
+                                self.aggregation_engine
+                                    .orderbooks
+                                    .get(key)
+                                    .cloned()
+                                    .map(|snapshot| (key.venue, snapshot))
                             });
+                            let canonical_book = if canonical_l2 {
+                                key.as_ref().and_then(|key| {
+                                    self.aggregation_engine
+                                        .canonical_top_n(key)
+                                        .map(|snapshot| (key.venue, snapshot))
+                                })
+                            } else {
+                                None
+                            };
                             self.pending_market_events.push(PendingMarketEvent {
                                 input: PendingStrategyInput::Market(event),
                                 received_at,
                                 capture_boundary,
                                 book,
+                                canonical_book,
                             });
                         }
                         self.aggregation_events_buf = aggregation_events;
@@ -1624,10 +1637,20 @@ impl Engine {
                     ask_prices: &book.ask_prices,
                     ask_quantities: &book.ask_quantities,
                 });
-            let strategy_context = ports::StrategyContext {
-                account: &account_view,
-                book: l2_book,
-            };
+            let canonical_l2_book =
+                pending
+                    .canonical_book
+                    .as_ref()
+                    .map(|(venue, book)| ports::L2BookView {
+                        symbol: &book.symbol,
+                        venue: *venue,
+                        timestamp: book.timestamp,
+                        sequence: book.sequence,
+                        bid_prices: &book.bid_prices,
+                        bid_quantities: &book.bid_quantities,
+                        ask_prices: &book.ask_prices,
+                        ask_quantities: &book.ask_quantities,
+                    });
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
             let strategy_account_mapping = &self.strategy_account_mapping;
@@ -1693,6 +1716,17 @@ impl Engine {
 
                 let mut intents = match (event, clock_timestamp) {
                     (Some(event), _) => {
+                        let strategy_context = ports::StrategyContext {
+                            account: &account_view,
+                            book: if strategy
+                                .clock_interval_micros()
+                                .is_some_and(|interval| interval > 0)
+                            {
+                                canonical_l2_book
+                            } else {
+                                l2_book
+                            },
+                        };
                         strategy.on_market_event_with_context(event, &strategy_context)
                     }
                     (None, Some(timestamp))
@@ -2532,8 +2566,10 @@ mod tests {
     #[test]
     fn strategy_clock_waits_until_market_input_is_drained() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut config = EngineConfig::default();
-        config.max_events_per_cycle = 1;
+        let config = EngineConfig {
+            max_events_per_cycle: 1,
+            ..EngineConfig::default()
+        };
         let mut engine = Engine::new(config);
         engine.register_strategy(ClockCaptureStrategy {
             interval: 1,
@@ -2764,6 +2800,7 @@ mod tests {
             received_at,
             capture_boundary: LatencyCaptureBoundary::AdapterPublish,
             book: None,
+            canonical_book: None,
         });
 
         engine
@@ -2823,6 +2860,7 @@ mod tests {
             received_at,
             capture_boundary: LatencyCaptureBoundary::AdapterPublish,
             book: None,
+            canonical_book: None,
         });
 
         engine

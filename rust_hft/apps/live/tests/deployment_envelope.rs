@@ -400,6 +400,7 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
         };
         assert_eq!(request.mode, expected_mode);
         assert_eq!(request.market.as_deref(), Some("usdm"));
+        assert_eq!(request.max_notional, 500.0);
         let costs = request
             .cex_execution_costs
             .as_ref()
