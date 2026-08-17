@@ -104,6 +104,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(rows: &[Value]) -> Self {
+        Self::new_with_manifest(rows, |manifest| manifest)
+    }
+
+    fn new_with_manifest(rows: &[Value], edit: impl FnOnce(Value) -> Value) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "binance-market-tape-slicer-{}-{}",
             std::process::id(),
@@ -145,7 +149,7 @@ impl Fixture {
                     .unwrap();
             }
         }
-        let manifest_value = json!({
+        let manifest_value = edit(json!({
             "schema": "binance.market_tape.v2", "venue": "binance", "market": "spot",
             "dataset": "spot_all", "shard_id": "all", "mode": "diff",
             "symbols": SYMBOLS, "security_token_symbols": [], "excluded_symbols": [],
@@ -167,7 +171,7 @@ impl Fixture {
             "trade_summaries": trade_summaries.finish().unwrap(),
             "lob_continuity": lob_continuity.finish().unwrap(),
             "stream_types": ["depth@100ms", "aggTrade"]
-        });
+        }));
         let mut manifest_bytes = serde_json::to_vec(&manifest_value).unwrap();
         manifest_bytes.push(b'\n');
         fs::write(sibling(&data, ".manifest.json"), &manifest_bytes).unwrap();
@@ -353,6 +357,50 @@ fn cli_rejects_a_manifest_digest_mismatch() {
 
     let output = fixture.slice(&fixture.directory.join("slices"), &[]);
     assert!(!output.status.success());
+}
+
+#[test]
+fn cli_publishes_nothing_when_the_strict_gate_rejects_a_slice() {
+    // A source manifest the slicer accepts but whose slices the strict gate
+    // rejects (mode != diff): the failure must surface before anything is
+    // published, leaving no complete-looking slice triplet behind.
+    let fixture = Fixture::new_with_manifest(&segment_rows(), |mut manifest| {
+        manifest["mode"] = json!("full");
+        manifest
+    });
+    let slice_dir = fixture.directory.join("slices");
+    let output = fixture.slice(&slice_dir, &[]);
+    assert!(!output.status.success());
+    let visible = fs::read_dir(&slice_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with('.'))
+        .collect::<Vec<_>>();
+    assert!(visible.is_empty(), "staged artifacts leaked: {visible:?}");
+}
+
+#[test]
+fn cli_publishes_the_success_marker_after_data_and_manifest() {
+    // A conflicting immutable data object forces the data publication to
+    // fail; neither the manifest nor the _SUCCESS marker may appear, because
+    // the triplet contract publishes data -> manifest -> _SUCCESS last.
+    let fixture = Fixture::new(&segment_rows());
+    let slice_dir = fixture.directory.join("slices");
+    fs::create_dir_all(&slice_dir).unwrap();
+    fs::write(
+        slice_dir.join("part-1.slice-001.jsonl.zst"),
+        b"conflict\n",
+    )
+    .unwrap();
+    let output = fixture.slice(&slice_dir, &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("different content"));
+    assert!(!slice_dir
+        .join("part-1.slice-001.jsonl.zst.manifest.json")
+        .exists());
+    assert!(!slice_dir
+        .join("part-1.slice-001.jsonl.zst._SUCCESS")
+        .exists());
 }
 
 fn sha256_file(path: &Path) -> String {

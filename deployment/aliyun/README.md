@@ -813,15 +813,18 @@ market-tape seal bound, which keeps them out of
 (hft-collector) rewrites one digest-verified segment into disjoint
 symbol-subset segments: session rows are rewritten to the subset scope,
 per-slice manifests and digests are recomputed, and every slice is re-sealed
-and re-verified under the unchanged strict market-tape gate before it is
-reported. The 2 GiB bound is a deliberate resource limit and is not raised.
+and re-verified under the unchanged strict market-tape gate while it is still
+staged — only a verified slice is published, in data -> manifest -> _SUCCESS
+order. The 2 GiB bound is a deliberate resource limit and is not raised.
 `deployment/aliyun/binance-lob-slice-materialize.sh` is the batch driver: it
-enumerates `date=/hour=` partitions under the governed lake prefix, downloads
-each segment triplet, slices it for a requested symbol set, and materializes
-every slice with the unchanged materializer into content-addressed canonical
-parquet plus a `slice-materialization-run.json` evidence manifest. State under
-`WORK_DIR/state/` makes reruns resumable (completed segment/symbol pairs are
-skipped), and any download, slice, or materialize failure fails the run.
+recursively enumerates `date=/hour=` partitions under the governed lake
+prefix, downloads each segment triplet, slices it for a requested symbol set,
+and materializes every slice with the unchanged materializer into
+content-addressed canonical parquet plus a `slice-materialization-run.json`
+evidence manifest. State under `WORK_DIR/state/` makes reruns resumable
+(completed segment/symbol pairs are skipped; a changed symbol set re-slices),
+and any download, slice, or materialize failure, any symbol left pending, an
+empty enumeration, or a run-manifest publish failure fails the run.
 
 ## Rust-only collector release workflow
 

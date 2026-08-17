@@ -778,19 +778,25 @@ fn publish_slice(
     };
 
     let data_path = output_dir.join(data_name);
-    let (temporary_zst, compressed) = temporary_file(&data_path)?;
-    drop(compressed);
-    compress_file(&temporary, &temporary_zst)?;
-    fs::remove_file(&temporary)?;
-    let compressed_bytes = fs::metadata(&temporary_zst)?.len();
-    let content_sha256 = sha256_file(&temporary_zst)?;
-    publish_temp_immutable(&temporary_zst, &data_path, &content_sha256)?;
-
+    let manifest_path = sibling(&data_path, ".manifest.json")?;
     let success_path = sibling(&data_path, "._SUCCESS")?;
-    publish_immutable_bytes(
-        &success_path,
-        format!("{content_sha256}\n").as_bytes(),
-    )?;
+
+    // Stage the full triplet under one hidden directory so the unchanged
+    // strict gate seals and verifies it before anything is visible at its
+    // final name. Only a verified slice is published, in
+    // data -> manifest -> _SUCCESS order, so a crash or a verification
+    // failure can never leave a complete-looking slice behind.
+    let staging_dir = tempfile::Builder::new()
+        .prefix(&format!(".{data_name}.staging."))
+        .tempdir_in(output_dir)
+        .context("cannot create the slice staging directory")?;
+    let staging = fs::canonicalize(staging_dir.path())
+        .context("cannot resolve the slice staging directory")?;
+    let staged_data = staging.join(data_name);
+    compress_file(&temporary, &staged_data)?;
+    fs::remove_file(&temporary)?;
+    let compressed_bytes = fs::metadata(&staged_data)?.len();
+    let content_sha256 = sha256_file(&staged_data)?;
 
     let manifest = slice_manifest(
         source_manifest,
@@ -804,15 +810,18 @@ fn publish_slice(
     let mut manifest_bytes = serde_json::to_vec(&Value::Object(manifest))?;
     manifest_bytes.push(b'\n');
     let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
-    let manifest_path = sibling(&data_path, ".manifest.json")?;
-    publish_immutable_bytes(&manifest_path, &manifest_bytes)?;
+    let staged_manifest = sibling(&staged_data, ".manifest.json")?;
+    write_staged(&staged_manifest, &manifest_bytes)?;
+    let success_bytes = format!("{content_sha256}\n").into_bytes();
+    let staged_success = sibling(&staged_data, "._SUCCESS")?;
+    write_staged(&staged_success, &success_bytes)?;
 
-    // Proof before report: every slice must seal and verify under the
-    // unchanged strict market-tape gate.
+    // Proof before publication: every slice must seal and verify under the
+    // unchanged strict market-tape gate while it is still staged.
     let triplet = BinanceMarketTapeTriplet {
-        data: data_path.clone(),
-        manifest: manifest_path,
-        success: success_path,
+        data: staged_data.clone(),
+        manifest: staged_manifest.clone(),
+        success: staged_success.clone(),
     };
     let trust =
         BinanceMarketTapeTrustAnchor::from_lower_hex(&content_sha256, &manifest_sha256)?;
@@ -820,6 +829,14 @@ fn publish_slice(
     verify_binance_market_tape_for_strict_gate(vec![sealed]).with_context(|| {
         format!("slice {data_name} failed the strict market-tape gate")
     })?;
+
+    publish_temp_immutable(&staged_data, &data_path, &content_sha256)?;
+    publish_temp_immutable(&staged_manifest, &manifest_path, &manifest_sha256)?;
+    publish_temp_immutable(
+        &staged_success,
+        &success_path,
+        &hex::encode(Sha256::digest(&success_bytes)),
+    )?;
 
     Ok(SliceEvidence {
         file: data_name.to_string(),
@@ -946,16 +963,10 @@ fn canonical_output_dir(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn publish_immutable_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let (temporary, mut output) = temporary_file(path)?;
-    let write_result = output.write_all(bytes).and_then(|_| output.sync_all());
-    drop(output);
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    let expected = hex::encode(Sha256::digest(bytes));
-    publish_temp_immutable(&temporary, path, &expected)
+fn write_staged(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes)
+        .with_context(|| format!("cannot stage slice artifact {}", path.display()))?;
+    sync_file(path)
 }
 
 fn publish_temp_immutable(temporary: &Path, path: &Path, expected_sha256: &str) -> Result<()> {

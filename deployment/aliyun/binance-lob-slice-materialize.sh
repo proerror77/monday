@@ -20,10 +20,13 @@
 # Resume contract: all state lives under WORK_DIR/state/. A segment whose
 # requested symbols all have <stem>.<SYMBOL>.ok records is skipped entirely; a
 # segment with <stem>.sliced.ok reuses its recorded slice report instead of
-# re-slicing. The materializer publishes immutable content-addressed
-# artifacts, so re-running any step is safe. The run manifest
-# ARTIFACT_DIR/slice-materialization-run.json is rebuilt from the ok records
-# on every run. Exit status is nonzero if any segment or symbol failed.
+# re-slicing, but only when the recorded <stem>.sliced.symbols set matches the
+# requested one: a wider --symbols set always re-slices. The materializer
+# publishes immutable content-addressed artifacts, so re-running any step is
+# safe. The run manifest ARTIFACT_DIR/slice-materialization-run.json is
+# rebuilt from the ok records on every run. Exit status is nonzero if any
+# segment or symbol failed, if any requested symbol is still pending, if no
+# segment matched the window, or if the run manifest cannot be published.
 #
 # Usage:
 #   binance-lob-slice-materialize.sh --market spot --start-date 2026-08-16 \
@@ -129,9 +132,11 @@ log() {
 }
 
 list_oss() {
-  # $1 = prefix URI. Prints the short-format listing (one URI per line);
-  # nonzero exit on any OSS failure.
-  aliyun ossutil ls "$1" --short-format \
+  # $1 = prefix URI. Prints the short-format recursive listing (one object
+  # URI per line); nonzero exit on any OSS failure. --recursive is required:
+  # data objects live one level below the date= prefix under hour=HH/, so a
+  # shallow listing only returns hour prefixes and sees no segments at all.
+  aliyun ossutil ls "$1" --recursive --short-format \
     --profile "$ALIYUN_PROFILE" --endpoint "$OSS_ENDPOINT" --region "$OSS_REGION"
 }
 
@@ -231,7 +236,13 @@ while [ "$DAY" -le "$END_EPOCH" ]; do
     SEG_RAW=$RAW_DIR/$PART
     SEG_SLICES=$SLICE_DIR/$PART
     REPORT=$STATE_DIR/$PART.slices.json
-    if [ ! -f "$STATE_DIR/$PART.sliced.ok" ]; then
+    SLICED_SYMBOLS=$(cat "$STATE_DIR/$PART.sliced.symbols" 2>/dev/null || true)
+    if [ ! -f "$STATE_DIR/$PART.sliced.ok" ] || [ "$SLICED_SYMBOLS" != "$SYMBOLS" ]; then
+      # The slice report is only valid for the symbol set that produced it.
+      # A changed --symbols set must re-slice from the raw segment instead of
+      # reusing stale slices that may not cover the new symbols.
+      rm -rf "$SEG_SLICES"
+      rm -f "$REPORT" "$STATE_DIR/$PART.sliced.ok"
       mkdir -p "$SEG_RAW" || continue
       DOWNLOAD_OK=1
       for SUFFIX in "" ".manifest.json" "._SUCCESS"; do
@@ -258,6 +269,7 @@ while [ "$DAY" -le "$END_EPOCH" ]; do
         continue
       fi
       mv "$REPORT.tmp" "$REPORT"
+      printf '%s\n' "$SYMBOLS" >"$STATE_DIR/$PART.sliced.symbols"
       : >"$STATE_DIR/$PART.sliced.ok"
     fi
 
@@ -300,7 +312,22 @@ while [ "$DAY" -le "$END_EPOCH" ]; do
     for SYMBOL in $(printf '%s' "$SYMBOLS" | tr ',' ' '); do
       [ -f "$STATE_DIR/$PART.$SYMBOL.ok" ] || PENDING="$PENDING $SYMBOL"
     done
-    if [ -z "$PENDING" ] && [ "$CLEANUP_RAW" = "1" ]; then
+    if [ -n "$PENDING" ]; then
+      # Fail closed: a requested symbol that never materialized (for example
+      # because no slice covered it) must surface as a failure, not pass
+      # silently under a zero exit status.
+      for SYMBOL in $(printf '%s' "$SYMBOLS" | tr ',' ' '); do
+        case " $PENDING " in
+          *" $SYMBOL "*) ;;
+          *) continue ;;
+        esac
+        if ! grep -qF "\"segment\":\"$PART\",\"symbol\":\"$SYMBOL\"" "$FAILURES" 2>/dev/null; then
+          log err "symbol $SYMBOL of $PART was not materialized"
+          printf '{"date":"%s","hour":"%s","segment":"%s","symbol":"%s","error":"symbol_pending"}\n' \
+            "$DATE" "$HOUR" "$PART" "$SYMBOL" >>"$FAILURES"
+        fi
+      done
+    elif [ "$CLEANUP_RAW" = "1" ]; then
       rm -rf "$SEG_RAW"
     fi
   done
@@ -311,15 +338,31 @@ RECORD_COUNT=$(grep -c . "$RECORDS" 2>/dev/null || true)
 FAILURE_COUNT=$(grep -c . "$FAILURES" 2>/dev/null || true)
 case "$RECORD_COUNT" in '' | *[!0-9]*) RECORD_COUNT=0 ;; esac
 case "$FAILURE_COUNT" in '' | *[!0-9]*) FAILURE_COUNT=0 ;; esac
+if [ "$SEGMENTS_SEEN" -eq 0 ]; then
+  # Zero matching segments is not a successful run: either the window or the
+  # enumeration is wrong, and a green exit would hide both.
+  log err "no market-tape segments matched the requested window"
+  printf '{"error":"no_segments_found","start_date":"%s","end_date":"%s"}\n' \
+    "$START_DATE" "$END_DATE" >>"$FAILURES"
+  FAILURE_COUNT=$((FAILURE_COUNT + 1))
+fi
 RUN_MANIFEST=$ARTIFACT_DIR/slice-materialization-run.json
-jq -n \
+if ! jq -n \
   --arg bucket "$OSS_BUCKET" --arg market "$MARKET" --arg dataset "$DATASET" \
   --arg shard "$SHARD" --arg start "$START_DATE" --arg end "$END_DATE" \
   --arg symbols "$SYMBOLS" --argjson seen "$SEGMENTS_SEEN" \
   --argjson skipped "$SEGMENTS_SKIPPED" \
   --slurpfile records "$RECORDS" --slurpfile failures "$FAILURES" \
   '{bucket:$bucket,market:$market,dataset:$dataset,shard:$shard,start_date:$start,end_date:$end,symbols:($symbols|split(",")),segments_seen:$seen,segments_skipped:$skipped,materialized:$records,failed:$failures}' \
-  >"$RUN_MANIFEST.tmp" && mv "$RUN_MANIFEST.tmp" "$RUN_MANIFEST"
+  >"$RUN_MANIFEST.tmp"; then
+  log err "failed to build the run manifest"
+  rm -f "$RUN_MANIFEST.tmp"
+  exit 1
+fi
+if ! mv "$RUN_MANIFEST.tmp" "$RUN_MANIFEST"; then
+  log err "failed to publish the run manifest $RUN_MANIFEST"
+  exit 1
+fi
 
 log info "segments=$SEGMENTS_SEEN skipped=$SEGMENTS_SKIPPED materialized=$RECORD_COUNT failures=$FAILURE_COUNT manifest=$RUN_MANIFEST"
 [ "$FAILURE_COUNT" -eq 0 ]
