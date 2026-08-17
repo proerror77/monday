@@ -8,9 +8,9 @@ use hft_collector::{
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
 use hft_research_manifest::{
-    CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplaySnapshotV1,
-    CexReplaySnapshotV2, CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1,
-    CEX_REPLAY_DATASET_SCHEMA_V2,
+    CexReplayDatasetManifestV1, CexReplayDatasetManifestV3, CexReplaySnapshotV1,
+    CexReplaySnapshotV3, CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1,
+    CEX_REPLAY_DATASET_SCHEMA_V3,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -86,10 +86,10 @@ pub fn import_and_register_features(
 pub fn admit_cex_replay_dataset(
     store: &mut AlphaStore,
     features: &FeatureDatasetManifest,
-    snapshot: &CexReplaySnapshotV2,
-) -> anyhow::Result<CexReplayDatasetManifestV2> {
+    snapshot: &CexReplaySnapshotV3,
+) -> anyhow::Result<CexReplayDatasetManifestV3> {
     validate_cex_replay_features(snapshot, features)?;
-    let manifest = CexReplayDatasetManifestV2::new(features.manifest_id.clone(), snapshot.clone())?;
+    let manifest = CexReplayDatasetManifestV3::new(features.manifest_id.clone(), snapshot.clone())?;
     store.put_registry_revision(&RegistryRevision {
         revision_id: manifest.manifest_id.clone(),
         registry_kind: "dataset".to_string(),
@@ -102,7 +102,7 @@ pub fn admit_cex_replay_dataset(
 }
 
 fn validate_cex_replay_features(
-    snapshot: &CexReplaySnapshotV2,
+    snapshot: &CexReplaySnapshotV3,
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
     snapshot.validate()?;
@@ -234,21 +234,21 @@ pub enum RegisteredResearchDataset {
 
 pub enum CexReplayAdmission {
     V1(Box<CexReplayDatasetManifestV1>),
-    V2(Box<CexReplayDatasetManifestV2>),
+    V3(Box<CexReplayDatasetManifestV3>),
 }
 
 impl CexReplayAdmission {
     fn manifest_id(&self) -> &str {
         match self {
             Self::V1(manifest) => &manifest.manifest_id,
-            Self::V2(manifest) => &manifest.manifest_id,
+            Self::V3(manifest) => &manifest.manifest_id,
         }
     }
 
     fn symbol(&self) -> &str {
         match self {
             Self::V1(manifest) => &manifest.snapshot.symbol,
-            Self::V2(manifest) => &manifest.snapshot.symbol,
+            Self::V3(manifest) => &manifest.snapshot.symbol,
         }
     }
 }
@@ -282,21 +282,20 @@ impl RegisteredResearchDataset {
                 ..
             } => bail!("historical V1 CEX replay evidence is read-only and cannot execute"),
             Self::CexReplay {
-                admission: CexReplayAdmission::V2(manifest),
+                admission: CexReplayAdmission::V3(manifest),
                 features,
             } => {
                 if costs.rebate_bps != 0.0 {
-                    bail!("V2 CEX replay evidence does not support mission-supplied rebates");
+                    bail!("CEX replay evidence does not support mission-supplied rebates");
                 }
-                let (fee_bps, funding_bps, latency_bps) =
+                let (fee_bps, funding_bps) =
                     cex_snapshot_costs(&manifest.snapshot, costs.cross_spread)?;
                 if costs.fee_bps.to_bits() != fee_bps.to_bits()
                     || costs.funding_bps.to_bits() != funding_bps.to_bits()
-                    || costs.latency_bps.to_bits() != latency_bps.to_bits()
                 {
-                    bail!("evaluation costs do not match the verified CEX replay snapshot");
+                    bail!("evaluation fee or funding costs do not match the verified CEX replay snapshot");
                 }
-                load_feature_research_rows(features, fee_bps, funding_bps, latency_bps, true)
+                load_feature_research_rows(features, fee_bps, funding_bps, costs.latency_bps, true)
             }
         }
     }
@@ -328,9 +327,9 @@ impl RegisteredResearchDataset {
 }
 
 pub fn cex_snapshot_costs(
-    snapshot: &CexReplaySnapshotV2,
+    snapshot: &CexReplaySnapshotV3,
     cross_spread: bool,
-) -> anyhow::Result<(f64, f64, f64)> {
+) -> anyhow::Result<(f64, f64)> {
     snapshot.validate()?;
     let fees = &snapshot.fee_schedule;
     let (buy, sell) = if cross_spread {
@@ -352,12 +351,7 @@ pub fn cex_snapshot_costs(
         .transpose()
         .context("snapshot funding evidence is not numeric")?
         .unwrap_or(0.0);
-    let latency_bps = snapshot
-        .latency_cost
-        .p95_cost_bps
-        .parse::<f64>()
-        .context("snapshot execution latency evidence is not numeric")?;
-    Ok((fee_bps, funding_bps, latency_bps))
+    Ok((fee_bps, funding_bps))
 }
 
 #[cfg(test)]
@@ -419,8 +413,8 @@ pub fn read_registered_research_dataset(
                     fields.2,
                 )
             }
-            CEX_REPLAY_DATASET_SCHEMA_V2 => {
-                let manifest: CexReplayDatasetManifestV2 = serde_json::from_value(value.clone())?;
+            CEX_REPLAY_DATASET_SCHEMA_V3 => {
+                let manifest: CexReplayDatasetManifestV3 = serde_json::from_value(value.clone())?;
                 manifest.validate()?;
                 let fields = (
                     manifest.manifest_id.clone(),
@@ -428,7 +422,7 @@ pub fn read_registered_research_dataset(
                     manifest.snapshot.symbol.clone(),
                 );
                 (
-                    CexReplayAdmission::V2(Box::new(manifest)),
+                    CexReplayAdmission::V3(Box::new(manifest)),
                     fields.0,
                     fields.1,
                     fields.2,
@@ -452,7 +446,7 @@ pub fn read_registered_research_dataset(
             CexReplayAdmission::V1(manifest) => {
                 validate_cex_replay_features_v1(&manifest.snapshot, &features)?
             }
-            CexReplayAdmission::V2(manifest) => {
+            CexReplayAdmission::V3(manifest) => {
                 validate_cex_replay_features(&manifest.snapshot, &features)?
             }
         }
@@ -532,7 +526,7 @@ pub fn require_promotable_research_dataset(
             .payload
             .get("schema_version")
             .and_then(serde_json::Value::as_str)
-            != Some(CEX_REPLAY_DATASET_SCHEMA_V2)
+            != Some(CEX_REPLAY_DATASET_SCHEMA_V3)
     {
         bail!("historical V1 CEX replay evidence is read-only and cannot be promoted");
     }

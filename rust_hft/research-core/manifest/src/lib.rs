@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V1: &str = "cex-replay-snapshot-v1";
-pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V2: &str = "cex-replay-snapshot-v2";
+pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V3: &str = "cex-replay-snapshot-v3";
 pub const CEX_REPLAY_DATASET_KIND: &str = "cex_replay_feature_dataset";
 pub const CEX_REPLAY_DATASET_SCHEMA_V1: &str = "cex-replay-feature-dataset-v1";
-pub const CEX_REPLAY_DATASET_SCHEMA_V2: &str = "cex-replay-feature-dataset-v2";
+pub const CEX_REPLAY_DATASET_SCHEMA_V3: &str = "cex-replay-feature-dataset-v3";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2: &str = "binance-lob-pit-v2";
-pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3: &str = "binance-lob-pit-v3";
+pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4: &str = "binance-lob-pit-v4";
 pub const CEX_REPLAY_CLOCK_RECEIVED_AT_NS: &str = "received_at_ns";
 pub const CEX_FEATURE_AVAILABILITY_POLICY: &str = "feature_available_time_equals_event_time";
 pub const CEX_MODALITY_LOB: &str = "lob";
@@ -44,7 +44,7 @@ pub struct CexReplaySegmentIdentity {
     pub events: u64,
 }
 
-/// Historical CEX replay snapshot. Kept for read-only evidence decoding; new writers use V2.
+/// Historical CEX replay snapshot. Kept for read-only evidence decoding; new writers use V3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV1 {
@@ -172,28 +172,7 @@ pub struct CexDerivativesReferenceV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CexLatencyCostV2 {
-    pub method: String,
-    pub venue: String,
-    pub symbol: String,
-    pub runtime_account_id: String,
-    pub account_fingerprint: String,
-    pub evidence: CexArtifactTripletV2,
-    pub first_observed_at: DateTime<Utc>,
-    pub last_observed_at: DateTime<Utc>,
-    pub available_at: DateTime<Utc>,
-    pub observations: u64,
-    pub p50_ns: u64,
-    pub p95_ns: u64,
-    pub p99_ns: u64,
-    pub p50_cost_bps: String,
-    pub p95_cost_bps: String,
-    pub p99_cost_bps: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CexReplaySnapshotV2 {
+pub struct CexReplaySnapshotV3 {
     pub schema_version: String,
     pub venue: String,
     pub instrument_type: String,
@@ -211,10 +190,9 @@ pub struct CexReplaySnapshotV2 {
     pub instrument_rules: CexInstrumentRulesV2,
     pub fee_schedule: CexFeeScheduleV2,
     pub derivatives_reference: Option<CexDerivativesReferenceV2>,
-    pub latency_cost: CexLatencyCostV2,
 }
 
-impl CexReplaySnapshotV2 {
+impl CexReplaySnapshotV3 {
     pub fn validate(&self) -> Result<(), ManifestError> {
         if !valid_cex_symbol(&self.symbol) {
             return Err(ManifestError::InvalidCexReplaySnapshot(
@@ -231,7 +209,7 @@ impl CexReplaySnapshotV2 {
         }
         validate_snapshot_core(
             &self.schema_version,
-            CEX_REPLAY_SNAPSHOT_SCHEMA_V2,
+            CEX_REPLAY_SNAPSHOT_SCHEMA_V3,
             &self.venue,
             &self.instrument_type,
             &self.symbol,
@@ -284,33 +262,6 @@ impl CexReplaySnapshotV2 {
                 ) && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
             ("spot", None) => {}
             _ => return Err(invalid("derivatives reference evidence is invalid")),
-        }
-        if self.latency_cost.method != "verified_order_lifecycle_realized_slippage"
-            || self.latency_cost.venue != self.venue
-            || self.latency_cost.symbol != self.symbol
-            || self.latency_cost.runtime_account_id != self.fee_schedule.runtime_account_id
-            || self.latency_cost.account_fingerprint != self.fee_schedule.account_fingerprint
-            || !self.latency_cost.evidence.valid()
-            || self.latency_cost.first_observed_at > self.latency_cost.last_observed_at
-            || self.latency_cost.last_observed_at > self.first_event_time
-            || self.latency_cost.available_at < self.latency_cost.last_observed_at
-            || self.latency_cost.available_at > self.first_event_time
-            || self.latency_cost.observations == 0
-            || self.latency_cost.p50_ns > self.latency_cost.p95_ns
-            || self.latency_cost.p95_ns > self.latency_cost.p99_ns
-            || !ordered_nonnegative_decimals([
-                &self.latency_cost.p50_cost_bps,
-                &self.latency_cost.p95_cost_bps,
-                &self.latency_cost.p99_cost_bps,
-            ])
-            || (self.latency_cost.observations == 1
-                && (self.latency_cost.p50_ns != self.latency_cost.p99_ns
-                    || !equal_decimals(
-                        &self.latency_cost.p50_cost_bps,
-                        &self.latency_cost.p99_cost_bps,
-                    )))
-        {
-            return Err(invalid("measured latency cost evidence is invalid"));
         }
         Ok(())
     }
@@ -443,7 +394,7 @@ fn snapshot_sha256<T: Serialize>(snapshot: &T) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Historical CEX replay dataset. Kept for read-only evidence decoding; new writers use V2.
+/// Historical CEX replay dataset. Kept for read-only evidence decoding; new writers use V3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV1 {
@@ -474,24 +425,24 @@ impl CexReplayDatasetManifestV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CexReplayDatasetManifestV2 {
+pub struct CexReplayDatasetManifestV3 {
     pub dataset_kind: String,
     pub schema_version: String,
     pub manifest_id: String,
     pub feature_manifest_id: String,
-    pub snapshot: CexReplaySnapshotV2,
+    pub snapshot: CexReplaySnapshotV3,
     pub snapshot_sha256: String,
 }
 
-impl CexReplayDatasetManifestV2 {
+impl CexReplayDatasetManifestV3 {
     pub fn new(
         feature_manifest_id: impl Into<String>,
-        snapshot: CexReplaySnapshotV2,
+        snapshot: CexReplaySnapshotV3,
     ) -> Result<Self, ManifestError> {
         let snapshot_sha256 = snapshot.sha256();
         let manifest = Self {
             dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
-            schema_version: CEX_REPLAY_DATASET_SCHEMA_V2.to_string(),
+            schema_version: CEX_REPLAY_DATASET_SCHEMA_V3.to_string(),
             manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
             feature_manifest_id: feature_manifest_id.into(),
             snapshot,
@@ -505,7 +456,7 @@ impl CexReplayDatasetManifestV2 {
         let invalid = ManifestError::InvalidCexReplayDataset;
         self.snapshot.validate()?;
         if self.dataset_kind != CEX_REPLAY_DATASET_KIND
-            || self.schema_version != CEX_REPLAY_DATASET_SCHEMA_V2
+            || self.schema_version != CEX_REPLAY_DATASET_SCHEMA_V3
             || self.feature_manifest_id.trim().is_empty()
             || !valid_sha256(&self.snapshot_sha256)
             || self.snapshot_sha256 != self.snapshot.sha256()
@@ -554,19 +505,6 @@ fn nonnegative_decimal(value: &str) -> bool {
         && value
             .parse::<Decimal>()
             .is_ok_and(|value| value >= Decimal::ZERO)
-}
-
-fn ordered_nonnegative_decimals(values: [&str; 3]) -> bool {
-    let parsed = values.map(|value| value.parse::<Decimal>().ok());
-    matches!(parsed, [Some(p50), Some(p95), Some(p99)]
-        if values.iter().all(|value| !value.starts_with('-'))
-            && p50 >= Decimal::ZERO
-            && p50 <= p95
-            && p95 <= p99)
-}
-
-fn equal_decimals(left: &str, right: &str) -> bool {
-    left.parse::<Decimal>().ok() == right.parse::<Decimal>().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -783,9 +721,9 @@ mod tests {
         }
     }
 
-    fn cex_snapshot() -> CexReplaySnapshotV2 {
-        CexReplaySnapshotV2 {
-            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
+    fn cex_snapshot() -> CexReplaySnapshotV3 {
+        CexReplaySnapshotV3 {
+            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -866,30 +804,6 @@ mod tests {
                 },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
-            latency_cost: CexLatencyCostV2 {
-                method: "verified_order_lifecycle_realized_slippage".to_string(),
-                venue: "binance".to_string(),
-                symbol: "BTCUSDT".to_string(),
-                runtime_account_id: "desk/main".to_string(),
-                account_fingerprint: "9".repeat(64),
-                evidence: triplet('8'),
-                first_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_observed_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                observations: 100,
-                p50_ns: 1_000_000,
-                p95_ns: 2_000_000,
-                p99_ns: 3_000_000,
-                p50_cost_bps: "0.1".to_string(),
-                p95_cost_bps: "0.2".to_string(),
-                p99_cost_bps: "0.3".to_string(),
-            },
         }
     }
 
@@ -902,7 +816,6 @@ mod tests {
         assert_eq!(snapshot.sha256().len(), 64);
         let mut other_symbol = snapshot.clone();
         other_symbol.symbol = "SOLUSDT".to_string();
-        other_symbol.latency_cost.symbol = "SOLUSDT".to_string();
         other_symbol.validate().unwrap();
         assert_ne!(snapshot.sha256(), other_symbol.sha256());
     }
@@ -941,11 +854,11 @@ mod tests {
     fn cex_replay_dataset_identity_binds_snapshot_digest() {
         let snapshot = cex_snapshot();
         let manifest =
-            CexReplayDatasetManifestV2::new("dataset-feature-sha", snapshot.clone()).unwrap();
+            CexReplayDatasetManifestV3::new("dataset-feature-sha", snapshot.clone()).unwrap();
         let mut different_tape = snapshot;
         different_tape.source_segments[0].manifest_sha256 = "4".repeat(64);
         let different =
-            CexReplayDatasetManifestV2::new("dataset-feature-sha", different_tape).unwrap();
+            CexReplayDatasetManifestV3::new("dataset-feature-sha", different_tape).unwrap();
 
         assert_ne!(manifest.manifest_id, different.manifest_id);
         manifest.validate().unwrap();
@@ -1047,50 +960,6 @@ mod tests {
         assert_eq!(
             snapshot.validate().unwrap_err(),
             ManifestError::InvalidCexReplaySnapshot("derivatives reference evidence is invalid")
-        );
-    }
-
-    #[test]
-    fn cex_replay_snapshot_rejects_nonmonotonic_latency_cost() {
-        let mut snapshot = cex_snapshot();
-        snapshot.latency_cost.p50_cost_bps = "0.21".to_string();
-
-        assert_eq!(
-            snapshot.validate().unwrap_err(),
-            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
-        );
-    }
-
-    #[test]
-    fn cex_replay_snapshot_rejects_latency_cost_from_another_scope() {
-        let mut snapshot = cex_snapshot();
-        snapshot.latency_cost.symbol = "ETHUSDT".to_string();
-
-        assert_eq!(
-            snapshot.validate().unwrap_err(),
-            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
-        );
-    }
-
-    #[test]
-    fn cex_replay_snapshot_rejects_latency_cost_from_another_account() {
-        let mut snapshot = cex_snapshot();
-        snapshot.latency_cost.runtime_account_id = "binance-secondary".to_string();
-
-        assert_eq!(
-            snapshot.validate().unwrap_err(),
-            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
-        );
-    }
-
-    #[test]
-    fn cex_replay_snapshot_rejects_divergent_single_observation_percentiles() {
-        let mut snapshot = cex_snapshot();
-        snapshot.latency_cost.observations = 1;
-
-        assert_eq!(
-            snapshot.validate().unwrap_err(),
-            ManifestError::InvalidCexReplaySnapshot("measured latency cost evidence is invalid")
         );
     }
 

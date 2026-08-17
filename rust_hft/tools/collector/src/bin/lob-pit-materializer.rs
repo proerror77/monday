@@ -14,16 +14,13 @@ use hft_collector::binance_fee_artifact::{verify_fee_artifact, PublishedFeeArtif
 use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact, PublishedReferenceArtifact,
 };
-use alpha_domain::runtime_latency_evidence::{
-    verify_runtime_latency_evidence, RuntimeLatencyEvidenceSource, VerifiedRuntimeLatencyEvidence,
-};
 use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_research_manifest::{
     CexArtifactTripletV2, CexDerivativesReferenceV2, CexFeeScheduleV2, CexInstrumentRulesV2,
-    CexLatencyCostV2, CexPitSeriesEvidenceV2, CexReplaySegmentIdentity, CexReplaySnapshotV2,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3, CEX_FEATURE_AVAILABILITY_POLICY,
+    CexPitSeriesEvidenceV2, CexReplaySegmentIdentity, CexReplaySnapshotV3,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, CEX_FEATURE_AVAILABILITY_POLICY,
     CEX_MODALITY_AGGREGATE_TRADE, CEX_MODALITY_FUNDING, CEX_MODALITY_LOB,
-    CEX_MODALITY_OPEN_INTEREST, CEX_REPLAY_CLOCK_RECEIVED_AT_NS, CEX_REPLAY_SNAPSHOT_SCHEMA_V2,
+    CEX_MODALITY_OPEN_INTEREST, CEX_REPLAY_CLOCK_RECEIVED_AT_NS, CEX_REPLAY_SNAPSHOT_SCHEMA_V3,
 };
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
@@ -85,18 +82,6 @@ struct Args {
     segment_manifest_sha256: Vec<String>,
     #[arg(long)]
     artifact_dir: PathBuf,
-    #[arg(long)]
-    runtime_feedback_log: PathBuf,
-    #[arg(long)]
-    runtime_feedback_log_sha256: String,
-    #[arg(long)]
-    runtime_feedback_trusted_keys: PathBuf,
-    #[arg(long)]
-    runtime_feedback_trusted_keys_sha256: String,
-    #[arg(long)]
-    runtime_feedback_deployment_id: String,
-    #[arg(long)]
-    runtime_feedback_account_id: String,
     #[arg(long, required = true)]
     fee_data: Vec<PathBuf>,
     #[arg(long, required = true)]
@@ -182,7 +167,7 @@ struct MaterializationReport {
     last_event_time: DateTime<Utc>,
     artifact_path: PathBuf,
     artifact_sha256: String,
-    snapshot: CexReplaySnapshotV2,
+    snapshot: CexReplaySnapshotV3,
     snapshot_sha256: String,
     created_at: DateTime<Utc>,
 }
@@ -386,13 +371,6 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .label_available_time;
     let (fee_schedule, spot_rules) =
         bind_fee_evidence(args, &symbol, first_event_time, last_label_time)?;
-    let latency_cost = load_latency_cost(
-        args,
-        &symbol,
-        &fee_schedule.runtime_account_id,
-        &fee_schedule.account_fingerprint,
-        first_event_time,
-    )?;
     if args.market == Market::Spot {
         context.instrument_rules = spot_rules;
     }
@@ -405,8 +383,8 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         reference.evaluation_funding_bps_per_bucket = funding_bound.to_string();
         reference
     });
-    let snapshot = CexReplaySnapshotV2 {
-        schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
+    let snapshot = CexReplaySnapshotV3 {
+        schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
         venue: "binance".to_string(),
         instrument_type: args.market.as_str().to_string(),
         symbol: symbol.clone(),
@@ -442,7 +420,6 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
             .context("verified instrument rules are missing")?,
         fee_schedule,
         derivatives_reference,
-        latency_cost,
     };
     snapshot.validate().map_err(anyhow::Error::new)?;
     publish_immutable(&artifact_path, &artifact_bytes)?;
@@ -450,7 +427,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
 
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
-        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3.to_string(),
+        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4.to_string(),
         mission_id: mission_id.to_string(),
         symbol,
         market: args.market.as_str().to_string(),
@@ -514,111 +491,6 @@ fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<S
         verify_binance_market_tape_with_required_trade_and_lob_summaries(sealed)?,
         paths,
     ))
-}
-
-fn load_latency_cost(
-    args: &Args,
-    symbol: &str,
-    runtime_account_id: &str,
-    account_fingerprint: &str,
-    first_event_time: DateTime<Utc>,
-) -> Result<CexLatencyCostV2> {
-    if args.runtime_feedback_account_id != runtime_account_id {
-        bail!("fee and runtime latency evidence accounts differ");
-    }
-    let verified = verify_runtime_latency_evidence(
-        RuntimeLatencyEvidenceSource {
-            feedback_log: &args.runtime_feedback_log,
-            feedback_log_sha256: &args.runtime_feedback_log_sha256,
-            trusted_keys: &args.runtime_feedback_trusted_keys,
-            trusted_keys_sha256: &args.runtime_feedback_trusted_keys_sha256,
-        },
-        &args.runtime_feedback_deployment_id,
-        args.market.as_str(),
-        symbol,
-        &args.runtime_feedback_account_id,
-        first_event_time,
-    )?;
-    if verified.account_id != runtime_account_id {
-        bail!("verified runtime latency account does not match fee evidence");
-    }
-    let evidence = publish_latency_evidence(args, symbol, account_fingerprint, &verified)?;
-    Ok(CexLatencyCostV2 {
-        method: "verified_order_lifecycle_realized_slippage".to_string(),
-        venue: "binance".to_string(),
-        symbol: symbol.to_string(),
-        runtime_account_id: verified.account_id.clone(),
-        account_fingerprint: account_fingerprint.to_string(),
-        evidence,
-        first_observed_at: verified.first_observed_at,
-        last_observed_at: verified.last_observed_at,
-        available_at: verified.available_at,
-        observations: verified.observations,
-        p50_ns: verified.p50_ns,
-        p95_ns: verified.p95_ns,
-        p99_ns: verified.p99_ns,
-        p50_cost_bps: verified.p50_cost_bps,
-        p95_cost_bps: verified.p95_cost_bps,
-        p99_cost_bps: verified.p99_cost_bps,
-    })
-}
-
-fn publish_latency_evidence(
-    args: &Args,
-    symbol: &str,
-    account_fingerprint: &str,
-    verified: &VerifiedRuntimeLatencyEvidence,
-) -> Result<CexArtifactTripletV2> {
-    // Anchor the complete supplied cohort: republish the full digest-anchored
-    // feedback log and the trusted-key document so independent readers can
-    // reverify every signed event instead of trusting a selected subset.
-    let data_sha256 = args
-        .runtime_feedback_log_sha256
-        .trim()
-        .to_ascii_lowercase();
-    let data_path = args
-        .artifact_dir
-        .join(format!("{data_sha256}.runtime-feedback.jsonl"));
-    republish_verified_file(&args.runtime_feedback_log, &data_path, &data_sha256)?;
-    let keys_sha256 = args
-        .runtime_feedback_trusted_keys_sha256
-        .trim()
-        .to_ascii_lowercase();
-    republish_verified_file(
-        &args.runtime_feedback_trusted_keys,
-        &args
-            .artifact_dir
-            .join(format!("{keys_sha256}.runtime-feedback-keys.json")),
-        &keys_sha256,
-    )?;
-    let manifest = serde_json::to_vec(&serde_json::json!({
-        "schema": "monday.runtime-feedback-evidence.v1",
-        "data_sha256": data_sha256,
-        "trusted_keys_sha256": keys_sha256,
-        "deployment_id": args.runtime_feedback_deployment_id,
-        "venue": "binance",
-        "symbol": symbol,
-        "runtime_account_id": verified.account_id.clone(),
-        "account_fingerprint": account_fingerprint,
-        "first_observed_at": verified.first_observed_at,
-        "last_observed_at": verified.last_observed_at,
-        "observations": verified.observations,
-    }))?;
-    let manifest_sha256 = hex::encode(Sha256::digest(&manifest));
-    let manifest_path = args
-        .artifact_dir
-        .join(format!("{manifest_sha256}.runtime-feedback.manifest.json"));
-    let success = format!("{data_sha256}\n");
-    let success_path = args
-        .artifact_dir
-        .join(format!("{data_sha256}.runtime-feedback._SUCCESS"));
-    publish_immutable(&manifest_path, &manifest)?;
-    publish_immutable(&success_path, success.as_bytes())?;
-    Ok(CexArtifactTripletV2 {
-        data_sha256: data_sha256.clone(),
-        manifest_sha256,
-        success_sha256: data_sha256,
-    })
 }
 
 fn bind_fee_evidence(
@@ -1305,10 +1177,6 @@ fn datetime_ns(value: u64) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::{
-        sign_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
-        RuntimeAttributionEvent,
-    };
     use data::binance_market_tape::{
         AggregateTrade, AggregateTradeSummaryBuilder, LobContinuitySummaryBuilder,
         AGGREGATE_TRADE_SUMMARY_CONTRACT,
@@ -1318,7 +1186,6 @@ mod tests {
         OpenInterestObservation, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
         PREMIUM_INDEX_ENDPOINT, REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
     };
-    use ed25519_dalek::SigningKey;
     use hft_collector::binance_fee_artifact::{
         publish_fee_snapshot, BinanceFeeSnapshot, BinanceInstrumentRules, SideFeeBps, FEE_SCHEMA,
     };
@@ -1489,10 +1356,6 @@ mod tests {
         success: PathBuf,
         content_sha256: String,
         manifest_sha256: String,
-        runtime_feedback_log: PathBuf,
-        runtime_feedback_log_sha256: String,
-        runtime_feedback_trusted_keys: PathBuf,
-        runtime_feedback_trusted_keys_sha256: String,
         fees: Vec<PublishedFeeArtifact>,
         references: Vec<PublishedReferenceArtifact>,
     }
@@ -1590,54 +1453,6 @@ mod tests {
             let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
             let success = sibling(&data, "._SUCCESS").unwrap();
             std::fs::write(&success, format!("{content_sha256}\n")).unwrap();
-            let signing_key = SigningKey::from_bytes(&[7; 32]);
-            let runtime_feedback_trusted_keys = directory.join("runtime-feedback-keys.json");
-            std::fs::write(
-                &runtime_feedback_trusted_keys,
-                serde_json::to_vec(&BTreeMap::from([(
-                    "runtime-feedback-1".to_string(),
-                    hex::encode(signing_key.verifying_key().to_bytes()),
-                )]))
-                .unwrap(),
-            )
-            .unwrap();
-            let runtime_feedback_trusted_keys_sha256 =
-                sha256_file(&runtime_feedback_trusted_keys).unwrap();
-            let runtime_feedback_log = directory.join("runtime-feedback.jsonl");
-            let signed = sign_runtime_attribution_event(
-                RuntimeAttributionEvent {
-                    event_id: "fill-1".to_string(),
-                    deployment_id: "deployment-1".to_string(),
-                    asset_revision_id: "candidate-1".to_string(),
-                    mission_id: Some("data-btc-usdm-1".to_string()),
-                    mode: AttributionMode::LiveSmall,
-                    outcome: AttributionOutcome::Healthy,
-                    kind: AttributionKind::Fill,
-                    strategy_id: Some("strategy-1".to_string()),
-                    order_id: Some("order-1".to_string()),
-                    account_id: Some("binance-main".to_string()),
-                    venue: Some("binance".to_string()),
-                    symbol: Some("BTCUSDT".to_string()),
-                    metrics: BTreeMap::from([
-                        ("intent_to_private_report_us".to_string(), 75.0),
-                        ("arrival_slippage_bps".to_string(), 1.25),
-                        (
-                            "evidence_available_at_us".to_string(),
-                            event_ns(0) as f64 / 1_000.0,
-                        ),
-                        ("instrument_market_".to_string() + market.as_str(), 1.0),
-                    ]),
-                    reason: None,
-                    observed_at: datetime_ns(event_ns(0)).unwrap(),
-                },
-                "runtime-feedback-1",
-                &signing_key,
-            )
-            .unwrap();
-            let mut feedback_bytes = serde_json::to_vec(&signed).unwrap();
-            feedback_bytes.push(b'\n');
-            std::fs::write(&runtime_feedback_log, feedback_bytes).unwrap();
-            let runtime_feedback_log_sha256 = sha256_file(&runtime_feedback_log).unwrap();
             let fees = [0, 6_000]
                 .into_iter()
                 .map(|milliseconds| {
@@ -1680,10 +1495,6 @@ mod tests {
                 success,
                 content_sha256,
                 manifest_sha256,
-                runtime_feedback_log,
-                runtime_feedback_log_sha256,
-                runtime_feedback_trusted_keys,
-                runtime_feedback_trusted_keys_sha256,
                 fees,
                 references,
             }
@@ -1696,10 +1507,7 @@ mod tests {
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
-                artifact_dir: self.directory.join("artifacts"), runtime_feedback_log: self.runtime_feedback_log.clone(),
-                runtime_feedback_log_sha256: self.runtime_feedback_log_sha256.clone(), runtime_feedback_trusted_keys: self.runtime_feedback_trusted_keys.clone(),
-                runtime_feedback_trusted_keys_sha256: self.runtime_feedback_trusted_keys_sha256.clone(),
-                runtime_feedback_deployment_id: "deployment-1".to_string(), runtime_feedback_account_id: "binance-main".to_string(),
+                artifact_dir: self.directory.join("artifacts"),
                 fee_data: self.fees.iter().map(|fee| fee.data_path.clone()).collect(), fee_data_sha256: self.fees.iter().map(|fee| fee.data_sha256.clone()).collect(),
                 fee_manifest_sha256: self.fees.iter().map(|fee| fee.manifest_sha256.clone()).collect(), reference_data: self.references.iter().map(|reference| reference.data_path.clone()).collect(),
                 reference_data_sha256: self.references.iter().map(|reference| reference.data_sha256.clone()).collect(), reference_manifest_sha256: self.references.iter().map(|reference| reference.manifest_sha256.clone()).collect(),
@@ -1844,17 +1652,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fee_and_runtime_evidence_from_different_accounts() {
-        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
-        let mut args = fixture.args();
-        args.runtime_feedback_account_id = "different-account".to_string();
-
-        let error = materialize(&args).unwrap_err().to_string();
-
-        assert!(error.contains("accounts differ"));
-    }
-
-    #[test]
     fn rejects_sparse_fee_evidence() {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let late = publish_fee_snapshot(
@@ -1873,16 +1670,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_usdm_without_a_derivatives_execution_path() {
+    fn materializes_usdm_before_live_execution_exists() {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let args = fixture.args();
 
-        let error = materialize(&args).unwrap_err().to_string();
+        let published = materialize(&args).unwrap();
 
-        assert!(error.contains("USD-M runtime latency evidence is unavailable"));
+        assert!(published.report.snapshot.derivatives_reference.is_some());
         assert!(args
             .artifact_dir
-            .join(format!("{}.reference.data", fixture.references[0].data_sha256))
+            .join(format!(
+                "{}.reference.data",
+                fixture.references[0].data_sha256
+            ))
             .is_file());
     }
 
@@ -1892,7 +1692,7 @@ mod tests {
         let published = materialize(&fixture.args()).unwrap();
         let output = serde_json::to_value(&published).unwrap();
         let source = &output["report"]["source_segments"][0];
-        let snapshot: hft_research_manifest::CexReplaySnapshotV2 =
+        let snapshot: hft_research_manifest::CexReplaySnapshotV3 =
             serde_json::from_value(output["report"]["snapshot"].clone()).unwrap();
         let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
             .lines()
@@ -1901,7 +1701,7 @@ mod tests {
 
         assert_eq!(
             published.report.schema_version,
-            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3
+            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4
         );
         assert_eq!(published.report.rows, 3);
         snapshot.validate().unwrap();
@@ -1913,8 +1713,6 @@ mod tests {
         assert_eq!(snapshot.fee_schedule.maker_buy_fee_bps, "2");
         assert_eq!(snapshot.fee_schedule.taker_buy_fee_bps, "5");
         assert_eq!(snapshot.fee_schedule.runtime_account_id, "binance-main");
-        assert_eq!(snapshot.latency_cost.p95_cost_bps, "1.25");
-        assert_eq!(snapshot.latency_cost.runtime_account_id, "binance-main");
         assert_eq!(
             source,
             &json!({
@@ -1961,27 +1759,5 @@ mod tests {
                 .join(format!("{}.fee._SUCCESS", fee.data_sha256))
                 .is_file());
         }
-        let artifact_dir = fixture.directory.join("artifacts");
-        // The published latency evidence anchors the complete supplied cohort:
-        // the full feedback log (not a selected subset) and the trusted-key
-        // document are both resolvable under their content digests.
-        assert_eq!(
-            snapshot.latency_cost.evidence.data_sha256,
-            fixture.runtime_feedback_log_sha256
-        );
-        assert_eq!(
-            std::fs::read(artifact_dir.join(format!(
-                "{}.runtime-feedback.jsonl",
-                fixture.runtime_feedback_log_sha256
-            )))
-            .unwrap(),
-            std::fs::read(&fixture.runtime_feedback_log).unwrap()
-        );
-        assert!(artifact_dir
-            .join(format!(
-                "{}.runtime-feedback-keys.json",
-                fixture.runtime_feedback_trusted_keys_sha256
-            ))
-            .is_file());
     }
 }
