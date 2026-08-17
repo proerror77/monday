@@ -16,7 +16,6 @@ pub mod factors_v2;
 pub mod model;
 pub mod orderbook;
 pub mod polymarket_evidence_projection;
-pub mod prediction_llm;
 pub mod prediction_loop;
 mod prediction_loop_fs;
 pub mod prediction_mcts;
@@ -91,14 +90,16 @@ pub use polymarket_evidence_projection::{
 #[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
 pub use research_snapshot::{
-    authenticate_ready_event_cohort, build_research_snapshot_from_polymarket_chainlink_baseline,
+    admit_extracted_authenticated_research_snapshot, authenticate_ready_event_cohort,
+    build_research_snapshot_from_polymarket_chainlink_baseline,
     build_research_snapshot_from_verified_artifacts, load_research_snapshot,
     materialize_authenticated_research_snapshot, validate_snapshot_request,
-    validate_snapshot_request_coverage, write_research_snapshot, AuthenticatedReadyEventCohort,
-    AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection,
-    AuthenticatedSnapshotMaterializationRequest, ResearchSnapshot, ResearchSnapshotArtifacts,
-    ResearchSnapshotManifest, ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource,
-    ResearchSnapshotRequest, ResearchSnapshotRowCounts, VerifiedArtifactSnapshotBuildOptions,
+    validate_snapshot_request_coverage, write_research_snapshot, AuthenticatedPartitionView,
+    AuthenticatedReadyEventCohort, AuthenticatedResearchSnapshot,
+    AuthenticatedResearchSnapshotRejection, AuthenticatedSnapshotMaterializationRequest,
+    ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
+    ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
+    ResearchSnapshotRowCounts, VerifiedArtifactSnapshotBuildOptions,
     BINANCE_SURFACES_OMITTED_QUALITY_FLAG, POLYMARKET_CHAINLINK_BASELINE_REQUIREMENT,
     POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
 };

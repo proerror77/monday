@@ -22,7 +22,7 @@ use ploy_market_data::polymarket_evidence::{
     VerifiedPolymarketEvidence, VerifiedPolymarketEvidenceSet,
 };
 use ploy_research::prediction_mission_v3::{
-    parse_prediction_mission_json, validate_prediction_mission_v3, ParsedPredictionMission,
+    parse_prediction_mission_json, validate_prediction_mission_v3,
 };
 use ploy_research::prediction_mission_v3::{
     PredictionAuthorityProfile, PredictionMissionCapability, PredictionMissionTask,
@@ -180,6 +180,7 @@ fn snapshot_admission_protocol_response(
                 "task": request.task,
                 "cohort_partition_id": request.cohort_partition_id,
                 "cohort_manifest_id": cohort.manifest_id(),
+                "partition_view": snapshot.partition_view(),
                 "immutable_image_identity": request.compiler_image_identity,
             })
         }
@@ -193,9 +194,20 @@ fn is_supported_snapshot_authority(source_kind: &str) -> bool {
 }
 
 fn is_supported_btc_5m_task(task: &PredictionMissionTask) -> bool {
-    matches!(task.kind, PredictionTaskKind::SettlementProbability)
-        && task.side.is_none()
-        && task.prediction_horizon_secs.is_none()
+    matches!(
+        (task.kind, task.side, task.prediction_horizon_secs),
+        (PredictionTaskKind::SettlementProbability, None, None)
+            | (
+                PredictionTaskKind::UpExecution,
+                Some(ploy_research::prediction_mission_v3::PredictionTokenSide::Up),
+                Some(5 | 10 | 15 | 30)
+            )
+            | (
+                PredictionTaskKind::DownExecution,
+                Some(ploy_research::prediction_mission_v3::PredictionTokenSide::Down),
+                Some(5 | 10 | 15 | 30)
+            )
+    )
 }
 
 fn validate_mission_admission_identity(
@@ -204,15 +216,13 @@ fn validate_mission_admission_identity(
     cohort_manifest_id: &str,
     snapshot_hash: &str,
 ) -> Result<(), &'static str> {
-    let ParsedPredictionMission::V3(mission) =
-        parse_prediction_mission_json(request.mission_json.as_bytes())
-            .map_err(|_| "invalid_mission")?
-    else {
-        return Err("invalid_mission");
-    };
+    let mission = parse_prediction_mission_json(request.mission_json.as_bytes())
+        .map_err(|_| "invalid_mission")?;
     validate_prediction_mission_v3(&mission).map_err(|_| "invalid_mission")?;
-    if mission.run_mode != PredictionRunMode::PipelineSmoke {
-        return Err("unsupported_run_mode");
+    if mission.run_mode == PredictionRunMode::PipelineSmoke
+        && !matches!(mission.task.kind, PredictionTaskKind::SettlementProbability)
+    {
+        return Err("unsupported_task");
     }
     if mission.authority_profile != PredictionAuthorityProfile::PolymarketChainlinkBaseline
         || mission.required_capabilities
@@ -433,7 +443,7 @@ fn parse_polymarket_verify_args(args: &[String]) -> anyhow::Result<Vec<AnchoredA
         anyhow::bail!("--verify-polymarket-evidence must be supplied exactly once");
     }
     let groups = &args[2..];
-    if groups.is_empty() || groups.len() % 6 != 0 {
+    if groups.is_empty() || !groups.len().is_multiple_of(6) {
         anyhow::bail!(
             "--verify-polymarket-evidence requires complete artifact groups: +             --polymarket-artifact PATH --polymarket-content-sha256 SHA256 +             --polymarket-manifest-sha256 SHA256"
         );
@@ -1072,7 +1082,7 @@ mod tests {
                 &cohort_manifest_id,
                 &snapshot_hash,
             ),
-            Err("mission_mismatch")
+            Err("unsupported_task")
         );
 
         let mut research_trial = serde_json::from_str::<serde_json::Value>(&request.mission_json)
@@ -1087,8 +1097,29 @@ mod tests {
                 &cohort_manifest_id,
                 &snapshot_hash,
             ),
-            Err("unsupported_run_mode")
+            Ok(())
         );
+        for (kind, side) in [("up_execution", "up"), ("down_execution", "down")] {
+            let task = serde_json::json!({
+                "kind": kind,
+                "side": side,
+                "prediction_horizon_secs": 10,
+            });
+            let mut execution = research_trial.clone();
+            execution["task"] = task.clone();
+            let mut execution_request = research_trial_request.clone();
+            execution_request.task = serde_json::from_value(task).unwrap();
+            execution_request.mission_json = execution.to_string();
+            assert_eq!(
+                super::validate_mission_admission_identity(
+                    &execution_request,
+                    &policy_identity,
+                    &cohort_manifest_id,
+                    &snapshot_hash,
+                ),
+                Ok(())
+            );
+        }
 
         let mut binance = serde_json::from_str::<serde_json::Value>(&request.mission_json)
             .expect("parse mission");

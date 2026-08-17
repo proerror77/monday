@@ -22,7 +22,6 @@ strategy-runtime = ["dep:ploy-strategy-bundles", "dep:ploy-trading"]
 [dependencies]
 data = { package = "hft-data", path = "../../../data-pipelines/core" }
 rand.workspace = true
-reqwest.workspace = true
 chrono.workspace = true
 polars = { workspace = true, optional = true }
 ploy-market-contracts.workspace = true

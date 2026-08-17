@@ -170,6 +170,8 @@ pub struct PredictionExecuteArgs {
     pub task_capability: String,
     #[arg(long)]
     pub image_identity: String,
+    #[arg(long)]
+    pub partition_view_json: String,
     /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
     #[arg(long)]
     pub snapshot_cache_dir: Option<PathBuf>,
@@ -865,6 +867,16 @@ mod tests {
             OsString::from("btc_5m_backtest"),
             OsString::from("--image-identity"),
             OsString::from(format!("sha256:{}", "a".repeat(64))),
+            OsString::from("--partition-view-json"),
+            OsString::from(
+                serde_json::json!({
+                    "common_time_boundary_ms": 1,
+                    "train_market_ids": ["train"],
+                    "crossing_excluded_market_ids": [],
+                    "held_out_market_ids": ["held-out"]
+                })
+                .to_string(),
+            ),
             OsString::from("--result-put-url"),
             root.path().join("results.zip").into_os_string(),
             OsString::from("--result-readback-url"),
@@ -1063,6 +1075,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "btc_5m_backtest",
             "--image-identity",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "--partition-view-json",
+            r#"{"common_time_boundary_ms":1,"train_market_ids":["train"],"crossing_excluded_market_ids":[],"held_out_market_ids":["held"]}"#,
             "--resume-url",
             "previous-results.zip",
             "--resume-sha256",

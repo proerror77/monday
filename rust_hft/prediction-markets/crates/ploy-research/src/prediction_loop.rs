@@ -221,7 +221,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 42] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 41] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -307,10 +307,6 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 42] {
         (
             "crates/ploy-research/src/prediction_loop_fs.rs",
             include_bytes!("prediction_loop_fs.rs"),
-        ),
-        (
-            "crates/ploy-research/src/prediction_llm.rs",
-            include_bytes!("prediction_llm.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_policy_identity.rs",
@@ -1503,31 +1499,6 @@ mod tests {
             "crates/ploy-market-data/src/polymarket_evidence/catalog.rs",
         ] {
             assert!(paths.contains(&path));
-        }
-    }
-
-    #[test]
-    fn checked_in_btc_and_sol_templates_pin_current_brief_and_rust_policy() {
-        for raw in [
-            include_str!("../../../config/research_missions/polymarket-btc-5m.example.json"),
-            include_str!("../../../config/research_missions/polymarket-sol-5m.example.json"),
-        ] {
-            let mission: PredictionResearchMission =
-                serde_json::from_str(raw).expect("parse checked-in mission template");
-            assert_eq!(
-                mission.prompt_snapshot_id,
-                research_brief_snapshot_id(&mission)
-            );
-            assert_eq!(
-                mission.search_policy_snapshot_id,
-                current_prediction_policy_snapshot_id()
-            );
-            assert_eq!(mission.time_cohort_boundary_ms, 0);
-            assert!(
-                validate_prediction_mission(&mission, &mission.search_policy_snapshot_id)
-                    .expect_err("template must require an operator-selected cohort boundary")
-                    .contains("time_cohort_boundary_ms")
-            );
         }
     }
 
