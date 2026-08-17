@@ -56,6 +56,7 @@ http = "0.2"
 # 壓縮支持
 flate2 = "1"
 lz4 = "1"
+zstd = "0.13"
 
 # WebSocket 握手
 base64 = "0.21"
@@ -76,7 +77,6 @@ collector-asterdex = []
 duckdb = ["dep:duckdb"]
 
 [dev-dependencies]
-zstd = "0.13"
 
 [[bin]]
 name = "hft-collector"
