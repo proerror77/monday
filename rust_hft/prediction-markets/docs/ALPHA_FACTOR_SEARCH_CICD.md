@@ -531,127 +531,43 @@ prior draft using only the existing allowed mutation types. It still cannot
 guarantee profitability and cannot bypass walk-forward, promotion, replay
 parity, dry-run, or live approval gates.
 
-## Rust Prediction LoopRun and Optional LLM Expansion
+## Rust Prediction Mission v4
 
-The optional LLM turn is mission-driven and remains off by default. Its first
-turn requires a reviewed `prediction_research_mission.v2` JSON; later turns may
-recover the same mission from the previous typed prior. BTC and SOL must use
-separate mission files so a candidate cannot silently broaden its symbol
-population. Start from one of the checked-in examples. Set `data_snapshot_id`
-to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
-brief and implementation IDs before dispatching the governed mission. The
-checked-in paths keep the `.example.json` suffix until an operator creates a
-reviewed immutable mission revision:
+The external prediction-research entrypoint accepts only
+`prediction_research_mission.v4`. `pipeline_smoke` proves mechanical
+compatibility for settlement probability. `research_trial` runs the existing
+bounded MCTS/checkpoint and typed evaluator path for settlement probability and
+side-bound UP/DOWN execution tasks at 5, 10, 15, or 30 seconds. Neither mode can
+emit Paper, Shadow, Live, promotion, or profitability authority.
 
-Set `time_cohort_boundary_ms` to the shared wall-clock cutoff chosen for every
-horizon-specific task of that underlying. The checked-in examples use zero so
-they fail closed until an operator supplies the reviewed boundary.
+Before either run, snapshot admission independently reads and hashes the ready
+catalog partition and sealed snapshot. It returns the exact cohort manifest,
+partition digest and view, policy identity, snapshot contract and digest, task
+capability, and immutable image identity. The runner forwards those values and
+the research binary re-admits the extracted read-only snapshot; raw paths or a
+caller-authored status cannot substitute for that handle.
 
-```bash
-cargo run -p ploy-research --bin monday-prediction-research -- \
-  --print-brief-snapshot-id \
-  config/research_missions/polymarket-btc-5m.example.json
-cargo run -p ploy-research --bin monday-prediction-research -- \
-  --print-policy-snapshot-id
-```
+`alpha-harness prediction` owns signed input transport, outer hashes, safe ZIP
+extraction, process invocation, immutable result upload, and independent bundle
+readback. `monday-prediction-research` owns Mission v4 validation and the
+research receipt. The ACK image contains precompiled Rust binaries and no PLOY
+daemon, OMS, order, cancel, reconciliation, venue credential, or runtime Cargo
+path.
 
-The printed values must equal `prompt_snapshot_id` and
-`search_policy_snapshot_id`. A brief or implementation change requires a new
-mission revision; do not rewrite an existing run's identity. There is no
-Python proposal compatibility path.
+The current `research_trial` profile is deterministic and does not call an
+external proposal provider. The v2 mission parser, checked-in v2 templates,
+HTTP proposal client, LLM environment/secret contract, and Python compatibility
+path are retired. The prediction policy identity still pins the curated Rust
+sources and the reviewed `x86_64-unknown-linux-gnu` `default,db` dependency
+graph; a source, lockfile, manifest, package, checksum, or feature change creates
+a new policy identity and fails closed until both graph artifacts are updated.
 
-The policy identity binds both the curated evaluator/LoopRun sources and a
-checked-in, reviewed `x86_64-unknown-linux-gnu` `default,db` Cargo graph of
-packages, checksums, and features. The graph also pins the lockfile and every
-path dependency manifest in that graph, so changing any of those inputs fails
-closed until the reviewed graph and its hash are regenerated together.
-Regenerate those artifacts from the pinned Linux research CI evidence rather
-than from an arbitrary developer or Docker build invocation.
-Operator, strategy-bundle, trading, SQLite, host, and proc-macro packages are
-rejected from that production research graph; the compatibility packages remain
-available only behind the separate `strategy-runtime` feature.
-
-The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
-immutable research snapshot exists:
-
-```bash
-alpha-harness prediction execute \
-  --work-dir /work/prediction-btc-001 \
-  --mission-url 'https://signed-mission-get-url' \
-  --mission-sha256 "$MISSION_SHA256" \
-  --snapshot-url 'https://signed-snapshot-get-url' \
-  --snapshot-sha256 "$SNAPSHOT_ARCHIVE_SHA256" \
-  --result-put-url 'https://signed-results-put-url'
-```
-
-`alpha-harness` owns download, outer hashes, safe extraction, evidence bundling,
-and immutable upload. It starts the precompiled
-`monday-prediction-research`, which directly starts the precompiled
-`monday-prediction-evaluator`; the ACK runtime neither contains nor invokes
-Cargo. This is a research-only chain and has no PLOY daemon, OMS, order, cancel,
-replace, reconciliation, or venue credential path.
-
-The driver runs a deterministic baseline, proposes a typed batch, invokes the
-same Rust evaluator, ingests candidate feedback, and repeats until a candidate
-is kept, a budget is exhausted, or an explicit failure pauses the run. A paused
-attempt still publishes an immutable result bundle. Resume it in a new work
-directory and result object with `--resume-url` and `--resume-sha256` bound to
-that bundle. `kept`, `budget_exhausted`, and `failed` are immutable terminal
-ledgers; extending one of those requires a new reviewed mission revision and a
-new output directory. Evaluator failures reuse
-the already persisted prior without another LLM call. Every LLM attempt is
-retained in an append-only call ledger, including schema rejection, provider
-failure, and a response missing after process interruption. A durably persisted
-response is replayed after a crash before any new provider call or call-budget
-check.
-
-The output directory is exclusively locked while the LoopRun owns it. Reusing
-it for SOL, another mission revision, another snapshot, or another policy
-implementation is rejected. The prediction LoopRun requires `mutable_scope` to
-contain only `probability_blend_weights`; formula/IC diagnostics remain a
-separate standalone research lane.
-
-Governed five-minute missions enforce `event_window_secs=300` at both the Rust
-LoopRun and evaluator boundaries. They require observations whose persisted
-`event_window_secs` is exactly `300`, plus a verified
-`snapshot_contract_hash` that binds the complete evaluator manifest and input
-artifacts. Legacy snapshots default that field to zero and do not have the
-strong contract hash, so they must be regenerated before this LoopRun can use
-them. Rebuilding the snapshot does not imply recollecting an already retained
-raw source, but it does require producing a new immutable evaluator artifact.
-
-The Rust client requires `MONDAY_PREDICTION_LLM_BASE_URL` and
-`MONDAY_PREDICTION_LLM_MODEL`. `MONDAY_PREDICTION_LLM_API_KEY` is optional for a
-loopback Grok Builder and should be set for an authenticated remote HTTPS
-endpoint; `MONDAY_PREDICTION_LLM_PROVIDER` labels the durable call record. Missing mission
-authority, unresolved provenance placeholders, a target/horizon mismatch, a
-provider failure, or an invalid response fails soft and leaves the deterministic
-prior unchanged.
-
-The model sees the mission objective, hypothesis scope, registered probability
-components, and at most eight qualitative
-`keep`/`discard` outcomes. It does not receive raw labels, evaluator thresholds,
-or numeric evaluation metrics. Output is limited by `mutable_scope`:
-
-- `probability_blend_weights` allows a named non-negative logit blend over the
-  five registered probability components: Polymarket midpoint, Chainlink
-  digital probability, Binance distance/LOB/volatility, event surface, and the
-  existing Binance log-moneyness model. These candidates enter the real
-  event-disjoint probability evaluator as `q_llm_<name>` and are scored with
-  Brier score, log loss, calibration error, executable settlement PnL, and
-  conservative-depth capacity evidence.
-
-After evaluation, `prediction-research-feedback-<sha256>.json` records the
-candidate definition, metrics, and deterministic reason codes. Only the
-candidate definition, hypothesis, verdict, and reason codes are returned to the
-next LLM turn; evaluator metrics and thresholds are withheld. This closes the
-proposal/evaluation/feedback loop without giving the model evaluator or
-execution authority.
-
-When the standalone Python compatibility helper receives provider usage, it writes
-`llm-expansion-usage.json` next to `next-llm-prior.json` in the alpha-search
-artifact directory. Treat that as per-run token accounting, not promotion
-evidence.
+Governed five-minute missions require `event_window_secs=300`, a strong
+`snapshot_contract_hash`, and event-disjoint train, crossing-excluded, and
+held-out membership. Output namespaces are task-specific, create-once, and
+bound to the Mission, partition, snapshot, policy, image, receipt artifact, and
+receipt payload hashes. A different task, mission revision, snapshot, or policy
+must use a different output identity.
 
 ## FactorEvolve Research Manager V0
 

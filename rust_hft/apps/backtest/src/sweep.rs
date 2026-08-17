@@ -5,9 +5,8 @@ use itertools::Itertools;
 use serde_yaml::{Mapping, Value};
 use tracing::info;
 
-use crate::config::BacktestConfig;
-use crate::engine::BacktestEngine;
 use crate::{print_summary, write_outputs};
+use hft_backtest::{config::BacktestConfig, engine::BacktestEngine};
 
 pub struct SweepOptions<'a> {
     pub config_path: &'a str,

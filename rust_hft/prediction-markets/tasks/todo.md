@@ -68,8 +68,14 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Route snapshot and mission transport through `alpha-harness prediction`,
   including signed inputs, outer hashes, safe ZIP extraction, immutable result
   publication, and cross-Job paused-state resume.
-- [ ] Add the Mission v3 `pipeline_smoke` execution receipt with one typed
-  no-alpha evaluator path and published-bundle readback (#323).
+- [x] Keep Mission v4 `pipeline_smoke` on its typed no-alpha evaluator and
+  published-bundle readback path (#323).
+- [x] Route deterministic `research_trial` receipts through authenticated
+  partition readmission and typed evaluation without a v2 or external-provider
+  fallback.
+- [x] Remove the retired proposal-provider call path from the deterministic
+  prediction MCTS runner while preserving typed prior inputs and zero order
+  authority.
 - [x] Build the binaries into the shared Monday research image and validate the
   restricted ACK Job in prediction-market CI without adding an OMS, risk,
   reconciliation, or venue execution path.
@@ -83,10 +89,10 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
 - [x] Pin a canonical reviewed Linux prediction-policy graph and fail closed when its lockfile or policy path-manifest inputs change; preserve package, checksum, and feature evidence, exclude host/proc-macro runtime dependencies, then pin the v5 identity in both mission templates.
-- [x] Add a resumable Monday prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
+- [x] Add a resumable Monday prediction LoopRun with mission candidate/time budgets and content-addressed iteration evidence.
 - [x] Retire the superseded non-MCTS prediction LoopRun engine, ledger, crash-recovery helpers, and engine-only tests after the governed runner cut over to bounded MCTS.
 - [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.
-- [x] Make interrupted MCTS advisor calls fail closed after durable budget consumption; do not replay provider responses or claim provider, model, or usage envelope recovery.
+- [x] Retire MCTS advisor calls, prompt/state persistence, and provider response recovery after the deterministic Mission v4 cutover.
 - [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
 - [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink opening/settlement authority.
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.

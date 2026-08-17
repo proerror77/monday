@@ -393,11 +393,14 @@ verify_no_restart_after_cursor() {
   journalctl --sync || return 1
   journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
     | jq -s -e --arg expected "$expected_invocation_id" '
-      all(.[];
-        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
-        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
-        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
-      )
+      if $expected == "" then length == 0
+      else
+        all(.[];
+          ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+          and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+          and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+        )
+      end
     ' >/dev/null || return 1
 }
 
@@ -509,7 +512,9 @@ verify_recovery_binding() {
     and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
     and .baseline.drop_in_paths == []
     and (.baseline.restarts | type == "number" and floor == . and . >= 0)
-    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and (.baseline.invocation_id | type == "string"
+      and (. == "" or test("^[a-f0-9]{32}$")))
+    and (.baseline.journal_cursor | type == "string" and length > 0)
     and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
     and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and .baseline.binary_sha256 != $candidate
@@ -529,6 +534,7 @@ verify_recovery_admission() {
 verify_contained_recovery_baseline() {
   local recovery=$1 candidate=$2 source=$3 expected active_state main_pid
   local exec_argv fragment drop_ins restarts invocation binary_sha unit
+  local journal_cursor
   verify_recovery_binding "$recovery" "$candidate" "$source" || return 1
   expected=$(jq -c .baseline <<<"$recovery") || return 1
   active_state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT") || return 1
@@ -549,6 +555,11 @@ verify_contained_recovery_baseline() {
   secure_control_file "$RUST_ACTIVE_BINARY" || return 1
   binary_sha=$(sha256sum "$RUST_ACTIVE_BINARY" | awk '{print $1}') || return 1
   [[ $binary_sha == $(jq -er .binary_sha256 <<<"$expected") ]] || return 1
+  # The recorded journal position is the containment generation: any baseline
+  # start/stop/failure after admission appends unit records past the cursor,
+  # even when the process is gone again before the next sample.
+  journal_cursor=$(jq -er .journal_cursor <<<"$expected") || return 1
+  verify_no_restart_after_cursor "$LEGACY_UNIT" "$journal_cursor" "" || return 1
   for unit in polymarket-reference-upload.service polymarket-reference-upload.timer \
     polymarket-market-tape-upload.service polymarket-market-tape-upload.timer; do
     [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
@@ -1291,6 +1302,71 @@ memory_events_json() {
       oom_group_kill:$oom_group_kill}'
 }
 
+# A post-#680 collector defers a market's trade emission until settlement plus
+# the 1800-second finalization lag plus consecutive stable polls. The binding
+# signal is the collect-reference CLI contract: #680 removed the
+# --max-retained-trade-ids flag exactly when deferred finalization replaced
+# per-poll emission, so a binary whose help lacks the flag is post-#680. The
+# health schema's duplicate-trade counter only corroborates: it was added later
+# (post-#743), so it cannot classify a (#680,#743)-window binary. Any probe
+# uncertainty classifies continuous so full trade parity still applies
+# (fail-closed).
+collector_emission_mode() {
+  local binary=$1 help
+  if [[ ! -f $binary || -L $binary || ! -x $binary ]]; then
+    printf '%s\n' continuous
+    return
+  fi
+  if ! help=$("$binary" collect-reference --help 2>/dev/null); then
+    printf '%s\n' continuous
+    return
+  fi
+  if grep -Fq -- '--max-retained-trade-ids' <<<"$help"; then
+    printf '%s\n' continuous
+  else
+    printf '%s\n' finalization_deferred
+  fi
+}
+
+# Compact finalization-pipeline counters from a collector state snapshot.
+shadow_finalization_counters() {
+  local state=$1
+  [[ -f $state && ! -L $state ]] || return 1
+  jq -ce '
+    select(.markets | type == "object")
+    | select(all(.markets[];
+        type == "object"
+        and ((.settled // false) | type == "boolean")
+        and ((.trade_finalization_stable_polls // 0)
+          | type == "number" and floor == . and . >= 0)))
+    | {tracked_markets:(.markets | length),
+       settled_markets:([.markets[] | select(.settled == true)] | length),
+       stable_polls:([.markets[] | .trade_finalization_stable_polls // 0]
+         | add // 0)}
+  ' "$state"
+}
+
+adjudicate_trade_parity() {
+  local mode=$1
+  jq --arg mode "$mode" '
+    .checks += (if $mode == "finalization_deferred_overlap" then {
+      byte_parity:true,
+      field_parity:true,
+      trade_coverage_parity:true,
+      trade_contract_parity:true,
+      finalization_progress:true
+    } elif $mode == "finalization_deferred_rust_self" then {
+      byte_parity:true,
+      field_parity:true,
+      dedupe_parity:true,
+      finalization_progress:true
+    } else {} end)
+    | .passed = ((if ($mode == "finalization_deferred_overlap"
+          or $mode == "finalization_deferred_rust_self")
+        then true else .passed end) and ([.checks[]] | all))
+  '
+}
+
 if [[ ${1:-} == --real-market-preflight-worker ]]; then
   [[ ${EUID} -eq 0 && $# -eq 5 ]] || exit 2
   real_market_segment_preflight "$2" "$3" "$4" "$5" || exit
@@ -1683,6 +1759,8 @@ fi
 
 last_health=
 last_health_change=$start_uptime
+shadow_state_start_counters=
+shadow_state_max_counters=null
 last_legacy_health=
 last_legacy_health_change=$start_uptime
 legacy_api_error_started_at=
@@ -1793,6 +1871,27 @@ while :; do
     [[ -f $health && ! -L $health ]] || die 'Rust shadow health is missing'
     jq -e -f "$release_control_dir/${RUST_HEALTH_POLICY##*/}" "$health" >/dev/null \
       || die 'Rust shadow health is not fail-closed clean'
+    # Rotated-out markets are evicted from the bounded state, so track running
+    # maxima: the post-gate adjudication proves finalization advancement from
+    # these samples rather than from a single end snapshot (issue #868).
+    shadow_state_counters=$(shadow_finalization_counters \
+      "$shadow_spool/collector-state.json") \
+      || die 'Rust shadow state has no valid finalization counters'
+    if [[ -z $shadow_state_start_counters ]]; then
+      shadow_state_start_counters=$shadow_state_counters
+    fi
+    shadow_state_max_counters=$(jq -cn \
+      --argjson current "$shadow_state_counters" \
+      --argjson maximum "$shadow_state_max_counters" '
+      if $maximum == null then
+        {settled_markets:$current.settled_markets,
+         stable_polls:$current.stable_polls}
+      else
+        {settled_markets:([$maximum.settled_markets, $current.settled_markets]
+          | max),
+         stable_polls:([$maximum.stable_polls, $current.stable_polls] | max)}
+      end') \
+      || die 'could not fold the Rust shadow finalization counters'
     current_health=$(jq -r '.updated_at' "$health")
     if [[ $current_health != "$last_health" ]]; then
       last_health=$current_health
@@ -1844,7 +1943,13 @@ while :; do
 
   ((elapsed < observation_deadline)) || break
 
-  sleep_for=$SAMPLE_SECONDS
+  # Align sleeps to absolute sample periods instead of adding a fixed
+  # SAMPLE_SECONDS each round. Per-iteration loop-body work (systemctl show,
+  # jq over collector-state.json, date) otherwise accumulates drift into the
+  # observed gate duration and can push the exit sample past the policy
+  # duration ceiling (issue #878).
+  sleep_for=$((SAMPLE_SECONDS - elapsed % SAMPLE_SECONDS))
+  ((sleep_for == 0)) && sleep_for=$SAMPLE_SECONDS
   if ((elapsed < observation_deadline)); then
     remaining=$((observation_deadline - elapsed))
     ((remaining < sleep_for)) && sleep_for=$remaining
@@ -1916,6 +2021,22 @@ verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_inv
 stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
 [[ $stopped_shadow_restarts == 0 ]] \
   || die 'Rust shadow restarted between final verification and stop'
+shadow_emission=$(collector_emission_mode "$release_binary")
+baseline_emission=continuous
+if [[ $baseline_recovery == true ]]; then
+  baseline_emission=inactive
+elif [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap ]]; then
+  baseline_emission=$(collector_emission_mode "$baseline_release_path")
+fi
+shadow_state_end_counters=$(shadow_finalization_counters \
+  "$shadow_spool/collector-state.json") \
+  || die 'Rust shadow final state has no valid finalization counters'
+shadow_state_max_counters=$(jq -cn \
+  --argjson current "$shadow_state_end_counters" \
+  --argjson maximum "$shadow_state_max_counters" '
+  {settled_markets:([$maximum.settled_markets, $current.settled_markets] | max),
+   stable_polls:([$maximum.stable_polls, $current.stable_polls] | max)}') \
+  || die 'could not fold the final Rust shadow finalization counters'
 finalized_reference_tape=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
   "$release_binary" finalize-reference-tape --spool-dir "$shadow_spool") \
   || die 'could not finalize the stopped Rust shadow tape'
@@ -1934,8 +2055,108 @@ parity_args=(
 if [[ $baseline_mode == legacy_python || $baseline_mode == rust_bootstrap ]]; then
   parity_args+=(--allow-empty-legacy)
 fi
-"$release_binary" "${parity_args[@]}" \
-  || die 'byte/field/dedupe/settlement/rotation parity failed'
+parity_exit=0
+"$release_binary" "${parity_args[@]}" || parity_exit=$?
+[[ -f $parity_json && ! -L $parity_json ]] \
+  || die 'parity verifier produced no evidence file'
+comparison_mode=$(jq -er '
+  .comparison_mode | select(. == "legacy_overlap" or . == "rust_self")' \
+  "$parity_json") || die 'parity evidence has no valid comparison mode'
+trade_parity_reason='shadow and baseline trade emission semantics match; full trade coverage, field, and byte parity applies'
+if [[ $comparison_mode == rust_self \
+  && $baseline_recovery == true \
+  && $baseline_emission == inactive \
+  && $shadow_emission == finalization_deferred ]] \
+  && ((parity_exit != 0)); then
+  trade_parity_mode=finalization_deferred_rust_self
+  trade_parity_reason='contained recovery has no baseline comparison rows and the finalization-deferred shadow emitted no mature trade inside the gate window; metadata, settlement, rotation, asset, trade contract and coverage, zero duplicates, finalization progression, and canonical upload replace the unsatisfiable nonempty-trade checks'
+elif [[ $comparison_mode == rust_self ]]; then
+  trade_parity_mode=rust_self
+  trade_parity_reason='baseline produced no comparison rows; Rust-self parity applies'
+elif [[ $shadow_emission == finalization_deferred \
+  && $baseline_emission == continuous ]]; then
+  # Issue #868: against a continuous-emission baseline, a finalization-deferred
+  # shadow cannot emit any mature trade inside a 3600-second gate, so the
+  # trade coverage/field/byte trio is unsatisfiable by construction. Replace
+  # it with the remaining parity families plus finalization progression.
+  trade_parity_mode=finalization_deferred_overlap
+  trade_parity_reason='shadow defers trade emission until settlement plus the 1800-second finalization lag plus stable polls (post-#680) while the baseline emits trades continuously (pre-#680); trade coverage within a 3600-second gate is unsatisfiable by construction, so settlement, metadata, rotation, asset, and dedupe parity plus finalization progression and the canonical upload replace it'
+else
+  trade_parity_mode=continuous_overlap
+fi
+parity_verifier_json=null
+finalization_progress_json=null
+if [[ $trade_parity_mode == finalization_deferred_overlap \
+  || $trade_parity_mode == finalization_deferred_rust_self ]]; then
+  # The verifier's failure is legitimate only when it is confined to the
+  # deferred-emission trade family. Overlap may omit baseline-only trades;
+  # contained Rust-self recovery must have no trades or duplicates at all.
+  jq --arg mode "$trade_parity_mode" -e '
+    .checks.metadata_parity == true and .checks.settlement_parity == true
+    and .checks.rotation_parity == true and .checks.asset_parity == true
+    and .metrics.trade_shared_values_match == true
+    and (.metrics.trade_shared_value_mismatch_ids | length == 0)
+    and (.metrics.legacy_duplicate_trade_ids | length == 0)
+    and (.metrics.rust_duplicate_trade_ids | length == 0)
+    and .metrics.trade_metadata_shared_values_match == true
+    and .metrics.legacy_trade_metadata_context_match == true
+    and .metrics.rust_trade_metadata_context_match == true
+    and (if $mode == "finalization_deferred_overlap" then
+      .checks.dedupe_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+      and (.metrics.rust_only_trade_ids | length == 0)
+      and (.metrics.legacy_trade_count
+        | type == "number" and floor == . and . > 0)
+    else
+      .checks.byte_parity == false
+      and .checks.field_parity == false
+      and .checks.dedupe_parity == false
+      and .checks.trade_coverage_parity == true
+      and .checks.trade_contract_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "dedupe_parity"))
+      and .metrics.legacy_trade_count == 0
+      and .metrics.rust_trade_count == 0
+      and (.metrics.legacy_only_trade_ids | length == 0)
+      and (.metrics.rust_only_trade_ids | length == 0)
+    end)
+  ' "$parity_json" >/dev/null \
+    || die 'parity failed outside the adjudicated deferred-emission family'
+  # The pipeline must demonstrably advance, not merely exist: the stable-poll
+  # counter is zero until the 1800-second lag elapses, so a positive growing
+  # maximum proves finalization ticked; a growing settled maximum proves new
+  # settlements entered the bounded state despite eviction.
+  jq -en --argjson start "$shadow_state_start_counters" \
+    --argjson end "$shadow_state_end_counters" \
+    --argjson maximum "$shadow_state_max_counters" '
+    ($end.tracked_markets > 0)
+    and (($maximum.stable_polls > 0
+        and $maximum.stable_polls > $start.stable_polls)
+      or ($maximum.settled_markets > $start.settled_markets))
+  ' >/dev/null \
+    || die 'Rust shadow finalization pipeline did not advance during the gate'
+  parity_verifier_json=$(jq -c '{passed:.passed, checks:.checks}' "$parity_json") \
+    || die 'could not preserve the raw parity verifier verdict'
+  finalization_progress_json=$(jq -cn \
+    --argjson start "$shadow_state_start_counters" \
+    --argjson end "$shadow_state_end_counters" \
+    --argjson maximum "$shadow_state_max_counters" '
+    {tracked_markets_start:$start.tracked_markets,
+     settled_markets_start:$start.settled_markets,
+     stable_polls_start:$start.stable_polls,
+     tracked_markets_end:$end.tracked_markets,
+     settled_markets_end:$end.settled_markets,
+     stable_polls_end:$end.stable_polls,
+     settled_markets_max:$maximum.settled_markets,
+     stable_polls_max:$maximum.stable_polls}') \
+    || die 'could not serialize the finalization progression evidence'
+else
+  ((parity_exit == 0)) \
+    || die 'byte/field/dedupe/settlement/rotation parity failed'
+fi
 
 verify_current_oss_config
 upload_json=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \
@@ -2047,6 +2268,12 @@ jq \
   --argjson market_uploaded_segments "$market_uploaded_segments" \
   --argjson market_canonical_uploaded_segments "$market_canonical_uploaded_segments" \
   --argjson real_market_preflight "$real_market_preflight_json" \
+  --arg trade_parity_mode "$trade_parity_mode" \
+  --arg trade_parity_reason "$trade_parity_reason" \
+  --arg shadow_emission "$shadow_emission" \
+  --arg baseline_emission "$baseline_emission" \
+  --argjson parity_verifier "$parity_verifier_json" \
+  --argjson finalization_progress "$finalization_progress_json" \
   '. + {
     schema:"monday.polymarket_shadow_gate.v1",
     baseline_mode:$baseline_mode,
@@ -2078,6 +2305,12 @@ jq \
     baseline_health_completion_file_identity:
       $baseline_health_completion_file_identity,
     real_market_preflight:$real_market_preflight,
+    trade_parity_mode:$trade_parity_mode,
+    trade_parity_reason:$trade_parity_reason,
+    shadow_emission:$shadow_emission,
+    baseline_emission:$baseline_emission,
+    parity_verifier:$parity_verifier,
+    finalization_progress:$finalization_progress,
     recovery:$recovery,
     legacy_runtime:$legacy_runtime,
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
@@ -2099,8 +2332,9 @@ jq \
       market_oss_uploaded_segments:$market_uploaded_segments,
       market_oss_canonical_uploaded_segments:$market_canonical_uploaded_segments
     })
-  } | .passed = (.passed and ([.checks[]] | all))' \
-  "$parity_json" >"$gate_tmp"
+  }' "$parity_json" \
+  | adjudicate_trade_parity "$trade_parity_mode" >"$gate_tmp" \
+  || die 'could not adjudicate the combined trade parity evidence'
 mv "$gate_tmp" "$gate_json"
 sync "$gate_json"
 

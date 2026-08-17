@@ -5,7 +5,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ploy_market_data::polymarket_evidence::{
@@ -15,18 +14,15 @@ use ploy_market_data::polymarket_evidence::{
     PolymarketEvidenceTrustAnchor, PolymarketReadyEventCatalog, PolymarketResearchTask,
 };
 use ploy_research::prediction_loop::{
-    current_prediction_policy_snapshot_id, PredictionSearchBudget, ProposalCallOutput,
-    ProposalClient,
+    current_prediction_policy_snapshot_id, PredictionSearchBudget,
 };
 use ploy_research::prediction_mcts_authenticated::{
     read_authenticated_prediction_experiment_manifest,
     read_authenticated_prediction_result_receipt,
-    run_or_resume_authenticated_prediction_mcts_trial,
-    write_authenticated_prediction_experiment_manifest, AuthenticatedTaskMetrics,
-    BuiltInAuthenticatedPredictionMctsEvaluator,
+    write_authenticated_prediction_experiment_manifest, AuthenticatedPredictionResultReceiptRef,
+    AuthenticatedTaskMetrics,
 };
 use ploy_research::prediction_mission_v3::{
-    admit_prediction_mission_v3, authenticate_prediction_mission_v3_inputs,
     PredictionAuthorityProfile, PredictionMissionCapability, PredictionMissionTask,
     PredictionProductIdentity, PredictionProductSymbol, PredictionResearchMissionV3,
     PredictionRunMode, PredictionTaskKind, PredictionTokenSide,
@@ -36,9 +32,10 @@ use ploy_research::research_snapshot::{
     admit_cached_authenticated_research_snapshot, ResearchSnapshotInputArtifact,
 };
 use ploy_research::{
-    authenticate_ready_event_cohort, build_research_snapshot_from_polymarket_chainlink_baseline,
+    admit_extracted_authenticated_research_snapshot, authenticate_ready_event_cohort,
+    build_research_snapshot_from_polymarket_chainlink_baseline,
     materialize_authenticated_research_snapshot, read_catalog_partition_artifact,
-    write_catalog_partition_artifact, AuthenticatedResearchSnapshot,
+    write_catalog_partition_artifact, AuthenticatedPartitionView, AuthenticatedResearchSnapshot,
     AuthenticatedSnapshotMaterializationRequest, EventCohortPartition, ResearchSnapshot,
     VerifiedArtifactSnapshotBuildOptions,
 };
@@ -58,21 +55,6 @@ struct EventFixture {
     qualification: Value,
     qualification_path: PathBuf,
     qualification_sha256: String,
-}
-
-struct NoNetworkClient {
-    calls: usize,
-}
-
-impl ProposalClient for NoNetworkClient {
-    fn propose(
-        &mut self,
-        _prompt: &str,
-        _timeout: StdDuration,
-    ) -> Result<ProposalCallOutput, String> {
-        self.calls += 1;
-        Err("the offline E2E fixture forbids provider calls".to_string())
-    }
 }
 
 #[test]
@@ -151,12 +133,39 @@ fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
         readback.partition_view().common_time_boundary_ms(),
         boundary.timestamp_millis()
     );
+    let mut forged_view = serde_json::to_value(snapshot.partition_view()).unwrap();
+    forged_view["held_out_market_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("forged-market"));
+    assert!(admit_extracted_authenticated_research_snapshot(
+        snapshot.snapshot_dir(),
+        snapshot.cohort_manifest_id(),
+        snapshot.partition_digest(),
+        snapshot.causal_projection_policy_id(),
+        serde_json::from_value(forged_view).unwrap(),
+        snapshot.snapshot_contract_id(),
+        snapshot.snapshot_hash(),
+    )
+    .is_err());
+    let runtime_snapshot = admit_extracted_authenticated_research_snapshot(
+        snapshot.snapshot_dir(),
+        snapshot.cohort_manifest_id(),
+        snapshot.partition_digest(),
+        snapshot.causal_projection_policy_id(),
+        serde_json::from_slice::<AuthenticatedPartitionView>(
+            &serde_json::to_vec(snapshot.partition_view()).unwrap(),
+        )
+        .unwrap(),
+        snapshot.snapshot_contract_id(),
+        snapshot.snapshot_hash(),
+    )
+    .expect("re-admit the exact serialized runtime partition view");
 
     assert_pipeline_smoke_completed(&root, &snapshot);
 
     let output = root.join("research-trial");
     let immutable_image_identity = format!("sha256:{}", "4".repeat(64));
-    let mut client = NoNetworkClient { calls: 0 };
     let mut receipts = Vec::new();
     let mut receipt_refs = Vec::new();
     for kind in [
@@ -164,20 +173,44 @@ fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
         PredictionTaskKind::UpExecution,
         PredictionTaskKind::DownExecution,
     ] {
-        let mission = mission(&snapshot, kind, PredictionRunMode::ResearchTrial);
-        let inputs = authenticate_prediction_mission_v3_inputs(&snapshot, &mission).unwrap();
-        let admitted = admit_prediction_mission_v3(&mission, &inputs, None).unwrap();
-        let run = run_or_resume_authenticated_prediction_mcts_trial(
-            &mission,
-            &admitted,
-            &snapshot,
-            &immutable_image_identity,
-            &output,
-            &mut client,
-            &mut BuiltInAuthenticatedPredictionMctsEvaluator,
-        )
-        .unwrap_or_else(|error| panic!("bounded authenticated {kind:?} research trial: {error}"));
-        let receipt = read_authenticated_prediction_result_receipt(&output, &run.receipt).unwrap();
+        let mission = mission(&runtime_snapshot, kind, PredictionRunMode::ResearchTrial);
+        let mission_path = root.join(format!("research-trial-{kind:?}.json").to_ascii_lowercase());
+        fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
+        let process = Command::new(env!("CARGO_BIN_EXE_monday-prediction-research"))
+            .arg("--research-trial")
+            .arg(&mission_path)
+            .arg(runtime_snapshot.snapshot_dir())
+            .arg(&output)
+            .arg("--admitted-cohort-manifest-id")
+            .arg(runtime_snapshot.cohort_manifest_id())
+            .arg("--admitted-partition-digest")
+            .arg(runtime_snapshot.partition_digest())
+            .arg("--admitted-policy-identity")
+            .arg(runtime_snapshot.causal_projection_policy_id())
+            .arg("--admitted-snapshot-contract-id")
+            .arg(runtime_snapshot.snapshot_contract_id())
+            .arg("--admitted-snapshot-digest")
+            .arg(runtime_snapshot.snapshot_hash())
+            .arg("--admitted-partition-view-json")
+            .arg(serde_json::to_string(runtime_snapshot.partition_view()).unwrap())
+            .arg("--immutable-image-identity")
+            .arg(&immutable_image_identity)
+            .output()
+            .expect("run production research trial binary");
+        assert!(
+            process.status.success(),
+            "bounded authenticated {kind:?} research trial: {}",
+            String::from_utf8_lossy(&process.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&process.stdout).unwrap();
+        assert_eq!(summary["status"], "completed");
+        let receipt_ref: AuthenticatedPredictionResultReceiptRef = serde_json::from_value(json!({
+            "path": summary["receipt_path"],
+            "artifact_sha256": summary["receipt_artifact_sha256"],
+            "receipt_sha256": summary["receipt_sha256"],
+        }))
+        .unwrap();
+        let receipt = read_authenticated_prediction_result_receipt(&output, &receipt_ref).unwrap();
         assert_eq!(receipt.mission.partition_digest, partition.digest());
         assert_eq!(
             metric_event_count(&receipt.metrics),
@@ -185,11 +218,11 @@ fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
             "crossing event leaked"
         );
         assert_rehashes(
-            &output.join(run.receipt.path()),
-            run.receipt.artifact_sha256(),
+            &output.join(receipt_ref.path()),
+            receipt_ref.artifact_sha256(),
         );
         receipts.push(receipt);
-        receipt_refs.push(run.receipt);
+        receipt_refs.push(receipt_ref);
     }
     let AuthenticatedTaskMetrics::Settlement(settlement) = &receipts[0].metrics else {
         unreachable!("first task is settlement")
@@ -208,7 +241,6 @@ fn producer_snapshot_smoke_and_three_task_receipts_share_one_partition() {
         / 3.0;
     assert!((settlement.mean_brier_score - expected_held_out_brier).abs() < 1e-12);
     assert!((settlement.mean_brier_score - crossing_brier).abs() > 0.1);
-    assert_eq!(client.calls, 0, "baseline trial attempted a provider call");
     assert!(receipt_refs[0].path().contains("/settlement/"));
     assert!(receipt_refs[1].path().contains("/up-execution-10s/"));
     assert!(receipt_refs[2].path().contains("/down-execution-10s/"));
@@ -640,7 +672,6 @@ fn mission(
         search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
         search_budget: PredictionSearchBudget {
             max_candidates: usize::from(!pipeline_smoke),
-            max_llm_calls: usize::from(!pipeline_smoke),
             max_seconds: 30,
         },
     }
@@ -674,6 +705,10 @@ fn assert_pipeline_smoke_completed(root: &Path, snapshot: &AuthenticatedResearch
         .arg(snapshot.snapshot_contract_id())
         .arg("--admitted-snapshot-digest")
         .arg(snapshot.snapshot_hash())
+        .arg("--admitted-partition-view-json")
+        .arg(serde_json::to_string(snapshot.partition_view()).unwrap())
+        .arg("--immutable-image-identity")
+        .arg(format!("sha256:{}", "4".repeat(64)))
         .output()
         .expect("run production pipeline smoke binaries");
     assert!(

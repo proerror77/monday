@@ -10,8 +10,8 @@ Type=simple
 User=hftcollector
 Group=hftcollector
 # --max-trade-polls-per-cycle 200: the 180-second cycle watchdog and the
-# 100ms minimum Data API request spacing bound one cycle to 1800 request
-# starts; 200 polls need at least 20 seconds of pacing, leaving ~160 seconds
+# 125ms minimum Data API request spacing bounds one cycle to 1440 request
+# starts; 200 polls need at least 25 seconds of pacing, leaving ~155 seconds
 # of headroom for metadata and settlement work inside the watchdog. Poll
 # concurrency stays at the default 4, so the 672MiB/768MiB memory calibration
 # is unchanged while historical trade backfill throughput rises from the

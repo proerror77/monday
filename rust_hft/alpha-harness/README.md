@@ -8,6 +8,23 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 - `alpha-engine`: GP, MCTS, Bayesian search, offline Q-learning, OpenAI-compatible proposals/critics, causal DSL evaluation, checkpointing, and learning.
 - `alpha-harness`: Agent-facing CLI.
 
+## Current Capability
+
+| Contract | Status | Current terminal evidence |
+| --- | --- | --- |
+| CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
+| Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
+| Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
+| Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt and explicit queue/partial-fill/impact/capacity disclosures |
+| Final precommit and sealed holdout | Implemented | Exact precommit, at-most-once sealed opening, immutable receipt, bundle, and promotion lineage |
+| Signed Paper/Shadow intake | Implemented | Signed four-stage CEX bundles reach the fail-closed Paper/Shadow boundary; this grants no LiveSmall authority |
+| Exact-main CEX run and readback | Pending [#606](https://github.com/proerror77/monday/issues/606) | A fresh credential-free USD-M Mission still needs cloud Runtime and independent result readback |
+| Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
+
+`mission execute` is the CEX operator acceptance seam. Low-level Mission and
+LoopRun commands remain diagnostics and implementation surfaces; they are not
+alternate evidence paths around the acceptance contracts above.
+
 ## Data Mission
 
 ```bash
@@ -46,7 +63,18 @@ cargo run -p alpha-harness -- mission status \
 
 cargo run -p alpha-harness -- candidate list \
   --db var/alpha.duckdb --mission-id mission-1
+
+cargo run -p alpha-harness -- candidate show \
+  --db var/alpha.duckdb --mission-id mission-1 \
+  --candidate-id mission-1-gp-1
 ```
+
+`candidate show` prints the candidate artifact plus every stored evaluation as
+structured JSON: pass/fail, score, failure reasons, the bound evaluation
+protocol, and the full metrics (IC/RankIC/ICIR/RankICIR, positive-IC ratio,
+per-fold and aggregate net return, drawdown, turnover, trade count, and the
+unannualized per-observation net Sharpe). It is read-only evidence readback;
+it grants no promotion or runtime authority.
 
 The bounded CEX entrypoint consumes a separate Agent-produced,
 content-addressed `cex-research-mission-v1` artifact:
@@ -58,23 +86,52 @@ cargo run -p alpha-harness -- mission execute \
   --mission-sha256 "$MISSION_SHA256" \
   --feature-url var/materializations/features.jsonl \
   --materialization-url var/materializations/materialization.json \
-  --result-put-url var/results/cex-mission-1.zip
+  --result-put-url var/results/cex-mission-1.zip \
+  --result-readback-url var/results/cex-mission-1.zip
 ```
+
+Resume a persisted subset-search checkpoint into a fresh work directory by
+adding `--resume-url <checkpoint.json>` and
+`--resume-sha256 <checkpoint-content-sha256>` using the checkpoint artifact's
+embedded `checkpoint_sha256` field. Restore deterministically replays the
+complete trace against the newly reproduced Mission, Factor Bank, baselines,
+policies, and research context before accepting any persisted RNG, tree
+statistics, evaluation, or selection.
+Mission admission rejects search plans whose conservative checkpoint-size bound
+cannot fit the same 64 MiB resume transport limit.
 
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and
 evaluation protocol, and typed prior-evidence references. The command derives
 research fields, budgets, and costs from that artifact; they are not accepted
-as alternate execute flags. Unknown fields, Prediction Market fields, action
+as alternate execute flags. The latest credential-free replay writer currently
+admits USD-M only: public reference artifacts bind instrument rules, funding,
+and open interest, while fee and rebate values remain explicit, content-hashed
+Mission assumptions. Historical account-bound and Spot replay schemas remain
+read-only. Unknown fields, Prediction Market fields, action
 requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
 feedback fail before Mission admission. `operational.submitted_at` is retained
-for audit but does not alter the semantic Mission identity. Execution stops
-after research candidate selection; sealed-holdout evaluation requires the
-separate governed precommit boundary. This schema binds prior-evidence
-identities; later holdout and Paper/Shadow gates own receipt and signature
-verification.
+for audit but does not alter the semantic Mission identity. After both baselines
+pass, execution searches only canonical Factor Bank subsets through add, remove,
+and swap actions, scores mechanically oriented equal-absolute-weight signals on
+the research folds, and emits the typed weight policy plus deterministic
+checkpoint, trace, and terminal-result artifacts. GP screening and subset search
+share one multiplicity correction sized for both bounded candidate families;
+only passing subset evaluations are selectable; a terminal search with no
+passing subset publishes `selected: null` instead of dropping the negative
+result. A passing selection also emits `combination-walk-forward.json`: four
+content-addressed stages linked from the immutable Factor Bank through fixed
+equal-absolute Signal weights, sign-based bounded Sizing, evaluator-owned Risk
+limits, and the exact Binance bucketed-L2 cost/execution assumptions. The same
+artifact binds the selected walk-forward metrics and both mandatory baseline
+evaluations under one protocol while keeping the holdout unopened and carrying
+neither deployment nor order-submission authority. Its selected result is
+accepted only after exact checkpoint replay derives the same terminal metadata,
+subset, and evaluation. Sealed-holdout evaluation requires the separate governed
+precommit boundary. This schema binds prior-evidence identities; later holdout
+and Paper/Shadow gates own receipt and signature verification.
 
-For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
+For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The low-level CLI rejects `mcts`; Factor-Bank subset MCTS is owned only by the content-bound `mission execute` seam. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -89,7 +146,7 @@ For an LLM mission, `objective` and `hypothesis_scope` are the governed research
 
 ## Bounded LoopRun
 
-Run or resume a durable staged goal with the same command:
+The durable state contract has the following command shape:
 
 ```bash
 cargo run -p alpha-harness -- loop run \
@@ -108,7 +165,13 @@ cargo run -p alpha-harness -- loop status \
   --loop-run-id loop-btc-1
 ```
 
-The durable LoopRun accepts only `mcts`, the live-capable engine with a versioned exact-state checkpoint. GP and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. Bayesian and offline RL are rejected during preflight. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
+The durable LoopRun still targets the retired Formula-MCTS proposal interface,
+so it is not a runnable CEX golden path. The content-bound `mission execute` path
+owns Factor-Bank subset MCTS and exact checkpoint resume. GP and LLM remain
+available through standalone `mission run` commands but cannot claim that
+acceptance path. Bayesian and offline RL are rejected during preflight. Missing
+evaluation, holdout, Paper, Shadow, or human evidence pauses LoopRun instead of
+fabricating progress; invocation does not bypass stage evidence.
 
 ## Prediction-Market Research
 
@@ -145,7 +208,8 @@ alpha-harness prediction execute \
   --mission-sha256 "$MISSION_SHA256" \
   --snapshot-url 'https://signed-snapshot-get-url' \
   --snapshot-sha256 "$SNAPSHOT_ARCHIVE_SHA256" \
-  --result-put-url 'https://signed-results-put-url'
+  --result-put-url 'https://signed-results-put-url' \
+  --result-readback-url 'https://signed-results-get-url'
 ```
 
 Workers may add `--snapshot-cache-dir /cache/research-snapshots` to reuse a

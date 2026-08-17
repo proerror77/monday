@@ -29,10 +29,18 @@ pub(crate) fn uses_partial_depth_stream() -> bool {
     !explicitly_diff || force_limited
 }
 
+pub(crate) fn validate_depth_frequency(usdm: bool) -> HftResult<()> {
+    let configured = std::env::var("COLLECTOR_DEPTH_FREQ")
+        .or_else(|_| std::env::var("BINANCE_DEPTH_FREQ"))
+        .ok();
+    depth_frequency(usdm, configured.as_deref()).map(|_| ())
+}
+
 pub struct BinanceWebSocket {
     client: WsClient,
     symbols: Vec<Symbol>,
     ws_base_url: String,
+    usdm: bool,
 }
 
 impl Default for BinanceWebSocket {
@@ -58,7 +66,13 @@ impl BinanceWebSocket {
             client: WsClient::new(config),
             symbols: Vec::new(),
             ws_base_url: url_string,
+            usdm: false,
         }
+    }
+
+    pub fn with_usdm(mut self) -> Self {
+        self.usdm = true;
+        self
     }
 
     /// 開始連接並訂閱指定品種
@@ -66,7 +80,7 @@ impl BinanceWebSocket {
         self.symbols = symbols.clone();
 
         // 構建訂閱流名稱
-        let streams = self.build_stream_names(&symbols);
+        let streams = self.build_stream_names(&symbols)?;
         info!("連接 Binance WebSocket，訂閱流: {:?}", streams);
 
         // 構建 WebSocket URL
@@ -96,7 +110,7 @@ impl BinanceWebSocket {
     }
 
     /// 構建訂閱流名稱
-    fn build_stream_names(&self, symbols: &[Symbol]) -> Vec<String> {
+    fn build_stream_names(&self, symbols: &[Symbol]) -> HftResult<Vec<String>> {
         // 允許通過環境變數控制深度模式
         // BINANCE_USE_LIMITED=true -> 使用 depth{levels}@{freq}
         // 否則使用 diff depth（symbol@depth）
@@ -111,11 +125,14 @@ impl BinanceWebSocket {
             })
             .filter(|levels| matches!(*levels, 5 | 10 | 20))
             .unwrap_or(20);
-        let freq = std::env::var("COLLECTOR_DEPTH_FREQ")
-            .or_else(|_| std::env::var("BINANCE_DEPTH_FREQ"))
-            .ok()
-            .filter(|freq| matches!(freq.as_str(), "100ms" | "1000ms"))
-            .unwrap_or_else(|| "100ms".to_string());
+        let freq = if use_limited {
+            let configured_freq = std::env::var("COLLECTOR_DEPTH_FREQ")
+                .or_else(|_| std::env::var("BINANCE_DEPTH_FREQ"))
+                .ok();
+            depth_frequency(self.usdm, configured_freq.as_deref())?
+        } else {
+            "100ms".to_string()
+        };
         let mut streams = Vec::new();
 
         let sub_book_ticker = std::env::var("COLLECTOR_SUB_BOOK_TICKER")
@@ -169,7 +186,7 @@ impl BinanceWebSocket {
             streams.push("!bookTicker".to_string());
         }
 
-        streams
+        Ok(streams)
     }
 
     pub async fn receive_message_bytes_with_metrics(
@@ -183,6 +200,25 @@ impl BinanceWebSocket {
     }
 }
 
+fn depth_frequency(usdm: bool, configured: Option<&str>) -> HftResult<String> {
+    let Some(configured) = configured else {
+        return Ok("100ms".to_string());
+    };
+    if usdm {
+        if matches!(configured, "100ms" | "250ms" | "500ms") {
+            return Ok(configured.to_string());
+        }
+        return Err(HftError::Config(format!(
+            "Binance USD-M partial depth does not support {configured}; use 100ms, 250ms, or 500ms"
+        )));
+    }
+    Ok(if matches!(configured, "100ms" | "1000ms") {
+        configured.to_string()
+    } else {
+        "100ms".to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +228,7 @@ mod tests {
         let ws = BinanceWebSocket::new();
         let symbols = vec![Symbol::new("BTCUSDT"), Symbol::new("ETHUSDT")];
 
-        let streams = ws.build_stream_names(&symbols);
+        let streams = ws.build_stream_names(&symbols).unwrap();
 
         assert_eq!(streams.len(), 6); // 每個品種 3 個流
         assert!(streams.contains(&"btcusdt@depth20@100ms".to_string()));
@@ -201,6 +237,14 @@ mod tests {
         assert!(streams.contains(&"ethusdt@depth20@100ms".to_string()));
         assert!(streams.contains(&"ethusdt@trade".to_string()));
         assert!(streams.contains(&"ethusdt@bookTicker".to_string()));
+    }
+
+    #[test]
+    fn usdm_rejects_spot_only_partial_depth_frequency() {
+        assert!(depth_frequency(true, Some("1000ms")).is_err());
+        for frequency in ["100ms", "250ms", "500ms"] {
+            assert_eq!(depth_frequency(true, Some(frequency)).unwrap(), frequency);
+        }
     }
 
     #[test]

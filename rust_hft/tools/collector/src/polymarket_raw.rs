@@ -36,7 +36,12 @@ const TRADE_ID_VERSION: &str = "v2";
 const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
+// gamma-api /markets/keyset 500s on wide closed-market windows while every
+// <=6h sub-window of the same range returns 200 (upstream regression), so
+// closed-lane discovery iterates contiguous chunks of at most this span.
+const GAMMA_DISCOVERY_WINDOW_CHUNK_SECS: i64 = 21_600;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
+const MAX_STARTUP_DURATION: Duration = Duration::from_secs(600);
 const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -45,6 +50,7 @@ const MAX_TRADE_ROWS_PER_SNAPSHOT: usize = 20_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
+pub const DEFAULT_TRADE_REQUEST_SPACING_MS: u64 = 125;
 // Default cap on one active tape's bytes before fail-closed rotation. At
 // tick-level recording a single UTC-hour tape reached 20-25 GiB (#655), and
 // upload processing needs ~1.6x the tape size of transient spool disk.
@@ -52,7 +58,7 @@ pub const DEFAULT_TAPE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // A nonzero cap below one record's order of magnitude would rotate every
 // write batch and flood the uploader with trivial tapes.
 const MIN_TAPE_MAX_BYTES: u64 = 1024 * 1024;
-const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(100);
+const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(DEFAULT_TRADE_REQUEST_SPACING_MS);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
@@ -493,12 +499,15 @@ fn plan_market_detail_fetches(
             .iter()
             .filter_map(|(market_id, tracked)| {
                 let end_time = parse_optional_datetime(tracked.end_time.as_deref());
-                (!target_ids.contains(market_id)
-                    && end_time.is_some_and(|end| end <= now)
-                    && !(tracked.settled && tracked.trade_complete))
+                (end_time.is_none()
+                    || (!target_ids.contains(market_id)
+                        && end_time.is_some_and(|end| end <= now)
+                        && !(tracked.settled && tracked.trade_complete)))
                     .then(|| TradePollCandidate {
                         market_id: market_id.clone(),
-                        priority: !tracked.settled || tracked.settlement_failure_since.is_some(),
+                        priority: end_time.is_none()
+                            || !tracked.settled
+                            || tracked.settlement_failure_since.is_some(),
                         last_success_at: parse_optional_datetime(
                             tracked.last_market_detail_attempt_at.as_deref(),
                         ),
@@ -918,6 +927,10 @@ struct TapeWriter {
     tape_bytes: u64,
     tape_max_bytes: u64,
     recovery_pending: bool,
+    /// Segment names this writer published; several rotations can share one
+    /// cycle-level timestamp, so own names are bumped past, while a foreign
+    /// closed tape at the target name stays a hard no-clobber failure.
+    rotated_names: BTreeSet<PathBuf>,
     file: Option<File>,
 }
 
@@ -1141,6 +1154,7 @@ impl TapeWriter {
             tape_bytes: 0,
             tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
             recovery_pending: false,
+            rotated_names: BTreeSet::new(),
             file: None,
         };
         writer.recover_active(recover, expected_active)?;
@@ -1210,7 +1224,26 @@ impl TapeWriter {
         self.rotate_with_rename(now, rename_noreplace)
     }
 
-    fn rotate_with_rename<F>(&mut self, now: DateTime<Utc>, mut rename: F) -> Result<PathBuf>
+    fn rotate_with_rename<F>(&mut self, now: DateTime<Utc>, rename: F) -> Result<PathBuf>
+    where
+        F: FnMut(&Path, &Path) -> Result<()>,
+    {
+        self.rotate_staged_with_rename(now, &[], 0, rename)
+    }
+
+    /// Publish a fresh active tape that starts with `initial` (already
+    /// encoded rows with sequences 0..initial_records). The staged tape is
+    /// populated and synced before either rename runs, so a crash or failure
+    /// at any point leaves either the old active tape or a new active tape
+    /// that already contains the initial rows — never an empty or partial
+    /// replacement.
+    fn rotate_staged_with_rename<F>(
+        &mut self,
+        now: DateTime<Utc>,
+        initial: &[u8],
+        initial_records: u64,
+        mut rename: F,
+    ) -> Result<PathBuf>
     where
         F: FnMut(&Path, &Path) -> Result<()>,
     {
@@ -1220,15 +1253,18 @@ impl TapeWriter {
         let staged = self
             .spool_dir
             .join(format!(".{ACTIVE_TAPE}.{}.rotate", random::<u64>()));
-        let staged_file = OpenOptions::new()
+        let mut staged_file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&staged)?;
-        if let Err(error) = staged_file.sync_all() {
+        if let Err(error) = staged_file
+            .write_all(initial)
+            .and_then(|()| staged_file.sync_all())
+        {
             drop(staged_file);
             let cleanup = fs::remove_file(&staged);
             return Err(anyhow!(
-                "failed to sync staged next tape: {error}; cleanup={cleanup:?}"
+                "failed to populate staged next tape: {error}; cleanup={cleanup:?}"
             ));
         }
         drop(staged_file);
@@ -1241,10 +1277,29 @@ impl TapeWriter {
         }
         let active_metadata = active_file.metadata()?;
         drop(self.file.take().expect("active tape was checked above"));
-        let rotated = self.spool_dir.join(format!(
+        // Several rotations can share one cycle-level timestamp (size-cap
+        // rotations inside a single batch, including carry rotations), and
+        // the rename below is no-clobber, so bump the microsecond stamp past
+        // names this writer itself published. A pre-existing closed tape we
+        // did not create stays a hard collision: the rename fails instead of
+        // silently picking a new name for an anomalous spool state. Bumped
+        // stamps still parse under the uploader's strict rotation-name rule.
+        let mut rotated = self.spool_dir.join(format!(
             "market-updates.{}.ndjson",
             now.format("%Y%m%dT%H%M%S%6f")
         ));
+        let mut bump = 0_u32;
+        while rotated.exists() && self.rotated_names.contains(&rotated) {
+            bump += 1;
+            if bump > 1024 {
+                let cleanup = fs::remove_file(&staged);
+                bail!("could not allocate a unique rotated tape name; cleanup={cleanup:?}");
+            }
+            rotated = self.spool_dir.join(format!(
+                "market-updates.{}.ndjson",
+                (now + TimeDelta::microseconds(i64::from(bump))).format("%Y%m%dT%H%M%S%6f")
+            ));
+        }
         if let Err(error) = rename(&self.active, &rotated) {
             let cleanup = fs::remove_file(&staged);
             let directory_sync = File::open(&self.spool_dir).and_then(|file| file.sync_all());
@@ -1280,11 +1335,159 @@ impl TapeWriter {
             ));
         }
         File::open(&self.spool_dir)?.sync_all()?;
-        self.sequence = 0;
-        self.tape_bytes = 0;
+        self.sequence = initial_records;
+        self.tape_bytes = u64::try_from(initial.len())?;
         self.hour = None;
         self.file = Some(open_append(&self.active)?);
+        self.rotated_names.insert(rotated.clone());
         Ok(rotated)
+    }
+
+    /// Rotate at the byte cap while recovered trades remain pending: restate
+    /// the still-pending recovered trade rows at the front of the new active
+    /// segment, so the active tape stays a self-contained crash-recovery
+    /// source instead of deadlocking against the cap. The latest metadata row
+    /// of each pending condition is carried as well, because the upload
+    /// scanner only counts a segment as canonical when every trade context
+    /// has a matching market_metadata row in the same segment. Carried rows
+    /// keep their original payloads and recorded_at, get fresh sequences, are
+    /// the only content allowed to exceed the cap, and are published
+    /// atomically with the new active tape. Two streaming passes keep memory
+    /// bounded by the live pending set rather than the whole tape.
+    fn rotate_with_pending_carry(&mut self, now: DateTime<Utc>) -> Result<()> {
+        self.rotate_with_pending_carry_and_rename(now, rename_noreplace)
+    }
+
+    fn rotate_with_pending_carry_and_rename<F>(
+        &mut self,
+        now: DateTime<Utc>,
+        rename: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Path, &Path) -> Result<()>,
+    {
+        // Pass 1: stream the tape to compute the live pending set, mirroring
+        // recover_state_from_tape_row (a completion clears the whole
+        // condition), plus the last metadata line of each condition.
+        let mut live: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut last_metadata_line: BTreeMap<String, u64> = BTreeMap::new();
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            let mut reader = BufReader::new(file.try_clone()?);
+            reader.seek(SeekFrom::Start(0))?;
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                let bytes = reader.read_until(b'\n', &mut line)?;
+                if bytes == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                line_number += 1;
+                let row: Value = serde_json::from_slice(&line)?;
+                let Some(update) = row.get("update").and_then(Value::as_object) else {
+                    continue;
+                };
+                let kind = update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let condition_id = update.get("condition_id").and_then(Value::as_str);
+                if kind == "polymarket_trade"
+                    && update.get("record_id_version").and_then(Value::as_str)
+                        == Some(TRADE_ID_VERSION)
+                {
+                    if let (Some(condition_id), Some(record_id)) = (
+                        condition_id,
+                        update.get("record_id").and_then(Value::as_str),
+                    ) {
+                        if !live
+                            .entry(condition_id.to_owned())
+                            .or_default()
+                            .insert(record_id.to_owned())
+                        {
+                            bail!("active tape contains duplicate trade record ID {record_id}");
+                        }
+                    }
+                } else if kind == TRADE_COMPLETION_KIND {
+                    if let Some(condition_id) = condition_id {
+                        live.remove(condition_id);
+                    }
+                } else if kind == "market_metadata" {
+                    if let Some(condition_id) = condition_id {
+                        last_metadata_line.insert(condition_id.to_owned(), line_number);
+                    }
+                }
+            }
+            release_clean_file_cache(reader.get_ref())?;
+        }
+        // Pass 2: stream again and encode the rows to carry into one buffer
+        // with fresh sequences. Selection follows the original tape order so
+        // recorded_at stays non-decreasing inside the new segment.
+        let mut carried = Vec::new();
+        let mut carried_records = 0_u64;
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            let mut reader = BufReader::new(file.try_clone()?);
+            reader.seek(SeekFrom::Start(0))?;
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                let bytes = reader.read_until(b'\n', &mut line)?;
+                if bytes == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                line_number += 1;
+                let mut row: Value = serde_json::from_slice(&line)?;
+                let Some(update) = row.get("update").and_then(Value::as_object) else {
+                    continue;
+                };
+                let kind = update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let condition_id = update.get("condition_id").and_then(Value::as_str);
+                let carry = match kind {
+                    "polymarket_trade"
+                        if update.get("record_id_version").and_then(Value::as_str)
+                            == Some(TRADE_ID_VERSION) =>
+                    {
+                        match (
+                            condition_id,
+                            update.get("record_id").and_then(Value::as_str),
+                        ) {
+                            (Some(condition_id), Some(record_id)) => live
+                                .get(condition_id)
+                                .is_some_and(|records| records.contains(record_id)),
+                            _ => false,
+                        }
+                    }
+                    "market_metadata" => condition_id.is_some_and(|condition_id| {
+                        live.contains_key(condition_id)
+                            && last_metadata_line.get(condition_id) == Some(&line_number)
+                    }),
+                    _ => false,
+                };
+                if !carry {
+                    continue;
+                }
+                let object = row
+                    .as_object_mut()
+                    .context("active tape row is not a JSON object")?;
+                object.insert("sequence".to_owned(), Value::from(carried_records));
+                carried_records += 1;
+                serde_json::to_writer(&mut carried, &row)?;
+                carried.push(b'\n');
+            }
+            release_clean_file_cache(reader.get_ref())?;
+        }
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            file.seek(SeekFrom::End(0))?;
+        }
+        self.rotate_staged_with_rename(now, &carried, carried_records, rename)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1363,18 +1566,23 @@ impl TapeWriter {
                         .saturating_add(u64::try_from(encoded.len())?)
                         > self.tape_max_bytes
                 {
+                    // Recovered trades still pending cannot be stranded in the
+                    // rotated segment: restate them at the front of the fresh
+                    // tape so rotation stays safe and the active tape remains
+                    // a self-contained crash-recovery source.
                     if self.recovery_pending {
-                        bail!("active tape reached its byte cap while recovered trade IDs remain");
+                        self.rotate_with_pending_carry(now)?;
+                    } else {
+                        self.rotate(now)?;
                     }
-                    self.rotate(now)?;
                     encoded = encode(self.sequence)?;
                     // The rotated tape is published; the rollback anchor moves
-                    // to the fresh segment so a later failure never truncates
-                    // across the rotation boundary.
+                    // to the fresh segment (past any carried rows) so a later
+                    // failure never truncates across the rotation boundary.
                     start_hour = None;
-                    start_sequence = 0;
-                    start_tape_bytes = 0;
-                    start_offset = 0;
+                    start_sequence = self.sequence;
+                    start_tape_bytes = self.tape_bytes;
+                    start_offset = self.tape_bytes;
                     self.hour = Some(target_hour.clone());
                 }
                 let file = self.file.as_mut().context("active tape is closed")?;
@@ -1696,6 +1904,7 @@ impl GammaLane {
 struct GammaLaneDiscovery {
     seen: usize,
     targets: Vec<Value>,
+    target_ids: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -1763,30 +1972,43 @@ fn append_gamma_page(
     discovery.targets.extend(
         page.iter()
             .filter(|market| target_market(market, symbols).is_some())
+            .filter(|market| match market.get("id").and_then(Value::as_str) {
+                // Adjacent discovery chunks share a boundary timestamp, so a
+                // market can appear in two consecutive pages.
+                Some(id) => discovery.target_ids.insert(id.to_owned()),
+                None => true,
+            })
             .cloned(),
     );
     Ok(next_cursor)
 }
 
-fn gamma_discovery_params(
-    config: &ReferenceConfig,
+fn gamma_discovery_windows(
     now: DateTime<Utc>,
+    lookback_secs: i64,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let end = now + TimeDelta::minutes(30);
+    let mut start = now - TimeDelta::seconds(lookback_secs);
+    let mut windows = Vec::new();
+    while start < end {
+        let chunk_end = std::cmp::min(
+            start + TimeDelta::seconds(GAMMA_DISCOVERY_WINDOW_CHUNK_SECS),
+            end,
+        );
+        windows.push((start, chunk_end));
+        start = chunk_end;
+    }
+    windows
+}
+
+fn gamma_discovery_params(
     closed: bool,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
 ) -> Vec<(String, String)> {
-    let lookback_secs = if closed {
-        config.settlement_lookback_secs
-    } else {
-        config.market_lookback_secs
-    };
     vec![
-        (
-            "end_date_min".to_owned(),
-            iso_z(now - TimeDelta::seconds(lookback_secs)),
-        ),
-        (
-            "end_date_max".to_owned(),
-            iso_z(now + TimeDelta::minutes(30)),
-        ),
+        ("end_date_min".to_owned(), iso_z(window_start)),
+        ("end_date_max".to_owned(), iso_z(window_end)),
         ("closed".to_owned(), closed.to_string()),
         ("tag_id".to_owned(), CRYPTO_TAG_ID.to_string()),
         ("related_tags".to_owned(), "false".to_owned()),
@@ -2446,46 +2668,54 @@ impl ReferenceCollector {
 
         let mut discovery = GammaDiscovery::default();
         for lane in [GammaLane::Open, GammaLane::Closed] {
-            let base = gamma_discovery_params(&self.config, now, lane.is_closed());
-            let mut cursor: Option<String> = None;
-            let mut seen_cursors = BTreeSet::new();
-            loop {
-                let mut params = base.clone();
-                if let Some(cursor) = cursor.as_ref() {
-                    params.push(("after_cursor".to_owned(), cursor.clone()));
-                }
-                let payload = match self.get_json(&self.endpoints.gamma_markets, &params).await {
-                    Ok(payload) => payload,
-                    Err(error)
-                        if lane.is_closed()
-                            && error
-                                .downcast_ref::<reqwest::Error>()
-                                .and_then(reqwest::Error::status)
-                                == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) =>
-                    {
-                        let fallback_params = params
-                            .iter()
-                            .filter(|(key, _)| key != "tag_id")
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        self.get_json(&self.endpoints.gamma_markets, &fallback_params)
-                            .await?
+            let lookback_secs = if lane.is_closed() {
+                self.config.settlement_lookback_secs
+            } else {
+                self.config.market_lookback_secs
+            };
+            for (window_start, window_end) in gamma_discovery_windows(now, lookback_secs) {
+                let base = gamma_discovery_params(lane.is_closed(), window_start, window_end);
+                let mut cursor: Option<String> = None;
+                let mut seen_cursors = BTreeSet::new();
+                loop {
+                    let mut params = base.clone();
+                    if let Some(cursor) = cursor.as_ref() {
+                        params.push(("after_cursor".to_owned(), cursor.clone()));
                     }
-                    Err(error) => return Err(error),
-                };
-                cursor = discovery.append_page(
-                    lane,
-                    &payload,
-                    &self.symbols,
-                    self.config.max_markets,
-                )?;
-                let Some(next_cursor) = cursor.as_ref() else {
-                    break;
-                };
-                if !seen_cursors.insert(next_cursor.clone()) {
-                    return Err(completeness_error(format!(
-                        "Gamma keyset cursor repeated: {next_cursor}"
-                    )));
+                    let payload = match self.get_json(&self.endpoints.gamma_markets, &params).await
+                    {
+                        Ok(payload) => payload,
+                        Err(error)
+                            if lane.is_closed()
+                                && error
+                                    .downcast_ref::<reqwest::Error>()
+                                    .and_then(reqwest::Error::status)
+                                    == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR) =>
+                        {
+                            let fallback_params = params
+                                .iter()
+                                .filter(|(key, _)| key != "tag_id")
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            self.get_json(&self.endpoints.gamma_markets, &fallback_params)
+                                .await?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    cursor = discovery.append_page(
+                        lane,
+                        &payload,
+                        &self.symbols,
+                        self.config.max_markets,
+                    )?;
+                    let Some(next_cursor) = cursor.as_ref() else {
+                        break;
+                    };
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        return Err(completeness_error(format!(
+                            "Gamma keyset cursor repeated: {next_cursor}"
+                        )));
+                    }
                 }
             }
         }
@@ -2615,9 +2845,10 @@ impl ReferenceCollector {
             {
                 continue;
             }
-            let needs_detail = !targets.contains_key(&market_id)
-                && end_time.is_some_and(|end| end <= now)
-                && !(tracked.settled && tracked.trade_complete);
+            let needs_detail = end_time.is_none()
+                || (!targets.contains_key(&market_id)
+                    && end_time.is_some_and(|end| end <= now)
+                    && !(tracked.settled && tracked.trade_complete));
             if needs_detail && market_detail_plan.selected.contains(&market_id) {
                 tracked.last_market_detail_attempt_at = Some(retrieved_at.clone());
                 match market_detail_fetches
@@ -2997,12 +3228,9 @@ impl ReferenceCollector {
             ))
             .into());
         }
-        if !invalid_end_time_markets.is_empty() {
-            return Err(DataCompletenessError(format!(
-                "tracked markets with missing or invalid end time: {invalid_end_time_markets:?}"
-            ))
-            .into());
-        }
+        // Keep the health fail-closed while the bounded detail queue repairs
+        // recovered markets; exiting here would restart before the queue can
+        // advance and turn a recoverable backlog into a crash loop.
         if !stale_trade_markets.is_empty() {
             return Err(DataCompletenessError(format!(
                 "stale trade markets: {stale_trade_markets:?}"
@@ -3047,7 +3275,7 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     let poll_interval = config.poll_interval;
     let stale_after = config.stale_after;
     let (_spool_lock, collector) =
-        initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
+        initialize_reference_collector_with_watchdog(MAX_STARTUP_DURATION, || {
             let spool_lock = ReferenceSpoolLock::acquire(&config.spool_dir)?;
             Ok((spool_lock, ReferenceCollector::new(config)?))
         })?;
@@ -3384,6 +3612,12 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_has_its_own_bounded_watchdog_budget() {
+        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(600));
+        assert!(MAX_STARTUP_DURATION > MAX_CYCLE_DURATION);
+    }
+
+    #[test]
     fn hard_cycle_watchdog_exits_124_while_stderr_is_locked() {
         let started = Instant::now();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -3549,7 +3783,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut requests = Vec::new();
-            while requests.len() < 3 && Instant::now() < deadline {
+            while requests.len() < 7 && Instant::now() < deadline {
                 let (mut connection, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3595,7 +3829,18 @@ mod tests {
                 connection.write_all(body).unwrap();
                 connection.flush().unwrap();
             }
-            assert_eq!(requests, ["discovery", "discovery", "trade"]);
+            assert_eq!(
+                requests,
+                [
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "discovery",
+                    "trade"
+                ]
+            );
         });
 
         let temp = TestDir::new();
@@ -3653,7 +3898,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..6 {
                 let (mut connection, _) = listener.accept().unwrap();
                 let mut request = [0_u8; 2_048];
                 let _ = connection.read(&mut request).unwrap();
@@ -4213,6 +4458,10 @@ mod tests {
             default.max_concurrent_trade_polls,
             DEFAULT_MAX_CONCURRENT_TRADE_POLLS
         );
+        assert_eq!(
+            default.per_market_delay,
+            Duration::from_millis(DEFAULT_TRADE_REQUEST_SPACING_MS)
+        );
         default.validate().unwrap();
 
         let malformed_market_id = ReferenceConfig {
@@ -4465,6 +4714,64 @@ mod tests {
     }
 
     #[test]
+    fn missing_end_time_recovery_is_bounded_and_rotates_backlog() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let tracked = || TrackedMarket {
+            settled: true,
+            trade_complete: false,
+            ..TrackedMarket::default()
+        };
+        let mut markets = BTreeMap::from([
+            ("missing-a".to_owned(), tracked()),
+            ("missing-b".to_owned(), tracked()),
+            ("missing-c".to_owned(), tracked()),
+        ]);
+
+        let first = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        assert_eq!(first.eligible, 3);
+        assert_eq!(first.priority, 3);
+        assert_eq!(first.priority_deferred, 1);
+        assert_eq!(
+            first.selected,
+            BTreeSet::from(["missing-a".to_owned(), "missing-b".to_owned()])
+        );
+
+        for market_id in &first.selected {
+            markets
+                .get_mut(market_id)
+                .unwrap()
+                .last_market_detail_attempt_at = Some(iso_z(now));
+        }
+        let second = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        assert!(second.selected.contains("missing-c"));
+    }
+
+    #[test]
+    fn missing_end_time_recovery_includes_completed_and_current_markets() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let markets = BTreeMap::from([
+            (
+                "completed".to_owned(),
+                TrackedMarket {
+                    settled: true,
+                    trade_complete: true,
+                    ..TrackedMarket::default()
+                },
+            ),
+            ("current".to_owned(), TrackedMarket::default()),
+        ]);
+        let targets = BTreeSet::from(["current".to_owned()]);
+
+        let plan = plan_market_detail_fetches(&markets, &targets, now, 2);
+
+        assert_eq!(plan.priority, 2);
+        assert_eq!(
+            plan.selected,
+            BTreeSet::from(["completed".to_owned(), "current".to_owned()])
+        );
+    }
+
+    #[test]
     fn recovered_market_detail_must_match_the_requested_target() {
         let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
         let valid = market(
@@ -4597,10 +4904,27 @@ mod tests {
             settlement_lookback_secs: 86_400,
             ..ReferenceConfig::default()
         };
-        let open = gamma_discovery_params(&config, now, false)
+        let open_windows = gamma_discovery_windows(now, config.market_lookback_secs);
+        let closed_windows = gamma_discovery_windows(now, config.settlement_lookback_secs);
+        assert_eq!(open_windows.len(), 1);
+        assert_eq!(open_windows[0].0, now - TimeDelta::seconds(7_200));
+        assert_eq!(open_windows[0].1, now + TimeDelta::minutes(30));
+        assert_eq!(closed_windows.len(), 5);
+        assert_eq!(closed_windows[0].0, now - TimeDelta::seconds(86_400));
+        for pair in closed_windows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "chunks must be contiguous");
+        }
+        for (start, end) in &closed_windows {
+            assert!(*end - *start <= TimeDelta::seconds(GAMMA_DISCOVERY_WINDOW_CHUNK_SECS));
+        }
+        assert_eq!(
+            closed_windows.last().unwrap().1,
+            now + TimeDelta::minutes(30)
+        );
+        let open = gamma_discovery_params(false, open_windows[0].0, open_windows[0].1)
             .into_iter()
             .collect::<BTreeMap<_, _>>();
-        let closed = gamma_discovery_params(&config, now, true)
+        let closed = gamma_discovery_params(true, closed_windows[0].0, closed_windows[0].1)
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         assert_eq!(open["closed"], "false");
@@ -4622,7 +4946,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut requests = Vec::new();
-            while requests.len() < 5 && Instant::now() < deadline {
+            while requests.len() < 9 && Instant::now() < deadline {
                 let (mut connection, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4658,7 +4982,7 @@ mod tests {
                         assert_eq!(params["closed"], "true");
                         assert_eq!(params["tag_id"], "21");
                         assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
-                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-14T08:00:00.000000Z");
                         requests.push(params);
                         connection
                             .write_all(b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
@@ -4669,7 +4993,7 @@ mod tests {
                         assert_eq!(params["closed"], "true");
                         assert!(!params.contains_key("tag_id"));
                         assert_eq!(params["end_date_min"], "2026-07-14T02:00:00.000000Z");
-                        assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                        assert_eq!(params["end_date_max"], "2026-07-14T08:00:00.000000Z");
                         serde_json::to_vec(&json!({
                             "markets": [
                                 market(
@@ -4689,6 +5013,19 @@ mod tests {
                             "next_cursor": "",
                         }))
                         .unwrap()
+                    }
+                    5..=8 => {
+                        assert_eq!(params["closed"], "true");
+                        assert_eq!(params["tag_id"], "21");
+                        let (min, max) = match request_index {
+                            5 => ("2026-07-14T08:00:00.000000Z", "2026-07-14T14:00:00.000000Z"),
+                            6 => ("2026-07-14T14:00:00.000000Z", "2026-07-14T20:00:00.000000Z"),
+                            7 => ("2026-07-14T20:00:00.000000Z", "2026-07-15T02:00:00.000000Z"),
+                            _ => ("2026-07-15T02:00:00.000000Z", "2026-07-15T02:30:00.000000Z"),
+                        };
+                        assert_eq!(params["end_date_min"], min);
+                        assert_eq!(params["end_date_max"], max);
+                        serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
                     }
                     _ => unreachable!(),
                 };
@@ -4723,13 +5060,257 @@ mod tests {
         let markets =
             result.expect("a final closed-lane 500 must use the bounded untagged fallback");
 
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 9);
         assert_eq!(
             markets.len(),
             1,
             "untagged fallback must retain target filtering"
         );
         assert_eq!(markets[0]["id"], "market-1");
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_chunks_the_window_and_dedupes_boundary_markets() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut windows = Vec::new();
+            let mut accepted = 0;
+            while accepted < 6 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let path = read_http_request_path(&mut connection);
+                let params = path
+                    .split_once('?')
+                    .map(|(_, query)| {
+                        query
+                            .split('&')
+                            .map(|pair| {
+                                let (key, value) = pair.split_once('=').unwrap();
+                                (
+                                    urlencoding::decode(key).unwrap().into_owned(),
+                                    urlencoding::decode(value).unwrap().into_owned(),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap();
+                let body = if params["closed"] == "true" {
+                    windows.push((
+                        params["end_date_min"].clone(),
+                        params["end_date_max"].clone(),
+                    ));
+                    let markets = match windows.len() {
+                        // The same market ends exactly on the boundary shared by
+                        // chunks 1 and 2, so both pages legitimately return it.
+                        1 | 2 => vec![market(
+                            "Bitcoin Up or Down - 5 minutes",
+                            "2026-07-14T07:55:00Z",
+                            "2026-07-14T08:00:00Z",
+                        )],
+                        _ => Vec::new(),
+                    };
+                    serde_json::to_vec(&json!({"markets": markets, "next_cursor": ""})).unwrap()
+                } else {
+                    assert_eq!(params["end_date_min"], "2026-07-15T00:00:00.000000Z");
+                    assert_eq!(params["end_date_max"], "2026-07-15T02:30:00.000000Z");
+                    serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
+                };
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+            }
+            windows
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let markets = collector.discover_markets(now).await.unwrap();
+        let windows = server.join().unwrap();
+
+        assert_eq!(
+            windows
+                .iter()
+                .map(|(min, max)| (min.as_str(), max.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("2026-07-14T02:00:00.000000Z", "2026-07-14T08:00:00.000000Z"),
+                ("2026-07-14T08:00:00.000000Z", "2026-07-14T14:00:00.000000Z"),
+                ("2026-07-14T14:00:00.000000Z", "2026-07-14T20:00:00.000000Z"),
+                ("2026-07-14T20:00:00.000000Z", "2026-07-15T02:00:00.000000Z"),
+                ("2026-07-15T02:00:00.000000Z", "2026-07-15T02:30:00.000000Z"),
+            ]
+        );
+        assert_eq!(markets.len(), 1, "boundary market must be deduped");
+        assert_eq!(markets[0]["id"], "market-1");
+    }
+
+    #[tokio::test]
+    async fn gamma_discovery_fails_closed_when_a_cursor_repeats_within_a_chunk() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0;
+            while accepted < 3 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let _ = read_http_request_path(&mut connection);
+                let body = if accepted == 1 {
+                    serde_json::to_vec(&json!({"markets": [], "next_cursor": ""})).unwrap()
+                } else {
+                    serde_json::to_vec(&json!({
+                        "markets": [market(
+                            "Bitcoin Up or Down - 5 minutes",
+                            "2026-07-14T07:55:00Z",
+                            "2026-07-14T08:00:00Z",
+                        )],
+                        "next_cursor": "cursor-1",
+                    }))
+                    .unwrap()
+                };
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+            }
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let error = collector.discover_markets(now).await.unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            format!("{error:#}").contains("Gamma keyset cursor repeated: cursor-1"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_fails_closed_when_a_mid_lane_chunk_keeps_failing() {
+        const RETRYABLE_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        const EMPTY_PAGE: &[u8] = br#"{"markets":[],"next_cursor":""}"#;
+
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepted = 0;
+            while accepted < 9 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                accepted += 1;
+                let path = read_http_request_path(&mut connection);
+                let chunk_three = path
+                    .split_once('?')
+                    .map(|(_, query)| {
+                        query.split('&').any(|pair| {
+                            pair.split_once('=').is_some_and(|(key, value)| {
+                                key == "end_date_min"
+                                    && urlencoding::decode(value).unwrap()
+                                        == "2026-07-14T14:00:00.000000Z"
+                            })
+                        })
+                    })
+                    .unwrap_or(false);
+                if chunk_three {
+                    // The tagged request exhausts its retries, then the untagged
+                    // fallback exhausts its own bounded retries too.
+                    connection.write_all(RETRYABLE_500).unwrap();
+                } else {
+                    write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        EMPTY_PAGE.len()
+                    )
+                    .unwrap();
+                    connection.write_all(EMPTY_PAGE).unwrap();
+                }
+            }
+            accepted
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let result = collector.discover_markets(now).await;
+        let accepted = server.join().unwrap();
+
+        assert!(result.is_err(), "a failing mid-lane chunk must fail closed");
+        assert_eq!(
+            accepted, 9,
+            "open + chunks 1-2 + chunk 3 tagged retries + untagged retries"
+        );
     }
 
     #[tokio::test]
@@ -5621,6 +6202,266 @@ mod tests {
         assert_eq!(active_rows[0]["update"]["kind"], "second");
         assert_eq!(active_rows[1]["sequence"], 1);
         assert_eq!(active_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn size_cap_carries_pending_recovered_trades_into_the_fresh_segment() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer.write_updates(std::slice::from_ref(&trade), now).unwrap();
+        // Simulate crash-recovered pending trades, then cross the cap: the
+        // writer must rotate and carry instead of deadlocking on the cap.
+        writer.recovery_pending = true;
+        writer
+            .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The old segment keeps the original trade row untouched.
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let rotated_rows = fs::read_to_string(&rotated[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rotated_rows.len(), 1);
+        assert_eq!(rotated_rows[0]["sequence"], 0);
+        assert_eq!(rotated_rows[0]["update"], trade);
+
+        // The fresh segment restates the pending trade first (original
+        // payload and recorded_at, fresh sequence), then the current record.
+        let active_rows = fs::read_to_string(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"], trade);
+        assert_eq!(active_rows[0]["update"]["record_id"], record_id.as_str());
+        assert_eq!(
+            active_rows[0]["recorded_at"],
+            rotated_rows[0]["recorded_at"]
+        );
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"]["kind"], "second");
+    }
+
+    #[test]
+    fn size_cap_carry_preserves_recovered_trade_ids_across_restart() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer.write_updates(&[trade], now).unwrap();
+            writer.recovery_pending = true;
+            writer
+                .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+                .unwrap();
+            writer.close().unwrap();
+        }
+
+        // Restart: recovery rebuilds the same pending set from the carried
+        // rows, with no duplicate-ID false positive.
+        let mut state = CollectorState::default();
+        let mut recovered_total = 0;
+        let writer = TapeWriter::new_with_recovery(root.path(), |row| {
+            recover_state_from_tape_row(&mut state, row, 1024, &mut recovered_total)
+        })
+        .unwrap();
+        assert_eq!(writer.sequence, 2);
+        assert_eq!(recovered_total, 1);
+        assert_eq!(state.recovered_trade_ids.len(), 1);
+        assert_eq!(
+            state.recovered_trade_ids["condition-1"],
+            BTreeSet::from([record_id])
+        );
+    }
+
+    #[test]
+    fn carry_rotation_publishes_carried_rows_atomically_with_the_new_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+
+        // Spy on the staged tape at publication time: the carried rows must
+        // already be inside it before the rename makes it the active tape,
+        // so a crash can never expose an empty or partial replacement.
+        let mut staged_rows = Vec::new();
+        writer
+            .rotate_with_pending_carry_and_rename(now, |source, target| {
+                if source
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with('.')
+                {
+                    staged_rows = fs::read_to_string(source)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                }
+                rename_noreplace(source, target)
+            })
+            .unwrap();
+
+        assert_eq!(staged_rows.len(), 1);
+        assert_eq!(staged_rows[0]["sequence"], 0);
+        assert_eq!(staged_rows[0]["update"], trade);
+    }
+
+    #[test]
+    fn failed_carry_rotation_leaves_the_active_tape_and_writer_state_coherent() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let sequence_before = writer.sequence;
+        let tape_bytes_before = writer.tape_bytes;
+
+        // Fail the first rename (active -> rotated): the batch-level rollback
+        // anchors still describe this active tape, so they must stay valid.
+        let error = writer
+            .rotate_with_pending_carry_and_rename(now, |source, target| {
+                if source
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with('.')
+                {
+                    rename_noreplace(source, target)
+                } else {
+                    bail!("injected carry publish failure");
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected carry publish failure"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert_eq!(writer.sequence, sequence_before);
+        assert_eq!(writer.tape_bytes, tape_bytes_before);
+        assert!(writer.file.is_some(), "rollback must reopen the active tape");
+        assert!(rotated_tapes(root.path()).is_empty());
+        assert!(!fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".rotate")));
+    }
+
+    #[test]
+    fn repeated_carry_rotations_in_one_batch_get_unique_segment_names() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let payload = "x".repeat(600_000);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+        // One batch, one timestamp, two cap crossings: the second carry
+        // rotation must not reuse the first segment's name (no-clobber).
+        writer
+            .write_updates(
+                &[
+                    json!({"kind": "second", "payload": payload}),
+                    json!({"kind": "third", "payload": payload}),
+                    json!({"kind": "fourth", "payload": payload}),
+                ],
+                now,
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 2);
+        assert_ne!(rotated[0], rotated[1]);
+        let discovered = crate::polymarket_upload::discover_rotated_tapes(root.path()).unwrap();
+        assert!(rotated.iter().all(|path| discovered.contains(path)));
+        // Every carried segment re-states the pending trade at sequence 0.
+        for path in &rotated {
+            let rows = fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows[0]["sequence"], 0);
+        }
+        let second_rows = fs::read_to_string(&rotated[1])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_rows[0]["update"]["kind"], "polymarket_trade");
+        assert_eq!(second_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn carry_rotation_restates_metadata_context_for_pending_trades() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let metadata = valid_metadata_update(now);
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut filler = valid_metadata_update(now);
+        filler["payload"] = json!("x".repeat(MIN_TAPE_MAX_BYTES as usize));
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(&[metadata.clone(), trade.clone()], now)
+            .unwrap();
+        writer.recovery_pending = true;
+        writer
+            .write_updates(std::slice::from_ref(&filler), now)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The carried segment re-states the latest metadata row ahead of the
+        // pending trade, in original tape order, with fresh sequences.
+        let active = root.path().join(ACTIVE_TAPE);
+        let rows = fs::read_to_string(&active)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["sequence"], 0);
+        assert_eq!(rows[0]["update"], metadata);
+        assert_eq!(rows[1]["sequence"], 1);
+        assert_eq!(rows[1]["update"], trade);
+        assert_eq!(rows[2]["sequence"], 2);
+        assert_eq!(rows[2]["update"], filler);
+
+        // The upload scanner finds the trade context complete because the
+        // carried segment re-states its metadata row (quote coverage is a
+        // separate gate that real collector segments satisfy with quotes).
+        let manifest =
+            crate::polymarket_upload::scan_tape(&active, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["reference_context_complete"], true);
     }
 
     #[test]

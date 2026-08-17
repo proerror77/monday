@@ -58,8 +58,9 @@ avoiding unsafe copy/truncate operations and hourly WebSocket reconnect gaps. A
 new tape is seeded with the active `event_discovered` records before quotes, so
 token-to-event context remains independently replayable.
 
-Closed Polymarket sessions are validated, compressed, and uploaded every five
-minutes by `polymarket-market-tape-upload.timer`. The uploader ignores the active
+Closed Polymarket sessions are validated, compressed, and uploaded five minutes
+after the prior run finishes by `polymarket-market-tape-upload.timer`. The uploader
+ignores the active
 `market-updates.ndjson`, requires contiguous sequence numbers and monotonic record
 timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under the
 immutable `lake/raw/venue=polymarket/dataset=crypto_expiry/date=.../hour=.../sha256=<data-sha>/`
@@ -242,6 +243,57 @@ systemctl status monday-collector-health.service --no-pager -n 5
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
 
+### Data completeness check
+
+`deployment/aliyun/data-completeness-check.sh` (#882) is a POSIX `sh`,
+read-only OSS reconciliation: it compares EXPECTED vs ACTUAL hour partitions
+in the `lake/raw/` lake for every production dataset and fails closed (exit 1)
+on any missing partition, triplet violation, or OSS listing failure. It guards
+against silent hour-level holes like the 2026-08-14 audit findings (a ~36-hour
+USD-M gap, scattered Bybit single-hour losses, Polymarket data stopping ~12
+hours before the reported outage).
+
+Governed datasets and their completeness rules:
+
+| Dataset | Lake prefix | Rule |
+| --- | --- | --- |
+| `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all/` | same triplet |
+| `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
+| `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
+| `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
+
+An hour is expected once it has ended and the per-dataset grace lag has passed
+(default 1 hour: the current hour is still collecting and the previous hour may
+still be in flight). Configuration: `COMPLETENESS_WINDOW_DAYS` (default 2),
+`COMPLETENESS_GRACE_HOURS` plus per-dataset
+`COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}`, and the
+usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. The JSON
+report (`--json`, or `--output FILE`) carries per-dataset `expected_hours`,
+`present_hours`, `missing_partitions`, `triplet_violations`,
+`latest_landed_hour`, and `lag_seconds`.
+`test-data-completeness-check.sh` is the self-contained offline contract test
+(stubbed `aliyun ossutil ls` over a fixture lake).
+
+Install (a governed runtime change, same controller/target/rollback template
+as the health monitor above):
+
+```bash
+sudo install -m 0755 deployment/aliyun/data-completeness-check.sh \
+  /opt/monday/bin/data-completeness-check.sh
+sudo install -m 0644 deployment/aliyun/data-completeness-check.service \
+  deployment/aliyun/data-completeness-check.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now data-completeness-check.timer
+```
+
+The timer runs hourly at :35 (after the :23 upload sweep); the oneshot writes
+its JSON report to `/var/lib/monday-data-completeness/report.json`. Rollback:
+`sudo systemctl disable --now data-completeness-check.timer`, remove the three
+installed files, `sudo rm -rf /var/lib/monday-data-completeness`, and
+`sudo systemctl daemon-reload`.
+
 ### Cloud Monitor disk alarm (PRIMARY)
 
 The on-host timer and the GitHub workflow cannot alert if the host is
@@ -357,7 +409,7 @@ advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
 health sample, while `deferred_trade_markets` makes bounded historical backfill
 explicit rather than silently claiming full-cycle trade coverage. Every Data API
 request, including a second pagination request for the same market, passes through a
-shared start-time pacer with at least 100ms between request starts. Up to four requests
+shared start-time pacer with at least 125ms between request starts. Up to four requests
 may remain in flight, and each processing chunk retains at most four market responses,
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
 absolute 180-second cycle deadline cancels stalled network work and fails closed.
@@ -424,6 +476,23 @@ of reusing the settlement-oriented market-end projection, and those two context
 snapshots must have the same governed values even when the market is outside the
 normal metadata event projection. Evidence includes both trade-ID set differences
 and context-value mismatch market IDs.
+When the shadow defers trade emission until settlement plus the 1800-second
+finalization lag plus stable polls (post-#680 semantics) while the baseline
+emits trades continuously, no mature shadow trade can exist inside the gate
+window, so the trade coverage, field, and byte trio is unsatisfiable by
+construction. The gate then adjudicates that trio instead of requiring it from
+the verifier: settlement, metadata, rotation, asset, and dedupe parity must
+still pass, the shadow must not emit any trade the baseline lacks, the shadow
+finalization pipeline must demonstrably advance during the observation (a
+growing stable-poll maximum — zero until the lag elapses — or a growing settled
+maximum, from running-maxima samples of the bounded fresh-spool state), and the
+canonical upload still runs. Emission modes are classified by the
+collect-reference CLI contract: #680 removed the --max-retained-trade-ids flag
+exactly when deferred finalization replaced per-poll emission, and any probe
+uncertainty classifies continuous so full trade parity applies. The
+verdict records the applied trade parity mode, both detected emission modes,
+the raw verifier checks, and the reason (issue #868). When both sides share
+the same emission semantics, full trade parity applies unchanged.
 Settlement parity uses each market's end time with a 15-minute lookback and a
 10-minute maturity lag, because independent 30-second polling schedules can record
 the same closed market on opposite sides of a wall-clock boundary. Every mature
@@ -736,6 +805,27 @@ ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
 not duplicate the complete raw OSS tape.
 
+### Oversized all-market segments: slice then materialize
+
+Production `spot_all`/`usdm_all` hour segments can decompress past the 2 GiB
+market-tape seal bound, which keeps them out of
+`binance-replay-parquet-materializer`. The `binance-market-tape-slicer` binary
+(hft-collector) rewrites one digest-verified segment into disjoint
+symbol-subset segments: session rows are rewritten to the subset scope,
+per-slice manifests and digests are recomputed, and every slice is re-sealed
+and re-verified under the unchanged strict market-tape gate while it is still
+staged — only a verified slice is published, in data -> manifest -> _SUCCESS
+order. The 2 GiB bound is a deliberate resource limit and is not raised.
+`deployment/aliyun/binance-lob-slice-materialize.sh` is the batch driver: it
+recursively enumerates `date=/hour=` partitions under the governed lake
+prefix, downloads each segment triplet, slices it for a requested symbol set,
+and materializes every slice with the unchanged materializer into
+content-addressed canonical parquet plus a `slice-materialization-run.json`
+evidence manifest. State under `WORK_DIR/state/` makes reruns resumable
+(completed segment/symbol pairs are skipped; a changed symbol set re-slices),
+and any download, slice, or materialize failure, any symbol left pending, an
+empty enumeration, or a run-manifest publish failure fails the run.
+
 ## Rust-only collector release workflow
 
 The Binance collector deployment lane is Rust-only. The legacy Python collector,
@@ -791,7 +881,14 @@ exactly; otherwise installation fails instead of rewriting historical release
 evidence. First installation is assembled in a sibling directory and renamed
 into place only after all identity checks pass.
 
-The committed shadow environments use `SYMBOLS=ALL`, ten-minute segments, the
+For a script/policy-only change that does not rebuild the binary, run the
+installer with `BUNDLE_ONLY=1`. It keeps the artifact identity and verifies the
+installed binary SHA, archives the prior `release.json` as
+`release.json.prev.<sha256>`, and atomically replaces `deployment/` plus the
+`deployment_bundle_*` fields and `deployment_source_revision` of `release.json`.
+The binary is never replaced in this mode.
+
+The committed shadow environments use `SYMBOLS=ALL`, five-minute segments, the
 isolated spools below, and isolated OSS datasets:
 
 | Market | Shadow spool | Shadow dataset |
@@ -837,7 +934,7 @@ trade for a static symbol. Every segment must still contain at least one real
 `agg_trade` for its market dataset, and a v2 segment must additionally carry
 `raw_trade` and `book_ticker` events for the same scope.
 
-### 2. Run the one-hour full-catalog gate
+### 2. Run the 15-minute full-catalog gate
 
 Start the gate through the same CLI wrapper:
 
@@ -852,7 +949,7 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 The host gate owns the complete transition. It verifies the candidate and
 `SYMBOLS=ALL`, drains any previous isolated shadow data, restarts both units,
 waits for initial full-catalog health, freezes both session IDs and catalog
-digests, and then uses monotonic time to observe at least 3,600 seconds. It fails unless all of
+digests, and then uses monotonic time to observe at least 900 seconds. It fails unless all of
 these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;

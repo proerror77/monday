@@ -9,10 +9,12 @@ use crate::{
 use anyhow::{bail, Context};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::Read,
-    path::Path,
+    path::{Component, Path},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -24,18 +26,45 @@ const MAX_RESUME_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_EXTRACTED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES: usize = 10_000;
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PredictionTaskKind {
+    SettlementProbability,
+    UpExecution,
+    DownExecution,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PredictionTokenSide {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PredictionTaskIdentity {
+    kind: PredictionTaskKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    side: Option<PredictionTokenSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prediction_horizon_secs: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
-struct PredictionMissionV2Identity {
-    mission_id: String,
-    lane: String,
-    data_snapshot_id: String,
-    search_policy_snapshot_id: String,
+#[serde(deny_unknown_fields)]
+struct AuthenticatedPartitionViewIdentity {
+    common_time_boundary_ms: i64,
+    train_market_ids: Vec<String>,
+    crossing_excluded_market_ids: Vec<String>,
+    held_out_market_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PredictionMissionV4Identity {
     schema_version: String,
     mission_id: String,
+    task: PredictionTaskIdentity,
     run_mode: String,
     cohort_manifest_id: String,
     partition_digest: String,
@@ -47,29 +76,30 @@ struct PredictionMissionV4Identity {
 
 #[derive(Debug)]
 enum PredictionMissionIdentity {
-    V2(PredictionMissionV2Identity),
     PipelineSmoke(PredictionMissionV4Identity),
+    ResearchTrial(PredictionMissionV4Identity),
 }
 
 impl PredictionMissionIdentity {
     fn mission_id(&self) -> &str {
         match self {
-            Self::V2(mission) => &mission.mission_id,
-            Self::PipelineSmoke(mission) => &mission.mission_id,
+            Self::PipelineSmoke(mission) | Self::ResearchTrial(mission) => &mission.mission_id,
         }
     }
 
     fn snapshot_contract_id(&self) -> &str {
         match self {
-            Self::V2(mission) => &mission.data_snapshot_id,
-            Self::PipelineSmoke(mission) => &mission.snapshot_contract_id,
+            Self::PipelineSmoke(mission) | Self::ResearchTrial(mission) => {
+                &mission.snapshot_contract_id
+            }
         }
     }
 
     fn policy_identity(&self) -> &str {
         match self {
-            Self::V2(mission) => &mission.search_policy_snapshot_id,
-            Self::PipelineSmoke(mission) => &mission.search_policy_snapshot_id,
+            Self::PipelineSmoke(mission) | Self::ResearchTrial(mission) => {
+                &mission.search_policy_snapshot_id
+            }
         }
     }
 
@@ -77,10 +107,23 @@ impl PredictionMissionIdentity {
         matches!(self, Self::PipelineSmoke(_))
     }
 
-    fn matches_admitted_pipeline_identity(&self, args: &PredictionExecuteArgs) -> bool {
+    fn run_mode(&self) -> &'static str {
+        if self.is_pipeline_smoke() {
+            "pipeline_smoke"
+        } else {
+            "research_trial"
+        }
+    }
+
+    fn task(&self) -> &PredictionTaskIdentity {
         match self {
-            Self::V2(_) => true,
-            Self::PipelineSmoke(mission) => {
+            Self::PipelineSmoke(mission) | Self::ResearchTrial(mission) => &mission.task,
+        }
+    }
+
+    fn matches_admitted_identity(&self, args: &PredictionExecuteArgs) -> bool {
+        match self {
+            Self::PipelineSmoke(mission) | Self::ResearchTrial(mission) => {
                 mission.cohort_manifest_id == args.cohort_manifest_id
                     && mission.partition_digest == args.partition_digest
                     && mission.causal_projection_policy_id == args.policy_identity
@@ -125,6 +168,8 @@ struct PredictionExecutionReport<'a> {
     readback_bundle_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pipeline_smoke: Option<PipelineSmokeCompletion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    research_trial: Option<ResearchTrialCompletion>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,6 +182,20 @@ struct PipelineSmokeCompletion {
     snapshot_digest: String,
     search_policy_snapshot_id: String,
     evaluator_report_sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ResearchTrialCompletion {
+    schema_version: String,
+    status: String,
+    mission_id: String,
+    task: PredictionTaskIdentity,
+    snapshot_contract_id: String,
+    snapshot_digest: String,
+    search_policy_snapshot_id: String,
+    receipt_path: String,
+    receipt_artifact_sha256: String,
+    receipt_sha256: String,
 }
 
 pub fn execute(args: PredictionExecuteArgs) -> anyhow::Result<()> {
@@ -189,6 +248,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
             )
         })?;
     extract_archive(&snapshot_archive, snapshot_dir.path(), None)?;
+    make_files_read_only(snapshot_dir.path())?;
     verify_admitted_snapshot_identity(&args, &mission, snapshot_dir.path())?;
 
     let resume_bundle_sha256 = if let Some((resume_url, resume_sha256)) = resume_source(&args)? {
@@ -211,29 +271,31 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
     let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
     let mut command = Command::new(runner);
-    if mission.is_pipeline_smoke() {
-        command.arg("--pipeline-smoke");
-    }
+    command.arg(if mission.is_pipeline_smoke() {
+        "--pipeline-smoke"
+    } else {
+        "--research-trial"
+    });
     let status = command
         .arg(&mission_path)
         .arg(snapshot_dir.path())
         .arg(&results_dir)
-        .args(if mission.is_pipeline_smoke() {
-            vec![
-                "--admitted-cohort-manifest-id",
-                args.cohort_manifest_id.as_str(),
-                "--admitted-partition-digest",
-                args.partition_digest.as_str(),
-                "--admitted-policy-identity",
-                args.policy_identity.as_str(),
-                "--admitted-snapshot-contract-id",
-                args.snapshot_contract_id.as_str(),
-                "--admitted-snapshot-digest",
-                args.snapshot_digest.as_str(),
-            ]
-        } else {
-            Vec::new()
-        })
+        .args([
+            "--admitted-cohort-manifest-id",
+            args.cohort_manifest_id.as_str(),
+            "--admitted-partition-digest",
+            args.partition_digest.as_str(),
+            "--admitted-policy-identity",
+            args.policy_identity.as_str(),
+            "--admitted-snapshot-contract-id",
+            args.snapshot_contract_id.as_str(),
+            "--admitted-snapshot-digest",
+            args.snapshot_digest.as_str(),
+            "--admitted-partition-view-json",
+            args.partition_view_json.as_str(),
+            "--immutable-image-identity",
+            args.image_identity.as_str(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.reopen()?))
         .stderr(Stdio::from(stderr.reopen()?))
@@ -255,6 +317,16 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     if let Some(completion) = pipeline_smoke.as_ref() {
         verify_pipeline_smoke_report_digest(&results_dir, completion)?;
     }
+    let research_trial = if !mission.is_pipeline_smoke() && status.success() {
+        Some(read_research_trial_completion(
+            &stdout_path,
+            &mission,
+            &args,
+            &results_dir,
+        )?)
+    } else {
+        None
+    };
     let evidence = PredictionExecutionEvidence {
         lane: "prediction_market",
         mission_id: mission.mission_id(),
@@ -267,11 +339,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         policy_identity: &args.policy_identity,
         task_capability: &args.task_capability,
         image_identity: &args.image_identity,
-        run_mode: if mission.is_pipeline_smoke() {
-            "pipeline_smoke"
-        } else {
-            "research_trial_or_legacy"
-        },
+        run_mode: mission.run_mode(),
         resume_bundle_sha256: resume_bundle_sha256.as_deref(),
         runner_exit_code: status.code(),
     };
@@ -298,6 +366,7 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         bundle_sha256,
         readback_bundle_sha256: readback_sha256,
         pipeline_smoke,
+        research_trial,
     };
     // The readback hash proves the published bundle is the exact bundle whose smoke
     // report was verified before publication. Keep local status evidence outside that
@@ -379,6 +448,109 @@ fn verify_pipeline_smoke_report_digest(
     Ok(())
 }
 
+fn read_research_trial_completion(
+    stdout_path: &Path,
+    mission: &PredictionMissionIdentity,
+    args: &PredictionExecuteArgs,
+    results_dir: &Path,
+) -> anyhow::Result<ResearchTrialCompletion> {
+    let bytes = std::fs::read(stdout_path)
+        .with_context(|| format!("read research trial completion {}", stdout_path.display()))?;
+    if bytes.len() as u64 > MAX_MISSION_BYTES {
+        bail!("research trial completion exceeds {MAX_MISSION_BYTES} bytes");
+    }
+    let completion: ResearchTrialCompletion = serde_json::from_slice(&bytes)
+        .context("research trial completion must be a typed JSON object")?;
+    if completion.schema_version != "monday.prediction.research_trial.result.v1"
+        || completion.status != "completed"
+        || completion.mission_id != mission.mission_id()
+        || &completion.task != mission.task()
+        || completion.snapshot_contract_id != args.snapshot_contract_id
+        || completion.snapshot_digest != args.snapshot_digest
+        || completion.search_policy_snapshot_id != args.policy_identity
+    {
+        bail!("research trial completion does not bind the admitted identity");
+    }
+    immutable_sha256_identity(
+        "research trial receipt artifact",
+        &completion.receipt_artifact_sha256,
+    )?;
+    immutable_sha256_identity("research trial receipt", &completion.receipt_sha256)?;
+    let relative = Path::new(&completion.receipt_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("research trial receipt path is invalid");
+    }
+    let root = std::fs::canonicalize(results_dir).context("canonicalize research results")?;
+    let receipt_path = std::fs::canonicalize(results_dir.join(relative))
+        .context("read research trial receipt path")?;
+    if !receipt_path.starts_with(&root) || !receipt_path.is_file() {
+        bail!("research trial receipt path escapes its result bundle");
+    }
+    if sha256_file(&receipt_path)?
+        != completion
+            .receipt_artifact_sha256
+            .strip_prefix("sha256:")
+            .unwrap_or_default()
+    {
+        bail!("research trial receipt artifact SHA256 does not match its completion");
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt_path)?)
+        .context("research trial receipt must be valid JSON")?;
+    let receipt_sha256 = research_trial_receipt_sha256(&receipt)?;
+    if receipt_sha256 != completion.receipt_sha256
+        || receipt["schema_version"] != "prediction_authenticated_result_receipt.v1"
+        || receipt["sha256"] != completion.receipt_sha256
+        || receipt["mission"]["mission_id"] != mission.mission_id()
+        || receipt["mission"]["task"] != serde_json::to_value(mission.task())?
+        || receipt["mission"]["cohort_manifest_id"] != args.cohort_manifest_id
+        || receipt["mission"]["partition_digest"] != args.partition_digest
+        || receipt["mission"]["causal_projection_policy_id"] != args.policy_identity
+        || receipt["mission"]["snapshot_contract_id"] != args.snapshot_contract_id
+        || receipt["mission"]["snapshot_hash"] != args.snapshot_digest
+        || receipt["mission"]["search_policy_snapshot_id"] != args.policy_identity
+        || receipt["immutable_image_identity"] != args.image_identity
+    {
+        bail!("research trial receipt does not bind its completion");
+    }
+    Ok(completion)
+}
+
+fn research_trial_receipt_sha256(receipt: &serde_json::Value) -> anyhow::Result<String> {
+    let mut payload = receipt.clone();
+    let serde_json::Value::String(sha256) = &mut payload["sha256"] else {
+        bail!("research trial receipt sha256 is missing");
+    };
+    sha256.clear();
+    let mut bytes = serde_json::to_vec(&payload)?;
+    bytes.push(b'\n');
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn make_files_read_only(root: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        if metadata.is_symlink() {
+            bail!("prediction snapshot extraction contains a symbolic link");
+        }
+        if metadata.is_dir() {
+            make_files_read_only(&entry.path())?;
+        } else if metadata.is_file() {
+            let mut permissions = entry.metadata()?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(entry.path(), permissions)?;
+        } else {
+            bail!("prediction snapshot extraction contains a non-regular file");
+        }
+    }
+    Ok(())
+}
+
 fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
     if args.work_dir.as_os_str().is_empty()
         || [
@@ -393,6 +565,7 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
             args.policy_identity.as_str(),
             args.task_capability.as_str(),
             args.image_identity.as_str(),
+            args.partition_view_json.as_str(),
             args.result_put_url.as_str(),
             args.result_readback_url.as_str(),
         ]
@@ -410,7 +583,27 @@ fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
     if args.task_capability != "btc_5m_backtest" {
         bail!("prediction task capability is not admitted for the current snapshot contract");
     }
+    validate_partition_view_json(&args.partition_view_json)?;
     resume_source(args)?;
+    Ok(())
+}
+
+fn validate_partition_view_json(value: &str) -> anyhow::Result<()> {
+    let view: AuthenticatedPartitionViewIdentity =
+        serde_json::from_str(value).context("admitted partition view is invalid")?;
+    let ids = view
+        .train_market_ids
+        .iter()
+        .chain(&view.crossing_excluded_market_ids)
+        .chain(&view.held_out_market_ids)
+        .collect::<Vec<_>>();
+    let unique = ids.iter().map(|id| id.as_str()).collect::<BTreeSet<_>>();
+    if view.common_time_boundary_ms <= 0
+        || ids.len() != unique.len()
+        || unique.iter().any(|id| id.trim().is_empty())
+    {
+        bail!("admitted partition view is invalid");
+    }
     Ok(())
 }
 
@@ -481,30 +674,44 @@ fn parse_prediction_mission_identity(path: &Path) -> anyhow::Result<PredictionMi
     if schema_version == "prediction_research_mission.v4" {
         let mission = serde_json::from_value::<PredictionMissionV4Identity>(value)
             .context("prediction Mission v4 identity is invalid")?;
-        let identity = PredictionMissionIdentity::PipelineSmoke(mission);
+        let identity = match mission.run_mode.as_str() {
+            "pipeline_smoke" => PredictionMissionIdentity::PipelineSmoke(mission),
+            "research_trial" => PredictionMissionIdentity::ResearchTrial(mission),
+            _ => bail!("prediction Mission v4 run mode is unsupported"),
+        };
         validate_mission_identity(&identity)?;
         return Ok(identity);
     }
-    let mission = serde_json::from_value::<PredictionMissionV2Identity>(value)
-        .context("prediction mission identity is invalid")?;
-    let identity = PredictionMissionIdentity::V2(mission);
-    validate_mission_identity(&identity)?;
-    Ok(identity)
+    bail!("prediction execution requires Mission v4")
 }
 
 fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Result<()> {
     match mission {
-        PredictionMissionIdentity::V2(mission)
-            if mission.lane == "prediction_market"
+        PredictionMissionIdentity::PipelineSmoke(mission)
+            if mission.schema_version == "prediction_research_mission.v4"
+                && mission.run_mode == "pipeline_smoke"
+                && matches!(
+                    (
+                        &mission.task.kind,
+                        &mission.task.side,
+                        mission.task.prediction_horizon_secs
+                    ),
+                    (PredictionTaskKind::SettlementProbability, None, None)
+                )
                 && !mission.mission_id.trim().is_empty()
-                && !mission.data_snapshot_id.trim().is_empty()
+                && !mission.cohort_manifest_id.trim().is_empty()
+                && !mission.partition_digest.trim().is_empty()
+                && !mission.causal_projection_policy_id.trim().is_empty()
+                && !mission.snapshot_contract_id.trim().is_empty()
+                && !mission.snapshot_hash.trim().is_empty()
                 && !mission.search_policy_snapshot_id.trim().is_empty() =>
         {
             Ok(())
         }
-        PredictionMissionIdentity::PipelineSmoke(mission)
+        PredictionMissionIdentity::ResearchTrial(mission)
             if mission.schema_version == "prediction_research_mission.v4"
-                && mission.run_mode == "pipeline_smoke"
+                && mission.run_mode == "research_trial"
+                && valid_research_task(&mission.task)
                 && !mission.mission_id.trim().is_empty()
                 && !mission.cohort_manifest_id.trim().is_empty()
                 && !mission.partition_digest.trim().is_empty()
@@ -517,6 +724,23 @@ fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Res
         }
         _ => bail!("prediction mission identity or lane is invalid"),
     }
+}
+
+fn valid_research_task(task: &PredictionTaskIdentity) -> bool {
+    matches!(
+        (&task.kind, &task.side, task.prediction_horizon_secs),
+        (PredictionTaskKind::SettlementProbability, None, None)
+            | (
+                PredictionTaskKind::UpExecution,
+                Some(PredictionTokenSide::Up),
+                Some(5 | 10 | 15 | 30)
+            )
+            | (
+                PredictionTaskKind::DownExecution,
+                Some(PredictionTokenSide::Down),
+                Some(5 | 10 | 15 | 30)
+            )
+    )
 }
 
 fn verify_admitted_snapshot_identity(
@@ -533,10 +757,9 @@ fn verify_admitted_snapshot_identity(
         || mission.snapshot_contract_id() != args.snapshot_contract_id
         || snapshot.snapshot_contract_hash != args.snapshot_contract_id
         || snapshot.snapshot_hash != args.snapshot_digest
-        || (mission.is_pipeline_smoke()
-            && (mission.policy_identity() != args.policy_identity
-                || !mission.matches_admitted_pipeline_identity(args)
-                || snapshot.source_kind != "polymarket_chainlink_baseline"))
+        || mission.policy_identity() != args.policy_identity
+        || !mission.matches_admitted_identity(args)
+        || snapshot.source_kind != "polymarket_chainlink_baseline"
     {
         bail!("prediction mission, admitted snapshot contract, and snapshot manifest do not match");
     }
@@ -650,7 +873,6 @@ fn extract_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
     use std::{
         io::Write,
         path::PathBuf,
@@ -729,7 +951,10 @@ mod tests {
         let runner = fixture.root.join("monday-prediction-research");
         std::fs::write(
             &runner,
-            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+            successful_research_runner(
+                &fixture,
+                "mkdir -p \"$4\"\nprintf '{\"status\":\"completed\"}\\n' > \"$4/summary.json\"",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -844,7 +1069,10 @@ mod tests {
         let runner = fixture.root.join("monday-prediction-research");
         std::fs::write(
             &runner,
-            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+            successful_research_runner(
+                &fixture,
+                "mkdir -p \"$4\"\nprintf '{\"status\":\"completed\"}\\n' > \"$4/summary.json\"",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -889,7 +1117,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-mission.json");
@@ -909,12 +1137,14 @@ mod tests {
         std::fs::write(
             &runner,
             format!(
-                "#!/bin/sh\ntest \"$1\" = '--pipeline-smoke' || exit 2\ntest \"$5\" = '--admitted-cohort-manifest-id' || exit 2\ntest \"$6\" = '{}' || exit 2\ntest \"$7\" = '--admitted-partition-digest' || exit 2\ntest \"$8\" = '{}' || exit 2\ntest \"$9\" = '--admitted-policy-identity' || exit 2\ntest \"${{10}}\" = '{}' || exit 2\ntest \"${{11}}\" = '--admitted-snapshot-contract-id' || exit 2\ntest \"${{12}}\" = '{}' || exit 2\ntest \"${{13}}\" = '--admitted-snapshot-digest' || exit 2\ntest \"${{14}}\" = '{}' || exit 2\nmkdir -p \"$4/reports\"\ncp '{}' \"$4/reports/pipeline-smoke-{}.json\"\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\ntest \"$1\" = '--pipeline-smoke' || exit 2\ntest \"$5\" = '--admitted-cohort-manifest-id' || exit 2\ntest \"$6\" = '{}' || exit 2\ntest \"$7\" = '--admitted-partition-digest' || exit 2\ntest \"$8\" = '{}' || exit 2\ntest \"$9\" = '--admitted-policy-identity' || exit 2\ntest \"${{10}}\" = '{}' || exit 2\ntest \"${{11}}\" = '--admitted-snapshot-contract-id' || exit 2\ntest \"${{12}}\" = '{}' || exit 2\ntest \"${{13}}\" = '--admitted-snapshot-digest' || exit 2\ntest \"${{14}}\" = '{}' || exit 2\ntest \"${{15}}\" = '--admitted-partition-view-json' || exit 2\ntest \"${{16}}\" = '{}' || exit 2\ntest \"${{17}}\" = '--immutable-image-identity' || exit 2\ntest \"${{18}}\" = '{}' || exit 2\nmkdir -p \"$4/reports\"\ncp '{}' \"$4/reports/pipeline-smoke-{}.json\"\nprintf '%s\\n' '{}'\n",
                 fixture.args.cohort_manifest_id.as_str(),
                 fixture.args.partition_digest.as_str(),
                 fixture.args.policy_identity.as_str(),
                 fixture.args.snapshot_contract_id.as_str(),
                 fixture.args.snapshot_digest.as_str(),
+                fixture.args.partition_view_json.as_str(),
+                fixture.args.image_identity.as_str(),
                 evaluator_report_path.display(),
                 evaluator_report_sha256,
                 serde_json::json!({
@@ -956,7 +1186,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-forged-mission.json");
@@ -993,7 +1223,7 @@ mod tests {
             "snapshot_contract_id": fixture.args.snapshot_contract_id.clone(),
             "snapshot_hash": fixture.args.snapshot_digest.clone(),
             "search_policy_snapshot_id": fixture.args.policy_identity.clone(),
-            "search_budget": {"max_candidates": 0, "max_llm_calls": 0, "max_seconds": 1}
+            "search_budget": {"max_candidates": 0, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         let mission_path = fixture.root.join("pipeline-smoke-mission.json");
@@ -1042,7 +1272,10 @@ mod tests {
         let runner = fixture.root.join("monday-prediction-research");
         std::fs::write(
             &runner,
-            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"completed\"}\\n' > \"$3/summary.json\"\n",
+            successful_research_runner(
+                &fixture,
+                "mkdir -p \"$4\"\nprintf '{\"status\":\"completed\"}\\n' > \"$4/summary.json\"",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1068,7 +1301,7 @@ mod tests {
         let runner = fixture.root.join("monday-prediction-research");
         std::fs::write(
             &runner,
-            "#!/bin/sh\nmkdir -p \"$3\"\nprintf '{\"status\":\"paused\"}\\n' > \"$3/checkpoint.json\"\nexit 1\n",
+            "#!/bin/sh\nmkdir -p \"$4\"\nprintf '{\"status\":\"paused\"}\\n' > \"$4/checkpoint.json\"\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1107,7 +1340,10 @@ mod tests {
         let resumed_runner = fixture.root.join("resumed-runner");
         std::fs::write(
             &resumed_runner,
-            "#!/bin/sh\ntest -f \"$2/manifest.json\" || exit 4\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+            successful_research_runner(
+                &fixture,
+                "test -f \"$3/manifest.json\" || exit 4\nprintf '{\"status\":\"completed\"}\\n' > \"$4/summary.json\"",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&resumed_runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1137,7 +1373,7 @@ mod tests {
         let runner = fixture.root.join("must-not-start");
         std::fs::write(
             &runner,
-            "#!/bin/sh\nprintf started > \"$3/runner-started\"\n",
+            "#!/bin/sh\nprintf started > \"$4/runner-started\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1218,7 +1454,10 @@ mod tests {
         let runner = fixture.root.join("monday-prediction-research");
         std::fs::write(
             &runner,
-            "#!/bin/sh\ntest -f \"$3/checkpoint.json\" || exit 2\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+            successful_research_runner(
+                &fixture,
+                "test -f \"$4/checkpoint.json\" || exit 2\nprintf '{\"status\":\"completed\"}\\n' > \"$4/summary.json\"",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1232,6 +1471,8 @@ mod tests {
     struct ExecuteFixture {
         root: PathBuf,
         result_path: PathBuf,
+        receipt_source: PathBuf,
+        research_completion: String,
         args: PredictionExecuteArgs,
     }
 
@@ -1240,11 +1481,24 @@ mod tests {
         let mission_path = root.join("mission.json");
         let snapshot_contract_id = format!("sha256:{}", "1".repeat(64));
         let snapshot_digest = "0123456789abcdef";
+        let cohort_manifest_id = format!("sha256:{}", "5".repeat(64));
+        let partition_digest = format!("sha256:{}", "2".repeat(64));
+        let policy_identity = format!("sha256:{}", "3".repeat(64));
         let mission = serde_json::json!({
+            "schema_version": "prediction_research_mission.v4",
             "mission_id": "prediction-test",
-            "lane": "prediction_market",
-            "data_snapshot_id": snapshot_contract_id,
-            "search_policy_snapshot_id": "sha256:evaluator-version"
+            "product": {"symbol": "BTC", "event_horizon_secs": 300},
+            "task": {"kind": "settlement_probability"},
+            "run_mode": "research_trial",
+            "authority_profile": "polymarket_chainlink_baseline",
+            "required_capabilities": ["polymarket_chainlink"],
+            "cohort_manifest_id": cohort_manifest_id,
+            "partition_digest": partition_digest,
+            "causal_projection_policy_id": policy_identity,
+            "snapshot_contract_id": snapshot_contract_id,
+            "snapshot_hash": snapshot_digest,
+            "search_policy_snapshot_id": policy_identity,
+            "search_budget": {"max_candidates": 1, "max_seconds": 1}
         });
         let mission_bytes = serde_json::to_vec(&mission).unwrap();
         std::fs::write(&mission_path, &mission_bytes).unwrap();
@@ -1266,6 +1520,31 @@ mod tests {
             )
             .unwrap();
         archive.finish().unwrap();
+        let mut receipt = serde_json::json!({
+            "schema_version": "prediction_authenticated_result_receipt.v1",
+            "mission": mission,
+            "immutable_image_identity": format!("sha256:{}", "4".repeat(64)),
+            "sha256": "",
+        });
+        let receipt_sha256 = research_trial_receipt_sha256(&receipt).unwrap();
+        receipt["sha256"] = serde_json::Value::String(receipt_sha256.clone());
+        let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        let receipt_source = root.join("fixture-receipt.json");
+        std::fs::write(&receipt_source, &receipt_bytes).unwrap();
+        let receipt_artifact_sha256 = format!("sha256:{:x}", Sha256::digest(&receipt_bytes));
+        let research_completion = serde_json::json!({
+            "schema_version": "monday.prediction.research_trial.result.v1",
+            "status": "completed",
+            "mission_id": "prediction-test",
+            "task": {"kind": "settlement_probability"},
+            "snapshot_contract_id": snapshot_contract_id,
+            "snapshot_digest": snapshot_digest,
+            "search_policy_snapshot_id": policy_identity,
+            "receipt_path": "mcts-v4/receipts/receipt.json",
+            "receipt_artifact_sha256": receipt_artifact_sha256,
+            "receipt_sha256": receipt_sha256,
+        })
+        .to_string();
         let result_path = root.join("published.zip");
         let args = PredictionExecuteArgs {
             work_dir: root.join("work"),
@@ -1275,11 +1554,18 @@ mod tests {
             snapshot_sha256: sha256_file(&snapshot_path).unwrap(),
             snapshot_contract_id,
             snapshot_digest: snapshot_digest.to_owned(),
-            cohort_manifest_id: format!("sha256:{}", "5".repeat(64)),
-            partition_digest: format!("sha256:{}", "2".repeat(64)),
-            policy_identity: format!("sha256:{}", "3".repeat(64)),
+            cohort_manifest_id,
+            partition_digest,
+            policy_identity,
             task_capability: "btc_5m_backtest".to_owned(),
             image_identity: format!("sha256:{}", "4".repeat(64)),
+            partition_view_json: serde_json::json!({
+                "common_time_boundary_ms": 1,
+                "train_market_ids": ["train"],
+                "crossing_excluded_market_ids": [],
+                "held_out_market_ids": ["held-out"]
+            })
+            .to_string(),
             snapshot_cache_dir: None,
             resume_url: None,
             resume_sha256: None,
@@ -1289,8 +1575,18 @@ mod tests {
         ExecuteFixture {
             root,
             result_path,
+            receipt_source,
+            research_completion,
             args,
         }
+    }
+
+    fn successful_research_runner(fixture: &ExecuteFixture, setup: &str) -> String {
+        format!(
+            "#!/bin/sh\ntest \"$1\" = '--research-trial' || exit 2\n{setup}\nmkdir -p \"$4/mcts-v4/receipts\"\ncp '{}' \"$4/mcts-v4/receipts/receipt.json\"\nprintf '%s\\n' '{}'\n",
+            fixture.receipt_source.display(),
+            fixture.research_completion,
+        )
     }
 
     fn temporary_root(name: &str) -> PathBuf {

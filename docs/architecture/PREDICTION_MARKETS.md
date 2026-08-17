@@ -193,18 +193,20 @@ authority flags. At each decision timestamp, both `decision - source_ts` and
 mask an old exchange observation. The retained raw feed remains the audit
 source; the aggregate is the bounded research view.
 
-LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
-lab-only Formula proposer for derivatives missions. The prediction-market module
-keeps the versioned `prediction_research_mission.v2` JSON brief on its existing
-LoopRun path and admits `prediction_research_mission.v4` only through typed,
-authenticated task and input identities. Mission v4 has no implicit v2 mapping or
-resume path; Issue #320 owns construction of its opaque admission handle after
-independent cohort, snapshot, and policy readback. The module retains its existing
-`LlmPriorSpec` and does not import the alpha-harness Rust domain or loop runtime.
-Instead, the module has
-its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
-`monday-prediction-research` as its precompiled process entrypoint, because an
-event settlement loop cannot reuse the derivatives return/IC state machine.
+The prediction-market external research contract accepts only
+`prediction_research_mission.v4`. Both `pipeline_smoke` and `research_trial`
+cross the same independently authenticated cohort, partition, snapshot, policy,
+task, image, publication, and readback boundary; there is no v2 mapping or
+fallback. `research_trial` supports settlement probability plus side-bound UP
+and DOWN execution tasks at 5, 10, 15, or 30 seconds. It re-admits the serialized
+partition view before invoking the existing bounded MCTS checkpoint and typed
+evaluator path. The current profile is deterministic and makes no external
+proposal-provider call.
+
+The module has its own bounded Rust prediction-research LoopRun in
+`crates/ploy-research`, with `monday-prediction-research` as its precompiled
+process entrypoint, because an event settlement loop cannot reuse the
+derivatives return/IC state machine.
 `alpha-harness prediction` owns only the shared Monday transport, evidence, and
 resume envelope around that process. No compatibility script is an authoritative
 prediction LoopRun or promotion surface. Standalone formula
@@ -242,12 +244,10 @@ scheduled event expiry—to precede the first retained validation decision.
 Existing v1 snapshots therefore require a deterministic rebuild from retained
 raw data; they are never silently upgraded.
 
-The active prediction LoopRun uses bounded MCTS checkpoints. Before an advisor
-provider call, it durably marks the call as consumed. If the process is
-interrupted before the advisor result is checkpointed, resume fails closed
-instead of replaying the response or spending another provider call. The MCTS
-runner does not claim a durable provider, model, usage, or retry-lineage ledger.
-Neither loop owns execution or live activation.
+The active Mission v4 path retains bounded MCTS checkpoints and immutable result
+receipts but has no HTTP proposal client, LLM credential, provider/model usage
+ledger, or checked-in v2 mission template. Neither research loop owns execution
+or live activation.
 
 ## Source and provenance
 

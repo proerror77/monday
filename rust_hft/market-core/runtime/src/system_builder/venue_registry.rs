@@ -47,7 +47,7 @@ impl SystemBuilder {
                 let mut parts = id.split('@');
                 let symbol = Symbol::new(parts.next()?);
                 let venue = VenueId::from_str(parts.next()?)?;
-                Some(instrument_for_venue(symbol, venue))
+                Some(instrument_for_venue(symbol, venue, None))
             })
             .collect()
     }
@@ -72,15 +72,21 @@ impl SystemBuilder {
                 .symbol_catalog
                 .iter()
                 .filter_map(|instrument_id| {
-                    instrument_id
-                        .split()
-                        .map(|(symbol, venue)| instrument_for_venue(symbol, venue))
+                    instrument_id.split().map(|(symbol, venue_id)| {
+                        instrument_for_venue(symbol, venue_id, venue.inst_type.as_deref())
+                    })
                 })
                 .collect()
         } else {
             instruments
                 .iter()
-                .map(|instrument| instrument_for_venue(instrument.symbol.clone(), venue_id))
+                .map(|instrument| {
+                    instrument_for_venue(
+                        instrument.symbol.clone(),
+                        venue_id,
+                        venue.inst_type.as_deref(),
+                    )
+                })
                 .collect()
         };
 
@@ -125,8 +131,13 @@ impl SystemBuilder {
     }
 }
 
-fn instrument_for_venue(symbol: Symbol, venue: VenueId) -> InstrumentSpec {
+fn instrument_for_venue(symbol: Symbol, venue: VenueId, inst_type: Option<&str>) -> InstrumentSpec {
     match venue {
+        VenueId::BINANCE if inst_type.is_some_and(|market| market.eq_ignore_ascii_case("usdm")) => {
+            let mut instrument = InstrumentSpec::crypto_spot(symbol, venue);
+            instrument.product_type = hft_core::ProductType::Perp;
+            instrument
+        }
         VenueId::BINANCE_TOKENIZED_SECURITIES => {
             InstrumentSpec::tokenized_security_spot(symbol, venue)
         }
@@ -189,7 +200,7 @@ mod tests {
             passphrase: None,
             execution_mode: None,
             capabilities: VenueCapabilities::default(),
-            inst_type: None,
+            inst_type: Some("usdm".to_string()),
             simulate_execution: false,
             symbol_catalog: vec![
                 InstrumentId::new("BTCUSDT@BINANCE"),
@@ -212,6 +223,9 @@ mod tests {
             .map(|instrument| instrument.symbol.as_str())
             .collect();
         assert_eq!(collected, vec!["BTCUSDT", "ETHUSDT"]);
+        assert!(instruments
+            .iter()
+            .all(|instrument| instrument.product_type == hft_core::ProductType::Perp));
     }
 
     #[test]

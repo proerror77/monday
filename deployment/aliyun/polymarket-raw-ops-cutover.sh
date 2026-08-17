@@ -36,6 +36,10 @@ readonly LEGACY_REFERENCE_UPLOAD_EXEC="/usr/bin/python3 $LEGACY_UPLOADER --spool
 readonly REFERENCE_UPLOAD_EXEC="$ACTIVE_BINARY upload --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0"
 readonly MARKET_UPLOAD_EXEC="/usr/bin/env ZSTD_THREADS=1 $ACTIVE_BINARY upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 1"
 readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
+readonly STARTUP_RECOVERY_SECONDS=600
+readonly MAX_ACCEPTED_CYCLE_SECONDS=180
+readonly INITIAL_HEALTH_GRACE_SECONDS=60
+readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
 readonly MAX_HEALTH_SILENCE_SECONDS=240
 readonly -a UNIT_ASSETS=(
   polymarket-reference-collector.service
@@ -671,11 +675,14 @@ verify_no_restart_after_cursor() {
   journalctl --sync || return 1
   journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
     | jq -s -e --arg expected "$expected_invocation_id" '
-      all(.[];
-        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
-        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
-        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
-      )
+      if $expected == "" then length == 0
+      else
+        all(.[];
+          ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+          and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+          and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+        )
+      end
     ' >/dev/null || return 1
 }
 
@@ -711,6 +718,24 @@ atomic_install() {
   temporary="${destination}.new.$$"
   install -m "$mode" "$source" "$temporary"
   mv -Tf "$temporary" "$destination"
+}
+
+reset_failed_unit_if_needed() {
+  local unit=$1 active_state restarts
+  active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$unit") || return 1
+  [[ $restarts =~ ^[0-9]+$ ]] || return 1
+  case "$active_state" in
+    inactive)
+      [[ $restarts == 0 ]] || systemctl reset-failed "$unit" || return 1
+      ;;
+    failed)
+      systemctl reset-failed "$unit" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ $(systemctl show --property=ActiveState --value "$unit") == inactive \
+    && $(systemctl show --property=NRestarts --value "$unit") == 0 ]]
 }
 
 unit_active() {
@@ -955,6 +980,7 @@ verify_bootstrap_rust_runtime() {
 verify_contained_bootstrap_recovery() {
   local recovery=$1 candidate_sha=$2 source_revision=$3 baseline
   local active_state main_pid fragment drop_ins exec_argv restarts invocation binary_sha unit
+  local journal_cursor
   jq -e --arg candidate "$candidate_sha" --arg source "$source_revision" '
     .mode == "gamma_closed_200"
     and .candidate_probe.schema == "monday.polymarket_gamma_closed_200_recovery_probe.v1"
@@ -967,7 +993,9 @@ verify_contained_bootstrap_recovery() {
     and .baseline.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
     and .baseline.drop_in_paths == []
     and (.baseline.restarts | type == "number" and floor == . and . >= 0)
-    and (.baseline.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+    and (.baseline.invocation_id | type == "string"
+      and (. == "" or test("^[a-f0-9]{32}$")))
+    and (.baseline.journal_cursor | type == "string" and length > 0)
     and .baseline.binary_path == "/opt/monday/bin/polymarket-raw-ops"
     and (.baseline.binary_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
     and .baseline.binary_sha256 != $candidate
@@ -990,6 +1018,11 @@ verify_contained_bootstrap_recovery() {
   secure_regular_file "$ACTIVE_BINARY" || return 1
   binary_sha=$(sha256sum "$ACTIVE_BINARY" | awk '{print $1}') || return 1
   [[ $binary_sha == $(jq -er .binary_sha256 <<<"$baseline") ]] || return 1
+  # The recorded journal position is the containment generation: any baseline
+  # start/stop/failure after gate admission appends unit records past the
+  # cursor, even when the process is gone again before this re-check.
+  journal_cursor=$(jq -er .journal_cursor <<<"$baseline") || return 1
+  verify_no_restart_after_cursor "$COLLECTOR_UNIT" "$journal_cursor" "" || return 1
   for unit in "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER" \
     "$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_TIMER"; do
     [[ $(systemctl show --property=ActiveState --value "$unit") == inactive ]] || return 1
@@ -1277,7 +1310,7 @@ restore_legacy() (
   sync -f /opt/monday
   systemctl daemon-reload
   if [[ $contained_recovery == true ]]; then
-    systemctl reset-failed "$COLLECTOR_UNIT"
+    reset_failed_unit_if_needed "$COLLECTOR_UNIT"
     systemctl stop "$COLLECTOR_UNIT"
     for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
       if jq -e --arg unit "$asset" '.units[$unit].enabled == true' \
@@ -1299,7 +1332,7 @@ restore_legacy() (
     printf '%s\n' "$evidence_dir"
     return
   fi
-  systemctl reset-failed "$COLLECTOR_UNIT"
+  reset_failed_unit_if_needed "$COLLECTOR_UNIT"
   [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
     || die 'legacy restart counter did not reset before rollback verification'
   started_epoch=$(date -u +%s)
@@ -1910,7 +1943,7 @@ systemctl daemon-reload
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit or timer identity differs from the gated configuration'
 
-systemctl reset-failed "$COLLECTOR_UNIT"
+reset_failed_unit_if_needed "$COLLECTOR_UNIT"
 [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
   || die 'collector restart counter did not reset before Rust verification'
 started_epoch=$(date -u +%s)
@@ -1919,7 +1952,8 @@ rust_pid=
 rust_invocation_id=
 first_health_updated_at=
 health_advanced=false
-for _ in $(seq 1 36); do
+health_deadline=$((SECONDS + CUTOVER_HEALTH_TIMEOUT_SECONDS))
+while ((SECONDS < health_deadline)); do
   rust_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
   [[ $rust_restarts == 0 ]] || die 'Rust collector restarted during cutover verification'
   current_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
@@ -1963,7 +1997,7 @@ systemctl start "$REFERENCE_UPLOAD_UNIT"
   || die 'pinned OSS configuration changed during reference upload'
 verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
   || die 'Rust reference uploader did not complete successfully'
-systemctl reset-failed "$MARKET_UPLOAD_UNIT"
+reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"
 market_upload_invocation_before=$(systemctl show \
   --property=InvocationID --value "$MARKET_UPLOAD_UNIT")
 systemctl start --no-block "$MARKET_UPLOAD_UNIT"

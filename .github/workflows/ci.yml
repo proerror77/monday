@@ -190,7 +190,7 @@ jobs:
           cargo test -p hft-data-adapter-binance --no-default-features --locked
           cargo test -p hft-data-adapter-binance --no-default-features --features json-simd --locked
           cargo test -p hft-infra-redis --features redis --locked
-          cargo check -p hft-live --features clickhouse,redis,grpc --locked
+          cargo check -p hft-live --features clickhouse,redis,grpc,polymarket --locked
 
       - name: Verify Ondo Perps feature boundary
         if: needs.scope.outputs.ondo == 'true'

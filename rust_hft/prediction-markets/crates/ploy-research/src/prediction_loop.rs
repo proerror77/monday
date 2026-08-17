@@ -21,7 +21,6 @@ pub const PREDICTION_LOOP_TARGET: &str = "full_depth_settlement_executable_pnl";
 pub const PREDICTION_EVENT_WINDOW_SECS: i64 = 300;
 const PROBABILITY_WEIGHT_EPSILON: f64 = 1e-9;
 const MAX_GOVERNED_CANDIDATES: usize = 64;
-const MAX_GOVERNED_LLM_CALLS: usize = 16;
 const MAX_GOVERNED_SECONDS: u64 = 86_400;
 pub const REQUIRED_BINANCE_DATA_REQUIREMENTS: [&str; 3] =
     ["binance_price", "binance_agg_trades", "binance_lob"];
@@ -38,7 +37,6 @@ pub const REQUIRED_SETTLEMENT_SOURCE_SURFACE: &str = "pm_token_settlements";
 #[serde(deny_unknown_fields)]
 pub struct PredictionSearchBudget {
     pub max_candidates: usize,
-    pub max_llm_calls: usize,
     pub max_seconds: u64,
 }
 
@@ -87,125 +85,6 @@ impl From<ProposedProbabilityBlend> for LlmProbabilityBlendSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PredictionProposal {
-    pub probability_blends: Vec<ProposedProbabilityBlend>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ProbabilityComponentDescription {
-    pub name: &'static str,
-    pub inputs: &'static str,
-    pub theory: &'static str,
-    pub authority: &'static str,
-}
-
-pub fn registered_probability_components() -> [ProbabilityComponentDescription; 5] {
-    [
-        ProbabilityComponentDescription {
-            name: "market_midpoint",
-            inputs: "Polymarket executable bid and ask midpoint",
-            theory: "prediction-market consensus prior before independent evidence",
-            authority: "market prior only; Polymarket CLOB owns executable price and depth",
-        },
-        ProbabilityComponentDescription {
-            name: "chainlink_digital",
-            inputs: "fresh Chainlink current price, arrival-timestamped pre-open Chainlink reference, remaining time, and horizon volatility",
-            theory: "cash-or-nothing endpoint probability that the Chainlink settlement price finishes above the opening Chainlink reference",
-            authority: "contract reference-price probability; Chainlink defines the opening reference and expiry-price semantics, while Polymarket official resolution owns the binary label",
-        },
-        ProbabilityComponentDescription {
-            name: "distance_lob_vol",
-            inputs: "Binance CEX spot distance to the Chainlink-defined price-to-beat, Binance L2 imbalance and depth, side-aggregated Binance aggTrade flow, and realized volatility",
-            theory: "independent Binance microstructure-conditioned endpoint probability proxy",
-            authority: "predictive context only; never a settlement oracle or execution venue",
-        },
-        ProbabilityComponentDescription {
-            name: "event_surface",
-            inputs: "train-only asset, time-to-expiry, and distance buckets",
-            theory: "empirical endpoint frequency surface estimated without test labels",
-            authority: "research prior only",
-        },
-        ProbabilityComponentDescription {
-            name: "existing_model",
-            inputs: "Binance CEX spot, Chainlink-defined price-to-beat, remaining time, and horizon volatility",
-            theory: "Binance log-moneyness scaled by horizon volatility endpoint proxy",
-            authority: "predictive context only; never a settlement oracle or execution venue",
-        },
-    ]
-}
-
-/// One source of truth for both the prompt and provider-side structured output.
-pub fn prediction_proposal_json_schema() -> serde_json::Value {
-    let non_negative_number = || {
-        serde_json::json!({
-            "type": "number",
-            "minimum": 0
-        })
-    };
-    serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["probability_blends"],
-        "properties": {
-            "probability_blends": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "name",
-                        "hypothesis",
-                        "market_midpoint_weight",
-                        "chainlink_digital_weight",
-                        "distance_lob_vol_weight",
-                        "event_surface_weight",
-                        "existing_model_weight"
-                    ],
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 80,
-                            "pattern": "^[A-Za-z0-9_-]+$"
-                        },
-                        "hypothesis": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 500
-                        },
-                        "market_midpoint_weight": non_negative_number(),
-                        "chainlink_digital_weight": non_negative_number(),
-                        "distance_lob_vol_weight": non_negative_number(),
-                        "event_surface_weight": non_negative_number(),
-                        "existing_model_weight": non_negative_number()
-                    }
-                }
-            }
-        }
-    })
-}
-
-pub fn build_prediction_prompt(
-    mission: &PredictionResearchMission,
-    remaining_candidates: usize,
-    prior_outcomes: &[serde_json::Value],
-) -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "task": format!(
-            "Propose up to {remaining_candidates} typed probability blends for this governed prediction-market mission. Change only probability_blend_weights. Every blend must state one falsifiable hypothesis and use finite non-negative weights with a positive total. Do not change labels, gates, costs, settlement rules, or execution settings."
-        ),
-        "target": mission.target,
-        "mission": mission,
-        "registered_probability_components": registered_probability_components(),
-        "prior_candidate_outcomes": prior_outcomes,
-        "response_json_schema": prediction_proposal_json_schema()
-    }))
-    .expect("prediction prompt is serializable")
-}
-
 pub fn current_prediction_policy_snapshot_id() -> String {
     let mut digest = Sha256::new();
     for (path, body) in prediction_policy_sources() {
@@ -221,7 +100,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 42] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 41] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -307,10 +186,6 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 42] {
         (
             "crates/ploy-research/src/prediction_loop_fs.rs",
             include_bytes!("prediction_loop_fs.rs"),
-        ),
-        (
-            "crates/ploy-research/src/prediction_llm.rs",
-            include_bytes!("prediction_llm.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_policy_identity.rs",
@@ -462,82 +337,52 @@ pub(crate) fn validate_prediction_search_budget(
     if search_budget.max_seconds == 0 {
         return Err("mission.search_budget.max_seconds must be positive".to_string());
     }
-    let baseline_only_budget =
-        search_budget.max_candidates == 0 && search_budget.max_llm_calls == 0;
-    if (search_budget.max_candidates == 0 || search_budget.max_llm_calls == 0)
-        && !baseline_only_budget
-    {
-        return Err(
-            "mission.search_budget baseline-only mode requires max_candidates and max_llm_calls to both be zero"
-                .to_string(),
-        );
-    }
     if search_budget.max_candidates > MAX_GOVERNED_CANDIDATES
-        || search_budget.max_llm_calls > MAX_GOVERNED_LLM_CALLS
         || search_budget.max_seconds > MAX_GOVERNED_SECONDS
     {
         return Err(format!(
-            "mission.search_budget exceeds governed maxima: candidates<={MAX_GOVERNED_CANDIDATES}, calls<={MAX_GOVERNED_LLM_CALLS}, seconds<={MAX_GOVERNED_SECONDS}"
+            "mission.search_budget exceeds governed maxima: candidates<={MAX_GOVERNED_CANDIDATES}, seconds<={MAX_GOVERNED_SECONDS}"
         ));
     }
     Ok(())
 }
 
-pub fn validate_prediction_proposal(
-    proposal: PredictionProposal,
-    remaining_candidates: usize,
-) -> Result<Vec<LlmProbabilityBlendSpec>, String> {
-    if proposal.probability_blends.is_empty() {
-        return Err("proposal must contain at least one probability blend".to_string());
+pub(crate) fn validate_probability_blend(
+    blend: ProposedProbabilityBlend,
+) -> Result<LlmProbabilityBlendSpec, String> {
+    if blend.name.is_empty()
+        || blend.name.len() > 80
+        || !blend
+            .name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err("probability blend name must be a safe 1..80 character identifier".to_string());
     }
-    if proposal.probability_blends.len() > remaining_candidates {
-        return Err(format!(
-            "proposal exceeds remaining candidate budget: {} > {remaining_candidates}",
-            proposal.probability_blends.len()
-        ));
+    let hypothesis = blend.hypothesis.trim().to_string();
+    if hypothesis.is_empty() || hypothesis.chars().count() > 500 {
+        return Err("probability blend hypothesis must contain 1..500 characters".to_string());
     }
-    let mut names = BTreeSet::new();
-    let mut blends = Vec::with_capacity(proposal.probability_blends.len());
-    for blend in proposal.probability_blends {
-        if blend.name.is_empty()
-            || blend.name.len() > 80
-            || !blend.name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-            })
-        {
-            return Err(
-                "probability blend name must be a safe 1..80 character identifier".to_string(),
-            );
-        }
-        if !names.insert(blend.name.clone()) {
-            return Err("probability blend names must be unique".to_string());
-        }
-        let hypothesis = blend.hypothesis.trim().to_string();
-        if hypothesis.is_empty() || hypothesis.chars().count() > 500 {
-            return Err("probability blend hypothesis must contain 1..500 characters".to_string());
-        }
-        let weights = [
-            blend.market_midpoint_weight,
-            blend.chainlink_digital_weight,
-            blend.distance_lob_vol_weight,
-            blend.event_surface_weight,
-            blend.existing_model_weight,
-        ];
-        if weights
-            .iter()
-            .any(|weight| !weight.is_finite() || *weight < 0.0)
-        {
-            return Err("probability blend weights must be finite and non-negative".to_string());
-        }
-        let total = weights.iter().sum::<f64>();
-        if !total.is_finite() || total <= PROBABILITY_WEIGHT_EPSILON {
-            return Err("probability blend weights must have a positive finite total".to_string());
-        }
-        let mut blend = blend;
-        blend.hypothesis = hypothesis;
-        blends.push(blend.into());
+    let weights = [
+        blend.market_midpoint_weight,
+        blend.chainlink_digital_weight,
+        blend.distance_lob_vol_weight,
+        blend.event_surface_weight,
+        blend.existing_model_weight,
+    ];
+    if weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err("probability blend weights must be finite and non-negative".to_string());
     }
-    Ok(blends)
+    let total = weights.iter().sum::<f64>();
+    if !total.is_finite() || total <= PROBABILITY_WEIGHT_EPSILON {
+        return Err("probability blend weights must have a positive finite total".to_string());
+    }
+    let mut blend = blend;
+    blend.hypothesis = hypothesis;
+    Ok(blend.into())
 }
 
 fn require_non_empty(value: &str, field: &str) -> Result<(), String> {
@@ -1034,20 +879,6 @@ pub fn validate_prediction_run_inputs(
 }
 
 #[derive(Debug, Clone)]
-pub struct ProposalCallOutput {
-    /// The assistant's JSON object, before it is trusted or deserialized.
-    pub raw_response: String,
-    pub provider: String,
-    pub model: String,
-    pub usage: serde_json::Value,
-}
-
-pub trait ProposalClient {
-    /// Perform exactly one provider call. Retry policy belongs to the bounded caller.
-    fn propose(&mut self, prompt: &str, timeout: Duration) -> Result<ProposalCallOutput, String>;
-}
-
-#[derive(Debug, Clone)]
 pub struct PredictionEvaluationPrior {
     pub value: LlmPriorSpec,
     pub artifact_path: PathBuf,
@@ -1122,10 +953,7 @@ pub enum LoopRunStatus {
 pub struct LoopRunSummary {
     pub mission_id: String,
     pub status: LoopRunStatus,
-    pub llm_calls_used: usize,
     pub candidates_evaluated: usize,
-    pub iterations_completed: usize,
-    pub keep_models: Vec<String>,
     pub reason: Option<String>,
     pub state_path: PathBuf,
 }
@@ -1211,7 +1039,6 @@ mod tests {
             search_policy_snapshot_id: format!("sha256:{}", "2".repeat(64)),
             search_budget: PredictionSearchBudget {
                 max_candidates: 6,
-                max_llm_calls: 2,
                 max_seconds: 900,
             },
         };
@@ -1219,17 +1046,15 @@ mod tests {
         mission
     }
 
-    fn proposal() -> PredictionProposal {
-        PredictionProposal {
-            probability_blends: vec![ProposedProbabilityBlend {
-                name: "binance_context".to_string(),
-                hypothesis: "Binance spot, flow, and L2 improve held-out calibration beyond the Polymarket midpoint.".to_string(),
-                market_midpoint_weight: 0.4,
-                chainlink_digital_weight: 0.2,
-                distance_lob_vol_weight: 0.2,
-                event_surface_weight: 0.1,
-                existing_model_weight: 0.1,
-            }],
+    fn probability_blend() -> ProposedProbabilityBlend {
+        ProposedProbabilityBlend {
+            name: "binance_context".to_string(),
+            hypothesis: "Binance spot, flow, and L2 improve held-out calibration beyond the Polymarket midpoint.".to_string(),
+            market_midpoint_weight: 0.4,
+            chainlink_digital_weight: 0.2,
+            distance_lob_vol_weight: 0.2,
+            event_surface_weight: 0.1,
+            existing_model_weight: 0.1,
         }
     }
 
@@ -1507,118 +1332,36 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_btc_and_sol_templates_pin_current_brief_and_rust_policy() {
-        for raw in [
-            include_str!("../../../config/research_missions/polymarket-btc-5m.example.json"),
-            include_str!("../../../config/research_missions/polymarket-sol-5m.example.json"),
-        ] {
-            let mission: PredictionResearchMission =
-                serde_json::from_str(raw).expect("parse checked-in mission template");
-            assert_eq!(
-                mission.prompt_snapshot_id,
-                research_brief_snapshot_id(&mission)
-            );
-            assert_eq!(
-                mission.search_policy_snapshot_id,
-                current_prediction_policy_snapshot_id()
-            );
-            assert_eq!(mission.time_cohort_boundary_ms, 0);
-            assert!(
-                validate_prediction_mission(&mission, &mission.search_policy_snapshot_id)
-                    .expect_err("template must require an operator-selected cohort boundary")
-                    .contains("time_cohort_boundary_ms")
-            );
-        }
-    }
-
-    #[test]
-    fn baseline_only_budget_requires_both_search_counts_zero_and_positive_time() {
+    fn search_budget_allows_baseline_only_and_requires_positive_time() {
         let mission = mission();
 
-        let mut zero_candidates_only = mission.clone();
-        zero_candidates_only.search_budget.max_candidates = 0;
-        assert!(validate_prediction_mission(
-            &zero_candidates_only,
-            &zero_candidates_only.search_policy_snapshot_id
-        )
-        .expect_err("0/N budget must fail")
-        .contains("both be zero"));
+        validate_prediction_mission(&mission, &mission.search_policy_snapshot_id)
+            .expect("deterministic search remains valid");
 
-        let mut zero_calls_only = mission.clone();
-        zero_calls_only.search_budget.max_llm_calls = 0;
-        assert!(validate_prediction_mission(
-            &zero_calls_only,
-            &zero_calls_only.search_policy_snapshot_id
-        )
-        .expect_err("N/0 budget must fail")
-        .contains("both be zero"));
+        let mut baseline_only = mission.clone();
+        baseline_only.search_budget.max_candidates = 0;
+        validate_prediction_mission(&baseline_only, &baseline_only.search_policy_snapshot_id)
+            .expect("zero-candidate baseline remains valid");
 
-        let mut zero_everything = mission;
-        zero_everything.search_budget.max_candidates = 0;
-        zero_everything.search_budget.max_llm_calls = 0;
-        zero_everything.search_budget.max_seconds = 0;
-        assert!(validate_prediction_mission(
-            &zero_everything,
-            &zero_everything.search_policy_snapshot_id
-        )
-        .expect_err("0/0/0 budget must fail")
-        .contains("max_seconds"));
+        let mut zero_time = mission.clone();
+        zero_time.search_budget.max_seconds = 0;
+        assert!(
+            validate_prediction_mission(&zero_time, &zero_time.search_policy_snapshot_id)
+                .expect_err("zero time budget must fail")
+                .contains("max_seconds")
+        );
     }
 
     #[test]
-    fn proposal_is_typed_bounded_and_schema_has_no_factor_mutation_surface() {
-        let blends = validate_prediction_proposal(proposal(), 2).expect("valid proposal");
-        assert_eq!(blends.len(), 1);
-        assert_eq!(blends[0].name, "binance_context");
+    fn probability_blend_is_validated() {
+        let blend = validate_probability_blend(probability_blend()).expect("valid blend");
+        assert_eq!(blend.name, "binance_context");
 
-        let raw = serde_json::json!({
-            "mutations": [{"anything": true}],
-            "probability_blends": proposal().probability_blends,
-        });
-        assert!(serde_json::from_value::<PredictionProposal>(raw)
-            .expect_err("mutation field must not exist in prediction schema")
-            .to_string()
-            .contains("unknown field"));
-
-        let mut negative = proposal();
-        negative.probability_blends[0].existing_model_weight = -0.1;
-        assert!(validate_prediction_proposal(negative, 2)
+        let mut negative = probability_blend();
+        negative.existing_model_weight = -0.1;
+        assert!(validate_probability_blend(negative)
             .expect_err("negative weight must fail")
             .contains("non-negative"));
-
-        assert!(validate_prediction_proposal(proposal(), 0)
-            .expect_err("candidate budget must fail")
-            .contains("remaining candidate budget"));
-    }
-
-    #[test]
-    fn prompt_exposes_binance_as_predictor_and_chainlink_as_settlement_source() {
-        let prompt = build_prediction_prompt(&mission(), 3, &[]);
-        let payload: serde_json::Value = serde_json::from_str(&prompt).expect("prompt JSON");
-        let components = payload["registered_probability_components"]
-            .as_array()
-            .expect("component list");
-        let by_name = components
-            .iter()
-            .map(|component| (component["name"].as_str().expect("name"), component))
-            .collect::<BTreeMap<_, _>>();
-
-        assert!(by_name["chainlink_digital"]["authority"]
-            .as_str()
-            .expect("authority")
-            .contains("official resolution"));
-        for component in ["distance_lob_vol", "existing_model"] {
-            assert!(by_name[component]["inputs"]
-                .as_str()
-                .expect("inputs")
-                .contains("Binance"));
-            assert!(by_name[component]["authority"]
-                .as_str()
-                .expect("authority")
-                .contains("never a settlement oracle"));
-        }
-        assert!(!prompt.contains("raw labels"));
-        assert!(!prompt.contains("gate thresholds"));
     }
 
     #[test]

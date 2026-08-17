@@ -5929,7 +5929,6 @@ dependencies = [
  "ploy-trading",
  "polars",
  "rand 0.8.7",
- "reqwest 0.13.4",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

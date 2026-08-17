@@ -136,6 +136,7 @@ struct ArbitrageCaptureStrategy {
 
 struct ContextSequenceCaptureStrategy {
     captured: Arc<Mutex<Vec<(u64, f64)>>>,
+    bucketed: bool,
 }
 
 impl Strategy for ContextSequenceCaptureStrategy {
@@ -168,6 +169,10 @@ impl Strategy for ContextSequenceCaptureStrategy {
         _account: &AccountView,
     ) -> Vec<OrderIntent> {
         Vec::new()
+    }
+
+    fn clock_interval_micros(&self) -> Option<u64> {
+        self.bucketed.then_some(u64::MAX)
     }
 
     fn name(&self) -> &str {
@@ -564,6 +569,73 @@ fn realtime_quote_overlays_bbo_without_destroying_deeper_l2() {
 }
 
 #[test]
+fn only_bucketed_strategies_exclude_a_newer_quote_overlay() {
+    let mut config = EngineConfig::default();
+    config.ingestion.stale_threshold_us = 1_000_000;
+    let mut engine = Engine::new(config);
+    let ingester = engine.create_event_ingester_pair();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let overlaid = Arc::new(Mutex::new(Vec::new()));
+    engine.register_strategy(ContextSequenceCaptureStrategy {
+        captured: Arc::clone(&captured),
+        bucketed: true,
+    });
+    engine.register_strategy(ContextSequenceCaptureStrategy {
+        captured: Arc::clone(&overlaid),
+        bucketed: false,
+    });
+    let symbol = Symbol::new("BTCUSDT");
+
+    ingester
+        .lock()
+        .expect("ingester lock")
+        .ingest(MarketEvent::Snapshot(MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 1.0)],
+            asks: vec![level(101.0, 1.0)],
+            sequence: 20,
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
+        }))
+        .expect("snapshot accepted");
+    engine.tick().expect("snapshot tick");
+    ingester
+        .lock()
+        .expect("ingester lock")
+        .ingest(MarketEvent::Quote(TopOfBook {
+            symbol: symbol.clone(),
+            timestamp: now_micros(),
+            sequence: 25,
+            bid: level(99.0, 10.0),
+            ask: level(102.0, 10.0),
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
+        }))
+        .expect("quote accepted");
+    engine.tick().expect("quote tick");
+    ingester
+        .lock()
+        .expect("ingester lock")
+        .ingest(MarketEvent::Update(BookUpdate {
+            symbol,
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 2.0)],
+            asks: Vec::new(),
+            first_sequence: Some(21),
+            sequence: 21,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BINANCE),
+            timestamps: Default::default(),
+        }))
+        .expect("delta accepted");
+    engine.tick().expect("delta tick");
+
+    assert_eq!(*captured.lock().expect("capture lock"), vec![(21, 100.0)]);
+    assert_eq!(*overlaid.lock().expect("capture lock"), vec![(25, 99.0)]);
+}
+
+#[test]
 fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
     let mut config = EngineConfig::default();
     config.ingestion.stale_threshold_us = 1_000_000;
@@ -850,6 +922,7 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     engine.register_strategy(ContextSequenceCaptureStrategy {
         captured: Arc::clone(&captured),
+        bucketed: true,
     });
     let symbol = Symbol::new("BTCUSDT");
     ingester

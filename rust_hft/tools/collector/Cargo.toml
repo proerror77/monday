@@ -39,7 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
-alpha-domain = { path = "../../alpha-harness/domain" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
 polymarket-tape-contract = { path = "../../shared/polymarket-tape" }
 
@@ -57,6 +56,7 @@ http = "0.2"
 # 壓縮支持
 flate2 = "1"
 lz4 = "1"
+zstd = "0.13"
 
 # WebSocket 握手
 base64 = "0.21"
@@ -77,8 +77,6 @@ collector-asterdex = []
 duckdb = ["dep:duckdb"]
 
 [dev-dependencies]
-zstd = "0.13"
-ed25519-dalek = { workspace = true }
 
 [[bin]]
 name = "hft-collector"

@@ -12,10 +12,18 @@ use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements}
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(test)]
+pub(crate) const BUILD_SOURCE_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+#[cfg(not(test))]
+pub(crate) const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") {
+    Some(value) => value,
+    None => "unbound-source-revision",
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "alpha-harness",
-    version,
+    version = BUILD_SOURCE_REVISION,
     about = "Bounded Loop Engineer alpha research control plane"
 )]
 pub struct Cli {
@@ -162,6 +170,8 @@ pub struct PredictionExecuteArgs {
     pub task_capability: String,
     #[arg(long)]
     pub image_identity: String,
+    #[arg(long)]
+    pub partition_view_json: String,
     /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
     #[arg(long)]
     pub snapshot_cache_dir: Option<PathBuf>,
@@ -192,7 +202,18 @@ pub struct PredictionSnapshotArgs {
 #[derive(Debug, Subcommand)]
 enum CandidateCommand {
     List(MissionStatusArgs),
+    Show(CandidateShowArgs),
     RegisterOnnx(Box<RegisterOnnxArgs>),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CandidateShowArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub candidate_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -367,7 +388,24 @@ pub struct ExecuteMissionArgs {
     #[arg(long)]
     pub materialization_url: String,
     #[arg(long)]
+    pub replay_artifact_url: String,
+    #[arg(long)]
+    pub replay_artifact_sha256: String,
+    #[arg(long)]
+    pub replay_manifest_url: String,
+    #[arg(long)]
+    pub replay_manifest_sha256: String,
+    /// Prior immutable Factor-Bank subset checkpoint for a fresh-work-directory resume.
+    #[arg(long, requires = "resume_sha256")]
+    pub resume_url: Option<String>,
+    /// Canonical SHA-256 from the checkpoint artifact's `checkpoint_sha256` field.
+    #[arg(long, requires = "resume_url")]
+    pub resume_sha256: Option<String>,
+    #[arg(long)]
     pub result_put_url: String,
+    /// Independently authorized read URL for the immutable published result bundle.
+    #[arg(long)]
+    pub result_readback_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -688,6 +726,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
+            CandidateCommand::Show(args) => governance::candidate_show(args),
             CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(*args),
         },
         Command::Evaluate(args) => governance::evaluate(args),
@@ -780,7 +819,17 @@ mod tests {
             missing_features,
             "--materialization-url".to_owned(),
             missing_materialization,
+            "--replay-artifact-url".to_owned(),
+            "missing-replay.parquet".to_owned(),
+            "--replay-artifact-sha256".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            "--replay-manifest-url".to_owned(),
+            "missing-replay-manifest.json".to_owned(),
+            "--replay-manifest-sha256".to_owned(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
             "--result-put-url".to_owned(),
+            result.clone(),
+            "--result-readback-url".to_owned(),
             result,
         ])
         .unwrap();
@@ -830,6 +879,16 @@ mod tests {
             OsString::from("btc_5m_backtest"),
             OsString::from("--image-identity"),
             OsString::from(format!("sha256:{}", "a".repeat(64))),
+            OsString::from("--partition-view-json"),
+            OsString::from(
+                serde_json::json!({
+                    "common_time_boundary_ms": 1,
+                    "train_market_ids": ["train"],
+                    "crossing_excluded_market_ids": [],
+                    "held_out_market_ids": ["held-out"]
+                })
+                .to_string(),
+            ),
             OsString::from("--result-put-url"),
             root.path().join("results.zip").into_os_string(),
             OsString::from("--result-readback-url"),
@@ -1028,6 +1087,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "btc_5m_backtest",
             "--image-identity",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "--partition-view-json",
+            r#"{"common_time_boundary_ms":1,"train_market_ids":["train"],"crossing_excluded_market_ids":[],"held_out_market_ids":["held"]}"#,
             "--resume-url",
             "previous-results.zip",
             "--resume-sha256",
@@ -1052,7 +1113,21 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "--resume-url",
+            "checkpoint.json",
+            "--resume-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "--result-put-url",
+            "results.zip",
+            "--result-readback-url",
             "results.zip",
         ])
         .is_ok());
@@ -1086,7 +1161,17 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "--result-put-url",
+            "results.zip",
+            "--result-readback-url",
             "results.zip",
         ])
         .expect("content-bound Mission transport must be accepted");
@@ -1099,6 +1184,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
         };
         assert_eq!(args.mission_url, "mission.json");
         assert_eq!(args.mission_sha256, "b".repeat(64));
+        assert!(args.resume_url.is_none());
+        assert!(args.resume_sha256.is_none());
 
         assert!(Cli::try_parse_from([
             "alpha-harness",
@@ -1114,10 +1201,54 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "features.jsonl",
             "--materialization-url",
             "materialization.json",
+            "--replay-artifact-url",
+            "replay.parquet",
+            "--replay-artifact-sha256",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "--replay-manifest-url",
+            "replay-manifest.json",
+            "--replay-manifest-sha256",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "--result-put-url",
+            "results.zip",
+            "--result-readback-url",
             "results.zip",
             "--objective",
             "alternate authority",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_candidate_show() {
+        let cli = Cli::try_parse_from([
+            "alpha-harness",
+            "candidate",
+            "show",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--candidate-id",
+            "candidate-1",
+        ])
+        .unwrap();
+        let Command::Candidate {
+            command: CandidateCommand::Show(args),
+        } = cli.command
+        else {
+            panic!("expected candidate show command")
+        };
+        assert_eq!(args.mission_id, "mission-1");
+        assert_eq!(args.candidate_id, "candidate-1");
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "candidate",
+            "show",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
         ])
         .is_err());
     }

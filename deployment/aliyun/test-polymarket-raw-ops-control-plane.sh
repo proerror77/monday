@@ -161,6 +161,8 @@ printf 'inactive\n' >"$supervisor_state/baseline-active"
 printf '0\n' >"$supervisor_state/baseline-main-pid"
 printf '2\n' >"$supervisor_state/baseline-restarts"
 printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
+printf '%s\n' 's=f117a34ab56114517b40bca1d5686544;i=c688f;b=5ae37843852646d4802319d80bea1205;m=3b5e870d04;t=6590d3b141564;x=c7af40f6aafe778' \
+  >"$supervisor_state/baseline-journal-cursor"
 printf '%s\n' '/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200' \
   >"$supervisor_state/baseline-exec"
 for uploader_unit in \
@@ -369,6 +371,22 @@ destination=${!#}
 exec /bin/rm "$@"
 EOF
 chmod 0755 "$supervisor_fake_bin/rm"
+cat >"$supervisor_fake_bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+read_state() { tr -d '\n' <"$FAKE_SYSTEMCTL_STATE/$1"; }
+case "$*" in
+  --sync)
+    exit 0
+    ;;
+  "--unit polymarket-reference-collector.service --lines=0 --show-cursor --no-pager")
+    printf '%s\n' "-- cursor: $(read_state baseline-journal-cursor)"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$supervisor_fake_bin/journalctl"
 
 flock_probe="$supervisor_tmp/flock-probe.lock"
 exec 7>"$flock_probe"
@@ -666,6 +684,37 @@ gate_control cancel "$supervisor_candidate_sha" \
 set_supervisor_state baseline-active inactive
 set_supervisor_state baseline-restarts 2
 
+# systemd clears the invocation ID of an inactive Type=simple baseline: a
+# clean stop clears it, and the governed reset-failed of a failed unit clears
+# it as well (observed on systemd 259). Admission binds the recorded empty
+# identity verbatim; a malformed ID remains refused.
+: >"$supervisor_state/baseline-invocation"
+supervisor_empty_id_invocation=$(printf '0%.0s' {1..32})
+set_supervisor_state invocation "$supervisor_empty_id_invocation"
+set_supervisor_state active inactive
+gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe" >/dev/null
+empty_id_request="$supervisor_root/data/monday/evidence/polymarket-gate-jobs/$supervisor_candidate_sha/$supervisor_empty_id_invocation/request.json"
+jq -e '.recovery.baseline.invocation_id == ""
+  and (.recovery.baseline.journal_cursor | length > 0)
+  and .recovery.baseline.active_state == "inactive"
+  and .recovery.baseline.main_pid == 0
+' "$empty_id_request" >/dev/null
+[[ $(admission_records_matching '
+  .result == "admitted" and .baseline.invocation_id == ""
+  and (.baseline.journal_cursor | length > 0)
+' | grep -c .) -eq 1 ]]
+gate_control cancel "$supervisor_candidate_sha" \
+  "$supervisor_empty_id_invocation" >/dev/null
+printf 'not-a-valid-invocation-id\n' >"$supervisor_state/baseline-invocation"
+reject gate_control recover "$supervisor_candidate" "$supervisor_candidate_sha" \
+  "$supervisor_source" "$supervisor_probe"
+[[ $(admission_records_matching \
+  '.result == "refused" and (.refusal_reason | test("invocation ID"))' \
+  | grep -c .) -ge 1 ]]
+printf '%s\n' "$(printf 'a%.0s' {1..32})" >"$supervisor_state/baseline-invocation"
+set_supervisor_state baseline-restarts 2
+
 # Each failed uploader unit is admitted through a governed reset-failed inside
 # the control lock, exactly like the failed baseline.
 failed_uploader_letters=(c e f a)
@@ -694,9 +743,12 @@ set_supervisor_state baseline-active inactive
 
 # A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
-sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE" >"$recovery_binding_contract"
-sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
-sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_binding_contract"
+{
+  sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$GATE"
+  sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE"
+} >"$recovery_binding_contract"
 (
   set -euo pipefail
   RUST_ACTIVE_BINARY="$supervisor_baseline" LEGACY_UNIT=polymarket-reference-collector.service
@@ -706,6 +758,8 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
   recovery_restarts=2 recovery_invocation=$supervisor_baseline_invocation recovery_binary_sha=$supervisor_baseline_sha
   recovery_binary_secure=true
   recovery=$(jq -c .recovery "$supervisor_recovery_request")
+  recovery_journal_cursor=$(jq -er .baseline.journal_cursor <<<"$recovery")
+  recovery_journal_fixture=
   recovery_observed_epoch=1000 recovery_now=$recovery_observed_epoch
   date() {
     [[ $1 == -u ]] || { command date "$@"; return; }
@@ -719,12 +773,26 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
       *InvocationID*) printf '%s\n' "$recovery_invocation" ;; *) return 1 ;;
     esac
   }
+  journalctl() {
+    case "$*" in
+      --sync) return 0 ;;
+      "--unit $LEGACY_UNIT --after-cursor $recovery_journal_cursor --output=json --no-pager")
+        [[ -z $recovery_journal_fixture ]] || printf '%s\n' "$recovery_journal_fixture"
+        ;;
+      *) return 1 ;;
+    esac
+  }
   effective_exec_argv() { printf '%s\n' "$recovery_exec"; }
   secure_control_file() { [[ $recovery_binary_secure == true ]]; }
   sha256sum() { printf '%s  %s\n' "$recovery_binary_sha" "$1"; }
   # shellcheck source=/dev/null
   source "$recovery_binding_contract"
   verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_bad_cursor=$(jq -c '.baseline.journal_cursor = ""' <<<"$recovery")
+  if verify_recovery_binding "$recovery_bad_cursor" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery binding accepted an invalid journal cursor\n' >&2; exit 1
+  fi
   recovery_now=$((recovery_observed_epoch + 901))
   if verify_recovery_admission "$recovery" "$supervisor_candidate_sha" "$supervisor_source"; then
     printf 'recovery admission accepted a stale probe\n' >&2; exit 1
@@ -737,6 +805,29 @@ sed -n '/^verify_contained_recovery_baseline() {$/,/^}$/p' "$GATE" >>"$recovery_
     printf 'recovery identity check accepted an insecure baseline binary\n' >&2; exit 1
   fi
   recovery_binary_secure=true
+  # A contained simple baseline has a systemd-cleared (empty) invocation ID:
+  # the recorded empty identity verifies against an empty live value, and an
+  # ID assigned by a later start is drift.
+  recovery_empty_invocation=$(jq -c '.baseline.invocation_id = ""' <<<"$recovery")
+  recovery_invocation=''
+  verify_recovery_binding "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"
+  verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"
+  recovery_journal_fixture=$(jq -cn \
+    '{MESSAGE:"baseline started and stopped between samples"}')
+  if verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery identity check accepted a start-stop cycle after admission\n' >&2
+    exit 1
+  fi
+  recovery_journal_fixture=
+  recovery_invocation=$supervisor_baseline_invocation
+  if verify_contained_recovery_baseline "$recovery_empty_invocation" \
+    "$supervisor_candidate_sha" "$supervisor_source"; then
+    printf 'recovery identity check accepted an assigned ID over recorded empty\n' >&2
+    exit 1
+  fi
   for recovery_drift in active fragment drop_ins exec restarts invocation binary; do
     recovery_active_state=inactive recovery_fragment=/etc/systemd/system/polymarket-reference-collector.service
     recovery_drop_ins='' recovery_exec='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
@@ -2513,6 +2604,8 @@ gate_journal_contract=$(sed -n \
   printf 'shadow and cutover journal restart guards are missing or differ\n' >&2
   exit 1
 }
+grep -Fq 'verify_no_restart_after_cursor "$LEGACY_UNIT" "$journal_cursor" ""' "$GATE"
+grep -Fq 'verify_no_restart_after_cursor "$COLLECTOR_UNIT" "$journal_cursor" ""' "$CUTOVER"
 journal_contract="$tmp_dir/journal-contract.sh"
 printf '%s\n' "$cutover_journal_contract" >"$journal_contract"
 # shellcheck source=/dev/null
@@ -2568,6 +2661,18 @@ journal_failure_mode=none
 
 expected_invocation_id=$(printf '1%.0s' {1..32})
 other_invocation_id=$(printf '2%.0s' {1..32})
+journal_fixture=
+verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "" || {
+  printf 'journal containment guard rejected a quiet baseline\n' >&2
+  exit 1
+}
+journal_fixture=$(jq -cn '{MESSAGE:"baseline started and stopped between samples"}')
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" ""; then
+  printf 'journal containment guard accepted a start-stop cycle\n' >&2
+  exit 1
+fi
 journal_fixture=$(jq -cn '{MESSAGE_ID:"unrelated"}')
 verify_no_restart_after_cursor \
   "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id" || {
@@ -3447,6 +3552,91 @@ jq -e '.passed == true and .comparison_mode == "rust_self"
   and .metrics.rust_metadata_count > 0
   and .metrics.rust_settlement_count > 0' "$rust_self_parity" >/dev/null
 
+rust_self_deferred="$tmp_dir/rust-self-deferred"
+cp -R "$rust" "$rust_self_deferred"
+jq -cs 'map(select(.update.kind != "polymarket_trade"))
+  | to_entries[] | .value.sequence = .key | .value' \
+  "$rust_self_deferred/market-updates.19700101T000400000000.ndjson" \
+  >"$rust_self_deferred/market-updates.rewritten"
+mv "$rust_self_deferred/market-updates.rewritten" \
+  "$rust_self_deferred/market-updates.19700101T000400000000.ndjson"
+if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
+  --legacy-spool "$legacy_empty" --rust-spool "$rust_self_deferred" \
+  --started-at-unix 100 --ended-at-unix 1000 \
+  --output "$tmp_dir/rust-self-deferred-parity.json" \
+  --allow-empty-legacy 2>/dev/null; then
+  printf 'Rust-self parity unexpectedly accepted a deferred zero-trade window\n' >&2
+  exit 1
+fi
+jq -e '.passed == false and .comparison_mode == "rust_self"
+  and .checks.byte_parity == false
+  and .checks.field_parity == false
+  and .checks.dedupe_parity == false
+  and .checks.metadata_parity == true
+  and .checks.settlement_parity == true
+  and .checks.rotation_parity == true
+  and .checks.asset_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .metrics.legacy_trade_count == 0
+  and .metrics.rust_trade_count == 0
+  and .metrics.legacy_duplicate_trade_ids == []
+  and .metrics.rust_duplicate_trade_ids == []' \
+  "$tmp_dir/rust-self-deferred-parity.json" >/dev/null
+
+trade_mode_contract="$tmp_dir/trade-mode-contract.sh"
+sed -n '/^trade_parity_reason=/,/^fi$/p' "$GATE" >"$trade_mode_contract"
+select_trade_mode() (
+  comparison_mode=$1
+  baseline_recovery=$2
+  baseline_emission=$3
+  shadow_emission=$4
+  parity_exit=$5
+  # shellcheck source=/dev/null
+  source "$trade_mode_contract"
+  printf '%s\n' "$trade_parity_mode"
+)
+[[ $(select_trade_mode rust_self true inactive finalization_deferred 1) \
+    == finalization_deferred_rust_self \
+  && $(select_trade_mode rust_self true inactive finalization_deferred 0) \
+    == rust_self \
+  && $(select_trade_mode rust_self false inactive finalization_deferred 1) \
+    == rust_self \
+  && $(select_trade_mode legacy_overlap false continuous finalization_deferred 1) \
+    == finalization_deferred_overlap \
+  && $(select_trade_mode legacy_overlap false continuous continuous 0) \
+    == continuous_overlap ]] || {
+  printf 'Gate selected an invalid trade parity mode\n' >&2
+  exit 1
+}
+
+adjudication_contract="$tmp_dir/trade-parity-adjudication.sh"
+sed -n '/^adjudicate_trade_parity()/,/^}/p' "$GATE" \
+  >"$adjudication_contract"
+# shellcheck source=/dev/null
+source "$adjudication_contract"
+adjudicate_trade_parity finalization_deferred_rust_self \
+  <"$tmp_dir/rust-self-deferred-parity.json" \
+  >"$tmp_dir/adjudicated-rust-self-deferred-parity.json"
+jq -e '.passed == true and ([.checks[]] | all)
+  and .checks.byte_parity == true
+  and .checks.field_parity == true
+  and .checks.dedupe_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .checks.finalization_progress == true' \
+  "$tmp_dir/adjudicated-rust-self-deferred-parity.json" >/dev/null
+adjudicate_trade_parity rust_self \
+  <"$tmp_dir/rust-self-deferred-parity.json" \
+  >"$tmp_dir/unadjudicated-rust-self-deferred-parity.json"
+jq -e '.passed == false
+  and .checks.byte_parity == false
+  and .checks.field_parity == false
+  and .checks.dedupe_parity == false
+  and (.checks | has("finalization_progress") | not)' \
+  "$tmp_dir/unadjudicated-rust-self-deferred-parity.json" >/dev/null
+
 rust_self_missing_settlement="$tmp_dir/rust-self-missing-settlement"
 cp -R "$rust" "$rust_self_missing_settlement"
 jq -c 'select(.update.kind != "market_settlement")' \
@@ -3571,6 +3761,12 @@ jq \
     completed_at:"1970-01-01T01:12:01Z",
     shadow_run_id:"run-1",
     production_eligible:true,
+    trade_parity_mode:"continuous_overlap",
+    trade_parity_reason:"shadow and baseline trade emission semantics match; full trade coverage, field, and byte parity applies",
+    shadow_emission:"continuous",
+    baseline_emission:"continuous",
+    parity_verifier:null,
+    finalization_progress:null,
     baseline_health_start_required:true,
     baseline_runtime_stability_required:true,
     baseline_health_completion_required:true,
@@ -3756,6 +3952,7 @@ if jq -e -f "$POLICY" \
   exit 1
 fi
 jq '.comparison_mode = "rust_self"
+  | .trade_parity_mode = "rust_self"
   | .metrics.legacy_trade_count = 0
   | .metrics.legacy_metadata_count = 0
   | .metrics.legacy_settlement_count = 0' \
@@ -3783,6 +3980,114 @@ jq -e -f "$POLICY" "$tmp_dir/health-optional-rust-self-gate.json" >/dev/null || 
   printf 'gate policy rejected a Rust-self gate with legacy health admission disabled\n' >&2
   exit 1
 }
+# Issue #868: a finalization-deferred shadow against a continuous-emission
+# baseline cannot emit a mature trade inside the gate window, so the trade
+# coverage/field/byte trio is adjudicated rather than required from the
+# verifier; every other parity family and the finalization progression
+# evidence remain fail-closed.
+jq '.trade_parity_mode = "finalization_deferred_overlap"
+  | .trade_parity_reason = "shadow defers trade emission until settlement plus the 1800-second finalization lag plus stable polls (post-#680) while the baseline emits trades continuously (pre-#680); trade coverage within a 3600-second gate is unsatisfiable by construction, so settlement, metadata, rotation, asset, and dedupe parity plus finalization progression and the canonical upload replace it"
+  | .shadow_emission = "finalization_deferred"
+  | .baseline_emission = "continuous"
+  | .checks += {finalization_progress:true}
+  | .parity_verifier = {passed:false, checks:{
+      byte_parity:false,metadata_parity:true,field_parity:false,
+      dedupe_parity:true,trade_coverage_parity:false,
+      trade_contract_parity:false,settlement_parity:true,
+      rotation_parity:true,asset_parity:true}}
+  | .finalization_progress = {
+      tracked_markets_start:160,settled_markets_start:0,stable_polls_start:0,
+      tracked_markets_end:161,settled_markets_end:112,stable_polls_end:5,
+      settled_markets_max:112,stable_polls_max:5}
+  | .metrics.rust_trade_count = 0
+  | .metrics.legacy_only_trade_ids = ["legacy-trade-1"]
+  | .metrics.rust_only_trade_ids = []' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/finalization-overlap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/finalization-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected finalization-deferred overlap evidence\n' >&2
+  exit 1
+}
+# Advancement through either channel alone is sufficient: a growing settled
+# maximum with flat stable polls, or a growing stable-poll maximum (zero until
+# the 1800-second lag elapses) with a flat settled maximum.
+jq '.finalization_progress.stable_polls_end = 0
+  | .finalization_progress.stable_polls_max = 0' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/settled-advanced-overlap-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/settled-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected settled-only finalization advancement\n' >&2
+  exit 1
+}
+jq '.finalization_progress.settled_markets_start = 112
+  | .finalization_progress.settled_markets_end = 112' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/stable-polls-advanced-overlap-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/stable-polls-advanced-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected stable-poll-only finalization advancement\n' >&2
+  exit 1
+}
+for mutation in \
+  '.parity_verifier.checks.settlement_parity = false' \
+  '.parity_verifier.checks.metadata_parity = false' \
+  '.parity_verifier.passed = true' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.settled_markets_start = 112' \
+  '.finalization_progress.stable_polls_start = 5
+    | .finalization_progress.stable_polls_end = 5
+    | .finalization_progress.stable_polls_max = 5
+    | .finalization_progress.settled_markets_start = 112
+    | .finalization_progress.settled_markets_end = 112' \
+  '.finalization_progress.settled_markets_max = 0' \
+  '.finalization_progress.settled_markets_max
+    = (.finalization_progress.settled_markets_end - 1)' \
+  '.finalization_progress.tracked_markets_end = 0' \
+  '.metrics.rust_only_trade_ids = ["rust-only-trade"]' \
+  '.metrics.rust_trade_count = -1' \
+  'del(.checks.finalization_progress)' \
+  '.trade_parity_mode = "continuous_overlap"' \
+  '.shadow_emission = "continuous"' \
+  '.baseline_emission = "finalization_deferred"' \
+  '.trade_parity_reason = ""'; do
+  jq "$mutation" "$tmp_dir/finalization-overlap-gate.json" \
+    >"$tmp_dir/forged-finalization-overlap-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-finalization-overlap-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged finalization-deferred overlap evidence\n' >&2
+    exit 1
+  fi
+done
+# A finalization-deferred shadow against a finalization-deferred baseline keeps
+# the full trade parity requirement; no adjudication applies.
+jq '.shadow_emission = "finalization_deferred"
+  | .baseline_emission = "finalization_deferred"' \
+  "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/same-semantics-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/same-semantics-gate.json" >/dev/null || {
+  printf 'gate policy rejected same-semantics overlap evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  '.metrics.rust_trade_count = 0' \
+  '.metrics.legacy_only_trade_ids = ["legacy-trade-1"]' \
+  '.parity_verifier = {passed:false, checks:{trade_coverage_parity:false}}' \
+  '.checks += {finalization_progress:true}' \
+  '.checks.trade_coverage_parity = false'; do
+  jq "$mutation" "$tmp_dir/same-semantics-gate.json" \
+    >"$tmp_dir/forged-same-semantics-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-same-semantics-gate.json" >/dev/null; then
+    printf 'gate policy relaxed trade parity for same-semantics overlap\n' >&2
+    exit 1
+  fi
+done
+jq '.metrics.rust_trade_count = 0' "$tmp_dir/expedited-legacy-gate.json" \
+  >"$tmp_dir/empty-shadow-trades-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/empty-shadow-trades-gate.json" >/dev/null; then
+  printf 'gate policy accepted an empty shadow trade set in continuous overlap\n' >&2
+  exit 1
+fi
 for mutation in \
   'del(.baseline_health_start_required)' \
   '.baseline_runtime_stability_required = false' \
@@ -4341,6 +4646,7 @@ candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
 EOF
 jq '.baseline_mode = "rust_bootstrap"
   | .comparison_mode = "rust_self"
+  | .trade_parity_mode = "rust_self"
   | .baseline_degraded = true
   | .metrics.legacy_trade_count = 0
   | .metrics.legacy_metadata_count = 0
@@ -4374,6 +4680,7 @@ jq '
         exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200",
         fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
         drop_in_paths:[],restarts:2,invocation_id:("2" * 32),
+        journal_cursor:"s=f117a34ab56114517b40bca1d5686544;i=c688f;b=5ae37843852646d4802319d80bea1205;m=3b5e870d04;t=6590d3b141564;x=c7af40f6aafe778",
         binary_path:"/opt/monday/bin/polymarket-raw-ops",
         binary_sha256:(if .candidate_sha256 == ("0" * 64) then ("1" * 64) else ("0" * 64) end)
       },
@@ -4395,6 +4702,54 @@ jq -e -f "$POLICY" "$tmp_dir/contained-recovery-gate.json" >/dev/null || {
   printf 'gate policy rejected a verified contained bootstrap recovery\n' >&2
   exit 1
 }
+jq '.trade_parity_mode = "finalization_deferred_rust_self"
+  | .trade_parity_reason = "contained recovery has no baseline comparison rows and the finalization-deferred shadow emitted no mature trade inside the gate window; metadata, settlement, rotation, asset, trade contract and coverage, zero duplicates, finalization progression, and canonical upload replace the unsatisfiable nonempty-trade checks"
+  | .shadow_emission = "finalization_deferred"
+  | .baseline_emission = "inactive"
+  | .checks += {finalization_progress:true}
+  | .parity_verifier = {passed:false, checks:{
+      byte_parity:false,metadata_parity:true,field_parity:false,
+      dedupe_parity:false,trade_coverage_parity:true,
+      trade_contract_parity:true,settlement_parity:true,
+      rotation_parity:true,asset_parity:true}}
+  | .finalization_progress = {
+      tracked_markets_start:160,settled_markets_start:0,stable_polls_start:0,
+      tracked_markets_end:161,settled_markets_end:112,stable_polls_end:5,
+      settled_markets_max:112,stable_polls_max:5}
+  | .metrics.rust_trade_count = 0
+  | .metrics.legacy_only_trade_ids = []
+  | .metrics.rust_only_trade_ids = []' \
+  "$tmp_dir/contained-recovery-gate.json" \
+  >"$tmp_dir/finalization-rust-self-recovery-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/finalization-rust-self-recovery-gate.json" >/dev/null || {
+  printf 'gate policy rejected contained finalization-deferred Rust-self evidence\n' >&2
+  exit 1
+}
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/finalization-rust-self-recovery-gate.json" \
+    >"$tmp_dir/forged-finalization-rust-self-$name.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-finalization-rust-self-$name.json" >/dev/null; then
+    printf 'finalization-deferred Rust-self policy accepted %s drift\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+raw_settlement|.parity_verifier.checks.settlement_parity = false
+raw_trade_coverage|.parity_verifier.checks.trade_coverage_parity = false
+raw_dedupe|.parity_verifier.checks.dedupe_parity = true
+rust_trade_count|.metrics.rust_trade_count = 1
+rust_duplicate|.metrics.rust_duplicate_trade_ids = ["duplicate"]
+no_progress|.finalization_progress.stable_polls_start = 5 | .finalization_progress.settled_markets_start = 112
+active_baseline|.baseline_emission = "continuous"
+missing_recovery|.recovery = null
+EOF
+jq '.recovery.baseline.invocation_id = ""' "$tmp_dir/contained-recovery-gate.json" \
+  >"$tmp_dir/contained-recovery-empty-invocation.json"
+jq -e -f "$POLICY" "$tmp_dir/contained-recovery-empty-invocation.json" >/dev/null || {
+  printf 'gate policy rejected a contained baseline with a systemd-cleared invocation ID\n' >&2
+  exit 1
+}
 while IFS='|' read -r name filter; do
   jq "$filter" "$tmp_dir/contained-recovery-gate.json" \
     >"$tmp_dir/contained-recovery-$name.json"
@@ -4407,6 +4762,8 @@ candidate_binding|.recovery.candidate_probe.candidate_sha256 = (if .candidate_sh
 source_binding|.recovery.candidate_probe.source_revision = (if .deployment_source_revision == ("0" * 40) then ("1" * 40) else ("0" * 40) end)
 tagged_status|.recovery.candidate_probe.gamma.tagged_closed.http_status = 500
 baseline_active|.recovery.baseline.active_state = "active"
+baseline_invocation|.recovery.baseline.invocation_id = "not-an-invocation-id"
+baseline_journal_cursor|.recovery.baseline.journal_cursor = ""
 runtime_stability|.baseline_runtime_stability_required = true
 missing_recovery|.recovery = null
 baseline_is_candidate|.recovery.baseline.binary_sha256 = .candidate_sha256
@@ -4966,7 +5323,7 @@ jq -n '{
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:120,
   missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
-  trade_poll_budget:200,trade_poll_concurrency:4,trade_request_spacing_ms:100,
+  trade_poll_budget:200,trade_poll_concurrency:4,trade_request_spacing_ms:125,
   priority_trade_markets_before_market_details:108,
   market_detail_budget:4,market_detail_eligible:3,market_detail_priority:2,
   market_detail_selected:3,market_detail_deferred:0,market_detail_priority_deferred:0,
@@ -5035,7 +5392,7 @@ for mutation in \
   '.market_detail_priority_deferred = 1' \
   '.trade_poll_budget_after_market_details = 196' \
   'del(.trade_request_spacing_ms)' \
-  '.trade_request_spacing_ms = 99' \
+  '.trade_request_spacing_ms = 124' \
   '.priority_trade_markets = 107' \
   '.priority_trade_backlog = 1' \
   '.selected_trade_markets = 196' \
@@ -5093,6 +5450,12 @@ cutover_health_silence_seconds=$(
     "$cutover_health_silence_seconds" >&2
   exit 1
 }
+grep -Fxq 'readonly STARTUP_RECOVERY_SECONDS=600' "$CUTOVER"
+grep -Fxq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$CUTOVER"
+grep -Fxq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$CUTOVER"
+grep -Fxq 'readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$CUTOVER"
+grep -Fq 'health_deadline=$((SECONDS + CUTOVER_HEALTH_TIMEOUT_SECONDS))' "$CUTOVER"
+grep -Fq 'while ((SECONDS < health_deadline)); do' "$CUTOVER"
 grep -Fq 'legacy_health_state=$(legacy_health_sample_state' "$GATE"
 grep -Fq '"$legacy_health" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}"' \
   "$GATE"
@@ -5121,6 +5484,16 @@ if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]
 fi
 grep -Fq 'verify-shadow-parity' "$GATE"
 grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
+grep -Fq 'finalization_deferred_overlap' "$GATE"
+grep -Fq 'trade_parity_mode' "$GATE"
+grep -Fq 'collector_emission_mode' "$GATE"
+grep -Fq -- '--max-retained-trade-ids' "$GATE"
+grep -Fq 'shadow_finalization_counters' "$GATE"
+grep -Fxq 'shadow_state_max_counters=null' "$GATE"
+if grep -Eq '^[[:space:]]*shadow_state_max_counters=$' "$GATE"; then
+  printf 'Gate initializes the finalization maxima to an empty JSON value\n' >&2
+  exit 1
+fi
 if grep -Fq '&& $LEGACY_RUNTIME_STABILITY_REQUIRED == false ]]; then' "$GATE"; then
   printf 'Gate retains a legacy identity bypass after parity or OSS readback\n' >&2
   exit 1
@@ -5396,7 +5769,56 @@ legacy_stopped_equality_line=$(grep -n \
   | cut -d: -f1)
 cutover_clear_line=$(grep -n '^clear_health_before_restart "$evidence_dir" pre-cutover$' \
   "$CUTOVER" | cut -d: -f1)
-cutover_reset_line=$(grep -n '^systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+reset_function="$tmp_dir/cutover-reset-function.sh"
+awk '
+  /^reset_failed_unit_if_needed\(\) \{$/ {copy=1}
+  copy {print}
+  copy && /^}$/ {exit}
+' "$CUTOVER" >"$reset_function"
+[[ -s $reset_function ]] || {
+  printf 'cutover has no shared failure-state reset helper\n' >&2
+  exit 1
+}
+run_reset_case() (
+  local initial_state=$1 initial_restarts=$2 reset_allowed=$3
+  local expected_result=$4 expected_calls=$5
+  local current_state=$initial_state current_restarts=$initial_restarts
+  local reset_calls=0 result=failure property argument
+  # shellcheck disable=SC2317
+  systemctl() {
+    case "${1:-}" in
+      show)
+        property=
+        for argument in "$@"; do
+          [[ $argument == --property=* ]] && property=${argument#--property=}
+        done
+        case "$property" in
+          ActiveState) printf '%s\n' "$current_state" ;;
+          NRestarts) printf '%s\n' "$current_restarts" ;;
+          *) return 2 ;;
+        esac
+        ;;
+      reset-failed)
+        ((reset_calls += 1))
+        [[ $reset_allowed == true ]] || return 5
+        current_state=inactive
+        current_restarts=0
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  # shellcheck disable=SC1090
+  source "$reset_function"
+  reset_failed_unit_if_needed example.service && result=success
+  [[ $result == "$expected_result" && $reset_calls == "$expected_calls" ]]
+)
+run_reset_case inactive 0 false success 0
+run_reset_case failed 2 true success 1
+run_reset_case inactive 2 true success 1
+run_reset_case failed 0 false failure 1
+run_reset_case active 0 true failure 0
+
+cutover_reset_line=$(grep -n '^reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
@@ -5415,7 +5837,7 @@ cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER
   exit 1
 }
 rollback_reload_line=$(grep -n '^  systemctl daemon-reload$' "$CUTOVER" | cut -d: -f1)
-rollback_reset_line=$(grep -n '^  systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+rollback_reset_line=$(grep -n '^  reset_failed_unit_if_needed "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
 rollback_restart_line=$(grep -n '^  systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
@@ -5518,7 +5940,7 @@ grep -Fq 'systemctl start --no-block "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 grep -Fq \
   'verify_deferred_market_upload "$candidate_binary" "$market_upload_invocation_before"' \
   "$CUTOVER"
-grep -Fq 'systemctl reset-failed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
+grep -Fq 'reset_failed_unit_if_needed "$MARKET_UPLOAD_UNIT"' "$CUTOVER"
 [[ $(grep -c 'systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT"' "$CUTOVER") -ge 3 ]]
 grep -Fq 'unit_active "$REFERENCE_UPLOAD_TIMER"' "$CUTOVER"
 grep -Fq 'unit_active "$MARKET_UPLOAD_TIMER"' "$CUTOVER"
