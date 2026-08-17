@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --release \
     --locked \
     -p hft-live \
-    --features "clickhouse,redis,grpc" \
+    --features "clickhouse,redis,grpc,polymarket" \
     && cp /work/target/release/hft-live /work/hft-live
 
 FROM debian:bookworm-slim AS runtime
