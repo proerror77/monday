@@ -506,10 +506,9 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
         let candidate = if let Some(pending) = state.pending.clone() {
             pending
         } else {
-            if !engine.has_expandable_candidate()? {
+            let Some(candidate) = engine.propose()? else {
                 break;
-            }
-            let candidate = engine.propose()?;
+            };
             state.pending = Some(candidate.clone());
             state.checkpoint = Some(engine.checkpoint()?);
             checkpoint(&state_path, &mut state)?;
@@ -992,6 +991,31 @@ mod tests {
             PredictionMctsIdentity::from_mission(&mission(2))
                 .unwrap()
                 .mission_id
+        );
+    }
+
+    #[test]
+    fn deterministic_tree_exhaustion_still_selects_and_runs_held_out() {
+        let output = temp_dir("tree-exhaustion");
+        let mut evaluator = FakeEvaluator::default();
+
+        let summary = run_or_resume_prediction_mcts(
+            mission(64),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut evaluator,
+        )
+        .expect("novelty exhaustion is a normal terminal condition");
+
+        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.candidates_evaluated, 55);
+        assert_eq!(
+            evaluator
+                .calls
+                .iter()
+                .filter(|call| call.as_str() == "held_out")
+                .count(),
+            1
         );
     }
 

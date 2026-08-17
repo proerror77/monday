@@ -794,34 +794,34 @@ impl PredictionMctsEngine {
         Ok(Self { checkpoint })
     }
 
-    pub fn propose(&mut self) -> Result<PredictionMctsCandidate, String> {
+    pub fn propose(&mut self) -> Result<Option<PredictionMctsCandidate>, String> {
         if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
-            return Err("prediction MCTS candidate budget is exhausted".to_string());
+            return Ok(None);
         }
         if self.checkpoint.config.component_profile
             == SettlementProbabilityComponentProfile::MarketMidpointOnly
         {
             if self.checkpoint.proposed == 0 {
-                return Ok(self.mark_candidate_pending(0));
+                return Ok(Some(self.mark_candidate_pending(0)));
             }
-            return Err(
-                "market-midpoint-only search evaluates only its canonical baseline".to_string(),
-            );
+            return Ok(None);
         }
         for _ in 0..256 {
-            let parent = select_expandable(
+            let Some(parent) = select_expandable(
                 &self.checkpoint.nodes,
                 0,
                 self.checkpoint.config.exploration,
             )
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "prediction MCTS tree has no expandable node".to_string())?;
+            else {
+                return Ok(None);
+            };
             let node_id = self.expand(parent)?;
             let blend = self.checkpoint.nodes[node_id].blend.clone();
             if !self.checkpoint.seen_blends.insert(blend_key(&blend)) {
                 continue;
             }
-            return Ok(self.mark_candidate_pending(node_id));
+            return Ok(Some(self.mark_candidate_pending(node_id)));
         }
         Err("prediction MCTS could not produce a novel candidate".to_string())
     }
@@ -844,24 +844,6 @@ impl PredictionMctsEngine {
             source: self.checkpoint.nodes[node_id].source,
             probability_blend: blend,
         }
-    }
-
-    pub(crate) fn has_expandable_candidate(&self) -> Result<bool, String> {
-        if self.checkpoint.proposed >= self.checkpoint.config.max_candidates {
-            return Ok(false);
-        }
-        if self.checkpoint.config.component_profile
-            == SettlementProbabilityComponentProfile::MarketMidpointOnly
-        {
-            return Ok(self.checkpoint.proposed == 0);
-        }
-        Ok(select_expandable(
-            &self.checkpoint.nodes,
-            0,
-            self.checkpoint.config.exploration,
-        )
-        .map_err(|error| error.to_string())?
-        .is_some())
     }
 
     pub fn evaluate_and_observe<E: PredictionTrainingEvaluator>(
@@ -1135,7 +1117,10 @@ mod tests {
         )
         .expect("market-midpoint-only engine");
 
-        let candidate = engine.propose().expect("canonical baseline candidate");
+        let candidate = engine
+            .propose()
+            .expect("canonical baseline proposal")
+            .expect("canonical baseline candidate");
         assert_eq!(candidate.source, PredictionExpansionSource::Baseline);
         assert_eq!(
             candidate.probability_blend,
@@ -1148,12 +1133,8 @@ mod tests {
         engine
             .observe(&candidate.candidate_id, &evaluation)
             .expect("observe canonical baseline");
-        assert!(!engine.has_expandable_candidate().unwrap());
         let before = engine.checkpoint().expect("observed baseline checkpoint");
-        let error = engine
-            .propose()
-            .expect_err("market-midpoint-only search must stop after its baseline");
-        assert!(error.contains("canonical baseline"), "{error}");
+        assert!(engine.propose().unwrap().is_none());
         assert_eq!(engine.checkpoint().unwrap(), before);
 
         let mut forged = before.clone();
@@ -1169,7 +1150,7 @@ mod tests {
     fn typed_adapter_resumes_deterministically_through_shared_kernel() {
         let mission = mission();
         let mut engine = PredictionMctsEngine::new(&mission, blend("baseline"), 7, 1.4, 3).unwrap();
-        let candidate = engine.propose().unwrap();
+        let candidate = engine.propose().unwrap().unwrap();
         assert_eq!(candidate.identity.mission_id, mission.mission_id);
         assert_eq!(
             candidate.identity.data_snapshot_id,
@@ -1191,8 +1172,8 @@ mod tests {
         let mut restored =
             PredictionMctsEngine::new(&mission, blend("baseline"), 7, 1.4, 3).unwrap();
         restored.restore_checkpoint(checkpoint).unwrap();
-        let expected = engine.propose().unwrap();
-        let actual = restored.propose().unwrap();
+        let expected = engine.propose().unwrap().unwrap();
+        let actual = restored.propose().unwrap().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(restored.checkpoint.nodes, engine.checkpoint.nodes);
     }
@@ -1283,8 +1264,8 @@ mod tests {
         let mission = mission();
         let mut left = PredictionMctsEngine::new(&mission, blend("baseline"), 9, 1.4, 2).unwrap();
         let mut right = PredictionMctsEngine::new(&mission, blend("baseline"), 9, 1.4, 2).unwrap();
-        let left_candidate = left.propose().unwrap();
-        let right_candidate = right.propose().unwrap();
+        let left_candidate = left.propose().unwrap().unwrap();
+        let right_candidate = right.propose().unwrap().unwrap();
         assert_eq!(left_candidate, right_candidate);
         let left_evaluation = FakeEvaluator.evaluate_training(&left_candidate).unwrap();
         let right_evaluation = left_evaluation.clone();
@@ -1300,7 +1281,7 @@ mod tests {
     fn settlement_candidate_rejects_execution_metric_substitution() {
         let mission = mission();
         let mut engine = PredictionMctsEngine::new(&mission, blend("baseline"), 9, 1.4, 2).unwrap();
-        let candidate = engine.propose().unwrap();
+        let candidate = engine.propose().unwrap().unwrap();
         let before = engine.checkpoint().unwrap();
         let evaluation = PredictionMctsEvaluation {
             training: PredictionMctsTrainingEvidence::UpExecution(ExecutionTrainingEvidence {
@@ -1340,7 +1321,7 @@ mod tests {
     fn mismatched_training_evidence_fails_without_state_mutation() {
         let mission = mission();
         let mut engine = PredictionMctsEngine::new(&mission, blend("baseline"), 5, 1.4, 2).unwrap();
-        let candidate = engine.propose().unwrap();
+        let candidate = engine.propose().unwrap().unwrap();
         let before = engine.checkpoint().unwrap();
         let mut evaluation = FakeEvaluator.evaluate_training(&candidate).unwrap();
         match &mut evaluation.training {
@@ -1359,7 +1340,7 @@ mod tests {
     fn forged_candidate_payload_fails_without_state_mutation() {
         let mission = mission();
         let mut engine = PredictionMctsEngine::new(&mission, blend("baseline"), 5, 1.4, 2).unwrap();
-        let candidate = engine.propose().unwrap();
+        let candidate = engine.propose().unwrap().unwrap();
         let before = engine.checkpoint().unwrap();
         struct MustNotEvaluate;
         impl PredictionTrainingEvaluator for MustNotEvaluate {
@@ -1398,7 +1379,7 @@ mod tests {
     fn checkpoint_rejects_a_forged_pending_candidate_key() {
         let mission = mission();
         let mut engine = PredictionMctsEngine::new(&mission, blend("baseline"), 5, 1.4, 2).unwrap();
-        engine.propose().unwrap();
+        engine.propose().unwrap().unwrap();
         let before = engine.checkpoint().unwrap();
         let mut forged = before.clone();
         let (candidate_id, node_id) = forged.pending.pop_first().unwrap();
