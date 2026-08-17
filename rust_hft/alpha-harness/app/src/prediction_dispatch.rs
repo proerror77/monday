@@ -45,6 +45,22 @@ enum MissionTokenSide {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MissionRunMode {
+    PipelineSmoke,
+    ResearchTrial,
+}
+
+impl MissionRunMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PipelineSmoke => "pipeline_smoke",
+            Self::ResearchTrial => "research_trial",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct MissionTaskIdentity {
@@ -53,6 +69,15 @@ struct MissionTaskIdentity {
     side: Option<MissionTokenSide>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prediction_horizon_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedPartitionView {
+    common_time_boundary_ms: i64,
+    train_market_ids: Vec<String>,
+    crossing_excluded_market_ids: Vec<String>,
+    held_out_market_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,8 +95,6 @@ struct PredictionSubmission {
     snapshot_contract_id: String,
     result_put_url: String,
     result_readback_url: String,
-    #[serde(default)]
-    llm_secret_name: Option<String>,
     #[serde(default)]
     resume_url: Option<String>,
     #[serde(default)]
@@ -109,6 +132,8 @@ struct SnapshotAdmissionRequest<'a> {
 
 #[derive(Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase", deny_unknown_fields)]
+// ponytail: parsed once per dispatch; box variants only if admission throughput matters.
+#[allow(clippy::large_enum_variant)]
 enum SnapshotAdmissionResponse {
     Admitted {
         schema_version: String,
@@ -120,6 +145,7 @@ enum SnapshotAdmissionResponse {
         task: MissionTaskIdentity,
         cohort_partition_id: String,
         cohort_manifest_id: String,
+        partition_view: AuthenticatedPartitionView,
         immutable_image_identity: String,
     },
     Rejected {
@@ -137,6 +163,7 @@ struct SnapshotAdmission {
     task: MissionTaskIdentity,
     cohort_partition_id: String,
     cohort_manifest_id: String,
+    partition_view: AuthenticatedPartitionView,
     immutable_image_identity: String,
 }
 
@@ -159,7 +186,7 @@ struct ValidatedSubmission {
 struct AdmittedSubmission {
     validated: ValidatedSubmission,
     admission: SnapshotAdmission,
-    pipeline_smoke: bool,
+    run_mode: MissionRunMode,
 }
 
 enum AdmissionDecision {
@@ -167,6 +194,8 @@ enum AdmissionDecision {
     Rejected(String),
 }
 
+// ponytail: created once per dispatch; box variants only if admission throughput matters.
+#[allow(clippy::large_enum_variant)]
 enum SnapshotAdmissionDecision {
     Admitted(SnapshotAdmission),
     Rejected(String),
@@ -566,9 +595,6 @@ fn validate_submission(submission: PredictionSubmission) -> anyhow::Result<Valid
     validate_task_capability(&submission.task_capability)?;
     validate_admitted_task(&submission.task)?;
     immutable_sha256_identity("cohort partition", &submission.cohort_partition_id)?;
-    if let Some(llm_secret_name) = &submission.llm_secret_name {
-        validate_dns_label("LLM secret name", llm_secret_name)?;
-    }
     if submission.resource_profile != RESOURCE_PROFILE {
         bail!("prediction resource profile must be {RESOURCE_PROFILE}");
     }
@@ -781,14 +807,11 @@ fn admit_submission_before_deadline(
     }
     match parse_snapshot_admission_response(&output, &validated)? {
         SnapshotAdmissionDecision::Admitted(admission) => {
-            let pipeline_smoke = mission_is_pipeline_smoke(mission_json)?;
-            if !pipeline_smoke && validated.submission.llm_secret_name.is_none() {
-                bail!("prediction research missions require an LLM secret name");
-            }
+            let run_mode = mission_run_mode(mission_json)?;
             Ok(AdmissionDecision::Admitted(Box::new(AdmittedSubmission {
                 validated,
                 admission,
-                pipeline_smoke,
+                run_mode,
             })))
         }
         SnapshotAdmissionDecision::Rejected(rejection) => {
@@ -797,12 +820,19 @@ fn admit_submission_before_deadline(
     }
 }
 
-fn mission_is_pipeline_smoke(mission_json: &str) -> anyhow::Result<bool> {
+fn mission_run_mode(mission_json: &str) -> anyhow::Result<MissionRunMode> {
     let mission: Value = serde_json::from_str(mission_json)
         .context("parse SHA-verified Mission v4 execution mode")?;
-    Ok(mission.get("schema_version").and_then(Value::as_str)
-        == Some("prediction_research_mission.v4")
-        && mission.get("run_mode").and_then(Value::as_str) == Some("pipeline_smoke"))
+    if mission.get("schema_version").and_then(Value::as_str)
+        != Some("prediction_research_mission.v4")
+    {
+        bail!("prediction execution requires Mission v4");
+    }
+    match mission.get("run_mode").and_then(Value::as_str) {
+        Some("pipeline_smoke") => Ok(MissionRunMode::PipelineSmoke),
+        Some("research_trial") => Ok(MissionRunMode::ResearchTrial),
+        _ => bail!("prediction Mission v4 run mode is unsupported"),
+    }
 }
 
 fn read_verified_mission_for_admission(
@@ -934,6 +964,7 @@ fn parse_snapshot_admission_response(
             task,
             cohort_partition_id,
             cohort_manifest_id,
+            partition_view,
             immutable_image_identity,
         } => {
             if schema_version != SNAPSHOT_ADMISSION_SCHEMA_VERSION
@@ -967,6 +998,7 @@ fn parse_snapshot_admission_response(
                     "admitted cohort manifest",
                     &cohort_manifest_id,
                 )?,
+                partition_view,
                 immutable_image_identity,
             }))
         }
@@ -1017,7 +1049,7 @@ fn render_validated_submission(
 ) -> anyhow::Result<RenderedSubmission> {
     let admission = admitted.admission;
     let validated = admitted.validated;
-    let pipeline_smoke = admitted.pipeline_smoke;
+    let run_mode = admitted.run_mode;
     let resume_url = validated.submission.resume_url.as_deref().unwrap_or("");
     let resume_sha256 = validated.resume_sha256.as_deref().unwrap_or("");
     let labels = json!({
@@ -1040,7 +1072,7 @@ fn render_validated_submission(
         "research.monday/policy-identity": admission.policy_identity,
         "research.monday/task-capability": admission.task_capability,
         "research.monday/task-kind": admitted_task_kind(&admission.task),
-        "research.monday/run-mode": if pipeline_smoke { "pipeline_smoke" } else { "research_trial_or_legacy" },
+        "research.monday/run-mode": run_mode.as_str(),
         "research.monday/admitted-image-identity": admission.immutable_image_identity,
         "research.monday/result-object": validated.result_object,
         "research.monday/result-readback-object": validated.result_readback_object,
@@ -1050,6 +1082,44 @@ fn render_validated_submission(
         "research.monday/resource-profile": RESOURCE_PROFILE,
         "research.monday/lane": "prediction_market",
     });
+    let container_args = json!([
+        "prediction",
+        "execute",
+        "--work-dir",
+        "/work",
+        "--mission-url",
+        "$(MISSION_URL)",
+        "--mission-sha256",
+        "$(MISSION_SHA256)",
+        "--snapshot-url",
+        "$(SNAPSHOT_URL)",
+        "--snapshot-sha256",
+        "$(SNAPSHOT_SHA256)",
+        "--snapshot-contract-id",
+        "$(SNAPSHOT_CONTRACT_ID)",
+        "--snapshot-digest",
+        "$(SNAPSHOT_DIGEST)",
+        "--cohort-manifest-id",
+        "$(COHORT_MANIFEST_ID)",
+        "--partition-digest",
+        "$(PARTITION_DIGEST)",
+        "--policy-identity",
+        "$(POLICY_IDENTITY)",
+        "--task-capability",
+        "$(TASK_CAPABILITY)",
+        "--image-identity",
+        "$(IMAGE_IDENTITY)",
+        "--partition-view-json",
+        "$(PARTITION_VIEW_JSON)",
+        "--resume-url",
+        "$(RESUME_URL)",
+        "--resume-sha256",
+        "$(RESUME_SHA256)",
+        "--result-put-url",
+        "$(RESULT_PUT_URL)",
+        "--result-readback-url",
+        "$(RESULT_READBACK_URL)"
+    ]);
     let manifest = json!({
         "apiVersion": "v1",
         "kind": "List",
@@ -1109,25 +1179,8 @@ fn render_validated_submission(
                                 "image": validated.submission.image,
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": ["/usr/local/bin/alpha-harness"],
-                                "args": [
-                                    "prediction", "execute", "--work-dir", "/work",
-                                    "--mission-url", "$(MISSION_URL)",
-                                    "--mission-sha256", "$(MISSION_SHA256)",
-                                    "--snapshot-url", "$(SNAPSHOT_URL)",
-                                    "--snapshot-sha256", "$(SNAPSHOT_SHA256)",
-                                    "--snapshot-contract-id", "$(SNAPSHOT_CONTRACT_ID)",
-                                    "--snapshot-digest", "$(SNAPSHOT_DIGEST)",
-                                    "--cohort-manifest-id", "$(COHORT_MANIFEST_ID)",
-                                    "--partition-digest", "$(PARTITION_DIGEST)",
-                                    "--policy-identity", "$(POLICY_IDENTITY)",
-                                    "--task-capability", "$(TASK_CAPABILITY)",
-                                    "--image-identity", "$(IMAGE_IDENTITY)",
-                                    "--resume-url", "$(RESUME_URL)",
-                                    "--resume-sha256", "$(RESUME_SHA256)",
-                                    "--result-put-url", "$(RESULT_PUT_URL)",
-                                    "--result-readback-url", "$(RESULT_READBACK_URL)"
-                                ],
-                                "env": prediction_environment(&validated, &admission, pipeline_smoke),
+                                "args": container_args,
+                                "env": prediction_environment(&validated, &admission),
                                 "resources": {
                                     "requests": { "cpu": "3500m", "memory": "8Gi" },
                                     "limits": { "cpu": "3500m", "memory": "12Gi" },
@@ -1160,18 +1213,14 @@ fn render_validated_submission(
     })
 }
 
-fn prediction_environment(
-    validated: &ValidatedSubmission,
-    admission: &SnapshotAdmission,
-    pipeline_smoke: bool,
-) -> Value {
+fn prediction_environment(validated: &ValidatedSubmission, admission: &SnapshotAdmission) -> Value {
     let secret_ref = |key: &str| {
         json!({
             "name": validated.secret_name,
             "key": key,
         })
     };
-    let mut environment = vec![
+    let environment = vec![
         json!({ "name": "MISSION_URL", "valueFrom": { "secretKeyRef": secret_ref("mission-url") } }),
         json!({ "name": "SNAPSHOT_URL", "valueFrom": { "secretKeyRef": secret_ref("snapshot-url") } }),
         json!({ "name": "RESULT_PUT_URL", "valueFrom": { "secretKeyRef": secret_ref("result-put-url") } }),
@@ -1187,20 +1236,8 @@ fn prediction_environment(
         json!({ "name": "POLICY_IDENTITY", "value": admission.policy_identity }),
         json!({ "name": "TASK_CAPABILITY", "value": admission.task_capability }),
         json!({ "name": "IMAGE_IDENTITY", "value": admission.immutable_image_identity }),
+        json!({ "name": "PARTITION_VIEW_JSON", "value": serde_json::to_string(&admission.partition_view).expect("serialize admitted partition view") }),
     ];
-    if !pipeline_smoke {
-        let llm_secret_name = validated
-            .submission
-            .llm_secret_name
-            .as_deref()
-            .expect("validated research Mission must carry an LLM secret");
-        environment.extend([
-            json!({ "name": "MONDAY_PREDICTION_LLM_BASE_URL", "valueFrom": { "secretKeyRef": { "name": llm_secret_name, "key": "base-url" } } }),
-            json!({ "name": "MONDAY_PREDICTION_LLM_MODEL", "valueFrom": { "secretKeyRef": { "name": llm_secret_name, "key": "model" } } }),
-            json!({ "name": "MONDAY_PREDICTION_LLM_API_KEY", "valueFrom": { "secretKeyRef": { "name": llm_secret_name, "key": "api-key", "optional": true } } }),
-            json!({ "name": "MONDAY_PREDICTION_LLM_PROVIDER", "valueFrom": { "secretKeyRef": { "name": llm_secret_name, "key": "provider", "optional": true } } }),
-        ]);
-    }
     Value::Array(environment)
 }
 
@@ -1520,6 +1557,10 @@ mod tests {
             job["metadata"]["annotations"]["research.monday/partition-digest"],
             format!("sha256:{}", "e".repeat(64))
         );
+        assert_eq!(
+            job["metadata"]["annotations"]["research.monday/run-mode"],
+            "research_trial"
+        );
         let container = &job["spec"]["template"]["spec"]["containers"][0];
         assert!(container["args"].as_array().is_some_and(|args| {
             [
@@ -1528,6 +1569,7 @@ mod tests {
                 "--policy-identity",
                 "--task-capability",
                 "--image-identity",
+                "--partition-view-json",
             ]
             .iter()
             .all(|flag| args.contains(&json!(flag)))
@@ -1547,24 +1589,20 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_smoke_render_omits_llm_credentials() {
-        let rendered = render_admitted_submission(
+    fn both_v4_modes_render_without_llm_credentials() {
+        for admitted in [
+            admitted_submission_for_test(valid_submission()),
             pipeline_smoke_admitted_submission_for_test(valid_submission()),
-            "monday-research",
-        )
-        .expect("pipeline smoke must render without an LLM secret");
-        let job = &rendered.manifest["items"][1];
-        let environment = job["spec"]["template"]["spec"]["containers"][0]["env"]
-            .as_array()
-            .expect("prediction Job environment must be an array");
-
-        assert_eq!(
-            job["metadata"]["annotations"]["research.monday/run-mode"],
-            "pipeline_smoke"
-        );
-        assert!(environment.iter().all(|value| !value["name"]
-            .as_str()
-            .is_some_and(|name| name.starts_with("MONDAY_PREDICTION_LLM_"))));
+        ] {
+            let rendered = render_admitted_submission(admitted, "monday-research").unwrap();
+            let environment = rendered.manifest["items"][1]["spec"]["template"]["spec"]
+                ["containers"][0]["env"]
+                .as_array()
+                .expect("prediction Job environment must be an array");
+            assert!(environment.iter().all(|value| !value["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("MONDAY_PREDICTION_LLM_"))));
+        }
     }
 
     #[test]
@@ -1677,7 +1715,6 @@ mod tests {
                 "snapshot_contract_id": format!("sha256:{}", "1".repeat(64)),
                 "result_put_url": "https://oss-internal/results/btc-5m-attempt-001/results.zip?signature=x",
                 "result_readback_url": "https://oss-internal/results/btc-5m-attempt-001/results.zip?read-signature=x",
-                "llm_secret_name": "monday-prediction-llm",
                 "catalog_partition_artifact": {
                     "path": "catalog/catalog-partition-deadbeef.json",
                     "artifact_sha256": format!("sha256:{}", "e".repeat(64)),
@@ -1741,6 +1778,12 @@ mod tests {
             "task": {"kind": "settlement_probability"},
             "cohort_partition_id": format!("sha256:{}", "e".repeat(64)),
             "cohort_manifest_id": format!("sha256:{}", "d".repeat(64)),
+            "partition_view": {
+                "common_time_boundary_ms": 1,
+                "train_market_ids": ["train"],
+                "crossing_excluded_market_ids": [],
+                "held_out_market_ids": ["held-out"]
+            },
             "immutable_image_identity": format!("sha256:{}", "a".repeat(64)),
         }))
         .expect("serialize admitted response");
@@ -2006,7 +2049,7 @@ mod tests {
         ] {
             let mut evidence = status_evidence();
             evidence[field] = if field == "run_mode" {
-                json!("research_trial_or_legacy")
+                json!("legacy")
             } else {
                 json!(format!("sha256:{}", "9".repeat(64)))
             };
@@ -2098,7 +2141,6 @@ mod tests {
             result_readback_url:
                 "https://oss-internal/results/btc-5m-attempt-001/results.zip?read-signature=x"
                     .to_owned(),
-            llm_secret_name: Some("monday-prediction-llm".to_owned()),
             resume_url: None,
             resume_sha256: None,
             catalog_partition_artifact: CatalogPartitionArtifactRef {
@@ -2134,18 +2176,23 @@ mod tests {
                 },
                 cohort_partition_id: format!("sha256:{}", "e".repeat(64)),
                 cohort_manifest_id: format!("sha256:{}", "d".repeat(64)),
+                partition_view: AuthenticatedPartitionView {
+                    common_time_boundary_ms: 1,
+                    train_market_ids: vec!["train".to_owned()],
+                    crossing_excluded_market_ids: Vec::new(),
+                    held_out_market_ids: vec!["held-out".to_owned()],
+                },
                 immutable_image_identity: format!("sha256:{}", "a".repeat(64)),
             },
-            pipeline_smoke: false,
+            run_mode: MissionRunMode::ResearchTrial,
         }
     }
 
     fn pipeline_smoke_admitted_submission_for_test(
-        mut submission: PredictionSubmission,
+        submission: PredictionSubmission,
     ) -> AdmittedSubmission {
-        submission.llm_secret_name = None;
         let mut admitted = admitted_submission_for_test(submission);
-        admitted.pipeline_smoke = true;
+        admitted.run_mode = MissionRunMode::PipelineSmoke;
         admitted
     }
 }

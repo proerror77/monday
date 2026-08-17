@@ -68,8 +68,11 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Route snapshot and mission transport through `alpha-harness prediction`,
   including signed inputs, outer hashes, safe ZIP extraction, immutable result
   publication, and cross-Job paused-state resume.
-- [ ] Add the Mission v3 `pipeline_smoke` execution receipt with one typed
-  no-alpha evaluator path and published-bundle readback (#323).
+- [x] Keep Mission v4 `pipeline_smoke` on its typed no-alpha evaluator and
+  published-bundle readback path (#323).
+- [x] Route deterministic `research_trial` receipts through authenticated
+  partition readmission and typed evaluation without a v2 or external-provider
+  fallback.
 - [x] Build the binaries into the shared Monday research image and validate the
   restricted ACK Job in prediction-market CI without adding an OMS, risk,
   reconciliation, or venue execution path.

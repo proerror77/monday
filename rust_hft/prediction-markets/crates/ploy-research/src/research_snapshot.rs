@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -186,6 +186,7 @@ const AUTHENTICATED_SNAPSHOT_WINDOW_SECS: i64 = 300;
 const SEALED_SNAPSHOT_CACHE_MARKER: &str = ".authenticated-research-snapshot.sealed";
 const AUTHENTICATED_COHORT_ARTIFACT: &str = "authenticated_ready_event_cohort";
 const AUTHENTICATED_PARTITION_ARTIFACT: &str = "event_cohort_partition";
+const AUTHENTICATED_PARTITION_VIEW_ARTIFACT: &str = "event_cohort_partition_view";
 const AUTHENTICATED_COMPILER_SOURCE_ARTIFACT: &str = "research_snapshot_compiler_source";
 const AUTHENTICATED_COMPILER_IMAGE_ARTIFACT: &str = "research_snapshot_compiler_image";
 const AUTHENTICATED_BUILD_INPUT_ARTIFACT: &str = "research_snapshot_build_input";
@@ -205,7 +206,8 @@ pub struct AuthenticatedReadyEventCohort {
 
 /// Read-only cohort assignment copied from the validated #322 partition.
 /// Its digest is already bound into the authenticated snapshot contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedPartitionView {
     common_time_boundary_ms: i64,
     train_market_ids: Vec<String>,
@@ -237,6 +239,36 @@ impl AuthenticatedPartitionView {
             crossing_excluded_market_ids: partition.crossing_excluded_market_ids().to_vec(),
             held_out_market_ids: partition.held_out_market_ids().to_vec(),
         }
+    }
+
+    fn sha256_identity(&self) -> Result<String, String> {
+        Ok(format!(
+            "sha256:{}",
+            sha256_hex(&canonical_json_bytes(self)?)
+        ))
+    }
+
+    pub(crate) fn validate_market_ids(&self, available: &BTreeSet<String>) -> Result<(), String> {
+        let assigned = self
+            .train_market_ids
+            .iter()
+            .chain(&self.crossing_excluded_market_ids)
+            .chain(&self.held_out_market_ids)
+            .collect::<Vec<_>>();
+        let unique = assigned
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.common_time_boundary_ms <= 0
+            || assigned.len() != unique.len()
+            || unique.iter().any(|id| id.trim().is_empty())
+            || unique != available.iter().map(String::as_str).collect()
+        {
+            return Err(
+                "authenticated snapshot does not exactly match its sealed partition".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -669,6 +701,122 @@ pub fn admit_cached_authenticated_research_snapshot(
     admit_cached_authenticated_snapshot_at(cohort, request, snapshot_dir)
 }
 
+/// Reconstruct the opaque runtime handle from the exact admission evidence
+/// carried across the sibling-process boundary. The snapshot must still be a
+/// sealed authenticated cache entry; caller-provided identities alone are not
+/// sufficient.
+pub fn admit_extracted_authenticated_research_snapshot(
+    snapshot_dir: &Path,
+    cohort_manifest_id: &str,
+    partition_digest: &str,
+    causal_projection_policy_id: &str,
+    partition_view: AuthenticatedPartitionView,
+    snapshot_contract_id: &str,
+    snapshot_hash: &str,
+) -> std::result::Result<AuthenticatedResearchSnapshot, AuthenticatedResearchSnapshotRejection> {
+    let rejected =
+        |reason: String| AuthenticatedResearchSnapshotRejection::SnapshotRejected { reason };
+    for (identity, field) in [
+        (cohort_manifest_id, "authenticated cohort manifest"),
+        (partition_digest, "authenticated partition"),
+        (
+            causal_projection_policy_id,
+            "authenticated causal projection policy",
+        ),
+        (snapshot_contract_id, "authenticated snapshot contract"),
+    ] {
+        crate::prediction_loop::validate_sha256_id(identity, field).map_err(&rejected)?;
+    }
+    if snapshot_hash.len() != 16
+        || !snapshot_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(rejected(
+            "authenticated snapshot hash must be 16 lowercase hexadecimal characters".into(),
+        ));
+    }
+    let snapshot = load_research_snapshot(snapshot_dir).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+            reason: error.to_string(),
+        }
+    })?;
+    verify_sealed_snapshot_cache(snapshot_dir, &snapshot).map_err(|error| {
+        AuthenticatedResearchSnapshotRejection::CorruptCachedSnapshot {
+            reason: error.to_string(),
+        }
+    })?;
+    if snapshot.manifest.schema_version != RESEARCH_SNAPSHOT_SCHEMA_VERSION
+        || snapshot.manifest.symbols.as_slice() != [AUTHENTICATED_SNAPSHOT_SYMBOL]
+        || snapshot.manifest.source_kind != POLYMARKET_CHAINLINK_BASELINE_SOURCE_KIND
+        || snapshot.manifest.snapshot_contract_hash.as_deref() != Some(snapshot_contract_id)
+        || snapshot.manifest.snapshot_hash.as_deref() != Some(snapshot_hash)
+    {
+        return Err(rejected(
+            "authenticated runtime snapshot identity does not match admission".into(),
+        ));
+    }
+    let partition_view_identity = partition_view.sha256_identity().map_err(&rejected)?;
+    for (name, path, identity) in [
+        (
+            AUTHENTICATED_COHORT_ARTIFACT,
+            "authenticated://ready-event-cohort",
+            cohort_manifest_id,
+        ),
+        (
+            AUTHENTICATED_PARTITION_ARTIFACT,
+            "authenticated://event-cohort-partition",
+            partition_digest,
+        ),
+        (
+            AUTHENTICATED_PARTITION_VIEW_ARTIFACT,
+            "authenticated://event-cohort-partition-view",
+            partition_view_identity.as_str(),
+        ),
+    ] {
+        let matches = snapshot
+            .manifest
+            .input_artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.name == name
+                    && artifact.path == path
+                    && artifact.content_hash.as_deref() == Some(identity)
+            })
+            .count();
+        if matches != 1 {
+            return Err(rejected(format!(
+                "authenticated runtime snapshot {name} identity does not match admission"
+            )));
+        }
+    }
+    let mut available = snapshot
+        .observations
+        .iter()
+        .map(|row| row.event_id.clone())
+        .chain(
+            snapshot
+                .pm_book_snapshots
+                .iter()
+                .map(|row| row.event_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    available.extend(partition_view.crossing_excluded_market_ids.iter().cloned());
+    partition_view
+        .validate_market_ids(&available)
+        .map_err(&rejected)?;
+    Ok(AuthenticatedResearchSnapshot {
+        cohort_manifest_id: cohort_manifest_id.to_string(),
+        partition_digest: partition_digest.to_string(),
+        causal_projection_policy_id: causal_projection_policy_id.to_string(),
+        partition_view,
+        snapshot_contract_id: snapshot_contract_id.to_string(),
+        snapshot_hash: snapshot_hash.to_string(),
+        source_kind: snapshot.manifest.source_kind,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+    })
+}
+
 fn admit_cached_authenticated_snapshot_at(
     cohort: &AuthenticatedReadyEventCohort,
     request: &AuthenticatedSnapshotMaterializationRequest,
@@ -774,6 +922,7 @@ fn bind_authenticated_snapshot_identity(
     let reserved = [
         AUTHENTICATED_COHORT_ARTIFACT,
         AUTHENTICATED_PARTITION_ARTIFACT,
+        AUTHENTICATED_PARTITION_VIEW_ARTIFACT,
         AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,
         AUTHENTICATED_COMPILER_IMAGE_ARTIFACT,
         AUTHENTICATED_BUILD_INPUT_ARTIFACT,
@@ -801,6 +950,14 @@ fn bind_authenticated_snapshot_identity(
             name: AUTHENTICATED_PARTITION_ARTIFACT.to_string(),
             path: "authenticated://event-cohort-partition".to_string(),
             content_hash: Some(cohort.partition_digest.clone()),
+            row_count: Some(cohort.members.len()),
+        },
+        ResearchSnapshotInputArtifact {
+            name: AUTHENTICATED_PARTITION_VIEW_ARTIFACT.to_string(),
+            path: "authenticated://event-cohort-partition-view".to_string(),
+            content_hash: Some(cohort.partition_view.sha256_identity().map_err(|reason| {
+                AuthenticatedResearchSnapshotRejection::SnapshotRejected { reason }
+            })?),
             row_count: Some(cohort.members.len()),
         },
         ResearchSnapshotInputArtifact {
@@ -905,6 +1062,10 @@ fn validate_authenticated_snapshot(
         });
     }
     if require_identity {
+        let partition_view_identity =
+            cohort.partition_view.sha256_identity().map_err(|reason| {
+                AuthenticatedResearchSnapshotRejection::SnapshotRejected { reason }
+            })?;
         let artifacts = snapshot
             .manifest
             .input_artifacts
@@ -921,6 +1082,11 @@ fn validate_authenticated_snapshot(
                 AUTHENTICATED_PARTITION_ARTIFACT,
                 "authenticated://event-cohort-partition",
                 Some(cohort.partition_digest.as_str()),
+            ),
+            (
+                AUTHENTICATED_PARTITION_VIEW_ARTIFACT,
+                "authenticated://event-cohort-partition-view",
+                Some(partition_view_identity.as_str()),
             ),
             (
                 AUTHENTICATED_COMPILER_SOURCE_ARTIFACT,

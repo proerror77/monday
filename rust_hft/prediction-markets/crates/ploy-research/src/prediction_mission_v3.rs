@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::prediction_loop::{
     current_prediction_policy_snapshot_id, validate_prediction_search_budget, validate_sha256_id,
-    PredictionResearchMission, PredictionSearchBudget,
+    PredictionSearchBudget,
 };
 use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
 use crate::research_snapshot::{
@@ -97,12 +97,6 @@ pub struct PredictionResearchMissionV3 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParsedPredictionMission {
-    V2(PredictionResearchMission),
-    V3(PredictionResearchMissionV3),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmittedPredictionTask {
     SettlementProbability,
     UpExecution { prediction_horizon_secs: u32 },
@@ -173,24 +167,19 @@ impl AdmittedPredictionMissionV3 {
     }
 }
 
-pub fn parse_prediction_mission_json(bytes: &[u8]) -> Result<ParsedPredictionMission, String> {
+pub fn parse_prediction_mission_json(bytes: &[u8]) -> Result<PredictionResearchMissionV3, String> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("parse prediction mission JSON: {error}"))?;
     let schema_version = value
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "prediction mission schema_version is required".to_string())?;
-    match schema_version {
-        crate::prediction_loop::PREDICTION_MISSION_SCHEMA_VERSION => serde_json::from_value(value)
-            .map(ParsedPredictionMission::V2)
-            .map_err(|error| format!("parse prediction Mission v2: {error}")),
-        PREDICTION_MISSION_V3_SCHEMA_VERSION => serde_json::from_value(value)
-            .map(ParsedPredictionMission::V3)
-            .map_err(|error| format!("parse prediction Mission v4: {error}")),
-        other => Err(format!(
-            "unsupported prediction mission schema_version {other}"
-        )),
+    if schema_version != PREDICTION_MISSION_V3_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported prediction mission schema_version {schema_version}"
+        ));
     }
+    serde_json::from_value(value).map_err(|error| format!("parse prediction Mission v4: {error}"))
 }
 
 pub fn prediction_mission_v3_sha256(
@@ -478,10 +467,7 @@ mod tests {
     }
 
     fn parse_v3(value: serde_json::Value) -> PredictionResearchMissionV3 {
-        match parse_prediction_mission_json(&serde_json::to_vec(&value).unwrap()).unwrap() {
-            ParsedPredictionMission::V3(mission) => mission,
-            ParsedPredictionMission::V2(_) => panic!("v3 mission parsed as v2"),
-        }
+        parse_prediction_mission_json(&serde_json::to_vec(&value).unwrap()).unwrap()
     }
 
     fn authenticated(
@@ -727,13 +713,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_mission_keeps_its_existing_versioned_path() {
-        let parsed = parse_prediction_mission_json(include_bytes!(
-            "../../../config/research_missions/polymarket-btc-5m.example.json"
-        ))
-        .unwrap();
+    fn external_v2_mission_is_rejected() {
+        let error = parse_prediction_mission_json(
+            br#"{"schema_version":"prediction_research_mission.v2"}"#,
+        )
+        .unwrap_err();
 
-        assert!(matches!(parsed, ParsedPredictionMission::V2(_)));
+        assert!(error.contains("unsupported prediction mission schema_version"));
     }
 
     #[test]

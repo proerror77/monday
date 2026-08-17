@@ -19,7 +19,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
 | Signed Paper/Shadow intake | Blocked by [#605](https://github.com/proerror77/monday/issues/605) | The generic signed boundary exists; no four-stage CEX bundle reaches it yet |
 | Exact-main CEX run and readback | Blocked by [#606](https://github.com/proerror77/monday/issues/606) | No complete single-instrument result bundle has crossed every boundary above |
-| Prediction Mission v2/v4 | Transitional | v2 remains the research-run path; v4 is admitted only for `pipeline_smoke`, not `research_trial` |
+| Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
 
 `mission execute` is the CEX operator acceptance seam. Low-level Mission and
 LoopRun commands remain diagnostics and implementation surfaces; they are not

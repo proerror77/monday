@@ -54,12 +54,30 @@ spec:
             - $(SNAPSHOT_URL)
             - --snapshot-sha256
             - $(SNAPSHOT_SHA256)
+            - --snapshot-contract-id
+            - $(SNAPSHOT_CONTRACT_ID)
+            - --snapshot-digest
+            - $(SNAPSHOT_DIGEST)
+            - --cohort-manifest-id
+            - $(COHORT_MANIFEST_ID)
+            - --partition-digest
+            - $(PARTITION_DIGEST)
+            - --policy-identity
+            - $(POLICY_IDENTITY)
+            - --task-capability
+            - $(TASK_CAPABILITY)
+            - --image-identity
+            - $(IMAGE_IDENTITY)
+            - --partition-view-json
+            - $(PARTITION_VIEW_JSON)
             - --resume-url
             - $(RESUME_URL)
             - --resume-sha256
             - $(RESUME_SHA256)
             - --result-put-url
             - $(RESULT_PUT_URL)
+            - --result-readback-url
+            - $(RESULT_READBACK_URL)
           env:
             - name: MISSION_URL
               valueFrom:
@@ -76,6 +94,11 @@ spec:
                 secretKeyRef:
                   name: REPLACE_URL_SECRET_NAME
                   key: result-put-url
+            - name: RESULT_READBACK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: result-readback-url
             - name: RESUME_URL
               valueFrom:
                 secretKeyRef:
@@ -90,28 +113,22 @@ spec:
               value: REPLACE_MISSION_SHA256
             - name: SNAPSHOT_SHA256
               value: REPLACE_SNAPSHOT_SHA256
-            - name: MONDAY_PREDICTION_LLM_BASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_LLM_SECRET_NAME
-                  key: base-url
-            - name: MONDAY_PREDICTION_LLM_MODEL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_LLM_SECRET_NAME
-                  key: model
-            - name: MONDAY_PREDICTION_LLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_LLM_SECRET_NAME
-                  key: api-key
-                  optional: true
-            - name: MONDAY_PREDICTION_LLM_PROVIDER
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_LLM_SECRET_NAME
-                  key: provider
-                  optional: true
+            - name: SNAPSHOT_CONTRACT_ID
+              value: REPLACE_ADMITTED_SNAPSHOT_CONTRACT_ID
+            - name: SNAPSHOT_DIGEST
+              value: REPLACE_ADMITTED_SNAPSHOT_DIGEST
+            - name: COHORT_MANIFEST_ID
+              value: REPLACE_ADMITTED_COHORT_MANIFEST_ID
+            - name: PARTITION_DIGEST
+              value: REPLACE_ADMITTED_PARTITION_DIGEST
+            - name: POLICY_IDENTITY
+              value: REPLACE_ADMITTED_POLICY_IDENTITY
+            - name: TASK_CAPABILITY
+              value: REPLACE_ADMITTED_TASK_CAPABILITY
+            - name: IMAGE_IDENTITY
+              value: REPLACE_ADMITTED_IMAGE_IDENTITY
+            - name: PARTITION_VIEW_JSON
+              value: REPLACE_ADMITTED_PARTITION_VIEW_JSON
           resources:
             requests:
               cpu: "3500m"

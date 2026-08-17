@@ -262,16 +262,14 @@ aggregator may merge their immutable evidence.
 security context, signed-URL input transport, and immutable result upload for one
 event-settlement mission. Its evaluator remains the prediction-specific
 event-disjoint binary and the Job contains no exchange credential or execution
-entrypoint. Missions that use an LLM receive only the
-`MONDAY_PREDICTION_LLM_BASE_URL`, `MONDAY_PREDICTION_LLM_MODEL`,
-`MONDAY_PREDICTION_LLM_API_KEY`, and `MONDAY_PREDICTION_LLM_PROVIDER`
-variables from the dedicated LLM Secret. The base URL must be reachable through
-the VPC, and every non-loopback endpoint must use HTTPS; a public LLM endpoint is
-not reachable from the private worker pool.
+entrypoint. Mission v4 uses the built-in deterministic research profile and the
+Job contains no LLM endpoint, model, API key, or provider environment.
 
 Create a private submission JSON; never commit signed URLs. Include IDs,
 digest-pinned image/evaluator, `standard-v1`, URL+SHA pairs, attempt-bound result,
-LLM Secret, and an optional complete resume pair. Render and review offline with
+catalog partition identity, and an optional complete resume pair. Snapshot
+admission supplies the exact cohort, partition view, policy, snapshot, task, and
+image identities injected into the Job. Render and review offline with
 `alpha-harness prediction dispatch render --submission FILE --namespace NS`.
 Submit with `alpha-harness prediction dispatch submit --submission FILE --context
 CONTEXT --namespace NS`. The query-free result URL is the duplicate guard; each

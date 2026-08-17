@@ -1,9 +1,9 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:51217ed01659da1baf2a3ecb437ddb5ab9ea530e6247d955028bdc1cafb68330
+input:Cargo.lock=sha256:16f88b8dad22289cedddc3f2d177e9f36db20dbab4da9a8aebab0298ca718069
 input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
-input:crates/ploy-research/Cargo.toml=sha256:6ca7b4b9068c6eee63e2d766399b7d79b9b0d300391149eb43b0905c8adfa957
+input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
@@ -19,8 +19,6 @@ package:arc-swap@1.9.2|source=registry+https://github.com/rust-lang/crates.io-in
 package:arrayvec@0.7.8|source=registry+https://github.com/rust-lang/crates.io-index|checksum=d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56|features=std
 package:atoi@2.0.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=f28d99ec8bfea296261ca1af174f24225171fea9664ba9003cbebee704810528|features=default,std
 package:atomic-waker@1.1.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0|features=
-package:aws-lc-rs@1.17.3|source=registry+https://github.com/rust-lang/crates.io-index|checksum=00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1|features=aws-lc-sys,prebuilt-nasm
-package:aws-lc-sys@0.43.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c|features=prebuilt-nasm
 package:base64@0.21.7|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567|features=alloc,default,std
 package:base64@0.22.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6|features=alloc,default,std
 package:bitflags@2.13.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da|features=
@@ -78,7 +76,7 @@ package:http-body-util@0.1.4|source=registry+https://github.com/rust-lang/crates
 package:http-body@1.1.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c|features=
 package:http@1.4.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425|features=default,std
 package:httparse@1.10.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87|features=default,std
-package:hyper-rustls@0.27.9|source=registry+https://github.com/rust-lang/crates.io-index|checksum=33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f|features=aws-lc-rs,http1,ring,tls12,webpki-roots,webpki-tokio
+package:hyper-rustls@0.27.9|source=registry+https://github.com/rust-lang/crates.io-index|checksum=33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f|features=http1,ring,tls12,webpki-roots,webpki-tokio
 package:hyper-util@0.1.20|source=registry+https://github.com/rust-lang/crates.io-index|checksum=96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0|features=client,client-legacy,client-proxy,default,http1,tokio
 package:hyper@1.10.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498|features=client,default,http1
 package:iana-time-zone@0.1.65|source=registry+https://github.com/rust-lang/crates.io-index|checksum=e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470|features=fallback
@@ -103,7 +101,6 @@ package:memchr@2.8.3|source=registry+https://github.com/rust-lang/crates.io-inde
 package:mio@1.2.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427|features=net,os-ext,os-poll
 package:num-traits@0.2.19|source=registry+https://github.com/rust-lang/crates.io-index|checksum=071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841|features=i128,std
 package:once_cell@1.21.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50|features=alloc,default,race,std
-package:openssl-probe@0.2.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe|features=
 package:optimizer@1.0.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1351570ae6d5c76f96581b2b5e6fbf3a2029ac26ead6ddf18d355955b155ba9f|features=default
 package:parking@2.2.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba|features=
 package:parking_lot@0.12.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a|features=default
@@ -123,14 +120,11 @@ package:rand_chacha@0.9.0|source=registry+https://github.com/rust-lang/crates.io
 package:rand_core@0.6.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c|features=alloc,getrandom,std
 package:rand_core@0.9.5|source=registry+https://github.com/rust-lang/crates.io-index|checksum=76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c|features=os_rng,std
 package:reqwest@0.12.28|source=registry+https://github.com/rust-lang/crates.io-index|checksum=eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147|features=__rustls,__rustls-ring,__tls,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider
-package:reqwest@0.13.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3|features=__rustls,__rustls-aws-lc-rs,__tls,blocking,json,rustls
 package:ring@0.17.14|source=registry+https://github.com/rust-lang/crates.io-index|checksum=a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7|features=alloc,default,dev_urandom_fallback
 package:rust_decimal@1.42.1|source=git+https://github.com/proerror77/monday-rust-decimal-security-694?rev=4f7bc6f02d7920b6416988914ae86d25f6670b22#4f7bc6f02d7920b6416988914ae86d25f6670b22|checksum=none|features=default,maths,serde,serde-with-str,std
-package:rustls-native-certs@0.8.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d|features=
 package:rustls-pki-types@1.15.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046|features=alloc,default,std
-package:rustls-platform-verifier@0.7.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0|features=
-package:rustls-webpki@0.103.13|source=registry+https://github.com/rust-lang/crates.io-index|checksum=61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e|features=alloc,aws-lc-rs,ring,std
-package:rustls@0.23.42|source=registry+https://github.com/rust-lang/crates.io-index|checksum=3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138|features=aws-lc-rs,aws_lc_rs,ring,std,tls12
+package:rustls-webpki@0.103.13|source=registry+https://github.com/rust-lang/crates.io-index|checksum=61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e|features=alloc,ring,std
+package:rustls@0.23.42|source=registry+https://github.com/rust-lang/crates.io-index|checksum=3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138|features=ring,std,tls12
 package:ryu@1.0.23|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f|features=
 package:scopeguard@1.2.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49|features=
 package:serde@1.0.228|source=registry+https://github.com/rust-lang/crates.io-index|checksum=9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e|features=alloc,default,derive,rc,serde_derive,std
@@ -155,7 +149,7 @@ package:thiserror@2.0.18|source=registry+https://github.com/rust-lang/crates.io-
 package:tinystr@0.8.3|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d|features=zerovec
 package:tinyvec@1.12.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f|features=alloc,default,tinyvec_macros
 package:tinyvec_macros@0.1.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20|features=
-package:tokio-rustls@0.26.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61|features=aws-lc-rs,aws_lc_rs,ring,tls12
+package:tokio-rustls@0.26.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61|features=ring,tls12
 package:tokio-stream@0.1.18|source=registry+https://github.com/rust-lang/crates.io-index|checksum=32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70|features=default,fs,time
 package:tokio-tungstenite@0.26.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084|features=__rustls-tls,connect,handshake,rustls,rustls-pki-types,rustls-tls-webpki-roots,stream,tokio-rustls,webpki-roots
 package:tokio@1.53.0|source=registry+https://github.com/rust-lang/crates.io-index|checksum=d988bcd52dbe076d3d46903332f58c912b87a2c49b1428419a5845154762ffee|features=bytes,default,fs,io-util,libc,macros,mio,net,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,time,tokio-macros
