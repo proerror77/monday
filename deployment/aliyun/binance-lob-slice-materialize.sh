@@ -88,8 +88,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ -n "$MARKET" ] && [ -n "$START_DATE" ] && [ -n "$END_DATE" ] && [ -n "$SYMBOLS" ] \
-  && [ -n "$WORK_DIR" ] && [ -n "$ARTIFACT_DIR" ] || usage
+if [ -z "$MARKET" ] || [ -z "$START_DATE" ] || [ -z "$END_DATE" ] || [ -z "$SYMBOLS" ] || \
+  [ -z "$WORK_DIR" ] || [ -z "$ARTIFACT_DIR" ]; then
+  usage
+fi
 
 case "$MARKET" in
   spot) DATASET=${DATASET:-spot_all} ;;
