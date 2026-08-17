@@ -122,6 +122,22 @@ pub struct CexInstrumentRulesV2 {
     pub evidence: Vec<CexArtifactTripletV2>,
 }
 
+impl CexInstrumentRulesV2 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if !positive_decimal(&self.tick_size)
+            || !positive_decimal(&self.step_size)
+            || !positive_decimal(&self.min_notional)
+            || self.available_at > self.valid_through
+            || !valid_evidence_set(&self.evidence)
+        {
+            return Err(ManifestError::InvalidCexReplaySnapshot(
+                "instrument rules are invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexFeeScheduleV2 {
@@ -239,12 +255,8 @@ impl CexReplaySnapshotV2 {
             .and_then(chrono::TimeDelta::try_milliseconds)
             .and_then(|offset| self.last_event_time.checked_add_signed(offset))
             .ok_or_else(|| invalid("label availability time overflows"))?;
-        if !positive_decimal(&self.instrument_rules.tick_size)
-            || !positive_decimal(&self.instrument_rules.step_size)
-            || !positive_decimal(&self.instrument_rules.min_notional)
-            || !valid_evidence_set(&self.instrument_rules.evidence)
-            || self.instrument_rules.available_at > self.first_event_time
-            || self.instrument_rules.available_at > self.instrument_rules.valid_through
+        self.instrument_rules.validate()?;
+        if self.instrument_rules.available_at > self.first_event_time
             || self.instrument_rules.valid_through < label_available_through
             || !valid_runtime_account_id(&self.fee_schedule.runtime_account_id)
             || !valid_sha256(&self.fee_schedule.account_fingerprint)

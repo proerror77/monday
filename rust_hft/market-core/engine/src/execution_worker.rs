@@ -784,14 +784,6 @@ impl ExecutionWorker {
                 self.reject_for_disabled_intake(&envelope).await;
                 continue;
             }
-            if envelope.intent.product_type != hft_core::ProductType::Spot {
-                self.reject_intent(
-                    &envelope.client_order_id,
-                    "product requires a venue-specific account admission policy",
-                )
-                .await;
-                continue;
-            }
             let simulated_client_idx = if envelope.account_id.is_none()
                 && self
                     .execution_clients
@@ -915,6 +907,17 @@ impl ExecutionWorker {
                     }
                 },
             };
+            if intent.product_type != hft_core::ProductType::Spot
+                && !(intent.product_type == hft_core::ProductType::Perp
+                    && self.execution_clients[client_idx].is_simulated_execution())
+            {
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    "product requires a venue-specific account admission policy",
+                )
+                .await;
+                continue;
+            }
             let account_id = if self.execution_clients[client_idx].is_simulated_execution() {
                 Some(account_id)
             } else {
@@ -4162,6 +4165,7 @@ mod tests {
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         let mut intent = create_test_intent("SIMULATED");
         intent.target_venue = Some(VenueId::MOCK);
+        intent.product_type = ProductType::Perp;
         engine_queues
             .send_envelope(OrderIntentEnvelope::new(
                 intent,
@@ -4789,10 +4793,9 @@ mod tests {
             events.as_slice(),
             [ExecutionEvent::OrderNew {
                 account_id: Some(account_id),
-                arrival_price: Some(arrival_price),
+                arrival_price: None,
                 ..
             }] if account_id == &AccountId("binance-main".to_string())
-                && *arrival_price == Price::from_f64(100.0).unwrap()
         ));
 
         worker

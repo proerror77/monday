@@ -5,7 +5,7 @@ use hft_factor_dsl::{
 };
 use ports::{
     AccountView, AggregatedBar, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot,
-    OrderIntent, Strategy, StrategyContext,
+    OrderIntent, Strategy, StrategyContext, VenueSpec,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -18,6 +18,11 @@ pub struct FormulaStrategyConfig {
     pub ast: FactorAst,
     pub max_order_notional: Decimal,
     pub signal_threshold: f64,
+    pub target_position: bool,
+    pub evaluation_interval_millis: Option<u64>,
+    pub target_venue: Option<hft_core::VenueId>,
+    pub venue_spec: Option<VenueSpec>,
+    pub cross_spread: Option<bool>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -26,6 +31,10 @@ pub enum FormulaStrategyError {
     InvalidMaxOrderNotional,
     #[error("signal_threshold must be nonnegative and finite")]
     InvalidSignalThreshold,
+    #[error("target-position formulas require a positive evaluation interval")]
+    InvalidEvaluationInterval,
+    #[error("sealed target-position execution contract is invalid")]
+    InvalidExecutionContract,
     #[error("invalid factor AST: {0}")]
     InvalidAst(#[from] FactorDslError),
     #[error("unsupported live operator: {0}")]
@@ -45,6 +54,12 @@ pub struct FormulaStrategy {
     config: FormulaStrategyConfig,
     domain: EventDomain,
     signal_state: SignalState,
+    signal_initialized: bool,
+    evaluation_interval_micros: Option<u64>,
+    bucket_sample: Option<BucketSample>,
+    next_bucket_micros: Option<u64>,
+    pending_target: Option<PendingTarget>,
+    target_position: Option<Decimal>,
 }
 
 impl FormulaStrategy {
@@ -60,12 +75,173 @@ impl FormulaStrategy {
         if !config.signal_threshold.is_finite() || config.signal_threshold < 0.0 {
             return Err(FormulaStrategyError::InvalidSignalThreshold);
         }
+        let evaluation_interval_micros = match config.evaluation_interval_millis {
+            Some(interval) => Some(
+                interval
+                    .checked_mul(1_000)
+                    .filter(|value| *value > 0)
+                    .ok_or(FormulaStrategyError::InvalidEvaluationInterval)?,
+            ),
+            None => None,
+        };
+        if config.target_position && evaluation_interval_micros.is_none() {
+            return Err(FormulaStrategyError::InvalidEvaluationInterval);
+        }
+        match (
+            &config.target_venue,
+            &config.venue_spec,
+            config.cross_spread,
+        ) {
+            (None, None, None) => {}
+            (Some(_), Some(spec), Some(_))
+                if config.target_position
+                    && !spec.name.trim().is_empty()
+                    && spec.tick_size.0 > Decimal::ZERO
+                    && spec.lot_size.0 > Decimal::ZERO
+                    && spec.min_qty.0 > Decimal::ZERO
+                    && spec.min_notional > Decimal::ZERO
+                    && spec
+                        .max_quantity
+                        .is_none_or(|quantity| quantity.0 > Decimal::ZERO) => {}
+            _ => return Err(FormulaStrategyError::InvalidExecutionContract),
+        }
         let domain = validate_live_ast(&config.ast)?;
         Ok(Self {
             config,
             domain,
             signal_state: SignalState::Neutral,
+            signal_initialized: false,
+            evaluation_interval_micros,
+            bucket_sample: None,
+            next_bucket_micros: None,
+            pending_target: None,
+            target_position: None,
         })
+    }
+
+    fn handle_disconnect(&mut self, event: &MarketEvent) -> bool {
+        let MarketEvent::Disconnect {
+            source_venue,
+            symbol,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        if self.config.target_position
+            && symbol
+                .as_ref()
+                .is_none_or(|symbol| symbol == &self.config.symbol)
+            && source_venue.is_none_or(|venue| {
+                self.config
+                    .target_venue
+                    .is_none_or(|target| target == venue)
+            })
+        {
+            self.reset_target_series();
+        }
+        true
+    }
+
+    fn reset_target_series(&mut self) {
+        self.signal_state = SignalState::Neutral;
+        self.signal_initialized = false;
+        self.bucket_sample = None;
+        self.next_bucket_micros = None;
+        self.pending_target = None;
+        self.target_position = None;
+    }
+
+    fn normalize_target_price(&self, price: Decimal) -> Option<Decimal> {
+        let price = if let Some(spec) = &self.config.venue_spec {
+            (price / spec.tick_size.0).round() * spec.tick_size.0
+        } else {
+            price
+        };
+        (price > Decimal::ZERO).then_some(price)
+    }
+
+    fn normalize_target_quantity(&self, quantity: Decimal) -> Option<Decimal> {
+        let quantity = if let Some(spec) = &self.config.venue_spec {
+            (quantity / spec.lot_size.0).floor() * spec.lot_size.0
+        } else {
+            quantity
+        };
+        (quantity > Decimal::ZERO).then_some(quantity)
+    }
+
+    fn valid_target_order(&self, price: Decimal, quantity: Decimal) -> bool {
+        self.config.venue_spec.as_ref().is_none_or(|spec| {
+            quantity >= spec.min_qty.0
+                && spec
+                    .max_quantity
+                    .is_none_or(|maximum| quantity <= maximum.0)
+                && price
+                    .checked_mul(quantity)
+                    .is_some_and(|notional| notional >= spec.min_notional)
+        })
+    }
+
+    fn target_price(&self, side: Side, best_bid: Decimal, best_ask: Decimal) -> Option<Decimal> {
+        let price = match (self.config.cross_spread.unwrap_or(true), side) {
+            (true, Side::Buy) | (false, Side::Sell) => best_ask,
+            (true, Side::Sell) | (false, Side::Buy) => best_bid,
+        };
+        self.normalize_target_price(price)
+    }
+
+    fn record_bucket_sample(
+        &mut self,
+        timestamp: u64,
+        signal: f64,
+        venue: hft_core::VenueId,
+        best_bid: Decimal,
+        best_ask: Decimal,
+    ) {
+        let Some(interval) = self.evaluation_interval_micros else {
+            return;
+        };
+        if self
+            .bucket_sample
+            .is_some_and(|sample| timestamp < sample.observed_at)
+        {
+            return;
+        }
+        self.bucket_sample = Some(BucketSample {
+            observed_at: timestamp,
+            bucket: timestamp / interval,
+            signal,
+            venue,
+            best_bid,
+            best_ask,
+        });
+        if self.next_bucket_micros.is_none() {
+            let floor = timestamp - timestamp % interval;
+            self.next_bucket_micros = Some(if timestamp.is_multiple_of(interval) {
+                timestamp
+            } else {
+                floor.saturating_add(interval)
+            });
+        }
+    }
+
+    fn clocked_decision(&mut self, timestamp: u64) -> Option<BucketSample> {
+        let interval = self.evaluation_interval_micros?;
+        if !timestamp.is_multiple_of(interval) {
+            return None;
+        }
+        let expected = self.next_bucket_micros?;
+        if timestamp < expected {
+            return None;
+        }
+        if timestamp > expected {
+            self.reset_target_series();
+            return None;
+        }
+        self.next_bucket_micros = Some(expected.saturating_add(interval));
+        let mut decision = self.bucket_sample?;
+        decision.bucket = timestamp / interval;
+        Some(decision)
     }
 
     fn evaluate_event(&self, event: &MarketEvent) -> Option<(f64, Option<hft_core::VenueId>)> {
@@ -102,7 +278,9 @@ impl FormulaStrategy {
         &mut self,
         signal: f64,
         target_venue: hft_core::VenueId,
-        executable_price: impl FnOnce(Side) -> Option<Decimal>,
+        account: &AccountView,
+        executable_price: impl Fn(Side) -> Option<Decimal>,
+        decision_bucket: Option<u64>,
     ) -> Vec<OrderIntent> {
         let next_state = if signal > self.config.signal_threshold {
             SignalState::Buy
@@ -111,29 +289,137 @@ impl FormulaStrategy {
         } else {
             SignalState::Neutral
         };
-        if next_state == SignalState::Neutral {
+        if !self.config.target_position && next_state == SignalState::Neutral {
             self.signal_state = SignalState::Neutral;
+            self.signal_initialized = true;
             return Vec::new();
         }
-        if next_state == self.signal_state {
+        if !self.config.target_position
+            && self.signal_initialized
+            && next_state == self.signal_state
+        {
             return Vec::new();
         }
-        let side = match next_state {
-            SignalState::Buy => Side::Buy,
-            SignalState::Sell => Side::Sell,
-            SignalState::Neutral => unreachable!(),
+        if self.config.target_position
+            && self
+                .config
+                .target_venue
+                .is_some_and(|venue| venue != target_venue)
+        {
+            return Vec::new();
+        }
+        let mut target_position_before = None;
+        let mut target_position_after = None;
+        let (side, raw_quantity) = if self.config.target_position {
+            let Some(decision_bucket) = decision_bucket else {
+                return Vec::new();
+            };
+            let current = account
+                .positions
+                .get(&self.config.symbol)
+                .map(|position| position.quantity.0)
+                .unwrap_or(Decimal::ZERO);
+            let same_signal = self.signal_initialized && next_state == self.signal_state;
+            if !same_signal {
+                self.pending_target = None;
+            }
+            let target = if same_signal {
+                self.target_position
+            } else {
+                None
+            }
+            .map_or_else(
+                || match next_state {
+                    SignalState::Neutral => Some(Decimal::ZERO),
+                    SignalState::Buy | SignalState::Sell => {
+                        let target_side = match next_state {
+                            SignalState::Buy => Side::Buy,
+                            SignalState::Sell => Side::Sell,
+                            SignalState::Neutral => unreachable!(),
+                        };
+                        let price = executable_price(target_side)?;
+                        let quantity =
+                            quantity_within_notional(self.config.max_order_notional, price)?;
+                        let quantity = self.normalize_target_quantity(quantity)?;
+                        Some(if next_state == SignalState::Buy {
+                            quantity
+                        } else {
+                            -quantity
+                        })
+                    }
+                },
+                Some,
+            );
+            let Some(target) = target else {
+                return Vec::new();
+            };
+            self.signal_state = next_state;
+            self.signal_initialized = true;
+            self.target_position = Some(target);
+            if same_signal {
+                if let Some(pending) = self.pending_target {
+                    if current == pending.target_position {
+                        self.pending_target = None;
+                        return Vec::new();
+                    }
+                    // ponytail: signed Paper/Shadow fills in 50 ms; wait one full research bucket
+                    // before retrying an unchanged position. Track order IDs before external execution.
+                    if current == pending.position_before
+                        && decision_bucket <= pending.emitted_bucket.saturating_add(1)
+                    {
+                        return Vec::new();
+                    }
+                    self.pending_target = None;
+                }
+            }
+            target_position_before = Some(current);
+            target_position_after = Some(target);
+            let delta = target - current;
+            if delta == Decimal::ZERO {
+                self.pending_target = None;
+                return Vec::new();
+            }
+            if delta > Decimal::ZERO {
+                (Side::Buy, delta)
+            } else {
+                (Side::Sell, -delta)
+            }
+        } else {
+            let side = match next_state {
+                SignalState::Buy => Side::Buy,
+                SignalState::Sell => Side::Sell,
+                SignalState::Neutral => unreachable!(),
+            };
+            let Some(price) = executable_price(side).filter(|price| *price > Decimal::ZERO) else {
+                return Vec::new();
+            };
+            let Some(quantity) = self
+                .config
+                .max_order_notional
+                .checked_div(price)
+                .filter(|quantity| *quantity > Decimal::ZERO)
+            else {
+                return Vec::new();
+            };
+            (side, quantity)
         };
         let Some(limit_price) = executable_price(side).filter(|price| *price > Decimal::ZERO)
         else {
             return Vec::new();
         };
-        let Some(raw_quantity) = self
-            .config
-            .max_order_notional
-            .checked_div(limit_price)
-            .filter(|quantity| *quantity > Decimal::ZERO)
-        else {
-            return Vec::new();
+        let raw_quantity = if self.config.target_position {
+            let Some(max_quantity) =
+                quantity_within_notional(self.config.max_order_notional, limit_price)
+            else {
+                return Vec::new();
+            };
+            let Some(quantity) = self.normalize_target_quantity(raw_quantity.min(max_quantity))
+            else {
+                return Vec::new();
+            };
+            quantity
+        } else {
+            raw_quantity
         };
         // Polymarket CLOB share sizes are signed with two decimal places. Round down before the
         // intent enters risk review so the adapter does not reject ordinary non-divisible prices
@@ -146,16 +432,37 @@ impl FormulaStrategy {
         if quantity <= Decimal::ZERO {
             return Vec::new();
         }
+        if self.config.target_position && !self.valid_target_order(limit_price, quantity) {
+            return Vec::new();
+        }
 
         self.signal_state = next_state;
-        let intent = if target_venue == hft_core::VenueId::POLYMARKET {
+        self.signal_initialized = true;
+        if let (Some(position_before), Some(target_position), Some(emitted_bucket)) = (
+            target_position_before,
+            target_position_after,
+            decision_bucket,
+        ) {
+            self.pending_target = Some(PendingTarget {
+                position_before,
+                target_position,
+                emitted_bucket,
+            });
+        }
+        let time_in_force =
+            if self.config.target_position && self.config.cross_spread == Some(false) {
+                TimeInForce::GTC
+            } else {
+                TimeInForce::IOC
+            };
+        let mut intent = if target_venue == hft_core::VenueId::POLYMARKET {
             OrderIntent::prediction_market(
                 self.config.symbol.clone(),
                 side,
                 Quantity(quantity),
                 OrderType::Limit,
                 Some(Price(limit_price)),
-                TimeInForce::IOC,
+                time_in_force,
                 self.config.name.clone(),
                 target_venue,
             )
@@ -166,11 +473,14 @@ impl FormulaStrategy {
                 Quantity(quantity),
                 OrderType::Limit,
                 Some(Price(limit_price)),
-                TimeInForce::IOC,
+                time_in_force,
                 self.config.name.clone(),
                 Some(target_venue),
             )
         };
+        if self.config.target_position {
+            intent.product_type = hft_core::ProductType::Perp;
+        }
         vec![intent]
     }
 }
@@ -188,15 +498,56 @@ enum SignalState {
     Sell,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BucketSample {
+    observed_at: u64,
+    bucket: u64,
+    signal: f64,
+    venue: hft_core::VenueId,
+    best_bid: Decimal,
+    best_ask: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTarget {
+    position_before: Decimal,
+    target_position: Decimal,
+    emitted_bucket: u64,
+}
+
 impl Strategy for FormulaStrategy {
-    fn on_market_event(&mut self, event: &MarketEvent, _account: &AccountView) -> Vec<OrderIntent> {
+    fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent> {
+        if self.handle_disconnect(event) {
+            return Vec::new();
+        }
         let Some((signal, source_venue)) = self.evaluate_event(event) else {
             return Vec::new();
         };
         let Some(target_venue) = source_venue else {
             return Vec::new();
         };
-        self.emit_signal(signal, target_venue, |side| executable_price(event, side))
+        if self.config.target_position {
+            let (Some(best_bid), Some(best_ask)) = (
+                executable_price(event, Side::Sell),
+                executable_price(event, Side::Buy),
+            ) else {
+                return Vec::new();
+            };
+            let timestamp = event
+                .timestamps()
+                .and_then(|timestamps| timestamps.local_receive)
+                .map(|timestamp| timestamp.as_micros())
+                .unwrap_or_else(|| event_timestamp(event));
+            self.record_bucket_sample(timestamp, signal, target_venue, best_bid, best_ask);
+            return Vec::new();
+        }
+        self.emit_signal(
+            signal,
+            target_venue,
+            account,
+            |side| executable_price(event, side),
+            None,
+        )
     }
 
     fn on_market_event_with_context(
@@ -204,13 +555,16 @@ impl Strategy for FormulaStrategy {
         event: &MarketEvent,
         context: &StrategyContext<'_>,
     ) -> Vec<OrderIntent> {
+        if self.handle_disconnect(event) {
+            return Vec::new();
+        }
         if self.domain != EventDomain::Snapshot {
             return self.on_market_event(event, context.account);
         }
         let event_symbol = match event {
             MarketEvent::Snapshot(snapshot) => &snapshot.symbol,
             MarketEvent::Update(update) => &update.symbol,
-            MarketEvent::Quote(quote) => &quote.symbol,
+            MarketEvent::Quote(quote) if !self.config.target_position => &quote.symbol,
             _ => return Vec::new(),
         };
         if event_symbol != &self.config.symbol {
@@ -231,10 +585,50 @@ impl Strategy for FormulaStrategy {
         };
         let best_bid = Price::from(*best_bid).0;
         let best_ask = Price::from(*best_ask).0;
-        self.emit_signal(signal, book.venue, |side| match side {
-            Side::Buy => Some(best_ask),
-            Side::Sell => Some(best_bid),
-        })
+        if self.config.target_position {
+            let timestamp = event
+                .timestamps()
+                .and_then(|timestamps| timestamps.local_receive)
+                .map(|timestamp| timestamp.as_micros())
+                .unwrap_or(book.timestamp);
+            self.record_bucket_sample(timestamp, signal, book.venue, best_bid, best_ask);
+            return Vec::new();
+        }
+        self.emit_signal(
+            signal,
+            book.venue,
+            context.account,
+            |side| match side {
+                Side::Buy => Some(best_ask),
+                Side::Sell => Some(best_bid),
+            },
+            None,
+        )
+    }
+
+    fn clock_interval_micros(&self) -> Option<u64> {
+        self.config
+            .target_position
+            .then_some(self.evaluation_interval_micros)
+            .flatten()
+    }
+
+    fn on_clock(&mut self, timestamp: u64, account: &AccountView) -> Vec<OrderIntent> {
+        let Some(decision) = self.clocked_decision(timestamp) else {
+            return Vec::new();
+        };
+        let buy_price = self.target_price(Side::Buy, decision.best_bid, decision.best_ask);
+        let sell_price = self.target_price(Side::Sell, decision.best_bid, decision.best_ask);
+        self.emit_signal(
+            decision.signal,
+            decision.venue,
+            account,
+            |side| match side {
+                Side::Buy => buy_price,
+                Side::Sell => sell_price,
+            },
+            Some(decision.bucket),
+        )
     }
 
     fn on_execution_event(
@@ -265,6 +659,14 @@ fn executable_price(event: &MarketEvent, side: Side) -> Option<Decimal> {
         _ => return None,
     };
     (price > Decimal::ZERO).then_some(price)
+}
+
+fn event_timestamp(event: &MarketEvent) -> u64 {
+    match event {
+        MarketEvent::Snapshot(snapshot) => snapshot.timestamp,
+        MarketEvent::Bar(bar) => bar.close_time,
+        _ => 0,
+    }
 }
 
 fn validate_live_ast(ast: &FactorAst) -> Result<EventDomain, FormulaStrategyError> {
@@ -425,6 +827,16 @@ fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+fn quantity_within_notional(notional: Decimal, price: Decimal) -> Option<Decimal> {
+    let quantity = notional.checked_div(price)?;
+    if quantity.checked_mul(price)? <= notional {
+        return (quantity > Decimal::ZERO).then_some(quantity);
+    }
+    quantity
+        .checked_sub(Decimal::new(1, quantity.scale()))
+        .filter(|quantity| *quantity > Decimal::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,7 +844,7 @@ mod tests {
         AssetClass, FixedPrice, FixedQuantity, OrderType, Price, ProductType, Quantity, Side,
         TimeInForce, VenueId,
     };
-    use ports::{AggregatedBar, BookLevel, L2BookView, MarketSnapshot, StrategyContext};
+    use ports::{AggregatedBar, BookLevel, L2BookView, MarketSnapshot, StrategyContext, TopOfBook};
 
     fn config(ast: FactorAst) -> FormulaStrategyConfig {
         FormulaStrategyConfig {
@@ -441,7 +853,34 @@ mod tests {
             ast,
             max_order_notional: Decimal::from(100),
             signal_threshold: 0.1,
+            target_position: false,
+            evaluation_interval_millis: None,
+            target_venue: None,
+            venue_spec: None,
+            cross_spread: None,
         }
+    }
+
+    fn sealed_target_config(ast: FactorAst) -> FormulaStrategyConfig {
+        let mut target = config(ast);
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        target.target_venue = Some(VenueId::BITGET);
+        target.venue_spec = Some(VenueSpec {
+            name: "BITGET".to_string(),
+            tick_size: Price(Decimal::ONE),
+            lot_size: Quantity(Decimal::new(1, 2)),
+            min_qty: Quantity(Decimal::new(1, 2)),
+            max_quantity: None,
+            min_notional: Decimal::from(5),
+            maker_fee_bps: None,
+            taker_fee_bps: None,
+            rate_limit: None,
+        });
+        target.cross_spread = Some(false);
+        target
     }
 
     fn field(name: &str) -> FactorAst {
@@ -474,6 +913,15 @@ mod tests {
         })
     }
 
+    fn snapshot_at(bid_size: i64, ask_size: i64, timestamp: u64) -> MarketEvent {
+        let mut event = snapshot(bid_size, ask_size);
+        let MarketEvent::Snapshot(snapshot) = &mut event else {
+            unreachable!()
+        };
+        snapshot.timestamp = timestamp;
+        event
+    }
+
     fn bar(open: i64, close: i64) -> MarketEvent {
         MarketEvent::Bar(AggregatedBar {
             symbol: Symbol::from("BTCUSDT"),
@@ -493,6 +941,16 @@ mod tests {
 
     fn intents(strategy: &mut FormulaStrategy, event: &MarketEvent) -> Vec<OrderIntent> {
         strategy.on_market_event(event, &AccountView::default())
+    }
+
+    fn target_intents(
+        strategy: &mut FormulaStrategy,
+        event: &MarketEvent,
+        account: &AccountView,
+        clock: u64,
+    ) -> Vec<OrderIntent> {
+        assert!(strategy.on_market_event(event, account).is_empty());
+        strategy.on_clock(clock, account)
     }
 
     #[test]
@@ -519,6 +977,17 @@ mod tests {
                 FormulaStrategyError::InvalidSignalThreshold
             );
         }
+    }
+
+    #[test]
+    fn target_position_requires_a_positive_bucket_interval() {
+        let mut target = config(field("book_imbalance"));
+        target.target_position = true;
+
+        assert_eq!(
+            FormulaStrategy::new(target).unwrap_err(),
+            FormulaStrategyError::InvalidEvaluationInterval
+        );
     }
 
     #[test]
@@ -776,6 +1245,328 @@ mod tests {
     }
 
     #[test]
+    fn target_position_mode_reverses_and_closes_with_position_deltas() {
+        let long_quantity =
+            quantity_within_notional(Decimal::from(50), Decimal::from(101)).unwrap();
+        let mut account = AccountView::default();
+        account.positions.insert(
+            Symbol::from("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::from("BTCUSDT"),
+                quantity: Quantity(long_quantity),
+                avg_price: Price(Decimal::from(101)),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+        let mut target = config(field("book_imbalance"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = 0.2;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target.clone()).unwrap();
+
+        let reversal = target_intents(
+            &mut strategy,
+            &snapshot_at(1, 3, 1_000_000),
+            &account,
+            1_000_000,
+        );
+        assert_eq!(reversal.len(), 1);
+        assert_eq!(reversal[0].side, Side::Sell);
+        assert_eq!(reversal[0].product_type, ProductType::Perp);
+        assert_eq!(
+            reversal[0].quantity.0,
+            quantity_within_notional(Decimal::from(50), Decimal::from(99)).unwrap()
+        );
+        assert!(reversal[0].quantity.0 * reversal[0].price.unwrap().0 <= Decimal::from(50));
+
+        let mut progressed = account.clone();
+        progressed
+            .positions
+            .get_mut(&Symbol::from("BTCUSDT"))
+            .unwrap()
+            .quantity = Quantity(long_quantity - reversal[0].quantity.0);
+        let remainder = target_intents(
+            &mut strategy,
+            &snapshot_at(1, 3, 2_000_000),
+            &progressed,
+            2_000_000,
+        );
+        assert_eq!(remainder.len(), 1);
+        assert_eq!(remainder[0].side, Side::Sell);
+        assert_eq!(remainder[0].quantity.0, long_quantity);
+        assert!(remainder[0].quantity.0 * remainder[0].price.unwrap().0 <= Decimal::from(50));
+
+        let mut rejected = FormulaStrategy::new(target.clone()).unwrap();
+        assert_eq!(
+            target_intents(
+                &mut rejected,
+                &snapshot_at(1, 3, 1_000_000),
+                &account,
+                1_000_000,
+            )
+            .len(),
+            1
+        );
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(1, 3, 3_000_000),
+            &progressed,
+            3_000_000,
+        )
+        .is_empty());
+        assert!(target_intents(
+            &mut rejected,
+            &snapshot_at(1, 3, 2_000_000),
+            &account,
+            2_000_000,
+        )
+        .is_empty());
+        assert_eq!(
+            target_intents(
+                &mut rejected,
+                &snapshot_at(1, 3, 3_000_000),
+                &account,
+                3_000_000,
+            )
+            .len(),
+            1
+        );
+
+        let mut flipped = FormulaStrategy::new(target.clone()).unwrap();
+        assert_eq!(
+            target_intents(
+                &mut flipped,
+                &snapshot_at(3, 1, 1_000_000),
+                &AccountView::default(),
+                1_000_000,
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            target_intents(
+                &mut flipped,
+                &snapshot_at(1, 3, 2_000_000),
+                &AccountView::default(),
+                2_000_000,
+            )[0]
+            .side,
+            Side::Sell
+        );
+
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let close = target_intents(
+            &mut strategy,
+            &snapshot_at(1, 1, 1_000_000),
+            &account,
+            1_000_000,
+        );
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].side, Side::Sell);
+        assert_eq!(close[0].quantity.0, long_quantity);
+    }
+
+    #[test]
+    fn target_position_uses_the_last_point_in_time_book_before_each_bucket() {
+        let mut target = config(field("book_imbalance"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+
+        assert!(strategy
+            .on_market_event(&snapshot_at(3, 1, 100_000), &account)
+            .is_empty());
+        assert!(strategy
+            .on_market_event(&snapshot_at(1, 3, 900_000), &account)
+            .is_empty());
+        let boundary = strategy.on_clock(1_000_000, &account);
+        assert_eq!(boundary.len(), 1);
+        assert_eq!(boundary[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn target_position_reuses_the_last_book_on_each_clock_bucket() {
+        let mut target = config(field("book_imbalance"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+
+        assert!(strategy
+            .on_market_event(&snapshot_at(3, 1, 100_000), &account)
+            .is_empty());
+        assert_eq!(strategy.on_clock(1_000_000, &account).len(), 1);
+        assert!(strategy.on_clock(2_000_000, &account).is_empty());
+        assert_eq!(strategy.on_clock(3_000_000, &account).len(), 1);
+    }
+
+    #[test]
+    fn sealed_target_orders_use_maker_price_step_size_and_minimum_notional() {
+        let mut strategy = FormulaStrategy::new(sealed_target_config(field("book_imbalance")))
+            .expect("valid sealed target strategy");
+
+        let order = target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 1_000_000),
+            &AccountView::default(),
+            1_000_000,
+        )[0]
+        .clone();
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.price, Some(Price(Decimal::from(99))));
+        assert_eq!(order.quantity, Quantity(Decimal::new(50, 2)));
+        assert_eq!(order.time_in_force, TimeInForce::GTC);
+
+        let mut dust = AccountView::default();
+        dust.positions.insert(
+            Symbol::from("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::from("BTCUSDT"),
+                quantity: Quantity(Decimal::new(4, 2)),
+                avg_price: Price(Decimal::from(99)),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(1, 1, 2_000_000),
+            &dust,
+            2_000_000,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn attained_target_does_not_rebalance_when_the_quote_changes() {
+        let mut strategy = FormulaStrategy::new(sealed_target_config(field("book_imbalance")))
+            .expect("valid sealed target strategy");
+        let first = target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 1_000_000),
+            &AccountView::default(),
+            1_000_000,
+        );
+        let mut filled = AccountView::default();
+        filled.positions.insert(
+            Symbol::from("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::from("BTCUSDT"),
+                quantity: first[0].quantity,
+                avg_price: first[0].price.unwrap(),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+        let MarketEvent::Snapshot(mut changed_quote) = snapshot_at(3, 1, 2_000_000) else {
+            unreachable!()
+        };
+        changed_quote.bids[0].price = Price(Decimal::from(109));
+        changed_quote.asks[0].price = Price(Decimal::from(111));
+
+        assert!(target_intents(
+            &mut strategy,
+            &MarketEvent::Snapshot(changed_quote),
+            &filled,
+            2_000_000,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn target_series_resets_on_disconnect() {
+        let mut target = config(field("book_imbalance"));
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+
+        assert!(strategy
+            .on_market_event(&snapshot_at(3, 1, 100_000), &account)
+            .is_empty());
+        assert!(strategy
+            .on_market_event(
+                &MarketEvent::Disconnect {
+                    reason: "depth generation invalidated".to_string(),
+                    source_venue: Some(VenueId::BITGET),
+                    symbol: Some(Symbol::from("BTCUSDT")),
+                },
+                &account,
+            )
+            .is_empty());
+        assert!(strategy
+            .on_market_event(&snapshot_at(1, 3, 1_100_000), &account)
+            .is_empty());
+        assert_eq!(strategy.on_clock(2_000_000, &account)[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn target_series_ignores_book_ticker_overlays() {
+        let mut strategy = FormulaStrategy::new(sealed_target_config(field("book_imbalance")))
+            .expect("valid sealed target strategy");
+        let symbol = Symbol::from("BTCUSDT");
+        let bid_prices = [FixedPrice::from_f64(99.0)];
+        let bid_quantities = [FixedQuantity::from_f64(3.0)];
+        let ask_prices = [FixedPrice::from_f64(101.0)];
+        let ask_quantities = [FixedQuantity::from_f64(1.0)];
+        let account = AccountView::default();
+        let context = StrategyContext {
+            account: &account,
+            book: Some(L2BookView {
+                symbol: &symbol,
+                venue: VenueId::BITGET,
+                timestamp: 1_000_000,
+                sequence: 2,
+                bid_prices: &bid_prices,
+                bid_quantities: &bid_quantities,
+                ask_prices: &ask_prices,
+                ask_quantities: &ask_quantities,
+            }),
+        };
+        let quote = MarketEvent::Quote(TopOfBook {
+            symbol: symbol.clone(),
+            timestamp: 1_000_000,
+            sequence: 2,
+            bid: BookLevel {
+                price: Price(Decimal::from(99)),
+                quantity: Quantity(Decimal::from(3)),
+            },
+            ask: BookLevel {
+                price: Price(Decimal::from(101)),
+                quantity: Quantity(Decimal::ONE),
+            },
+            source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
+        });
+        assert!(strategy
+            .on_market_event_with_context(&quote, &context)
+            .is_empty());
+
+        let update = MarketEvent::Update(ports::BookUpdate {
+            symbol: symbol.clone(),
+            timestamp: 1_000_000,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            first_sequence: Some(2),
+            sequence: 2,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
+        });
+        assert!(strategy
+            .on_market_event_with_context(&update, &context)
+            .is_empty());
+        assert_eq!(strategy.on_clock(1_000_000, &account).len(), 1);
+    }
+
+    #[test]
     fn unsupported_or_invalid_arithmetic_and_empty_books_fail_closed() {
         for (ast, operator) in [
             (
@@ -850,7 +1641,7 @@ mod tests {
             book: Some(L2BookView {
                 symbol: &symbol,
                 venue: VenueId::BITGET,
-                timestamp: 2,
+                timestamp: 1_000_000,
                 sequence: 2,
                 bid_prices: &bid_prices,
                 bid_quantities: &bid_quantities,
@@ -860,7 +1651,7 @@ mod tests {
         };
         let event = MarketEvent::Update(ports::BookUpdate {
             symbol: symbol.clone(),
-            timestamp: 2,
+            timestamp: 1_000_000,
             bids: vec![BookLevel {
                 price: Price(Decimal::from(99)),
                 quantity: Quantity(Decimal::from(3)),
@@ -879,5 +1670,16 @@ mod tests {
         assert_eq!(orders[0].side, Side::Buy);
         assert_eq!(orders[0].price, Some(Price(Decimal::from(101))));
         assert_eq!(orders[0].target_venue, Some(VenueId::BITGET));
+
+        let mut target = config(field("book_imbalance"));
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut target = FormulaStrategy::new(target).unwrap();
+        assert!(target
+            .on_market_event_with_context(&event, &context)
+            .is_empty());
+        let orders = target.on_clock(1_000_000, &account);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].product_type, ProductType::Perp);
     }
 }

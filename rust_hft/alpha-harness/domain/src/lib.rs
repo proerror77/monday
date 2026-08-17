@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hft_factor_dsl::{
     validate_live_formula, FactorAst, FactorOperator, FactorTerminal, LiveFormulaCapabilityError,
 };
-use hft_research_manifest::{ArtifactRef, ManifestId};
+use hft_research_manifest::{ArtifactRef, CexInstrumentRulesV2, ManifestId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3427,6 +3427,27 @@ pub struct SignedRuntimeAttributionEvent {
     pub signature_hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedRuntimeAttributionEvent(RuntimeAttributionEvent);
+
+impl VerifiedRuntimeAttributionEvent {
+    pub fn event(&self) -> &RuntimeAttributionEvent {
+        &self.0
+    }
+
+    pub fn into_event(self) -> RuntimeAttributionEvent {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedRuntimeAttributionEvent {
+    type Target = RuntimeAttributionEvent;
+
+    fn deref(&self) -> &Self::Target {
+        self.event()
+    }
+}
+
 pub fn sign_runtime_attribution_event(
     event: RuntimeAttributionEvent,
     key_id: impl Into<String>,
@@ -3448,7 +3469,7 @@ pub fn sign_runtime_attribution_event(
 pub fn verify_runtime_attribution_event(
     signed: &SignedRuntimeAttributionEvent,
     trusted_keys: &BTreeMap<String, VerifyingKey>,
-) -> Result<RuntimeAttributionEvent, DomainError> {
+) -> Result<VerifiedRuntimeAttributionEvent, DomainError> {
     signed.event.validate()?;
     require_text("runtime attribution key_id", &signed.key_id)?;
     let expected_hash = canonical_json_hash(&signed.event)?;
@@ -3464,7 +3485,7 @@ pub fn verify_runtime_attribution_event(
         .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
     key.verify(signed.content_hash.as_bytes(), &signature)
         .map_err(|_| DomainError::InvalidAttributionSignature)?;
-    Ok(signed.event.clone())
+    Ok(VerifiedRuntimeAttributionEvent(signed.event.clone()))
 }
 
 pub fn runtime_stage_is_healthy(
@@ -3475,6 +3496,7 @@ pub fn runtime_stage_is_healthy(
     #[derive(Default)]
     struct DeploymentHealth {
         activated: bool,
+        cost_coverage_required: bool,
         unhealthy: bool,
         strategies: BTreeMap<String, StrategyHealth>,
     }
@@ -3482,6 +3504,7 @@ pub fn runtime_stage_is_healthy(
     #[derive(Default)]
     struct StrategyHealth {
         healthy_snapshot: bool,
+        cost_covered_snapshot: bool,
         fill: bool,
     }
 
@@ -3507,6 +3530,10 @@ pub fn runtime_stage_is_healthy(
             && event.outcome == AttributionOutcome::Activated
         {
             health.activated = true;
+            health.cost_coverage_required |= event
+                .metrics
+                .get("sealed_execution_cost_coverage_required")
+                .is_some_and(|value| value.is_finite() && *value >= 1.0);
         }
         if event.outcome == AttributionOutcome::Healthy
             && event.kind == AttributionKind::PortfolioSnapshot
@@ -3514,11 +3541,10 @@ pub fn runtime_stage_is_healthy(
                 || portfolio_snapshot_has_authoritative_truth(event))
         {
             if let Some(strategy_id) = event.strategy_id.as_ref() {
-                health
-                    .strategies
-                    .entry(strategy_id.clone())
-                    .or_default()
-                    .healthy_snapshot = true;
+                let strategy = health.strategies.entry(strategy_id.clone()).or_default();
+                strategy.healthy_snapshot = true;
+                strategy.cost_covered_snapshot |=
+                    portfolio_snapshot_has_complete_cost_coverage(event);
             }
         }
         if event.kind == AttributionKind::Fill {
@@ -3535,14 +3561,29 @@ pub fn runtime_stage_is_healthy(
     by_deployment.values().any(|health| {
         !health.unhealthy
             && health.activated
-            && health
-                .strategies
-                .values()
-                .any(|strategy| strategy.healthy_snapshot && strategy.fill)
+            && health.strategies.values().any(|strategy| {
+                strategy.fill
+                    && if health.cost_coverage_required {
+                        strategy.cost_covered_snapshot
+                    } else {
+                        strategy.healthy_snapshot
+                    }
+            })
     })
 }
 
 const MAX_RUNTIME_RECONCILIATION_AGE_US: f64 = 30_000_000.0;
+
+fn portfolio_snapshot_has_complete_cost_coverage(event: &RuntimeAttributionEvent) -> bool {
+    ["fee_coverage_complete", "execution_cost_coverage_complete"]
+        .iter()
+        .all(|name| {
+            event
+                .metrics
+                .get(*name)
+                .is_some_and(|value| value.is_finite() && *value >= 1.0)
+        })
+}
 
 fn portfolio_snapshot_has_authoritative_truth(event: &RuntimeAttributionEvent) -> bool {
     let metric_is_one = |name: &str| {
@@ -4101,9 +4142,20 @@ pub struct CexFourStageStrategyCandidateV1 {
     pub venue: CexResearchVenueV1,
     pub market: CexResearchMarketV1,
     pub symbol: String,
+    pub instrument_rules: CexInstrumentRulesV2,
     pub evaluation_protocol_hash: String,
     pub deployment_authority: bool,
     pub order_submission_authority: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CexFourStageRuntimeContractV1 {
+    pub zero_epsilon: f64,
+    pub observation_frequency_millis: u64,
+    pub tick_size: String,
+    pub step_size: String,
+    pub min_notional: String,
+    pub costs: EvaluationCostsV1,
 }
 
 impl CexFourStageStrategyCandidateV1 {
@@ -4117,6 +4169,7 @@ impl CexFourStageStrategyCandidateV1 {
         venue: CexResearchVenueV1,
         market: CexResearchMarketV1,
         symbol: String,
+        instrument_rules: CexInstrumentRulesV2,
         evaluation_protocol_hash: String,
     ) -> Result<Self, DomainError> {
         let strategy_artifact_sha256 =
@@ -4134,6 +4187,7 @@ impl CexFourStageStrategyCandidateV1 {
             venue,
             market,
             symbol,
+            instrument_rules,
             evaluation_protocol_hash,
             deployment_authority: false,
             order_submission_authority: false,
@@ -4146,6 +4200,9 @@ impl CexFourStageStrategyCandidateV1 {
         let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
         strategy.validate()?;
+        self.instrument_rules
+            .validate()
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
         if self.schema_version != CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1
             || self.precommit_id != format!("cex-final-precommit:{}", self.mission_id)
             || [
@@ -4179,6 +4236,20 @@ impl CexFourStageStrategyCandidateV1 {
         }
         validate_live_formula(&self.executable_formula)?;
         Ok(())
+    }
+
+    pub fn runtime_contract(&self) -> Result<CexFourStageRuntimeContractV1, DomainError> {
+        self.validate()?;
+        let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        Ok(CexFourStageRuntimeContractV1 {
+            zero_epsilon: strategy.sizing.zero_epsilon,
+            observation_frequency_millis: strategy.execution.horizon.observation_frequency_millis,
+            tick_size: self.instrument_rules.tick_size.clone(),
+            step_size: self.instrument_rules.step_size.clone(),
+            min_notional: self.instrument_rules.min_notional.clone(),
+            costs: strategy.execution.costs,
+        })
     }
 
     pub fn validate_against_factor_bank(
@@ -5874,7 +5945,9 @@ mod tests {
         let trusted = BTreeMap::from([("feedback-1".to_string(), key.verifying_key())]);
 
         assert_eq!(
-            verify_runtime_attribution_event(&signed, &trusted).unwrap(),
+            verify_runtime_attribution_event(&signed, &trusted)
+                .unwrap()
+                .into_event(),
             event
         );
         assert_eq!(
@@ -5891,7 +5964,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_requires_reconciliation_truth_only_for_live_small() {
+    fn runtime_health_requires_cost_coverage_and_live_small_reconciliation_truth() {
         let now = Utc::now();
         let scoped = |id: &str,
                       kind: AttributionKind,
@@ -5919,6 +5992,9 @@ mod tests {
             AttributionOutcome::Activated,
             None,
         )];
+        events[0]
+            .metrics
+            .insert("sealed_execution_cost_coverage_required".to_string(), 1.0);
         assert!(!runtime_stage_is_healthy(
             &events,
             "candidate-1",
@@ -5936,6 +6012,18 @@ mod tests {
             AttributionOutcome::Healthy,
             Some("strategy-1"),
         ));
+        assert!(!runtime_stage_is_healthy(
+            &events,
+            "candidate-1",
+            AttributionMode::Shadow
+        ));
+        let snapshot = events.last_mut().unwrap();
+        snapshot
+            .metrics
+            .insert("fee_coverage_complete".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("execution_cost_coverage_complete".to_string(), 1.0);
         assert!(runtime_stage_is_healthy(
             &events,
             "candidate-1",
