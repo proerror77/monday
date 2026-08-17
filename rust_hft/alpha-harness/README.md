@@ -15,15 +15,15 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
 | Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
-| Event-level L2 replay receipt | Blocked by [#603](https://github.com/proerror77/monday/issues/603) | Replay/materializer infrastructure exists, but no receipt is produced from the missing four-stage artifact |
-| Final precommit and sealed holdout | Blocked by [#604](https://github.com/proerror77/monday/issues/604) | Existing generic sealed-evaluation primitives are not completion evidence for this CEX contract |
-| Signed Paper/Shadow intake | Blocked by [#605](https://github.com/proerror77/monday/issues/605) | The generic signed boundary exists; no four-stage CEX bundle reaches it yet |
-| Exact-main CEX run and readback | Blocked by [#606](https://github.com/proerror77/monday/issues/606) | No complete single-instrument result bundle has crossed every boundary above |
+| Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt and explicit queue/partial-fill/impact/capacity disclosures |
+| Final precommit and sealed holdout | Implemented | Exact precommit, at-most-once sealed opening, immutable receipt, bundle, and promotion lineage |
+| Signed Paper/Shadow intake | Implemented | Signed four-stage CEX bundles reach the fail-closed Paper/Shadow boundary; this grants no LiveSmall authority |
+| Exact-main CEX run and readback | Pending [#606](https://github.com/proerror77/monday/issues/606) | A fresh credential-free USD-M Mission still needs cloud Runtime and independent result readback |
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
 
 `mission execute` is the CEX operator acceptance seam. Low-level Mission and
 LoopRun commands remain diagnostics and implementation surfaces; they are not
-alternate evidence paths around the blocked contracts above.
+alternate evidence paths around the acceptance contracts above.
 
 ## Data Mission
 
@@ -104,7 +104,11 @@ The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and
 evaluation protocol, and typed prior-evidence references. The command derives
 research fields, budgets, and costs from that artifact; they are not accepted
-as alternate execute flags. Unknown fields, Prediction Market fields, action
+as alternate execute flags. The latest credential-free replay writer currently
+admits USD-M only: public reference artifacts bind instrument rules, funding,
+and open interest, while fee and rebate values remain explicit, content-hashed
+Mission assumptions. Historical account-bound and Spot replay schemas remain
+read-only. Unknown fields, Prediction Market fields, action
 requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
 feedback fail before Mission admission. `operational.submitted_at` is retained
 for audit but does not alter the semantic Mission identity. After both baselines

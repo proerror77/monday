@@ -10,13 +10,16 @@ use thiserror::Error;
 pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V1: &str = "cex-replay-snapshot-v1";
 pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V2: &str = "cex-replay-snapshot-v2";
 pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V3: &str = "cex-replay-snapshot-v3";
+pub const CEX_REPLAY_SNAPSHOT_SCHEMA_V4: &str = "cex-replay-snapshot-v4";
 pub const CEX_REPLAY_DATASET_KIND: &str = "cex_replay_feature_dataset";
 pub const CEX_REPLAY_DATASET_SCHEMA_V1: &str = "cex-replay-feature-dataset-v1";
 pub const CEX_REPLAY_DATASET_SCHEMA_V2: &str = "cex-replay-feature-dataset-v2";
 pub const CEX_REPLAY_DATASET_SCHEMA_V3: &str = "cex-replay-feature-dataset-v3";
+pub const CEX_REPLAY_DATASET_SCHEMA_V4: &str = "cex-replay-feature-dataset-v4";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2: &str = "binance-lob-pit-v2";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3: &str = "binance-lob-pit-v3";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4: &str = "binance-lob-pit-v4";
+pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5: &str = "binance-lob-pit-v5";
 pub const CEX_REPLAY_CLOCK_RECEIVED_AT_NS: &str = "received_at_ns";
 pub const CEX_FEATURE_AVAILABILITY_POLICY: &str = "feature_available_time_equals_event_time";
 pub const CEX_MODALITY_LOB: &str = "lob";
@@ -47,7 +50,7 @@ pub struct CexReplaySegmentIdentity {
     pub events: u64,
 }
 
-/// Historical CEX replay snapshot. Kept for read-only evidence decoding; new writers use V3.
+/// Historical CEX replay snapshot. Kept for read-only evidence decoding; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV1 {
@@ -195,7 +198,7 @@ pub struct CexLatencyCostV2 {
     pub p99_cost_bps: String,
 }
 
-/// Historical CEX replay snapshot. Kept for immutable evidence readback; new writers use V3.
+/// Historical CEX replay snapshot. Kept for immutable evidence readback; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV2 {
@@ -325,6 +328,7 @@ impl CexReplaySnapshotV2 {
     }
 }
 
+/// Historical account-bound snapshot. Kept for immutable evidence readback; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplaySnapshotV3 {
@@ -403,6 +407,98 @@ impl CexReplaySnapshotV3 {
             || self.fee_schedule.valid_through < label_available_through
         {
             return Err(invalid("PIT rules or fee evidence is invalid"));
+        }
+        match (&self.instrument_type[..], &self.derivatives_reference) {
+            ("usdm", Some(reference))
+                if pit_series_covers(
+                    &reference.funding,
+                    self.first_event_time,
+                    label_available_through,
+                ) && pit_series_covers(
+                    &reference.open_interest,
+                    self.first_event_time,
+                    label_available_through,
+                ) && nonnegative_decimal(&reference.evaluation_funding_bps_per_bucket) => {}
+            ("spot", None) => {}
+            _ => return Err(invalid("derivatives reference evidence is invalid")),
+        }
+        Ok(())
+    }
+
+    pub fn sha256(&self) -> String {
+        snapshot_sha256(self)
+    }
+}
+
+/// Credential-free research snapshot. Account-specific fees belong to runtime calibration;
+/// reproducible research costs are declared by the content-hashed Mission evaluation policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexReplaySnapshotV4 {
+    pub schema_version: String,
+    pub venue: String,
+    pub instrument_type: String,
+    pub symbol: String,
+    pub replay_clock: String,
+    pub required_modalities: BTreeSet<String>,
+    pub source_segments: Vec<CexReplaySegmentIdentity>,
+    pub first_event_time: DateTime<Utc>,
+    pub last_event_time: DateTime<Utc>,
+    pub feature_artifact_sha256: String,
+    pub feature_availability_policy: String,
+    pub bucket_ms: u64,
+    pub label_horizon_buckets: usize,
+    pub top_depth: usize,
+    pub instrument_rules: CexInstrumentRulesV2,
+    pub derivatives_reference: Option<CexDerivativesReferenceV2>,
+}
+
+impl CexReplaySnapshotV4 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if !valid_cex_symbol(&self.symbol) {
+            return Err(ManifestError::InvalidCexReplaySnapshot(
+                "symbol is not canonical",
+            ));
+        }
+        let mut required = BTreeSet::from([
+            CEX_MODALITY_LOB.to_string(),
+            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+        ]);
+        if self.instrument_type == "usdm" {
+            required.insert(CEX_MODALITY_FUNDING.to_string());
+            required.insert(CEX_MODALITY_OPEN_INTEREST.to_string());
+        }
+        validate_snapshot_core(
+            &self.schema_version,
+            CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
+            &self.venue,
+            &self.instrument_type,
+            &self.symbol,
+            &self.replay_clock,
+            &self.required_modalities,
+            &required,
+            &self.source_segments,
+            self.first_event_time,
+            self.last_event_time,
+            &self.feature_artifact_sha256,
+            &self.feature_availability_policy,
+            self.bucket_ms,
+            self.label_horizon_buckets,
+            self.top_depth,
+        )?;
+        let invalid = ManifestError::InvalidCexReplaySnapshot;
+        let label_available_through = u64::try_from(self.label_horizon_buckets)
+            .ok()
+            .and_then(|horizon| self.bucket_ms.checked_mul(horizon))
+            .and_then(|offset| i64::try_from(offset).ok())
+            .and_then(chrono::TimeDelta::try_milliseconds)
+            .and_then(|offset| self.last_event_time.checked_add_signed(offset))
+            .ok_or_else(|| invalid("label availability time overflows"))?;
+        self.instrument_rules.validate()?;
+        if self.instrument_rules.available_at > self.first_event_time
+            || self.instrument_rules.valid_through < label_available_through
+        {
+            return Err(invalid("PIT instrument rules evidence is invalid"));
         }
         match (&self.instrument_type[..], &self.derivatives_reference) {
             ("usdm", Some(reference))
@@ -549,7 +645,7 @@ fn snapshot_sha256<T: Serialize>(snapshot: &T) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Historical CEX replay dataset. Kept for read-only evidence decoding; new writers use V3.
+/// Historical CEX replay dataset. Kept for read-only evidence decoding; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV1 {
@@ -578,7 +674,7 @@ impl CexReplayDatasetManifestV1 {
     }
 }
 
-/// Historical dataset manifest. Kept for immutable evidence readback; new writers use V3.
+/// Historical dataset manifest. Kept for immutable evidence readback; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV2 {
@@ -607,6 +703,7 @@ impl CexReplayDatasetManifestV2 {
     }
 }
 
+/// Historical account-bound dataset. Kept for immutable evidence readback; new writers use V4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CexReplayDatasetManifestV3 {
@@ -616,6 +713,51 @@ pub struct CexReplayDatasetManifestV3 {
     pub feature_manifest_id: String,
     pub snapshot: CexReplaySnapshotV3,
     pub snapshot_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CexReplayDatasetManifestV4 {
+    pub dataset_kind: String,
+    pub schema_version: String,
+    pub manifest_id: String,
+    pub feature_manifest_id: String,
+    pub snapshot: CexReplaySnapshotV4,
+    pub snapshot_sha256: String,
+}
+
+impl CexReplayDatasetManifestV4 {
+    pub fn new(
+        feature_manifest_id: impl Into<String>,
+        snapshot: CexReplaySnapshotV4,
+    ) -> Result<Self, ManifestError> {
+        let snapshot_sha256 = snapshot.sha256();
+        let manifest = Self {
+            dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
+            schema_version: CEX_REPLAY_DATASET_SCHEMA_V4.to_string(),
+            manifest_id: format!("dataset-cex-replay-{snapshot_sha256}"),
+            feature_manifest_id: feature_manifest_id.into(),
+            snapshot,
+            snapshot_sha256,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let invalid = ManifestError::InvalidCexReplayDataset;
+        self.snapshot.validate()?;
+        if self.dataset_kind != CEX_REPLAY_DATASET_KIND
+            || self.schema_version != CEX_REPLAY_DATASET_SCHEMA_V4
+            || self.feature_manifest_id.trim().is_empty()
+            || !valid_sha256(&self.snapshot_sha256)
+            || self.snapshot_sha256 != self.snapshot.sha256()
+            || self.manifest_id != format!("dataset-cex-replay-{}", self.snapshot_sha256)
+        {
+            return Err(invalid("metadata or digest is inconsistent"));
+        }
+        Ok(())
+    }
 }
 
 impl CexReplayDatasetManifestV3 {
@@ -918,9 +1060,9 @@ mod tests {
         }
     }
 
-    fn cex_snapshot() -> CexReplaySnapshotV3 {
-        CexReplaySnapshotV3 {
-            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
+    fn cex_snapshot() -> CexReplaySnapshotV4 {
+        CexReplaySnapshotV4 {
+            schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -961,21 +1103,6 @@ mod tests {
                     .with_timezone(&Utc),
                 evidence: vec![triplet('4')],
             },
-            fee_schedule: CexFeeScheduleV2 {
-                runtime_account_id: "desk/main".to_string(),
-                account_fingerprint: "9".repeat(64),
-                maker_buy_fee_bps: "2".to_string(),
-                maker_sell_fee_bps: "2".to_string(),
-                taker_buy_fee_bps: "5".to_string(),
-                taker_sell_fee_bps: "5".to_string(),
-                available_at: DateTime::parse_from_rfc3339("2026-07-14T00:00:01Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                valid_through: DateTime::parse_from_rfc3339("2026-07-14T00:00:09Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                evidence: vec![triplet('5')],
-            },
             derivatives_reference: Some(CexDerivativesReferenceV2 {
                 funding: CexPitSeriesEvidenceV2 {
                     evidence: vec![triplet('6'), triplet('a')],
@@ -1004,8 +1131,25 @@ mod tests {
         }
     }
 
-    fn historical_cex_snapshot_v2() -> CexReplaySnapshotV2 {
+    fn historical_cex_snapshot_v3() -> CexReplaySnapshotV3 {
         let mut value = serde_json::to_value(cex_snapshot()).unwrap();
+        value["schema_version"] = serde_json::json!(CEX_REPLAY_SNAPSHOT_SCHEMA_V3);
+        value["fee_schedule"] = serde_json::json!({
+            "runtime_account_id": "desk/main",
+            "account_fingerprint": "9".repeat(64),
+            "maker_buy_fee_bps": "2",
+            "maker_sell_fee_bps": "2",
+            "taker_buy_fee_bps": "5",
+            "taker_sell_fee_bps": "5",
+            "available_at": "2026-07-14T00:00:01Z",
+            "valid_through": "2026-07-14T00:00:09Z",
+            "evidence": [triplet('5')]
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn historical_cex_snapshot_v2() -> CexReplaySnapshotV2 {
+        let mut value = serde_json::to_value(historical_cex_snapshot_v3()).unwrap();
         value["schema_version"] = serde_json::json!(CEX_REPLAY_SNAPSHOT_SCHEMA_V2);
         value["latency_cost"] = serde_json::json!({
             "method": "verified_order_lifecycle_realized_slippage",
@@ -1062,6 +1206,16 @@ mod tests {
     }
 
     #[test]
+    fn credential_free_snapshot_has_no_account_identity_or_fee_schedule() {
+        let value = serde_json::to_value(cex_snapshot()).unwrap();
+
+        assert!(value.get("fee_schedule").is_none());
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(!encoded.contains("runtime_account_id"));
+        assert!(!encoded.contains("account_fingerprint"));
+    }
+
+    #[test]
     fn cex_replay_snapshot_rejects_overlapping_segments() {
         let mut snapshot = cex_snapshot();
         snapshot.source_segments.push(CexReplaySegmentIdentity {
@@ -1095,11 +1249,11 @@ mod tests {
     fn cex_replay_dataset_identity_binds_snapshot_digest() {
         let snapshot = cex_snapshot();
         let manifest =
-            CexReplayDatasetManifestV3::new("dataset-feature-sha", snapshot.clone()).unwrap();
+            CexReplayDatasetManifestV4::new("dataset-feature-sha", snapshot.clone()).unwrap();
         let mut different_tape = snapshot;
         different_tape.source_segments[0].manifest_sha256 = "4".repeat(64);
         let different =
-            CexReplayDatasetManifestV3::new("dataset-feature-sha", different_tape).unwrap();
+            CexReplayDatasetManifestV4::new("dataset-feature-sha", different_tape).unwrap();
 
         assert_ne!(manifest.manifest_id, different.manifest_id);
         manifest.validate().unwrap();
@@ -1142,18 +1296,18 @@ mod tests {
     #[test]
     fn cex_replay_snapshot_rejects_empty_evidence_set() {
         let mut snapshot = cex_snapshot();
-        snapshot.fee_schedule.evidence.clear();
+        snapshot.instrument_rules.evidence.clear();
 
         assert_eq!(
             snapshot.validate().unwrap_err(),
-            ManifestError::InvalidCexReplaySnapshot("PIT rules or fee evidence is invalid")
+            ManifestError::InvalidCexReplaySnapshot("instrument rules are invalid")
         );
     }
 
     #[test]
     fn cex_replay_snapshot_rejects_unbound_success_marker() {
         let mut snapshot = cex_snapshot();
-        snapshot.fee_schedule.evidence[0].success_sha256 = "9".repeat(64);
+        snapshot.instrument_rules.evidence[0].success_sha256 = "9".repeat(64);
 
         assert!(snapshot.validate().is_err());
     }
@@ -1183,7 +1337,7 @@ mod tests {
 
     #[test]
     fn cex_replay_snapshot_rejects_fee_expiry_before_last_label() {
-        let mut snapshot = cex_snapshot();
+        let mut snapshot = historical_cex_snapshot_v3();
         snapshot.fee_schedule.valid_through = snapshot.last_event_time;
 
         assert_eq!(
@@ -1206,7 +1360,7 @@ mod tests {
 
     #[test]
     fn cex_replay_snapshot_rejects_negative_decimal_underflow() {
-        let mut snapshot = cex_snapshot();
+        let mut snapshot = historical_cex_snapshot_v3();
         snapshot.fee_schedule.maker_buy_fee_bps = "-1e-400".to_string();
 
         assert_eq!(

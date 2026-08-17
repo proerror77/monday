@@ -31,8 +31,8 @@ The storage authority remains split deliberately:
   must never open the same DuckDB file for writes.
 
 The first Agentic Alpha path uses the Rust `lob-pit-materializer` binary to
-validate the raw segment, replay Binance's Spot or USD-M sequence contract, and
-emit one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
+validate the raw segment, replay Binance's USD-M sequence contract, and emit
+one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
 SHA-256 mismatch, sequence gaps, unseeded diffs, and closing checkpoints that
 do not match the replayed full book. Feature rows and the materialization report
 are published to SHA-256-named immutable paths. Forward-mid labels are only
@@ -40,6 +40,10 @@ exposed at the future bucket's availability time.
 
 No exchange credential belongs in this namespace. Research Pods receive public
 datasets, ClickHouse read credentials, and result-write authority only.
+Account-specific fee files are not research inputs: fee and rebate assumptions
+come from the content-hashed Mission evaluation policy. Public USD-M reference
+artifacts continue to bind instrument rules, funding, and open interest. Older
+account-bound materializations remain readable evidence but cannot execute.
 
 ## Bootstrap sizing
 
