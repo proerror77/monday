@@ -40,9 +40,9 @@ use hft_backtest::{
     },
 };
 use hft_research_manifest::{
-    CexInstrumentRulesV2, CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2,
-    ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
+    CexInstrumentRulesV2, CexReplayDatasetManifestV3, CexReplaySnapshotV1, CexReplaySnapshotV2,
+    CexReplaySnapshotV3, ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4,
 };
 use reqwest::{
     blocking::Client,
@@ -91,7 +91,7 @@ struct Materialization {
     top_depth: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
-    snapshot: CexReplaySnapshotV2,
+    snapshot: CexReplaySnapshotV3,
     snapshot_sha256: String,
 }
 
@@ -291,6 +291,7 @@ struct ExecutionModelEvidence {
     rebate_bps: f64,
     funding_bps: f64,
     latency_bps: f64,
+    latency_cost_basis: &'static str,
     additional_slippage_bps: f64,
     cross_spread: bool,
     turnover_definition: &'static str,
@@ -309,11 +310,12 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     fn from(costs: &EvaluationCostsV1) -> Self {
         let capacity_gate_enabled = costs.capacity_enabled();
         Self {
-            schema_version: "execution_cost_model_v2",
+            schema_version: "execution_cost_model_v3",
             fee_bps: costs.fee_bps,
             rebate_bps: costs.rebate_bps,
             funding_bps: costs.funding_bps,
             latency_bps: costs.latency_bps,
+            latency_cost_basis: "mission_declared_assumption",
             additional_slippage_bps: costs.slippage_bps,
             cross_spread: costs.cross_spread,
             turnover_definition: "absolute_position_change; a full side flip has turnover 2",
@@ -1158,8 +1160,8 @@ fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
     {
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
-            serde_json::from_value(value).context("V3 materialization manifest is invalid")
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4) => {
+            serde_json::from_value(value).context("V4 materialization manifest is invalid")
         }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2) => {
             let snapshot: CexReplaySnapshotV1 = serde_json::from_value(
@@ -1171,6 +1173,17 @@ fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
             .context("historical V2 materialization snapshot is invalid")?;
             snapshot.validate().map_err(anyhow::Error::new)?;
             bail!("historical V2 materialization is read-only and cannot execute")
+        }
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
+            let snapshot: CexReplaySnapshotV2 = serde_json::from_value(
+                value
+                    .get("snapshot")
+                    .cloned()
+                    .context("historical V3 materialization has no snapshot")?,
+            )
+            .context("historical V3 materialization snapshot is invalid")?;
+            snapshot.validate().map_err(anyhow::Error::new)?;
+            bail!("historical V3 materialization is read-only and cannot execute")
         }
         _ => bail!("materialization kind or schema is unsupported"),
     }
@@ -1780,7 +1793,7 @@ fn validate_mission_materialization_binding(
 fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
-    dataset: &CexReplayDatasetManifestV2,
+    dataset: &CexReplayDatasetManifestV3,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
         || mission.spec.inputs.feature.content_sha256 != features.artifact_sha256
@@ -1807,7 +1820,7 @@ fn validate_materialization(
         bail!("CEX replay snapshot SHA256 mismatch");
     }
     if materialization.dataset_kind != MATERIALIZATION_KIND
-        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3
+        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4
     {
         bail!("materialization kind or schema is unsupported");
     }
@@ -1851,14 +1864,13 @@ fn validate_materialization(
     {
         bail!("evaluation label horizon or frequency does not match the materialization");
     }
-    let (fee_bps, funding_bps, latency_bps) =
+    let (fee_bps, funding_bps) =
         data_mission::cex_snapshot_costs(&materialization.snapshot, validation.cross_spread)?;
     if validation.rebate_bps != 0.0
         || validation.fee_bps.to_bits() != fee_bps.to_bits()
         || validation.funding_bps.to_bits() != funding_bps.to_bits()
-        || validation.latency_bps.to_bits() != latency_bps.to_bits()
     {
-        bail!("evaluation costs do not match the verified CEX replay snapshot");
+        bail!("evaluation fee or funding costs do not match the verified CEX replay snapshot");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
     for segment in &materialization.source_segments {
@@ -2463,7 +2475,7 @@ mod tests {
         fixture.materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
         fixture.materialization["snapshot"]["feature_artifact_sha256"] =
             serde_json::json!("0".repeat(64));
-        let snapshot: CexReplaySnapshotV2 =
+        let snapshot: CexReplaySnapshotV3 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         resign_materialization_outer(&mut fixture);
@@ -2696,7 +2708,11 @@ mod tests {
             &std::fs::read(fixture.args.work_dir.join("results/execution-model.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(execution_model["schema_version"], "execution_cost_model_v2");
+        assert_eq!(execution_model["schema_version"], "execution_cost_model_v3");
+        assert_eq!(
+            execution_model["latency_cost_basis"],
+            "mission_declared_assumption"
+        );
         assert_eq!(execution_model["rebate_bps"], 0.0);
         assert_eq!(execution_model["additional_slippage_bps"], 0.75);
         assert_eq!(execution_model["queue_position_modeled"], false);
@@ -2717,16 +2733,16 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_optimistic_costs_below_snapshot_evidence() {
+    fn execute_rejects_optimistic_fees_below_snapshot_evidence() {
         let mut fixture = fixture("optimistic-snapshot-costs");
         fixture.mission.spec.evaluation_protocol.costs.fee_bps = 0.0;
         resign_mission(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("evaluation costs do not match the verified CEX replay snapshot"));
+        assert!(error.to_string().contains(
+            "evaluation fee or funding costs do not match the verified CEX replay snapshot"
+        ));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -3949,7 +3965,7 @@ mod tests {
         let producer_id = fixture.mission.semantic_id().unwrap();
         let source = AlphaStore::open(&source_db).unwrap();
         let producer = source.get_mission(&producer_id).unwrap();
-        let dataset_manifest: CexReplayDatasetManifestV2 = serde_json::from_slice(
+        let dataset_manifest: CexReplayDatasetManifestV3 = serde_json::from_slice(
             &std::fs::read(results.join("cex-replay-dataset-manifest.json")).unwrap(),
         )
         .unwrap();
@@ -4708,8 +4724,8 @@ message binance_replay {
         )
         .unwrap();
         let source_end_ns = u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-        let snapshot = CexReplaySnapshotV2 {
-            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2.to_string(),
+        let snapshot = CexReplaySnapshotV3 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -4771,29 +4787,11 @@ message binance_replay {
                 },
                 evaluation_funding_bps_per_bucket: "0".to_string(),
             }),
-            latency_cost: hft_research_manifest::CexLatencyCostV2 {
-                method: "verified_order_lifecycle_realized_slippage".to_string(),
-                venue: "binance".to_string(),
-                symbol: "BTCUSDT".to_string(),
-                runtime_account_id: "binance-main".to_string(),
-                account_fingerprint: "9".repeat(64),
-                evidence: cex_triplet('8'),
-                first_observed_at: first_event_time - ChronoDuration::seconds(2),
-                last_observed_at: first_event_time - ChronoDuration::seconds(1),
-                available_at: first_event_time - ChronoDuration::seconds(1),
-                observations: 160,
-                p50_ns: 1_000_000,
-                p95_ns: 2_000_000,
-                p99_ns: 3_000_000,
-                p50_cost_bps: "0.1".to_string(),
-                p95_cost_bps: "0.5".to_string(),
-                p99_cost_bps: "0.6".to_string(),
-            },
         };
         let snapshot_sha256 = snapshot.sha256();
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
-            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
+            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4,
             "mission_id": "data-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
@@ -4899,7 +4897,7 @@ message binance_replay {
         let materialization_sha256 = sha256_file(&materialization_path).unwrap();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
         let dataset =
-            CexReplayDatasetManifestV2::new(format!("dataset-{feature_sha256}"), snapshot.clone())
+            CexReplayDatasetManifestV3::new(format!("dataset-{feature_sha256}"), snapshot.clone())
                 .unwrap();
         let mut mission = CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
@@ -5060,12 +5058,7 @@ message binance_replay {
                 hft_research_manifest::CEX_MODALITY_LOB
             ]),
         );
-        for field in [
-            "instrument_rules",
-            "fee_schedule",
-            "derivatives_reference",
-            "latency_cost",
-        ] {
+        for field in ["instrument_rules", "fee_schedule", "derivatives_reference"] {
             snapshot.remove(field);
         }
 
@@ -5074,6 +5067,48 @@ message binance_replay {
         assert!(error
             .to_string()
             .contains("historical V2 materialization is read-only"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn historical_v3_materialization_decodes_read_only() {
+        let fixture = fixture("historical-v3-read-only");
+        let mut value = fixture.materialization.clone();
+        value["schema_version"] = serde_json::json!(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3);
+        let snapshot = value["snapshot"].as_object_mut().unwrap();
+        snapshot.insert(
+            "schema_version".to_string(),
+            serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2),
+        );
+        let first_event_time: chrono::DateTime<Utc> =
+            serde_json::from_value(snapshot["first_event_time"].clone()).unwrap();
+        snapshot.insert(
+            "latency_cost".to_string(),
+            serde_json::json!({
+                "method": "verified_order_lifecycle_realized_slippage",
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "runtime_account_id": "binance-main",
+                "account_fingerprint": "9".repeat(64),
+                "evidence": cex_triplet('8'),
+                "first_observed_at": first_event_time - ChronoDuration::seconds(2),
+                "last_observed_at": first_event_time - ChronoDuration::seconds(1),
+                "available_at": first_event_time - ChronoDuration::seconds(1),
+                "observations": 160,
+                "p50_ns": 1_000_000,
+                "p95_ns": 2_000_000,
+                "p99_ns": 3_000_000,
+                "p50_cost_bps": "0.1",
+                "p95_cost_bps": "0.5",
+                "p99_cost_bps": "0.6"
+            }),
+        );
+
+        let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("historical V3 materialization is read-only"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -5180,7 +5215,7 @@ message binance_replay {
     }
 
     fn rebind_mission_inputs(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV2 =
+        let snapshot: CexReplaySnapshotV3 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         let snapshot_sha256 = snapshot.sha256();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
@@ -5194,7 +5229,7 @@ message binance_replay {
             .unwrap()
             .to_string();
         let dataset =
-            CexReplayDatasetManifestV2::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
+            CexReplayDatasetManifestV3::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
         fixture.mission.spec.data_mission_id = data_mission_id.clone();
         fixture.mission.spec.inputs = CexResearchInputBindingsV1 {
             dataset: CexResearchContentRefV1 {
@@ -5237,7 +5272,7 @@ message binance_replay {
     }
 
     fn resign_materialization(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV2 =
+        let snapshot: CexReplaySnapshotV3 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         std::fs::write(

@@ -1,3 +1,5 @@
+//! Read-only verifier for immutable V2 runtime-latency evidence.
+
 use crate::{
     verify_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
     SignedRuntimeAttributionEvent,
