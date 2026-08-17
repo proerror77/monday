@@ -1296,6 +1296,95 @@ impl TapeWriter {
         Ok(rotated)
     }
 
+    /// Rotate at the byte cap while recovered trades remain pending: restate
+    /// the still-pending recovered trade rows (original payloads, fresh
+    /// sequences) at the front of the new active segment, so the active tape
+    /// stays a self-contained crash-recovery source instead of deadlocking
+    /// against the cap. The carried batch is the only content allowed to
+    /// exceed the cap, and it is synced before the caller's batch continues.
+    fn rotate_with_pending_carry(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let pending = {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            let mut reader = BufReader::new(file.try_clone()?);
+            reader.seek(SeekFrom::Start(0))?;
+            // condition_id -> record_id -> insertion index into `carried`;
+            // a completion record clears the whole condition, mirroring
+            // recover_state_from_tape_row.
+            let mut live: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+            let mut carried = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                let bytes = reader.read_until(b'\n', &mut line)?;
+                if bytes == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                let row: Value = serde_json::from_slice(&line)?;
+                let Some(update) = row.get("update").and_then(Value::as_object) else {
+                    continue;
+                };
+                let kind = update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let condition_id = update.get("condition_id").and_then(Value::as_str);
+                if kind == "polymarket_trade"
+                    && update.get("record_id_version").and_then(Value::as_str)
+                        == Some(TRADE_ID_VERSION)
+                {
+                    if let (Some(condition_id), Some(record_id)) = (
+                        condition_id,
+                        update.get("record_id").and_then(Value::as_str),
+                    ) {
+                        let records = live.entry(condition_id.to_owned()).or_default();
+                        if records
+                            .insert(record_id.to_owned(), carried.len())
+                            .is_some()
+                        {
+                            bail!("active tape contains duplicate trade record ID {record_id}");
+                        }
+                        carried.push(row);
+                    }
+                } else if kind == TRADE_COMPLETION_KIND {
+                    if let Some(condition_id) = condition_id {
+                        live.remove(condition_id);
+                    }
+                }
+            }
+            let keep: BTreeSet<usize> = live
+                .values()
+                .flat_map(|records| records.values().copied())
+                .collect();
+            release_clean_file_cache(reader.get_ref())?;
+            drop(reader);
+            file.seek(SeekFrom::End(0))?;
+            carried
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| keep.contains(index))
+                .map(|(_, row)| row)
+                .collect::<Vec<_>>()
+        };
+        self.rotate(now)?;
+        for mut row in pending {
+            let row = row
+                .as_object_mut()
+                .context("active tape row is not a JSON object")?;
+            row.insert("sequence".to_owned(), Value::from(self.sequence));
+            let mut encoded = serde_json::to_vec(&row)?;
+            encoded.push(b'\n');
+            let file = self.file.as_mut().context("active tape is closed")?;
+            file.write_all(&encoded)?;
+            self.sequence += 1;
+            self.tape_bytes += u64::try_from(encoded.len())?;
+        }
+        // The old segment is already rotated away, so the carried rows must
+        // be durable before any further record can fail or the process can
+        // crash; otherwise the pending recovery state would be lost.
+        let file = self.file.as_mut().context("active tape is closed")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn write_updates(&mut self, updates: &[Value], now: DateTime<Utc>) -> Result<()> {
         self.write_updates_with_sync(updates, now, |file| {
@@ -1372,18 +1461,23 @@ impl TapeWriter {
                         .saturating_add(u64::try_from(encoded.len())?)
                         > self.tape_max_bytes
                 {
+                    // Recovered trades still pending cannot be stranded in the
+                    // rotated segment: restate them at the front of the fresh
+                    // tape so rotation stays safe and the active tape remains
+                    // a self-contained crash-recovery source.
                     if self.recovery_pending {
-                        bail!("active tape reached its byte cap while recovered trade IDs remain");
+                        self.rotate_with_pending_carry(now)?;
+                    } else {
+                        self.rotate(now)?;
                     }
-                    self.rotate(now)?;
                     encoded = encode(self.sequence)?;
                     // The rotated tape is published; the rollback anchor moves
-                    // to the fresh segment so a later failure never truncates
-                    // across the rotation boundary.
+                    // to the fresh segment (past any carried rows) so a later
+                    // failure never truncates across the rotation boundary.
                     start_hour = None;
-                    start_sequence = 0;
-                    start_tape_bytes = 0;
-                    start_offset = 0;
+                    start_sequence = self.sequence;
+                    start_tape_bytes = self.tape_bytes;
+                    start_offset = self.tape_bytes;
                     self.hour = Some(target_hour.clone());
                 }
                 let file = self.file.as_mut().context("active tape is closed")?;
@@ -6003,6 +6097,90 @@ mod tests {
         assert_eq!(active_rows[0]["update"]["kind"], "second");
         assert_eq!(active_rows[1]["sequence"], 1);
         assert_eq!(active_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn size_cap_carries_pending_recovered_trades_into_the_fresh_segment() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer.write_updates(std::slice::from_ref(&trade), now).unwrap();
+        // Simulate crash-recovered pending trades, then cross the cap: the
+        // writer must rotate and carry instead of deadlocking on the cap.
+        writer.recovery_pending = true;
+        writer
+            .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The old segment keeps the original trade row untouched.
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let rotated_rows = fs::read_to_string(&rotated[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rotated_rows.len(), 1);
+        assert_eq!(rotated_rows[0]["sequence"], 0);
+        assert_eq!(rotated_rows[0]["update"], trade);
+
+        // The fresh segment restates the pending trade first (original
+        // payload and recorded_at, fresh sequence), then the current record.
+        let active_rows = fs::read_to_string(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"], trade);
+        assert_eq!(active_rows[0]["update"]["record_id"], record_id.as_str());
+        assert_eq!(
+            active_rows[0]["recorded_at"],
+            rotated_rows[0]["recorded_at"]
+        );
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"]["kind"], "second");
+    }
+
+    #[test]
+    fn size_cap_carry_preserves_recovered_trade_ids_across_restart() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer.write_updates(&[trade], now).unwrap();
+            writer.recovery_pending = true;
+            writer
+                .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+                .unwrap();
+            writer.close().unwrap();
+        }
+
+        // Restart: recovery rebuilds the same pending set from the carried
+        // rows, with no duplicate-ID false positive.
+        let mut state = CollectorState::default();
+        let mut recovered_total = 0;
+        let writer = TapeWriter::new_with_recovery(root.path(), |row| {
+            recover_state_from_tape_row(&mut state, row, 1024, &mut recovered_total)
+        })
+        .unwrap();
+        assert_eq!(writer.sequence, 2);
+        assert_eq!(recovered_total, 1);
+        assert_eq!(state.recovered_trade_ids.len(), 1);
+        assert_eq!(
+            state.recovered_trade_ids["condition-1"],
+            BTreeSet::from([record_id])
+        );
     }
 
     #[test]
