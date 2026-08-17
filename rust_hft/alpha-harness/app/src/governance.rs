@@ -22,6 +22,7 @@ use alpha_engine::{
 use alpha_onnx_evaluator::OnnxEvaluator;
 use alpha_store::{
     AlphaStore, ApprovalRecord, EvaluationRecord, MissionLineage, RegistryRevision, StoreError,
+    StoredCandidate, StoredEvaluation,
 };
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
@@ -51,7 +52,7 @@ pub fn candidate_show(args: CandidateShowArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn candidate_show_report(args: &CandidateShowArgs) -> anyhow::Result<serde_json::Value> {
-    let store = AlphaStore::open(&args.db)?;
+    let store = AlphaStore::open_read_only(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
     let candidate = lineage
         .candidates
@@ -69,27 +70,125 @@ pub(crate) fn candidate_show_report(args: &CandidateShowArgs) -> anyhow::Result<
         .iter()
         .filter(|stored| stored.record.candidate_id == args.candidate_id)
     {
-        let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
-            .with_context(|| {
-                format!(
-                    "evaluation {} payload is malformed",
-                    stored.record.evaluation_id
-                )
-            })?;
-        evaluations.push(serde_json::json!({
-            "evaluation_id": stored.record.evaluation_id,
-            "content_hash": stored.content_hash,
-            "dataset_manifest_id": stored.record.dataset_manifest_id,
-            "evaluation_protocol_hash": stored.record.evaluation_protocol_hash,
-            "created_at": stored.record.created_at,
-            "evaluation": evaluation,
-        }));
+        evaluations.push(validated_evaluation_readback(stored)?);
     }
+    let sealed_evaluation = canonical_sealed_evaluation_readback(&store, &lineage, candidate)?;
     Ok(serde_json::json!({
         "mission_id": args.mission_id,
         "candidate": candidate,
         "evaluations": evaluations,
+        "sealed_evaluation": sealed_evaluation,
     }))
+}
+
+/// Validates a stored evaluation fail-closed, then renders the raw stored
+/// payload so the report stays a direct readback of the record identified by
+/// `content_hash` instead of a re-serialized typed view that would inject
+/// defaults and drop unknown fields.
+fn validated_evaluation_readback(stored: &StoredEvaluation) -> anyhow::Result<serde_json::Value> {
+    let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
+        .with_context(|| {
+            format!(
+                "evaluation {} payload is malformed",
+                stored.record.evaluation_id
+            )
+        })?;
+    evaluation
+        .validate()
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "evaluation {} is not internally consistent evidence",
+                stored.record.evaluation_id
+            )
+        })?;
+    let (_, payload_protocol_hash) = evaluation
+        .protocol_binding()
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "evaluation {} has no valid protocol binding",
+                stored.record.evaluation_id
+            )
+        })?;
+    if stored.record.evaluation_protocol_hash != payload_protocol_hash {
+        bail!(
+            "evaluation {} record protocol hash does not match its payload binding",
+            stored.record.evaluation_id
+        );
+    }
+    Ok(serde_json::json!({
+        "evaluation_id": stored.record.evaluation_id,
+        "content_hash": stored.content_hash,
+        "dataset_manifest_id": stored.record.dataset_manifest_id,
+        "evaluation_protocol_hash": stored.record.evaluation_protocol_hash,
+        "created_at": stored.record.created_at,
+        "evaluation": stored.record.payload,
+    }))
+}
+
+/// Reads the canonical sealed-holdout evaluation registry revision for a
+/// candidate, validating its identity and evidence fail-closed before
+/// including it in the report. Returns `None` when the candidate has not been
+/// sealed yet.
+fn canonical_sealed_evaluation_readback(
+    store: &AlphaStore,
+    lineage: &MissionLineage,
+    candidate: &StoredCandidate,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let evaluator_version = match &candidate.artifact {
+        CandidateArtifact::Formula(_) | CandidateArtifact::CexFourStage(_) => {
+            SEALED_HOLDOUT_EVALUATOR_VERSION
+        }
+        CandidateArtifact::OnnxModel(_) => ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+        _ => return Ok(None),
+    };
+    let revision_id = sealed_evaluation_revision_id(&candidate.candidate_id, evaluator_version);
+    let revision = match store.get_registry_revision(&revision_id) {
+        Ok(revision) => revision,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if revision.registry_kind != "sealed_evaluation" || revision.asset_id != candidate.candidate_id
+    {
+        bail!("sealed evaluation revision {revision_id} is not canonical for this candidate");
+    }
+    let payload = &revision.payload;
+    let sealed_evaluation = payload
+        .get("evaluation")
+        .cloned()
+        .context("sealed evaluation payload is incomplete")?;
+    let evaluation: CandidateEvaluation = serde_json::from_value(sealed_evaluation)
+        .with_context(|| format!("sealed evaluation revision {revision_id} is malformed"))?;
+    evaluation
+        .validate()
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!("sealed evaluation revision {revision_id} is not consistent evidence")
+        })?;
+    let (_, payload_protocol_hash) = evaluation
+        .protocol_binding()
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!("sealed evaluation revision {revision_id} has no valid protocol binding")
+        })?;
+    let payload_field = |field: &str| payload.get(field).and_then(serde_json::Value::as_str);
+    if evaluation.evaluator_version != evaluator_version
+        || payload_field("evaluation_protocol_hash") != Some(payload_protocol_hash)
+        || payload_field("mission_id") != Some(lineage.mission.mission_id.as_str())
+        || payload_field("candidate_content_hash") != Some(candidate.content_hash.as_str())
+        || payload_field("dataset_manifest_id")
+            != Some(lineage.mission.dataset_manifest_id.as_str())
+    {
+        bail!("sealed evaluation revision {revision_id} does not match candidate identity");
+    }
+    Ok(Some(serde_json::json!({
+        "revision_id": revision.revision_id,
+        "registry_kind": revision.registry_kind,
+        "asset_id": revision.asset_id,
+        "created_at": revision.created_at,
+        "payload": revision.payload,
+    })))
 }
 
 pub(crate) fn validated_walk_forward_candidates(
@@ -1817,52 +1916,66 @@ mod tests {
         .contains("failed verification"));
     }
 
-    #[test]
-    fn candidate_show_returns_typed_metrics_with_folds_and_failure_reasons() {
-        let root = tempfile::tempdir().unwrap();
-        let db = root.path().join("alpha.duckdb");
+    fn sealed_evaluation_protocol() -> EvaluationProtocolV1 {
+        let mut protocol = evaluation_protocol();
+        protocol.walk_forward.sealed_holdout_rows = 32;
+        protocol
+    }
+
+    fn candidate_show_rows(correlated: bool) -> (Vec<ResearchRow>, Vec<f64>) {
+        let start = Utc::now();
+        let rows = (0..64)
+            .map(|index| ResearchRow {
+                available_time: start + Duration::seconds(index),
+                signal: if index % 2 == 0 { 1.0 } else { -1.0 },
+                features: BTreeMap::new(),
+                label: if index % 2 == 0 { 0.01 } else { -0.01 },
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let signals = rows
+            .iter()
+            .map(|row| if correlated { row.signal } else { -row.signal })
+            .collect::<Vec<_>>();
+        (rows, signals)
+    }
+
+    /// Produces evaluator-generated walk-forward evidence that passes the
+    /// domain `CandidateEvaluation::validate` contract, together with the
+    /// protocol hash the store record must carry.
+    fn candidate_show_evaluation_payload(correlated: bool) -> (serde_json::Value, String) {
+        let (rows, signals) = candidate_show_rows(correlated);
+        let evaluation = FormulaEvaluator::for_mission(&research_mission())
+            .unwrap()
+            .evaluate_onnx_signals(
+                &rows,
+                &signals,
+                [0..32, 32..64],
+                false,
+                &evaluation_protocol(),
+            )
+            .unwrap();
+        evaluation.validate().unwrap();
+        let protocol_hash = evaluation.evaluation_protocol_hash.clone().unwrap();
+        (serde_json::to_value(evaluation).unwrap(), protocol_hash)
+    }
+
+    fn seed_candidate_show_store(
+        db: &Path,
+        evaluation_payload: serde_json::Value,
+        record_protocol_hash: String,
+    ) {
         let now = Utc::now();
-        let candidate = onnx_candidate();
         let evaluation = EvaluationRecord {
             evaluation_id: "evaluation-1".to_string(),
             mission_id: "mission-1".to_string(),
             candidate_id: "candidate-1".to_string(),
             dataset_manifest_id: "dataset-1".to_string(),
-            evaluation_protocol_hash: evaluation_protocol().content_hash().unwrap(),
-            payload: serde_json::json!({
-                "passed": false,
-                "score": 0.0,
-                "failure_reasons": ["time_series_ic 0.010 below floor 0.020"],
-                "evaluator_version": WALK_FORWARD_EVALUATOR_VERSION,
-                "evaluator_config": {},
-                "metrics": {
-                    "predictive": {
-                        "row_count": 2,
-                        "time_series_ic": 0.01,
-                        "time_series_rank_ic": 0.02,
-                        "time_series_icir": 0.5,
-                        "time_series_rank_icir": 0.6,
-                        "positive_ic_ratio": 0.5,
-                        "folds": [
-                            {"fold_index": 0, "row_count": 1, "time_series_ic": 0.01, "time_series_rank_ic": 0.02},
-                            {"fold_index": 1, "row_count": 1, "time_series_ic": 0.01, "time_series_rank_ic": 0.02}
-                        ]
-                    },
-                    "row_count": 2,
-                    "trade_count": 2,
-                    "total_turnover": 4.0,
-                    "mean_net_return": -0.001,
-                    "cumulative_net_return": -0.002,
-                    "max_drawdown": 0.003,
-                    "net_sharpe": -1.5,
-                    "raw_score": -0.5,
-                    "adjusted_score": -0.25,
-                    "folds": [
-                        {"fold_index": 0, "row_count": 1, "trade_count": 1, "total_turnover": 2.0, "mean_net_return": -0.001, "cumulative_net_return": -0.001, "max_drawdown": 0.001, "net_sharpe": -1.0, "raw_score": -0.5},
-                        {"fold_index": 1, "row_count": 1, "trade_count": 1, "total_turnover": 2.0, "mean_net_return": -0.001, "cumulative_net_return": -0.001, "max_drawdown": 0.003, "net_sharpe": -2.0, "raw_score": -0.5}
-                    ]
-                }
-            }),
+            evaluation_protocol_hash: record_protocol_hash,
+            payload: evaluation_payload,
             created_at: now,
         };
         let iteration = ResearchIteration {
@@ -1882,24 +1995,34 @@ mod tests {
             failure_explanation: None,
             created_at: now,
         };
-        {
-            let mut store = AlphaStore::open(&db).unwrap();
-            store.create_mission(&research_mission()).unwrap();
-            store
-                .append_iteration(
-                    &iteration,
-                    Some(("candidate-1", &candidate)),
-                    Some(&evaluation),
-                )
-                .unwrap();
-        }
+        let mut store = AlphaStore::open(db).unwrap();
+        store.create_mission(&research_mission()).unwrap();
+        store
+            .append_iteration(
+                &iteration,
+                Some(("candidate-1", &onnx_candidate())),
+                Some(&evaluation),
+            )
+            .unwrap();
+    }
 
-        let report = candidate_show_report(&CandidateShowArgs {
-            db: db.clone(),
+    fn candidate_show_args(db: &Path) -> CandidateShowArgs {
+        CandidateShowArgs {
+            db: db.to_path_buf(),
             mission_id: "mission-1".to_string(),
             candidate_id: "candidate-1".to_string(),
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn candidate_show_returns_raw_payload_readback_with_folds_and_failure_reasons() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("alpha.duckdb");
+        let (mut payload, protocol_hash) = candidate_show_evaluation_payload(false);
+        payload["out_of_band_provenance"] = serde_json::json!("kept verbatim");
+        seed_candidate_show_store(&db, payload.clone(), protocol_hash);
+
+        let report = candidate_show_report(&candidate_show_args(&db)).unwrap();
 
         assert_eq!(report["mission_id"], "mission-1");
         assert_eq!(report["candidate"]["candidate_id"], "candidate-1");
@@ -1908,17 +2031,17 @@ mod tests {
         let shown = &evaluations[0];
         assert_eq!(shown["evaluation_id"], "evaluation-1");
         assert_eq!(shown["content_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(shown["dataset_manifest_id"], "dataset-1");
+        // The rendered evaluation is the exact stored payload: no injected
+        // defaults and no dropped unknown fields, so it stays the evidence
+        // identified by the record content hash.
+        assert_eq!(shown["evaluation"], payload);
         let shown_evaluation = &shown["evaluation"];
         assert_eq!(shown_evaluation["passed"], false);
-        assert_eq!(
-            shown_evaluation["failure_reasons"],
-            serde_json::json!(["time_series_ic 0.010 below floor 0.020"])
-        );
-        assert_eq!(shown_evaluation["metrics"]["net_sharpe"], -1.5);
-        assert_eq!(
-            shown_evaluation["metrics"]["predictive"]["positive_ic_ratio"],
-            0.5
-        );
+        assert!(!shown_evaluation["failure_reasons"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             shown_evaluation["metrics"]["folds"]
                 .as_array()
@@ -1926,7 +2049,7 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(shown_evaluation["metrics"]["folds"][1]["net_sharpe"], -2.0);
+        assert_eq!(report["sealed_evaluation"], serde_json::Value::Null);
 
         assert!(candidate_show_report(&CandidateShowArgs {
             db: db.clone(),
@@ -1942,5 +2065,147 @@ mod tests {
             candidate_id: "candidate-1".to_string(),
         })
         .is_err());
+    }
+
+    #[test]
+    fn candidate_show_rejects_internally_inconsistent_evaluation_evidence() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Structurally valid but semantically impossible: passed with failure reasons.
+        let forged = root.path().join("forged.duckdb");
+        let (mut payload, protocol_hash) = candidate_show_evaluation_payload(true);
+        assert_eq!(payload["passed"], true);
+        payload["failure_reasons"] = serde_json::json!(["forged failure"]);
+        seed_candidate_show_store(&forged, payload, protocol_hash);
+        assert!(candidate_show_report(&candidate_show_args(&forged))
+            .unwrap_err()
+            .to_string()
+            .contains("not internally consistent"));
+
+        // Record-level protocol hash disagrees with the payload binding.
+        let drifted = root.path().join("drifted.duckdb");
+        let (payload, _) = candidate_show_evaluation_payload(true);
+        seed_candidate_show_store(&drifted, payload, "0".repeat(64));
+        assert!(candidate_show_report(&candidate_show_args(&drifted))
+            .unwrap_err()
+            .to_string()
+            .contains("record protocol hash does not match"));
+    }
+
+    #[test]
+    fn candidate_show_requires_an_existing_database_without_write_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("missing").join("alpha.duckdb");
+        let error = candidate_show_report(&candidate_show_args(&db)).unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!db.exists());
+        assert!(!db.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn candidate_show_includes_the_validated_canonical_sealed_evaluation() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("alpha.duckdb");
+        let (payload, protocol_hash) = candidate_show_evaluation_payload(true);
+        seed_candidate_show_store(&db, payload, protocol_hash);
+
+        let (rows, signals) = candidate_show_rows(true);
+        let sealed = FormulaEvaluator::for_mission(&research_mission())
+            .unwrap()
+            .evaluate_onnx_signals(
+                &rows,
+                &signals,
+                std::iter::once(0..32),
+                true,
+                &sealed_evaluation_protocol(),
+            )
+            .unwrap();
+        sealed.validate().unwrap();
+        let sealed_revision_id =
+            sealed_evaluation_revision_id("candidate-1", ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION);
+        let candidate_hash = {
+            let mut store = AlphaStore::open(&db).unwrap();
+            let lineage = store.mission_lineage("mission-1").unwrap();
+            let candidate_hash = lineage.candidates[0].content_hash.clone();
+            let sealed_payload = |candidate_hash: &str| {
+                serde_json::json!({
+                    "mission_id": "mission-1",
+                    "candidate_content_hash": candidate_hash,
+                    "dataset_manifest_id": "dataset-1",
+                    "evaluation_protocol_hash": sealed.evaluation_protocol_hash.clone(),
+                    "evaluation": sealed.clone(),
+                })
+            };
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: sealed_revision_id.clone(),
+                    registry_kind: "sealed_evaluation".to_string(),
+                    asset_id: "candidate-1".to_string(),
+                    parent_revision_id: None,
+                    payload: sealed_payload(&candidate_hash),
+                    created_at: Utc::now(),
+                })
+                .unwrap();
+            candidate_hash
+        };
+
+        let report = candidate_show_report(&candidate_show_args(&db)).unwrap();
+        let shown_sealed = &report["sealed_evaluation"];
+        assert_eq!(shown_sealed["revision_id"], sealed_revision_id);
+        assert_eq!(shown_sealed["registry_kind"], "sealed_evaluation");
+        assert_eq!(
+            shown_sealed["payload"]["candidate_content_hash"],
+            candidate_hash
+        );
+        assert_eq!(
+            shown_sealed["payload"]["evaluation"],
+            serde_json::to_value(&sealed).unwrap()
+        );
+    }
+
+    #[test]
+    fn candidate_show_rejects_a_sealed_evaluation_bound_to_another_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("alpha.duckdb");
+        let (payload, protocol_hash) = candidate_show_evaluation_payload(true);
+        seed_candidate_show_store(&db, payload, protocol_hash);
+
+        let (rows, signals) = candidate_show_rows(true);
+        let sealed = FormulaEvaluator::for_mission(&research_mission())
+            .unwrap()
+            .evaluate_onnx_signals(
+                &rows,
+                &signals,
+                std::iter::once(0..32),
+                true,
+                &sealed_evaluation_protocol(),
+            )
+            .unwrap();
+        let mut store = AlphaStore::open(&db).unwrap();
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: sealed_evaluation_revision_id(
+                    "candidate-1",
+                    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+                ),
+                registry_kind: "sealed_evaluation".to_string(),
+                asset_id: "candidate-1".to_string(),
+                parent_revision_id: None,
+                payload: serde_json::json!({
+                    "mission_id": "mission-1",
+                    "candidate_content_hash": "0".repeat(64),
+                    "dataset_manifest_id": "dataset-1",
+                    "evaluation_protocol_hash": sealed.evaluation_protocol_hash.clone(),
+                    "evaluation": sealed,
+                }),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        drop(store);
+
+        assert!(candidate_show_report(&candidate_show_args(&db))
+            .unwrap_err()
+            .to_string()
+            .contains("does not match candidate identity"));
     }
 }
