@@ -69,8 +69,8 @@ pub(crate) fn candidate_show_report(args: &CandidateShowArgs) -> anyhow::Result<
         .iter()
         .filter(|stored| stored.record.candidate_id == args.candidate_id)
     {
-        let evaluation: CandidateEvaluation =
-            serde_json::from_value(stored.record.payload.clone()).with_context(|| {
+        let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
+            .with_context(|| {
                 format!(
                     "evaluation {} payload is malformed",
                     stored.record.evaluation_id
@@ -1920,13 +1920,13 @@ mod tests {
             0.5
         );
         assert_eq!(
-            shown_evaluation["metrics"]["folds"].as_array().unwrap().len(),
+            shown_evaluation["metrics"]["folds"]
+                .as_array()
+                .unwrap()
+                .len(),
             2
         );
-        assert_eq!(
-            shown_evaluation["metrics"]["folds"][1]["net_sharpe"],
-            -2.0
-        );
+        assert_eq!(shown_evaluation["metrics"]["folds"][1]["net_sharpe"], -2.0);
 
         assert!(candidate_show_report(&CandidateShowArgs {
             db: db.clone(),
