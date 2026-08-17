@@ -281,10 +281,42 @@ if grep -Fq 'previous_uploader_release_sha256' "$cutover"; then
 fi
 grep -Fq 'CANDIDATE_MAY_HAVE_WRITTEN=1' "$cutover"
 grep -Fq "controller: \$controller" "$cutover"
-grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true" "$cutover"
+grep -Fq "runtime_matches_collector \"\$OLD_COLLECTOR\" true false" "$cutover"
 grep -Fq "systemctl disable \"\$COLLECTOR_UNIT\" \"\$UPLOAD_TIMER\"" "$cutover"
 grep -Fq "! systemctl is-active --quiet \"\$UPLOAD_SERVICE\"" "$cutover"
 grep -Fq 'quarantine_reference_staging' "$cutover"
+
+# A long-lived baseline accumulates planned RuntimeMaxSec restarts.
+# Only the freshly started candidate and rollback process must remain unrestarted.
+eval "$(awk '/^runtime_matches_collector\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' "$cutover")"
+COLLECTOR_UNIT=collector.service
+UPLOAD_TIMER=upload.timer
+runtime_expected=/release/binance-usdm-reference-collector
+runtime_restart_count=42
+# shellcheck disable=SC2329 # Invoked by the extracted production validator.
+systemctl() {
+  case "$1" in
+    is-active|is-enabled) return 0 ;;
+    show)
+      case " $* " in
+        *' --property=NRestarts '*) printf '%s\n' "$runtime_restart_count" ;;
+        *' --property=MainPID '*) printf '4242\n' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+# shellcheck disable=SC2329 # Invoked by the extracted production validator.
+readlink() { printf '%s\n' "$runtime_expected"; }
+runtime_matches_collector "$runtime_expected" true false
+if runtime_matches_collector "$runtime_expected" true true; then
+  printf '%s\n' 'fresh candidate accepted a non-zero restart count' >&2
+  exit 1
+fi
+runtime_restart_count=0
+runtime_matches_collector "$runtime_expected" true true
+unset -f systemctl readlink runtime_matches_collector
 
 # A release installed by this cutover keeps collector and uploader together.
 # Exercise the real upgrade identity validator against that first-cutover shape.
@@ -398,7 +430,9 @@ atomic_install() { printf 'install %s\n' "$3" >>"$rollback_trace"; }
 atomic_symlink() { printf 'symlink %s\n' "$2" >>"$rollback_trace"; }
 systemctl() { :; }
 health_ready_for_release() { printf 'health-readback\n' >>"$rollback_trace"; }
-runtime_matches_collector() { printf 'runtime %s %s\n' "$1" "$2" >>"$rollback_trace"; }
+runtime_matches_collector() {
+  printf 'runtime %s %s %s\n' "$1" "$2" "$3" >>"$rollback_trace"
+}
 readlink() {
   local path=${!#}
   [[ $path == "$COLLECTOR_LINK" ]] && printf '%s\n' "$OLD_COLLECTOR" \
@@ -421,8 +455,8 @@ restore_old_production
 grep -Fq 'symlink /collector-link' "$rollback_trace"
 grep -Fq 'symlink /uploader-link' "$rollback_trace"
 grep -Fq 'health-readback' "$rollback_trace"
-grep -Fq 'runtime /old/collector false' "$rollback_trace"
-grep -Fq 'runtime /old/collector true' "$rollback_trace"
+grep -Fq 'runtime /old/collector false true' "$rollback_trace"
+grep -Fq 'runtime /old/collector true true' "$rollback_trace"
 
 grep -Fxq 'ConditionPathIsMountPoint=/data' "$production_collector"
 grep -Fxq 'ExecStart=/opt/monday/bin/binance-usdm-reference-collector --output-root /data/monday/spool/binance-usdm-reference --interval-seconds 30 --request-timeout-seconds 10 --oi-concurrency 8 --max-staleness-ms 30000' \

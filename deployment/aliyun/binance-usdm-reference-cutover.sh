@@ -371,9 +371,9 @@ restore_old_production() {
   while (( SECONDS < deadline )); do
     systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
     if health_ready_for_release "$restore_started_ns" \
-      && runtime_matches_collector "$OLD_COLLECTOR" false; then
+      && runtime_matches_collector "$OLD_COLLECTOR" false true; then
       systemctl enable --now "$UPLOAD_TIMER" >/dev/null || return 1
-      runtime_matches_collector "$OLD_COLLECTOR" true || return 1
+      runtime_matches_collector "$OLD_COLLECTOR" true true || return 1
       return 0
     fi
     sleep 5
@@ -408,10 +408,11 @@ health_ready_for_release() {
 }
 
 runtime_matches_collector() {
-  local expected_collector=$1 require_enabled=$2 restarts main_pid main_exe
+  local expected_collector=$1 require_enabled=$2 require_zero_restarts=$3
+  local restarts main_pid main_exe
   systemctl is-active --quiet "$COLLECTOR_UNIT" || return 1
   restarts=$(systemctl show "$COLLECTOR_UNIT" --property=NRestarts --value) || return 1
-  [[ $restarts == 0 ]] || return 1
+  [[ $require_zero_restarts == false || $restarts == 0 ]] || return 1
   main_pid=$(systemctl show "$COLLECTOR_UNIT" --property=MainPID --value) || return 1
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
   main_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || true)
@@ -423,7 +424,7 @@ runtime_matches_collector() {
 }
 
 runtime_matches_release() {
-  runtime_matches_collector "$CANDIDATE_COLLECTOR" "$1"
+  runtime_matches_collector "$CANDIDATE_COLLECTOR" "$1" true
 }
 
 wait_for_release_health() {
@@ -707,7 +708,7 @@ if systemctl is-active --quiet "$COLLECTOR_UNIT" \
     || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_RELEASE_SHA256" "$OLD_COLLECTOR" | sha256sum --check --strict
   validate_old_release_uploader
-  runtime_matches_collector "$OLD_COLLECTOR" true \
+  runtime_matches_collector "$OLD_COLLECTOR" true false \
     || fail 'production collector process does not match its release symlink'
   secure_regular_file "$UPLOAD_ENV"
   validate_upload_env "$UPLOAD_ENV"
