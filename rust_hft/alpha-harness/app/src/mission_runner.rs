@@ -40,8 +40,9 @@ use hft_backtest::{
     },
 };
 use hft_research_manifest::{
-    CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2, ManifestId,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
+    CexInstrumentRulesV2, CexReplayDatasetManifestV2, CexReplaySnapshotV1, CexReplaySnapshotV2,
+    ManifestId, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
 };
 use reqwest::{
     blocking::Client,
@@ -734,6 +735,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
                 &baseline_policy,
                 &weight_policy,
                 &replay_policy,
+                &materialization.snapshot.instrument_rules,
             )?)
         }
         _ => None,
@@ -820,6 +822,7 @@ fn finalize_cex_candidate(
     baseline_policy: &CexBaselinePolicyV1,
     weight_policy: &CexEqualAbsoluteWeightPolicyV1,
     replay_policy: &CexEventReplayPolicyV1,
+    instrument_rules: &CexInstrumentRulesV2,
 ) -> anyhow::Result<CexFinalizationReportV1> {
     let ridge = baselines
         .ridge
@@ -861,6 +864,7 @@ fn finalize_cex_candidate(
         control_mission.spec.instrument.venue.clone(),
         control_mission.spec.instrument.market.clone(),
         control_mission.spec.instrument.symbol.clone(),
+        instrument_rules.clone(),
         control_mission
             .spec
             .policies
@@ -2033,17 +2037,25 @@ pub(crate) fn configured_sibling_binary(environment: &str, name: &str) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ValidationArgs;
+    use crate::{
+        cli::{FeedbackLogArgs, FeedbackRecordArgs, SignDeploymentArgs, ValidationArgs},
+        governance,
+    };
     use alpha_domain::{
+        deployment_scope_hash, runtime_stage_is_healthy, sign_runtime_attribution_event,
+        AllowedIntentType, ApprovalClass, AttributionKind, AttributionMode, AttributionOutcome,
         CexBaselineArtifactV1, CexBaselineGateV1, CexEventReplayPolicyV1, CexResearchContentRefV1,
-        CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchFalsificationTestV1,
-        CexResearchHoldoutStateV1, CexResearchHoldoutV1, CexResearchHypothesisTargetV1,
-        CexResearchHypothesisV1, CexResearchInputBindingsV1, CexResearchInstrumentV1,
-        CexResearchMarketV1, CexResearchMissionSpecV1, CexResearchOperationalMetadataV1,
-        CexResearchPolicyBindingsV1, CexResearchSearchPlanV1, CexResearchVenueV1,
-        EvaluationLabelSpecV1, SearchBudget, CEX_RESEARCH_MISSION_SCHEMA_V1,
+        CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchEvidenceSignatureV1,
+        CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
+        CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
+        CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionSpecV1,
+        CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
+        CexResearchVenueV1, DeploymentEnvelope, EvaluationLabelSpecV1, RuntimeAttributionEvent,
+        SearchBudget, SignedRuntimeAttributionEvent, CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
     use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
+    use alpha_store::ApprovalRecord;
+    use ed25519_dalek::SigningKey;
 
     fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
         hft_research_manifest::CexArtifactTripletV2 {
@@ -2071,6 +2083,210 @@ mod tests {
     };
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn ingest_governed_cex_feedback(
+        db: &Path,
+        directory: &Path,
+        mission_id: &str,
+        promotion: &PromotionRecord,
+        bundle: &StrategyBundle,
+    ) -> Vec<SignedRuntimeAttributionEvent> {
+        let now = Utc::now();
+        let deployment_key_path = directory.join("cex-deployment-signing-key.hex");
+        std::fs::write(&deployment_key_path, hex::encode([9_u8; 32])).unwrap();
+        let feedback_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let trusted_keys_path = directory.join("cex-runtime-feedback-keys.json");
+        std::fs::write(
+            &trusted_keys_path,
+            serde_json::to_vec(&BTreeMap::from([(
+                "cex-runtime-feedback".to_string(),
+                hex::encode(feedback_key.verifying_key().to_bytes()),
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut feedback = Vec::new();
+        for (suffix, intent, approval_class, approval_name, mode) in [
+            (
+                "paper",
+                AllowedIntentType::StartPaper,
+                ApprovalClass::Paper,
+                "paper",
+                AttributionMode::Paper,
+            ),
+            (
+                "shadow",
+                AllowedIntentType::StartShadow,
+                ApprovalClass::Shadow,
+                "shadow",
+                AttributionMode::Shadow,
+            ),
+        ] {
+            let deployment_id = format!("cex-{suffix}-{}", bundle.candidate_id);
+            let approval_id = format!("cex-{suffix}-approval");
+            let envelope = DeploymentEnvelope {
+                deployment_id: deployment_id.clone(),
+                asset_revision_id: bundle.candidate_id.clone(),
+                promotion_id: promotion.promotion_id.clone(),
+                promotion_manifest_hash: canonical_json_hash(promotion).unwrap(),
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_hash: bundle.bundle_hash.clone(),
+                runtime_config_hash: "d".repeat(64),
+                risk_policy_hash: "e".repeat(64),
+                account_id: "binance-paper-shadow".to_string(),
+                venue: "binance".to_string(),
+                instruments: vec!["BTCUSDT".to_string()],
+                allowed_intent_types: vec![AllowedIntentType::LoadFactor, intent],
+                max_notional: 100.0,
+                max_symbol_exposure: 50.0,
+                max_order_size: 10.0,
+                max_slippage_bps: 2.0,
+                valid_from: now - ChronoDuration::minutes(1),
+                expires_at: now + ChronoDuration::minutes(30),
+                nonce: format!("cex-{suffix}-nonce"),
+                approval_class,
+                approval_signatures: vec![approval_id.clone()],
+                payload_hash: String::new(),
+            };
+            AlphaStore::open(db)
+                .unwrap()
+                .record_approval(&ApprovalRecord {
+                    approval_id,
+                    approval_class: approval_name.to_string(),
+                    subject_id: promotion.promotion_id.clone(),
+                    payload: serde_json::json!({
+                        "scope_hash": deployment_scope_hash(&envelope).unwrap(),
+                    }),
+                    signer_id: Some(format!("cex-{suffix}-risk-officer")),
+                    valid_from: Some(now - ChronoDuration::minutes(1)),
+                    expires_at: Some(now + ChronoDuration::minutes(30)),
+                    revoked_at: None,
+                    revoked_by: None,
+                    revocation_reason: None,
+                    created_at: now - ChronoDuration::minutes(1),
+                })
+                .unwrap();
+
+            let envelope_path = directory.join(format!("cex-{suffix}-envelope.json"));
+            let signed_path = directory.join(format!("cex-{suffix}-signed.json"));
+            data_mission::write_json_atomic(&envelope_path, &envelope).unwrap();
+            governance::sign_deployment(SignDeploymentArgs {
+                db: db.to_path_buf(),
+                envelope: envelope_path,
+                signing_key: deployment_key_path.clone(),
+                key_id: "cex-deployment-key".to_string(),
+                output: signed_path,
+            })
+            .unwrap();
+
+            let strategy_id = format!("{}:BTCUSDT", bundle.bundle_id);
+            for event in [
+                RuntimeAttributionEvent {
+                    event_id: format!("{deployment_id}:activation"),
+                    deployment_id: deployment_id.clone(),
+                    asset_revision_id: bundle.candidate_id.clone(),
+                    mission_id: None,
+                    mode: mode.clone(),
+                    outcome: AttributionOutcome::Activated,
+                    kind: AttributionKind::Activation,
+                    strategy_id: None,
+                    order_id: None,
+                    account_id: None,
+                    venue: None,
+                    symbol: None,
+                    metrics: BTreeMap::from([(
+                        "sealed_execution_cost_coverage_required".to_string(),
+                        1.0,
+                    )]),
+                    reason: None,
+                    observed_at: now,
+                },
+                RuntimeAttributionEvent {
+                    event_id: format!("{deployment_id}:portfolio"),
+                    deployment_id: deployment_id.clone(),
+                    asset_revision_id: bundle.candidate_id.clone(),
+                    mission_id: None,
+                    mode: mode.clone(),
+                    outcome: AttributionOutcome::Healthy,
+                    kind: AttributionKind::PortfolioSnapshot,
+                    strategy_id: Some(strategy_id.clone()),
+                    order_id: None,
+                    account_id: Some("binance-paper-shadow".to_string()),
+                    venue: Some("binance".to_string()),
+                    symbol: Some("BTCUSDT".to_string()),
+                    metrics: BTreeMap::from([
+                        ("gross_pnl_coverage_complete".to_string(), 1.0),
+                        ("fee_coverage_complete".to_string(), 1.0),
+                        ("execution_cost_coverage_complete".to_string(), 1.0),
+                        ("mark_coverage_complete".to_string(), 1.0),
+                    ]),
+                    reason: None,
+                    observed_at: now + ChronoDuration::seconds(1),
+                },
+                RuntimeAttributionEvent {
+                    event_id: format!("{deployment_id}:fill"),
+                    deployment_id,
+                    asset_revision_id: bundle.candidate_id.clone(),
+                    mission_id: None,
+                    mode,
+                    outcome: AttributionOutcome::Healthy,
+                    kind: AttributionKind::Fill,
+                    strategy_id: Some(strategy_id),
+                    order_id: Some(format!("cex-{suffix}-order")),
+                    account_id: Some("binance-paper-shadow".to_string()),
+                    venue: Some("binance".to_string()),
+                    symbol: Some("BTCUSDT".to_string()),
+                    metrics: BTreeMap::from([("fill_quantity".to_string(), 1.0)]),
+                    reason: None,
+                    observed_at: now + ChronoDuration::seconds(2),
+                },
+            ] {
+                feedback.push(
+                    sign_runtime_attribution_event(event, "cex-runtime-feedback", &feedback_key)
+                        .unwrap(),
+                );
+            }
+        }
+
+        let mut wrong_scope = feedback[2].clone();
+        wrong_scope.event.event_id = "cex-cross-scope-feedback".to_string();
+        wrong_scope.event.symbol = Some("ETHUSDT".to_string());
+        wrong_scope = sign_runtime_attribution_event(
+            wrong_scope.event,
+            "cex-runtime-feedback",
+            &feedback_key,
+        )
+        .unwrap();
+        let wrong_scope_path = directory.join("cex-cross-scope-feedback.json");
+        data_mission::write_json_atomic(&wrong_scope_path, &wrong_scope).unwrap();
+        assert!(governance::ingest_feedback(FeedbackRecordArgs {
+            db: db.to_path_buf(),
+            record: wrong_scope_path,
+            trusted_keys: trusted_keys_path.clone(),
+        })
+        .is_err());
+        assert!(AlphaStore::open(db)
+            .unwrap()
+            .runtime_attributions_for_mission(mission_id)
+            .unwrap()
+            .is_empty());
+
+        let feedback_path = directory.join("cex-runtime-feedback.jsonl");
+        let mut bytes = Vec::new();
+        for signed in &feedback {
+            serde_json::to_writer(&mut bytes, signed).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&feedback_path, bytes).unwrap();
+        governance::ingest_feedback_log(FeedbackLogArgs {
+            db: db.to_path_buf(),
+            log: feedback_path,
+            trusted_keys: trusted_keys_path,
+        })
+        .unwrap();
+        feedback
+    }
 
     #[test]
     fn execute_rejects_features_that_have_no_live_formula_semantics() {
@@ -3066,6 +3282,88 @@ mod tests {
             policy_revision.payload,
             serde_json::to_value(&policy).unwrap()
         );
+        let source_mission_id = precommit.mission.id.clone();
+        let source_iterations = store
+            .mission_lineage(&source_mission_id)
+            .unwrap()
+            .iterations
+            .len();
+        drop(store);
+
+        let db = results.join("alpha.duckdb");
+        let signed_feedback =
+            ingest_governed_cex_feedback(&db, &results, &source_mission_id, &promotion, &bundle);
+        let store = AlphaStore::open(&db).unwrap();
+        let admitted = store
+            .runtime_attributions_for_mission(&source_mission_id)
+            .unwrap();
+        assert_eq!(admitted.len(), 6);
+        assert!(runtime_stage_is_healthy(
+            &admitted,
+            &bundle.candidate_id,
+            AttributionMode::Paper,
+        ));
+        assert!(runtime_stage_is_healthy(
+            &admitted,
+            &bundle.candidate_id,
+            AttributionMode::Shadow,
+        ));
+        assert!(admitted.iter().all(|event| {
+            event.mission_id.as_deref() == Some(source_mission_id.as_str())
+                && event
+                    .account_id
+                    .as_deref()
+                    .is_none_or(|value| value == "binance-paper-shadow")
+                && event
+                    .venue
+                    .as_deref()
+                    .is_none_or(|value| value == "binance")
+                && event
+                    .symbol
+                    .as_deref()
+                    .is_none_or(|value| value == "BTCUSDT")
+        }));
+        assert_eq!(
+            store.get_mission(&source_mission_id).unwrap().status,
+            MissionStatus::Completed
+        );
+        assert_eq!(
+            store
+                .mission_lineage(&source_mission_id)
+                .unwrap()
+                .iterations
+                .len(),
+            source_iterations
+        );
+
+        let mut later_mission = fixture.mission.clone();
+        later_mission.spec.search_lineage_id = "later-signed-runtime-search".to_string();
+        later_mission.spec.evidence.extend(
+            signed_feedback
+                .iter()
+                .filter(|signed| signed.event.kind == AttributionKind::PortfolioSnapshot)
+                .map(|signed| CexResearchEvidenceRefV1 {
+                    evidence_id: signed.event.event_id.clone(),
+                    kind: match signed.event.mode {
+                        AttributionMode::Paper => CexResearchEvidenceKindV1::SignedPaper,
+                        AttributionMode::Shadow => CexResearchEvidenceKindV1::SignedShadow,
+                        AttributionMode::LiveSmall => unreachable!(),
+                    },
+                    source_mission_id: source_mission_id.clone(),
+                    source_search_lineage_id: fixture.mission.spec.search_lineage_id.clone(),
+                    artifact_sha256: signed.content_hash.clone(),
+                    signature: Some(CexResearchEvidenceSignatureV1 {
+                        key_id: signed.key_id.clone(),
+                        signature_sha256: hex::encode(Sha256::digest(
+                            hex::decode(&signed.signature_hex).unwrap(),
+                        )),
+                    }),
+                    holdout_id: None,
+                }),
+        );
+        later_mission.validate().unwrap();
+        assert_ne!(later_mission.semantic_id().unwrap(), source_mission_id);
+        drop(store);
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

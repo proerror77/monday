@@ -9,9 +9,10 @@ use alpha_domain::{
     LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration,
     ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision,
     SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    CEX_FINAL_PRECOMMIT_REGISTRY_KIND, CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND,
-    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-    SEALED_HOLDOUT_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
+    VerifiedRuntimeAttributionEvent, CEX_FINAL_PRECOMMIT_REGISTRY_KIND,
+    CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -2117,14 +2118,14 @@ impl AlphaStore {
 
     pub fn ingest_runtime_attribution(
         &mut self,
-        event: RuntimeAttributionEvent,
+        event: VerifiedRuntimeAttributionEvent,
     ) -> Result<bool, StoreError> {
         Ok(self.ingest_runtime_attributions(vec![event])? == 1)
     }
 
     pub fn ingest_runtime_attributions(
         &mut self,
-        events: Vec<RuntimeAttributionEvent>,
+        events: Vec<VerifiedRuntimeAttributionEvent>,
     ) -> Result<usize, StoreError> {
         if events.is_empty() {
             return Err(StoreError::Domain(
@@ -2134,7 +2135,10 @@ impl AlphaStore {
         let transaction = self.connection.transaction().map_err(database_error)?;
         let mut inserted = 0_usize;
         for event in events {
-            inserted += usize::from(ingest_runtime_attribution(&transaction, event)?);
+            inserted += usize::from(ingest_runtime_attribution(
+                &transaction,
+                event.into_event(),
+            )?);
         }
         transaction.commit().map_err(database_error)?;
         Ok(inserted)
@@ -2692,7 +2696,14 @@ fn validate_strategy_scope(
             format!("{}:{symbol}", bundle.bundle_id)
         }
         StrategyBundleArtifact::Onnx { .. } => bundle.bundle_id.clone(),
-        StrategyBundleArtifact::CexFourStage { .. } => bundle.bundle_id.clone(),
+        StrategyBundleArtifact::CexFourStage { .. } => {
+            let symbol = symbol.ok_or_else(|| {
+                StoreError::Domain(
+                    "four-stage CEX strategy attribution requires one instrument".to_string(),
+                )
+            })?;
+            format!("{}:{symbol}", bundle.bundle_id)
+        }
     };
     if strategy_id != expected {
         return Err(StoreError::Domain(
@@ -3338,7 +3349,8 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 mod tests {
     use super::*;
     use alpha_domain::{
-        canonical_json_hash, sign_envelope, AllowedIntentType, ApprovalClass, AttributionKind,
+        canonical_json_hash, sign_envelope, sign_runtime_attribution_event,
+        verify_runtime_attribution_event, AllowedIntentType, ApprovalClass, AttributionKind,
         AttributionMode, AttributionOutcome, DeploymentEnvelope, EngineKind, EvaluationCostsV1,
         EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict,
         LoopCompletionPolicy, LoopRunStatus, LoopTargetStage, MissionCompletionPolicy,
@@ -3396,6 +3408,18 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn verified_attribution(event: RuntimeAttributionEvent) -> VerifiedRuntimeAttributionEvent {
+        let key = SigningKey::from_bytes(&[13_u8; 32]);
+        verify_runtime_attribution_event(
+            &sign_runtime_attribution_event(event, "runtime-feedback", &key).unwrap(),
+            &std::collections::BTreeMap::from([(
+                "runtime-feedback".to_string(),
+                key.verifying_key(),
+            )]),
+        )
+        .unwrap()
     }
 
     fn iteration() -> ResearchIteration {
@@ -4977,8 +5001,12 @@ mod tests {
             reason: None,
             observed_at: now,
         };
-        assert!(store.ingest_runtime_attribution(event.clone()).unwrap());
-        assert!(!store.ingest_runtime_attribution(event).unwrap());
+        assert!(store
+            .ingest_runtime_attribution(verified_attribution(event.clone()))
+            .unwrap());
+        assert!(!store
+            .ingest_runtime_attribution(verified_attribution(event))
+            .unwrap());
         assert_eq!(
             store
                 .get_runtime_attribution("attribution-1")
@@ -5061,14 +5089,19 @@ mod tests {
         };
 
         assert!(store
-            .ingest_runtime_attributions(vec![activation.clone(), forged_fill])
+            .ingest_runtime_attributions(vec![
+                verified_attribution(activation.clone()),
+                verified_attribution(forged_fill),
+            ])
             .is_err());
         assert!(matches!(
             store.get_runtime_attribution("batch-activation"),
             Err(StoreError::NotFound)
         ));
         assert_eq!(
-            store.ingest_runtime_attributions(vec![activation]).unwrap(),
+            store
+                .ingest_runtime_attributions(vec![verified_attribution(activation)])
+                .unwrap(),
             1
         );
         let stored = store.get_runtime_attribution("batch-activation").unwrap();

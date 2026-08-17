@@ -207,13 +207,27 @@ pub struct EngineConfig {
     pub latency_monitor: LatencyMonitorConfig,
 }
 
+enum PendingStrategyInput {
+    Market(ports::MarketEvent),
+    Clock(Timestamp),
+}
+
 struct PendingMarketEvent {
-    event: ports::MarketEvent,
+    input: PendingStrategyInput,
     /// Local adapter-boundary timestamp used for latency and order lifecycle validation.
     received_at: Timestamp,
     capture_boundary: hft_core::LatencyCaptureBoundary,
-    /// Canonical L2 immediately after this event was applied, before any later batched delta.
+    /// Published L2 immediately after this event was applied, including any newer BBO overlay.
     book: Option<(VenueId, Arc<TopNSnapshot>)>,
+    /// Canonical L2 before BBO overlays, used only by bucketed research-contract strategies.
+    canonical_book: Option<(VenueId, Arc<TopNSnapshot>)>,
+}
+
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 impl Default for EngineConfig {
@@ -263,6 +277,9 @@ pub struct Engine {
     stats: EngineStats,
     /// 暫存的市場事件（從聚合引擎產生）
     pending_market_events: Vec<PendingMarketEvent>,
+    /// Smallest shared clock quantum requested by registered time-bucketed strategies.
+    strategy_clock_quantum_us: Option<u64>,
+    next_strategy_clock_us: Option<u64>,
     /// Reused output buffer for one aggregation input event.
     aggregation_events_buf: Vec<ports::MarketEvent>,
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
@@ -358,6 +375,8 @@ impl Engine {
                 start_time_us: now_micros(),
             },
             pending_market_events: Vec::new(),
+            strategy_clock_quantum_us: None,
+            next_strategy_clock_us: None,
             aggregation_events_buf: Vec::with_capacity(4),
             intents_work_buf: Vec::new(),
             execution_events_buf: Vec::new(),
@@ -781,6 +800,7 @@ impl Engine {
     pub fn register_strategy<S: Strategy + 'static>(&mut self, s: S) {
         // 在註冊策略時記錄其實例 ID（而不是類型名稱）
         let instance_id = self.extract_strategy_instance_id(&s);
+        self.register_strategy_clock(s.clock_interval_micros());
         self.strategy_instance_ids.push(instance_id);
         self.strategies.push(Box::new(s));
     }
@@ -788,8 +808,59 @@ impl Engine {
     pub fn register_strategy_boxed(&mut self, s: Box<dyn Strategy>) {
         // 在註冊策略時記錄其實例 ID（而不是類型名稱）
         let instance_id = self.extract_strategy_instance_id(s.as_ref());
+        self.register_strategy_clock(s.clock_interval_micros());
         self.strategy_instance_ids.push(instance_id);
         self.strategies.push(s);
+    }
+
+    fn register_strategy_clock(&mut self, interval_us: Option<u64>) {
+        let Some(interval_us) = interval_us.filter(|interval| *interval > 0) else {
+            return;
+        };
+        self.strategy_clock_quantum_us = Some(
+            self.strategy_clock_quantum_us
+                .map_or(interval_us, |current| gcd(current, interval_us)),
+        );
+        self.next_strategy_clock_us = None;
+    }
+
+    fn queue_due_strategy_clock(&mut self, now: Timestamp) {
+        let Some(quantum) = self.strategy_clock_quantum_us else {
+            return;
+        };
+        let next = *self.next_strategy_clock_us.get_or_insert_with(|| {
+            let floor = now - now % quantum;
+            if now.is_multiple_of(quantum) {
+                now
+            } else {
+                floor.saturating_add(quantum)
+            }
+        });
+        if now < next {
+            return;
+        }
+
+        let scheduled_at = now - now % quantum;
+        if scheduled_at > next {
+            self.stats.data_integrity_gaps = self.stats.data_integrity_gaps.saturating_add(1);
+            self.pause_trading();
+        }
+        self.next_strategy_clock_us = Some(scheduled_at.saturating_add(quantum));
+        let insert_at = self
+            .pending_market_events
+            .iter()
+            .position(|pending| pending.received_at > scheduled_at)
+            .unwrap_or(self.pending_market_events.len());
+        self.pending_market_events.insert(
+            insert_at,
+            PendingMarketEvent {
+                input: PendingStrategyInput::Clock(scheduled_at),
+                received_at: now,
+                capture_boundary: hft_core::LatencyCaptureBoundary::Unspecified,
+                book: None,
+                canonical_book: None,
+            },
+        );
     }
 
     pub fn strategy_instance_ids(&self) -> Vec<String> {
@@ -1106,18 +1177,33 @@ impl Engine {
                                 self.stats.data_integrity_gaps =
                                     self.stats.data_integrity_gaps.saturating_add(1);
                             }
-                            let book = Self::event_venue_symbol(&event).and_then(|key| {
+                            let canonical_l2 = matches!(
+                                &event,
+                                ports::MarketEvent::Snapshot(_) | ports::MarketEvent::Update(_)
+                            );
+                            let key = Self::event_venue_symbol(&event);
+                            let book = key.as_ref().and_then(|key| {
                                 self.aggregation_engine
                                     .orderbooks
-                                    .get(&key)
+                                    .get(key)
                                     .cloned()
                                     .map(|snapshot| (key.venue, snapshot))
                             });
+                            let canonical_book = if canonical_l2 {
+                                key.as_ref().and_then(|key| {
+                                    self.aggregation_engine
+                                        .canonical_top_n(key)
+                                        .map(|snapshot| (key.venue, snapshot))
+                                })
+                            } else {
+                                None
+                            };
                             self.pending_market_events.push(PendingMarketEvent {
-                                event,
+                                input: PendingStrategyInput::Market(event),
                                 received_at,
                                 capture_boundary,
                                 book,
+                                canonical_book,
                             });
                         }
                         self.aggregation_events_buf = aggregation_events;
@@ -1160,6 +1246,9 @@ impl Engine {
         }
 
         result.events_total = total_events;
+        if self.event_consumers.iter().all(EventConsumer::is_empty) {
+            self.queue_due_strategy_clock(now_micros());
+        }
 
         // 階段 2: 處理執行事件 (來自执行队列) - 非阻塞批量接收
         let mut exec_processed = 0u32;
@@ -1497,20 +1586,28 @@ impl Engine {
         let mut events_to_process = std::mem::take(&mut self.pending_market_events);
 
         for pending in &events_to_process {
-            let event = &pending.event;
-            let exchange_timestamp = self.extract_event_timestamp(event);
+            let (event, clock_timestamp) = match &pending.input {
+                PendingStrategyInput::Market(event) => (Some(event), None),
+                PendingStrategyInput::Clock(timestamp) => (None, Some(*timestamp)),
+            };
+            let exchange_timestamp = event
+                .and_then(|event| self.extract_event_timestamp(event))
+                .or(clock_timestamp);
             let received_at = pending.received_at;
             let capture_boundary = pending.capture_boundary;
-            self.recent_market_event_timestamp =
-                Self::receive_latency_anchor(capture_boundary, received_at);
+            if event.is_some() {
+                self.recent_market_event_timestamp =
+                    Self::receive_latency_anchor(capture_boundary, received_at);
+            }
             let mut event_tracker = LatencyTracker::from_time(received_at);
 
             // 日誌降噪：逐事件改為 debug 級別
             let (event_kind, symbol) = match event {
-                ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.as_str()),
-                ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.as_str()),
-                ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.as_str()),
-                ports::MarketEvent::Quote(quote) => ("quote", quote.symbol.as_str()),
+                Some(ports::MarketEvent::Bar(bar)) => ("bar", bar.symbol.as_str()),
+                Some(ports::MarketEvent::Trade(trade)) => ("trade", trade.symbol.as_str()),
+                Some(ports::MarketEvent::Snapshot(snap)) => ("snapshot", snap.symbol.as_str()),
+                Some(ports::MarketEvent::Quote(quote)) => ("quote", quote.symbol.as_str()),
+                None => ("clock", ""),
                 _ => ("other", ""),
             };
 
@@ -1540,10 +1637,20 @@ impl Engine {
                     ask_prices: &book.ask_prices,
                     ask_quantities: &book.ask_quantities,
                 });
-            let strategy_context = ports::StrategyContext {
-                account: &account_view,
-                book: l2_book,
-            };
+            let canonical_l2_book =
+                pending
+                    .canonical_book
+                    .as_ref()
+                    .map(|(venue, book)| ports::L2BookView {
+                        symbol: &book.symbol,
+                        venue: *venue,
+                        timestamp: book.timestamp,
+                        sequence: book.sequence,
+                        bid_prices: &book.bid_prices,
+                        bid_quantities: &book.bid_quantities,
+                        ask_prices: &book.ask_prices,
+                        ask_quantities: &book.ask_quantities,
+                    });
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
             let strategy_account_mapping = &self.strategy_account_mapping;
@@ -1563,14 +1670,14 @@ impl Engine {
 
                 // 事件範疇過濾（使用策略顯式語義）：單場策略僅處理綁定場域事件
                 let mut should_process = true;
-                if matches!(strategy.venue_scope(), ports::VenueScope::Single) {
+                if matches!(strategy.venue_scope(), ports::VenueScope::Single) && event.is_some() {
                     // 取得事件來源場域
                     let event_venue = match event {
-                        ports::MarketEvent::Snapshot(snapshot) => snapshot.source_venue,
-                        ports::MarketEvent::Update(update) => update.source_venue,
-                        ports::MarketEvent::Quote(quote) => quote.source_venue,
-                        ports::MarketEvent::Trade(trade) => trade.source_venue,
-                        ports::MarketEvent::Bar(bar) => bar.source_venue,
+                        Some(ports::MarketEvent::Snapshot(snapshot)) => snapshot.source_venue,
+                        Some(ports::MarketEvent::Update(update)) => update.source_venue,
+                        Some(ports::MarketEvent::Quote(quote)) => quote.source_venue,
+                        Some(ports::MarketEvent::Trade(trade)) => trade.source_venue,
+                        Some(ports::MarketEvent::Bar(bar)) => bar.source_venue,
                         _ => None,
                     };
                     if let Some(&expected_venue) =
@@ -1583,16 +1690,16 @@ impl Engine {
                 }
                 if !should_process {
                     let (event_kind, symbol, source) = match event {
-                        ports::MarketEvent::Bar(bar) => {
+                        Some(ports::MarketEvent::Bar(bar)) => {
                             ("bar", bar.symbol.as_str(), bar.source_venue)
                         }
-                        ports::MarketEvent::Trade(trade) => {
+                        Some(ports::MarketEvent::Trade(trade)) => {
                             ("trade", trade.symbol.as_str(), trade.source_venue)
                         }
-                        ports::MarketEvent::Snapshot(snap) => {
+                        Some(ports::MarketEvent::Snapshot(snap)) => {
                             ("snapshot", snap.symbol.as_str(), snap.source_venue)
                         }
-                        ports::MarketEvent::Quote(quote) => {
+                        Some(ports::MarketEvent::Quote(quote)) => {
                             ("quote", quote.symbol.as_str(), quote.source_venue)
                         }
                         _ => ("other", "", None),
@@ -1607,7 +1714,32 @@ impl Engine {
                     continue;
                 }
 
-                let mut intents = strategy.on_market_event_with_context(event, &strategy_context);
+                let mut intents = match (event, clock_timestamp) {
+                    (Some(event), _) => {
+                        let strategy_context = ports::StrategyContext {
+                            account: &account_view,
+                            book: if strategy
+                                .clock_interval_micros()
+                                .is_some_and(|interval| interval > 0)
+                            {
+                                canonical_l2_book
+                            } else {
+                                l2_book
+                            },
+                        };
+                        strategy.on_market_event_with_context(event, &strategy_context)
+                    }
+                    (None, Some(timestamp))
+                        if strategy
+                            .clock_interval_micros()
+                            .filter(|interval| *interval > 0)
+                            .is_some_and(|interval| timestamp.is_multiple_of(interval)) =>
+                    {
+                        strategy.on_clock(timestamp, &account_view)
+                    }
+                    (None, None) => Vec::new(),
+                    (None, Some(_)) => Vec::new(),
+                };
 
                 // 自動填充 strategy_id（如果是空字串）：使用策略實例 ID 而非索引
                 for intent in &mut intents {
@@ -1750,9 +1882,9 @@ impl Engine {
                     envelope.lifecycle.source_feature_ts = exchange_timestamp;
                     envelope.lifecycle.source_book_seq =
                         l2_book.map(|book| book.sequence).or(match event {
-                            ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
-                            ports::MarketEvent::Update(update) => Some(update.sequence),
-                            ports::MarketEvent::Quote(quote) => Some(quote.sequence),
+                            Some(ports::MarketEvent::Snapshot(snapshot)) => Some(snapshot.sequence),
+                            Some(ports::MarketEvent::Update(update)) => Some(update.sequence),
+                            Some(ports::MarketEvent::Quote(quote)) => Some(quote.sequence),
                             _ => None,
                         });
                     envelope.lifecycle.timing.risk_completed_mono_us = risk_completed_mono_us;
@@ -2354,6 +2486,124 @@ mod tests {
             Engine::receive_latency_anchor(LatencyCaptureBoundary::AdapterPublish, 20);
         assert_eq!(engine.recent_market_event_timestamp, None);
     }
+
+    struct ClockCaptureStrategy {
+        interval: u64,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl ports::Strategy for ClockCaptureStrategy {
+        fn on_market_event(
+            &mut self,
+            _event: &ports::MarketEvent,
+            _account: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn clock_interval_micros(&self) -> Option<u64> {
+            Some(self.interval)
+        }
+
+        fn on_clock(
+            &mut self,
+            timestamp: u64,
+            _account: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            self.calls.lock().unwrap().push(timestamp);
+            Vec::new()
+        }
+
+        fn on_execution_event(
+            &mut self,
+            _event: &ports::ExecutionEvent,
+            _account: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "clock-capture"
+        }
+    }
+
+    #[test]
+    fn time_bucketed_strategies_receive_clock_boundaries_without_market_events() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slower_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_strategy(ClockCaptureStrategy {
+            interval: 1_000_000,
+            calls: std::sync::Arc::clone(&calls),
+        });
+        engine.register_strategy(ClockCaptureStrategy {
+            interval: 2_000_000,
+            calls: std::sync::Arc::clone(&slower_calls),
+        });
+
+        engine.queue_due_strategy_clock(100_000);
+        assert!(engine.pending_market_events.is_empty());
+        engine.queue_due_strategy_clock(1_000_000);
+        engine
+            .run_strategies_sync(&mut EngineTickResult::default())
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec![1_000_000]);
+        assert!(slower_calls.lock().unwrap().is_empty());
+
+        engine.queue_due_strategy_clock(2_000_000);
+        engine
+            .run_strategies_sync(&mut EngineTickResult::default())
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![1_000_000, 2_000_000]);
+        assert_eq!(*slower_calls.lock().unwrap(), vec![2_000_000]);
+
+        engine.queue_due_strategy_clock(4_100_000);
+        assert_eq!(engine.trading_mode(), TradingMode::Paused);
+        assert_eq!(engine.stats.data_integrity_gaps, 1);
+    }
+
+    #[test]
+    fn strategy_clock_waits_until_market_input_is_drained() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = EngineConfig {
+            max_events_per_cycle: 1,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config);
+        engine.register_strategy(ClockCaptureStrategy {
+            interval: 1,
+            calls: std::sync::Arc::clone(&calls),
+        });
+        let ingester = engine.create_event_ingester_pair();
+        let now = now_micros();
+        for sequence in 0..2 {
+            ingester
+                .lock()
+                .unwrap()
+                .ingest(MarketEvent::Bar(AggregatedBar {
+                    symbol: Symbol::new("BTCUSDT"),
+                    interval_ms: 1,
+                    open_time: now.saturating_sub(1),
+                    close_time: now,
+                    open: Price::from_f64(100.0).unwrap(),
+                    high: Price::from_f64(100.0).unwrap(),
+                    low: Price::from_f64(100.0).unwrap(),
+                    close: Price::from_f64(100.0).unwrap(),
+                    volume: Quantity::from_f64(1.0).unwrap(),
+                    trade_count: sequence,
+                    source_venue: Some(VenueId::BINANCE),
+                    timestamps: Default::default(),
+                }))
+                .unwrap();
+        }
+
+        engine.tick().unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        engine.tick().unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
     struct SingleVenueStub {
         id: String,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -2533,7 +2783,7 @@ mod tests {
 
         let received_at = now_micros();
         engine.pending_market_events.push(PendingMarketEvent {
-            event: MarketEvent::Bar(AggregatedBar {
+            input: PendingStrategyInput::Market(MarketEvent::Bar(AggregatedBar {
                 symbol: Symbol::new("BTCUSDT"),
                 interval_ms: 60_000,
                 open_time: received_at,
@@ -2546,10 +2796,11 @@ mod tests {
                 trade_count: 1,
                 source_venue: Some(VenueId::MOCK),
                 timestamps: Default::default(),
-            }),
+            })),
             received_at,
             capture_boundary: LatencyCaptureBoundary::AdapterPublish,
             book: None,
+            canonical_book: None,
         });
 
         engine
@@ -2592,7 +2843,7 @@ mod tests {
 
         let received_at = now_micros();
         engine.pending_market_events.push(PendingMarketEvent {
-            event: MarketEvent::Bar(AggregatedBar {
+            input: PendingStrategyInput::Market(MarketEvent::Bar(AggregatedBar {
                 symbol: Symbol::new("BTCUSDT"),
                 interval_ms: 60_000,
                 open_time: received_at,
@@ -2605,10 +2856,11 @@ mod tests {
                 trade_count: 1,
                 source_venue: Some(VenueId::MOCK),
                 timestamps: Default::default(),
-            }),
+            })),
             received_at,
             capture_boundary: LatencyCaptureBoundary::AdapterPublish,
             book: None,
+            canonical_book: None,
         });
 
         engine

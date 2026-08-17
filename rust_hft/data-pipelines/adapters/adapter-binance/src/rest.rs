@@ -23,6 +23,8 @@ fn classify_http_error(status: u16, retry_after: Option<&str>, body: &str) -> Hf
 #[derive(Clone)]
 pub struct BinanceRestClient {
     client: integration::http::HttpClient,
+    depth_path: &'static str,
+    ping_path: &'static str,
 }
 
 impl Default for BinanceRestClient {
@@ -45,7 +47,17 @@ impl BinanceRestClient {
         let client =
             integration::http::HttpClient::new(config).expect("Failed to create HTTP client");
 
-        Self { client }
+        Self {
+            client,
+            depth_path: "/api/v3/depth",
+            ping_path: "/api/v3/ping",
+        }
+    }
+
+    pub fn with_usdm(mut self) -> Self {
+        self.depth_path = "/fapi/v1/depth";
+        self.ping_path = "/fapi/v1/ping";
+        self
     }
 
     /// 獲取訂單簿快照
@@ -53,7 +65,7 @@ impl BinanceRestClient {
         let limit = limit.unwrap_or(100);
         let symbol_str = symbol.to_string();
 
-        let path = format!("/api/v3/depth?symbol={}&limit={}", symbol_str, limit);
+        let path = format!("{}?symbol={}&limit={}", self.depth_path, symbol_str, limit);
 
         debug!("獲取 {} 深度快照，限制: {}", symbol, limit);
 
@@ -96,11 +108,9 @@ impl BinanceRestClient {
 
     /// 測試連通性
     pub async fn ping(&self) -> HftResult<()> {
-        let path = "/api/v3/ping";
-
         let response = self
             .client
-            .get(path, None)
+            .get(self.ping_path, None)
             .await
             .map_err(|e| HftError::Network(format!("ping 請求失敗: {}", e)))?;
 
@@ -136,6 +146,13 @@ mod tests {
         assert!(
             matches!(error, HftError::RateLimit(message) if message.contains("retry-after=60s"))
         );
+    }
+
+    #[test]
+    fn usdm_uses_futures_rest_paths() {
+        let client = BinanceRestClient::with_base_url("https://fapi.binance.com").with_usdm();
+        assert_eq!(client.depth_path, "/fapi/v1/depth");
+        assert_eq!(client.ping_path, "/fapi/v1/ping");
     }
 
     #[tokio::test]

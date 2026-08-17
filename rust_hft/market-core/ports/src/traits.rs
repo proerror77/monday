@@ -468,8 +468,8 @@ pub struct L2BookView<'a> {
     pub ask_quantities: &'a [FixedQuantity],
 }
 
-/// Stable strategy input. `book` is present when the event identifies a venue and symbol
-/// whose canonical L2 state is currently synchronized.
+/// Stable strategy input. Time-bucketed strategies receive canonical L2 for snapshot/update
+/// events; event-driven strategies retain the published book, including newer BBO overlays.
 #[derive(Debug, Clone, Copy)]
 pub struct StrategyContext<'a> {
     pub account: &'a AccountView,
@@ -480,7 +480,7 @@ pub trait Strategy: Send + Sync {
     /// 處理市場事件，返回交易意圖
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent>;
 
-    /// Process an event with the engine's latest canonical L2 state.
+    /// Process an event with the point-in-time L2 state selected by the strategy contract.
     ///
     /// Existing non-LOB strategies remain source-compatible through this default implementation.
     fn on_market_event_with_context(
@@ -489,6 +489,16 @@ pub trait Strategy: Send + Sync {
         context: &StrategyContext<'_>,
     ) -> Vec<OrderIntent> {
         self.on_market_event(event, context.account)
+    }
+
+    /// Optional wall-clock cadence for strategies whose research contract is time-bucketed.
+    fn clock_interval_micros(&self) -> Option<u64> {
+        None
+    }
+
+    /// Process one epoch-aligned clock boundary. Event-driven strategies ignore it by default.
+    fn on_clock(&mut self, _timestamp: Timestamp, _account: &AccountView) -> Vec<OrderIntent> {
+        Vec::new()
     }
 
     /// 處理執行事件 (成交回報等)
@@ -549,7 +559,7 @@ pub enum RiskDecision {
 }
 
 /// 交易所規格（作為穩定契約的一部分）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VenueSpec {
     pub name: String,
     // 精度/步進

@@ -33,11 +33,11 @@ mod venue_registry; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
 pub use config_types::{
-    ClickHouseConfig, CpuAffinityConfig, EnhancedRiskSettings, ExecutionQueueSettings, InfraConfig,
-    LobFlowGridParams, PortfolioSpec, RedisConfig, RiskConfig, StrategyConfig,
-    StrategyEnhancedRiskOverride, StrategyParams, StrategyRiskLimits, StrategyRiskOverride,
-    StrategyType, SystemEngineConfig, TokenizedSecuritiesRiskConfig, TradingWindow,
-    TradingWindowConfig, VenueCapabilities, VenueConfig, VenueType,
+    ClickHouseConfig, CpuAffinityConfig, EnhancedRiskSettings, ExecutionQueueSettings,
+    FormulaExecutionContract, InfraConfig, LobFlowGridParams, PortfolioSpec, RedisConfig,
+    RiskConfig, StrategyConfig, StrategyEnhancedRiskOverride, StrategyParams, StrategyRiskLimits,
+    StrategyRiskOverride, StrategyType, SystemEngineConfig, TokenizedSecuritiesRiskConfig,
+    TradingWindow, TradingWindowConfig, VenueCapabilities, VenueConfig, VenueType,
 };
 
 // ClickHouse 行結構已移至 system_builder::infra_exporters（feature = "clickhouse"）
@@ -625,6 +625,15 @@ impl SystemBuilder {
             error!(%error, "invalid intent execution limits; engine remains paused");
             engine.pause_trading();
         }
+        for strategy in &self.config.strategies {
+            if let StrategyParams::Formula {
+                execution_contract: Some(contract),
+                ..
+            } = &strategy.params
+            {
+                engine.add_venue_spec(contract.venue, contract.venue_spec.clone());
+            }
+        }
 
         // 🔥 P0: 依賴注入 - 創建並注入 OMS 與 Portfolio
         {
@@ -900,6 +909,13 @@ impl SystemRuntime {
                             }
                             if let Some(rest_url) = &cfg.rest {
                                 stream = stream.with_rest_base_url(rest_url.clone());
+                            }
+                            if cfg
+                                .inst_type
+                                .as_deref()
+                                .is_some_and(|market| market.eq_ignore_ascii_case("usdm"))
+                            {
+                                stream = stream.with_usdm();
                             }
                         }
                         let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;

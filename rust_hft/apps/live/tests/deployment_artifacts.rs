@@ -144,7 +144,7 @@ fn production_config_accepts_the_governed_paper_target() {
         .config()
         .clone();
     let bundle = formula_bundle();
-    let request = ActivationRequest {
+    let mut request = ActivationRequest {
         deployment_id: "deployment-1".to_string(),
         asset_revision_id: bundle.candidate_id.clone(),
         promotion_id: "promotion-1".to_string(),
@@ -152,6 +152,8 @@ fn production_config_accepts_the_governed_paper_target() {
         bundle_hash: bundle.bundle_hash.clone(),
         account_id: "bitget_main".to_string(),
         venue: "bitget".to_string(),
+        market: None,
+        cex_execution_costs: None,
         instruments: vec!["BTCUSDT".to_string()],
         artifact: ActivationArtifact::Formula,
         mode: ActivationMode::Paper,
@@ -162,7 +164,7 @@ fn production_config_accepts_the_governed_paper_target() {
     };
 
     SystemConfigActivationAdapter::new(&mut config, &bundle, Path::new("bundle.json"))
-        .activate(&request)
+        .activate(&mut request)
         .expect("canonical deployment target must resolve");
     assert!(!config.quotes_only);
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
