@@ -609,6 +609,7 @@ dependencies = [
 name = "alpha-domain"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "ed25519-dalek",
  "hex",
@@ -617,6 +618,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
