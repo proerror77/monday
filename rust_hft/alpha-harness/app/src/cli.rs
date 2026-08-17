@@ -1075,6 +1075,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "btc_5m_backtest",
             "--image-identity",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "--partition-view-json",
+            r#"{"common_time_boundary_ms":1,"train_market_ids":["train"],"crossing_excluded_market_ids":[],"held_out_market_ids":["held"]}"#,
             "--resume-url",
             "previous-results.zip",
             "--resume-sha256",
