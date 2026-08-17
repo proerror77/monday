@@ -927,6 +927,10 @@ struct TapeWriter {
     tape_bytes: u64,
     tape_max_bytes: u64,
     recovery_pending: bool,
+    /// Segment names this writer published; several rotations can share one
+    /// cycle-level timestamp, so own names are bumped past, while a foreign
+    /// closed tape at the target name stays a hard no-clobber failure.
+    rotated_names: BTreeSet<PathBuf>,
     file: Option<File>,
 }
 
@@ -1150,6 +1154,7 @@ impl TapeWriter {
             tape_bytes: 0,
             tape_max_bytes: DEFAULT_TAPE_MAX_BYTES,
             recovery_pending: false,
+            rotated_names: BTreeSet::new(),
             file: None,
         };
         writer.recover_active(recover, expected_active)?;
@@ -1219,7 +1224,26 @@ impl TapeWriter {
         self.rotate_with_rename(now, rename_noreplace)
     }
 
-    fn rotate_with_rename<F>(&mut self, now: DateTime<Utc>, mut rename: F) -> Result<PathBuf>
+    fn rotate_with_rename<F>(&mut self, now: DateTime<Utc>, rename: F) -> Result<PathBuf>
+    where
+        F: FnMut(&Path, &Path) -> Result<()>,
+    {
+        self.rotate_staged_with_rename(now, &[], 0, rename)
+    }
+
+    /// Publish a fresh active tape that starts with `initial` (already
+    /// encoded rows with sequences 0..initial_records). The staged tape is
+    /// populated and synced before either rename runs, so a crash or failure
+    /// at any point leaves either the old active tape or a new active tape
+    /// that already contains the initial rows — never an empty or partial
+    /// replacement.
+    fn rotate_staged_with_rename<F>(
+        &mut self,
+        now: DateTime<Utc>,
+        initial: &[u8],
+        initial_records: u64,
+        mut rename: F,
+    ) -> Result<PathBuf>
     where
         F: FnMut(&Path, &Path) -> Result<()>,
     {
@@ -1229,15 +1253,18 @@ impl TapeWriter {
         let staged = self
             .spool_dir
             .join(format!(".{ACTIVE_TAPE}.{}.rotate", random::<u64>()));
-        let staged_file = OpenOptions::new()
+        let mut staged_file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&staged)?;
-        if let Err(error) = staged_file.sync_all() {
+        if let Err(error) = staged_file
+            .write_all(initial)
+            .and_then(|()| staged_file.sync_all())
+        {
             drop(staged_file);
             let cleanup = fs::remove_file(&staged);
             return Err(anyhow!(
-                "failed to sync staged next tape: {error}; cleanup={cleanup:?}"
+                "failed to populate staged next tape: {error}; cleanup={cleanup:?}"
             ));
         }
         drop(staged_file);
@@ -1250,10 +1277,29 @@ impl TapeWriter {
         }
         let active_metadata = active_file.metadata()?;
         drop(self.file.take().expect("active tape was checked above"));
-        let rotated = self.spool_dir.join(format!(
+        // Several rotations can share one cycle-level timestamp (size-cap
+        // rotations inside a single batch, including carry rotations), and
+        // the rename below is no-clobber, so bump the microsecond stamp past
+        // names this writer itself published. A pre-existing closed tape we
+        // did not create stays a hard collision: the rename fails instead of
+        // silently picking a new name for an anomalous spool state. Bumped
+        // stamps still parse under the uploader's strict rotation-name rule.
+        let mut rotated = self.spool_dir.join(format!(
             "market-updates.{}.ndjson",
             now.format("%Y%m%dT%H%M%S%6f")
         ));
+        let mut bump = 0_u32;
+        while rotated.exists() && self.rotated_names.contains(&rotated) {
+            bump += 1;
+            if bump > 1024 {
+                let cleanup = fs::remove_file(&staged);
+                bail!("could not allocate a unique rotated tape name; cleanup={cleanup:?}");
+            }
+            rotated = self.spool_dir.join(format!(
+                "market-updates.{}.ndjson",
+                (now + TimeDelta::microseconds(i64::from(bump))).format("%Y%m%dT%H%M%S%6f")
+            ));
+        }
         if let Err(error) = rename(&self.active, &rotated) {
             let cleanup = fs::remove_file(&staged);
             let directory_sync = File::open(&self.spool_dir).and_then(|file| file.sync_all());
@@ -1289,11 +1335,159 @@ impl TapeWriter {
             ));
         }
         File::open(&self.spool_dir)?.sync_all()?;
-        self.sequence = 0;
-        self.tape_bytes = 0;
+        self.sequence = initial_records;
+        self.tape_bytes = u64::try_from(initial.len())?;
         self.hour = None;
         self.file = Some(open_append(&self.active)?);
+        self.rotated_names.insert(rotated.clone());
         Ok(rotated)
+    }
+
+    /// Rotate at the byte cap while recovered trades remain pending: restate
+    /// the still-pending recovered trade rows at the front of the new active
+    /// segment, so the active tape stays a self-contained crash-recovery
+    /// source instead of deadlocking against the cap. The latest metadata row
+    /// of each pending condition is carried as well, because the upload
+    /// scanner only counts a segment as canonical when every trade context
+    /// has a matching market_metadata row in the same segment. Carried rows
+    /// keep their original payloads and recorded_at, get fresh sequences, are
+    /// the only content allowed to exceed the cap, and are published
+    /// atomically with the new active tape. Two streaming passes keep memory
+    /// bounded by the live pending set rather than the whole tape.
+    fn rotate_with_pending_carry(&mut self, now: DateTime<Utc>) -> Result<()> {
+        self.rotate_with_pending_carry_and_rename(now, rename_noreplace)
+    }
+
+    fn rotate_with_pending_carry_and_rename<F>(
+        &mut self,
+        now: DateTime<Utc>,
+        rename: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Path, &Path) -> Result<()>,
+    {
+        // Pass 1: stream the tape to compute the live pending set, mirroring
+        // recover_state_from_tape_row (a completion clears the whole
+        // condition), plus the last metadata line of each condition.
+        let mut live: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut last_metadata_line: BTreeMap<String, u64> = BTreeMap::new();
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            let mut reader = BufReader::new(file.try_clone()?);
+            reader.seek(SeekFrom::Start(0))?;
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                let bytes = reader.read_until(b'\n', &mut line)?;
+                if bytes == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                line_number += 1;
+                let row: Value = serde_json::from_slice(&line)?;
+                let Some(update) = row.get("update").and_then(Value::as_object) else {
+                    continue;
+                };
+                let kind = update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let condition_id = update.get("condition_id").and_then(Value::as_str);
+                if kind == "polymarket_trade"
+                    && update.get("record_id_version").and_then(Value::as_str)
+                        == Some(TRADE_ID_VERSION)
+                {
+                    if let (Some(condition_id), Some(record_id)) = (
+                        condition_id,
+                        update.get("record_id").and_then(Value::as_str),
+                    ) {
+                        if !live
+                            .entry(condition_id.to_owned())
+                            .or_default()
+                            .insert(record_id.to_owned())
+                        {
+                            bail!("active tape contains duplicate trade record ID {record_id}");
+                        }
+                    }
+                } else if kind == TRADE_COMPLETION_KIND {
+                    if let Some(condition_id) = condition_id {
+                        live.remove(condition_id);
+                    }
+                } else if kind == "market_metadata" {
+                    if let Some(condition_id) = condition_id {
+                        last_metadata_line.insert(condition_id.to_owned(), line_number);
+                    }
+                }
+            }
+            release_clean_file_cache(reader.get_ref())?;
+        }
+        // Pass 2: stream again and encode the rows to carry into one buffer
+        // with fresh sequences. Selection follows the original tape order so
+        // recorded_at stays non-decreasing inside the new segment.
+        let mut carried = Vec::new();
+        let mut carried_records = 0_u64;
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            let mut reader = BufReader::new(file.try_clone()?);
+            reader.seek(SeekFrom::Start(0))?;
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                let bytes = reader.read_until(b'\n', &mut line)?;
+                if bytes == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                line_number += 1;
+                let mut row: Value = serde_json::from_slice(&line)?;
+                let Some(update) = row.get("update").and_then(Value::as_object) else {
+                    continue;
+                };
+                let kind = update
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let condition_id = update.get("condition_id").and_then(Value::as_str);
+                let carry = match kind {
+                    "polymarket_trade"
+                        if update.get("record_id_version").and_then(Value::as_str)
+                            == Some(TRADE_ID_VERSION) =>
+                    {
+                        match (
+                            condition_id,
+                            update.get("record_id").and_then(Value::as_str),
+                        ) {
+                            (Some(condition_id), Some(record_id)) => live
+                                .get(condition_id)
+                                .is_some_and(|records| records.contains(record_id)),
+                            _ => false,
+                        }
+                    }
+                    "market_metadata" => condition_id.is_some_and(|condition_id| {
+                        live.contains_key(condition_id)
+                            && last_metadata_line.get(condition_id) == Some(&line_number)
+                    }),
+                    _ => false,
+                };
+                if !carry {
+                    continue;
+                }
+                let object = row
+                    .as_object_mut()
+                    .context("active tape row is not a JSON object")?;
+                object.insert("sequence".to_owned(), Value::from(carried_records));
+                carried_records += 1;
+                serde_json::to_writer(&mut carried, &row)?;
+                carried.push(b'\n');
+            }
+            release_clean_file_cache(reader.get_ref())?;
+        }
+        {
+            let file = self.file.as_mut().context("active tape is closed")?;
+            file.seek(SeekFrom::End(0))?;
+        }
+        self.rotate_staged_with_rename(now, &carried, carried_records, rename)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1372,18 +1566,23 @@ impl TapeWriter {
                         .saturating_add(u64::try_from(encoded.len())?)
                         > self.tape_max_bytes
                 {
+                    // Recovered trades still pending cannot be stranded in the
+                    // rotated segment: restate them at the front of the fresh
+                    // tape so rotation stays safe and the active tape remains
+                    // a self-contained crash-recovery source.
                     if self.recovery_pending {
-                        bail!("active tape reached its byte cap while recovered trade IDs remain");
+                        self.rotate_with_pending_carry(now)?;
+                    } else {
+                        self.rotate(now)?;
                     }
-                    self.rotate(now)?;
                     encoded = encode(self.sequence)?;
                     // The rotated tape is published; the rollback anchor moves
-                    // to the fresh segment so a later failure never truncates
-                    // across the rotation boundary.
+                    // to the fresh segment (past any carried rows) so a later
+                    // failure never truncates across the rotation boundary.
                     start_hour = None;
-                    start_sequence = 0;
-                    start_tape_bytes = 0;
-                    start_offset = 0;
+                    start_sequence = self.sequence;
+                    start_tape_bytes = self.tape_bytes;
+                    start_offset = self.tape_bytes;
                     self.hour = Some(target_hour.clone());
                 }
                 let file = self.file.as_mut().context("active tape is closed")?;
@@ -6003,6 +6202,266 @@ mod tests {
         assert_eq!(active_rows[0]["update"]["kind"], "second");
         assert_eq!(active_rows[1]["sequence"], 1);
         assert_eq!(active_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn size_cap_carries_pending_recovered_trades_into_the_fresh_segment() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer.write_updates(std::slice::from_ref(&trade), now).unwrap();
+        // Simulate crash-recovered pending trades, then cross the cap: the
+        // writer must rotate and carry instead of deadlocking on the cap.
+        writer.recovery_pending = true;
+        writer
+            .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The old segment keeps the original trade row untouched.
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let rotated_rows = fs::read_to_string(&rotated[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rotated_rows.len(), 1);
+        assert_eq!(rotated_rows[0]["sequence"], 0);
+        assert_eq!(rotated_rows[0]["update"], trade);
+
+        // The fresh segment restates the pending trade first (original
+        // payload and recorded_at, fresh sequence), then the current record.
+        let active_rows = fs::read_to_string(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"], trade);
+        assert_eq!(active_rows[0]["update"]["record_id"], record_id.as_str());
+        assert_eq!(
+            active_rows[0]["recorded_at"],
+            rotated_rows[0]["recorded_at"]
+        );
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"]["kind"], "second");
+    }
+
+    #[test]
+    fn size_cap_carry_preserves_recovered_trade_ids_across_restart() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let payload = "x".repeat(MIN_TAPE_MAX_BYTES as usize);
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer.write_updates(&[trade], now).unwrap();
+            writer.recovery_pending = true;
+            writer
+                .write_updates(&[json!({"kind": "second", "payload": payload})], now)
+                .unwrap();
+            writer.close().unwrap();
+        }
+
+        // Restart: recovery rebuilds the same pending set from the carried
+        // rows, with no duplicate-ID false positive.
+        let mut state = CollectorState::default();
+        let mut recovered_total = 0;
+        let writer = TapeWriter::new_with_recovery(root.path(), |row| {
+            recover_state_from_tape_row(&mut state, row, 1024, &mut recovered_total)
+        })
+        .unwrap();
+        assert_eq!(writer.sequence, 2);
+        assert_eq!(recovered_total, 1);
+        assert_eq!(state.recovered_trade_ids.len(), 1);
+        assert_eq!(
+            state.recovered_trade_ids["condition-1"],
+            BTreeSet::from([record_id])
+        );
+    }
+
+    #[test]
+    fn carry_rotation_publishes_carried_rows_atomically_with_the_new_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+
+        // Spy on the staged tape at publication time: the carried rows must
+        // already be inside it before the rename makes it the active tape,
+        // so a crash can never expose an empty or partial replacement.
+        let mut staged_rows = Vec::new();
+        writer
+            .rotate_with_pending_carry_and_rename(now, |source, target| {
+                if source
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with('.')
+                {
+                    staged_rows = fs::read_to_string(source)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                }
+                rename_noreplace(source, target)
+            })
+            .unwrap();
+
+        assert_eq!(staged_rows.len(), 1);
+        assert_eq!(staged_rows[0]["sequence"], 0);
+        assert_eq!(staged_rows[0]["update"], trade);
+    }
+
+    #[test]
+    fn failed_carry_rotation_leaves_the_active_tape_and_writer_state_coherent() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let sequence_before = writer.sequence;
+        let tape_bytes_before = writer.tape_bytes;
+
+        // Fail the first rename (active -> rotated): the batch-level rollback
+        // anchors still describe this active tape, so they must stay valid.
+        let error = writer
+            .rotate_with_pending_carry_and_rename(now, |source, target| {
+                if source
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with('.')
+                {
+                    rename_noreplace(source, target)
+                } else {
+                    bail!("injected carry publish failure");
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected carry publish failure"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert_eq!(writer.sequence, sequence_before);
+        assert_eq!(writer.tape_bytes, tape_bytes_before);
+        assert!(writer.file.is_some(), "rollback must reopen the active tape");
+        assert!(rotated_tapes(root.path()).is_empty());
+        assert!(!fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".rotate")));
+    }
+
+    #[test]
+    fn repeated_carry_rotations_in_one_batch_get_unique_segment_names() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let trade = valid_trade_update(now, now.timestamp());
+        let payload = "x".repeat(600_000);
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(std::slice::from_ref(&trade), now)
+            .unwrap();
+        writer.recovery_pending = true;
+        // One batch, one timestamp, two cap crossings: the second carry
+        // rotation must not reuse the first segment's name (no-clobber).
+        writer
+            .write_updates(
+                &[
+                    json!({"kind": "second", "payload": payload}),
+                    json!({"kind": "third", "payload": payload}),
+                    json!({"kind": "fourth", "payload": payload}),
+                ],
+                now,
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 2);
+        assert_ne!(rotated[0], rotated[1]);
+        let discovered = crate::polymarket_upload::discover_rotated_tapes(root.path()).unwrap();
+        assert!(rotated.iter().all(|path| discovered.contains(path)));
+        // Every carried segment re-states the pending trade at sequence 0.
+        for path in &rotated {
+            let rows = fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows[0]["sequence"], 0);
+        }
+        let second_rows = fs::read_to_string(&rotated[1])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_rows[0]["update"]["kind"], "polymarket_trade");
+        assert_eq!(second_rows[1]["update"]["kind"], "third");
+    }
+
+    #[test]
+    fn carry_rotation_restates_metadata_context_for_pending_trades() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T01:00:00Z");
+        let metadata = valid_metadata_update(now);
+        let trade = valid_trade_update(now, now.timestamp());
+        let mut filler = valid_metadata_update(now);
+        filler["payload"] = json!("x".repeat(MIN_TAPE_MAX_BYTES as usize));
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+        writer
+            .write_updates(&[metadata.clone(), trade.clone()], now)
+            .unwrap();
+        writer.recovery_pending = true;
+        writer
+            .write_updates(std::slice::from_ref(&filler), now)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The carried segment re-states the latest metadata row ahead of the
+        // pending trade, in original tape order, with fresh sequences.
+        let active = root.path().join(ACTIVE_TAPE);
+        let rows = fs::read_to_string(&active)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["sequence"], 0);
+        assert_eq!(rows[0]["update"], metadata);
+        assert_eq!(rows[1]["sequence"], 1);
+        assert_eq!(rows[1]["update"], trade);
+        assert_eq!(rows[2]["sequence"], 2);
+        assert_eq!(rows[2]["update"], filler);
+
+        // The upload scanner finds the trade context complete because the
+        // carried segment re-states its metadata row (quote coverage is a
+        // separate gate that real collector segments satisfy with quotes).
+        let manifest =
+            crate::polymarket_upload::scan_tape(&active, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["reference_context_complete"], true);
     }
 
     #[test]
