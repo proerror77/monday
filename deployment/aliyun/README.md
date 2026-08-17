@@ -805,6 +805,27 @@ ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
 not duplicate the complete raw OSS tape.
 
+### Oversized all-market segments: slice then materialize
+
+Production `spot_all`/`usdm_all` hour segments can decompress past the 2 GiB
+market-tape seal bound, which keeps them out of
+`binance-replay-parquet-materializer`. The `binance-market-tape-slicer` binary
+(hft-collector) rewrites one digest-verified segment into disjoint
+symbol-subset segments: session rows are rewritten to the subset scope,
+per-slice manifests and digests are recomputed, and every slice is re-sealed
+and re-verified under the unchanged strict market-tape gate while it is still
+staged — only a verified slice is published, in data -> manifest -> _SUCCESS
+order. The 2 GiB bound is a deliberate resource limit and is not raised.
+`deployment/aliyun/binance-lob-slice-materialize.sh` is the batch driver: it
+recursively enumerates `date=/hour=` partitions under the governed lake
+prefix, downloads each segment triplet, slices it for a requested symbol set,
+and materializes every slice with the unchanged materializer into
+content-addressed canonical parquet plus a `slice-materialization-run.json`
+evidence manifest. State under `WORK_DIR/state/` makes reruns resumable
+(completed segment/symbol pairs are skipped; a changed symbol set re-slices),
+and any download, slice, or materialize failure, any symbol left pending, an
+empty enumeration, or a run-manifest publish failure fails the run.
+
 ## Rust-only collector release workflow
 
 The Binance collector deployment lane is Rust-only. The legacy Python collector,
