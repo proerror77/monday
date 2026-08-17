@@ -1943,7 +1943,13 @@ while :; do
 
   ((elapsed < observation_deadline)) || break
 
-  sleep_for=$SAMPLE_SECONDS
+  # Align sleeps to absolute sample periods instead of adding a fixed
+  # SAMPLE_SECONDS each round. Per-iteration loop-body work (systemctl show,
+  # jq over collector-state.json, date) otherwise accumulates drift into the
+  # observed gate duration and can push the exit sample past the policy
+  # duration ceiling (issue #878).
+  sleep_for=$((SAMPLE_SECONDS - elapsed % SAMPLE_SECONDS))
+  ((sleep_for == 0)) && sleep_for=$SAMPLE_SECONDS
   if ((elapsed < observation_deadline)); then
     remaining=$((observation_deadline - elapsed))
     ((remaining < sleep_for)) && sleep_for=$remaining
