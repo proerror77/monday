@@ -1,8 +1,8 @@
 use crate::{
     cli::{
-        print_json, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs, FeedbackRecordArgs,
-        JsonRecordArgs, MissionStatusArgs, PromoteArgs, RegisterOnnxArgs, RevokeApprovalArgs,
-        SignDeploymentArgs,
+        print_json, CandidateShowArgs, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs,
+        FeedbackRecordArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs, RegisterOnnxArgs,
+        RevokeApprovalArgs, SignDeploymentArgs,
     },
     data_mission,
 };
@@ -43,6 +43,52 @@ pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
         "mission_id": args.mission_id,
         "candidates": lineage.candidates,
         "evaluations": lineage.evaluations,
+    }))
+}
+
+pub fn candidate_show(args: CandidateShowArgs) -> anyhow::Result<()> {
+    print_json(&candidate_show_report(&args)?)
+}
+
+pub(crate) fn candidate_show_report(args: &CandidateShowArgs) -> anyhow::Result<serde_json::Value> {
+    let store = AlphaStore::open(&args.db)?;
+    let lineage = store.mission_lineage(&args.mission_id)?;
+    let candidate = lineage
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == args.candidate_id)
+        .with_context(|| {
+            format!(
+                "candidate {} does not belong to mission {}",
+                args.candidate_id, args.mission_id
+            )
+        })?;
+    let mut evaluations = Vec::new();
+    for stored in lineage
+        .evaluations
+        .iter()
+        .filter(|stored| stored.record.candidate_id == args.candidate_id)
+    {
+        let evaluation: CandidateEvaluation =
+            serde_json::from_value(stored.record.payload.clone()).with_context(|| {
+                format!(
+                    "evaluation {} payload is malformed",
+                    stored.record.evaluation_id
+                )
+            })?;
+        evaluations.push(serde_json::json!({
+            "evaluation_id": stored.record.evaluation_id,
+            "content_hash": stored.content_hash,
+            "dataset_manifest_id": stored.record.dataset_manifest_id,
+            "evaluation_protocol_hash": stored.record.evaluation_protocol_hash,
+            "created_at": stored.record.created_at,
+            "evaluation": evaluation,
+        }));
+    }
+    Ok(serde_json::json!({
+        "mission_id": args.mission_id,
+        "candidate": candidate,
+        "evaluations": evaluations,
     }))
 }
 
@@ -1769,5 +1815,132 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("failed verification"));
+    }
+
+    #[test]
+    fn candidate_show_returns_typed_metrics_with_folds_and_failure_reasons() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("alpha.duckdb");
+        let now = Utc::now();
+        let candidate = onnx_candidate();
+        let evaluation = EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            dataset_manifest_id: "dataset-1".to_string(),
+            evaluation_protocol_hash: evaluation_protocol().content_hash().unwrap(),
+            payload: serde_json::json!({
+                "passed": false,
+                "score": 0.0,
+                "failure_reasons": ["time_series_ic 0.010 below floor 0.020"],
+                "evaluator_version": WALK_FORWARD_EVALUATOR_VERSION,
+                "evaluator_config": {},
+                "metrics": {
+                    "predictive": {
+                        "row_count": 2,
+                        "time_series_ic": 0.01,
+                        "time_series_rank_ic": 0.02,
+                        "time_series_icir": 0.5,
+                        "time_series_rank_icir": 0.6,
+                        "positive_ic_ratio": 0.5,
+                        "folds": [
+                            {"fold_index": 0, "row_count": 1, "time_series_ic": 0.01, "time_series_rank_ic": 0.02},
+                            {"fold_index": 1, "row_count": 1, "time_series_ic": 0.01, "time_series_rank_ic": 0.02}
+                        ]
+                    },
+                    "row_count": 2,
+                    "trade_count": 2,
+                    "total_turnover": 4.0,
+                    "mean_net_return": -0.001,
+                    "cumulative_net_return": -0.002,
+                    "max_drawdown": 0.003,
+                    "net_sharpe": -1.5,
+                    "raw_score": -0.5,
+                    "adjusted_score": -0.25,
+                    "folds": [
+                        {"fold_index": 0, "row_count": 1, "trade_count": 1, "total_turnover": 2.0, "mean_net_return": -0.001, "cumulative_net_return": -0.001, "max_drawdown": 0.001, "net_sharpe": -1.0, "raw_score": -0.5},
+                        {"fold_index": 1, "row_count": 1, "trade_count": 1, "total_turnover": 2.0, "mean_net_return": -0.001, "cumulative_net_return": -0.001, "max_drawdown": 0.003, "net_sharpe": -2.0, "raw_score": -0.5}
+                    ]
+                }
+            }),
+            created_at: now,
+        };
+        let iteration = ResearchIteration {
+            iteration_id: "iteration-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            parent_candidate_ids: vec![],
+            engine: EngineKind::ManualSeed,
+            hypothesis: "candidate show fixture".to_string(),
+            candidate_artifact_id: Some("candidate-1".to_string()),
+            evaluation_artifact_id: Some("evaluation-1".to_string()),
+            budget_usage: SearchBudgetUsage {
+                candidates: 1,
+                ..SearchBudgetUsage::default()
+            },
+            verdict: IterationVerdict::Discard,
+            failure_class: None,
+            failure_explanation: None,
+            created_at: now,
+        };
+        {
+            let mut store = AlphaStore::open(&db).unwrap();
+            store.create_mission(&research_mission()).unwrap();
+            store
+                .append_iteration(
+                    &iteration,
+                    Some(("candidate-1", &candidate)),
+                    Some(&evaluation),
+                )
+                .unwrap();
+        }
+
+        let report = candidate_show_report(&CandidateShowArgs {
+            db: db.clone(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(report["mission_id"], "mission-1");
+        assert_eq!(report["candidate"]["candidate_id"], "candidate-1");
+        let evaluations = report["evaluations"].as_array().unwrap();
+        assert_eq!(evaluations.len(), 1);
+        let shown = &evaluations[0];
+        assert_eq!(shown["evaluation_id"], "evaluation-1");
+        assert_eq!(shown["content_hash"].as_str().unwrap().len(), 64);
+        let shown_evaluation = &shown["evaluation"];
+        assert_eq!(shown_evaluation["passed"], false);
+        assert_eq!(
+            shown_evaluation["failure_reasons"],
+            serde_json::json!(["time_series_ic 0.010 below floor 0.020"])
+        );
+        assert_eq!(shown_evaluation["metrics"]["net_sharpe"], -1.5);
+        assert_eq!(
+            shown_evaluation["metrics"]["predictive"]["positive_ic_ratio"],
+            0.5
+        );
+        assert_eq!(
+            shown_evaluation["metrics"]["folds"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            shown_evaluation["metrics"]["folds"][1]["net_sharpe"],
+            -2.0
+        );
+
+        assert!(candidate_show_report(&CandidateShowArgs {
+            db: db.clone(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-unknown".to_string(),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("does not belong to mission"));
+        assert!(candidate_show_report(&CandidateShowArgs {
+            db,
+            mission_id: "mission-unknown".to_string(),
+            candidate_id: "candidate-1".to_string(),
+        })
+        .is_err());
     }
 }
