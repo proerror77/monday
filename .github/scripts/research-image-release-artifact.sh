@@ -13,6 +13,7 @@ binaries=(
   hft-backtest
   alpha-harness
   lob-pit-materializer
+  binance-market-tape-slicer
   binance-replay-parquet-materializer
   monday-prediction-research
   monday-prediction-evaluator
