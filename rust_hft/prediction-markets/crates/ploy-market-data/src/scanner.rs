@@ -21,8 +21,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::discovery::crypto::discover_crypto_markets;
 use crate::discovery::crypto::DiscoveredCryptoMarket;
+use crate::discovery::crypto::{discover_crypto_catalog_markets, discover_crypto_markets};
 use crate::discovery::sports::discover_sports_markets;
 use crate::discovery::upsert_market_catalog;
 use crate::feeds::spawn_clob_ws_quote_feed_until;
@@ -616,7 +616,7 @@ async fn refresh_crypto_catalog(
     match fetch_markets(&request, CRYPTO_DISCOVERY_MAX_MARKETS).await {
         Ok(markets) => {
             let discovered =
-                discover_crypto_markets(&markets, symbols, reference_prices, now).await;
+                discover_crypto_catalog_markets(&markets, symbols, reference_prices, now).await;
             for market in &discovered {
                 persist_discovered_crypto_market(Some(pool), market).await;
             }

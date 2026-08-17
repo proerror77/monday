@@ -32,11 +32,36 @@ pub async fn discover_crypto_markets(
     reference_prices: &ReferencePriceRegistry,
     now: DateTime<Utc>,
 ) -> Vec<DiscoveredCryptoMarket> {
+    discover_crypto_markets_inner(markets, configured_symbols, reference_prices, now, true).await
+}
+
+pub async fn discover_crypto_catalog_markets(
+    markets: &[Market],
+    configured_symbols: &[String],
+    reference_prices: &ReferencePriceRegistry,
+    now: DateTime<Utc>,
+) -> Vec<DiscoveredCryptoMarket> {
+    discover_crypto_markets_inner(markets, configured_symbols, reference_prices, now, false).await
+}
+
+async fn discover_crypto_markets_inner(
+    markets: &[Market],
+    configured_symbols: &[String],
+    reference_prices: &ReferencePriceRegistry,
+    now: DateTime<Utc>,
+    require_price_to_beat: bool,
+) -> Vec<DiscoveredCryptoMarket> {
     let mut discovered = Vec::new();
 
     for market in markets {
-        if let Some(item) =
-            normalize_crypto_market(market, configured_symbols, reference_prices, now).await
+        if let Some(item) = normalize_crypto_market(
+            market,
+            configured_symbols,
+            reference_prices,
+            now,
+            require_price_to_beat,
+        )
+        .await
         {
             discovered.push(item);
         }
@@ -50,6 +75,7 @@ async fn normalize_crypto_market(
     configured_symbols: &[String],
     reference_prices: &ReferencePriceRegistry,
     now: DateTime<Utc>,
+    require_price_to_beat: bool,
 ) -> Option<DiscoveredCryptoMarket> {
     let question = market.question.as_deref().unwrap_or("");
     let event = market.events.as_ref().and_then(|events| events.first());
@@ -84,7 +110,7 @@ async fn normalize_crypto_market(
     let (up_token, down_token) = semantic_up_down_tokens(market, token_ids)?;
     let reference_symbol = market_symbol_to_chainlink_symbol(strategy_symbol);
 
-    let price_to_beat = match market_start_time {
+    let price_to_beat = (match market_start_time {
         Some(start_time) => reference_price_at(
             reference_prices,
             ReferencePriceSource::Chainlink,
@@ -94,8 +120,11 @@ async fn normalize_crypto_market(
         .await
         .map(|snapshot| snapshot.value),
         None => None,
+    })
+    .or_else(|| usable_metadata_threshold(market.group_item_threshold.as_deref()));
+    if require_price_to_beat && price_to_beat.is_none() {
+        return None;
     }
-    .or_else(|| usable_metadata_threshold(market.group_item_threshold.as_deref()))?;
 
     let descriptor = MarketDescriptor {
         market_family: MarketFamily::Crypto,
@@ -134,7 +163,7 @@ async fn normalize_crypto_market(
         end_time,
         window_secs,
         market_window_secs: market_window_secs.expect("validated allowed market window"),
-        price_to_beat: Some(price_to_beat),
+        price_to_beat,
         raw_event: event.and_then(event_to_value),
         raw_market: serde_json::to_value(market).ok()?,
     })
@@ -247,8 +276,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        crypto_market_start_time, discover_crypto_markets, infer_crypto_strategy_symbol,
-        infer_market_window_secs,
+        crypto_market_start_time, discover_crypto_catalog_markets, discover_crypto_markets,
+        infer_crypto_strategy_symbol, infer_market_window_secs,
     };
     use crate::reference_prices::{
         new_reference_price_registry, upsert_reference_price, ReferenceAssetClass,
@@ -398,7 +427,7 @@ mod tests {
             .unwrap();
 
         let discovered = discover_crypto_markets(
-            &[market],
+            &[market.clone()],
             &["BTCUSDT".to_string()],
             &registry,
             Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 30).unwrap(),
@@ -406,6 +435,16 @@ mod tests {
         .await;
 
         assert!(discovered.is_empty());
+
+        let catalog = discover_crypto_catalog_markets(
+            &[market],
+            &["BTCUSDT".to_string()],
+            &registry,
+            Utc.with_ymd_and_hms(2026, 4, 6, 0, 0, 30).unwrap(),
+        )
+        .await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].price_to_beat, None);
     }
 
     #[tokio::test]
