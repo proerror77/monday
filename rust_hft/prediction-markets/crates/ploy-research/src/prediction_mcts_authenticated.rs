@@ -12,8 +12,7 @@ use crate::factors_v2::{
 };
 use crate::prediction_loop::{
     current_prediction_policy_snapshot_id, research_brief_snapshot_id, LoopRunSummary,
-    PredictionResearchMission, ProposalClient, PREDICTION_LOOP_TARGET,
-    PREDICTION_MISSION_SCHEMA_VERSION,
+    PredictionResearchMission, PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
 };
 use crate::prediction_loop_fs::{
     read_verified_artifact_bounded, write_content_addressed_json, ArtifactRef,
@@ -1440,7 +1439,6 @@ impl<E: AuthenticatedPredictionMctsEvaluator> PredictionMctsRunEvaluator
 }
 
 pub fn run_or_resume_authenticated_prediction_mcts_trial<
-    C: ProposalClient,
     E: AuthenticatedPredictionMctsEvaluator,
 >(
     mission: &PredictionResearchMissionV3,
@@ -1448,7 +1446,6 @@ pub fn run_or_resume_authenticated_prediction_mcts_trial<
     snapshot: &AuthenticatedResearchSnapshot,
     immutable_image_identity: &str,
     output_dir: &Path,
-    client: &mut C,
     evaluator: &mut E,
 ) -> Result<AuthenticatedPredictionMctsTrialRun, String> {
     validate_prediction_mission_v3(mission)?;
@@ -1479,7 +1476,6 @@ pub fn run_or_resume_authenticated_prediction_mcts_trial<
             identity.clone(),
             (mission, admitted),
             output_dir,
-            client,
             &mut adapter,
             SettlementProbabilityComponentProfile::MarketMidpointOnly,
             immutable_image_identity,
@@ -2200,7 +2196,6 @@ mod tests {
             search_policy_snapshot_id: current_prediction_policy_snapshot_id(),
             search_budget: crate::prediction_loop::PredictionSearchBudget {
                 max_candidates: 1,
-                max_llm_calls: 1,
                 max_seconds: 60,
             },
         }

@@ -1253,7 +1253,6 @@ fn authenticated_snapshot_coverage_mission() -> crate::prediction_loop::Predicti
         search_policy_snapshot_id: format!("sha256:{}", "0".repeat(64)),
         search_budget: crate::prediction_loop::PredictionSearchBudget {
             max_candidates: 0,
-            max_llm_calls: 0,
             max_seconds: 0,
         },
     }
@@ -5419,7 +5418,6 @@ mod tests {
             search_policy_snapshot_id: cohort.causal_projection_policy_id.clone(),
             search_budget: PredictionSearchBudget {
                 max_candidates: 0,
-                max_llm_calls: 0,
                 max_seconds: 1,
             },
         };

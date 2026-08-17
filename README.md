@@ -11,7 +11,7 @@ This repository is locally production-gated for governed research plus signed **
 The implemented loop is goal-based and evidence-driven:
 
 1. A `LoopRun` declares a target stage, bounded mission budget, and explicit completion policy.
-2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. Monday's prediction-market module may run its bounded, typed probability-blend LLM loop under the event-disjoint Rust evaluator; it has no promotion or execution authority outside that research lane.
+2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. Monday's prediction-market module runs bounded deterministic probability-blend MCTS under the event-disjoint Rust evaluator; it has no proposal-provider, promotion, or execution authority outside that research lane.
 3. The versioned evaluator applies point-in-time data, purged walk-forward folds, costs, drawdown limits, minimum evidence, and a pre-registered multiple-testing haircut.
 4. Failures remain queryable and may create one bounded follow-up mission with a validator-gated learning directive.
 5. Promotion binds candidate, dataset, evaluator config/metrics, sealed result, approval, and bundle hashes.
