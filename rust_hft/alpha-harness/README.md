@@ -63,7 +63,18 @@ cargo run -p alpha-harness -- mission status \
 
 cargo run -p alpha-harness -- candidate list \
   --db var/alpha.duckdb --mission-id mission-1
+
+cargo run -p alpha-harness -- candidate show \
+  --db var/alpha.duckdb --mission-id mission-1 \
+  --candidate-id mission-1-gp-1
 ```
+
+`candidate show` prints the candidate artifact plus every stored evaluation as
+structured JSON: pass/fail, score, failure reasons, the bound evaluation
+protocol, and the full metrics (IC/RankIC/ICIR/RankICIR, positive-IC ratio,
+per-fold and aggregate net return, drawdown, turnover, trade count, and the
+unannualized per-observation net Sharpe). It is read-only evidence readback;
+it grants no promotion or runtime authority.
 
 The bounded CEX entrypoint consumes a separate Agent-produced,
 content-addressed `cex-research-mission-v1` artifact:

@@ -561,11 +561,12 @@ impl BacktestEngine {
     }
 
     fn finish(&mut self) -> BacktestResult {
+        let trades = mem::take(&mut self.execution.trades);
         BacktestResult {
-            trades: mem::take(&mut self.execution.trades),
             summary: self
                 .stats
-                .clone_into_summary(self.execution.position.qty.abs()),
+                .clone_into_summary(self.execution.position.qty.abs(), &trades),
+            trades,
             input_evidence: None,
         }
     }
@@ -1592,7 +1593,7 @@ impl BacktestStats {
         self.max_drawdown = self.max_drawdown.max(drawdown);
     }
 
-    fn clone_into_summary(&self, open_position_qty: f64) -> SummaryMetrics {
+    fn clone_into_summary(&self, open_position_qty: f64, trades: &[TradeRecord]) -> SummaryMetrics {
         let total_trades = self.wins + self.losses;
         let win_rate = if total_trades > 0 {
             self.wins as f64 / total_trades as f64
@@ -1609,8 +1610,26 @@ impl BacktestStats {
             max_drawdown: self.max_drawdown,
             max_position: self.max_position,
             open_position_qty,
+            net_sharpe: per_trade_net_sharpe(trades),
         }
     }
+}
+
+// Per-trade Sharpe over net pnl: mean / population standard deviation with an
+// epsilon floor. Unannualized, matching the alpha-harness per-observation
+// Sharpe convention (annualize only after the period frequency is explicit).
+fn per_trade_net_sharpe(trades: &[TradeRecord]) -> f64 {
+    if trades.is_empty() {
+        return 0.0;
+    }
+    let average = trades.iter().map(|trade| trade.pnl).sum::<f64>() / trades.len() as f64;
+    let deviation = (trades
+        .iter()
+        .map(|trade| (trade.pnl - average).powi(2))
+        .sum::<f64>()
+        / trades.len() as f64)
+        .sqrt();
+    average / deviation.max(f64::EPSILON)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1624,6 +1643,7 @@ pub struct SummaryMetrics {
     pub max_drawdown: f64,
     pub max_position: f64,
     pub open_position_qty: f64,
+    pub net_sharpe: f64,
 }
 
 #[cfg(test)]
@@ -2014,5 +2034,43 @@ mod tests {
 
         assert_eq!(fill_qty, 2.5);
         assert!((fill_price - 100.08).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summary_net_sharpe_uses_unannualized_per_trade_population_stddev() {
+        let mut execution = ExecutionManager::new(
+            ExecutionConfig {
+                fee_bps: 10.0,
+                ..ExecutionConfig::default()
+            },
+            RiskConfig::default(),
+            0.01,
+        );
+        let mut stats = BacktestStats::default();
+        execution.enter_long(1.0, 100.0, 1.0, 100.0, 10.0, &mut stats);
+        execution.exit_position(2.0, 110.0, 1.0, ExitReason::SessionEnd, &mut stats);
+        execution.enter_long(3.0, 100.0, 1.0, 100.0, 10.0, &mut stats);
+        execution.exit_position(4.0, 90.0, 1.0, ExitReason::SessionEnd, &mut stats);
+
+        let summary = stats.clone_into_summary(0.0, &execution.trades);
+
+        let pnls = execution
+            .trades
+            .iter()
+            .map(|trade| trade.pnl)
+            .collect::<Vec<_>>();
+        let average = pnls.iter().sum::<f64>() / pnls.len() as f64;
+        let deviation = (pnls
+            .iter()
+            .map(|pnl| (pnl - average).powi(2))
+            .sum::<f64>()
+            / pnls.len() as f64)
+            .sqrt();
+        assert!(deviation > 0.0);
+        assert!((summary.net_sharpe - average / deviation).abs() < 1e-12);
+        assert_eq!(summary.trades, 2);
+
+        let empty = BacktestStats::default().clone_into_summary(0.0, &[]);
+        assert_eq!(empty.net_sharpe, 0.0);
     }
 }
