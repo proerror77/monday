@@ -228,11 +228,11 @@ test "$(grep -Fxc '            jq \' "$ploy_workflow")" -eq 1
 grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create \' "$ploy_workflow"
 grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$ploy_workflow"
 
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   grep -Fq "research-release/research-bin/$binary" <<<"$mode_restore_block"
 done
 
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   touch "$tmp_dir/$binary"
   chmod 0644 "$tmp_dir/$binary"
 done
@@ -243,6 +243,7 @@ chmod 0755 \
   "$tmp_dir/hft-backtest" \
   "$tmp_dir/alpha-harness" \
   "$tmp_dir/lob-pit-materializer" \
+  "$tmp_dir/binance-market-tape-slicer" \
   "$tmp_dir/binance-replay-parquet-materializer" \
   "$tmp_dir/monday-prediction-research" \
   "$tmp_dir/monday-prediction-evaluator" \

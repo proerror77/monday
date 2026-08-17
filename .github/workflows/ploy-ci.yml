@@ -232,6 +232,7 @@ jobs:
             --locked \
             -p hft-collector \
             --bin lob-pit-materializer \
+            --bin binance-market-tape-slicer \
             --bin binance-replay-parquet-materializer
           CARGO_TARGET_DIR=target/prediction-markets \
             cargo build \
@@ -246,6 +247,7 @@ jobs:
           install -D -m 0755 target/release/hft-backtest research-release/research-bin/hft-backtest
           install -D -m 0755 target/release/alpha-harness research-release/research-bin/alpha-harness
           install -D -m 0755 target/release/lob-pit-materializer research-release/research-bin/lob-pit-materializer
+          install -D -m 0755 target/release/binance-market-tape-slicer research-release/research-bin/binance-market-tape-slicer
           install -D -m 0755 target/release/binance-replay-parquet-materializer research-release/research-bin/binance-replay-parquet-materializer
           install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-release/research-bin/monday-prediction-research
           install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-release/research-bin/monday-prediction-evaluator
@@ -323,6 +325,10 @@ jobs:
             --entrypoint /usr/local/bin/alpha-harness \
             monday-research-smoke:local \
             prediction --help
+          docker run --rm \
+            --entrypoint /usr/local/bin/binance-market-tape-slicer \
+            monday-research-smoke:local \
+            --help >/dev/null
           docker run --rm \
             --entrypoint /usr/local/bin/binance-replay-parquet-materializer \
             monday-research-smoke:local \
