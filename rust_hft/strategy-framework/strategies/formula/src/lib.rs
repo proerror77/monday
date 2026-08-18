@@ -1,7 +1,7 @@
 use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use hft_factor_dsl::{
-    validate_live_formula, FactorAst, FactorDslError, FactorOperator, FactorTerminal,
-    LiveEventDomain, LiveFormulaCapabilityError,
+    evaluate_live_formula_series, validate_live_formula, FactorAst, FactorDslError, FactorOperator,
+    FactorTerminal, LiveEventDomain, LiveFormulaCapabilityError,
 };
 use ports::{
     AccountView, AggregatedBar, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot,
@@ -9,6 +9,7 @@ use ports::{
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::collections::{BTreeSet, VecDeque};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,14 @@ pub enum FormulaStrategyError {
     MissingEventDomain,
     #[error("formula constant is not a finite f64: {0}")]
     InvalidConstant(String),
+    #[error("rolling window must be a positive integer no larger than 10000")]
+    InvalidRollingWindow,
+    #[error("live formula history exceeds {0} rows")]
+    HistoryTooLong(usize),
+    #[error("live formula exceeds {0} bounded evaluation steps")]
+    EvaluationTooExpensive(usize),
+    #[error("stateful formulas require target-position bucket evaluation")]
+    StatefulFormulaRequiresTargetPosition,
 }
 
 #[derive(Debug)]
@@ -60,6 +69,9 @@ pub struct FormulaStrategy {
     next_bucket_micros: Option<u64>,
     pending_target: Option<PendingTarget>,
     target_position: Option<Decimal>,
+    history_rows: usize,
+    field_names: Vec<String>,
+    history: VecDeque<Vec<f64>>,
 }
 
 impl FormulaStrategy {
@@ -105,7 +117,11 @@ impl FormulaStrategy {
                         .is_none_or(|quantity| quantity.0 > Decimal::ZERO) => {}
             _ => return Err(FormulaStrategyError::InvalidExecutionContract),
         }
-        let domain = validate_live_ast(&config.ast)?;
+        let (domain, history_rows) = validate_live_ast(&config.ast)?;
+        if history_rows > 1 && !config.target_position {
+            return Err(FormulaStrategyError::StatefulFormulaRequiresTargetPosition);
+        }
+        let field_names = formula_fields(&config.ast);
         Ok(Self {
             config,
             domain,
@@ -116,6 +132,9 @@ impl FormulaStrategy {
             next_bucket_micros: None,
             pending_target: None,
             target_position: None,
+            history_rows,
+            field_names,
+            history: VecDeque::with_capacity(history_rows),
         })
     }
 
@@ -150,6 +169,7 @@ impl FormulaStrategy {
         self.next_bucket_micros = None;
         self.pending_target = None;
         self.target_position = None;
+        self.history.clear();
     }
 
     fn normalize_target_price(&self, price: Decimal) -> Option<Decimal> {
@@ -193,16 +213,24 @@ impl FormulaStrategy {
     fn record_bucket_sample(
         &mut self,
         timestamp: u64,
-        signal: f64,
+        fields: Vec<f64>,
         venue: hft_core::VenueId,
         best_bid: Decimal,
         best_ask: Decimal,
     ) {
+        if self
+            .config
+            .target_venue
+            .is_some_and(|target| target != venue)
+        {
+            return;
+        }
         let Some(interval) = self.evaluation_interval_micros else {
             return;
         };
         if self
             .bucket_sample
+            .as_ref()
             .is_some_and(|sample| timestamp < sample.observed_at)
         {
             return;
@@ -210,7 +238,7 @@ impl FormulaStrategy {
         self.bucket_sample = Some(BucketSample {
             observed_at: timestamp,
             bucket: timestamp / interval,
-            signal,
+            fields,
             venue,
             best_bid,
             best_ask,
@@ -239,9 +267,29 @@ impl FormulaStrategy {
             return None;
         }
         self.next_bucket_micros = Some(expected.saturating_add(interval));
-        let mut decision = self.bucket_sample?;
+        let mut decision = self.bucket_sample.clone()?;
         decision.bucket = timestamp / interval;
         Some(decision)
+    }
+
+    fn sample_event(&self, event: &MarketEvent) -> Option<(Vec<f64>, Option<hft_core::VenueId>)> {
+        match (self.domain, event) {
+            (EventDomain::Snapshot, MarketEvent::Snapshot(snapshot))
+                if snapshot.symbol == self.config.symbol =>
+            {
+                Some((
+                    sample_fields(&self.field_names, |field| snapshot_value(snapshot, field))?,
+                    snapshot.source_venue,
+                ))
+            }
+            (EventDomain::Bar, MarketEvent::Bar(bar)) if bar.symbol == self.config.symbol => {
+                Some((
+                    sample_fields(&self.field_names, |field| bar_value(bar, field))?,
+                    bar.source_venue,
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn evaluate_event(&self, event: &MarketEvent) -> Option<(f64, Option<hft_core::VenueId>)> {
@@ -249,24 +297,11 @@ impl FormulaStrategy {
             (EventDomain::Snapshot, MarketEvent::Snapshot(snapshot))
                 if snapshot.symbol == self.config.symbol =>
             {
-                let best_bid = snapshot.bids.first()?.price.0;
-                let best_ask = snapshot.asks.first()?.price.0;
-                if best_bid <= Decimal::ZERO
-                    || best_ask <= best_bid
-                    || snapshot.bids.first()?.quantity.0 <= Decimal::ZERO
-                    || snapshot.asks.first()?.quantity.0 <= Decimal::ZERO
-                {
-                    return None;
-                }
                 let signal =
                     evaluate_ast(&self.config.ast, &|field| snapshot_value(snapshot, field))?;
                 Some((signal, snapshot.source_venue))
             }
             (EventDomain::Bar, MarketEvent::Bar(bar)) if bar.symbol == self.config.symbol => {
-                let reference_price = bar.close.0;
-                if reference_price <= Decimal::ZERO {
-                    return None;
-                }
                 let signal = evaluate_ast(&self.config.ast, &|field| bar_value(bar, field))?;
                 Some((signal, bar.source_venue))
             }
@@ -498,11 +533,11 @@ enum SignalState {
     Sell,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BucketSample {
     observed_at: u64,
     bucket: u64,
-    signal: f64,
+    fields: Vec<f64>,
     venue: hft_core::VenueId,
     best_bid: Decimal,
     best_ask: Decimal,
@@ -520,13 +555,13 @@ impl Strategy for FormulaStrategy {
         if self.handle_disconnect(event) {
             return Vec::new();
         }
-        let Some((signal, source_venue)) = self.evaluate_event(event) else {
-            return Vec::new();
-        };
-        let Some(target_venue) = source_venue else {
-            return Vec::new();
-        };
         if self.config.target_position {
+            let Some((fields, source_venue)) = self.sample_event(event) else {
+                return Vec::new();
+            };
+            let Some(target_venue) = source_venue else {
+                return Vec::new();
+            };
             let (Some(best_bid), Some(best_ask)) = (
                 executable_price(event, Side::Sell),
                 executable_price(event, Side::Buy),
@@ -538,9 +573,15 @@ impl Strategy for FormulaStrategy {
                 .and_then(|timestamps| timestamps.local_receive)
                 .map(|timestamp| timestamp.as_micros())
                 .unwrap_or_else(|| event_timestamp(event));
-            self.record_bucket_sample(timestamp, signal, target_venue, best_bid, best_ask);
+            self.record_bucket_sample(timestamp, fields, target_venue, best_bid, best_ask);
             return Vec::new();
         }
+        let Some((signal, source_venue)) = self.evaluate_event(event) else {
+            return Vec::new();
+        };
+        let Some(target_venue) = source_venue else {
+            return Vec::new();
+        };
         self.emit_signal(
             signal,
             target_venue,
@@ -576,9 +617,6 @@ impl Strategy for FormulaStrategy {
         else {
             return Vec::new();
         };
-        let Some(signal) = evaluate_book_formula(&self.config.ast, book) else {
-            return Vec::new();
-        };
         let (Some(best_bid), Some(best_ask)) = (book.bid_prices.first(), book.ask_prices.first())
         else {
             return Vec::new();
@@ -586,14 +624,21 @@ impl Strategy for FormulaStrategy {
         let best_bid = Price::from(*best_bid).0;
         let best_ask = Price::from(*best_ask).0;
         if self.config.target_position {
+            let Some(fields) = sample_fields(&self.field_names, |field| book_value(book, field))
+            else {
+                return Vec::new();
+            };
             let timestamp = event
                 .timestamps()
                 .and_then(|timestamps| timestamps.local_receive)
                 .map(|timestamp| timestamp.as_micros())
                 .unwrap_or(book.timestamp);
-            self.record_bucket_sample(timestamp, signal, book.venue, best_bid, best_ask);
+            self.record_bucket_sample(timestamp, fields, book.venue, best_bid, best_ask);
             return Vec::new();
         }
+        let Some(signal) = evaluate_book_formula(&self.config.ast, book) else {
+            return Vec::new();
+        };
         self.emit_signal(
             signal,
             book.venue,
@@ -617,10 +662,18 @@ impl Strategy for FormulaStrategy {
         let Some(decision) = self.clocked_decision(timestamp) else {
             return Vec::new();
         };
+        self.history.push_back(decision.fields);
+        while self.history.len() > self.history_rows {
+            self.history.pop_front();
+        }
+        let Some(signal) = evaluate_ast_history(&self.config.ast, &self.field_names, &self.history)
+        else {
+            return Vec::new();
+        };
         let buy_price = self.target_price(Side::Buy, decision.best_bid, decision.best_ask);
         let sell_price = self.target_price(Side::Sell, decision.best_bid, decision.best_ask);
         self.emit_signal(
-            decision.signal,
+            signal,
             decision.venue,
             account,
             |side| match side {
@@ -669,7 +722,7 @@ fn event_timestamp(event: &MarketEvent) -> u64 {
     }
 }
 
-fn validate_live_ast(ast: &FactorAst) -> Result<EventDomain, FormulaStrategyError> {
+fn validate_live_ast(ast: &FactorAst) -> Result<(EventDomain, usize), FormulaStrategyError> {
     let capability = validate_live_formula(ast).map_err(|error| match error {
         LiveFormulaCapabilityError::InvalidAst(error) => FormulaStrategyError::InvalidAst(error),
         LiveFormulaCapabilityError::UnsupportedOperator(operator) => {
@@ -683,11 +736,23 @@ fn validate_live_ast(ast: &FactorAst) -> Result<EventDomain, FormulaStrategyErro
         LiveFormulaCapabilityError::InvalidConstant(value) => {
             FormulaStrategyError::InvalidConstant(value)
         }
+        LiveFormulaCapabilityError::InvalidRollingWindow => {
+            FormulaStrategyError::InvalidRollingWindow
+        }
+        LiveFormulaCapabilityError::HistoryTooLong { max_rows } => {
+            FormulaStrategyError::HistoryTooLong(max_rows)
+        }
+        LiveFormulaCapabilityError::EvaluationTooExpensive { max_steps } => {
+            FormulaStrategyError::EvaluationTooExpensive(max_steps)
+        }
     })?;
-    Ok(match capability.event_domain {
-        LiveEventDomain::Snapshot => EventDomain::Snapshot,
-        LiveEventDomain::Bar => EventDomain::Bar,
-    })
+    Ok((
+        match capability.event_domain {
+            LiveEventDomain::Snapshot => EventDomain::Snapshot,
+            LiveEventDomain::Bar => EventDomain::Bar,
+        },
+        capability.history_rows,
+    ))
 }
 
 fn evaluate_ast(ast: &FactorAst, field_value: &impl Fn(&str) -> Option<f64>) -> Option<f64> {
@@ -744,6 +809,28 @@ fn evaluate_ast(ast: &FactorAst, field_value: &impl Fn(&str) -> Option<f64>) -> 
     value.is_finite().then_some(value)
 }
 
+fn formula_fields(ast: &FactorAst) -> Vec<String> {
+    fn collect(ast: &FactorAst, fields: &mut BTreeSet<String>) {
+        match ast {
+            FactorAst::Terminal(FactorTerminal::Field(field)) => {
+                fields.insert(field.clone());
+            }
+            FactorAst::Call { args, .. } => {
+                args.iter().for_each(|arg| collect(arg, fields));
+            }
+            FactorAst::Terminal(FactorTerminal::Constant(_)) => {}
+        }
+    }
+
+    let mut fields = BTreeSet::new();
+    collect(ast, &mut fields);
+    fields.into_iter().collect()
+}
+
+fn sample_fields(field_names: &[String], value: impl Fn(&str) -> Option<f64>) -> Option<Vec<f64>> {
+    field_names.iter().map(|field| value(field)).collect()
+}
+
 fn snapshot_value(snapshot: &MarketSnapshot, field: &str) -> Option<f64> {
     let best_bid = snapshot.bids.first()?;
     let best_ask = snapshot.asks.first()?;
@@ -751,6 +838,9 @@ fn snapshot_value(snapshot: &MarketSnapshot, field: &str) -> Option<f64> {
     let ask_price = decimal_to_f64(best_ask.price.0)?;
     let bid_size = decimal_to_f64(best_bid.quantity.0)?;
     let ask_size = decimal_to_f64(best_ask.quantity.0)?;
+    if bid_price <= 0.0 || ask_price <= bid_price || bid_size <= 0.0 || ask_size <= 0.0 {
+        return None;
+    }
     let mid_price = (bid_price + ask_price) / 2.0;
     let spread = ask_price - bid_price;
     match field {
@@ -758,17 +848,15 @@ fn snapshot_value(snapshot: &MarketSnapshot, field: &str) -> Option<f64> {
         "best_ask" => Some(ask_price),
         "mid_price" => finite(mid_price),
         "spread" => finite(spread),
-        "spread_bps" if mid_price != 0.0 => finite(spread / mid_price * 10_000.0),
+        "spread_bps" => finite(spread / mid_price * 10_000.0),
         "bid_size" => Some(bid_size),
         "ask_size" => Some(ask_size),
-        "book_imbalance" if bid_size + ask_size != 0.0 => {
-            finite((bid_size - ask_size) / (bid_size + ask_size))
-        }
+        "book_imbalance" => finite((bid_size - ask_size) / (bid_size + ask_size)),
         _ => None,
     }
 }
 
-fn evaluate_book_formula(ast: &FactorAst, book: L2BookView<'_>) -> Option<f64> {
+fn book_value(book: L2BookView<'_>, field: &str) -> Option<f64> {
     let best_bid = book.bid_prices.first()?.to_f64();
     let best_ask = book.ask_prices.first()?.to_f64();
     let bid_size = book.bid_quantities.first()?.to_f64();
@@ -785,22 +873,27 @@ fn evaluate_book_formula(ast: &FactorAst, book: L2BookView<'_>) -> Option<f64> {
     }
     let mid_price = (best_bid + best_ask) * 0.5;
     let spread = best_ask - best_bid;
-    evaluate_ast(ast, &|field| match field {
+    match field {
         "best_bid" => Some(best_bid),
         "best_ask" => Some(best_ask),
-        "mid_price" => finite(mid_price),
-        "spread" => finite(spread),
-        "spread_bps" if mid_price != 0.0 => finite(spread / mid_price * 10_000.0),
+        "mid_price" => Some(mid_price),
+        "spread" => Some(spread),
+        "spread_bps" => Some(spread / mid_price * 10_000.0),
         "bid_size" => Some(bid_size),
         "ask_size" => Some(ask_size),
-        "book_imbalance" if bid_size + ask_size != 0.0 => {
-            finite((bid_size - ask_size) / (bid_size + ask_size))
-        }
+        "book_imbalance" => Some((bid_size - ask_size) / (bid_size + ask_size)),
         _ => None,
-    })
+    }
+}
+
+fn evaluate_book_formula(ast: &FactorAst, book: L2BookView<'_>) -> Option<f64> {
+    evaluate_ast(ast, &|field| book_value(book, field))
 }
 
 fn bar_value(bar: &AggregatedBar, field: &str) -> Option<f64> {
+    if decimal_to_f64(bar.close.0)? <= 0.0 {
+        return None;
+    }
     match field {
         "open" => decimal_to_f64(bar.open.0),
         "high" => decimal_to_f64(bar.high.0),
@@ -817,6 +910,22 @@ fn bar_value(bar: &AggregatedBar, field: &str) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+fn evaluate_ast_history(
+    ast: &FactorAst,
+    field_names: &[String],
+    history: &VecDeque<Vec<f64>>,
+) -> Option<f64> {
+    evaluate_live_formula_series(ast, history.len(), |row, field| {
+        let field_index = field_names
+            .iter()
+            .position(|candidate| candidate == field)?;
+        history.get(row)?.get(field_index).copied()
+    })
+    .ok()?
+    .last()
+    .copied()
 }
 
 fn decimal_to_f64(value: Decimal) -> Option<f64> {
@@ -1010,11 +1119,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stateful_operators() {
+    fn rejects_unsupported_research_operators() {
         for operator in [
             FactorOperator::Rank,
-            FactorOperator::ZScore,
-            FactorOperator::Delta,
             FactorOperator::Mean,
             FactorOperator::Std,
         ] {
@@ -1027,6 +1134,33 @@ mod tests {
                 FormulaStrategyError::UnsupportedOperator(name)
             );
         }
+    }
+
+    #[test]
+    fn stateful_formula_requires_target_position_buckets() {
+        for operator in [FactorOperator::ZScore, FactorOperator::Delta] {
+            let ast = call(operator, vec![field("book_imbalance"), constant("20")]);
+            assert_eq!(
+                FormulaStrategy::new(config(ast)).unwrap_err(),
+                FormulaStrategyError::StatefulFormulaRequiresTargetPosition
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_live_rolling_window() {
+        let ast = call(
+            FactorOperator::ZScore,
+            vec![field("book_imbalance"), constant("0")],
+        );
+        let mut target = config(ast);
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+
+        assert_eq!(
+            FormulaStrategy::new(target).unwrap_err(),
+            FormulaStrategyError::InvalidRollingWindow
+        );
     }
 
     #[test]
@@ -1366,6 +1500,61 @@ mod tests {
         assert_eq!(close.len(), 1);
         assert_eq!(close[0].side, Side::Sell);
         assert_eq!(close[0].quantity.0, long_quantity);
+    }
+
+    #[test]
+    fn target_position_evaluates_causal_zscore_on_bucket_history() {
+        let ast = call(
+            FactorOperator::ZScore,
+            vec![field("book_imbalance"), constant("2")],
+        );
+        let mut target = config(ast);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(1, 3, 1_000_000),
+            &account,
+            1_000_000,
+        )
+        .is_empty());
+        let orders = target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 2_000_000),
+            &account,
+            2_000_000,
+        );
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn target_position_does_not_record_foreign_venue_history() {
+        let ast = call(
+            FactorOperator::ZScore,
+            vec![field("book_imbalance"), constant("2")],
+        );
+        let mut strategy = FormulaStrategy::new(sealed_target_config(ast)).unwrap();
+        let account = AccountView::default();
+        let mut foreign = snapshot_at(1, 3, 1_000_000);
+        let MarketEvent::Snapshot(snapshot) = &mut foreign else {
+            unreachable!()
+        };
+        snapshot.source_venue = Some(VenueId::BINANCE_SPOT);
+
+        assert!(target_intents(&mut strategy, &foreign, &account, 1_000_000).is_empty());
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 2_000_000),
+            &account,
+            2_000_000,
+        )
+        .is_empty());
     }
 
     #[test]

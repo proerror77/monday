@@ -26,6 +26,7 @@ pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receipt-v1";
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
+pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 pub const CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1: &str =
@@ -1628,8 +1629,70 @@ impl CexGpPolicyV1 {
         Ok(policy)
     }
 
+    pub fn controlled_dynamic_v2(
+        policy_id: impl Into<String>,
+        mut admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        admitted_fields.sort();
+        admitted_fields.dedup();
+        let policy = Self {
+            schema_version: CEX_GP_POLICY_SCHEMA_V2.to_string(),
+            policy_id: policy_id.into(),
+            admitted_fields,
+            operators: vec![
+                FactorOperator::ZScore,
+                FactorOperator::Delta,
+                FactorOperator::Add,
+                FactorOperator::Sub,
+                FactorOperator::Mul,
+                FactorOperator::GreaterThan,
+                FactorOperator::LessThan,
+                FactorOperator::IfElse,
+            ],
+            windows: vec![5, 20],
+            constants: ["-1", "0", "1", "5", "20"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            max_ast_depth: 7,
+            max_ast_nodes: 31,
+            population_limit: 32,
+            seed,
+            budget: budget.clone(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_GP_POLICY_SCHEMA_V1
+        let governed_v1 = self.schema_version == CEX_GP_POLICY_SCHEMA_V1
+            && self.operators
+                == [
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                ]
+            && self.windows.is_empty()
+            && self.constants.is_empty()
+            && self.max_ast_depth == 5;
+        let dynamic_v2 = self.schema_version == CEX_GP_POLICY_SCHEMA_V2
+            && self.operators
+                == [
+                    FactorOperator::ZScore,
+                    FactorOperator::Delta,
+                    FactorOperator::Add,
+                    FactorOperator::Sub,
+                    FactorOperator::Mul,
+                    FactorOperator::GreaterThan,
+                    FactorOperator::LessThan,
+                    FactorOperator::IfElse,
+                ]
+            && self.windows == [5, 20]
+            && self.constants == ["-1", "0", "1", "5", "20"]
+            && self.max_ast_depth == 7;
+        if !(governed_v1 || dynamic_v2)
             || self.policy_id.trim().is_empty()
             || self.admitted_fields.is_empty()
             || self
@@ -1640,20 +1703,11 @@ impl CexGpPolicyV1 {
                 .admitted_fields
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
-            || self.operators
-                != [
-                    FactorOperator::Add,
-                    FactorOperator::Sub,
-                    FactorOperator::Mul,
-                ]
-            || !self.windows.is_empty()
-            || !self.constants.is_empty()
-            || self.max_ast_depth != 5
             || self.max_ast_nodes != 31
             || self.population_limit != 32
         {
             return Err(DomainError::InvalidCexGpPolicy(
-                "governed v1 fields, grammar, limits, or budget drifted",
+                "governed GP fields, grammar, limits, or budget drifted",
             ));
         }
         self.budget.validate()?;
@@ -1690,7 +1744,7 @@ impl CexGpPolicyV1 {
         binding.validate()?;
         if binding.id != self.policy_id || binding.content_sha256 != self.content_hash()? {
             return Err(DomainError::InvalidCexGpPolicy(
-                "mission GP policy identity or content hash does not match governed v1",
+                "mission GP policy identity or content hash does not match a known policy",
             ));
         }
         Ok(())
@@ -1726,6 +1780,21 @@ impl CexGpPolicyV1 {
                     ));
                 }
                 FactorAst::Call { operator, args } => {
+                    if matches!(operator, FactorOperator::Delta | FactorOperator::ZScore)
+                        && args
+                            .get(1)
+                            .and_then(|window| match window {
+                                FactorAst::Terminal(FactorTerminal::Constant(window)) => {
+                                    window.parse::<usize>().ok()
+                                }
+                                _ => None,
+                            })
+                            .is_none_or(|window| !self.windows.contains(&window))
+                    {
+                        return Err(DomainError::InvalidCexGpCandidate(
+                            "formula references an unadmitted rolling window",
+                        ));
+                    }
                     if !self.operators.contains(operator) {
                         return Err(DomainError::InvalidCexGpCandidate(
                             "formula references an unadmitted operator",
@@ -4518,7 +4587,9 @@ impl CandidateArtifact {
     ) -> Result<StrategyBundleArtifact, DomainError> {
         match self {
             Self::Formula(ast) => {
-                validate_live_formula(ast)?;
+                if validate_live_formula(ast)?.history_rows > 1 {
+                    return Err(DomainError::ResearchOnlyArtifact);
+                }
                 Ok(StrategyBundleArtifact::Formula { ast: ast.clone() })
             }
             Self::OnnxModel(model) => {
@@ -4559,7 +4630,13 @@ pub enum StrategyBundleArtifact {
 impl StrategyBundleArtifact {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
-            Self::Formula { ast } => validate_live_formula(ast).map(|_| ()).map_err(Into::into),
+            Self::Formula { ast } => validate_live_formula(ast)
+                .map_err(DomainError::from)
+                .and_then(|capability| {
+                    (capability.history_rows == 1)
+                        .then_some(())
+                        .ok_or(DomainError::InvalidStrategyBundle)
+                }),
             Self::Onnx { model } => model.validate(),
             Self::CexFourStage { strategy } => strategy.validate(),
         }
@@ -6491,6 +6568,37 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_gp_policy_rejects_constants_used_as_unadmitted_windows() {
+        let policy = CexGpPolicyV1::controlled_dynamic_v2(
+            "gp-policy-2",
+            vec!["book_imbalance".to_string()],
+            7,
+            &SearchBudget {
+                max_candidates: 4,
+                max_expansions: 16,
+                max_tokens: 0,
+                max_seconds: 0,
+            },
+        )
+        .unwrap();
+        let candidate = FactorAst::call(
+            FactorOperator::ZScore,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                FactorAst::Terminal(FactorTerminal::Constant("1".to_string())),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_candidate(&candidate),
+            Err(DomainError::InvalidCexGpCandidate(
+                "formula references an unadmitted rolling window"
+            ))
+        );
+    }
+
+    #[test]
     fn evaluation_protocol_hash_binds_fee_cost() {
         let protocol = evaluation_protocol();
         let original_hash = protocol.content_hash().unwrap();
@@ -7138,7 +7246,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_candidate_must_be_live_executable_before_bundle_creation() {
+    fn formula_candidate_must_have_a_complete_live_contract_before_bundle_creation() {
         let artifact = CandidateArtifact::Formula(
             FactorAst::call(
                 hft_factor_dsl::FactorOperator::Mean,
@@ -7158,6 +7266,23 @@ mod tests {
                 hft_factor_dsl::LiveFormulaCapabilityError::UnsupportedOperator(operator)
             )) if operator == "mean"
         ));
+
+        let stateful = CandidateArtifact::Formula(
+            FactorAst::call(
+                hft_factor_dsl::FactorOperator::ZScore,
+                vec![
+                    FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                        "book_imbalance".to_string(),
+                    )),
+                    FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Constant("20".to_string())),
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            stateful.to_governed_strategy_bundle_artifact(),
+            Err(DomainError::ResearchOnlyArtifact)
+        );
     }
 
     #[test]

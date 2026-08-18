@@ -3,7 +3,7 @@ use crate::{
     evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, RemainingBudget,
 };
-use alpha_domain::{CandidateArtifact, CexGpPolicyV1, EngineKind};
+use alpha_domain::{CandidateArtifact, CexGpPolicyV1, EngineKind, CEX_GP_POLICY_SCHEMA_V2};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use std::collections::BTreeSet;
 
@@ -69,7 +69,21 @@ impl GeneticProgrammingEngine {
         Ok(Self {
             rng: DeterministicRng::new(policy.seed),
             fields: policy.admitted_fields.clone(),
-            operators: policy.operators.clone(),
+            operators: policy
+                .operators
+                .iter()
+                .filter(|operator| {
+                    matches!(
+                        operator,
+                        FactorOperator::ZScore
+                            | FactorOperator::Delta
+                            | FactorOperator::Add
+                            | FactorOperator::Sub
+                            | FactorOperator::Mul
+                    )
+                })
+                .cloned()
+                .collect(),
             windows: policy.windows.iter().map(ToString::to_string).collect(),
             population_limit: policy.population_limit,
             max_depth: policy.max_ast_depth,
@@ -108,7 +122,7 @@ impl GeneticProgrammingEngine {
         let operator = self.operators[self.rng.index(self.operators.len())].clone();
         let candidate = match operator {
             FactorOperator::Rank => FactorAst::call(operator, vec![base]),
-            FactorOperator::Delta | FactorOperator::Mean => {
+            FactorOperator::Delta | FactorOperator::Mean | FactorOperator::ZScore => {
                 FactorAst::call(operator, vec![base, self.window_constant()?])
             }
             FactorOperator::Add | FactorOperator::Sub | FactorOperator::Mul => {
@@ -139,6 +153,38 @@ impl GeneticProgrammingEngine {
         Ok(FactorAst::Terminal(FactorTerminal::Constant(
             self.windows[self.rng.index(self.windows.len())].clone(),
         )))
+    }
+
+    fn governed_template(&self, iteration_index: usize) -> Result<Option<FactorAst>, String> {
+        let Some(policy) = &self.governed_policy else {
+            return Ok(None);
+        };
+        if policy.schema_version != CEX_GP_POLICY_SCHEMA_V2 || iteration_index == 0 {
+            return Ok(None);
+        }
+        let template_index = iteration_index - 1;
+        let Some(field) = self.fields.get(template_index / 2) else {
+            return Ok(None);
+        };
+        let field = FactorAst::Terminal(FactorTerminal::Field(field.clone()));
+        let value = if template_index.is_multiple_of(2) {
+            FactorAst::call(FactorOperator::ZScore, vec![field, constant("20")])
+        } else {
+            FactorAst::call(
+                FactorOperator::ZScore,
+                vec![
+                    FactorAst::call(FactorOperator::Delta, vec![field, constant("5")])
+                        .map_err(|error| error.to_string())?,
+                    constant("20"),
+                ],
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let candidate = thresholded_standard_signal(value)?;
+        policy
+            .validate_candidate(&candidate)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(candidate))
     }
 
     fn remember(&mut self, ast: FactorAst, score: f64) {
@@ -182,6 +228,21 @@ impl ProposalEngine for GeneticProgrammingEngine {
             let iteration = u64::try_from(iteration_index)
                 .map_err(|_| "GP iteration index exceeds the deterministic seed range")?;
             self.rng = DeterministicRng::new(policy.seed.wrapping_add(iteration));
+        }
+        if let Some(ast) = self.governed_template(iteration_index)? {
+            self.seen.insert(ast.to_string());
+            return Ok(EngineProposal {
+                candidate_id: format!(
+                    "{}-gp-{iteration_index}",
+                    self.candidate_namespace.as_deref().unwrap_or(mission_id)
+                ),
+                hypothesis: "fixed causal normalization and entry threshold over one registered factor field"
+                    .to_string(),
+                artifact: CandidateArtifact::Formula(ast),
+                expansions: 1,
+                tokens: 0,
+                elapsed_ms: 0,
+            });
         }
         let max_attempts = if governed {
             1
@@ -235,6 +296,35 @@ impl ProposalEngine for GeneticProgrammingEngine {
         }
         Ok(())
     }
+}
+
+fn constant(value: &str) -> FactorAst {
+    FactorAst::Terminal(FactorTerminal::Constant(value.to_string()))
+}
+
+fn thresholded_standard_signal(value: FactorAst) -> Result<FactorAst, String> {
+    FactorAst::call(
+        FactorOperator::IfElse,
+        vec![
+            FactorAst::call(
+                FactorOperator::GreaterThan,
+                vec![value.clone(), constant("1")],
+            )
+            .map_err(|error| error.to_string())?,
+            constant("1"),
+            FactorAst::call(
+                FactorOperator::IfElse,
+                vec![
+                    FactorAst::call(FactorOperator::LessThan, vec![value, constant("-1")])
+                        .map_err(|error| error.to_string())?,
+                    constant("-1"),
+                    constant("0"),
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+        ],
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -405,5 +495,58 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn governed_gp_emits_atomic_dynamic_templates_before_composition() {
+        let budget = alpha_domain::SearchBudget {
+            max_candidates: 8,
+            max_expansions: 256,
+            max_tokens: 0,
+            max_seconds: 0,
+        };
+        let policy = CexGpPolicyV1::controlled_dynamic_v2(
+            "policy",
+            vec!["spread_bps".to_string(), "book_imbalance".to_string()],
+            7,
+            &budget,
+        )
+        .unwrap();
+        let mut engine = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+        let dataset = super::super::test_dataset();
+        let remaining = RemainingBudget {
+            candidates: 8,
+            expansions: 256,
+            tokens: 0,
+            milliseconds: 0,
+        };
+        let templates = (1..=4)
+            .map(|iteration| {
+                engine
+                    .propose(
+                        "mission",
+                        iteration,
+                        &dataset.proposal_context(),
+                        &remaining,
+                    )
+                    .unwrap()
+                    .artifact
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = templates
+            .iter()
+            .map(|artifact| match artifact {
+                CandidateArtifact::Formula(ast) => ast.to_string(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[0].contains("zscore(book_imbalance, 20)"));
+        assert!(rendered[1].contains("zscore(delta(book_imbalance, 5), 20)"));
+        assert!(rendered[2].contains("zscore(spread_bps, 20)"));
+        assert!(rendered[3].contains("zscore(delta(spread_bps, 5), 20)"));
+        assert!(rendered.iter().all(|formula| {
+            formula.contains(" > 1") && formula.contains(" < -1") && formula.contains("if_else")
+        }));
     }
 }

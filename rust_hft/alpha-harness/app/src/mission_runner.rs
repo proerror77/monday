@@ -77,6 +77,27 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_VERSION: &str = "cex-event-replay-receipt-
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
+fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<CexGpPolicyV1> {
+    let binding = &mission.spec.policies.gp;
+    let legacy = CexGpPolicyV1::controlled_v1(
+        binding.id.clone(),
+        mission.spec.feature_fields.clone(),
+        mission.spec.search.seed,
+        &mission.spec.search.budget,
+    )?;
+    if legacy.validate_binding(binding).is_ok() {
+        return Ok(legacy);
+    }
+    let dynamic = CexGpPolicyV1::controlled_dynamic_v2(
+        binding.id.clone(),
+        mission.spec.feature_fields.clone(),
+        mission.spec.search.seed,
+        &mission.spec.search.budget,
+    )?;
+    dynamic.validate_binding(binding)?;
+    Ok(dynamic)
+}
+
 #[derive(Debug, Deserialize)]
 struct Materialization {
     dataset_kind: String,
@@ -407,13 +428,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("CEX Research Mission hypotheses do not share one frozen baseline target");
     }
     mission::validate_live_feature_fields(&control_mission.spec.feature_fields)?;
-    let gp_policy = CexGpPolicyV1::controlled_v1(
-        control_mission.spec.policies.gp.id.clone(),
-        control_mission.spec.feature_fields.clone(),
-        control_mission.spec.search.seed,
-        &control_mission.spec.search.budget,
-    )?;
-    gp_policy.validate_binding(&control_mission.spec.policies.gp)?;
+    let gp_policy = bound_gp_policy(&control_mission)?;
     data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
     let baseline_policy =
         CexBaselinePolicyV1::controlled_v1(control_mission.spec.policies.baseline.id.clone())?;
@@ -5159,6 +5174,22 @@ message binance_replay {
 
     fn rewrite_features(fixture: &mut Fixture, mutate: impl Fn(&mut PointInTimeFeatureRow)) {
         rewrite_features_indexed(fixture, |_, row| mutate(row));
+    }
+
+    #[test]
+    fn bound_gp_policy_uses_the_signed_policy_version() {
+        let mut fixture = fixture("dynamic-gp-policy-binding");
+        let expected = CexGpPolicyV1::controlled_dynamic_v2(
+            fixture.mission.spec.policies.gp.id.clone(),
+            fixture.mission.spec.feature_fields.clone(),
+            fixture.mission.spec.search.seed,
+            &fixture.mission.spec.search.budget,
+        )
+        .unwrap();
+        fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
+
+        assert_eq!(bound_gp_policy(&fixture.mission).unwrap(), expected);
+        std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     fn rewrite_features_indexed(
