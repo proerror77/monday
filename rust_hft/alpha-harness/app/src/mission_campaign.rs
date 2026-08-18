@@ -591,7 +591,8 @@ fn canonical_object(label: &str, value: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn expected_campaign_id_ignores_signed_queries_and_output_transports() {
@@ -738,6 +739,32 @@ mod tests {
         assert!(error
             .to_string()
             .contains("published Mission already exists with different bytes"));
+    }
+
+    #[test]
+    fn immutable_publish_conflict_recognizes_http_conflict() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = Client::new()
+            .put(format!("http://{address}/mission.json"))
+            .body("mission")
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(immutable_publish_conflict(&error.into()));
     }
 
     pub(crate) fn valid_request_for_other_modules() -> CampaignRequest {
