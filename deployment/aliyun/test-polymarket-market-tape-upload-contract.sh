@@ -7,8 +7,10 @@ timer="$script_dir/polymarket-market-tape-upload.timer"
 cutover="$script_dir/polymarket-raw-ops-cutover.sh"
 dollar='$'
 
-grep -Fxq 'ExecStart=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 1' "$service"
-grep -Fxq "readonly MARKET_UPLOAD_EXEC=\"/usr/bin/env ZSTD_THREADS=1 ${dollar}ACTIVE_BINARY upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 1\"" "$cutover"
+grep -Fxq 'ExecStart=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 2' "$service"
+grep -Fxq "readonly MARKET_UPLOAD_EXEC=\"/usr/bin/env ZSTD_THREADS=1 ${dollar}ACTIVE_BINARY upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency 2\"" "$cutover"
+grep -Fxq 'MemoryHigh=2G' "$service"
+grep -Fxq 'MemoryMax=3G' "$service"
 grep -Fxq 'OnBootSec=5min' "$timer"
 grep -Fxq 'OnUnitInactiveSec=5min' "$timer"
 if grep -Eq '^On(Calendar=|ActiveSec=|UnitActiveSec=)' "$timer"; then
