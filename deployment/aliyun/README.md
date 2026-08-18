@@ -163,15 +163,17 @@ tape files or `upload-status.json`. It emits one JSON snapshot (or a human
 to journald tag `monday-collector-health`. Run with `--json` for machine output
 and `--dry-run` to avoid reading or writing the persistent delta state.
 
-The monitor has exactly four hard gates. Each is a breach: it fails closed into
+The monitor has six hard gates. Each is a breach: it fails closed into
 the `monitor-collector-host` workflow issue and blocks `ok:true`.
 
 | Hard gate | Breach condition |
 | --- | --- |
 | 1. Status file | `upload-status.json` missing, a symlink, or unparseable on the mandated lanes (`binance-lob` spot/usdm, `binance-fee`) |
-| 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 7200s, bybit 5400s; each just above the lane's upload cadence — the polymarket lanes rotate tapes hourly, so the 5-minute upload timer is not a heartbeat) |
+| 2. Upload freshness | `last_success_at` missing/unparseable, or older than the lane bound (LOB 7200s, fee 600s, usdm-reference 1200s, polymarket 7200s, bybit 5400s; each just above the lane's upload cadence — the polymarket lanes rotate tapes hourly, so the 5-minute upload timer is not a heartbeat). On the polymarket lanes a pending rotated tape with a last success older than 1800s breaches earlier: an upload stall with a live backlog must alert within 30 minutes |
 | 3. Pending backlog | pending count over the lane limit, or oldest pending artifact older than the lane age bound, using each collector's own pending definition (LOB `*.manifest.json`, fee/usdm-reference `lake/raw/**/batch=*`, polymarket rotated `market-updates.*.ndjson` tapes, bybit marked `.ndjson` without `.uploaded.json`) |
 | 4. Upload failures | `last_error_at`/`last_error` present, or a `failure_count` increase since the previous poll (prior counts live under `/var/lib/monday-collector-health`) |
+| 5. `/data` disk | free < 15% (used >= 85%) via `df -Pk /data` — the 2026-08-17/18 incidents reached 100% twice, so the critical watermark pages a human instead of only warning |
+| 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
 
 The raw-ops Gate template has no `[Install]` section, so `static` is the
 healthy installed state only when no Gate instance is active, the control lock
@@ -184,7 +186,7 @@ Every other check is a warning — reported in the JSON `warnings` array and as
 
 | Warning | Condition |
 | --- | --- |
-| `/data` disk | free < 25% (warn) or < 10% (critical) via `df -Pk /data` |
+| `/data` disk | free < 25% (warn) via `df -Pk /data`; free < 15% is hard gate 5 above |
 | Governed services | `binance-lob-archiver-production@spot/usdm`, `binance-usdm-reference-collector`, `bybit-options-archiver` active AND enabled AND `Result==success`, plus a restart-rate delta > 1 since the last poll |
 | Upload lane units | upload/watchdog/fee timers active AND enabled; their oneshot services' last `Result==success` |
 | `health.json` | missing/unparseable, wall-clock age of `updated_at_ns` > 300s, or `sequence_gaps` > 0 (spot + usdm spools) |
