@@ -410,6 +410,8 @@ pub struct ExecuteMissionArgs {
     #[arg(long)]
     pub work_dir: PathBuf,
     #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
     pub mission_url: String,
     #[arg(long)]
     pub mission_sha256: String,
@@ -436,6 +438,12 @@ pub struct ExecuteMissionArgs {
     /// Independently authorized read URL for the immutable published result bundle.
     #[arg(long)]
     pub result_readback_url: String,
+    /// Create-once mission-scoped claim written immediately before sealed holdout access.
+    #[arg(long)]
+    pub holdout_claim_put_url: String,
+    /// Independently authorized read URL for the same immutable holdout claim object.
+    #[arg(long)]
+    pub holdout_claim_readback_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -838,13 +846,24 @@ mod tests {
             .join("missing-materialization.json")
             .display()
             .to_string();
-        let result = root.path().join("results.zip").display().to_string();
+        let mission_id = format!("cex-mission-{}", "a".repeat(64));
+        let mission_result_dir = root.path().join(format!("mission-id={mission_id}"));
+        let result = mission_result_dir
+            .join("attempt=test/results.zip")
+            .display()
+            .to_string();
+        let holdout_claim = mission_result_dir
+            .join("sealed-holdout-claim.json")
+            .display()
+            .to_string();
         let cli = Cli::try_parse_from(vec![
             "alpha-harness".to_owned(),
             "mission".to_owned(),
             "execute".to_owned(),
             "--work-dir".to_owned(),
             work_dir,
+            "--mission-id".to_owned(),
+            mission_id,
             "--mission-url".to_owned(),
             missing_mission.clone(),
             "--mission-sha256".to_owned(),
@@ -865,6 +884,10 @@ mod tests {
             result.clone(),
             "--result-readback-url".to_owned(),
             result,
+            "--holdout-claim-put-url".to_owned(),
+            holdout_claim.clone(),
+            "--holdout-claim-readback-url".to_owned(),
+            holdout_claim,
         ])
         .unwrap();
 
@@ -1151,6 +1174,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1175,6 +1200,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -1199,6 +1228,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1219,6 +1250,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
         ])
         .expect("content-bound Mission transport must be accepted");
 
@@ -1229,6 +1264,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             panic!("expected mission execute command")
         };
         assert_eq!(args.mission_url, "mission.json");
+        assert_eq!(
+            args.mission_id,
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(args.mission_sha256, "b".repeat(64));
         assert!(args.resume_url.is_none());
         assert!(args.resume_sha256.is_none());
@@ -1239,6 +1278,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1259,6 +1300,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
             "--objective",
             "alternate authority",
         ])

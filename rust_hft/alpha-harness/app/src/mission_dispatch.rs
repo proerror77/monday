@@ -1,8 +1,8 @@
 use crate::{
     cli::{print_json, MissionDispatchRenderArgs},
-    mission_runner::normalized_sha256,
+    mission_runner::{normalized_sha256, validate_cex_mission_id},
     prediction_dispatch::{
-        canonical_https_object, result_object_binds_attempt, validate_dns_label,
+        canonical_https_object, cex_result_attempt_and_holdout_claim, validate_dns_label,
     },
 };
 use anyhow::{bail, Context};
@@ -17,6 +17,7 @@ const ACTIVE_DEADLINE_SECONDS: u64 = 900;
 #[serde(deny_unknown_fields)]
 struct MissionDispatchSubmission {
     attempt_id: String,
+    mission_id: String,
     image: String,
     mission_url: String,
     mission_sha256: String,
@@ -28,6 +29,8 @@ struct MissionDispatchSubmission {
     replay_manifest_sha256: String,
     result_put_url: String,
     result_readback_url: String,
+    holdout_claim_put_url: String,
+    holdout_claim_readback_url: String,
     #[serde(default)]
     resume_url: Option<String>,
     #[serde(default)]
@@ -48,6 +51,8 @@ struct ValidatedSubmission {
     replay_manifest_object: String,
     result_object: String,
     result_readback_object: String,
+    holdout_claim_object: String,
+    holdout_claim_readback_object: String,
     resume_sha256: Option<String>,
     result_identity_sha256: String,
     result_identity_label: String,
@@ -76,6 +81,7 @@ fn validate_submission(
     submission: MissionDispatchSubmission,
 ) -> anyhow::Result<ValidatedSubmission> {
     validate_dns_label("attempt id", &submission.attempt_id)?;
+    validate_cex_mission_id(&submission.mission_id)?;
     let image_digest = image_digest(&submission.image)?;
     let mission_sha256 = normalized_sha256("mission", &submission.mission_sha256)?;
     let replay_artifact_sha256 =
@@ -96,8 +102,22 @@ fn validate_submission(
     if result_object != result_readback_object {
         bail!("result readback URL must identify the same immutable result object");
     }
-    if !result_object_binds_attempt(&result_object, &submission.attempt_id)? {
+    let (result_attempt_id, expected_holdout_claim_object) =
+        cex_result_attempt_and_holdout_claim(&result_object, &submission.mission_id)?;
+    if result_attempt_id != submission.attempt_id {
         bail!("result object must bind the exact attempt id");
+    }
+    let holdout_claim_object =
+        canonical_https_object("holdout claim", &submission.holdout_claim_put_url)?;
+    let holdout_claim_readback_object = canonical_https_object(
+        "holdout claim readback",
+        &submission.holdout_claim_readback_url,
+    )?;
+    if holdout_claim_object != holdout_claim_readback_object {
+        bail!("holdout claim readback URL must identify the same immutable object");
+    }
+    if holdout_claim_object != expected_holdout_claim_object {
+        bail!("holdout claim object must be the mission-scoped sibling of the result attempt");
     }
     let resume_sha256 = match (
         submission
@@ -133,6 +153,8 @@ fn validate_submission(
         replay_manifest_object,
         result_object,
         result_readback_object,
+        holdout_claim_object,
+        holdout_claim_readback_object,
         resume_sha256,
         result_identity_sha256,
         result_identity_label,
@@ -152,6 +174,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
     });
     let annotations = json!({
         "research.monday/attempt-id": validated.submission.attempt_id,
+        "research.monday/mission-id": validated.submission.mission_id,
         "research.monday/mission-sha256": validated.mission_sha256,
         "research.monday/mission-object": validated.mission_object,
         "research.monday/feature-object": validated.feature_object,
@@ -162,6 +185,8 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
         "research.monday/replay-manifest-sha256": validated.replay_manifest_sha256,
         "research.monday/result-object": validated.result_object,
         "research.monday/result-readback-object": validated.result_readback_object,
+        "research.monday/holdout-claim-object": validated.holdout_claim_object,
+        "research.monday/holdout-claim-readback-object": validated.holdout_claim_readback_object,
         "research.monday/result-identity-sha256": validated.result_identity_sha256,
         "research.monday/image-digest": validated.image_digest,
         "research.monday/lane": "cex_research",
@@ -180,6 +205,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                     "annotations": {
                         "research.monday/result-identity-sha256": validated.result_identity_sha256,
                         "research.monday/attempt-id": validated.submission.attempt_id,
+                        "research.monday/mission-id": validated.submission.mission_id,
                     }
                 },
                 "type": "Opaque",
@@ -192,6 +218,8 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                     "replay-manifest-url": validated.submission.replay_manifest_url,
                     "result-put-url": validated.submission.result_put_url,
                     "result-readback-url": validated.submission.result_readback_url,
+                    "holdout-claim-put-url": validated.submission.holdout_claim_put_url,
+                    "holdout-claim-readback-url": validated.submission.holdout_claim_readback_url,
                     "resume-url": resume_url,
                     "resume-sha256": resume_sha256,
                 },
@@ -232,6 +260,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                     "mission",
                                     "execute",
                                     "--work-dir", "/work",
+                                    "--mission-id", validated.submission.mission_id,
                                     "--mission-url", "$(MISSION_URL)",
                                     "--mission-sha256", "$(MISSION_SHA256)",
                                     "--feature-url", "$(FEATURE_URL)",
@@ -243,7 +272,9 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                     "--resume-url", "$(RESUME_URL)",
                                     "--resume-sha256", "$(RESUME_SHA256)",
                                     "--result-put-url", "$(RESULT_PUT_URL)",
-                                    "--result-readback-url", "$(RESULT_READBACK_URL)"
+                                    "--result-readback-url", "$(RESULT_READBACK_URL)",
+                                    "--holdout-claim-put-url", "$(HOLDOUT_CLAIM_PUT_URL)",
+                                    "--holdout-claim-readback-url", "$(HOLDOUT_CLAIM_READBACK_URL)"
                                 ],
                                 "env": [
                                     secret_env("MISSION_URL", &validated.secret_name, "mission-url"),
@@ -257,7 +288,9 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                     secret_env("RESUME_URL", &validated.secret_name, "resume-url"),
                                     secret_env("RESUME_SHA256", &validated.secret_name, "resume-sha256"),
                                     secret_env("RESULT_PUT_URL", &validated.secret_name, "result-put-url"),
-                                    secret_env("RESULT_READBACK_URL", &validated.secret_name, "result-readback-url")
+                                    secret_env("RESULT_READBACK_URL", &validated.secret_name, "result-readback-url"),
+                                    secret_env("HOLDOUT_CLAIM_PUT_URL", &validated.secret_name, "holdout-claim-put-url"),
+                                    secret_env("HOLDOUT_CLAIM_READBACK_URL", &validated.secret_name, "holdout-claim-readback-url")
                                 ],
                                 "resources": {
                                     "requests": { "cpu": "3500m", "memory": "8Gi" },
@@ -320,16 +353,12 @@ mod tests {
 
     #[test]
     fn render_is_stable_for_the_same_query_free_result_identity() {
-        let first = validate_submission(valid_submission(
-            "https://oss-internal/results/attempt-001/results.zip?signature=first",
-            "https://oss-internal/results/attempt-001/results.zip?signature=second",
-        ))
-        .unwrap();
-        let second = validate_submission(valid_submission(
-            "https://oss-internal/results/attempt-001/results.zip?signature=third",
-            "https://oss-internal/results/attempt-001/results.zip?signature=fourth",
-        ))
-        .unwrap();
+        let first_put = result_url("results.zip?signature=first");
+        let first_readback = result_url("results.zip?signature=second");
+        let first = validate_submission(valid_submission(&first_put, &first_readback)).unwrap();
+        let second_put = result_url("results.zip?signature=third");
+        let second_readback = result_url("results.zip?signature=fourth");
+        let second = validate_submission(valid_submission(&second_put, &second_readback)).unwrap();
 
         assert_eq!(first.job_name, second.job_name);
         assert_eq!(first.secret_name, second.secret_name);
@@ -338,34 +367,66 @@ mod tests {
 
     #[test]
     fn render_rejects_result_identity_drift() {
-        let error = validate_submission(valid_submission(
-            "https://oss-internal/results/attempt-001/results.zip",
-            "https://oss-internal/results/attempt-001/other.zip",
-        ))
-        .unwrap_err();
+        let result = result_url("results.zip");
+        let other = result_url("other.zip");
+        let error = validate_submission(valid_submission(&result, &other)).unwrap_err();
         assert!(format!("{error:#}").contains("same immutable result object"));
     }
 
     #[test]
     fn render_rejects_attempt_identity_drift() {
-        let mut submission = valid_submission(
-            "https://oss-internal/results/attempt-001/results.zip",
-            "https://oss-internal/results/attempt-001/results.zip",
-        );
-        submission.attempt_id = "attempt-002".to_string();
+        let result = result_url("results.zip");
+        let mut submission = valid_submission(&result, &result);
+        submission.attempt_id = "002".to_string();
         let error = validate_submission(submission).unwrap_err();
         assert!(format!("{error:#}").contains("exact attempt id"));
+    }
+
+    #[test]
+    fn render_rejects_noncanonical_attempt_filenames() {
+        let result = format!(
+            "https://oss-internal/results/mission-id={}/attempt-001.zip",
+            mission_id()
+        );
+        let error = validate_submission(valid_submission(&result, &result)).unwrap_err();
+        assert!(format!("{error:#}").contains("attempt=<id>/results.zip"));
+    }
+
+    #[test]
+    fn render_rejects_attempt_scoped_holdout_claims() {
+        let result = result_url("results.zip");
+        let mut submission = valid_submission(&result, &result);
+        submission.holdout_claim_put_url = format!(
+            "https://oss-internal/results/mission-id={}/attempt=001/sealed-holdout-claim.json",
+            mission_id()
+        );
+        submission.holdout_claim_readback_url = submission.holdout_claim_put_url.clone();
+        let error = validate_submission(submission).unwrap_err();
+        assert!(format!("{error:#}").contains("mission-scoped sibling"));
+    }
+
+    fn result_url(file: &str) -> String {
+        format!(
+            "https://oss-internal/results/mission-id={}/attempt=001/{file}",
+            mission_id()
+        )
+    }
+
+    fn mission_id() -> String {
+        format!("cex-mission-{}", "a".repeat(64))
     }
 
     fn valid_submission(
         result_put_url: &str,
         result_readback_url: &str,
     ) -> MissionDispatchSubmission {
+        let mission_sha256 = "2".repeat(64);
         MissionDispatchSubmission {
-            attempt_id: "attempt-001".to_string(),
+            attempt_id: "001".to_string(),
+            mission_id: mission_id(),
             image: "registry/research-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             mission_url: "https://oss-internal/missions/mission.json?signature=x".to_string(),
-            mission_sha256: "2".repeat(64),
+            mission_sha256: mission_sha256.clone(),
             feature_url: "https://oss-internal/features/features.jsonl?signature=x".to_string(),
             materialization_url: "https://oss-internal/materialization/report.json?signature=x".to_string(),
             replay_artifact_url: "https://oss-internal/replay/data.parquet?signature=x".to_string(),
@@ -374,6 +435,14 @@ mod tests {
             replay_manifest_sha256: "4".repeat(64),
             result_put_url: result_put_url.to_string(),
             result_readback_url: result_readback_url.to_string(),
+            holdout_claim_put_url: format!(
+                "https://oss-internal/results/mission-id={}/sealed-holdout-claim.json?signature=put",
+                mission_id()
+            ),
+            holdout_claim_readback_url: format!(
+                "https://oss-internal/results/mission-id={}/sealed-holdout-claim.json?signature=get",
+                mission_id()
+            ),
             resume_url: None,
             resume_sha256: None,
         }

@@ -82,12 +82,15 @@ content-addressed `cex-research-mission-v1` artifact:
 ```bash
 cargo run -p alpha-harness -- mission execute \
   --work-dir var/runs/cex-mission-1 \
+  --mission-id "$MISSION_ID" \
   --mission-url var/missions/cex-mission.json \
   --mission-sha256 "$MISSION_SHA256" \
   --feature-url var/materializations/features.jsonl \
   --materialization-url var/materializations/materialization.json \
-  --result-put-url var/results/cex-mission-1.zip \
-  --result-readback-url var/results/cex-mission-1.zip
+  --result-put-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
+  --result-readback-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
+  --holdout-claim-put-url "var/results/mission-id=$MISSION_ID/sealed-holdout-claim.json" \
+  --holdout-claim-readback-url "var/results/mission-id=$MISSION_ID/sealed-holdout-claim.json"
 ```
 
 Resume a persisted subset-search checkpoint into a fresh work directory by

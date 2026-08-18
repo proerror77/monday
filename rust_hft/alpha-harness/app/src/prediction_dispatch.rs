@@ -1282,6 +1282,32 @@ pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> any
     }))
 }
 
+pub(crate) fn cex_result_attempt_and_holdout_claim(
+    result_object: &str,
+    mission_id: &str,
+) -> anyhow::Result<(String, String)> {
+    let segment = format!("/mission-id={mission_id}/");
+    let mut matches = result_object.match_indices(&segment);
+    let (index, _) = matches
+        .next()
+        .context("result object must bind the exact Mission ID")?;
+    if matches.next().is_some() || result_object[..index].contains("/mission-id=") {
+        bail!("result object contains duplicate Mission ID bindings");
+    }
+    let attempt_id = result_object[index + segment.len()..]
+        .strip_prefix("attempt=")
+        .and_then(|value| value.strip_suffix("/results.zip"))
+        .context("CEX result object must end with mission-id=<id>/attempt=<id>/results.zip")?;
+    validate_dns_label("attempt id", attempt_id)?;
+    Ok((
+        attempt_id.to_string(),
+        format!(
+            "{}{segment}sealed-holdout-claim.json",
+            &result_object[..index]
+        ),
+    ))
+}
+
 fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {

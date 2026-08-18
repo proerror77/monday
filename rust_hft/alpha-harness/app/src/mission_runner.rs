@@ -48,6 +48,7 @@ use hft_research_manifest::{
 use reqwest::{
     blocking::Client,
     header::{HeaderValue, CONTENT_TYPE},
+    StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -66,6 +67,7 @@ const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
 const CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str = "cex_event_replay_receipt";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES: u64 = 64 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
@@ -361,6 +363,10 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
 
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     validate_args(&args)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    ensure_holdout_claim_absent(&client, &args.holdout_claim_readback_url)?;
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
@@ -377,9 +383,6 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&artifact_dir)?;
     std::fs::create_dir_all(&results_dir)?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
     let mission_path = input_dir.join("mission.json");
     let feature_path = input_dir.join("features.jsonl");
     let materialization_path = input_dir.join("materialization.json");
@@ -441,6 +444,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     weight_policy.validate_binding(&control_mission.spec.policies.weight)?;
     data_mission::write_json_atomic(&results_dir.join("weight-policy.json"), &weight_policy)?;
     let mission_id = control_mission.semantic_id()?;
+    if mission_id != args.mission_id {
+        bail!("CEX Research Mission semantic ID does not match the requested Mission ID");
+    }
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
 
@@ -741,6 +747,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             Some(finalize_cex_candidate(
                 &mut store,
                 &results_dir,
+                &client,
+                &args.holdout_claim_put_url,
+                &args.holdout_claim_readback_url,
                 &control_mission,
                 &lineage,
                 &factor_bank,
@@ -828,6 +837,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 fn finalize_cex_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
+    client: &Client,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
     control_mission: &CexResearchMissionArtifactV1,
     lineage: &MissionLineage,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1034,16 +1046,36 @@ fn finalize_cex_candidate(
     data_mission::write_json_atomic(&results_dir.join("final-precommit.json"), &precommit)?;
 
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
+    let claim_path = results_dir.join("sealed-holdout-claim.json");
+    data_mission::write_json_atomic(&claim_path, &claim)?;
     let sealed_revision = match store.claim_cex_sealed_holdout(&claim, Utc::now())? {
         Some(existing) => existing,
         None => {
+            let claim_sha256 = sha256_file(&claim_path)?;
+            // This create-once write is the at-most-once boundary. If it succeeds but
+            // readback or evaluation fails, the Mission is terminal and inconclusive.
+            publish_immutable_file(
+                client,
+                holdout_claim_put_url,
+                &claim_path,
+                "application/json",
+            )?;
+            let claim_readback_path = results_dir.join("sealed-holdout-claim-readback.json");
+            let (_, claim_readback_sha256) = fetch_to_file(
+                client,
+                holdout_claim_readback_url,
+                &claim_readback_path,
+                MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES,
+            )?;
+            if claim_readback_sha256 != claim_sha256 {
+                bail!("published CEX sealed holdout claim readback SHA256 mismatch");
+            }
             let sealed = evaluator
                 .evaluate_sealed(&proposal, dataset)
                 .map_err(anyhow::Error::msg)?;
             store.put_cex_sealed_evaluation(&claim, &sealed, Utc::now())?
         }
     };
-    data_mission::write_json_atomic(&results_dir.join("sealed-holdout-claim.json"), &claim)?;
     data_mission::write_json_atomic(
         &results_dir.join("sealed-holdout-receipt.json"),
         &sealed_revision,
@@ -1711,6 +1743,8 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
             args.replay_manifest_url.as_str(),
             args.result_put_url.as_str(),
             args.result_readback_url.as_str(),
+            args.holdout_claim_put_url.as_str(),
+            args.holdout_claim_readback_url.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -1718,6 +1752,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("Mission execution paths and URLs are required");
     }
     normalized_sha256("Mission", &args.mission_sha256)?;
+    validate_cex_mission_id(&args.mission_id)?;
     normalized_sha256("CEX replay artifact", &args.replay_artifact_sha256)?;
     normalized_sha256("CEX replay manifest", &args.replay_manifest_sha256)?;
     if !valid_git_revision(BUILD_SOURCE_REVISION) {
@@ -1725,6 +1760,98 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
     }
     resume_source(args)?;
     validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
+    validate_holdout_claim_binding(args)?;
+    Ok(())
+}
+
+fn validate_holdout_claim_binding(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
+    let result_is_remote =
+        args.result_put_url.starts_with("http://") || args.result_put_url.starts_with("https://");
+    let put_is_remote = args.holdout_claim_put_url.starts_with("http://")
+        || args.holdout_claim_put_url.starts_with("https://");
+    let readback_is_remote = args.holdout_claim_readback_url.starts_with("http://")
+        || args.holdout_claim_readback_url.starts_with("https://");
+    if result_is_remote != put_is_remote || put_is_remote != readback_is_remote {
+        bail!("CEX result and holdout claim transports must match");
+    }
+    if put_is_remote {
+        let result_object =
+            prediction_dispatch::canonical_https_object("CEX result", &args.result_put_url)?;
+        let claim_object = prediction_dispatch::canonical_https_object(
+            "CEX holdout claim",
+            &args.holdout_claim_put_url,
+        )?;
+        let claim_readback_object = prediction_dispatch::canonical_https_object(
+            "CEX holdout claim readback",
+            &args.holdout_claim_readback_url,
+        )?;
+        if claim_object != claim_readback_object {
+            bail!("CEX holdout claim readback URL must identify the same immutable object");
+        }
+        let (_, expected_claim_object) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &result_object,
+            &args.mission_id,
+        )?;
+        if claim_object != expected_claim_object {
+            bail!(
+                "CEX holdout claim object must be the mission-scoped sibling of the result attempt"
+            );
+        }
+    } else {
+        let result_object = normalized_local_object(&args.result_put_url)?;
+        let claim_object = normalized_local_object(&args.holdout_claim_put_url)?;
+        let claim_readback_object = normalized_local_object(&args.holdout_claim_readback_url)?;
+        if claim_object != claim_readback_object {
+            bail!("CEX holdout claim readback path must identify the same immutable object");
+        }
+        let (_, expected_claim_object) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &result_object,
+            &args.mission_id,
+        )?;
+        if claim_object != expected_claim_object {
+            bail!(
+                "CEX holdout claim path must be the mission-scoped sibling of the result attempt"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalized_local_object(value: &str) -> anyhow::Result<String> {
+    let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("local immutable object path must be non-empty and lexically normalized");
+    }
+    Ok(format!(
+        "/{}",
+        path.to_string_lossy().trim_start_matches('/')
+    ))
+}
+
+fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
+    let exists = if source.starts_with("http://") || source.starts_with("https://") {
+        let response = client.get(source).send()?;
+        match response.status() {
+            StatusCode::NOT_FOUND => false,
+            status if status.is_success() => true,
+            _ => {
+                response.error_for_status()?;
+                unreachable!()
+            }
+        }
+    } else {
+        Path::new(source.strip_prefix("file://").unwrap_or(source)).try_exists()?
+    };
+    if exists {
+        bail!("CEX sealed holdout claim already exists; Mission is terminal and inconclusive");
+    }
     Ok(())
 }
 
@@ -1923,6 +2050,16 @@ pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<Stri
     Ok(value)
 }
 
+pub(crate) fn validate_cex_mission_id(value: &str) -> anyhow::Result<()> {
+    let suffix = value
+        .strip_prefix("cex-mission-")
+        .context("CEX Mission ID must use the cex-mission-<sha256> form")?;
+    if value != value.trim() || normalized_sha256("CEX Mission ID", suffix)? != suffix {
+        bail!("CEX Mission ID must use the cex-mission-<sha256> form");
+    }
+    Ok(())
+}
+
 fn valid_git_revision(value: &str) -> bool {
     value.len() == 40
         && value
@@ -2018,19 +2155,28 @@ pub(crate) fn publish_result(
     destination: &str,
     bundle: &Path,
 ) -> anyhow::Result<()> {
+    publish_immutable_file(client, destination, bundle, "application/zip")
+}
+
+fn publish_immutable_file(
+    client: &Client,
+    destination: &str,
+    source: &Path,
+    content_type: &'static str,
+) -> anyhow::Result<()> {
     if destination.starts_with("http://") || destination.starts_with("https://") {
         client
             .put(destination)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/zip"))
+            .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
             .header("x-oss-forbid-overwrite", "true")
-            .body(File::open(bundle)?)
+            .body(File::open(source)?)
             .send()?
             .error_for_status()?;
         return Ok(());
     }
     let path = Path::new(destination.strip_prefix("file://").unwrap_or(destination));
     let mut output = data_mission::temporary_output_file(path, ".monday-result-")?;
-    std::io::copy(&mut File::open(bundle)?, output.as_file_mut())?;
+    std::io::copy(&mut File::open(source)?, output.as_file_mut())?;
     output.as_file().sync_all()?;
     match output.persist_noclobber(path) {
         Ok(_) => Ok(()),
@@ -3414,6 +3560,32 @@ mod tests {
     }
 
     #[test]
+    fn existing_claim_blocks_before_research_starts() {
+        let mut fixture = fixture("duplicate-remote-holdout-claim");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        std::fs::write(&fixture.args.holdout_claim_put_url, b"already-claimed").unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Mission is terminal and inconclusive"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!fixture.args.work_dir.exists());
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/sealed-holdout-receipt.json")
+            .exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn failed_sealed_holdout_keeps_precommit_but_creates_no_deployable_lineage() {
         let mut fixture = fixture("failed-final-holdout");
         fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
@@ -3768,26 +3940,12 @@ mod tests {
         .unwrap();
         assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
         fixture.args.work_dir = fixture.root.join("work-resumed");
-        fixture.args.result_put_url = fixture
-            .root
-            .join("result-resumed.zip")
-            .to_string_lossy()
-            .into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "resumed");
         fixture.args.resume_url = Some(resume_path.to_string_lossy().into_owned());
         fixture.args.resume_sha256 = Some(resume_content_sha256);
-        execute(fixture.args.clone()).unwrap();
-        let resumed_result: CexFactorBankMctsResultV1 = serde_json::from_slice(
-            &std::fs::read(
-                fixture
-                    .args
-                    .work_dir
-                    .join("results/factor-subset-mcts-result.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resumed_result, full_result);
+        let error = execute(fixture.args.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("Mission is terminal and inconclusive"));
+        assert!(!fixture.args.work_dir.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -4361,8 +4519,7 @@ mod tests {
         fixture.mission.spec.search.max_new_iterations = 4;
         resign_mission(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-2");
-        fixture.args.result_put_url = fixture.root.join("result-2.zip").to_string_lossy().into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "2");
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
 
@@ -4376,8 +4533,7 @@ mod tests {
         });
         rebind_mission_inputs(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-3");
-        fixture.args.result_put_url = fixture.root.join("result-3.zip").to_string_lossy().into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "3");
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
         std::fs::remove_dir_all(fixture.root).unwrap();
@@ -4398,6 +4554,23 @@ mod tests {
         assert!(error.to_string().contains("fresh work directory"));
         assert_eq!(std::fs::read(&sealed).unwrap(), b"sealed-evidence\n");
         assert_eq!(std::fs::read(&receipt).unwrap(), b"sealed-receipt\n");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_a_noncanonical_result_attempt_before_side_effects() {
+        let mut fixture = fixture("noncanonical-result-attempt");
+        let result = fixture.root.join(format!(
+            "mission-id={}/attempt-test.zip",
+            fixture.args.mission_id
+        ));
+        fixture.args.result_put_url = result.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("attempt=<id>/results.zip"));
+        assert!(!fixture.args.work_dir.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -5028,11 +5201,17 @@ message binance_replay {
         )
         .unwrap();
         mission.validate().unwrap();
+        let mission_id = mission.semantic_id().unwrap();
         let mission_path = root.join("mission.json");
         std::fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
-        let result_path = root.join("result.zip");
+        let mission_result_dir = root.join(format!("mission-id={mission_id}"));
+        let attempt_result_dir = mission_result_dir.join("attempt=test");
+        std::fs::create_dir_all(&attempt_result_dir).unwrap();
+        let result_path = attempt_result_dir.join("results.zip");
+        let holdout_claim_path = mission_result_dir.join("sealed-holdout-claim.json");
         let args = ExecuteMissionArgs {
             work_dir: root.join("work-1"),
+            mission_id,
             mission_url: mission_path.to_string_lossy().into_owned(),
             mission_sha256: sha256_file(&mission_path).unwrap(),
             feature_url: feature_path.to_string_lossy().into_owned(),
@@ -5045,6 +5224,8 @@ message binance_replay {
             resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
             result_readback_url: result_path.to_string_lossy().into_owned(),
+            holdout_claim_put_url: holdout_claim_path.to_string_lossy().into_owned(),
+            holdout_claim_readback_url: holdout_claim_path.to_string_lossy().into_owned(),
         };
         Fixture {
             root,
@@ -5229,6 +5410,24 @@ message binance_replay {
         )
         .unwrap();
         fixture.args.mission_sha256 = sha256_file(&fixture.mission_path).unwrap();
+        if let Ok(mission_id) = fixture.mission.semantic_id() {
+            fixture.args.mission_id = mission_id;
+            bind_result_attempt(fixture, "test");
+        }
+    }
+
+    fn bind_result_attempt(fixture: &mut Fixture, attempt: &str) {
+        let mission_dir = fixture
+            .root
+            .join(format!("mission-id={}", fixture.args.mission_id));
+        let attempt_dir = mission_dir.join(format!("attempt={attempt}"));
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fixture.result_path = attempt_dir.join("results.zip");
+        fixture.args.result_put_url = fixture.result_path.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        let claim_path = mission_dir.join("sealed-holdout-claim.json");
+        fixture.args.holdout_claim_put_url = claim_path.to_string_lossy().into_owned();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
     }
 
     fn resign_mission(fixture: &mut Fixture) {

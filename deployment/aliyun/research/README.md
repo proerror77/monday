@@ -284,9 +284,16 @@ search budget `8 / 256`, schema `v1`, GP policy `controlled_dynamic_v2`, and
 template family `signed_rolling_imbalance`.
 
 Create a private dispatch submission JSON; never commit signed URLs. Include the
-attempt id, digest-pinned image, mission URL/SHA, feature/materialization/replay
+attempt id, semantic Mission ID, digest-pinned image, mission URL/SHA, feature/materialization/replay
 URLs and replay SHAs, result PUT/readback URLs, and an optional complete resume
-pair. Render the Kubernetes Secret + Job offline with:
+pair. The result path must end exactly with
+`mission-id=<SEMANTIC_MISSION_ID>/attempt=<ATTEMPT_ID>/results.zip`. Also include
+PUT/readback URLs for its fixed
+mission-scoped sibling `sealed-holdout-claim.json`; this create-once object is
+written immediately before sealed holdout access and prevents another attempt
+from opening the same holdout. If that claim exists without a sealed receipt or
+result, stop: the Mission is terminal and inconclusive, and the same holdout must
+not be retried. Render the Kubernetes Secret + Job offline with:
 
 ```bash
 alpha-harness mission dispatch render \
@@ -334,8 +341,10 @@ materialization, and result URLs against the regional internal OSS endpoint
 `https://oss-ap-northeast-1-internal.aliyuncs.com`; a public OSS URL will time
 out from the worker pool. The result PUT signature must cover both
 `Content-Type: application/zip` and `x-oss-forbid-overwrite: true`, matching the
-native runner request. Delete the short-lived URL Secret after the Job reaches a
-terminal state.
+native runner request. The holdout-claim PUT signature must cover
+`Content-Type: application/json` and the same forbid-overwrite header. Delete
+the short-lived URL Secret after the Job reaches a terminal state; retain the
+claim object as the durable once-only guard.
 
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that

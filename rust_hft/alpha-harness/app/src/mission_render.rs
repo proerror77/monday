@@ -72,20 +72,20 @@ struct RenderReportV1 {
 }
 
 pub fn render_cex(args: RenderCexMissionArgs) -> anyhow::Result<()> {
-    let output_dir = create_output_dir(&args.output_dir)?;
-    let artifacts_dir = output_dir.join("artifacts");
-    std::fs::create_dir(&artifacts_dir)
-        .with_context(|| format!("create {}", artifacts_dir.display()))?;
-
     let feature_sha256 = sha256_file(&args.feature)?;
     let materialization_sha256 = sha256_file(&args.materialization)?;
     let materialization = decode_materialization(
         &std::fs::read(&args.materialization)
             .with_context(|| format!("read {}", args.materialization.display()))?,
     )?;
-    let feature_manifest =
-        import_feature_manifest(&materialization.mission_id, &args.feature, &artifacts_dir)?;
+    let feature_artifacts = tempfile::tempdir().context("create feature validation directory")?;
+    let feature_manifest = import_feature_manifest(
+        &materialization.mission_id,
+        &args.feature,
+        feature_artifacts.path(),
+    )?;
     ensure_materialization_scope(&materialization, &feature_manifest, &feature_sha256)?;
+    data_mission::validate_cex_replay_features(&materialization.snapshot, &feature_manifest)?;
     let validation = approved_validation(&materialization)?;
     validate_materialization(&materialization, &feature_sha256, &validation)?;
     let dataset = CexReplayDatasetManifestV4::new(
@@ -264,37 +264,53 @@ pub fn render_cex(args: RenderCexMissionArgs) -> anyhow::Result<()> {
         operational: CexResearchOperationalMetadataV1::default(),
     };
     mission.validate()?;
-    let mission_id = mission.semantic_id()?;
-    let mission_path = output_dir.join("mission.json");
-    let holdout_policy_path = output_dir.join("holdout-policy.json");
-    let gp_policy_path = output_dir.join("gp-policy.json");
-    let report_path = output_dir.join("render-report.json");
-    data_mission::write_json_atomic(&mission_path, &mission)?;
-    data_mission::write_json_atomic(&holdout_policy_path, &holdout_policy)?;
-    data_mission::write_json_atomic(&gp_policy_path, &gp_policy)?;
-    let report = RenderReportV1 {
-        schema_version: "cex-mission-render-report-v1",
-        stable_version: STABLE_VERSION,
-        frozen_input_sha256,
-        mission_id,
-        mission_sha256: sha256_file(&mission_path)?,
-        gp_policy_content_sha256,
-        gp_policy_file_sha256: sha256_file(&gp_policy_path)?,
-        holdout_policy_content_sha256,
-        holdout_policy_file_sha256: sha256_file(&holdout_policy_path)?,
-        feature_manifest_id: feature_manifest.manifest_id,
-        feature_sha256,
-        materialization_sha256,
-        row_count: materialization.rows,
-        source_revision: materialization.source_revision,
-    };
-    data_mission::write_json_atomic(&report_path, &report)?;
-    print_json(&serde_json::json!({
+    let output_dir = create_output_dir(&args.output_dir)?;
+    let render_result = (|| -> anyhow::Result<serde_json::Value> {
+        let mission_id = mission.semantic_id()?;
+        let mission_path = output_dir.join("mission.json");
+        let holdout_policy_path = output_dir.join("holdout-policy.json");
+        let gp_policy_path = output_dir.join("gp-policy.json");
+        let report_path = output_dir.join("render-report.json");
+        data_mission::write_json_atomic(&mission_path, &mission)?;
+        data_mission::write_json_atomic(&holdout_policy_path, &holdout_policy)?;
+        data_mission::write_json_atomic(&gp_policy_path, &gp_policy)?;
+        let report = RenderReportV1 {
+            schema_version: "cex-mission-render-report-v1",
+            stable_version: STABLE_VERSION,
+            frozen_input_sha256,
+            mission_id,
+            mission_sha256: sha256_file(&mission_path)?,
+            gp_policy_content_sha256,
+            gp_policy_file_sha256: sha256_file(&gp_policy_path)?,
+            holdout_policy_content_sha256,
+            holdout_policy_file_sha256: sha256_file(&holdout_policy_path)?,
+            feature_manifest_id: feature_manifest.manifest_id,
+            feature_sha256,
+            materialization_sha256,
+            row_count: materialization.rows,
+            source_revision: materialization.source_revision,
+        };
+        data_mission::write_json_atomic(&report_path, &report)?;
+        Ok(serde_json::json!({
         "mission": mission_path,
         "holdout_policy": holdout_policy_path,
         "gp_policy": gp_policy_path,
         "report": report_path,
-    }))
+        }))
+    })();
+    let rendered = match render_result {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&output_dir) {
+                return Err(error.context(format!(
+                    "remove partial render output {}: {cleanup_error}",
+                    output_dir.display()
+                )));
+            }
+            return Err(error);
+        }
+    };
+    print_json(&rendered)
 }
 
 fn create_output_dir(path: &Path) -> anyhow::Result<PathBuf> {
@@ -483,6 +499,20 @@ mod tests {
         assert_eq!(report["feature_sha256"], feature_sha256);
         assert_eq!(report["materialization_sha256"], materialization_sha256);
         assert_ne!(report["feature_sha256"], report["materialization_sha256"]);
+        let mut output_names = std::fs::read_dir(&fixture.output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        output_names.sort();
+        assert_eq!(
+            output_names,
+            [
+                "gp-policy.json",
+                "holdout-policy.json",
+                "mission.json",
+                "render-report.json",
+            ]
+        );
     }
 
     #[test]
@@ -490,6 +520,15 @@ mod tests {
         let fixture = Fixture::new(MIN_ROWS - 1);
         let error = render_cex(fixture.args()).unwrap_err();
         assert!(format!("{error:#}").contains("at least 1232 point-in-time rows"));
+        assert!(!fixture.output_dir.exists());
+    }
+
+    #[test]
+    fn render_cex_rejects_feature_source_drift_without_leaving_output() {
+        let fixture = Fixture::with_feature_source(MIN_ROWS, "d".repeat(64));
+        let error = render_cex(fixture.args()).unwrap_err();
+        assert!(format!("{error:#}").contains("feature source revision"));
+        assert!(!fixture.output_dir.exists());
     }
 
     struct Fixture {
@@ -501,19 +540,34 @@ mod tests {
 
     impl Fixture {
         fn new(rows: usize) -> Self {
+            Self::with_optional_feature_source(rows, None)
+        }
+
+        fn with_feature_source(rows: usize, feature_source_revision: String) -> Self {
+            Self::with_optional_feature_source(rows, Some(feature_source_revision))
+        }
+
+        fn with_optional_feature_source(
+            rows: usize,
+            feature_source_revision: Option<String>,
+        ) -> Self {
             let root = tempfile::tempdir().unwrap();
             let feature_path = root.path().join("features.jsonl");
             let materialization_path = root.path().join("materialization.json");
             let output_dir = root.path().join("rendered");
-            let source_revision = "a".repeat(64);
-            let rows = feature_rows(rows, &source_revision);
+            let source_content_sha256 = "b".repeat(64);
+            let source_revision =
+                hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
+            let feature_source_revision = feature_source_revision
+                .as_deref()
+                .unwrap_or(&source_revision);
+            let rows = feature_rows(rows, feature_source_revision);
             write_feature_rows(&feature_path, &rows);
             let bytes = std::fs::read(&feature_path).unwrap();
             let feature_sha256 = hex::encode(Sha256::digest(&bytes));
             let first_event_time = rows.first().unwrap().event_time;
             let last_event_time = rows.last().unwrap().event_time;
             let ingestion_time = rows.first().unwrap().ingestion_time;
-            let source_content_sha256 = "b".repeat(64);
             let source_manifest_sha256 = "c".repeat(64);
             let source_start_ns = u64::try_from(
                 (first_event_time - ChronoDuration::seconds(1))

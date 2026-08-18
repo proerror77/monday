@@ -103,7 +103,7 @@ pub fn admit_cex_replay_dataset(
     Ok(manifest)
 }
 
-fn validate_cex_replay_features(
+pub(crate) fn validate_cex_replay_features(
     snapshot: &CexReplaySnapshotV4,
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
