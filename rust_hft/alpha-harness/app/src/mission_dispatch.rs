@@ -52,6 +52,17 @@ impl SubmissionObjectState {
 struct CleanupState {
     job: SubmissionObjectState,
     secret: SubmissionObjectState,
+    release_patch_sent: bool,
+}
+
+impl CleanupState {
+    fn should_cleanup_job(self) -> bool {
+        !self.release_patch_sent && self.job.should_cleanup()
+    }
+
+    fn should_cleanup_secret(self) -> bool {
+        !self.release_patch_sent && self.secret.should_cleanup()
+    }
 }
 
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
@@ -102,6 +113,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             job_uid,
         )?;
         let release_patch_json = serde_json::to_string(&release_job_patch())?;
+        cleanup_state.release_patch_sent = true;
         let release_output = kubectl_with_input(
             &kubectl,
             &args.context,
@@ -273,7 +285,9 @@ fn adopt_existing_job(
     request_sha256: &str,
     job_state: &mut SubmissionObjectState,
 ) -> anyhow::Result<()> {
-    validate_job_readback(job, expected_job, job_name, request_sha256, true)?;
+    if validate_job_readback(job, expected_job, job_name, request_sha256, true).is_err() {
+        validate_job_readback(job, expected_job, job_name, request_sha256, false)?;
+    }
     *job_state = SubmissionObjectState::Adopted;
     Ok(())
 }
@@ -526,7 +540,7 @@ fn delete_created_campaign_objects(
     secret_name: &str,
     cleanup_state: CleanupState,
 ) -> anyhow::Result<()> {
-    if cleanup_state.job.should_cleanup() {
+    if cleanup_state.should_cleanup_job() {
         let output = kubectl_with_input(
             kubectl,
             context,
@@ -536,7 +550,7 @@ fn delete_created_campaign_objects(
         )?;
         ensure_kubectl_success(output, "clean up incomplete CEX Campaign submission")?;
     }
-    if cleanup_state.secret.should_cleanup() {
+    if cleanup_state.should_cleanup_secret() {
         delete_campaign_secret(kubectl, context, namespace, secret_name)?;
     }
     Ok(())
@@ -1014,6 +1028,18 @@ mod tests {
     }
 
     #[test]
+    fn release_phase_disables_cleanup_even_for_created_objects() {
+        let cleanup_state = CleanupState {
+            job: SubmissionObjectState::Created,
+            secret: SubmissionObjectState::Created,
+            release_patch_sent: true,
+        };
+
+        assert!(!cleanup_state.should_cleanup_job());
+        assert!(!cleanup_state.should_cleanup_secret());
+    }
+
+    #[test]
     fn released_and_mismatched_jobs_do_not_become_cleanup_targets() {
         let expected_job =
             render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
@@ -1037,20 +1063,6 @@ mod tests {
         assert_eq!(adopted_state, SubmissionObjectState::Adopted);
         assert!(!adopted_state.should_cleanup());
 
-        let mut released_state = SubmissionObjectState::Unknown;
-        let mut released_job = expected_job["items"][1].clone();
-        released_job["spec"]["suspend"] = json!(false);
-        assert!(adopt_existing_job(
-            &released_job,
-            &expected_job["items"][1],
-            job_name,
-            request_sha256,
-            &mut released_state,
-        )
-        .is_err());
-        assert_eq!(released_state, SubmissionObjectState::Unknown);
-        assert!(!released_state.should_cleanup());
-
         let mut mismatched_state = SubmissionObjectState::Unknown;
         let mut mismatched_job = expected_job["items"][1].clone();
         mismatched_job["metadata"]["annotations"]["research.monday/request-sha256"] =
@@ -1065,6 +1077,49 @@ mod tests {
         .is_err());
         assert_eq!(mismatched_state, SubmissionObjectState::Unknown);
         assert!(!mismatched_state.should_cleanup());
+
+        let mut mismatched_released_state = SubmissionObjectState::Unknown;
+        let mut mismatched_released_job = expected_job["items"][1].clone();
+        mismatched_released_job["spec"]["suspend"] = json!(false);
+        mismatched_released_job["metadata"]["annotations"]["research.monday/request-sha256"] =
+            json!("other-request");
+        assert!(adopt_existing_job(
+            &mismatched_released_job,
+            &expected_job["items"][1],
+            job_name,
+            request_sha256,
+            &mut mismatched_released_state,
+        )
+        .is_err());
+        assert_eq!(mismatched_released_state, SubmissionObjectState::Unknown);
+        assert!(!mismatched_released_state.should_cleanup());
+    }
+
+    #[test]
+    fn released_exact_job_is_adoptable_for_retry() {
+        let expected_job =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+        let job_name = expected_job["items"][1]["metadata"]["name"]
+            .as_str()
+            .unwrap();
+        let request_sha256 = expected_job["items"][1]["metadata"]["annotations"]
+            ["research.monday/request-sha256"]
+            .as_str()
+            .unwrap();
+        let mut released_job = expected_job["items"][1].clone();
+        released_job["spec"]["suspend"] = json!(false);
+
+        let mut released_state = SubmissionObjectState::Unknown;
+        adopt_existing_job(
+            &released_job,
+            &expected_job["items"][1],
+            job_name,
+            request_sha256,
+            &mut released_state,
+        )
+        .unwrap();
+        assert_eq!(released_state, SubmissionObjectState::Adopted);
+        assert!(!released_state.should_cleanup());
     }
 
     #[test]

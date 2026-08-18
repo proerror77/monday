@@ -2352,14 +2352,19 @@ fn validate_recovered_binding(
         ExecutionBinding::Campaign {
             campaign_id,
             round_id,
-            request_sha256,
+            request_sha256: _,
         } => {
             if admission.campaign_id.as_deref() != Some(campaign_id)
                 || admission.round_id.as_deref() != Some(round_id)
-                || admission.request_sha256.as_deref() != Some(request_sha256)
             {
                 bail!("published result bundle does not match the Campaign binding");
             }
+            normalized_sha256(
+                "published result bundle Campaign request SHA256",
+                admission.request_sha256.as_deref().context(
+                    "published result bundle is missing Campaign request SHA256 evidence",
+                )?,
+            )?;
         }
     }
     Ok(())
@@ -5076,13 +5081,42 @@ mod tests {
     }
 
     #[test]
+    fn recover_execution_report_accepts_a_renewed_campaign_request_sha() {
+        let mut fixture = fixture("recover-campaign-binding-mismatch");
+        let binding = campaign_binding_fixture(&mut fixture);
+        let original = execute_report(fixture.args.clone(), binding).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let renewed_binding = ExecutionBinding::Campaign {
+            campaign_id: "cex-campaign-test".to_string(),
+            round_id: "r1".to_string(),
+            request_sha256: "b".repeat(64),
+        };
+        let recovered = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-mismatch.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &renewed_binding,
+        )
+        .unwrap()
+        .expect("renewed request SHA should still recover the same Campaign result");
+
+        assert_eq!(recovered.mission_id, original.mission_id);
+        assert_eq!(recovered.campaign_id, original.campaign_id);
+        assert_eq!(recovered.round_id, original.round_id);
+        assert_eq!(recovered.request_sha256, original.request_sha256);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn recover_execution_report_rejects_a_result_bundle_for_another_campaign_binding() {
         let mut fixture = fixture("recover-campaign-binding-mismatch");
         let binding = campaign_binding_fixture(&mut fixture);
         execute_report(fixture.args.clone(), binding).unwrap();
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         let wrong_binding = ExecutionBinding::Campaign {
-            campaign_id: "cex-campaign-test".to_string(),
+            campaign_id: "cex-campaign-other".to_string(),
             round_id: "r1".to_string(),
             request_sha256: "b".repeat(64),
         };
