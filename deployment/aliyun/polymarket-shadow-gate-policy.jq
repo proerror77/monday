@@ -375,16 +375,24 @@ and (
   )
   or
   (
-    # Issues #868 and #891: finalization-deferred collection cannot always emit
-    # a mature trade inside the gate window. Adjudication is limited to either
-    # continuous baseline overlap or a fully contained inactive-baseline
-    # recovery, and preserves the raw verifier verdict.
+    # Issues #868 and #891 and gate #6: finalization-deferred collection
+    # cannot always emit a mature trade inside the gate window. Adjudication
+    # is limited to a continuous-baseline overlap, a deferred-baseline
+    # overlap, or a fully contained inactive-baseline recovery, and preserves
+    # the raw verifier verdict.
     (
       (
         .trade_parity_mode == "finalization_deferred_overlap"
         and .comparison_mode == "legacy_overlap"
         and .shadow_emission == "finalization_deferred"
         and .baseline_emission == "continuous"
+      )
+      or
+      (
+        .trade_parity_mode == "finalization_deferred_deferred_overlap"
+        and .comparison_mode == "legacy_overlap"
+        and .shadow_emission == "finalization_deferred"
+        and .baseline_emission == "finalization_deferred"
       )
       or
       (
@@ -454,7 +462,8 @@ and (if .trade_parity_mode == "finalization_deferred_overlap" then
   (.metrics.rust_trade_count | nonnegative_integer)
   and (.metrics.legacy_only_trade_ids | type == "array")
   and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
-elif .trade_parity_mode == "finalization_deferred_rust_self" then
+elif .trade_parity_mode == "finalization_deferred_rust_self"
+  or .trade_parity_mode == "finalization_deferred_deferred_overlap" then
   .metrics.rust_trade_count == 0
   and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
   and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
@@ -472,7 +481,11 @@ and (.metrics.rust_settlement_count | positive_integer)
 and (.metrics.legacy_only_settlement_ids | type == "array" and length == 0)
 and (.metrics.rust_only_settlement_ids | type == "array")
 and (if .comparison_mode == "legacy_overlap" then
-  (.metrics.legacy_trade_count | positive_integer)
+  (if .trade_parity_mode == "finalization_deferred_deferred_overlap" then
+    .metrics.legacy_trade_count == 0
+  else
+    (.metrics.legacy_trade_count | positive_integer)
+  end)
   and (.metrics.legacy_metadata_count | positive_integer)
   and (.metrics.legacy_settlement_count | positive_integer)
 else
