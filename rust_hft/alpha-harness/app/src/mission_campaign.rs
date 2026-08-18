@@ -277,13 +277,16 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         } else {
             "single_mission_completed_without_finalization".to_string()
         };
-
+    let request_sha256 = report
+        .request_sha256
+        .clone()
+        .context("Campaign execution report is missing request SHA256")?;
     let sealed_passed = mission.sealed_passed;
     let promotion_id = mission.promotion_id.clone();
     let result = CampaignResultV1 {
         schema_version: CAMPAIGN_RESULT_SCHEMA_V1,
         campaign_id: loaded.request.campaign_id.clone(),
-        request_sha256: loaded.sha256.clone(),
+        request_sha256,
         build_source_revision: loaded.request.build_source_revision.clone(),
         image_identity: loaded.request.image_identity.clone(),
         holdout_id: loaded.request.holdout_id.clone(),
