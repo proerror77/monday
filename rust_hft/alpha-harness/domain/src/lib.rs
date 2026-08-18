@@ -1780,6 +1780,21 @@ impl CexGpPolicyV1 {
                     ));
                 }
                 FactorAst::Call { operator, args } => {
+                    if matches!(operator, FactorOperator::Delta | FactorOperator::ZScore)
+                        && args
+                            .get(1)
+                            .and_then(|window| match window {
+                                FactorAst::Terminal(FactorTerminal::Constant(window)) => {
+                                    window.parse::<usize>().ok()
+                                }
+                                _ => None,
+                            })
+                            .is_none_or(|window| !self.windows.contains(&window))
+                    {
+                        return Err(DomainError::InvalidCexGpCandidate(
+                            "formula references an unadmitted rolling window",
+                        ));
+                    }
                     if !self.operators.contains(operator) {
                         return Err(DomainError::InvalidCexGpCandidate(
                             "formula references an unadmitted operator",
@@ -6550,6 +6565,37 @@ mod tests {
             &wall_clock,
         )
         .is_err());
+    }
+
+    #[test]
+    fn dynamic_gp_policy_rejects_constants_used_as_unadmitted_windows() {
+        let policy = CexGpPolicyV1::controlled_dynamic_v2(
+            "gp-policy-2",
+            vec!["book_imbalance".to_string()],
+            7,
+            &SearchBudget {
+                max_candidates: 4,
+                max_expansions: 16,
+                max_tokens: 0,
+                max_seconds: 0,
+            },
+        )
+        .unwrap();
+        let candidate = FactorAst::call(
+            FactorOperator::ZScore,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                FactorAst::Terminal(FactorTerminal::Constant("1".to_string())),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_candidate(&candidate),
+            Err(DomainError::InvalidCexGpCandidate(
+                "formula references an unadmitted rolling window"
+            ))
+        );
     }
 
     #[test]

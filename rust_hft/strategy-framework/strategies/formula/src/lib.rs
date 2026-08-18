@@ -1,7 +1,7 @@
 use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use hft_factor_dsl::{
-    validate_live_formula, FactorAst, FactorDslError, FactorOperator, FactorTerminal,
-    LiveEventDomain, LiveFormulaCapabilityError,
+    evaluate_live_formula_series, validate_live_formula, FactorAst, FactorDslError, FactorOperator,
+    FactorTerminal, LiveEventDomain, LiveFormulaCapabilityError,
 };
 use ports::{
     AccountView, AggregatedBar, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot,
@@ -52,6 +52,8 @@ pub enum FormulaStrategyError {
     InvalidRollingWindow,
     #[error("live formula history exceeds {0} rows")]
     HistoryTooLong(usize),
+    #[error("live formula exceeds {0} bounded evaluation steps")]
+    EvaluationTooExpensive(usize),
     #[error("stateful formulas require target-position bucket evaluation")]
     StatefulFormulaRequiresTargetPosition,
 }
@@ -216,6 +218,13 @@ impl FormulaStrategy {
         best_bid: Decimal,
         best_ask: Decimal,
     ) {
+        if self
+            .config
+            .target_venue
+            .is_some_and(|target| target != venue)
+        {
+            return;
+        }
         let Some(interval) = self.evaluation_interval_micros else {
             return;
         };
@@ -733,6 +742,9 @@ fn validate_live_ast(ast: &FactorAst) -> Result<(EventDomain, usize), FormulaStr
         LiveFormulaCapabilityError::HistoryTooLong { max_rows } => {
             FormulaStrategyError::HistoryTooLong(max_rows)
         }
+        LiveFormulaCapabilityError::EvaluationTooExpensive { max_steps } => {
+            FormulaStrategyError::EvaluationTooExpensive(max_steps)
+        }
     })?;
     Ok((
         match capability.event_domain {
@@ -905,90 +917,15 @@ fn evaluate_ast_history(
     field_names: &[String],
     history: &VecDeque<Vec<f64>>,
 ) -> Option<f64> {
-    evaluate_ast_at(ast, field_names, history, history.len().checked_sub(1)?)
-}
-
-fn evaluate_ast_at(
-    ast: &FactorAst,
-    field_names: &[String],
-    history: &VecDeque<Vec<f64>>,
-    index: usize,
-) -> Option<f64> {
-    let value = match ast {
-        FactorAst::Terminal(FactorTerminal::Field(field)) => {
-            let field_index = field_names
-                .iter()
-                .position(|candidate| candidate == field)?;
-            *history.get(index)?.get(field_index)?
-        }
-        FactorAst::Terminal(FactorTerminal::Constant(value)) => value.parse::<f64>().ok()?,
-        FactorAst::Call { operator, args } => match operator {
-            FactorOperator::Abs if args.len() == 1 => {
-                evaluate_ast_at(&args[0], field_names, history, index)?.abs()
-            }
-            FactorOperator::Delta if args.len() == 2 => {
-                let window = rolling_window(&args[1])?;
-                evaluate_ast_at(&args[0], field_names, history, index)?
-                    - evaluate_ast_at(&args[0], field_names, history, index.saturating_sub(window))?
-            }
-            FactorOperator::ZScore if args.len() == 2 => {
-                let window = rolling_window(&args[1])?;
-                let start = (index + 1).saturating_sub(window);
-                let values = (start..=index)
-                    .map(|row| evaluate_ast_at(&args[0], field_names, history, row))
-                    .collect::<Option<Vec<_>>>()?;
-                let mean = values.iter().sum::<f64>() / values.len() as f64;
-                let standard_deviation = (values
-                    .iter()
-                    .map(|value| (value - mean).powi(2))
-                    .sum::<f64>()
-                    / values.len() as f64)
-                    .sqrt();
-                if standard_deviation <= f64::EPSILON {
-                    0.0
-                } else {
-                    (values.last()? - mean) / standard_deviation
-                }
-            }
-            FactorOperator::IfElse if args.len() == 3 => {
-                if evaluate_ast_at(&args[0], field_names, history, index)? > 0.0 {
-                    evaluate_ast_at(&args[1], field_names, history, index)?
-                } else {
-                    evaluate_ast_at(&args[2], field_names, history, index)?
-                }
-            }
-            FactorOperator::Add
-            | FactorOperator::Sub
-            | FactorOperator::Mul
-            | FactorOperator::GreaterThan
-            | FactorOperator::LessThan
-                if args.len() == 2 =>
-            {
-                let left = evaluate_ast_at(&args[0], field_names, history, index)?;
-                let right = evaluate_ast_at(&args[1], field_names, history, index)?;
-                match operator {
-                    FactorOperator::Add => left + right,
-                    FactorOperator::Sub => left - right,
-                    FactorOperator::Mul => left * right,
-                    FactorOperator::GreaterThan => f64::from(left > right),
-                    FactorOperator::LessThan => f64::from(left < right),
-                    _ => unreachable!(),
-                }
-            }
-            _ => return None,
-        },
-    };
-    value.is_finite().then_some(value)
-}
-
-fn rolling_window(ast: &FactorAst) -> Option<usize> {
-    let FactorAst::Terminal(FactorTerminal::Constant(value)) = ast else {
-        return None;
-    };
-    value
-        .parse::<usize>()
-        .ok()
-        .filter(|window| (1..=10_000).contains(window))
+    evaluate_live_formula_series(ast, history.len(), |row, field| {
+        let field_index = field_names
+            .iter()
+            .position(|candidate| candidate == field)?;
+        history.get(row)?.get(field_index).copied()
+    })
+    .ok()?
+    .last()
+    .copied()
 }
 
 fn decimal_to_f64(value: Decimal) -> Option<f64> {
@@ -1594,6 +1531,30 @@ mod tests {
 
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn target_position_does_not_record_foreign_venue_history() {
+        let ast = call(
+            FactorOperator::ZScore,
+            vec![field("book_imbalance"), constant("2")],
+        );
+        let mut strategy = FormulaStrategy::new(sealed_target_config(ast)).unwrap();
+        let account = AccountView::default();
+        let mut foreign = snapshot_at(1, 3, 1_000_000);
+        let MarketEvent::Snapshot(snapshot) = &mut foreign else {
+            unreachable!()
+        };
+        snapshot.source_venue = Some(VenueId::BINANCE_SPOT);
+
+        assert!(target_intents(&mut strategy, &foreign, &account, 1_000_000).is_empty());
+        assert!(target_intents(
+            &mut strategy,
+            &snapshot_at(3, 1, 2_000_000),
+            &account,
+            2_000_000,
+        )
+        .is_empty());
     }
 
     #[test]

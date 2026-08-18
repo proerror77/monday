@@ -8,6 +8,7 @@ use thiserror::Error;
 pub const MAX_FACTOR_AST_DEPTH: usize = 64;
 pub const MAX_FACTOR_AST_NODES: usize = 10_000;
 pub const MAX_LIVE_HISTORY_ROWS: usize = 10_001;
+pub const MAX_LIVE_EVALUATION_STEPS: usize = 1_000_000;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FactorDslError {
@@ -53,6 +54,18 @@ pub enum LiveFormulaCapabilityError {
     InvalidRollingWindow,
     #[error("live formula requires more than {max_rows} history rows")]
     HistoryTooLong { max_rows: usize },
+    #[error("live formula exceeds {max_steps} bounded evaluation steps")]
+    EvaluationTooExpensive { max_steps: usize },
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LiveFormulaEvaluationError {
+    #[error(transparent)]
+    Capability(#[from] LiveFormulaCapabilityError),
+    #[error("formula field is not registered: {0}")]
+    MissingField(String),
+    #[error("live formula produced a non-finite value")]
+    NonFiniteValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +191,13 @@ pub fn validate_live_formula(
     ast.validate()?;
     let mut event_domain = None;
     let history_rows = validate_live_node(ast, &mut event_domain)?;
+    if live_evaluation_steps(ast, history_rows)
+        .is_none_or(|steps| steps > MAX_LIVE_EVALUATION_STEPS)
+    {
+        return Err(LiveFormulaCapabilityError::EvaluationTooExpensive {
+            max_steps: MAX_LIVE_EVALUATION_STEPS,
+        });
+    }
     Ok(LiveFormulaCapability {
         event_domain: event_domain.ok_or(LiveFormulaCapabilityError::MissingEventDomain)?,
         history_rows,
@@ -266,6 +286,154 @@ fn validate_live_node(
             Ok(history_rows)
         }
     }
+}
+
+fn live_evaluation_steps(ast: &FactorAst, history_rows: usize) -> Option<usize> {
+    match ast {
+        FactorAst::Terminal(_) => Some(history_rows),
+        FactorAst::Call { operator, args } => {
+            let own_steps = if *operator == FactorOperator::ZScore {
+                history_rows.checked_mul(rolling_window(&args[1])?)?
+            } else {
+                history_rows
+            };
+            let children = if matches!(operator, FactorOperator::Delta | FactorOperator::ZScore) {
+                live_evaluation_steps(&args[0], history_rows)?
+            } else {
+                args.iter().try_fold(0_usize, |total, arg| {
+                    total.checked_add(live_evaluation_steps(arg, history_rows)?)
+                })?
+            };
+            own_steps.checked_add(children)
+        }
+    }
+}
+
+pub fn evaluate_live_formula_series(
+    ast: &FactorAst,
+    row_count: usize,
+    field_value: impl Fn(usize, &str) -> Option<f64>,
+) -> Result<Vec<f64>, LiveFormulaEvaluationError> {
+    validate_live_formula(ast)?;
+    let values = evaluate_live_series_node(ast, row_count, &field_value)?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(LiveFormulaEvaluationError::NonFiniteValue);
+    }
+    Ok(values)
+}
+
+fn evaluate_live_series_node(
+    ast: &FactorAst,
+    row_count: usize,
+    field_value: &impl Fn(usize, &str) -> Option<f64>,
+) -> Result<Vec<f64>, LiveFormulaEvaluationError> {
+    match ast {
+        FactorAst::Terminal(FactorTerminal::Field(field)) => (0..row_count)
+            .map(|row| {
+                field_value(row, field)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| LiveFormulaEvaluationError::MissingField(field.clone()))
+            })
+            .collect(),
+        FactorAst::Terminal(FactorTerminal::Constant(value)) => {
+            Ok(vec![
+                value.parse::<f64>().map_err(|_| {
+                    LiveFormulaEvaluationError::NonFiniteValue
+                })?;
+                row_count
+            ])
+        }
+        FactorAst::Call { operator, args } => match operator {
+            FactorOperator::Abs => Ok(evaluate_live_series_node(&args[0], row_count, field_value)?
+                .into_iter()
+                .map(f64::abs)
+                .collect()),
+            FactorOperator::Delta => {
+                let values = evaluate_live_series_node(&args[0], row_count, field_value)?;
+                let window =
+                    rolling_window(&args[1]).ok_or(LiveFormulaEvaluationError::NonFiniteValue)?;
+                Ok((0..row_count)
+                    .map(|index| values[index] - values[index.saturating_sub(window)])
+                    .collect())
+            }
+            FactorOperator::ZScore => {
+                let values = evaluate_live_series_node(&args[0], row_count, field_value)?;
+                let window =
+                    rolling_window(&args[1]).ok_or(LiveFormulaEvaluationError::NonFiniteValue)?;
+                Ok((0..row_count)
+                    .map(|index| {
+                        let start = (index + 1).saturating_sub(window);
+                        let history = &values[start..=index];
+                        let mean = history.iter().sum::<f64>() / history.len() as f64;
+                        let deviation = (history
+                            .iter()
+                            .map(|value| (value - mean).powi(2))
+                            .sum::<f64>()
+                            / history.len() as f64)
+                            .sqrt();
+                        if deviation <= f64::EPSILON {
+                            0.0
+                        } else {
+                            (values[index] - mean) / deviation
+                        }
+                    })
+                    .collect())
+            }
+            FactorOperator::IfElse => {
+                let condition = evaluate_live_series_node(&args[0], row_count, field_value)?;
+                let truthy = evaluate_live_series_node(&args[1], row_count, field_value)?;
+                let falsy = evaluate_live_series_node(&args[2], row_count, field_value)?;
+                Ok(condition
+                    .into_iter()
+                    .zip(truthy)
+                    .zip(falsy)
+                    .map(
+                        |((condition, truthy), falsy)| {
+                            if condition > 0.0 {
+                                truthy
+                            } else {
+                                falsy
+                            }
+                        },
+                    )
+                    .collect())
+            }
+            FactorOperator::Add
+            | FactorOperator::Sub
+            | FactorOperator::Mul
+            | FactorOperator::GreaterThan
+            | FactorOperator::LessThan => {
+                let left = evaluate_live_series_node(&args[0], row_count, field_value)?;
+                let right = evaluate_live_series_node(&args[1], row_count, field_value)?;
+                Ok(left
+                    .into_iter()
+                    .zip(right)
+                    .map(|(left, right)| match operator {
+                        FactorOperator::Add => left + right,
+                        FactorOperator::Sub => left - right,
+                        FactorOperator::Mul => left * right,
+                        FactorOperator::GreaterThan => f64::from(left > right),
+                        FactorOperator::LessThan => f64::from(left < right),
+                        _ => unreachable!(),
+                    })
+                    .collect())
+            }
+            _ => Err(LiveFormulaCapabilityError::UnsupportedOperator(
+                operator.symbol().to_string(),
+            )
+            .into()),
+        },
+    }
+}
+
+fn rolling_window(ast: &FactorAst) -> Option<usize> {
+    let FactorAst::Terminal(FactorTerminal::Constant(value)) = ast else {
+        return None;
+    };
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|window| (1..=10_000).contains(window))
 }
 
 impl fmt::Display for FactorAst {
@@ -479,5 +647,55 @@ mod tests {
                 LiveFormulaCapabilityError::InvalidRollingWindow
             );
         }
+    }
+
+    #[test]
+    fn live_capability_rejects_expensive_nested_rolling_evaluation() {
+        let mut ast = FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string()));
+        for _ in 0..3 {
+            ast = FactorAst::call(
+                FactorOperator::ZScore,
+                vec![
+                    ast,
+                    FactorAst::Terminal(FactorTerminal::Constant("3000".to_string())),
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            validate_live_formula(&ast).unwrap_err(),
+            LiveFormulaCapabilityError::EvaluationTooExpensive {
+                max_steps: MAX_LIVE_EVALUATION_STEPS,
+            }
+        );
+    }
+
+    #[test]
+    fn shared_live_series_evaluator_preserves_causal_delta_and_zscore() {
+        let ast = FactorAst::call(
+            FactorOperator::ZScore,
+            vec![
+                FactorAst::call(
+                    FactorOperator::Delta,
+                    vec![
+                        FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                        FactorAst::Terminal(FactorTerminal::Constant("1".to_string())),
+                    ],
+                )
+                .unwrap(),
+                FactorAst::Terminal(FactorTerminal::Constant("2".to_string())),
+            ],
+        )
+        .unwrap();
+        let values = [1.0, 2.0, 4.0];
+
+        assert_eq!(
+            evaluate_live_formula_series(&ast, values.len(), |row, field| {
+                (field == "book_imbalance").then_some(values[row])
+            })
+            .unwrap(),
+            vec![0.0, 1.0, 1.0]
+        );
     }
 }

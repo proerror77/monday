@@ -11,7 +11,9 @@ use alpha_domain::{
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
 };
-use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
+use hft_factor_dsl::{
+    evaluate_live_formula_series, validate_live_formula, FactorAst, FactorOperator, FactorTerminal,
+};
 
 const BPS: f64 = 10_000.0;
 
@@ -463,6 +465,12 @@ fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
 }
 
 pub(crate) fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<f64>, String> {
+    if validate_live_formula(ast).is_ok() {
+        return evaluate_live_formula_series(ast, rows.len(), |row, field| {
+            rows.get(row)?.features.get(field).copied()
+        })
+        .map_err(|error| error.to_string());
+    }
     match ast {
         FactorAst::Terminal(FactorTerminal::Field(field)) if field == "signal" => {
             Ok(rows.iter().map(|row| row.signal).collect())
