@@ -719,8 +719,9 @@ mod tests {
         std::fs::write(&destination, br#"{"mission":"same"}"#).unwrap();
 
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        let mission_sha256 = publish_round_mission(
+        let mission_sha256 = publish_create_once_json(
             &client,
+            "Mission",
             &destination.to_string_lossy(),
             &destination.to_string_lossy(),
             &source,
@@ -750,8 +751,9 @@ mod tests {
         file.flush().unwrap();
 
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        let error = publish_round_mission(
+        let error = publish_create_once_json(
             &client,
+            "Mission",
             &destination.to_string_lossy(),
             &destination.to_string_lossy(),
             &source,
@@ -762,6 +764,63 @@ mod tests {
         assert!(error
             .to_string()
             .contains("published Mission already exists with different bytes"));
+    }
+
+    #[test]
+    fn publish_campaign_result_accepts_an_existing_identical_object() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("campaign-result.json");
+        let destination = root.path().join("published-campaign-result.json");
+        let readback = root.path().join("campaign-result-readback.json");
+        std::fs::write(&source, br#"{"campaign":"same"}"#).unwrap();
+        std::fs::write(&destination, br#"{"campaign":"same"}"#).unwrap();
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let result_sha256 = publish_create_once_json(
+            &client,
+            "campaign result",
+            &destination.to_string_lossy(),
+            &destination.to_string_lossy(),
+            &source,
+            &readback,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result_sha256,
+            crate::mission_runner::sha256_file(&destination).unwrap()
+        );
+        assert_eq!(
+            crate::mission_runner::sha256_file(&readback).unwrap(),
+            result_sha256
+        );
+    }
+
+    #[test]
+    fn publish_campaign_result_rejects_an_existing_different_object() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("campaign-result.json");
+        let destination = root.path().join("published-campaign-result.json");
+        let readback = root.path().join("campaign-result-readback.json");
+        std::fs::write(&source, br#"{"campaign":"new"}"#).unwrap();
+        let mut file = std::fs::File::create(&destination).unwrap();
+        file.write_all(br#"{"campaign":"old"}"#).unwrap();
+        file.flush().unwrap();
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = publish_create_once_json(
+            &client,
+            "campaign result",
+            &destination.to_string_lossy(),
+            &destination.to_string_lossy(),
+            &source,
+            &readback,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("published campaign result already exists with different bytes"));
     }
 
     #[test]

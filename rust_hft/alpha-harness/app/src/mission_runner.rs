@@ -59,7 +59,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
@@ -74,6 +74,7 @@ pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_VERSION: &str = "cex-event-replay-receipt-v1";
@@ -130,6 +131,15 @@ struct SourceSegment {
     start_received_at_ns: u64,
     end_received_at_ns: u64,
     events: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MissionAdmissionEvidenceV1 {
+    mission_id: String,
+    mission_artifact_sha256: String,
+    campaign_id: Option<String>,
+    round_id: Option<String>,
+    request_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2198,6 +2208,252 @@ pub(crate) fn fetch_to_file(
     }
     data_mission::persist_output_file(temporary, destination, "fetched source")?;
     Ok((bytes, sha256_file(destination)?))
+}
+
+pub(crate) fn recover_execution_report_from_published_result(
+    client: &Client,
+    result_readback_url: &str,
+    readback_destination: &Path,
+    expected_mission_id: &str,
+    expected_mission_sha256: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<Option<ExecutionReport>> {
+    let Some((bundle_bytes, bundle_sha256)) = fetch_optional_to_file(
+        client,
+        result_readback_url,
+        readback_destination,
+        MAX_RESULT_BUNDLE_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut archive = ZipArchive::new(File::open(readback_destination)?)
+        .context("open published result bundle")?;
+    let admission: MissionAdmissionEvidenceV1 =
+        read_bundle_json(&mut archive, "results/mission-admission.json", 64 * 1024)?
+            .context("published result bundle is missing results/mission-admission.json")?;
+    if admission.mission_id != expected_mission_id {
+        bail!("published result bundle Mission ID does not match the Campaign Mission");
+    }
+    if admission.mission_artifact_sha256 != normalized_sha256("Mission", expected_mission_sha256)? {
+        bail!("published result bundle Mission SHA256 does not match the Campaign Mission");
+    }
+    validate_recovered_binding(&admission, binding)?;
+
+    let replay_receipt: Option<CexEventReplayReceiptV1> = read_bundle_json(
+        &mut archive,
+        "results/cex-event-replay-receipt.json",
+        512 * 1024,
+    )?;
+    if let Some(receipt) = &replay_receipt {
+        receipt.validate()?;
+        if receipt.mission_id != expected_mission_id {
+            bail!("published result bundle replay receipt does not match the Campaign Mission");
+        }
+    }
+
+    let finalization: Option<CexFinalizationReportV1> =
+        read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)?;
+    let finalization = if let Some(report) = finalization {
+        validate_recovered_finalization(&mut archive, &report, replay_receipt.as_ref())?;
+        Some(report)
+    } else {
+        if replay_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.gate.passed)
+        {
+            bail!("published result bundle is missing finalization evidence for a passing replay");
+        }
+        None
+    };
+
+    Ok(Some(ExecutionReport {
+        mission_id: expected_mission_id.to_string(),
+        mission_sha256: normalized_sha256("Mission", expected_mission_sha256)?,
+        campaign_id: admission.campaign_id,
+        round_id: admission.round_id,
+        request_sha256: admission.request_sha256,
+        engine: "gp_then_factor_bank_subset_mcts",
+        bundle_bytes,
+        bundle_sha256: bundle_sha256.clone(),
+        readback_bundle_sha256: bundle_sha256,
+        replay_receipt_id: replay_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_id.clone()),
+        replay_gate_passed: replay_receipt.as_ref().map(|receipt| receipt.gate.passed),
+        final_precommit_id: finalization
+            .as_ref()
+            .map(|report| report.precommit_id.clone()),
+        sealed_receipt_id: finalization
+            .as_ref()
+            .map(|report| report.sealed_receipt_id.clone()),
+        sealed_passed: finalization.as_ref().map(|report| report.sealed_passed),
+        strategy_bundle_id: finalization
+            .as_ref()
+            .and_then(|report| report.strategy_bundle_id.clone()),
+        promotion_id: finalization
+            .as_ref()
+            .and_then(|report| report.promotion_id.clone()),
+    }))
+}
+
+fn fetch_optional_to_file(
+    client: &Client,
+    source: &str,
+    destination: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<Option<(u64, String)>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let response = client.get(source).send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            bail!("source exceeds the allowed size");
+        }
+        let mut temporary = data_mission::temporary_output_file(destination, ".monday-fetch-")?;
+        let mut reader = response;
+        let bytes = std::io::copy(
+            &mut reader.by_ref().take(max_bytes + 1),
+            temporary.as_file_mut(),
+        )?;
+        temporary.as_file().sync_all()?;
+        if bytes > max_bytes {
+            bail!("source exceeds the allowed size");
+        }
+        data_mission::persist_output_file(temporary, destination, "fetched source")?;
+        return Ok(Some((bytes, sha256_file(destination)?)));
+    }
+
+    let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    Ok(Some(fetch_to_file(client, source, destination, max_bytes)?))
+}
+
+fn validate_recovered_binding(
+    admission: &MissionAdmissionEvidenceV1,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<()> {
+    match binding {
+        ExecutionBinding::Direct => {
+            if admission.campaign_id.is_some()
+                || admission.round_id.is_some()
+                || admission.request_sha256.is_some()
+            {
+                bail!("published result bundle carries Campaign binding for a direct Mission");
+            }
+        }
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            request_sha256,
+        } => {
+            if admission.campaign_id.as_deref() != Some(campaign_id)
+                || admission.round_id.as_deref() != Some(round_id)
+                || admission.request_sha256.as_deref() != Some(request_sha256)
+            {
+                bail!("published result bundle does not match the Campaign binding");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovered_finalization(
+    archive: &mut ZipArchive<File>,
+    report: &CexFinalizationReportV1,
+    replay_receipt: Option<&CexEventReplayReceiptV1>,
+) -> anyhow::Result<()> {
+    if !replay_receipt.is_some_and(|receipt| receipt.gate.passed) {
+        bail!("published result bundle finalization lacks a passing replay receipt");
+    }
+    let precommit: CexFinalPrecommitV1 =
+        read_bundle_json(archive, "results/final-precommit.json", 512 * 1024)?
+            .context("published result bundle is missing results/final-precommit.json")?;
+    precommit.validate()?;
+    if precommit.precommit_id != report.precommit_id {
+        bail!("published result bundle precommit evidence does not match its finalization report");
+    }
+    let sealed_receipt: RegistryRevision =
+        read_bundle_json(archive, "results/sealed-holdout-receipt.json", 512 * 1024)?
+            .context("published result bundle is missing results/sealed-holdout-receipt.json")?;
+    if sealed_receipt.revision_id != report.sealed_receipt_id {
+        bail!("published result bundle sealed receipt does not match its finalization report");
+    }
+    let sealed: CandidateEvaluation = serde_json::from_value(
+        sealed_receipt
+            .payload
+            .get("evaluation")
+            .cloned()
+            .context("published result bundle sealed receipt is missing evaluation")?,
+    )
+    .context("published result bundle sealed receipt carries invalid evaluation")?;
+    sealed.validate()?;
+    if sealed.passed != report.sealed_passed {
+        bail!("published result bundle sealed evaluation does not match its finalization report");
+    }
+    if report.sealed_passed {
+        let strategy_bundle: StrategyBundle =
+            read_bundle_json(archive, "results/strategy-bundle.json", 4 * 1024 * 1024)?
+                .context("published result bundle is missing results/strategy-bundle.json")?;
+        strategy_bundle.validate()?;
+        if strategy_bundle.bundle_id
+            != report
+                .strategy_bundle_id
+                .as_deref()
+                .context("published result bundle finalization is missing strategy_bundle_id")?
+        {
+            bail!(
+                "published result bundle strategy lineage does not match its finalization report"
+            );
+        }
+        let promotion: PromotionRecord =
+            read_bundle_json(archive, "results/promotion-record.json", 512 * 1024)?
+                .context("published result bundle is missing results/promotion-record.json")?;
+        promotion.validate(&strategy_bundle)?;
+        if promotion.promotion_id
+            != report
+                .promotion_id
+                .as_deref()
+                .context("published result bundle finalization is missing promotion_id")?
+        {
+            bail!(
+                "published result bundle promotion lineage does not match its finalization report"
+            );
+        }
+    } else if report.strategy_bundle_id.is_some() || report.promotion_id.is_some() {
+        bail!("published result bundle failed sealed holdout cannot carry deployable lineage");
+    }
+    Ok(())
+}
+
+fn read_bundle_json<T: for<'de> Deserialize<'de>>(
+    archive: &mut ZipArchive<File>,
+    name: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Option<T>> {
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open bundle entry {name}")),
+    };
+    if file.size() > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    let mut bytes = Vec::with_capacity(file.size() as usize);
+    std::io::copy(&mut file.by_ref().take(max_bytes + 1), &mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+        format!("parse bundle JSON entry {name}")
+    })?))
 }
 
 pub(crate) fn create_bundle<'a>(
@@ -4779,6 +5035,100 @@ mod tests {
         .expect_err("a missing bundle must fail before publication");
 
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn recover_execution_report_from_an_existing_campaign_result_bundle() {
+        let mut fixture = fixture("recover-campaign-result");
+        let binding = campaign_binding_fixture(&mut fixture);
+        let original = execute_report(fixture.args.clone(), binding.clone()).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let recovered = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-results.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &binding,
+        )
+        .unwrap()
+        .expect("existing published result must recover");
+
+        assert_eq!(recovered.mission_id, original.mission_id);
+        assert_eq!(recovered.mission_sha256, original.mission_sha256);
+        assert_eq!(recovered.campaign_id, original.campaign_id);
+        assert_eq!(recovered.round_id, original.round_id);
+        assert_eq!(recovered.request_sha256, original.request_sha256);
+        assert_eq!(recovered.bundle_bytes, original.bundle_bytes);
+        assert_eq!(recovered.bundle_sha256, original.bundle_sha256);
+        assert_eq!(
+            recovered.readback_bundle_sha256,
+            original.readback_bundle_sha256
+        );
+        assert_eq!(recovered.replay_receipt_id, original.replay_receipt_id);
+        assert_eq!(recovered.replay_gate_passed, original.replay_gate_passed);
+        assert_eq!(recovered.final_precommit_id, original.final_precommit_id);
+        assert_eq!(recovered.sealed_receipt_id, original.sealed_receipt_id);
+        assert_eq!(recovered.sealed_passed, original.sealed_passed);
+        assert_eq!(recovered.strategy_bundle_id, original.strategy_bundle_id);
+        assert_eq!(recovered.promotion_id, original.promotion_id);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_rejects_a_result_bundle_for_another_campaign_binding() {
+        let mut fixture = fixture("recover-campaign-binding-mismatch");
+        let binding = campaign_binding_fixture(&mut fixture);
+        execute_report(fixture.args.clone(), binding).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let wrong_binding = ExecutionBinding::Campaign {
+            campaign_id: "cex-campaign-test".to_string(),
+            round_id: "r1".to_string(),
+            request_sha256: "b".repeat(64),
+        };
+        let error = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-mismatch.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &wrong_binding,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("published result bundle does not match the Campaign binding"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    fn campaign_binding_fixture(fixture: &mut Fixture) -> ExecutionBinding {
+        let campaign_id = "cex-campaign-test";
+        let round_id = "r1";
+        let request_sha256 = "a".repeat(64);
+        let result_path = fixture.root.join(format!(
+            "campaign-root/campaign-id={campaign_id}/round={round_id}/results.zip"
+        ));
+        std::fs::create_dir_all(result_path.parent().unwrap()).unwrap();
+        let holdout_claim = prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+            &result_path.to_string_lossy(),
+            campaign_id,
+            round_id,
+            &fixture.args.holdout_id,
+        )
+        .unwrap();
+        let holdout_claim_path = PathBuf::from(holdout_claim);
+        std::fs::create_dir_all(holdout_claim_path.parent().unwrap()).unwrap();
+        fixture.result_path = result_path.clone();
+        fixture.args.result_put_url = result_path.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        fixture.args.holdout_claim_put_url = holdout_claim_path.to_string_lossy().into_owned();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+        ExecutionBinding::Campaign {
+            campaign_id: campaign_id.to_string(),
+            round_id: round_id.to_string(),
+            request_sha256,
+        }
     }
 
     #[test]
