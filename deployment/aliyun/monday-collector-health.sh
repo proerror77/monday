@@ -8,9 +8,9 @@
 # accumulated while the only on-host monitor (polymarket-market-tape-upload-
 # watchdog.sh) self-healed without ever alerting a human.
 #
-# Health contract: exactly FOUR hard gates, each a breach that fails closed
-# into the monitor-collector-host workflow issue, plus the raw-ops Gate
-# containment contract:
+# Health contract: hard gates, each a breach that fails closed into the
+# monitor-collector-host workflow issue, plus the raw-ops Gate containment
+# contract:
 #   1. upload-status.json exists and parses for the mandated lanes
 #      (binance-lob spot/usdm and binance-fee); missing or malformed = breach.
 #   2. last_success_at is present and fresh on every upload lane. Thresholds
@@ -18,6 +18,12 @@
 #      constants). A missing/unparseable last_success_at is a breach: the
 #      delivery loop is unproven. The fee uploader gains last_success_at in a
 #      parallel change; until that deploys, the fee lane breaches by design.
+#      The polymarket lanes additionally breach once the oldest pending
+#      rotated tape exceeds POLY_PENDING_STALE_MAX_AGE: an upload stall with
+#      a live backlog must alert within 30 minutes, not after two full
+#      rotations. (Keyed on pending age, not last_success_at: with hourly
+#      rotation the last success is legitimately ~60 minutes old whenever a
+#      fresh tape awaits the next timer run.)
 #   3. Pending upload backlog is bounded: the pending count stays under the
 #      lane limit AND the oldest pending artifact stays younger than the lane
 #      age bound. Pending artifacts are discovered with the same rules the
@@ -30,6 +36,15 @@
 #      .uploaded.json readback marker.
 #   4. failure_count must not grow between polls and last_error must be empty,
 #      uniformly across all upload lanes.
+#   5. /data disk watermarks: free at or below DISK_WARN_PERCENT is a warning;
+#      free at or below DISK_CRIT_PERCENT (used >= 85%) is a breach. The
+#      2026-08-17/18
+#      incidents reached 100% twice, so the critical watermark pages a human
+#      instead of only warning.
+#   6. polymarket-market-tape-upload.timer and polymarket-reference-upload.timer
+#      must be active (waiting) whenever their collector service is active; a
+#      stopped timer with a running collector silently strands rotated tapes
+#      until the disk fills.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -38,7 +53,7 @@
 #
 # Everything else is a WARNING: unit/timer active+enabled state, systemd
 # Result, restart-rate deltas, health.json freshness/gaps, journald delay-gate
-# trips, fee snapshot journal failures, disk space, and the /data mount.
+# trips, fee snapshot journal failures, and the /data mount.
 # Warnings are reported in the JSON warnings array (and as warning: lines in
 # text mode) but never block ok:true.
 #
@@ -69,7 +84,7 @@ STATE_FILE="$STATE_DIR/state.json"
 
 HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
-DISK_CRIT_PERCENT=10
+DISK_CRIT_PERCENT=15
 RESTART_MAX_DELTA=1
 # journalctl --since value; must be a timestamp journalctl can parse
 # ("15min" is rejected with "Failed to parse timestamp" and would read as a
@@ -98,6 +113,9 @@ FEE_SUCCESS_MAX_AGE=600
 REF_SUCCESS_MAX_AGE=1200
 POLY_SUCCESS_MAX_AGE=7200
 BYBIT_SUCCESS_MAX_AGE=5400
+# Gate 2 polymarket addendum: with rotated tapes still pending, an upload
+# stall must alert within 30 minutes rather than after two full rotations.
+POLY_PENDING_STALE_MAX_AGE=1800
 
 # Gate 3: pending backlog bounds per lane (count limit, oldest-artifact age).
 LOB_PENDING_MAX=4
@@ -122,6 +140,9 @@ POLY_MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
 POLY_MARKET_UPLOAD_SERVICE=polymarket-market-tape-upload.service
 POLY_REF_UPLOAD_TIMER=polymarket-reference-upload.timer
 POLY_REF_UPLOAD_SERVICE=polymarket-reference-upload.service
+# Collectors that produce the tapes the two polymarket upload timers drain.
+POLY_MARKET_COLLECTOR=polymarket-market-tape.service
+POLY_REF_COLLECTOR=polymarket-reference-collector.service
 WATCHDOG_TIMER=polymarket-market-tape-upload-watchdog.timer
 WATCHDOG_SERVICE=polymarket-market-tape-upload-watchdog.service
 # Governed production lanes since the 2026-08-08 cutovers.
@@ -279,12 +300,12 @@ check_disk() {
     disk_free_gb=$((disk_avail_kib / 1048576))
     disk_critical=0
     disk_warning=0
-    if [ "$disk_free_percent" -lt "$DISK_CRIT_PERCENT" ]; then
+    if [ "$disk_free_percent" -le "$DISK_CRIT_PERCENT" ]; then
       disk_critical=1
-      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below critical ${DISK_CRIT_PERCENT}%"
-    elif [ "$disk_free_percent" -lt "$DISK_WARN_PERCENT" ]; then
+      record_breach "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) at or below critical ${DISK_CRIT_PERCENT}%"
+    elif [ "$disk_free_percent" -le "$DISK_WARN_PERCENT" ]; then
       disk_warning=1
-      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below warning ${DISK_WARN_PERCENT}%"
+      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) at or below warning ${DISK_WARN_PERCENT}%"
     fi
   fi
   disk_json=$(jq -n --argjson p "$disk_free_percent" --argjson g "$disk_free_gb" \
@@ -334,6 +355,22 @@ check_timer() {
     '{active: ($a == "active"), enabled: ($e == "enabled")}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
     '$base + {($k): $v}')
+}
+
+check_upload_timer_backed() {
+  # Gate 6: an upload timer must be active (waiting) whenever its collector
+  # service is active. A stopped timer with a running collector silently
+  # strands rotated tapes until the spool disk fills. The standalone
+  # check_timer observation above stays a warning; only the
+  # collector-active pairing is a breach.
+  collector=$1
+  timer=$2
+  label=$3
+  collector_active=$(unit_is_active "$collector")
+  timer_active=$(unit_is_active "$timer")
+  if [ "$collector_active" = "active" ] && [ "$timer_active" != "active" ]; then
+    record_breach "$label: $timer not active (is-active='$timer_active') while collector $collector is active"
+  fi
 }
 
 check_oneshot_result() {
@@ -585,6 +622,8 @@ check_upload_lane() {
   # The four hard gates, applied per upload lane:
   #   gate 1 (mandated lanes only): upload-status.json exists and parses.
   #   gate 2: last_success_at present and younger than $success_max_age.
+  #           When $8 (pending_stale_max_age) is set, a pending artifact older
+  #           than that tighter stall bound is also a breach.
   #   gate 3: pending backlog count/age under $pending_max/$pending_max_age.
   #   gate 4: last_error empty and failure_count not growing (cumulative
   #           counter vs the previous poll; a first observation with a
@@ -597,6 +636,8 @@ check_upload_lane() {
   pending_max=$5
   pending_max_age=$6
   pending_kind=$7
+  pending_stale_max_age=${8:-0}
+  case "$pending_stale_max_age" in (*[!0-9]*|'') pending_stale_max_age=0 ;; esac
   upload_file="$spool_dir/upload-status.json"
 
   emit_lane_json() {
@@ -634,6 +675,17 @@ check_upload_lane() {
   fi
   if [ "$pending_age" -gt "$pending_max_age" ]; then
     record_breach "$label: oldest pending upload backlog age ${pending_age}s over ${pending_max_age}s"
+  fi
+  # Gate 2 addendum (lanes passing $8): a rotated tape sitting unuploaded
+  # longer than the tighter stall bound means the uploader is stalled even
+  # when the lane cadence bound has not elapsed. Keyed on the oldest pending
+  # artifact's age rather than last_success_at: with hourly tape rotation the
+  # last success is legitimately ~60 minutes old in the minutes between a
+  # rotation and the next timer run, so a success-age condition would page on
+  # a healthy lane.
+  if [ "$pending_stale_max_age" -gt 0 ] && [ "$pending_count" -gt 0 ] \
+    && [ "$pending_age" -gt "$pending_stale_max_age" ]; then
+    record_breach "$label: $pending_count pending upload(s) stalled (oldest age ${pending_age}s > ${pending_stale_max_age}s)"
   fi
 
   if [ ! -f "$upload_file" ] || [ -L "$upload_file" ]; then
@@ -809,6 +861,8 @@ check_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
 check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
 check_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
 check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
+check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
+check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
 check_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
 check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
 check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
@@ -838,9 +892,9 @@ check_upload_lane "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-r
 check_upload_lane "bybit-options-upload" "$SPOOL_ROOT/bybit-options" \
   0 "$BYBIT_SUCCESS_MAX_AGE" "$BYBIT_PENDING_MAX" "$BYBIT_PENDING_MAX_AGE" bybit-raw
 check_upload_lane "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket" \
-  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes
+  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
 check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference" \
-  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes
+  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
 check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
   1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
 

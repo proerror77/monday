@@ -4,16 +4,19 @@
 # /tmp fixture trees with stubbed systemctl/df/journalctl/mountpoint/logger.
 # The script is read-only toward units, so the stubs never mutate anything.
 #
-# Contract under test: exactly four hard gates (breaches) —
+# Contract under test: hard gates (breaches) —
 #   1. upload-status.json exists and parses (binance-lob spot/usdm, binance-fee)
-#   2. last_success_at present and fresh per upload lane
+#   2. last_success_at present and fresh per upload lane; on the polymarket
+#      lanes a backlog with a last success older than 30 minutes also breaches
 #   3. pending upload backlog bounded (count + oldest pending age)
 #   4. failure_count not growing, last_error empty (all lanes)
+#   5. /data disk: free <= 25% warns, free <= 15% (used >= 85%) breaches
+#   6. polymarket upload timers must be active while their collector is active
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
 # failures. Everything else (units, timers, restarts,
-# health.json, delay-gate journal, disk, mount, fee snapshot journal) is a
-# warning: reported, never blocking ok:true.
+# health.json, delay-gate journal, disk warning band, mount, fee snapshot
+# journal) is a warning: reported, never blocking ok:true.
 #
 # Usage: ./test-monday-collector-health.sh
 set -euo pipefail
@@ -33,7 +36,8 @@ err_file="$test_root/err"
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
-DF_AVAIL_CRIT=9800000        # 5% free (<10% crit)
+DF_AVAIL_WARN=39200000       # 20% free (<25% warn, >=15% so not critical)
+DF_AVAIL_CRIT=9800000        # 5% free (<15% crit)
 
 pass_count=0
 fail_count=0
@@ -669,7 +673,8 @@ expect "gate4 initial count: exit 1" "$(rc_is 1; echo $?)"
 expect "gate4 initial count: breach message" "$(grep_out 'polymarket-market-tape-upload: initial upload failure_count=2'; echo $?)"
 
 # ---------------------------------------------------------------------------
-# 12. Demoted: disk critical is a warning, not a breach
+# 12. Gate 5: disk critical (used >= 85%) is a breach; the warn band stays a
+#     warning
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
@@ -677,9 +682,19 @@ healthy_scenario
 healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
 run_health
-expect "disk critical: exit 0" "$(rc_is 0; echo $?)"
-expect "disk critical: ok:true" "$(grep_out '^ok:true$'; echo $?)"
-expect "disk critical: warning message" "$(grep_out '^warning: disk: /data free .* below critical 10%'; echo $?)"
+expect "disk critical: exit 1" "$(rc_is 1; echo $?)"
+expect "disk critical: breach message" "$(grep_out '^breach: disk: /data free .* at or below critical 15%'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
+run_health
+expect "disk warn band: exit 0" "$(rc_is 0; echo $?)"
+expect "disk warn band: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+expect "disk warn band: warning message" "$(grep_out '^warning: disk: /data free .* at or below warning 25%'; echo $?)"
+expect "disk warn band: no breach lines" "$(grep_not_out '^breach:'; echo $?)"
 
 # ---------------------------------------------------------------------------
 # 13. Demoted: unit inactive / timer disabled / result failure are warnings
@@ -977,7 +992,7 @@ reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
-STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
+STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
 STUB_JOURNAL_TRIPS=1
 run_health --json
 expect "json warnings: exit 0" "$(rc_is 0; echo $?)"
@@ -985,7 +1000,7 @@ expect "json warnings: ok:true with warnings" "$(json_query '
   .ok == true
   and (.breaches | length) == 0
   and (.warnings | length) >= 2
-  and (.warnings | any(contains("below critical")))
+  and (.warnings | any(contains("at or below warning")))
   and (.warnings | any(contains("delay-gate trip")))
 '; echo $?)"
 
@@ -1011,6 +1026,95 @@ healthy_fixtures
 run_health --dry-run
 expect "dry-run: exit 0" "$(rc_is 0; echo $?)"
 expect "dry-run: state file not created" "$([ ! -e "$state_dir/state.json" ]; echo $?)"
+
+# ---------------------------------------------------------------------------
+# 24. Gate 6: an inactive polymarket upload timer while its collector is
+#     active is a breach; inactive collector + inactive timer is not
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '%s\n' 'polymarket-market-tape.service	active	enabled	success	2' >> "$scenario"
+rewrite_scenario 's|^polymarket-market-tape-upload.timer	active|polymarket-market-tape-upload.timer	inactive|'
+run_health
+expect "gate6 market timer down: exit 1" "$(rc_is 1; echo $?)"
+expect "gate6 market timer down: breach message" "$(grep_out '^breach: polymarket-market-tape-upload.timer: polymarket-market-tape-upload.timer not active .* while collector polymarket-market-tape.service is active'; echo $?)"
+expect "gate6 market timer down: timer warning still recorded" "$(grep_out '^warning: polymarket-market-tape-upload.timer: timer not active'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+printf '%s\n' 'polymarket-reference-collector.service	active	enabled	success	3' >> "$scenario"
+rewrite_scenario 's|^polymarket-reference-upload.timer	active|polymarket-reference-upload.timer	inactive|'
+run_health
+expect "gate6 reference timer down: exit 1" "$(rc_is 1; echo $?)"
+expect "gate6 reference timer down: breach message" "$(grep_out '^breach: polymarket-reference-upload.timer: .* while collector polymarket-reference-collector.service is active'; echo $?)"
+
+# Both collectors absent from the scenario read as inactive, so inactive
+# timers alone stay warnings (covered by the healthy baseline and section 13).
+
+# ---------------------------------------------------------------------------
+# 25. Gate 2 polymarket addendum: a pending rotated tape older than 30
+#     minutes is a breach; a fresh pending tape with an hour-old last success
+#     (normal post-rotation window) is not
+# ---------------------------------------------------------------------------
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 0 1900
+tape="$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t "$(jq -rn 'now - 1900 | floor | gmtime | strftime("%Y%m%d%H%M.%S")')" "$tape"
+run_health
+expect "gate2 poly pending stalled: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 poly pending stalled: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: 1 pending upload(s) stalled (oldest age .*s > 1800s)'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket-reference/upload-status.json" null null 0 1900
+tape="$spool_root/polymarket-reference/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t "$(jq -rn 'now - 1900 | floor | gmtime | strftime("%Y%m%d%H%M.%S")')" "$tape"
+run_health
+expect "gate2 poly-ref pending stalled: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 poly-ref pending stalled: breach message" "$(grep_out '^breach: polymarket-reference-upload: 1 pending upload(s) stalled'; echo $?)"
+
+# Healthy post-rotation window: last success ~55 minutes old and a just-
+# rotated tape pending — the uploader picks it up on the next timer run, so
+# this must NOT page.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 0 3300
+: > "$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+run_health
+expect "gate2 poly fresh pending post-rotation: exit 0" "$(rc_is 0; echo $?)"
+expect "gate2 poly fresh pending post-rotation: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 0 1900
+run_health
+expect "gate2 poly stale without pending: exit 0" "$(rc_is 0; echo $?)"
+expect "gate2 poly stale without pending: ok:true" "$(grep_out '^ok:true$'; echo $?)"
+
+# The lane bound (two full rotations) still breaches without any backlog.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 0 7300
+run_health
+expect "gate2 poly stale lane bound: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 poly stale lane bound: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: last upload success stale'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
