@@ -41,6 +41,10 @@ readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
+# Mirrors TAPE_WINDOW_LOOKBACK_SECONDS in the parity verifier
+# (rust_hft/tools/collector/src/polymarket_parity.rs): the verifier reads
+# baseline tapes rotated within one hour before the parity window.
+readonly LEGACY_TAPE_WINDOW_LOOKBACK_SECONDS=3600
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
 readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
@@ -1346,6 +1350,91 @@ shadow_finalization_counters() {
   ' "$state"
 }
 
+# Hardlink the baseline tapes inside the verifier's lookback window into the
+# evidence snapshot. The production uploader deletes every baseline tape right
+# after its OSS upload, so without this snapshot the verifier observes a
+# truncated baseline (gate #6: 56 baseline settlements against the shadow's
+# 112). Hardlinks pin the inode at zero copy cost — a byte copy of multi-GiB
+# tapes is not acceptable — and keep the then-active tape's rows readable even
+# after rotation renames the live path. The sweep is idempotent and runs at
+# observation start and again immediately before verification so tapes rotated
+# during the gate are unioned in while they still exist.
+snapshot_legacy_tapes() {
+  local snapshot_dir=$1 window_start_unix=$2
+  local path name stamp rotated_at
+  for path in "$LEGACY_SPOOL"/market-updates.ndjson \
+    "$LEGACY_SPOOL"/market-updates.*.ndjson; do
+    [[ -f $path && ! -L $path ]] || continue
+    name=${path##*/}
+    if [[ $name != market-updates.ndjson ]]; then
+      # market-updates.<YYYYMMDDTHHMMSS[ffffff]>[.<uuid>].ndjson, mirroring
+      # strict_rotation_name/rotation_epoch in the parity verifier.
+      stamp=${name#market-updates.}
+      stamp=${stamp%%.*}
+      [[ $stamp =~ ^[0-9]{8}T[0-9]{6}([0-9]{6})?$ ]] || continue
+      rotated_at=$(date -u -d \
+        "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" \
+        +%s) || die "could not parse baseline tape rotation time: $name"
+      ((rotated_at >= window_start_unix - LEGACY_TAPE_WINDOW_LOOKBACK_SECONDS)) \
+        || continue
+    fi
+    [[ ! -e $snapshot_dir/$name && ! -L $snapshot_dir/$name ]] || continue
+    ln "$path" "$snapshot_dir/$name" 2>/dev/null && continue
+    # A vanished source means the uploader won its deletion race before this
+    # sweep; any other hardlink failure (for example a cross-device evidence
+    # filesystem) leaves the baseline evidence incomplete, so fail closed.
+    [[ ! -e $path ]] || die "could not hardlink baseline tape into the evidence snapshot: $name"
+  done
+}
+
+# The parity verifier's failure is legitimate only when it is confined to the
+# deferred-emission trade family. Continuous-baseline overlap may omit
+# baseline-only trades; contained Rust-self recovery and deferred-deferred
+# overlap must have no trades or duplicates at all. Deferred-deferred overlap
+# additionally requires full baseline settlement coverage with matching shared
+# values; rust-only settlements are tolerated because the production uploader
+# deletes baseline tapes after upload while the shadow retains its own, so the
+# baseline tape set can race the verifier's read.
+admissible_deferred_parity_failure() {
+  local mode=$1 parity_json=$2
+  jq --arg mode "$mode" -e '
+    .checks.metadata_parity == true and .checks.settlement_parity == true
+    and .checks.rotation_parity == true and .checks.asset_parity == true
+    and .metrics.trade_shared_values_match == true
+    and (.metrics.trade_shared_value_mismatch_ids | length == 0)
+    and (.metrics.legacy_duplicate_trade_ids | length == 0)
+    and (.metrics.rust_duplicate_trade_ids | length == 0)
+    and .metrics.trade_metadata_shared_values_match == true
+    and .metrics.legacy_trade_metadata_context_match == true
+    and .metrics.rust_trade_metadata_context_match == true
+    and (if $mode == "finalization_deferred_overlap" then
+      .checks.dedupe_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "trade_coverage_parity" or . == "trade_contract_parity"))
+      and (.metrics.rust_only_trade_ids | length == 0)
+      and (.metrics.legacy_trade_count
+        | type == "number" and floor == . and . > 0)
+    else
+      .checks.byte_parity == false
+      and .checks.field_parity == false
+      and .checks.dedupe_parity == false
+      and .checks.trade_coverage_parity == true
+      and .checks.trade_contract_parity == true
+      and ([.checks | to_entries[] | select(.value == false) | .key]
+        | all(. == "byte_parity" or . == "field_parity"
+          or . == "dedupe_parity"))
+      and .metrics.legacy_trade_count == 0
+      and .metrics.rust_trade_count == 0
+      and (.metrics.legacy_only_trade_ids | length == 0)
+      and (.metrics.rust_only_trade_ids | length == 0)
+      and ($mode != "finalization_deferred_deferred_overlap"
+        or ((.metrics.legacy_only_settlement_ids | length == 0)
+          and .metrics.settlement_shared_values_match == true))
+    end)
+  ' "$parity_json" >/dev/null
+}
+
 adjudicate_trade_parity() {
   local mode=$1
   jq --arg mode "$mode" '
@@ -1355,14 +1444,16 @@ adjudicate_trade_parity() {
       trade_coverage_parity:true,
       trade_contract_parity:true,
       finalization_progress:true
-    } elif $mode == "finalization_deferred_rust_self" then {
+    } elif $mode == "finalization_deferred_rust_self"
+      or $mode == "finalization_deferred_deferred_overlap" then {
       byte_parity:true,
       field_parity:true,
       dedupe_parity:true,
       finalization_progress:true
     } else {} end)
     | .passed = ((if ($mode == "finalization_deferred_overlap"
-          or $mode == "finalization_deferred_rust_self")
+          or $mode == "finalization_deferred_rust_self"
+          or $mode == "finalization_deferred_deferred_overlap")
         then true else .passed end) and ([.checks[]] | all))
   '
 }
@@ -1382,7 +1473,7 @@ fi
 trap 'exit 143' HUP INT TERM
 
 for command in aliyun awk chown chmod date flock grep install journalctl jq mkdir mktemp \
-  mountpoint mv readlink rm runuser sed sha256sum sleep stat sync systemctl timeout \
+  mountpoint mv readlink rm rmdir runuser sed sha256sum sleep stat sync systemctl timeout \
   tr wc zstd; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -1751,6 +1842,14 @@ if [[ $baseline_mode == legacy_python \
 fi
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
+# Pin the lookback-window baseline tapes before the observation begins; the
+# production uploader deletes them after upload, long before the verifier
+# runs. The lookback is anchored at the observation start, a superset of the
+# parity window the verifier later derives from it.
+legacy_tape_snapshot="$evidence_dir/legacy-tape-snapshot"
+mkdir -m 0750 "$legacy_tape_snapshot" \
+  || die 'baseline tape snapshot directory already exists'
+snapshot_legacy_tapes "$legacy_tape_snapshot" "$started_at_unix"
 observation_deadline=$gate_seconds
 if [[ $test_only == true ]] \
   && ((observation_deadline < HEALTH_SETTLE_SECONDS)); then
@@ -2043,10 +2142,13 @@ finalized_reference_tape=$(runuser -u hftcollector -- env HOME=/var/lib/hft-coll
 valid_finalized_reference_tape_path "$finalized_reference_tape" "$shadow_spool" \
   || die 'Rust shadow finalizer returned an invalid closed tape path'
 
+# Union in baseline tapes rotated during the gate before the uploader can
+# delete them; the verifier reads the durable snapshot, not the live spool.
+snapshot_legacy_tapes "$legacy_tape_snapshot" "$started_at_unix"
 parity_json="$evidence_dir/parity.json"
 parity_args=(
   verify-shadow-parity
-  --legacy-spool "$LEGACY_SPOOL"
+  --legacy-spool "$legacy_tape_snapshot"
   --rust-spool "$shadow_spool"
   --started-at-unix "$parity_window_started_at"
   --ended-at-unix "$common_cutoff"
@@ -2074,6 +2176,19 @@ elif [[ $comparison_mode == rust_self ]]; then
   trade_parity_mode=rust_self
   trade_parity_reason='baseline produced no comparison rows; Rust-self parity applies'
 elif [[ $shadow_emission == finalization_deferred \
+  && $baseline_emission == finalization_deferred ]] \
+  && ((parity_exit != 0)); then
+  # Gate #6: a finalization-deferred shadow against a finalization-deferred
+  # baseline shares the same emission semantics, so neither side can emit a
+  # mature trade inside a 3600-second gate when no market closes early enough
+  # to finalize; the byte/field/dedupe trio is then unsatisfiable by
+  # construction (dedupe_parity requires a non-empty legacy trade set in
+  # legacy_overlap mode). Adjudicate it like the contained Rust-self
+  # recovery, additionally requiring full baseline settlement coverage. A
+  # fully passing verifier takes the continuous_overlap path instead.
+  trade_parity_mode=finalization_deferred_deferred_overlap
+  trade_parity_reason='shadow and baseline both defer trade emission until settlement plus the 1800-second finalization lag plus stable polls (post-#680), so neither emitted a mature trade inside the gate window; settlement, metadata, rotation, and asset parity, zero duplicates, finalization progression, and the canonical upload replace the unsatisfiable nonempty-trade checks'
+elif [[ $shadow_emission == finalization_deferred \
   && $baseline_emission == continuous ]]; then
   # Issue #868: against a continuous-emission baseline, a finalization-deferred
   # shadow cannot emit any mature trade inside a 3600-second gate, so the
@@ -2087,43 +2202,9 @@ fi
 parity_verifier_json=null
 finalization_progress_json=null
 if [[ $trade_parity_mode == finalization_deferred_overlap \
-  || $trade_parity_mode == finalization_deferred_rust_self ]]; then
-  # The verifier's failure is legitimate only when it is confined to the
-  # deferred-emission trade family. Overlap may omit baseline-only trades;
-  # contained Rust-self recovery must have no trades or duplicates at all.
-  jq --arg mode "$trade_parity_mode" -e '
-    .checks.metadata_parity == true and .checks.settlement_parity == true
-    and .checks.rotation_parity == true and .checks.asset_parity == true
-    and .metrics.trade_shared_values_match == true
-    and (.metrics.trade_shared_value_mismatch_ids | length == 0)
-    and (.metrics.legacy_duplicate_trade_ids | length == 0)
-    and (.metrics.rust_duplicate_trade_ids | length == 0)
-    and .metrics.trade_metadata_shared_values_match == true
-    and .metrics.legacy_trade_metadata_context_match == true
-    and .metrics.rust_trade_metadata_context_match == true
-    and (if $mode == "finalization_deferred_overlap" then
-      .checks.dedupe_parity == true
-      and ([.checks | to_entries[] | select(.value == false) | .key]
-        | all(. == "byte_parity" or . == "field_parity"
-          or . == "trade_coverage_parity" or . == "trade_contract_parity"))
-      and (.metrics.rust_only_trade_ids | length == 0)
-      and (.metrics.legacy_trade_count
-        | type == "number" and floor == . and . > 0)
-    else
-      .checks.byte_parity == false
-      and .checks.field_parity == false
-      and .checks.dedupe_parity == false
-      and .checks.trade_coverage_parity == true
-      and .checks.trade_contract_parity == true
-      and ([.checks | to_entries[] | select(.value == false) | .key]
-        | all(. == "byte_parity" or . == "field_parity"
-          or . == "dedupe_parity"))
-      and .metrics.legacy_trade_count == 0
-      and .metrics.rust_trade_count == 0
-      and (.metrics.legacy_only_trade_ids | length == 0)
-      and (.metrics.rust_only_trade_ids | length == 0)
-    end)
-  ' "$parity_json" >/dev/null \
+  || $trade_parity_mode == finalization_deferred_rust_self \
+  || $trade_parity_mode == finalization_deferred_deferred_overlap ]]; then
+  admissible_deferred_parity_failure "$trade_parity_mode" "$parity_json" \
     || die 'parity failed outside the adjudicated deferred-emission family'
   # The pipeline must demonstrably advance, not merely exist: the stable-poll
   # counter is zero until the 1800-second lag elapses, so a positive growing
@@ -2154,9 +2235,24 @@ if [[ $trade_parity_mode == finalization_deferred_overlap \
      stable_polls_max:$maximum.stable_polls}') \
     || die 'could not serialize the finalization progression evidence'
 else
-  ((parity_exit == 0)) \
-    || die 'byte/field/dedupe/settlement/rotation parity failed'
+  ((parity_exit == 0)) || {
+    failed_parity_checks=$(jq -r \
+      '[.checks | to_entries[] | select(.value == false) | .key] | join(",")' \
+      "$parity_json") || failed_parity_checks=unavailable
+    die "parity verifier failed; false checks: ${failed_parity_checks:-none}"
+  }
 fi
+
+# The distilled parity.json is the durable evidence. Release the tape
+# hardlinks so uploader-deleted segments do not keep multi-GiB inodes pinned
+# for the evidence directory's lifetime; when the gate dies above, the
+# snapshot stays for forensics.
+for path in "$legacy_tape_snapshot"/*; do
+  [[ -e $path || -L $path ]] || continue
+  rm -f -- "$path" || die 'could not release the baseline tape snapshot'
+done
+rmdir "$legacy_tape_snapshot" \
+  || die 'could not remove the baseline tape snapshot directory'
 
 verify_current_oss_config
 upload_json=$(runuser -u hftcollector -- env HOME=/var/lib/hft-collector \

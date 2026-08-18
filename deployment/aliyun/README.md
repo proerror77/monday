@@ -493,8 +493,18 @@ collect-reference CLI contract: #680 removed the --max-retained-trade-ids flag
 exactly when deferred finalization replaced per-poll emission, and any probe
 uncertainty classifies continuous so full trade parity applies. The
 verdict records the applied trade parity mode, both detected emission modes,
-the raw verifier checks, and the reason (issue #868). When both sides share
-the same emission semantics, full trade parity applies unchanged.
+the raw verifier checks, and the reason (issue #868). When both sides defer
+emission and no market closes early enough to finalize inside the window, the
+same unsatisfiable trade family fails on both lanes; the gate adjudicates the
+zero-trade shape like the contained recovery, additionally requiring full
+baseline settlement coverage while tolerating rust-only settlements from the
+baseline tape deletion race (gate #6). A fully passing verifier keeps full
+trade parity unchanged.
+The production uploader deletes each baseline tape right after its OSS upload,
+so the gate hardlinks every lookback-window baseline tape into the evidence
+directory at observation start and again just before verification, and the
+verifier reads that snapshot instead of the live spool; the hardlinks are
+released once the distilled parity verdict is written.
 Settlement parity uses each market's end time with a 15-minute lookback and a
 10-minute maturity lag, because independent 30-second polling schedules can record
 the same closed market on opposite sides of a wall-clock boundary. Every mature
@@ -557,7 +567,8 @@ mismatch blocks promotion. Live execution remains disabled; this lane only colle
 and archives public market data.
 The gate detects either the legacy Python writer or the active immutable Rust
 release. A legacy-Python Gate does not wait for health publication or freeze the
-writer identity; the persistent legacy spool is the parity input and Python remains
+writer identity; the hardlinked baseline tape snapshot in the evidence
+directory is the parity input and Python remains
 untouched for rollback. Cutover binds the current canonical Python identity only
 for its short transition. An active immutable Rust baseline still freezes its PID,
 systemd restart counter, and `InvocationID` throughout the Gate. After the baseline

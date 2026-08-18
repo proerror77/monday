@@ -3585,6 +3585,130 @@ jq -e '.passed == false and .comparison_mode == "rust_self"
   and .metrics.rust_duplicate_trade_ids == []' \
   "$tmp_dir/rust-self-deferred-parity.json" >/dev/null
 
+# Gate #6: a finalization-deferred shadow against a finalization-deferred
+# baseline produces the zero-trade legacy_overlap shape — the deferred trade
+# family fails on both sides while settlement, metadata, rotation, and asset
+# parity hold and the baseline settlement set is fully covered.
+legacy_deferred="$tmp_dir/legacy-deferred"
+mkdir "$legacy_deferred"
+jq -cs 'map(select(.update.kind != "polymarket_trade"))
+  | to_entries[] | .value.sequence = .key | .value' \
+  "$legacy_tape" >"$legacy_deferred/market-updates.ndjson"
+if "$VERIFY" verify-shadow-parity \
+  --trade-maturity-lag-seconds 600 \
+  --legacy-spool "$legacy_deferred" --rust-spool "$rust_self_deferred" \
+  --started-at-unix 100 --ended-at-unix 1000 \
+  --output "$tmp_dir/deferred-deferred-parity.json" 2>/dev/null; then
+  printf 'parity unexpectedly accepted a deferred-deferred zero-trade window\n' >&2
+  exit 1
+fi
+jq -e '.passed == false and .comparison_mode == "legacy_overlap"
+  and .checks.byte_parity == false
+  and .checks.field_parity == false
+  and .checks.dedupe_parity == false
+  and .checks.metadata_parity == true
+  and .checks.settlement_parity == true
+  and .checks.rotation_parity == true
+  and .checks.asset_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .metrics.legacy_trade_count == 0
+  and .metrics.rust_trade_count == 0
+  and .metrics.legacy_settlement_count > 0
+  and .metrics.rust_settlement_count > 0
+  and .metrics.legacy_only_settlement_ids == []
+  and .metrics.settlement_shared_values_match == true
+  and .metrics.legacy_duplicate_trade_ids == []
+  and .metrics.rust_duplicate_trade_ids == []' \
+  "$tmp_dir/deferred-deferred-parity.json" >/dev/null
+
+admissible_failure_contract="$tmp_dir/admissible-deferred-parity-failure.sh"
+sed -n '/^admissible_deferred_parity_failure()/,/^}/p' "$GATE" \
+  >"$admissible_failure_contract"
+# shellcheck source=/dev/null
+source "$admissible_failure_contract"
+admissible_deferred_parity_failure finalization_deferred_rust_self \
+  "$tmp_dir/rust-self-deferred-parity.json"
+admissible_deferred_parity_failure finalization_deferred_deferred_overlap \
+  "$tmp_dir/deferred-deferred-parity.json"
+# Rust-only settlements are tolerated: the production uploader deletes
+# baseline tapes after upload while the shadow retains its own, so the
+# baseline tape set can race the verifier's read.
+jq '.metrics.rust_only_settlement_ids = ["rust-only-settlement"]' \
+  "$tmp_dir/deferred-deferred-parity.json" \
+  >"$tmp_dir/deferred-deferred-rust-only-settlement-parity.json"
+admissible_deferred_parity_failure finalization_deferred_deferred_overlap \
+  "$tmp_dir/deferred-deferred-rust-only-settlement-parity.json"
+for mutation in \
+  '.checks.settlement_parity = false' \
+  '.checks.metadata_parity = false' \
+  '.checks.trade_coverage_parity = false' \
+  '.checks.dedupe_parity = true' \
+  '.metrics.rust_trade_count = 1' \
+  '.metrics.legacy_trade_count = 1' \
+  '.metrics.rust_only_trade_ids = ["rust-only-trade"]' \
+  '.metrics.rust_duplicate_trade_ids = ["duplicate"]' \
+  '.metrics.legacy_only_settlement_ids = ["legacy-settlement"]' \
+  '.metrics.settlement_shared_values_match = false'; do
+  jq "$mutation" "$tmp_dir/deferred-deferred-parity.json" \
+    >"$tmp_dir/forged-deferred-deferred-parity.json"
+  if admissible_deferred_parity_failure finalization_deferred_deferred_overlap \
+    "$tmp_dir/forged-deferred-deferred-parity.json"; then
+    printf 'deferred-deferred adjudication accepted forged parity evidence\n' >&2
+    exit 1
+  fi
+done
+
+# The baseline tape snapshot hardlinks the lookback-window tapes so the
+# production uploader's post-upload deletion cannot truncate the verifier's
+# baseline view, and re-sweeps union tapes rotated after the first sweep.
+if date -u -d @0 +%s >/dev/null 2>&1; then
+  (
+    snapshot_fn_contract="$tmp_dir/snapshot-legacy-tapes.sh"
+    sed -n '/^snapshot_legacy_tapes()/,/^}/p' "$GATE" >"$snapshot_fn_contract"
+    snapshot_legacy_spool="$tmp_dir/snapshot-legacy-spool"
+    tape_snapshot_dir="$tmp_dir/legacy-tape-snapshot"
+    mkdir "$snapshot_legacy_spool" "$tape_snapshot_dir"
+    printf 'active rows\n' >"$snapshot_legacy_spool/market-updates.ndjson"
+    printf 'recent rows\n' \
+      >"$snapshot_legacy_spool/market-updates.19700102T030000000000.ndjson"
+    printf 'old rows\n' \
+      >"$snapshot_legacy_spool/market-updates.19700101T000000000000.ndjson"
+    LEGACY_SPOOL=$snapshot_legacy_spool
+    LEGACY_TAPE_WINDOW_LOOKBACK_SECONDS=3600
+    die() { printf 'snapshot_legacy_tapes failed: %s\n' "$*" >&2; exit 1; }
+    # shellcheck source=/dev/null
+    source "$snapshot_fn_contract"
+    snapshot_legacy_tapes "$tape_snapshot_dir" 100000
+    [[ -f $tape_snapshot_dir/market-updates.ndjson \
+      && -f $tape_snapshot_dir/market-updates.19700102T030000000000.ndjson \
+      && ! -e $tape_snapshot_dir/market-updates.19700101T000000000000.ndjson ]] \
+      || {
+      printf 'snapshot_legacy_tapes did not select the lookback window tapes\n' >&2
+      exit 1
+    }
+    [[ $tape_snapshot_dir/market-updates.ndjson \
+      -ef $snapshot_legacy_spool/market-updates.ndjson ]] || {
+      printf 'snapshot_legacy_tapes did not hardlink the active tape\n' >&2
+      exit 1
+    }
+    rm "$snapshot_legacy_spool/market-updates.19700102T030000000000.ndjson"
+    [[ $(cat "$tape_snapshot_dir/market-updates.19700102T030000000000.ndjson") \
+      == 'recent rows' ]] || {
+      printf 'snapshot_legacy_tapes lost a tape the uploader deleted\n' >&2
+      exit 1
+    }
+    printf 'rotated rows\n' \
+      >"$snapshot_legacy_spool/market-updates.19700102T033000.ndjson"
+    snapshot_legacy_tapes "$tape_snapshot_dir" 100000
+    [[ $(cat "$tape_snapshot_dir/market-updates.19700102T033000.ndjson") \
+      == 'rotated rows' ]] || {
+      printf 'snapshot_legacy_tapes did not union a tape rotated after the first sweep\n' >&2
+      exit 1
+    }
+  )
+fi
+
 trade_mode_contract="$tmp_dir/trade-mode-contract.sh"
 sed -n '/^trade_parity_reason=/,/^fi$/p' "$GATE" >"$trade_mode_contract"
 select_trade_mode() (
@@ -3605,6 +3729,10 @@ select_trade_mode() (
     == rust_self \
   && $(select_trade_mode legacy_overlap false continuous finalization_deferred 1) \
     == finalization_deferred_overlap \
+  && $(select_trade_mode legacy_overlap false finalization_deferred finalization_deferred 1) \
+    == finalization_deferred_deferred_overlap \
+  && $(select_trade_mode legacy_overlap false finalization_deferred finalization_deferred 0) \
+    == continuous_overlap \
   && $(select_trade_mode legacy_overlap false continuous continuous 0) \
     == continuous_overlap ]] || {
   printf 'Gate selected an invalid trade parity mode\n' >&2
@@ -3636,6 +3764,23 @@ jq -e '.passed == false
   and .checks.dedupe_parity == false
   and (.checks | has("finalization_progress") | not)' \
   "$tmp_dir/unadjudicated-rust-self-deferred-parity.json" >/dev/null
+adjudicate_trade_parity finalization_deferred_deferred_overlap \
+  <"$tmp_dir/deferred-deferred-parity.json" \
+  >"$tmp_dir/adjudicated-deferred-deferred-parity.json"
+jq -e '.passed == true and ([.checks[]] | all)
+  and .checks.byte_parity == true
+  and .checks.field_parity == true
+  and .checks.dedupe_parity == true
+  and .checks.trade_coverage_parity == true
+  and .checks.trade_contract_parity == true
+  and .checks.settlement_parity == true
+  and .checks.finalization_progress == true' \
+  "$tmp_dir/adjudicated-deferred-deferred-parity.json" >/dev/null
+adjudicate_trade_parity finalization_deferred_overlap \
+  <"$tmp_dir/deferred-deferred-parity.json" \
+  >"$tmp_dir/misadjudicated-deferred-deferred-parity.json"
+jq -e '.passed == false and .checks.dedupe_parity == false' \
+  "$tmp_dir/misadjudicated-deferred-deferred-parity.json" >/dev/null
 
 rust_self_missing_settlement="$tmp_dir/rust-self-missing-settlement"
 cp -R "$rust" "$rust_self_missing_settlement"
@@ -4058,8 +4203,11 @@ for mutation in \
     exit 1
   fi
 done
-# A finalization-deferred shadow against a finalization-deferred baseline keeps
-# the full trade parity requirement; no adjudication applies.
+# A finalization-deferred shadow against a finalization-deferred baseline
+# keeps the full trade parity requirement when the verifier passes in full
+# (an early-closing market finalized inside the gate window); a failed
+# verifier takes the finalization_deferred_deferred_overlap adjudication
+# exercised below instead.
 jq '.shadow_emission = "finalization_deferred"
   | .baseline_emission = "finalization_deferred"' \
   "$tmp_dir/expedited-legacy-gate.json" \
@@ -4079,6 +4227,52 @@ for mutation in \
   if jq -e -f "$POLICY" \
     "$tmp_dir/forged-same-semantics-gate.json" >/dev/null; then
     printf 'gate policy relaxed trade parity for same-semantics overlap\n' >&2
+    exit 1
+  fi
+done
+# Gate #6: with both sides finalization-deferred and no early-closing market,
+# the gate window contains no mature trade on either side, so the verifier
+# fails the trade family by construction. The adjudicated evidence keeps the
+# zero-trade verifier shape, full baseline settlement coverage, and the
+# finalization progression; rust-only settlements from the baseline tape
+# deletion race are tolerated.
+jq '.trade_parity_mode = "finalization_deferred_deferred_overlap"
+  | .trade_parity_reason = "shadow and baseline both defer trade emission until settlement plus the 1800-second finalization lag plus stable polls (post-#680), so neither emitted a mature trade inside the gate window; settlement, metadata, rotation, and asset parity, zero duplicates, finalization progression, and the canonical upload replace the unsatisfiable nonempty-trade checks"
+  | .baseline_emission = "finalization_deferred"
+  | .parity_verifier = {passed:false, checks:{
+      byte_parity:false,metadata_parity:true,field_parity:false,
+      dedupe_parity:false,trade_coverage_parity:true,
+      trade_contract_parity:true,settlement_parity:true,
+      rotation_parity:true,asset_parity:true}}
+  | .metrics.legacy_trade_count = 0
+  | .metrics.legacy_only_trade_ids = []
+  | .metrics.rust_only_trade_ids = []
+  | .metrics.rust_only_settlement_ids = ["rust-only-settlement"]' \
+  "$tmp_dir/finalization-overlap-gate.json" \
+  >"$tmp_dir/deferred-deferred-overlap-gate.json"
+jq -e -f "$POLICY" \
+  "$tmp_dir/deferred-deferred-overlap-gate.json" >/dev/null || {
+  printf 'gate policy rejected finalization-deferred deferred-overlap evidence\n' >&2
+  exit 1
+}
+for mutation in \
+  '.baseline_emission = "continuous"' \
+  '.comparison_mode = "rust_self"' \
+  '.parity_verifier.passed = true' \
+  '.parity_verifier.checks.dedupe_parity = true' \
+  '.parity_verifier.checks.trade_coverage_parity = false' \
+  '.parity_verifier.checks.settlement_parity = false' \
+  '.metrics.legacy_trade_count = 1' \
+  '.metrics.rust_trade_count = 1' \
+  '.metrics.rust_only_trade_ids = ["rust-only-trade"]' \
+  '.metrics.legacy_only_settlement_ids = ["legacy-settlement"]' \
+  '.metrics.settlement_shared_values_match = false' \
+  'del(.checks.finalization_progress)'; do
+  jq "$mutation" "$tmp_dir/deferred-deferred-overlap-gate.json" \
+    >"$tmp_dir/forged-deferred-deferred-overlap-gate.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/forged-deferred-deferred-overlap-gate.json" >/dev/null; then
+    printf 'gate policy accepted forged deferred-deferred overlap evidence\n' >&2
     exit 1
   fi
 done
@@ -5485,6 +5679,35 @@ fi
 grep -Fq 'verify-shadow-parity' "$GATE"
 grep -Fq 'parity_args+=(--allow-empty-legacy)' "$GATE"
 grep -Fq 'finalization_deferred_overlap' "$GATE"
+grep -Fq 'finalization_deferred_deferred_overlap' "$GATE"
+grep -Fq 'finalization_deferred_deferred_overlap' "$POLICY"
+grep -Fq 'admissible_deferred_parity_failure "$trade_parity_mode" "$parity_json"' \
+  "$GATE"
+grep -Fq -- '--legacy-spool "$legacy_tape_snapshot"' "$GATE"
+if grep -Fq -- '--legacy-spool "$LEGACY_SPOOL"' "$GATE"; then
+  printf 'parity verifier still reads the deletion-raced live legacy spool\n' >&2
+  exit 1
+fi
+[[ $(grep -Fc \
+  'snapshot_legacy_tapes "$legacy_tape_snapshot" "$started_at_unix"' "$GATE") \
+  -eq 2 ]] || {
+  printf 'Gate does not snapshot baseline tapes at observation start and before verification\n' >&2
+  exit 1
+}
+first_sweep_line=$(grep -nF \
+  'snapshot_legacy_tapes "$legacy_tape_snapshot" "$started_at_unix"' "$GATE" \
+  | head -1 | cut -d: -f1)
+last_sweep_line=$(grep -nF \
+  'snapshot_legacy_tapes "$legacy_tape_snapshot" "$started_at_unix"' "$GATE" \
+  | tail -1 | cut -d: -f1)
+gate_started_line=$(grep -nF 'started_at_unix=$(date -u +%s)' "$GATE" | cut -d: -f1)
+parity_run_line=$(grep -nF '"$release_binary" "${parity_args[@]}"' "$GATE" \
+  | cut -d: -f1)
+((gate_started_line < first_sweep_line && first_sweep_line < last_sweep_line \
+  && last_sweep_line < parity_run_line)) || {
+  printf 'baseline tape snapshots do not bracket the observation window\n' >&2
+  exit 1
+}
 grep -Fq 'trade_parity_mode' "$GATE"
 grep -Fq 'collector_emission_mode' "$GATE"
 grep -Fq -- '--max-retained-trade-ids' "$GATE"
