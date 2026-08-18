@@ -1,6 +1,6 @@
 use crate::{
-    data_mission, governance, loop_control, mission, mission_runner, prediction_dispatch,
-    prediction_runner, prediction_snapshot,
+    data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
+    mission_runner, prediction_dispatch, prediction_runner, prediction_snapshot,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -77,6 +77,12 @@ enum Command {
 enum MissionCommand {
     Create(CreateMissionArgs),
     Execute(Box<ExecuteMissionArgs>),
+    CampaignExecute(CampaignExecuteArgs),
+    CampaignId(CampaignIdArgs),
+    Dispatch {
+        #[command(subcommand)]
+        command: MissionDispatchCommand,
+    },
     Run(RunMissionArgs),
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
@@ -112,6 +118,41 @@ enum PredictionDispatchCommand {
     Render(PredictionDispatchRenderArgs),
     Status(PredictionDispatchStatusArgs),
     Submit(PredictionDispatchSubmitArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MissionDispatchCommand {
+    Submit(MissionDispatchSubmitArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MissionDispatchSubmitArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignExecuteArgs {
+    #[arg(long)]
+    pub work_dir: PathBuf,
+    #[arg(long)]
+    pub campaign_id: String,
+    #[arg(long)]
+    pub image_identity: String,
+    #[arg(long)]
+    pub request: PathBuf,
+    #[arg(long)]
+    pub request_sha256: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignIdArgs {
+    #[arg(long)]
+    pub request: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -380,6 +421,11 @@ pub struct ExecuteMissionArgs {
     #[arg(long)]
     pub work_dir: PathBuf,
     #[arg(long)]
+    pub mission_id: String,
+    /// Exact sealed-holdout identity from the Mission artifact.
+    #[arg(long)]
+    pub holdout_id: String,
+    #[arg(long)]
     pub mission_url: String,
     #[arg(long)]
     pub mission_sha256: String,
@@ -406,6 +452,12 @@ pub struct ExecuteMissionArgs {
     /// Independently authorized read URL for the immutable published result bundle.
     #[arg(long)]
     pub result_readback_url: String,
+    /// Create-once holdout-scoped claim written immediately before sealed holdout access.
+    #[arg(long)]
+    pub holdout_claim_put_url: String,
+    /// Independently authorized read URL for the same immutable holdout claim object.
+    #[arg(long)]
+    pub holdout_claim_readback_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -652,6 +704,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("mission execution worker failed")?
             }
+            MissionCommand::CampaignExecute(args) => {
+                tokio::task::spawn_blocking(move || mission_campaign::execute(args))
+                    .await
+                    .context("campaign execution worker failed")?
+            }
+            MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
+            MissionCommand::Dispatch { command } => match command {
+                MissionDispatchCommand::Submit(args) => mission_dispatch::submit(args),
+            },
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
@@ -804,13 +865,29 @@ mod tests {
             .join("missing-materialization.json")
             .display()
             .to_string();
-        let result = root.path().join("results.zip").display().to_string();
+        let mission_id = format!("cex-mission-{}", "a".repeat(64));
+        let holdout_id = "holdout-test".to_string();
+        let mission_result_dir = root.path().join(format!("mission-id={mission_id}"));
+        let result = mission_result_dir
+            .join("attempt=test/results.zip")
+            .display()
+            .to_string();
+        let (_, holdout_claim) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &result,
+            &mission_id,
+            &holdout_id,
+        )
+        .unwrap();
         let cli = Cli::try_parse_from(vec![
             "alpha-harness".to_owned(),
             "mission".to_owned(),
             "execute".to_owned(),
             "--work-dir".to_owned(),
             work_dir,
+            "--mission-id".to_owned(),
+            mission_id,
+            "--holdout-id".to_owned(),
+            holdout_id,
             "--mission-url".to_owned(),
             missing_mission.clone(),
             "--mission-sha256".to_owned(),
@@ -831,6 +908,10 @@ mod tests {
             result.clone(),
             "--result-readback-url".to_owned(),
             result,
+            "--holdout-claim-put-url".to_owned(),
+            holdout_claim.clone(),
+            "--holdout-claim-readback-url".to_owned(),
+            holdout_claim,
         ])
         .unwrap();
 
@@ -910,6 +991,24 @@ mod tests {
     #[test]
     fn parses_prediction_dispatch_render() {
         let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_campaign_execute() {
+        let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_campaign_id() {
+        let args = "alpha-harness mission campaign-id --request campaign.json";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_dispatch_submit() {
+        let args = "alpha-harness mission dispatch submit --submission submission.json --context ack --namespace monday-research";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
@@ -1105,6 +1204,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1129,6 +1232,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -1153,6 +1260,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1173,6 +1284,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
         ])
         .expect("content-bound Mission transport must be accepted");
 
@@ -1183,6 +1298,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             panic!("expected mission execute command")
         };
         assert_eq!(args.mission_url, "mission.json");
+        assert_eq!(
+            args.mission_id,
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(args.mission_sha256, "b".repeat(64));
         assert!(args.resume_url.is_none());
         assert!(args.resume_sha256.is_none());
@@ -1193,6 +1312,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "execute",
             "--work-dir",
             "work",
+            "--mission-id",
+            "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1213,6 +1336,10 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "results.zip",
             "--result-readback-url",
             "results.zip",
+            "--holdout-claim-put-url",
+            "sealed-holdout-claim.json",
+            "--holdout-claim-readback-url",
+            "sealed-holdout-claim.json",
             "--objective",
             "alternate authority",
         ])

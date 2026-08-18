@@ -15,6 +15,7 @@ use alpha_domain::{
     FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy, MissionStatus,
     PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage, StrategyBundle,
     ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1, MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
@@ -48,6 +49,8 @@ use hft_research_manifest::{
 use reqwest::{
     blocking::Client,
     header::{HeaderValue, CONTENT_TYPE},
+    redirect::Policy,
+    StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,7 +60,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
@@ -66,11 +69,13 @@ const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
 const CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str = "cex_event_replay_receipt";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES: u64 = 64 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
-const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_VERSION: &str = "cex-event-replay-receipt-v1";
@@ -99,21 +104,22 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
 }
 
 #[derive(Debug, Deserialize)]
-struct Materialization {
+pub(crate) struct Materialization {
     dataset_kind: String,
     schema_version: String,
-    mission_id: String,
-    symbol: String,
-    market: String,
-    source_revision: String,
+    pub(crate) mission_id: String,
+    pub(crate) symbol: String,
+    pub(crate) market: String,
+    pub(crate) source_revision: String,
     source_segments: Vec<SourceSegment>,
-    artifact_sha256: String,
-    bucket_ms: u64,
-    label_horizon_buckets: usize,
-    top_depth: usize,
+    pub(crate) artifact_sha256: String,
+    pub(crate) bucket_ms: u64,
+    pub(crate) label_horizon_buckets: usize,
+    pub(crate) top_depth: usize,
+    pub(crate) rows: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
-    snapshot: CexReplaySnapshotV4,
+    pub(crate) snapshot: CexReplaySnapshotV4,
     snapshot_sha256: String,
 }
 
@@ -128,20 +134,46 @@ struct SourceSegment {
     events: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct ExecutionReport<'a> {
-    mission_id: &'a str,
+#[derive(Debug, Deserialize)]
+struct MissionAdmissionEvidenceV1 {
+    mission_id: String,
+    mission_artifact_sha256: String,
+    campaign_id: Option<String>,
+    round_id: Option<String>,
+    request_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExecutionReport {
+    pub(crate) mission_id: String,
+    pub(crate) mission_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) campaign_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) round_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_sha256: Option<String>,
     engine: &'static str,
-    bundle_bytes: u64,
-    bundle_sha256: String,
-    readback_bundle_sha256: String,
-    replay_receipt_id: Option<String>,
-    replay_gate_passed: Option<bool>,
-    final_precommit_id: Option<String>,
-    sealed_receipt_id: Option<String>,
-    sealed_passed: Option<bool>,
-    strategy_bundle_id: Option<String>,
-    promotion_id: Option<String>,
+    pub(crate) bundle_bytes: u64,
+    pub(crate) bundle_sha256: String,
+    pub(crate) readback_bundle_sha256: String,
+    pub(crate) replay_receipt_id: Option<String>,
+    pub(crate) replay_gate_passed: Option<bool>,
+    pub(crate) final_precommit_id: Option<String>,
+    pub(crate) sealed_receipt_id: Option<String>,
+    pub(crate) sealed_passed: Option<bool>,
+    pub(crate) strategy_bundle_id: Option<String>,
+    pub(crate) promotion_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutionBinding {
+    Direct,
+    Campaign {
+        campaign_id: String,
+        round_id: String,
+        request_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,7 +391,19 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
 }
 
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
-    validate_args(&args)?;
+    print_json(&execute_report(args, ExecutionBinding::Direct)?)
+}
+
+pub(crate) fn execute_report(
+    args: ExecuteMissionArgs,
+    binding: ExecutionBinding,
+) -> anyhow::Result<ExecutionReport> {
+    validate_args(&args, &binding)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?;
+    ensure_holdout_claim_absent(&client, &args.holdout_claim_readback_url)?;
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
@@ -376,9 +420,6 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&artifact_dir)?;
     std::fs::create_dir_all(&results_dir)?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
     let mission_path = input_dir.join("mission.json");
     let feature_path = input_dir.join("features.jsonl");
     let materialization_path = input_dir.join("materialization.json");
@@ -440,6 +481,13 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     weight_policy.validate_binding(&control_mission.spec.policies.weight)?;
     data_mission::write_json_atomic(&results_dir.join("weight-policy.json"), &weight_policy)?;
     let mission_id = control_mission.semantic_id()?;
+    if mission_id != args.mission_id {
+        bail!("CEX Research Mission semantic ID does not match the requested Mission ID");
+    }
+    if control_mission.spec.holdout.holdout_id != args.holdout_id {
+        bail!("CEX Research Mission holdout ID does not match the requested holdout ID");
+    }
+    validate_holdout_claim_binding(&args, &control_mission.spec.holdout.holdout_id, &binding)?;
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
 
@@ -564,6 +612,18 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &results_dir.join("control-plane-mission.json"),
         &control_mission,
     )?;
+    let (campaign_id, round_id) = match &binding {
+        ExecutionBinding::Direct => (None, None),
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            ..
+        } => (Some(campaign_id.clone()), Some(round_id.clone())),
+    };
+    let request_sha256 = match &binding {
+        ExecutionBinding::Direct => None,
+        ExecutionBinding::Campaign { request_sha256, .. } => Some(request_sha256.clone()),
+    };
     data_mission::write_json_atomic(
         &results_dir.join("mission-admission.json"),
         &serde_json::json!({
@@ -571,6 +631,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             "mission_id": &mission_id,
             "mission_artifact_sha256": &mission_sha256,
             "dataset_manifest_id": &dataset_manifest.manifest_id,
+            "campaign_id": campaign_id.clone(),
+            "round_id": round_id.clone(),
+            "request_sha256": request_sha256.clone(),
         }),
     )?;
     let research_mission = ResearchMission {
@@ -740,6 +803,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             Some(finalize_cex_candidate(
                 &mut store,
                 &results_dir,
+                &client,
+                &args.holdout_claim_put_url,
+                &args.holdout_claim_readback_url,
                 &control_mission,
                 &lineage,
                 &factor_bank,
@@ -784,7 +850,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     )?;
     drop(store);
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
-    let bundle_bytes = bundle.metadata()?.len();
+    let bundle_bytes = checked_result_bundle_bytes(&bundle)?;
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
     let readback_bundle = input_dir.join("published-result-readback.zip");
@@ -797,8 +863,12 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     if readback_sha256 != bundle_sha256 {
         bail!("published CEX result readback SHA256 mismatch");
     }
-    print_json(&ExecutionReport {
-        mission_id: &mission_id,
+    Ok(ExecutionReport {
+        mission_id,
+        mission_sha256,
+        campaign_id,
+        round_id,
+        request_sha256,
         engine: "gp_then_factor_bank_subset_mcts",
         bundle_bytes,
         bundle_sha256,
@@ -827,6 +897,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 fn finalize_cex_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
+    client: &Client,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
     control_mission: &CexResearchMissionArtifactV1,
     lineage: &MissionLineage,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1033,16 +1106,36 @@ fn finalize_cex_candidate(
     data_mission::write_json_atomic(&results_dir.join("final-precommit.json"), &precommit)?;
 
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
+    let claim_path = results_dir.join("sealed-holdout-claim.json");
+    data_mission::write_json_atomic(&claim_path, &claim)?;
     let sealed_revision = match store.claim_cex_sealed_holdout(&claim, Utc::now())? {
         Some(existing) => existing,
         None => {
+            let claim_sha256 = sha256_file(&claim_path)?;
+            // This create-once write is the at-most-once boundary. If it succeeds but
+            // readback or evaluation fails, the Mission is terminal and inconclusive.
+            publish_immutable_file(
+                client,
+                holdout_claim_put_url,
+                &claim_path,
+                "application/json",
+            )?;
+            let claim_readback_path = results_dir.join("sealed-holdout-claim-readback.json");
+            let (_, claim_readback_sha256) = fetch_to_file(
+                client,
+                holdout_claim_readback_url,
+                &claim_readback_path,
+                MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES,
+            )?;
+            if claim_readback_sha256 != claim_sha256 {
+                bail!("published CEX sealed holdout claim readback SHA256 mismatch");
+            }
             let sealed = evaluator
                 .evaluate_sealed(&proposal, dataset)
                 .map_err(anyhow::Error::msg)?;
             store.put_cex_sealed_evaluation(&claim, &sealed, Utc::now())?
         }
     };
-    data_mission::write_json_atomic(&results_dir.join("sealed-holdout-claim.json"), &claim)?;
     data_mission::write_json_atomic(
         &results_dir.join("sealed-holdout-receipt.json"),
         &sealed_revision,
@@ -1169,7 +1262,7 @@ fn registry_content_reference(
     content_reference(id, &serde_json::to_value(artifact)?)
 }
 
-fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
+pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("materialization manifest is invalid JSON")?;
     match value
@@ -1700,7 +1793,7 @@ fn build_factor_bank(
     )?)
 }
 
-fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
+fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyhow::Result<()> {
     if args.work_dir.as_os_str().is_empty()
         || [
             args.mission_url.as_str(),
@@ -1710,6 +1803,8 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
             args.replay_manifest_url.as_str(),
             args.result_put_url.as_str(),
             args.result_readback_url.as_str(),
+            args.holdout_claim_put_url.as_str(),
+            args.holdout_claim_readback_url.as_str(),
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -1717,6 +1812,8 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
         bail!("Mission execution paths and URLs are required");
     }
     normalized_sha256("Mission", &args.mission_sha256)?;
+    validate_cex_mission_id(&args.mission_id)?;
+    validate_cex_holdout_id(&args.holdout_id)?;
     normalized_sha256("CEX replay artifact", &args.replay_artifact_sha256)?;
     normalized_sha256("CEX replay manifest", &args.replay_manifest_sha256)?;
     if !valid_git_revision(BUILD_SOURCE_REVISION) {
@@ -1724,6 +1821,124 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
     }
     resume_source(args)?;
     validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
+    validate_holdout_claim_binding(args, &args.holdout_id, binding)?;
+    Ok(())
+}
+
+fn validate_holdout_claim_binding(
+    args: &ExecuteMissionArgs,
+    holdout_id: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<()> {
+    let result_is_remote =
+        args.result_put_url.starts_with("http://") || args.result_put_url.starts_with("https://");
+    let put_is_remote = args.holdout_claim_put_url.starts_with("http://")
+        || args.holdout_claim_put_url.starts_with("https://");
+    let readback_is_remote = args.holdout_claim_readback_url.starts_with("http://")
+        || args.holdout_claim_readback_url.starts_with("https://");
+    if result_is_remote != put_is_remote || put_is_remote != readback_is_remote {
+        bail!("CEX result and holdout claim transports must match");
+    }
+    if put_is_remote {
+        let claim_object = prediction_dispatch::canonical_https_object(
+            "CEX holdout claim",
+            &args.holdout_claim_put_url,
+        )?;
+        let claim_readback_object = prediction_dispatch::canonical_https_object(
+            "CEX holdout claim readback",
+            &args.holdout_claim_readback_url,
+        )?;
+        if claim_object != claim_readback_object {
+            bail!("CEX holdout claim readback URL must identify the same immutable object");
+        }
+        let expected_claim_object =
+            prediction_dispatch::cex_global_holdout_claim_object(holdout_id)?;
+        if claim_object != expected_claim_object {
+            bail!("CEX holdout claim object must use the global holdout claim path");
+        }
+    } else {
+        let result_object = normalized_local_object(&args.result_put_url)?;
+        let claim_object = normalized_local_object(&args.holdout_claim_put_url)?;
+        let claim_readback_object = normalized_local_object(&args.holdout_claim_readback_url)?;
+        if claim_object != claim_readback_object {
+            bail!("CEX holdout claim readback path must identify the same immutable object");
+        }
+        let expected_claim_object = expected_local_holdout_claim_object(
+            &result_object,
+            &args.mission_id,
+            holdout_id,
+            binding,
+        )?;
+        if claim_object != expected_claim_object {
+            bail!(
+                "CEX holdout claim path must be the holdout-scoped sibling of the Mission results"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expected_local_holdout_claim_object(
+    result_object: &str,
+    mission_id: &str,
+    holdout_id: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<String> {
+    match binding {
+        ExecutionBinding::Direct => Ok(prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            result_object,
+            mission_id,
+            holdout_id,
+        )?
+        .1),
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            ..
+        } => prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+            result_object,
+            campaign_id,
+            round_id,
+            holdout_id,
+        ),
+    }
+}
+
+fn normalized_local_object(value: &str) -> anyhow::Result<String> {
+    let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("local immutable object path must be non-empty and lexically normalized");
+    }
+    Ok(format!(
+        "/{}",
+        path.to_string_lossy().trim_start_matches('/')
+    ))
+}
+
+pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
+    let exists = if source.starts_with("http://") || source.starts_with("https://") {
+        let response = client.get(source).send()?;
+        match response.status() {
+            StatusCode::NOT_FOUND => false,
+            status if status.is_success() => true,
+            _ => {
+                response.error_for_status()?;
+                unreachable!()
+            }
+        }
+    } else {
+        Path::new(source.strip_prefix("file://").unwrap_or(source)).try_exists()?
+    };
+    if exists {
+        bail!("CEX sealed holdout claim already exists; Mission is terminal and inconclusive");
+    }
     Ok(())
 }
 
@@ -1832,7 +2047,7 @@ fn validate_mission_dataset_binding(
     Ok(())
 }
 
-fn validate_materialization(
+pub(crate) fn validate_materialization(
     materialization: &Materialization,
     feature_sha256: &str,
     validation: &ValidationArgs,
@@ -1896,8 +2111,11 @@ fn validate_materialization(
         bail!("evaluation funding cost does not match the verified CEX replay snapshot");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
+    let source_revision = normalized_sha256("source revision", &materialization.source_revision)?;
+    let mut source_sha256s = Vec::with_capacity(materialization.source_segments.len());
     for segment in &materialization.source_segments {
         let source_sha256 = normalized_sha256("source segment", &segment.sha256)?;
+        source_sha256s.push(source_sha256.clone());
         normalized_sha256(
             "source collector manifest",
             &segment.collector_manifest_sha256,
@@ -1907,6 +2125,11 @@ fn validate_materialization(
         if success_marker_sha256 != hex::encode(Sha256::digest(format!("{source_sha256}\n"))) {
             bail!("source success marker does not bind its segment");
         }
+    }
+    if hft_collector::lob_archiver::source_revision(source_sha256s.iter().map(String::as_str))
+        != source_revision
+    {
+        bail!("materialization source revision does not bind its source segments");
     }
     if artifact_sha256 != feature_sha256 {
         bail!("PIT feature artifact does not match materialization");
@@ -1922,7 +2145,28 @@ pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<Stri
     Ok(value)
 }
 
-fn valid_git_revision(value: &str) -> bool {
+pub(crate) fn validate_cex_mission_id(value: &str) -> anyhow::Result<()> {
+    let suffix = value
+        .strip_prefix("cex-mission-")
+        .context("CEX Mission ID must use the cex-mission-<sha256> form")?;
+    if value != value.trim() || normalized_sha256("CEX Mission ID", suffix)? != suffix {
+        bail!("CEX Mission ID must use the cex-mission-<sha256> form");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cex_holdout_id(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.len() > 256
+        || value.chars().any(char::is_control)
+    {
+        bail!("CEX holdout ID is invalid");
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_git_revision(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
@@ -1965,6 +2209,368 @@ pub(crate) fn fetch_to_file(
     }
     data_mission::persist_output_file(temporary, destination, "fetched source")?;
     Ok((bytes, sha256_file(destination)?))
+}
+
+pub(crate) fn recover_execution_report_from_published_result(
+    client: &Client,
+    result_readback_url: &str,
+    readback_destination: &Path,
+    expected_mission_id: &str,
+    expected_mission_sha256: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<Option<ExecutionReport>> {
+    let Some((bundle_bytes, bundle_sha256)) = fetch_optional_to_file(
+        client,
+        result_readback_url,
+        readback_destination,
+        MAX_RESULT_BUNDLE_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut archive = ZipArchive::new(File::open(readback_destination)?)
+        .context("open published result bundle")?;
+    let admission: MissionAdmissionEvidenceV1 =
+        read_bundle_json(&mut archive, "results/mission-admission.json", 64 * 1024)?
+            .context("published result bundle is missing results/mission-admission.json")?;
+    if admission.mission_id != expected_mission_id {
+        bail!("published result bundle Mission ID does not match the Campaign Mission");
+    }
+    if admission.mission_artifact_sha256 != normalized_sha256("Mission", expected_mission_sha256)? {
+        bail!("published result bundle Mission SHA256 does not match the Campaign Mission");
+    }
+    validate_recovered_binding(&admission, binding)?;
+    let control_mission: CexResearchMissionArtifactV1 = read_bundle_json(
+        &mut archive,
+        "results/control-plane-mission.json",
+        MAX_MISSION_BYTES,
+    )?
+    .context("published result bundle is missing results/control-plane-mission.json")?;
+    control_mission.validate()?;
+    if control_mission.semantic_id()? != expected_mission_id {
+        bail!("published result bundle Mission artifact does not match the Campaign Mission");
+    }
+
+    let replay_receipt: Option<CexEventReplayReceiptV1> = read_bundle_json(
+        &mut archive,
+        "results/cex-event-replay-receipt.json",
+        512 * 1024,
+    )?;
+    if let Some(receipt) = &replay_receipt {
+        receipt.validate()?;
+        if receipt.mission_id != expected_mission_id {
+            bail!("published result bundle replay receipt does not match the Campaign Mission");
+        }
+    }
+
+    let finalization: Option<CexFinalizationReportV1> =
+        read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)?;
+    let finalization = if let Some(report) = finalization {
+        validate_recovered_finalization(
+            &mut archive,
+            &report,
+            &control_mission,
+            replay_receipt.as_ref(),
+            expected_mission_id,
+        )?;
+        Some(report)
+    } else {
+        if replay_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.gate.passed)
+        {
+            bail!("published result bundle is missing finalization evidence for a passing replay");
+        }
+        None
+    };
+
+    Ok(Some(ExecutionReport {
+        mission_id: expected_mission_id.to_string(),
+        mission_sha256: normalized_sha256("Mission", expected_mission_sha256)?,
+        campaign_id: admission.campaign_id,
+        round_id: admission.round_id,
+        request_sha256: admission.request_sha256,
+        engine: "gp_then_factor_bank_subset_mcts",
+        bundle_bytes,
+        bundle_sha256: bundle_sha256.clone(),
+        readback_bundle_sha256: bundle_sha256,
+        replay_receipt_id: replay_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_id.clone()),
+        replay_gate_passed: replay_receipt.as_ref().map(|receipt| receipt.gate.passed),
+        final_precommit_id: finalization
+            .as_ref()
+            .map(|report| report.precommit_id.clone()),
+        sealed_receipt_id: finalization
+            .as_ref()
+            .map(|report| report.sealed_receipt_id.clone()),
+        sealed_passed: finalization.as_ref().map(|report| report.sealed_passed),
+        strategy_bundle_id: finalization
+            .as_ref()
+            .and_then(|report| report.strategy_bundle_id.clone()),
+        promotion_id: finalization
+            .as_ref()
+            .and_then(|report| report.promotion_id.clone()),
+    }))
+}
+
+fn fetch_optional_to_file(
+    client: &Client,
+    source: &str,
+    destination: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<Option<(u64, String)>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let response = client.get(source).send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            bail!("source exceeds the allowed size");
+        }
+        let mut temporary = data_mission::temporary_output_file(destination, ".monday-fetch-")?;
+        let mut reader = response;
+        let bytes = std::io::copy(
+            &mut reader.by_ref().take(max_bytes + 1),
+            temporary.as_file_mut(),
+        )?;
+        temporary.as_file().sync_all()?;
+        if bytes > max_bytes {
+            bail!("source exceeds the allowed size");
+        }
+        data_mission::persist_output_file(temporary, destination, "fetched source")?;
+        return Ok(Some((bytes, sha256_file(destination)?)));
+    }
+
+    let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    Ok(Some(fetch_to_file(client, source, destination, max_bytes)?))
+}
+
+fn validate_recovered_binding(
+    admission: &MissionAdmissionEvidenceV1,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<()> {
+    match binding {
+        ExecutionBinding::Direct => {
+            if admission.campaign_id.is_some()
+                || admission.round_id.is_some()
+                || admission.request_sha256.is_some()
+            {
+                bail!("published result bundle carries Campaign binding for a direct Mission");
+            }
+        }
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            request_sha256: _,
+        } => {
+            if admission.campaign_id.as_deref() != Some(campaign_id)
+                || admission.round_id.as_deref() != Some(round_id)
+            {
+                bail!("published result bundle does not match the Campaign binding");
+            }
+            normalized_sha256(
+                "published result bundle Campaign request SHA256",
+                admission.request_sha256.as_deref().context(
+                    "published result bundle is missing Campaign request SHA256 evidence",
+                )?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovered_finalization(
+    archive: &mut ZipArchive<File>,
+    report: &CexFinalizationReportV1,
+    control_mission: &CexResearchMissionArtifactV1,
+    replay_receipt: Option<&CexEventReplayReceiptV1>,
+    expected_mission_id: &str,
+) -> anyhow::Result<()> {
+    if !replay_receipt.is_some_and(|receipt| receipt.gate.passed) {
+        bail!("published result bundle finalization lacks a passing replay receipt");
+    }
+    let precommit: CexFinalPrecommitV1 =
+        read_bundle_json(archive, "results/final-precommit.json", 512 * 1024)?
+            .context("published result bundle is missing results/final-precommit.json")?;
+    precommit.validate()?;
+    let semantic_mission = serde_json::json!({
+        "schema_version": &control_mission.schema_version,
+        "spec": &control_mission.spec,
+    });
+    if precommit.mission.id != expected_mission_id
+        || precommit.mission.content_sha256 != canonical_json_hash(&semantic_mission)?
+        || precommit.holdout_id != control_mission.spec.holdout.holdout_id
+        || precommit.holdout_state != control_mission.spec.holdout.state
+    {
+        bail!("published result bundle precommit does not match the exact Campaign Mission");
+    }
+    if precommit.precommit_id != report.precommit_id {
+        bail!("published result bundle precommit evidence does not match its finalization report");
+    }
+    let replay_receipt = replay_receipt.expect("passing replay receipt already required");
+    if replay_receipt.receipt_id != precommit.replay_receipt.id
+        || canonical_json_hash(replay_receipt)? != precommit.replay_receipt.content_sha256
+        || replay_receipt.mission_id != precommit.mission.id
+        || replay_receipt.strategy != precommit.four_stage_strategy
+        || replay_receipt.dataset != precommit.dataset
+        || replay_receipt.source != precommit.source
+        || replay_receipt.holdout_id != precommit.holdout_id
+        || replay_receipt.holdout_state != precommit.holdout_state
+        || replay_receipt.capabilities_sha256 != precommit.replay_capabilities_sha256
+        || replay_receipt.deployment_authority
+        || replay_receipt.order_submission_authority
+    {
+        bail!("published result bundle replay receipt does not prove the exact final precommit");
+    }
+    let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
+    let sealed_receipt: RegistryRevision =
+        read_bundle_json(archive, "results/sealed-holdout-receipt.json", 512 * 1024)?
+            .context("published result bundle is missing results/sealed-holdout-receipt.json")?;
+    if sealed_receipt.revision_id != report.sealed_receipt_id {
+        bail!("published result bundle sealed receipt does not match its finalization report");
+    }
+    let sealed: CandidateEvaluation = serde_json::from_value(
+        sealed_receipt
+            .payload
+            .get("evaluation")
+            .cloned()
+            .context("published result bundle sealed receipt is missing evaluation")?,
+    )
+    .context("published result bundle sealed receipt carries invalid evaluation")?;
+    sealed.validate()?;
+    let (_, protocol_hash) = sealed.protocol_binding()?;
+    if sealed_receipt.registry_kind != "sealed_evaluation"
+        || sealed_receipt.asset_id != claim.candidate.id
+        || sealed_receipt.parent_revision_id.as_deref() != Some(claim.claim_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.mission_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.candidate.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.dataset_manifest_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.evaluation_protocol.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("precommit_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.precommit.id.as_str())
+        || sealed_receipt
+            .payload
+            .get("precommit_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.precommit.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("sealed_access_claim_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.claim_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("holdout_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.holdout_id.as_str())
+        || sealed.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+        || protocol_hash != claim.evaluation_protocol.content_sha256
+        || sealed.passed != report.sealed_passed
+    {
+        bail!("published result bundle sealed evaluation does not match its finalization report");
+    }
+    if report.sealed_passed {
+        let strategy_bundle: StrategyBundle =
+            read_bundle_json(archive, "results/strategy-bundle.json", 4 * 1024 * 1024)?
+                .context("published result bundle is missing results/strategy-bundle.json")?;
+        strategy_bundle.validate()?;
+        if strategy_bundle.candidate_id != precommit.final_candidate.id
+            || strategy_bundle.candidate_content_hash != precommit.final_candidate.content_sha256
+        {
+            bail!("published result bundle strategy lineage does not match the final precommit");
+        }
+        let alpha_domain::StrategyBundleArtifact::CexFourStage {
+            strategy: bundled_strategy,
+        } = &strategy_bundle.artifact
+        else {
+            bail!(
+                "published result bundle strategy lineage is not a final CEX four-stage strategy"
+            );
+        };
+        bundled_strategy.validate_against_precommit(&precommit)?;
+        if strategy_bundle.bundle_id
+            != report
+                .strategy_bundle_id
+                .as_deref()
+                .context("published result bundle finalization is missing strategy_bundle_id")?
+        {
+            bail!(
+                "published result bundle strategy lineage does not match its finalization report"
+            );
+        }
+        let promotion: PromotionRecord =
+            read_bundle_json(archive, "results/promotion-record.json", 512 * 1024)?
+                .context("published result bundle is missing results/promotion-record.json")?;
+        promotion.validate(&strategy_bundle)?;
+        if promotion.candidate_id != precommit.final_candidate.id
+            || promotion.candidate_content_hash != precommit.final_candidate.content_sha256
+        {
+            bail!("published result bundle promotion lineage does not match the final precommit");
+        }
+        if promotion.promotion_id
+            != report
+                .promotion_id
+                .as_deref()
+                .context("published result bundle finalization is missing promotion_id")?
+        {
+            bail!(
+                "published result bundle promotion lineage does not match its finalization report"
+            );
+        }
+    } else if report.strategy_bundle_id.is_some() || report.promotion_id.is_some() {
+        bail!("published result bundle failed sealed holdout cannot carry deployable lineage");
+    }
+    Ok(())
+}
+
+fn read_bundle_json<T: for<'de> Deserialize<'de>>(
+    archive: &mut ZipArchive<File>,
+    name: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Option<T>> {
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open bundle entry {name}")),
+    };
+    if file.size() > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    let mut bytes = Vec::with_capacity(file.size() as usize);
+    std::io::copy(&mut file.by_ref().take(max_bytes + 1), &mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("bundle entry exceeds the allowed size: {name}");
+    }
+    Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+        format!("parse bundle JSON entry {name}")
+    })?))
 }
 
 pub(crate) fn create_bundle<'a>(
@@ -2017,19 +2623,41 @@ pub(crate) fn publish_result(
     destination: &str,
     bundle: &Path,
 ) -> anyhow::Result<()> {
+    checked_result_bundle_bytes(bundle)?;
+    publish_immutable_file(client, destination, bundle, "application/zip")
+}
+
+fn checked_result_bundle_bytes(bundle: &Path) -> anyhow::Result<u64> {
+    let bundle_bytes = bundle.metadata()?.len();
+    if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
+        bail!(
+            "result bundle exceeds the allowed size: {} bytes > {} bytes",
+            bundle_bytes,
+            MAX_RESULT_BUNDLE_BYTES
+        );
+    }
+    Ok(bundle_bytes)
+}
+
+pub(crate) fn publish_immutable_file(
+    client: &Client,
+    destination: &str,
+    source: &Path,
+    content_type: &'static str,
+) -> anyhow::Result<()> {
     if destination.starts_with("http://") || destination.starts_with("https://") {
         client
             .put(destination)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/zip"))
+            .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
             .header("x-oss-forbid-overwrite", "true")
-            .body(File::open(bundle)?)
+            .body(File::open(source)?)
             .send()?
             .error_for_status()?;
         return Ok(());
     }
     let path = Path::new(destination.strip_prefix("file://").unwrap_or(destination));
     let mut output = data_mission::temporary_output_file(path, ".monday-result-")?;
-    std::io::copy(&mut File::open(bundle)?, output.as_file_mut())?;
+    std::io::copy(&mut File::open(source)?, output.as_file_mut())?;
     output.as_file().sync_all()?;
     match output.persist_noclobber(path) {
         Ok(_) => Ok(()),
@@ -2593,14 +3221,13 @@ mod tests {
             row.source_revisions
                 .insert("binance-usdm-lob".to_string(), forged_revision.clone());
         });
-        fixture.materialization["source_revision"] = serde_json::json!(forged_revision);
-        resign_materialization(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("feature source revision does not match the CEX replay snapshot"));
+        assert!(
+            format!("{error:#}").contains("registered feature lineage or label facts do not match"),
+            "{error:#}"
+        );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -3413,6 +4040,54 @@ mod tests {
     }
 
     #[test]
+    fn existing_claim_blocks_before_research_starts() {
+        let mut fixture = fixture("duplicate-remote-holdout-claim");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        std::fs::write(&fixture.args.holdout_claim_put_url, b"already-claimed").unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Mission is terminal and inconclusive"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!fixture.args.work_dir.exists());
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/sealed-holdout-receipt.json")
+            .exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn shared_holdout_claim_blocks_a_different_mission_before_research_starts() {
+        let mut fixture = fixture("shared-holdout-across-missions");
+        let first_mission_id = fixture.args.mission_id.clone();
+        let shared_claim = fixture.args.holdout_claim_put_url.clone();
+        fixture.mission.spec.search_lineage_id = "different-search-lineage".to_string();
+        write_mission(&mut fixture);
+
+        assert_ne!(fixture.args.mission_id, first_mission_id);
+        assert_eq!(fixture.args.holdout_claim_put_url, shared_claim);
+        std::fs::write(&shared_claim, b"already-claimed").unwrap();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Mission is terminal and inconclusive"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!fixture.args.work_dir.exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn failed_sealed_holdout_keeps_precommit_but_creates_no_deployable_lineage() {
         let mut fixture = fixture("failed-final-holdout");
         fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
@@ -3767,26 +4442,12 @@ mod tests {
         .unwrap();
         assert_ne!(sha256_file(&resume_path).unwrap(), resume_content_sha256);
         fixture.args.work_dir = fixture.root.join("work-resumed");
-        fixture.args.result_put_url = fixture
-            .root
-            .join("result-resumed.zip")
-            .to_string_lossy()
-            .into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "resumed");
         fixture.args.resume_url = Some(resume_path.to_string_lossy().into_owned());
         fixture.args.resume_sha256 = Some(resume_content_sha256);
-        execute(fixture.args.clone()).unwrap();
-        let resumed_result: CexFactorBankMctsResultV1 = serde_json::from_slice(
-            &std::fs::read(
-                fixture
-                    .args
-                    .work_dir
-                    .join("results/factor-subset-mcts-result.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resumed_result, full_result);
+        let error = execute(fixture.args.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("Mission is terminal and inconclusive"));
+        assert!(!fixture.args.work_dir.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -4360,8 +5021,7 @@ mod tests {
         fixture.mission.spec.search.max_new_iterations = 4;
         resign_mission(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-2");
-        fixture.args.result_put_url = fixture.root.join("result-2.zip").to_string_lossy().into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "2");
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
 
@@ -4375,8 +5035,7 @@ mod tests {
         });
         rebind_mission_inputs(&mut fixture);
         fixture.args.work_dir = fixture.root.join("work-3");
-        fixture.args.result_put_url = fixture.root.join("result-3.zip").to_string_lossy().into();
-        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        bind_result_attempt(&mut fixture, "3");
         execute(fixture.args.clone()).unwrap();
         assert_eq!(read_factor_bank(&fixture.args), first);
         std::fs::remove_dir_all(fixture.root).unwrap();
@@ -4397,6 +5056,23 @@ mod tests {
         assert!(error.to_string().contains("fresh work directory"));
         assert_eq!(std::fs::read(&sealed).unwrap(), b"sealed-evidence\n");
         assert_eq!(std::fs::read(&receipt).unwrap(), b"sealed-receipt\n");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_a_noncanonical_result_attempt_before_side_effects() {
+        let mut fixture = fixture("noncanonical-result-attempt");
+        let result = fixture.root.join(format!(
+            "mission-id={}/attempt-test.zip",
+            fixture.args.mission_id
+        ));
+        fixture.args.result_put_url = result.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("attempt=<id>/results.zip"));
+        assert!(!fixture.args.work_dir.exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -4489,6 +5165,275 @@ mod tests {
         .expect_err("a missing bundle must fail before publication");
 
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn publish_result_rejects_a_bundle_larger_than_the_readback_limit() {
+        let root = tempfile::tempdir().expect("create result publication test root");
+        let bundle = root.path().join("oversized-result.zip");
+        File::create(&bundle)
+            .unwrap()
+            .set_len(MAX_RESULT_BUNDLE_BYTES + 1)
+            .unwrap();
+        let destination = root.path().join("published-result.zip");
+        let client = Client::builder().build().unwrap();
+
+        let error = publish_result(&client, &destination.to_string_lossy(), &bundle).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("result bundle exceeds the allowed size"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn validate_holdout_claim_binding_uses_the_global_remote_claim_object() {
+        let mut fixture = fixture("remote-global-holdout-claim");
+        fixture.args.result_put_url = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/anything/results.zip".to_string();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        fixture.args.holdout_claim_put_url =
+            prediction_dispatch::cex_global_holdout_claim_object(&fixture.args.holdout_id).unwrap();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+
+        validate_holdout_claim_binding(
+            &fixture.args,
+            &fixture.args.holdout_id,
+            &ExecutionBinding::Direct,
+        )
+        .unwrap();
+
+        fixture.args.holdout_claim_put_url =
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/not-global/sealed-holdout-claim.json".to_string();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+        let error = validate_holdout_claim_binding(
+            &fixture.args,
+            &fixture.args.holdout_id,
+            &ExecutionBinding::Campaign {
+                campaign_id: "cex-campaign-test".to_string(),
+                round_id: "r1".to_string(),
+                request_sha256: "a".repeat(64),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CEX holdout claim object must use the global holdout claim path"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_from_an_existing_campaign_result_bundle() {
+        let mut fixture = fixture("recover-campaign-result");
+        let binding = campaign_binding_fixture(&mut fixture);
+        let original = execute_report(fixture.args.clone(), binding.clone()).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let recovered = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-results.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &binding,
+        )
+        .unwrap()
+        .expect("existing published result must recover");
+
+        assert_eq!(recovered.mission_id, original.mission_id);
+        assert_eq!(recovered.mission_sha256, original.mission_sha256);
+        assert_eq!(recovered.campaign_id, original.campaign_id);
+        assert_eq!(recovered.round_id, original.round_id);
+        assert_eq!(recovered.request_sha256, original.request_sha256);
+        assert_eq!(recovered.bundle_bytes, original.bundle_bytes);
+        assert_eq!(recovered.bundle_sha256, original.bundle_sha256);
+        assert_eq!(
+            recovered.readback_bundle_sha256,
+            original.readback_bundle_sha256
+        );
+        assert_eq!(recovered.replay_receipt_id, original.replay_receipt_id);
+        assert_eq!(recovered.replay_gate_passed, original.replay_gate_passed);
+        assert_eq!(recovered.final_precommit_id, original.final_precommit_id);
+        assert_eq!(recovered.sealed_receipt_id, original.sealed_receipt_id);
+        assert_eq!(recovered.sealed_passed, original.sealed_passed);
+        assert_eq!(recovered.strategy_bundle_id, original.strategy_bundle_id);
+        assert_eq!(recovered.promotion_id, original.promotion_id);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_accepts_a_renewed_campaign_request_sha() {
+        let mut fixture = fixture("recover-campaign-binding-mismatch");
+        let binding = campaign_binding_fixture(&mut fixture);
+        let original = execute_report(fixture.args.clone(), binding).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let renewed_binding = ExecutionBinding::Campaign {
+            campaign_id: "cex-campaign-test".to_string(),
+            round_id: "r1".to_string(),
+            request_sha256: "b".repeat(64),
+        };
+        let recovered = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-mismatch.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &renewed_binding,
+        )
+        .unwrap()
+        .expect("renewed request SHA should still recover the same Campaign result");
+
+        assert_eq!(recovered.mission_id, original.mission_id);
+        assert_eq!(recovered.campaign_id, original.campaign_id);
+        assert_eq!(recovered.round_id, original.round_id);
+        assert_eq!(recovered.request_sha256, original.request_sha256);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_rejects_a_result_bundle_for_another_campaign_binding() {
+        let mut fixture = fixture("recover-campaign-binding-mismatch");
+        let binding = campaign_binding_fixture(&mut fixture);
+        execute_report(fixture.args.clone(), binding).unwrap();
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let wrong_binding = ExecutionBinding::Campaign {
+            campaign_id: "cex-campaign-other".to_string(),
+            round_id: "r1".to_string(),
+            request_sha256: "b".repeat(64),
+        };
+        let error = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-mismatch.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &wrong_binding,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("published result bundle does not match the Campaign binding"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_rejects_mixed_foreign_finalization_evidence() {
+        let mut primary = finalizing_fixture("recover-campaign-foreign-finalization");
+        let binding = campaign_binding_fixture(&mut primary);
+        execute_report(primary.args.clone(), binding.clone()).unwrap();
+
+        let mut foreign = finalizing_fixture("recover-campaign-foreign-source");
+        let foreign_binding = campaign_binding_fixture(&mut foreign);
+        execute_report(foreign.args.clone(), foreign_binding).unwrap();
+
+        let foreign_results = foreign.args.work_dir.join("results");
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/finalization-report.json",
+            std::fs::read(foreign_results.join("finalization-report.json")).unwrap(),
+        );
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/final-precommit.json",
+            std::fs::read(foreign_results.join("final-precommit.json")).unwrap(),
+        );
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/sealed-holdout-receipt.json",
+            std::fs::read(foreign_results.join("sealed-holdout-receipt.json")).unwrap(),
+        );
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = recover_execution_report_from_published_result(
+            &client,
+            primary.args.result_readback_url.as_str(),
+            &primary.root.join("recovered-foreign-finalization.zip"),
+            &primary.args.mission_id,
+            &primary.args.mission_sha256,
+            &binding,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "published result bundle precommit does not match the exact Campaign Mission"
+        ));
+        std::fs::remove_dir_all(primary.root).unwrap();
+        std::fs::remove_dir_all(foreign.root).unwrap();
+    }
+
+    fn campaign_binding_fixture(fixture: &mut Fixture) -> ExecutionBinding {
+        let campaign_id = "cex-campaign-test";
+        let round_id = "r1";
+        let request_sha256 = "a".repeat(64);
+        let result_path = fixture.root.join(format!(
+            "campaign-root/campaign-id={campaign_id}/round={round_id}/results.zip"
+        ));
+        std::fs::create_dir_all(result_path.parent().unwrap()).unwrap();
+        let holdout_claim = prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+            &result_path.to_string_lossy(),
+            campaign_id,
+            round_id,
+            &fixture.args.holdout_id,
+        )
+        .unwrap();
+        let holdout_claim_path = PathBuf::from(holdout_claim);
+        std::fs::create_dir_all(holdout_claim_path.parent().unwrap()).unwrap();
+        fixture.result_path = result_path.clone();
+        fixture.args.result_put_url = result_path.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        fixture.args.holdout_claim_put_url = holdout_claim_path.to_string_lossy().into_owned();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+        ExecutionBinding::Campaign {
+            campaign_id: campaign_id.to_string(),
+            round_id: round_id.to_string(),
+            request_sha256,
+        }
+    }
+
+    fn finalizing_fixture(name: &str) -> Fixture {
+        let mut fixture = fixture(name);
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        fixture
+    }
+
+    fn rewrite_bundle_entry_bytes(bundle_path: &Path, entry_name: &str, replacement: Vec<u8>) {
+        let mut entries = read_bundle_entries(bundle_path);
+        let entry_index = entries
+            .iter()
+            .position(|(name, _)| name == entry_name)
+            .expect("bundle entry must exist");
+        entries[entry_index].1 = replacement;
+        rewrite_bundle_entries(bundle_path, entries);
+    }
+
+    fn read_bundle_entries(bundle_path: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut archive = ZipArchive::new(File::open(bundle_path).unwrap()).unwrap();
+        let mut entries = Vec::with_capacity(archive.len());
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            entries.push((entry.name().to_string(), bytes));
+        }
+        entries
+    }
+
+    fn rewrite_bundle_entries(bundle_path: &Path, entries: Vec<(String, Vec<u8>)>) {
+        let rewritten = bundle_path.with_extension("rewritten.zip");
+        let file = File::create(&rewritten).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        std::fs::rename(rewritten, bundle_path).unwrap();
     }
 
     #[test]
@@ -5027,11 +5972,25 @@ message binance_replay {
         )
         .unwrap();
         mission.validate().unwrap();
+        let mission_id = mission.semantic_id().unwrap();
         let mission_path = root.join("mission.json");
         std::fs::write(&mission_path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
-        let result_path = root.join("result.zip");
+        let mission_result_dir = root.join(format!("mission-id={mission_id}"));
+        let attempt_result_dir = mission_result_dir.join("attempt=test");
+        std::fs::create_dir_all(&attempt_result_dir).unwrap();
+        let result_path = attempt_result_dir.join("results.zip");
+        let (_, holdout_claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &result_path.to_string_lossy(),
+            &mission_id,
+            &mission.spec.holdout.holdout_id,
+        )
+        .unwrap();
+        let holdout_claim_path = PathBuf::from(holdout_claim_path);
+        std::fs::create_dir_all(holdout_claim_path.parent().unwrap()).unwrap();
         let args = ExecuteMissionArgs {
             work_dir: root.join("work-1"),
+            mission_id,
+            holdout_id: mission.spec.holdout.holdout_id.clone(),
             mission_url: mission_path.to_string_lossy().into_owned(),
             mission_sha256: sha256_file(&mission_path).unwrap(),
             feature_url: feature_path.to_string_lossy().into_owned(),
@@ -5044,6 +6003,8 @@ message binance_replay {
             resume_sha256: None,
             result_put_url: result_path.to_string_lossy().into_owned(),
             result_readback_url: result_path.to_string_lossy().into_owned(),
+            holdout_claim_put_url: holdout_claim_path.to_string_lossy().into_owned(),
+            holdout_claim_readback_url: holdout_claim_path.to_string_lossy().into_owned(),
         };
         Fixture {
             root,
@@ -5228,6 +6189,31 @@ message binance_replay {
         )
         .unwrap();
         fixture.args.mission_sha256 = sha256_file(&fixture.mission_path).unwrap();
+        if let Ok(mission_id) = fixture.mission.semantic_id() {
+            fixture.args.mission_id = mission_id;
+            bind_result_attempt(fixture, "test");
+        }
+    }
+
+    fn bind_result_attempt(fixture: &mut Fixture, attempt: &str) {
+        let mission_dir = fixture
+            .root
+            .join(format!("mission-id={}", fixture.args.mission_id));
+        let attempt_dir = mission_dir.join(format!("attempt={attempt}"));
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        fixture.result_path = attempt_dir.join("results.zip");
+        fixture.args.result_put_url = fixture.result_path.to_string_lossy().into_owned();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        let (_, claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &fixture.args.result_put_url,
+            &fixture.args.mission_id,
+            &fixture.args.holdout_id,
+        )
+        .unwrap();
+        let claim_path = PathBuf::from(claim_path);
+        std::fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
+        fixture.args.holdout_claim_put_url = claim_path.to_string_lossy().into_owned();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
     }
 
     fn resign_mission(fixture: &mut Fixture) {

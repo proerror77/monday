@@ -256,12 +256,70 @@ The image contains eight stable entrypoints:
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`
 
-`k8s/alpha-mission-job.example.yaml` is the current blessed BTCUSDT top-of-book
-GP screening and baseline Mission against a pre-materialized PIT feature file.
-It stops before the blocked Factor-Bank subset MCTS stage. The one-time signed
-OSS URLs belong in a Kubernetes Secret and must never be committed. Use distinct
-DuckDB files and result objects per parallel Mission; a later single-writer
-aggregator may merge their immutable evidence.
+`k8s/alpha-mission-job.example.yaml` is only the generated Pod-shape reference.
+The production CEX path does not render a Mission or scan feature rows on the
+workstation. The workstation prepares one private, immutable Campaign request,
+signs exact OSS objects, and submits it. The ACK Pod then performs the complete
+sequence:
+
+```text
+input GET + SHA admission
+  -> Mission render
+  -> Mission create-once PUT + GET/SHA readback
+  -> GP + screening + Factor Bank + Ridge/CART + subset MCTS
+  -> event replay + final precommit + at-most-once sealed holdout
+  -> results.zip PUT + GET/SHA readback
+  -> campaign-result.json PUT + GET/SHA readback
+```
+
+The request schema is `cex-campaign-request-v1`. It binds the exact Git source
+revision, digest-pinned image, feature/materialization/replay objects and
+SHA-256 values, expected holdout ID, and one `round` containing one seed plus
+Mission/result PUT and readback URLs. It also carries the global
+`holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
+Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
+signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
+
+Compute `campaign_id` from an unsigned request skeleton after choosing the
+input identities, image/source identities, seed, and output root. Replace the
+placeholder ID in the exact output keys, then sign those final keys. Signed
+query parameters are excluded from semantic identity, while the query-free
+input objects and output root are bound:
+
+```bash
+alpha-harness mission campaign-id \
+  --request /private/path/campaign-request.json
+```
+
+Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
+the private submission file, then submit it directly:
+
+```bash
+alpha-harness mission dispatch submit \
+  --submission /private/path/campaign-submission.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
+```
+
+The submitter creates the Job suspended, reads back its pinned execution
+template, then creates the immutable input Secret with the Job owner reference
+already attached. It reads the Secret back before releasing the Job and never
+prints the Secret or signed URLs. The Pod uses no ServiceAccount token,
+exchange account file, API key, or order/execution entrypoint.
+
+One Campaign maps to one Mission. The fixed Mission contract remains
+`200 + 3x256 + holdout256`, search budget `8 / 256`, GP policy
+`controlled_dynamic_v2`, and template family `signed_rolling_imbalance`.
+GP and subset MCTS already provide the bounded search iterations. A negative
+result terminates the Campaign; it must not trigger another seeded Mission
+without a separately designed Campaign-wide multiple-testing and holdout
+contract. A claim without a complete sealed receipt/result is terminal and
+inconclusive, not retry authority.
+
+Job completion alone is not research completion. Require the exact image ID,
+terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign
+result readback SHA. This path may emit a research promotion lineage, but it
+does not prove or authorize Paper, Shadow, or Live runtime.
 
 `k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
 security context, signed-URL input transport, and immutable result upload for one
@@ -299,8 +357,10 @@ materialization, and result URLs against the regional internal OSS endpoint
 `https://oss-ap-northeast-1-internal.aliyuncs.com`; a public OSS URL will time
 out from the worker pool. The result PUT signature must cover both
 `Content-Type: application/zip` and `x-oss-forbid-overwrite: true`, matching the
-native runner request. Delete the short-lived URL Secret after the Job reaches a
-terminal state.
+native runner request. The holdout-claim PUT signature must cover
+`Content-Type: application/json` and the same forbid-overwrite header. Delete
+the short-lived URL Secret after the Job reaches a terminal state; retain the
+claim object as the durable once-only guard.
 
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that

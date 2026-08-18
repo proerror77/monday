@@ -1,24 +1,38 @@
+# Pod-shape reference only. `alpha-harness mission dispatch submit` generates
+# the real Job and its immutable, Job-owned input Secret. Do not apply this file
+# directly and never commit a campaign request containing signed URLs.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: REPLACE_MISSION_JOB_NAME
+  name: REPLACE_CAMPAIGN_JOB_NAME
   namespace: monday-research
   annotations:
-    research.monday/evaluator-version: purged-walk-forward-v4
+    research.monday/attempt-id: REPLACE_ATTEMPT_ID
+    research.monday/campaign-id: REPLACE_CAMPAIGN_ID
+    research.monday/request-sha256: REPLACE_REQUEST_SHA256
+    research.monday/image-digest: REPLACE_IMAGE_SHA256
+    research.monday/lane: cex_research_campaign
   labels:
-    app.kubernetes.io/name: monday-alpha-mission
+    app.kubernetes.io/name: monday-alpha-campaign
     app.kubernetes.io/part-of: monday
+    research.monday/campaign-id: REPLACE_CAMPAIGN_ID
 spec:
+  suspend: true
   backoffLimit: 0
-  activeDeadlineSeconds: 900
+  activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
       annotations:
-        research.monday/evaluator-version: purged-walk-forward-v4
+        research.monday/attempt-id: REPLACE_ATTEMPT_ID
+        research.monday/campaign-id: REPLACE_CAMPAIGN_ID
+        research.monday/request-sha256: REPLACE_REQUEST_SHA256
+        research.monday/image-digest: REPLACE_IMAGE_SHA256
+        research.monday/lane: cex_research_campaign
       labels:
-        app.kubernetes.io/name: monday-alpha-mission
+        app.kubernetes.io/name: monday-alpha-campaign
         app.kubernetes.io/part-of: monday
+        research.monday/campaign-id: REPLACE_CAMPAIGN_ID
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
@@ -35,77 +49,23 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: alpha-mission
-          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+        - name: alpha-campaign
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_IMAGE_SHA256
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/alpha-harness"]
           args:
             - mission
-            - execute
+            - campaign-execute
             - --work-dir
             - /work
-            - --mission-url
-            - $(MISSION_URL)
-            - --mission-sha256
-            - $(MISSION_SHA256)
-            - --feature-url
-            - $(FEATURE_URL)
-            - --materialization-url
-            - $(MATERIALIZATION_URL)
-            - --replay-artifact-url
-            - $(REPLAY_ARTIFACT_URL)
-            - --replay-artifact-sha256
-            - $(REPLAY_ARTIFACT_SHA256)
-            - --replay-manifest-url
-            - $(REPLAY_MANIFEST_URL)
-            - --replay-manifest-sha256
-            - $(REPLAY_MANIFEST_SHA256)
-            - --result-put-url
-            - $(RESULT_PUT_URL)
-            - --result-readback-url
-            - $(RESULT_READBACK_URL)
-          env:
-            - name: MISSION_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: mission-url
-            - name: MISSION_SHA256
-              value: REPLACE_MISSION_SHA256
-            - name: FEATURE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: feature-url
-            - name: RESULT_PUT_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: result-put-url
-            - name: RESULT_READBACK_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: result-readback-url
-            - name: MATERIALIZATION_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: materialization-url
-            - name: REPLAY_ARTIFACT_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: replay-artifact-url
-            - name: REPLAY_ARTIFACT_SHA256
-              value: REPLACE_REPLAY_ARTIFACT_SHA256
-            - name: REPLAY_MANIFEST_URL
-              valueFrom:
-                secretKeyRef:
-                  name: REPLACE_URL_SECRET_NAME
-                  key: replay-manifest-url
-            - name: REPLAY_MANIFEST_SHA256
-              value: REPLACE_REPLAY_MANIFEST_SHA256
+            - --campaign-id
+            - REPLACE_CAMPAIGN_ID
+            - --image-identity
+            - REPLACE_IMAGE_SHA256
+            - --request
+            - /inputs/campaign.json
+            - --request-sha256
+            - REPLACE_REQUEST_SHA256
           resources:
             requests:
               cpu: "3500m"
@@ -123,9 +83,18 @@ spec:
               mountPath: /work
             - name: tmp
               mountPath: /tmp
+            - name: inputs
+              mountPath: /inputs
+              readOnly: true
       volumes:
         - name: work
           emptyDir:
             sizeLimit: 20Gi
         - name: tmp
           emptyDir: {}
+        - name: inputs
+          secret:
+            secretName: REPLACE_JOB_OWNED_INPUT_SECRET
+            items:
+              - key: campaign.json
+                path: campaign.json
