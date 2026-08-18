@@ -5450,7 +5450,7 @@ cutover_health_silence_seconds=$(
     "$cutover_health_silence_seconds" >&2
   exit 1
 }
-grep -Fxq 'readonly STARTUP_RECOVERY_SECONDS=600' "$CUTOVER"
+grep -Fxq 'readonly STARTUP_RECOVERY_SECONDS=1800' "$CUTOVER"
 grep -Fxq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$CUTOVER"
 grep -Fxq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$CUTOVER"
 grep -Fxq 'readonly CUTOVER_HEALTH_TIMEOUT_SECONDS=$((STARTUP_RECOVERY_SECONDS + 2 * MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$CUTOVER"

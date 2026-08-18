@@ -41,7 +41,11 @@ const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 // closed-lane discovery iterates contiguous chunks of at most this span.
 const GAMMA_DISCOVERY_WINDOW_CHUNK_SECS: i64 = 21_600;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
-const MAX_STARTUP_DURATION: Duration = Duration::from_secs(600);
+// Startup recovery of a capped tape with pending trades scans the full tape
+// four times (recovery, uploader validation, two carry passes) plus one
+// staged carry write; on the reference host a single 4GiB scan takes
+// several minutes, so the startup budget must cover that worst case.
+const MAX_STARTUP_DURATION: Duration = Duration::from_secs(1800);
 const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -2507,8 +2511,35 @@ impl ReferenceCollector {
         if state_migrated || recovered_active || state_scoped || state_path.exists() {
             atomic_write_json(&state_path, &state)?;
         }
-        if recovered_active && state.recovered_trade_ids.is_empty() {
-            writer.rotate(startup_at)?;
+        if recovered_active {
+            if state.recovered_trade_ids.is_empty() {
+                writer.rotate(startup_at)?;
+            } else if writer.tape_max_bytes > 0 && writer.tape_bytes >= writer.tape_max_bytes / 2 {
+                // A recovered tape this close to the cap with trades still
+                // pending forces the first cap-crossing write of the run into
+                // rotate_with_pending_carry: two full streaming passes over a
+                // multi-GiB tape cannot fit the 180s cycle watchdog, so the
+                // process exit(124)s and every restart re-pays the full
+                // recovery before dying the same way. Carry the pending rows
+                // here instead, under the startup recovery budget, so no
+                // cycle inherits a multi-GiB carry after a restart. Below
+                // half the cap the tape has hours of headroom — enough for
+                // pending recovery to finish and ordinary hour rotation to
+                // resume — and the carried rows are far below the threshold,
+                // so restarts do not churn.
+                // The carry writes and syncs a staged tape, so apply the same
+                // fail-closed disk probe the cycle path uses instead of
+                // risking an unhandled ENOSPC mid-startup.
+                let floor = reference_low_disk_floor_bytes(&config)?;
+                let available = available_disk_bytes(&config.spool_dir)?;
+                if available < floor {
+                    return Err(low_disk_error(format!(
+                        "low disk: {available} bytes available < {floor} byte floor; \
+                         refusing startup carry rotation to avoid ENOSPC"
+                    )));
+                }
+                writer.rotate_with_pending_carry(startup_at)?;
+            }
         }
         let http = reqwest::Client::builder()
             .timeout(config.http_timeout)
@@ -3613,7 +3644,12 @@ mod tests {
 
     #[test]
     fn startup_recovery_has_its_own_bounded_watchdog_budget() {
-        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(600));
+        // Startup recovery of a capped tape with pending trades scans the
+        // whole tape four times (recover, uploader validation, two carry
+        // passes) before the first cycle; on the reference host one 4GiB
+        // scan takes several minutes, so the budget must cover that worst
+        // case without turning into an unbounded wait.
+        assert_eq!(MAX_STARTUP_DURATION, Duration::from_secs(1800));
         assert!(MAX_STARTUP_DURATION > MAX_CYCLE_DURATION);
     }
 
@@ -7320,6 +7356,187 @@ mod tests {
         )
         .is_empty());
         restarted_again.writer.close().unwrap();
+    }
+
+    #[test]
+    fn startup_rotates_with_carry_when_pending_recovery_tape_is_near_the_cap() {
+        let root = TestDir::new();
+        let recorded_at = utc_now();
+        let metadata = valid_metadata_update(recorded_at);
+        let trade = valid_trade_update(recorded_at, recorded_at.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let mut filler = valid_metadata_update(recorded_at);
+        filler["payload"] = json!("x".repeat(400_000));
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2", "trade_completion_version": "v1"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer
+                .write_updates(&[metadata, trade.clone()], recorded_at)
+                .unwrap();
+            // Push the tape past half the cap without crossing it, leaving a
+            // pending trade that the first cycle's write would have to carry.
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer.close().unwrap();
+        }
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            tape_max_bytes: MIN_TAPE_MAX_BYTES,
+            ..ReferenceConfig::default()
+        };
+
+        let mut collector = ReferenceCollector::new(config.clone()).unwrap();
+
+        // The near-cap pending tape is carried under the startup recovery
+        // budget instead of being deferred to the first cycle's 180s
+        // watchdog, where a multi-GiB carry cannot finish.
+        let rotated = rotated_tapes(root.path());
+        assert_eq!(rotated.len(), 1);
+        let rotated_rows = fs::read_to_string(&rotated[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rotated_rows.len(), 4);
+        for (index, row) in rotated_rows.iter().enumerate() {
+            assert_eq!(row["sequence"], Value::from(index as u64));
+        }
+        // The fresh active tape re-states the pending trade and the latest
+        // metadata row for its condition, with fresh sequences.
+        let active_rows = fs::read_to_string(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["sequence"], 0);
+        assert_eq!(active_rows[0]["update"], trade);
+        assert_eq!(active_rows[1]["sequence"], 1);
+        assert_eq!(active_rows[1]["update"], filler);
+        assert!(collector.writer.recovery_pending);
+        assert!(collector.state.recovered_trade_ids["condition-1"].contains(&record_id));
+        // The carried tape stays a valid upload segment: the pending trade's
+        // metadata context was carried with it.
+        let manifest = crate::polymarket_upload::scan_tape(
+            &root.path().join(ACTIVE_TAPE),
+            "crypto_expiry_reference",
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(manifest["reference_context_complete"], true);
+        collector.writer.close().unwrap();
+        drop(collector);
+
+        // A second restart recovers the small carried tape: no churn
+        // re-rotation, and the pending trade survives intact.
+        let mut restarted = ReferenceCollector::new(config).unwrap();
+        assert_eq!(rotated_tapes(root.path()).len(), 1);
+        assert!(restarted.state.recovered_trade_ids["condition-1"].contains(&record_id));
+        restarted.writer.close().unwrap();
+    }
+
+    #[test]
+    fn startup_carry_refuses_a_near_cap_pending_tape_when_disk_is_low() {
+        let root = TestDir::new();
+        let recorded_at = utc_now();
+        let metadata = valid_metadata_update(recorded_at);
+        let trade = valid_trade_update(recorded_at, recorded_at.timestamp());
+        let mut filler = valid_metadata_update(recorded_at);
+        filler["payload"] = json!("x".repeat(400_000));
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2", "trade_completion_version": "v1"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer
+                .write_updates(&[metadata, trade], recorded_at)
+                .unwrap();
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer.close().unwrap();
+        }
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            tape_max_bytes: MIN_TAPE_MAX_BYTES,
+            low_disk_floor_bytes: Some(u64::MAX),
+            ..ReferenceConfig::default()
+        };
+
+        let error = ReferenceCollector::new(config)
+            .err()
+            .expect("startup carry must fail closed on low disk");
+
+        assert!(error.to_string().contains("low disk"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert!(rotated_tapes(root.path()).is_empty());
+    }
+
+    #[test]
+    fn startup_keeps_a_small_pending_recovery_tape_active_without_carry() {
+        let root = TestDir::new();
+        let recorded_at = utc_now();
+        let metadata = valid_metadata_update(recorded_at);
+        let trade = valid_trade_update(recorded_at, recorded_at.timestamp());
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2", "trade_completion_version": "v1"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer
+                .write_updates(&[metadata, trade.clone()], recorded_at)
+                .unwrap();
+            writer.close().unwrap();
+        }
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            tape_max_bytes: MIN_TAPE_MAX_BYTES,
+            ..ReferenceConfig::default()
+        };
+
+        let mut collector = ReferenceCollector::new(config).unwrap();
+
+        // Far below the cap, startup recovery keeps appending to the active
+        // tape (no rotation) so restarts do not churn segments.
+        assert!(rotated_tapes(root.path()).is_empty());
+        assert!(collector.writer.recovery_pending);
+        assert!(collector.state.recovered_trade_ids["condition-1"].contains(&record_id));
+        let active_rows = fs::read_to_string(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0]["update"]["kind"], "market_metadata");
+        assert_eq!(active_rows[1]["update"], trade);
+        collector.writer.close().unwrap();
     }
 
     #[test]
