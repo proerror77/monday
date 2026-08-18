@@ -1361,29 +1361,56 @@ shadow_finalization_counters() {
 # during the gate are unioned in while they still exist.
 snapshot_legacy_tapes() {
   local snapshot_dir=$1 window_start_unix=$2
-  local path name stamp rotated_at
+  local path name rest stamp suffix rotated_at existing_path relocated_name
   for path in "$LEGACY_SPOOL"/market-updates.ndjson \
     "$LEGACY_SPOOL"/market-updates.*.ndjson; do
     [[ -f $path && ! -L $path ]] || continue
     name=${path##*/}
     if [[ $name != market-updates.ndjson ]]; then
       # market-updates.<YYYYMMDDTHHMMSS[ffffff]>[.<uuid>].ndjson, mirroring
-      # strict_rotation_name/rotation_epoch in the parity verifier.
-      stamp=${name#market-updates.}
-      stamp=${stamp%%.*}
-      [[ $stamp =~ ^[0-9]{8}T[0-9]{6}([0-9]{6})?$ ]] || continue
+      # strict_rotation_name/rotation_epoch in the parity verifier; the
+      # snapshot is now the verifier's only baseline input, so a malformed
+      # rotated name must fail closed here exactly as it would there.
+      rest=${name#market-updates.}
+      rest=${rest%.ndjson}
+      stamp=${rest%%.*}
+      suffix=${rest#"$stamp"}
+      [[ $stamp =~ ^[0-9]{8}T[0-9]{6}([0-9]{6})?$ ]] \
+        || die "invalid rotated baseline tape name: $name"
+      [[ -z $suffix || $suffix =~ ^\.[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+        || die "invalid rotated baseline tape name: $name"
       rotated_at=$(date -u -d \
         "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" \
         +%s) || die "could not parse baseline tape rotation time: $name"
       ((rotated_at >= window_start_unix - LEGACY_TAPE_WINDOW_LOOKBACK_SECONDS)) \
         || continue
     fi
-    [[ ! -e $snapshot_dir/$name && ! -L $snapshot_dir/$name ]] || continue
-    ln "$path" "$snapshot_dir/$name" 2>/dev/null && continue
-    # A vanished source means the uploader won its deletion race before this
-    # sweep; any other hardlink failure (for example a cross-device evidence
-    # filesystem) leaves the baseline evidence incomplete, so fail closed.
-    [[ ! -e $path ]] || die "could not hardlink baseline tape into the evidence snapshot: $name"
+    # Never pin the same inode twice: the then-active tape keeps its inode
+    # after rotation, so a first-sweep link can be -ef a later rotated name,
+    # and a duplicate link would make the verifier read the rows twice.
+    for existing_path in "$snapshot_dir"/*; do
+      [[ -e $existing_path || -L $existing_path ]] || continue
+      [[ ! $existing_path -ef $path ]] || continue 2
+    done
+    if [[ $name == market-updates.ndjson && -e $snapshot_dir/$name ]]; then
+      # The live active tape rotated between sweeps. Preserve the stale link
+      # under a synthetic closed-tape name — its live rotated name may already
+      # be uploaded and deleted — then repoint the active name. The stamp only
+      # feeds the verifier's lookback filter, so the current time is correct;
+      # the PID suffix keeps the synthetic name unique within this run.
+      relocated_name="market-updates.$(date -u +%Y%m%dT%H%M%S)"
+      relocated_name+=$(printf '.00000000-0000-4000-8000-%012x.ndjson' "$$")
+      [[ ! -e $snapshot_dir/$relocated_name ]] \
+        || die "baseline tape snapshot name collision: $relocated_name"
+      mv "$snapshot_dir/$name" "$snapshot_dir/$relocated_name" \
+        || die 'could not relocate the rotated baseline tape snapshot link'
+    fi
+    # Any failure — a cross-device evidence filesystem, or the uploader
+    # winning its deletion race against this sweep — leaves the baseline
+    # evidence incomplete, so fail closed instead of verifying a truncated
+    # baseline.
+    ln "$path" "$snapshot_dir/$name" 2>/dev/null \
+      || die "could not hardlink baseline tape into the evidence snapshot: $name"
   done
 }
 

@@ -3661,7 +3661,8 @@ done
 
 # The baseline tape snapshot hardlinks the lookback-window tapes so the
 # production uploader's post-upload deletion cannot truncate the verifier's
-# baseline view, and re-sweeps union tapes rotated after the first sweep.
+# baseline view, re-sweeps union tapes rotated after the first sweep without
+# ever pinning an inode twice, and fails closed on malformed rotated names.
 if date -u -d @0 +%s >/dev/null 2>&1; then
   (
     snapshot_fn_contract="$tmp_dir/snapshot-legacy-tapes.sh"
@@ -3704,6 +3705,65 @@ if date -u -d @0 +%s >/dev/null 2>&1; then
     [[ $(cat "$tape_snapshot_dir/market-updates.19700102T033000.ndjson") \
       == 'rotated rows' ]] || {
       printf 'snapshot_legacy_tapes did not union a tape rotated after the first sweep\n' >&2
+      exit 1
+    }
+    # Rotate the live active tape between sweeps: the stale link must move to
+    # a synthetic closed name, the new active must be pinned, and the rotated
+    # inode must not be linked a second time (the verifier would read the
+    # rows twice and report spurious duplicates).
+    mv "$snapshot_legacy_spool/market-updates.ndjson" \
+      "$snapshot_legacy_spool/market-updates.19700102T034600.ndjson"
+    printf 'new active rows\n' >"$snapshot_legacy_spool/market-updates.ndjson"
+    snapshot_legacy_tapes "$tape_snapshot_dir" 100000
+    [[ $tape_snapshot_dir/market-updates.ndjson \
+      -ef $snapshot_legacy_spool/market-updates.ndjson ]] || {
+      printf 'snapshot_legacy_tapes did not repoint the rotated active tape\n' >&2
+      exit 1
+    }
+    [[ $(grep -lx 'active rows' "$tape_snapshot_dir"/* | wc -l) -eq 1 \
+      && $(cat "$tape_snapshot_dir"/market-updates.ndjson) \
+        == 'new active rows' \
+      && $(find "$tape_snapshot_dir" -type f | wc -l) -eq 4 ]] || {
+      printf 'snapshot_legacy_tapes double-linked or lost a rotated tape\n' >&2
+      exit 1
+    }
+    # A malformed rotated name and a same-name foreign inode both fail closed.
+    printf 'bad\n' >"$snapshot_legacy_spool/market-updates.not-a-tape.ndjson"
+    set +e
+    ( snapshot_legacy_tapes "$tape_snapshot_dir" 100000 ) 2>/dev/null
+    malformed_status=$?
+    set -e
+    [[ $malformed_status -ne 0 ]] || {
+      printf 'snapshot_legacy_tapes accepted a malformed rotated tape name\n' >&2
+      exit 1
+    }
+    rm "$snapshot_legacy_spool/market-updates.not-a-tape.ndjson"
+    rm "$tape_snapshot_dir/market-updates.19700102T033000.ndjson"
+    printf 'foreign\n' \
+      >"$tape_snapshot_dir/market-updates.19700102T033000.ndjson"
+    set +e
+    ( snapshot_legacy_tapes "$tape_snapshot_dir" 100000 ) 2>/dev/null
+    conflict_status=$?
+    set -e
+    [[ $conflict_status -ne 0 ]] || {
+      printf 'snapshot_legacy_tapes linked over a same-name foreign inode\n' >&2
+      exit 1
+    }
+    # The uploader winning its deletion race against the link attempt must
+    # fail closed as well: an enumerated baseline tape that never lands in
+    # the snapshot would silently truncate the verifier's baseline.
+    ln() {
+      # The source vanishes between the sweep's existence check and the link.
+      rm -f "$1"
+      return 1
+    }
+    set +e
+    ( snapshot_legacy_tapes "$tape_snapshot_dir" 100000 ) 2>/dev/null
+    race_status=$?
+    set -e
+    unset -f ln
+    [[ $race_status -ne 0 ]] || {
+      printf 'snapshot_legacy_tapes ignored a source deleted mid-link\n' >&2
       exit 1
     }
   )
