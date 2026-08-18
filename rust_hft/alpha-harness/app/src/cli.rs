@@ -411,6 +411,9 @@ pub struct ExecuteMissionArgs {
     pub work_dir: PathBuf,
     #[arg(long)]
     pub mission_id: String,
+    /// Exact sealed-holdout identity from the Mission artifact.
+    #[arg(long)]
+    pub holdout_id: String,
     #[arg(long)]
     pub mission_url: String,
     #[arg(long)]
@@ -438,7 +441,7 @@ pub struct ExecuteMissionArgs {
     /// Independently authorized read URL for the immutable published result bundle.
     #[arg(long)]
     pub result_readback_url: String,
-    /// Create-once mission-scoped claim written immediately before sealed holdout access.
+    /// Create-once holdout-scoped claim written immediately before sealed holdout access.
     #[arg(long)]
     pub holdout_claim_put_url: String,
     /// Independently authorized read URL for the same immutable holdout claim object.
@@ -847,15 +850,18 @@ mod tests {
             .display()
             .to_string();
         let mission_id = format!("cex-mission-{}", "a".repeat(64));
+        let holdout_id = "holdout-test".to_string();
         let mission_result_dir = root.path().join(format!("mission-id={mission_id}"));
         let result = mission_result_dir
             .join("attempt=test/results.zip")
             .display()
             .to_string();
-        let holdout_claim = mission_result_dir
-            .join("sealed-holdout-claim.json")
-            .display()
-            .to_string();
+        let (_, holdout_claim) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            &result,
+            &mission_id,
+            &holdout_id,
+        )
+        .unwrap();
         let cli = Cli::try_parse_from(vec![
             "alpha-harness".to_owned(),
             "mission".to_owned(),
@@ -864,6 +870,8 @@ mod tests {
             work_dir,
             "--mission-id".to_owned(),
             mission_id,
+            "--holdout-id".to_owned(),
+            holdout_id,
             "--mission-url".to_owned(),
             missing_mission.clone(),
             "--mission-sha256".to_owned(),
@@ -1176,6 +1184,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "work",
             "--mission-id",
             "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1230,6 +1240,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "work",
             "--mission-id",
             "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",
@@ -1280,6 +1292,8 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "work",
             "--mission-id",
             "cex-mission-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--holdout-id",
+            "holdout-test",
             "--mission-url",
             "mission.json",
             "--mission-sha256",

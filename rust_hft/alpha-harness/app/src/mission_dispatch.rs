@@ -1,6 +1,6 @@
 use crate::{
     cli::{print_json, MissionDispatchRenderArgs},
-    mission_runner::{normalized_sha256, validate_cex_mission_id},
+    mission_runner::{normalized_sha256, validate_cex_holdout_id, validate_cex_mission_id},
     prediction_dispatch::{
         canonical_https_object, cex_result_attempt_and_holdout_claim, validate_dns_label,
     },
@@ -18,6 +18,7 @@ const ACTIVE_DEADLINE_SECONDS: u64 = 900;
 struct MissionDispatchSubmission {
     attempt_id: String,
     mission_id: String,
+    holdout_id: String,
     image: String,
     mission_url: String,
     mission_sha256: String,
@@ -82,6 +83,7 @@ fn validate_submission(
 ) -> anyhow::Result<ValidatedSubmission> {
     validate_dns_label("attempt id", &submission.attempt_id)?;
     validate_cex_mission_id(&submission.mission_id)?;
+    validate_cex_holdout_id(&submission.holdout_id)?;
     let image_digest = image_digest(&submission.image)?;
     let mission_sha256 = normalized_sha256("mission", &submission.mission_sha256)?;
     let replay_artifact_sha256 =
@@ -102,8 +104,11 @@ fn validate_submission(
     if result_object != result_readback_object {
         bail!("result readback URL must identify the same immutable result object");
     }
-    let (result_attempt_id, expected_holdout_claim_object) =
-        cex_result_attempt_and_holdout_claim(&result_object, &submission.mission_id)?;
+    let (result_attempt_id, expected_holdout_claim_object) = cex_result_attempt_and_holdout_claim(
+        &result_object,
+        &submission.mission_id,
+        &submission.holdout_id,
+    )?;
     if result_attempt_id != submission.attempt_id {
         bail!("result object must bind the exact attempt id");
     }
@@ -117,7 +122,7 @@ fn validate_submission(
         bail!("holdout claim readback URL must identify the same immutable object");
     }
     if holdout_claim_object != expected_holdout_claim_object {
-        bail!("holdout claim object must be the mission-scoped sibling of the result attempt");
+        bail!("holdout claim object must be the holdout-scoped sibling of the Mission results");
     }
     let resume_sha256 = match (
         submission
@@ -167,6 +172,8 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
     validate_dns_label("namespace", namespace)?;
     let resume_url = validated.submission.resume_url.as_deref().unwrap_or("");
     let resume_sha256 = validated.resume_sha256.as_deref().unwrap_or("");
+    let mission_id_arg = format!("--mission-id={}", validated.submission.mission_id);
+    let holdout_id_arg = format!("--holdout-id={}", validated.submission.holdout_id);
     let labels = json!({
         "app.kubernetes.io/name": "monday-alpha-mission",
         "app.kubernetes.io/part-of": "monday",
@@ -260,7 +267,8 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                     "mission",
                                     "execute",
                                     "--work-dir", "/work",
-                                    "--mission-id", validated.submission.mission_id,
+                                    mission_id_arg,
+                                    holdout_id_arg,
                                     "--mission-url", "$(MISSION_URL)",
                                     "--mission-sha256", "$(MISSION_SHA256)",
                                     "--feature-url", "$(FEATURE_URL)",
@@ -402,7 +410,27 @@ mod tests {
         );
         submission.holdout_claim_readback_url = submission.holdout_claim_put_url.clone();
         let error = validate_submission(submission).unwrap_err();
-        assert!(format!("{error:#}").contains("mission-scoped sibling"));
+        assert!(format!("{error:#}").contains("holdout-scoped sibling"));
+    }
+
+    #[test]
+    fn the_same_holdout_uses_one_claim_across_missions() {
+        let first_mission = mission_id();
+        let second_mission = format!("cex-mission-{}", "b".repeat(64));
+        let first_result = format!(
+            "https://oss-internal/results/mission-id={first_mission}/attempt=001/results.zip"
+        );
+        let second_result = format!(
+            "https://oss-internal/results/mission-id={second_mission}/attempt=001/results.zip"
+        );
+        let (_, first_claim) =
+            cex_result_attempt_and_holdout_claim(&first_result, &first_mission, holdout_id())
+                .unwrap();
+        let (_, second_claim) =
+            cex_result_attempt_and_holdout_claim(&second_result, &second_mission, holdout_id())
+                .unwrap();
+
+        assert_eq!(first_claim, second_claim);
     }
 
     fn result_url(file: &str) -> String {
@@ -416,6 +444,10 @@ mod tests {
         format!("cex-mission-{}", "a".repeat(64))
     }
 
+    fn holdout_id() -> &'static str {
+        "cex-holdout-1"
+    }
+
     fn valid_submission(
         result_put_url: &str,
         result_readback_url: &str,
@@ -424,6 +456,7 @@ mod tests {
         MissionDispatchSubmission {
             attempt_id: "001".to_string(),
             mission_id: mission_id(),
+            holdout_id: holdout_id().to_string(),
             image: "registry/research-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             mission_url: "https://oss-internal/missions/mission.json?signature=x".to_string(),
             mission_sha256: mission_sha256.clone(),
@@ -435,16 +468,20 @@ mod tests {
             replay_manifest_sha256: "4".repeat(64),
             result_put_url: result_put_url.to_string(),
             result_readback_url: result_readback_url.to_string(),
-            holdout_claim_put_url: format!(
-                "https://oss-internal/results/mission-id={}/sealed-holdout-claim.json?signature=put",
-                mission_id()
-            ),
-            holdout_claim_readback_url: format!(
-                "https://oss-internal/results/mission-id={}/sealed-holdout-claim.json?signature=get",
-                mission_id()
-            ),
+            holdout_claim_put_url: format!("{}?signature=put", holdout_claim_url()),
+            holdout_claim_readback_url: format!("{}?signature=get", holdout_claim_url()),
             resume_url: None,
             resume_sha256: None,
         }
+    }
+
+    fn holdout_claim_url() -> String {
+        let (_, claim) = cex_result_attempt_and_holdout_claim(
+            &result_url("results.zip"),
+            &mission_id(),
+            holdout_id(),
+        )
+        .unwrap();
+        claim
     }
 }

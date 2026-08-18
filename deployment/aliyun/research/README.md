@@ -284,15 +284,15 @@ search budget `8 / 256`, schema `v1`, GP policy `controlled_dynamic_v2`, and
 template family `signed_rolling_imbalance`.
 
 Create a private dispatch submission JSON; never commit signed URLs. Include the
-attempt id, semantic Mission ID, digest-pinned image, mission URL/SHA, feature/materialization/replay
+attempt id, semantic Mission ID, exact Mission holdout ID, digest-pinned image, mission URL/SHA, feature/materialization/replay
 URLs and replay SHAs, result PUT/readback URLs, and an optional complete resume
 pair. The result path must end exactly with
 `mission-id=<SEMANTIC_MISSION_ID>/attempt=<ATTEMPT_ID>/results.zip`. Also include
-PUT/readback URLs for its fixed
-mission-scoped sibling `sealed-holdout-claim.json`; this create-once object is
+PUT/readback URLs for the fixed
+`holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` object; this create-once object is
 written immediately before sealed holdout access and prevents another attempt
-from opening the same holdout. If that claim exists without a sealed receipt or
-result, stop: the Mission is terminal and inconclusive, and the same holdout must
+or Mission from opening the same holdout. If that claim exists without a sealed
+receipt or result, stop: the holdout is terminal and inconclusive, and it must
 not be retried. Render the Kubernetes Secret + Job offline with:
 
 ```bash

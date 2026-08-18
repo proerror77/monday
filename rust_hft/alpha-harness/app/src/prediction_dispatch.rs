@@ -1285,6 +1285,7 @@ pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> any
 pub(crate) fn cex_result_attempt_and_holdout_claim(
     result_object: &str,
     mission_id: &str,
+    holdout_id: &str,
 ) -> anyhow::Result<(String, String)> {
     let segment = format!("/mission-id={mission_id}/");
     let mut matches = result_object.match_indices(&segment);
@@ -1302,8 +1303,9 @@ pub(crate) fn cex_result_attempt_and_holdout_claim(
     Ok((
         attempt_id.to_string(),
         format!(
-            "{}{segment}sealed-holdout-claim.json",
-            &result_object[..index]
+            "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
+            result_object[..index].trim_end_matches('/'),
+            sha256_text(holdout_id),
         ),
     ))
 }

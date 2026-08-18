@@ -80,18 +80,25 @@ The bounded CEX entrypoint consumes a separate Agent-produced,
 content-addressed `cex-research-mission-v1` artifact:
 
 ```bash
+HOLDOUT_ID='the exact spec.holdout.holdout_id from mission.json'
+HOLDOUT_ID_SHA256=$(printf '%s' "$HOLDOUT_ID" | sha256sum | awk '{print $1}')
+
 cargo run -p alpha-harness -- mission execute \
   --work-dir var/runs/cex-mission-1 \
   --mission-id "$MISSION_ID" \
+  --holdout-id "$HOLDOUT_ID" \
   --mission-url var/missions/cex-mission.json \
   --mission-sha256 "$MISSION_SHA256" \
   --feature-url var/materializations/features.jsonl \
   --materialization-url var/materializations/materialization.json \
   --result-put-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
   --result-readback-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
-  --holdout-claim-put-url "var/results/mission-id=$MISSION_ID/sealed-holdout-claim.json" \
-  --holdout-claim-readback-url "var/results/mission-id=$MISSION_ID/sealed-holdout-claim.json"
+  --holdout-claim-put-url "var/results/holdout-id-sha256=$HOLDOUT_ID_SHA256/sealed-holdout-claim.json" \
+  --holdout-claim-readback-url "var/results/holdout-id-sha256=$HOLDOUT_ID_SHA256/sealed-holdout-claim.json"
 ```
+
+For local paths, immutable publication creates missing real parent directories
+and rejects symbolic-link ancestors before writing.
 
 Resume a persisted subset-search checkpoint into a fresh work directory by
 adding `--resume-url <checkpoint.json>` and
