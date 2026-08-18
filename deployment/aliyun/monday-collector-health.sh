@@ -18,10 +18,12 @@
 #      constants). A missing/unparseable last_success_at is a breach: the
 #      delivery loop is unproven. The fee uploader gains last_success_at in a
 #      parallel change; until that deploys, the fee lane breaches by design.
-#      The polymarket lanes additionally breach once last_success_at is older
-#      than POLY_PENDING_STALE_MAX_AGE while rotated tapes are still pending:
-#      an upload stall with a live backlog must alert within 30 minutes, not
-#      after two full rotations.
+#      The polymarket lanes additionally breach once the oldest pending
+#      rotated tape exceeds POLY_PENDING_STALE_MAX_AGE: an upload stall with
+#      a live backlog must alert within 30 minutes, not after two full
+#      rotations. (Keyed on pending age, not last_success_at: with hourly
+#      rotation the last success is legitimately ~60 minutes old whenever a
+#      fresh tape awaits the next timer run.)
 #   3. Pending upload backlog is bounded: the pending count stays under the
 #      lane limit AND the oldest pending artifact stays younger than the lane
 #      age bound. Pending artifacts are discovered with the same rules the
@@ -34,8 +36,9 @@
 #      .uploaded.json readback marker.
 #   4. failure_count must not grow between polls and last_error must be empty,
 #      uniformly across all upload lanes.
-#   5. /data disk watermarks: free below DISK_WARN_PERCENT is a warning; free
-#      below DISK_CRIT_PERCENT (used >= 85%) is a breach. The 2026-08-17/18
+#   5. /data disk watermarks: free at or below DISK_WARN_PERCENT is a warning;
+#      free at or below DISK_CRIT_PERCENT (used >= 85%) is a breach. The
+#      2026-08-17/18
 #      incidents reached 100% twice, so the critical watermark pages a human
 #      instead of only warning.
 #   6. polymarket-market-tape-upload.timer and polymarket-reference-upload.timer
@@ -297,12 +300,12 @@ check_disk() {
     disk_free_gb=$((disk_avail_kib / 1048576))
     disk_critical=0
     disk_warning=0
-    if [ "$disk_free_percent" -lt "$DISK_CRIT_PERCENT" ]; then
+    if [ "$disk_free_percent" -le "$DISK_CRIT_PERCENT" ]; then
       disk_critical=1
-      record_breach "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below critical ${DISK_CRIT_PERCENT}%"
-    elif [ "$disk_free_percent" -lt "$DISK_WARN_PERCENT" ]; then
+      record_breach "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) at or below critical ${DISK_CRIT_PERCENT}%"
+    elif [ "$disk_free_percent" -le "$DISK_WARN_PERCENT" ]; then
       disk_warning=1
-      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) below warning ${DISK_WARN_PERCENT}%"
+      record_warning "disk: /data free ${disk_free_percent}% (${disk_free_gb}GiB) at or below warning ${DISK_WARN_PERCENT}%"
     fi
   fi
   disk_json=$(jq -n --argjson p "$disk_free_percent" --argjson g "$disk_free_gb" \
@@ -619,8 +622,8 @@ check_upload_lane() {
   # The four hard gates, applied per upload lane:
   #   gate 1 (mandated lanes only): upload-status.json exists and parses.
   #   gate 2: last_success_at present and younger than $success_max_age.
-  #           When $8 (pending_stale_max_age) is set, a backlog with a last
-  #           success older than that tighter bound is also a breach.
+  #           When $8 (pending_stale_max_age) is set, a pending artifact older
+  #           than that tighter stall bound is also a breach.
   #   gate 3: pending backlog count/age under $pending_max/$pending_max_age.
   #   gate 4: last_error empty and failure_count not growing (cumulative
   #           counter vs the previous poll; a first observation with a
@@ -672,6 +675,17 @@ check_upload_lane() {
   fi
   if [ "$pending_age" -gt "$pending_max_age" ]; then
     record_breach "$label: oldest pending upload backlog age ${pending_age}s over ${pending_max_age}s"
+  fi
+  # Gate 2 addendum (lanes passing $8): a rotated tape sitting unuploaded
+  # longer than the tighter stall bound means the uploader is stalled even
+  # when the lane cadence bound has not elapsed. Keyed on the oldest pending
+  # artifact's age rather than last_success_at: with hourly tape rotation the
+  # last success is legitimately ~60 minutes old in the minutes between a
+  # rotation and the next timer run, so a success-age condition would page on
+  # a healthy lane.
+  if [ "$pending_stale_max_age" -gt 0 ] && [ "$pending_count" -gt 0 ] \
+    && [ "$pending_age" -gt "$pending_stale_max_age" ]; then
+    record_breach "$label: $pending_count pending upload(s) stalled (oldest age ${pending_age}s > ${pending_stale_max_age}s)"
   fi
 
   if [ ! -f "$upload_file" ] || [ -L "$upload_file" ]; then
@@ -737,10 +751,6 @@ check_upload_lane() {
     success_age_json=$success_age
     if [ "$success_age" -gt "$success_max_age" ]; then
       record_breach "$label: last upload success stale (age ${success_age}s > ${success_max_age}s)"
-    fi
-    if [ "$pending_stale_max_age" -gt 0 ] && [ "$pending_count" -gt 0 ] \
-      && [ "$success_age" -gt "$pending_stale_max_age" ]; then
-      record_breach "$label: $pending_count pending upload(s) with last success stale (age ${success_age}s > ${pending_stale_max_age}s)"
     fi
   fi
 

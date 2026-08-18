@@ -10,7 +10,7 @@
 #      lanes a backlog with a last success older than 30 minutes also breaches
 #   3. pending upload backlog bounded (count + oldest pending age)
 #   4. failure_count not growing, last_error empty (all lanes)
-#   5. /data disk: free < 25% warns, free < 15% (used >= 85%) breaches
+#   5. /data disk: free <= 25% warns, free <= 15% (used >= 85%) breaches
 #   6. polymarket upload timers must be active while their collector is active
 # plus the raw-ops Gate containment contract (static template with no active
 # instance, running lock, or residual environment) and state-persistence
@@ -683,7 +683,7 @@ healthy_fixtures
 STUB_DF_AVAIL_KIB=$DF_AVAIL_CRIT
 run_health
 expect "disk critical: exit 1" "$(rc_is 1; echo $?)"
-expect "disk critical: breach message" "$(grep_out '^breach: disk: /data free .* below critical 15%'; echo $?)"
+expect "disk critical: breach message" "$(grep_out '^breach: disk: /data free .* at or below critical 15%'; echo $?)"
 
 reset_env
 reset_state
@@ -693,7 +693,7 @@ STUB_DF_AVAIL_KIB=$DF_AVAIL_WARN
 run_health
 expect "disk warn band: exit 0" "$(rc_is 0; echo $?)"
 expect "disk warn band: ok:true" "$(grep_out '^ok:true$'; echo $?)"
-expect "disk warn band: warning message" "$(grep_out '^warning: disk: /data free .* below warning 25%'; echo $?)"
+expect "disk warn band: warning message" "$(grep_out '^warning: disk: /data free .* at or below warning 25%'; echo $?)"
 expect "disk warn band: no breach lines" "$(grep_not_out '^breach:'; echo $?)"
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +1000,7 @@ expect "json warnings: ok:true with warnings" "$(json_query '
   .ok == true
   and (.breaches | length) == 0
   and (.warnings | length) >= 2
-  and (.warnings | any(contains("below warning")))
+  and (.warnings | any(contains("at or below warning")))
   and (.warnings | any(contains("delay-gate trip")))
 '; echo $?)"
 
@@ -1056,28 +1056,46 @@ expect "gate6 reference timer down: breach message" "$(grep_out '^breach: polyma
 # timers alone stay warnings (covered by the healthy baseline and section 13).
 
 # ---------------------------------------------------------------------------
-# 25. Gate 2 polymarket addendum: last_success_at stale beyond 30 minutes
-#     with a pending rotated tape is a breach; without pending it is not
+# 25. Gate 2 polymarket addendum: a pending rotated tape older than 30
+#     minutes is a breach; a fresh pending tape with an hour-old last success
+#     (normal post-rotation window) is not
 # ---------------------------------------------------------------------------
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 write_upload "$spool_root/polymarket/upload-status.json" null null 0 1900
-: > "$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+tape="$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t "$(jq -rn 'now - 1900 | floor | gmtime | strftime("%Y%m%d%H%M.%S")')" "$tape"
 run_health
-expect "gate2 poly stale with pending: exit 1" "$(rc_is 1; echo $?)"
-expect "gate2 poly stale with pending: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: 1 pending upload(s) with last success stale (age .*s > 1800s)'; echo $?)"
+expect "gate2 poly pending stalled: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 poly pending stalled: breach message" "$(grep_out '^breach: polymarket-market-tape-upload: 1 pending upload(s) stalled (oldest age .*s > 1800s)'; echo $?)"
 
 reset_env
 reset_state
 healthy_scenario
 healthy_fixtures
 write_upload "$spool_root/polymarket-reference/upload-status.json" null null 0 1900
-: > "$spool_root/polymarket-reference/market-updates.20200101T000000.ndjson"
+tape="$spool_root/polymarket-reference/market-updates.20200101T000000.ndjson"
+: > "$tape"
+touch -t "$(jq -rn 'now - 1900 | floor | gmtime | strftime("%Y%m%d%H%M.%S")')" "$tape"
 run_health
-expect "gate2 poly-ref stale with pending: exit 1" "$(rc_is 1; echo $?)"
-expect "gate2 poly-ref stale with pending: breach message" "$(grep_out '^breach: polymarket-reference-upload: 1 pending upload(s) with last success stale'; echo $?)"
+expect "gate2 poly-ref pending stalled: exit 1" "$(rc_is 1; echo $?)"
+expect "gate2 poly-ref pending stalled: breach message" "$(grep_out '^breach: polymarket-reference-upload: 1 pending upload(s) stalled'; echo $?)"
+
+# Healthy post-rotation window: last success ~55 minutes old and a just-
+# rotated tape pending — the uploader picks it up on the next timer run, so
+# this must NOT page.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_upload "$spool_root/polymarket/upload-status.json" null null 0 3300
+: > "$spool_root/polymarket/market-updates.20200101T000000.ndjson"
+run_health
+expect "gate2 poly fresh pending post-rotation: exit 0" "$(rc_is 0; echo $?)"
+expect "gate2 poly fresh pending post-rotation: ok:true" "$(grep_out '^ok:true$'; echo $?)"
 
 reset_env
 reset_state
