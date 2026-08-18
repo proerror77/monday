@@ -99,21 +99,22 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
 }
 
 #[derive(Debug, Deserialize)]
-struct Materialization {
+pub(crate) struct Materialization {
     dataset_kind: String,
     schema_version: String,
-    mission_id: String,
-    symbol: String,
-    market: String,
-    source_revision: String,
+    pub(crate) mission_id: String,
+    pub(crate) symbol: String,
+    pub(crate) market: String,
+    pub(crate) source_revision: String,
     source_segments: Vec<SourceSegment>,
-    artifact_sha256: String,
-    bucket_ms: u64,
-    label_horizon_buckets: usize,
-    top_depth: usize,
+    pub(crate) artifact_sha256: String,
+    pub(crate) bucket_ms: u64,
+    pub(crate) label_horizon_buckets: usize,
+    pub(crate) top_depth: usize,
+    pub(crate) rows: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
-    snapshot: CexReplaySnapshotV4,
+    pub(crate) snapshot: CexReplaySnapshotV4,
     snapshot_sha256: String,
 }
 
@@ -1169,7 +1170,7 @@ fn registry_content_reference(
     content_reference(id, &serde_json::to_value(artifact)?)
 }
 
-fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
+pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("materialization manifest is invalid JSON")?;
     match value
@@ -1832,7 +1833,7 @@ fn validate_mission_dataset_binding(
     Ok(())
 }
 
-fn validate_materialization(
+pub(crate) fn validate_materialization(
     materialization: &Materialization,
     feature_sha256: &str,
     validation: &ValidationArgs,

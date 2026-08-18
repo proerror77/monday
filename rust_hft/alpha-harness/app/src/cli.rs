@@ -1,6 +1,6 @@
 use crate::{
-    data_mission, governance, loop_control, mission, mission_runner, prediction_dispatch,
-    prediction_runner, prediction_snapshot,
+    data_mission, governance, loop_control, mission, mission_dispatch, mission_render,
+    mission_runner, prediction_dispatch, prediction_runner, prediction_snapshot,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -77,6 +77,11 @@ enum Command {
 enum MissionCommand {
     Create(CreateMissionArgs),
     Execute(Box<ExecuteMissionArgs>),
+    RenderCex(RenderCexMissionArgs),
+    Dispatch {
+        #[command(subcommand)]
+        command: MissionDispatchCommand,
+    },
     Run(RunMissionArgs),
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
@@ -112,6 +117,31 @@ enum PredictionDispatchCommand {
     Render(PredictionDispatchRenderArgs),
     Status(PredictionDispatchStatusArgs),
     Submit(PredictionDispatchSubmitArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MissionDispatchCommand {
+    Render(MissionDispatchRenderArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MissionDispatchRenderArgs {
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RenderCexMissionArgs {
+    /// Content-addressed V5 PIT feature rows (.jsonl).
+    #[arg(long)]
+    pub feature: PathBuf,
+    /// The matching V5 materialization report (.materialization.json).
+    #[arg(long)]
+    pub materialization: PathBuf,
+    #[arg(long)]
+    pub output_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -652,6 +682,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("mission execution worker failed")?
             }
+            MissionCommand::RenderCex(args) => mission_render::render_cex(args),
+            MissionCommand::Dispatch { command } => match command {
+                MissionDispatchCommand::Render(args) => mission_dispatch::render(args),
+            },
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
@@ -910,6 +944,18 @@ mod tests {
     #[test]
     fn parses_prediction_dispatch_render() {
         let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_render_cex() {
+        let args = "alpha-harness mission render-cex --feature features.jsonl --materialization materialization.json --output-dir rendered";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_dispatch_render() {
+        let args = "alpha-harness mission dispatch render --submission submission.json --namespace monday-research";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 

@@ -256,12 +256,47 @@ The image contains eight stable entrypoints:
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`
 
-`k8s/alpha-mission-job.example.yaml` is the current blessed BTCUSDT top-of-book
-GP screening and baseline Mission against a pre-materialized PIT feature file.
-It stops before the blocked Factor-Bank subset MCTS stage. The one-time signed
-OSS URLs belong in a Kubernetes Secret and must never be committed. Use distinct
-DuckDB files and result objects per parallel Mission; a later single-writer
-aggregator may merge their immutable evidence.
+`k8s/alpha-mission-job.example.yaml` remains the Pod-shape reference only. The
+blessed CEX Mission identity is now rendered offline from frozen inputs instead
+of hand-editing `REPLACE_*` YAML.
+
+Render the governed BTCUSDT USD-M 1s/h5/top5 Mission from the actual V5 PIT
+rows and the matching materialization evidence:
+
+```bash
+alpha-harness mission render-cex \
+  --feature /path/to/ACTUAL_FEATURE_ROWS.jsonl \
+  --materialization /path/to/ACTUAL_REPORT.materialization.json \
+  --output-dir /tmp/cex-render
+```
+
+The render step fails closed unless the inputs bind the approved Binance USD-M
+BTCUSDT 1-second / horizon-5 / top5 snapshot, the PIT rows and snapshot hashes
+match, and the materialization carries at least 1232 rows. It writes:
+
+- `mission.json`
+- `holdout-policy.json`
+- `gp-policy.json`
+- `render-report.json`
+
+The Mission keeps the fixed research contract: `200 + 3x256 + holdout256`,
+search budget `8 / 256`, schema `v1`, GP policy `controlled_dynamic_v2`, and
+template family `signed_rolling_imbalance`.
+
+Create a private dispatch submission JSON; never commit signed URLs. Include the
+attempt id, digest-pinned image, mission URL/SHA, feature/materialization/replay
+URLs and replay SHAs, result PUT/readback URLs, and an optional complete resume
+pair. Render the Kubernetes Secret + Job offline with:
+
+```bash
+alpha-harness mission dispatch render \
+  --submission /path/to/submission.json \
+  --namespace monday-research
+```
+
+This prints one Kubernetes `List` JSON containing an immutable Secret and one
+Job. Review it, then apply it with native `kubectl`. Do not add a separate
+submit wrapper here.
 
 `k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
 security context, signed-URL input transport, and immutable result upload for one

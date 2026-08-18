@@ -1273,13 +1273,13 @@ pub(crate) fn canonical_https_object(label: &str, value: &str) -> anyhow::Result
     Ok(url.to_string())
 }
 
-fn result_object_binds_attempt(object: &str, attempt_id: &str) -> anyhow::Result<bool> {
+pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> anyhow::Result<bool> {
     let url = reqwest::Url::parse(object)?;
-    Ok(url
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .any(|segment| segment == attempt_id || segment.strip_suffix(".zip") == Some(attempt_id)))
+    Ok(url.path_segments().into_iter().flatten().any(|segment| {
+        segment == attempt_id
+            || segment.strip_prefix("attempt=") == Some(attempt_id)
+            || segment.strip_suffix(".zip") == Some(attempt_id)
+    }))
 }
 
 fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
@@ -1358,7 +1358,7 @@ fn validate_catalog_partition_artifact_path(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_dns_label(label: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_dns_label(label: &str, value: &str) -> anyhow::Result<()> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
         || bytes.len() > 63

@@ -3,6 +3,8 @@ mod data_mission;
 mod governance;
 mod loop_control;
 mod mission;
+mod mission_dispatch;
+mod mission_render;
 mod mission_runner;
 mod prediction_dispatch;
 mod prediction_runner;
