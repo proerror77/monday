@@ -34,6 +34,26 @@ struct ValidatedSubmission {
     secret_name: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SubmissionObjectState {
+    #[default]
+    Unknown,
+    Created,
+    Adopted,
+}
+
+impl SubmissionObjectState {
+    fn should_cleanup(self) -> bool {
+        matches!(self, Self::Created)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CleanupState {
+    job: SubmissionObjectState,
+    secret: SubmissionObjectState,
+}
+
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let submission = load_submission(&args.submission)?;
@@ -45,6 +65,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let request_json = validated.request_json.clone();
     let manifest = render_manifest(validated, &args.namespace)?;
     let kubectl = kubectl_binary();
+    let mut cleanup_state = CleanupState::default();
 
     let result = (|| -> anyhow::Result<()> {
         let expected_job = &manifest["items"][1];
@@ -55,26 +76,22 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             expected_job,
             &job_name,
             &request_sha256,
+            &mut cleanup_state.job,
         )?;
         let job_uid = job["metadata"]["uid"]
             .as_str()
             .context("CEX Campaign Job readback is missing its UID")?;
         let secret = secret_with_owner(&manifest["items"][0], &job_name, job_uid)?;
-        let secret_body = serde_json::to_vec(&secret)?;
-        let output = kubectl_with_input(
+        let secret = create_or_adopt_secret(
             &kubectl,
             &args.context,
             &args.namespace,
-            ["create", "-f", "-"],
-            &secret_body,
-        )?;
-        ensure_kubectl_success(output, "create immutable CEX Campaign input Secret")?;
-        let secret = kubectl_json(
-            &kubectl,
-            &args.context,
-            &args.namespace,
-            ["get", "secret", &secret_name, "-o", "json"],
-            "read back immutable CEX Campaign input Secret",
+            &secret,
+            &secret_name,
+            &request_json,
+            &job_name,
+            job_uid,
+            &mut cleanup_state.secret,
         )?;
         validate_secret_readback(
             &secret,
@@ -119,12 +136,13 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         Ok(())
     })();
     if let Err(error) = result {
-        let cleanup = delete_campaign_objects(
+        let cleanup = delete_created_campaign_objects(
             &kubectl,
             &args.context,
             &args.namespace,
             &job_name,
             &secret_name,
+            cleanup_state,
         );
         return match cleanup {
             Ok(()) => Err(error),
@@ -151,6 +169,7 @@ fn create_or_adopt_job(
     expected_job: &Value,
     job_name: &str,
     request_sha256: &str,
+    job_state: &mut SubmissionObjectState,
 ) -> anyhow::Result<Value> {
     let job_body = serde_json::to_vec(expected_job)?;
     match kubectl_with_input(
@@ -163,16 +182,9 @@ fn create_or_adopt_job(
     .and_then(|output| {
         ensure_kubectl_success(output, "create immutable CEX Campaign Job").map(|_| ())
     }) {
-        Ok(()) => read_back_job(
-            kubectl,
-            context,
-            namespace,
-            expected_job,
-            job_name,
-            request_sha256,
-        ),
-        Err(error) if is_job_create_conflict(&error) => {
-            let job = read_back_job(
+        Ok(()) => {
+            *job_state = SubmissionObjectState::Created;
+            read_back_job(
                 kubectl,
                 context,
                 namespace,
@@ -180,13 +192,118 @@ fn create_or_adopt_job(
                 job_name,
                 request_sha256,
             )
-            .context(
+        }
+        Err(error) if is_job_create_conflict(&error) => {
+            let job = kubectl_json(
+                kubectl,
+                context,
+                namespace,
+                ["get", "job", job_name, "-o", "json"],
+                "read back immutable CEX Campaign Job",
+            )
+            .context("read back conflicting immutable CEX Campaign Job")?;
+            adopt_existing_job(&job, expected_job, job_name, request_sha256, job_state).context(
                 "refuse to adopt non-matching suspended CEX Campaign Job after create conflict",
             )?;
             Ok(job)
         }
         Err(error) => Err(error),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_or_adopt_secret(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    expected_secret: &Value,
+    secret_name: &str,
+    request_json: &str,
+    job_name: &str,
+    job_uid: &str,
+    secret_state: &mut SubmissionObjectState,
+) -> anyhow::Result<Value> {
+    let secret_body = serde_json::to_vec(expected_secret)?;
+    match kubectl_with_input(
+        kubectl,
+        context,
+        namespace,
+        ["create", "-f", "-"],
+        &secret_body,
+    )
+    .and_then(|output| {
+        ensure_kubectl_success(output, "create immutable CEX Campaign input Secret").map(|_| ())
+    }) {
+        Ok(()) => {
+            *secret_state = SubmissionObjectState::Created;
+            read_back_secret(
+                kubectl,
+                context,
+                namespace,
+                secret_name,
+                request_json,
+                job_name,
+                job_uid,
+            )
+        }
+        Err(error) if is_job_create_conflict(&error) => {
+            let secret = read_back_secret(
+                kubectl,
+                context,
+                namespace,
+                secret_name,
+                request_json,
+                job_name,
+                job_uid,
+            )
+            .context(
+                "refuse to adopt non-matching CEX Campaign input Secret after create conflict",
+            )?;
+            *secret_state = SubmissionObjectState::Adopted;
+            Ok(secret)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn adopt_existing_job(
+    job: &Value,
+    expected_job: &Value,
+    job_name: &str,
+    request_sha256: &str,
+    job_state: &mut SubmissionObjectState,
+) -> anyhow::Result<()> {
+    validate_job_readback(job, expected_job, job_name, request_sha256, true)?;
+    *job_state = SubmissionObjectState::Adopted;
+    Ok(())
+}
+
+fn read_back_secret(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    secret_name: &str,
+    request_json: &str,
+    job_name: &str,
+    job_uid: &str,
+) -> anyhow::Result<Value> {
+    let secret = kubectl_json(
+        kubectl,
+        context,
+        namespace,
+        ["get", "secret", secret_name, "-o", "json"],
+        "read back immutable CEX Campaign input Secret",
+    )?;
+    let request_sha256 = hex::encode(Sha256::digest(request_json.as_bytes()));
+    validate_secret_readback(
+        &secret,
+        secret_name,
+        &request_sha256,
+        request_json.as_bytes(),
+        job_name,
+        job_uid,
+    )?;
+    Ok(secret)
 }
 
 fn read_back_job(
@@ -401,22 +518,28 @@ fn delete_campaign_secret(
     Ok(())
 }
 
-fn delete_campaign_objects(
+fn delete_created_campaign_objects(
     kubectl: &std::path::Path,
     context: &str,
     namespace: &str,
     job_name: &str,
     secret_name: &str,
+    cleanup_state: CleanupState,
 ) -> anyhow::Result<()> {
-    let output = kubectl_with_input(
-        kubectl,
-        context,
-        namespace,
-        ["delete", "job", job_name, "--ignore-not-found=true"],
-        &[],
-    )?;
-    ensure_kubectl_success(output, "clean up incomplete CEX Campaign submission")?;
-    delete_campaign_secret(kubectl, context, namespace, secret_name)
+    if cleanup_state.job.should_cleanup() {
+        let output = kubectl_with_input(
+            kubectl,
+            context,
+            namespace,
+            ["delete", "job", job_name, "--ignore-not-found=true"],
+            &[],
+        )?;
+        ensure_kubectl_success(output, "clean up incomplete CEX Campaign submission")?;
+    }
+    if cleanup_state.secret.should_cleanup() {
+        delete_campaign_secret(kubectl, context, namespace, secret_name)?;
+    }
+    Ok(())
 }
 
 fn load_submission(path: &std::path::Path) -> anyhow::Result<MissionDispatchSubmission> {
@@ -881,6 +1004,99 @@ mod tests {
         }
 
         assert!(image_digest(&format!("localhost:5000/research/runner@sha256:{digest}")).is_ok());
+    }
+
+    #[test]
+    fn cleanup_only_targets_created_objects() {
+        assert!(!SubmissionObjectState::Unknown.should_cleanup());
+        assert!(!SubmissionObjectState::Adopted.should_cleanup());
+        assert!(SubmissionObjectState::Created.should_cleanup());
+    }
+
+    #[test]
+    fn released_and_mismatched_jobs_do_not_become_cleanup_targets() {
+        let expected_job =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+        let job_name = expected_job["items"][1]["metadata"]["name"]
+            .as_str()
+            .unwrap();
+        let request_sha256 = expected_job["items"][1]["metadata"]["annotations"]
+            ["research.monday/request-sha256"]
+            .as_str()
+            .unwrap();
+
+        let mut adopted_state = SubmissionObjectState::Unknown;
+        adopt_existing_job(
+            &expected_job["items"][1],
+            &expected_job["items"][1],
+            job_name,
+            request_sha256,
+            &mut adopted_state,
+        )
+        .unwrap();
+        assert_eq!(adopted_state, SubmissionObjectState::Adopted);
+        assert!(!adopted_state.should_cleanup());
+
+        let mut released_state = SubmissionObjectState::Unknown;
+        let mut released_job = expected_job["items"][1].clone();
+        released_job["spec"]["suspend"] = json!(false);
+        assert!(adopt_existing_job(
+            &released_job,
+            &expected_job["items"][1],
+            job_name,
+            request_sha256,
+            &mut released_state,
+        )
+        .is_err());
+        assert_eq!(released_state, SubmissionObjectState::Unknown);
+        assert!(!released_state.should_cleanup());
+
+        let mut mismatched_state = SubmissionObjectState::Unknown;
+        let mut mismatched_job = expected_job["items"][1].clone();
+        mismatched_job["metadata"]["annotations"]["research.monday/request-sha256"] =
+            json!("other-request");
+        assert!(adopt_existing_job(
+            &mismatched_job,
+            &expected_job["items"][1],
+            job_name,
+            request_sha256,
+            &mut mismatched_state,
+        )
+        .is_err());
+        assert_eq!(mismatched_state, SubmissionObjectState::Unknown);
+        assert!(!mismatched_state.should_cleanup());
+    }
+
+    #[test]
+    fn matching_secret_conflict_is_adoptable_without_cleanup() {
+        let request_sha256 = hex::encode(Sha256::digest(br#"{}"#));
+        let secret = json!({
+            "metadata": {
+                "name": "alpha-campaign-test-inputs",
+                "annotations": { "research.monday/request-sha256": request_sha256 },
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "alpha-campaign-test",
+                    "uid": "job-uid",
+                }],
+            },
+            "immutable": true,
+            "data": { "campaign.json": "e30=" },
+        });
+
+        validate_secret_readback(
+            &secret,
+            "alpha-campaign-test-inputs",
+            &request_sha256,
+            b"{}",
+            "alpha-campaign-test",
+            "job-uid",
+        )
+        .unwrap();
+
+        let adopted_state = SubmissionObjectState::Adopted;
+        assert!(!adopted_state.should_cleanup());
     }
 
     fn valid_submission() -> MissionDispatchSubmission {

@@ -5102,6 +5102,47 @@ mod tests {
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
+    #[test]
+    fn recover_execution_report_rejects_a_sealed_pass_mismatch_in_finalization() {
+        let mut fixture = fixture("recover-campaign-sealed-pass-mismatch");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features_indexed(&mut fixture, |index, row| {
+            let direction = if index % 2 == 0 { 1.0 } else { -1.0 };
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = if index < 130 {
+                direction * 0.001
+            } else {
+                -direction * 0.001
+            };
+        });
+        rebind_mission_inputs(&mut fixture);
+        let binding = campaign_binding_fixture(&mut fixture);
+        execute_report(fixture.args.clone(), binding.clone()).unwrap();
+        rewrite_bundle_json_entry(
+            &fixture.result_path,
+            "results/finalization-report.json",
+            |value| {
+                value["sealed_passed"] =
+                    serde_json::json!(!value["sealed_passed"].as_bool().unwrap());
+            },
+        );
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = recover_execution_report_from_published_result(
+            &client,
+            fixture.args.result_readback_url.as_str(),
+            &fixture.root.join("recovered-sealed-pass-mismatch.zip"),
+            &fixture.args.mission_id,
+            &fixture.args.mission_sha256,
+            &binding,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "published result bundle sealed evaluation does not match its finalization report"
+        ));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
     fn campaign_binding_fixture(fixture: &mut Fixture) -> ExecutionBinding {
         let campaign_id = "cex-campaign-test";
         let round_id = "r1";
@@ -5129,6 +5170,40 @@ mod tests {
             round_id: round_id.to_string(),
             request_sha256,
         }
+    }
+
+    fn rewrite_bundle_json_entry(
+        bundle_path: &Path,
+        entry_name: &str,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let mut archive = ZipArchive::new(File::open(bundle_path).unwrap()).unwrap();
+        let mut entries = Vec::with_capacity(archive.len());
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            entries.push((entry.name().to_string(), bytes));
+        }
+        let entry_index = entries
+            .iter()
+            .position(|(name, _)| name == entry_name)
+            .expect("bundle entry must exist");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&entries[entry_index].1).expect("bundle entry must be JSON");
+        mutate(&mut value);
+        entries[entry_index].1 = serde_json::to_vec_pretty(&value).unwrap();
+
+        let rewritten = bundle_path.with_extension("rewritten.zip");
+        let file = File::create(&rewritten).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        std::fs::rename(rewritten, bundle_path).unwrap();
     }
 
     #[test]
