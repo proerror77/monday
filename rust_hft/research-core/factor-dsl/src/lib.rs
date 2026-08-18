@@ -7,6 +7,7 @@ use thiserror::Error;
 
 pub const MAX_FACTOR_AST_DEPTH: usize = 64;
 pub const MAX_FACTOR_AST_NODES: usize = 10_000;
+pub const MAX_LIVE_HISTORY_ROWS: usize = 10_001;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FactorDslError {
@@ -31,6 +32,7 @@ pub enum LiveEventDomain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveFormulaCapability {
     pub event_domain: LiveEventDomain,
+    pub history_rows: usize,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -47,6 +49,10 @@ pub enum LiveFormulaCapabilityError {
     MissingEventDomain,
     #[error("formula constant is not a finite f64: {0}")]
     InvalidConstant(String),
+    #[error("rolling window must be a positive integer no larger than 10000")]
+    InvalidRollingWindow,
+    #[error("live formula requires more than {max_rows} history rows")]
+    HistoryTooLong { max_rows: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,16 +177,17 @@ pub fn validate_live_formula(
 ) -> Result<LiveFormulaCapability, LiveFormulaCapabilityError> {
     ast.validate()?;
     let mut event_domain = None;
-    validate_live_node(ast, &mut event_domain)?;
+    let history_rows = validate_live_node(ast, &mut event_domain)?;
     Ok(LiveFormulaCapability {
         event_domain: event_domain.ok_or(LiveFormulaCapabilityError::MissingEventDomain)?,
+        history_rows,
     })
 }
 
 fn validate_live_node(
     ast: &FactorAst,
     event_domain: &mut Option<LiveEventDomain>,
-) -> Result<(), LiveFormulaCapabilityError> {
+) -> Result<usize, LiveFormulaCapabilityError> {
     match ast {
         FactorAst::Terminal(FactorTerminal::Constant(value)) => {
             let parsed = value
@@ -189,6 +196,7 @@ fn validate_live_node(
             if !parsed.is_finite() {
                 return Err(LiveFormulaCapabilityError::InvalidConstant(value.clone()));
             }
+            Ok(1)
         }
         FactorAst::Terminal(FactorTerminal::Field(field)) => {
             let current = match field.as_str() {
@@ -206,28 +214,58 @@ fn validate_live_node(
                 None => *event_domain = Some(current),
                 _ => {}
             }
+            Ok(1)
         }
         FactorAst::Call { operator, args } => {
-            if !matches!(
-                operator,
+            let history_rows = match operator {
+                FactorOperator::Delta | FactorOperator::ZScore => {
+                    let value_rows = validate_live_node(&args[0], event_domain)?;
+                    validate_live_node(&args[1], event_domain)?;
+                    let FactorAst::Terminal(FactorTerminal::Constant(window)) = &args[1] else {
+                        return Err(LiveFormulaCapabilityError::InvalidRollingWindow);
+                    };
+                    let window = window
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|window| (1..=10_000).contains(window))
+                        .ok_or(LiveFormulaCapabilityError::InvalidRollingWindow)?;
+                    value_rows
+                        .checked_add(if *operator == FactorOperator::Delta {
+                            window
+                        } else {
+                            window - 1
+                        })
+                        .ok_or(LiveFormulaCapabilityError::HistoryTooLong {
+                            max_rows: MAX_LIVE_HISTORY_ROWS,
+                        })?
+                }
                 FactorOperator::Add
-                    | FactorOperator::Sub
-                    | FactorOperator::Mul
-                    | FactorOperator::Abs
-                    | FactorOperator::GreaterThan
-                    | FactorOperator::LessThan
-                    | FactorOperator::IfElse
-            ) {
-                return Err(LiveFormulaCapabilityError::UnsupportedOperator(
-                    operator.symbol().to_string(),
-                ));
+                | FactorOperator::Sub
+                | FactorOperator::Mul
+                | FactorOperator::Abs
+                | FactorOperator::GreaterThan
+                | FactorOperator::LessThan
+                | FactorOperator::IfElse => {
+                    let mut history_rows = 1;
+                    for arg in args {
+                        history_rows = history_rows.max(validate_live_node(arg, event_domain)?);
+                    }
+                    history_rows
+                }
+                _ => {
+                    return Err(LiveFormulaCapabilityError::UnsupportedOperator(
+                        operator.symbol().to_string(),
+                    ))
+                }
+            };
+            if history_rows > MAX_LIVE_HISTORY_ROWS {
+                return Err(LiveFormulaCapabilityError::HistoryTooLong {
+                    max_rows: MAX_LIVE_HISTORY_ROWS,
+                });
             }
-            for arg in args {
-                validate_live_node(arg, event_domain)?;
-            }
+            Ok(history_rows)
         }
     }
-    Ok(())
 }
 
 impl fmt::Display for FactorAst {
@@ -359,6 +397,7 @@ mod tests {
             validate_live_formula(&ast).unwrap(),
             LiveFormulaCapability {
                 event_domain: LiveEventDomain::Snapshot,
+                history_rows: 1,
             }
         );
     }
@@ -367,10 +406,8 @@ mod tests {
     fn live_capability_rejects_research_only_operators_and_features() {
         for operator in [
             FactorOperator::Rank,
-            FactorOperator::Delta,
             FactorOperator::Mean,
             FactorOperator::Std,
-            FactorOperator::ZScore,
             FactorOperator::Div,
             FactorOperator::Log,
         ] {
@@ -394,6 +431,52 @@ mod tests {
             assert_eq!(
                 validate_live_formula(&ast).unwrap_err(),
                 LiveFormulaCapabilityError::UnsupportedField(field.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn live_capability_accepts_bounded_causal_history() {
+        let delta = FactorAst::call(
+            FactorOperator::Delta,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                FactorAst::Terminal(FactorTerminal::Constant("5".to_string())),
+            ],
+        )
+        .unwrap();
+        let ast = FactorAst::call(
+            FactorOperator::ZScore,
+            vec![
+                delta,
+                FactorAst::Terminal(FactorTerminal::Constant("20".to_string())),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_live_formula(&ast).unwrap(),
+            LiveFormulaCapability {
+                event_domain: LiveEventDomain::Snapshot,
+                history_rows: 25,
+            }
+        );
+    }
+
+    #[test]
+    fn live_capability_rejects_unbounded_rolling_windows() {
+        for window in ["0", "1.5", "10001"] {
+            let ast = FactorAst::call(
+                FactorOperator::ZScore,
+                vec![
+                    FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                    FactorAst::Terminal(FactorTerminal::Constant(window.to_string())),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                validate_live_formula(&ast).unwrap_err(),
+                LiveFormulaCapabilityError::InvalidRollingWindow
             );
         }
     }
