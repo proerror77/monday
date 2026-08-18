@@ -42,32 +42,20 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let secret_name = validated.secret_name.clone();
     let campaign_id = validated.submission.request.campaign_id.clone();
     let request_sha256 = validated.request_sha256.clone();
+    let request_json = validated.request_json.clone();
     let manifest = render_manifest(validated, &args.namespace)?;
     let kubectl = kubectl_binary();
 
-    let job_body = serde_json::to_vec(&manifest["items"][1])?;
-    let job_create = kubectl_with_input(
-        &kubectl,
-        &args.context,
-        &args.namespace,
-        ["create", "-f", "-"],
-        &job_body,
-    )
-    .and_then(|output| {
-        ensure_kubectl_success(output, "create immutable CEX Campaign Job").map(|_| ())
-    });
-    job_create?;
-
     let result = (|| -> anyhow::Result<()> {
         let expected_job = &manifest["items"][1];
-        let job = kubectl_json(
+        let job = create_or_adopt_job(
             &kubectl,
             &args.context,
             &args.namespace,
-            ["get", "job", &job_name, "-o", "json"],
-            "read back immutable CEX Campaign Job",
+            expected_job,
+            &job_name,
+            &request_sha256,
         )?;
-        validate_job_readback(&job, expected_job, &job_name, &request_sha256, true)?;
         let job_uid = job["metadata"]["uid"]
             .as_str()
             .context("CEX Campaign Job readback is missing its UID")?;
@@ -88,7 +76,14 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             ["get", "secret", &secret_name, "-o", "json"],
             "read back immutable CEX Campaign input Secret",
         )?;
-        validate_secret_readback(&secret, &secret_name, &request_sha256, &job_name, job_uid)?;
+        validate_secret_readback(
+            &secret,
+            &secret_name,
+            &request_sha256,
+            request_json.as_bytes(),
+            &job_name,
+            job_uid,
+        )?;
         let release_patch_json = serde_json::to_string(&release_job_patch())?;
         let release_output = kubectl_with_input(
             &kubectl,
@@ -147,6 +142,74 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         "request_sha256": request_sha256,
         "job_name": job_name,
     }))
+}
+
+fn create_or_adopt_job(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    expected_job: &Value,
+    job_name: &str,
+    request_sha256: &str,
+) -> anyhow::Result<Value> {
+    let job_body = serde_json::to_vec(expected_job)?;
+    match kubectl_with_input(
+        kubectl,
+        context,
+        namespace,
+        ["create", "-f", "-"],
+        &job_body,
+    )
+    .and_then(|output| {
+        ensure_kubectl_success(output, "create immutable CEX Campaign Job").map(|_| ())
+    }) {
+        Ok(()) => read_back_job(
+            kubectl,
+            context,
+            namespace,
+            expected_job,
+            job_name,
+            request_sha256,
+        ),
+        Err(error) if is_job_create_conflict(&error) => {
+            let job = read_back_job(
+                kubectl,
+                context,
+                namespace,
+                expected_job,
+                job_name,
+                request_sha256,
+            )
+            .context(
+                "refuse to adopt non-matching suspended CEX Campaign Job after create conflict",
+            )?;
+            Ok(job)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_back_job(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    expected_job: &Value,
+    job_name: &str,
+    request_sha256: &str,
+) -> anyhow::Result<Value> {
+    let job = kubectl_json(
+        kubectl,
+        context,
+        namespace,
+        ["get", "job", job_name, "-o", "json"],
+        "read back immutable CEX Campaign Job",
+    )?;
+    validate_job_readback(&job, expected_job, job_name, request_sha256, true)?;
+    Ok(job)
+}
+
+fn is_job_create_conflict(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("AlreadyExists")
 }
 
 fn job_owner_reference(job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
@@ -257,16 +320,20 @@ fn validate_secret_readback(
     secret: &Value,
     secret_name: &str,
     request_sha256: &str,
+    expected_request: &[u8],
     job_name: &str,
     job_uid: &str,
 ) -> anyhow::Result<()> {
     let owner = &secret["metadata"]["ownerReferences"][0];
+    let encoded_request = secret["data"]["campaign.json"]
+        .as_str()
+        .context("CEX Campaign input Secret readback is missing campaign.json data")?;
+    let decoded_request = decode_base64(encoded_request)?;
     if secret["metadata"]["name"] != secret_name
         || secret["immutable"] != true
         || secret["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
-        || secret["data"]["campaign.json"]
-            .as_str()
-            .is_none_or(str::is_empty)
+        || decoded_request != expected_request
+        || hex::encode(Sha256::digest(&decoded_request)) != request_sha256
         || owner["apiVersion"] != "batch/v1"
         || owner["kind"] != "Job"
         || owner["name"] != job_name
@@ -275,6 +342,46 @@ fn validate_secret_readback(
         bail!("CEX Campaign input Secret readback does not match the submitted identity");
     }
     Ok(())
+}
+
+fn decode_base64(value: &str) -> anyhow::Result<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        bail!("CEX Campaign input Secret campaign.json is not valid base64");
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 4 * 3);
+    for chunk in value.as_bytes().chunks_exact(4) {
+        let mut quartet = [0u8; 4];
+        let mut padding = 0usize;
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            quartet[index] = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    padding += 1;
+                    0
+                }
+                _ => bail!("CEX Campaign input Secret campaign.json is not valid base64"),
+            };
+            if padding > 0 && byte != b'=' {
+                bail!("CEX Campaign input Secret campaign.json is not valid base64");
+            }
+        }
+        if padding > 2 || (padding > 0 && !chunk[(4 - padding)..].iter().all(|byte| *byte == b'='))
+        {
+            bail!("CEX Campaign input Secret campaign.json is not valid base64");
+        }
+        decoded.push((quartet[0] << 2) | (quartet[1] >> 4));
+        if padding < 2 {
+            decoded.push((quartet[1] << 4) | (quartet[2] >> 2));
+        }
+        if padding == 0 {
+            decoded.push((quartet[2] << 6) | quartet[3]);
+        }
+    }
+    Ok(decoded)
 }
 
 fn delete_campaign_secret(
@@ -477,12 +584,63 @@ fn image_digest(image: &str) -> anyhow::Result<String> {
         bail!("mission image must not contain surrounding whitespace or control characters");
     }
     let (repository, digest) = image
-        .rsplit_once("@sha256:")
+        .split_once('@')
         .context("mission image must be pinned by @sha256 digest")?;
-    if repository.is_empty() {
-        bail!("mission image repository is required");
+    if digest.is_empty() || digest.contains('@') {
+        bail!("mission image must be pinned by a canonical @sha256 digest");
     }
+    let digest = digest
+        .strip_prefix("sha256:")
+        .context("mission image must be pinned by @sha256 digest")?;
+    validate_image_repository(repository)?;
     normalized_sha256("mission image", digest)
+}
+
+fn validate_image_repository(repository: &str) -> anyhow::Result<()> {
+    if repository.is_empty()
+        || repository.starts_with('/')
+        || repository.ends_with('/')
+        || repository.contains("//")
+        || repository.chars().any(char::is_whitespace)
+        || repository.chars().any(|ch| ch.is_ascii_uppercase())
+    {
+        bail!("mission image repository must be a canonical OCI reference");
+    }
+    let segments = repository.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        bail!("mission image repository must be a canonical OCI reference");
+    }
+    let host_prefix = segments.len() > 1
+        && (segments[0].contains('.') || segments[0].contains(':') || segments[0] == "localhost");
+    if host_prefix && !segments[0].chars().all(is_registry_host_char) {
+        bail!("mission image repository must be a canonical OCI reference");
+    }
+    let name_segments = if host_prefix {
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+    if name_segments.is_empty()
+        || name_segments
+            .iter()
+            .any(|segment| !is_repository_segment(segment))
+    {
+        bail!("mission image repository must be a canonical OCI reference");
+    }
+    Ok(())
+}
+
+fn is_registry_host_char(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | ':' | '-')
+}
+
+fn is_repository_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with(['.', '-', '_'])
+        && !segment.ends_with(['.', '-', '_'])
+        && segment.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 fn sha256_text(value: &str) -> String {
@@ -558,10 +716,11 @@ mod tests {
 
     #[test]
     fn campaign_secret_readback_binds_request_and_job() {
+        let request_sha256 = hex::encode(Sha256::digest(br#"{}"#));
         let secret = json!({
             "metadata": {
                 "name": "alpha-campaign-test-inputs",
-                "annotations": { "research.monday/request-sha256": "request-sha" },
+                "annotations": { "research.monday/request-sha256": request_sha256 },
                 "ownerReferences": [{
                     "apiVersion": "batch/v1",
                     "kind": "Job",
@@ -576,11 +735,41 @@ mod tests {
         validate_secret_readback(
             &secret,
             "alpha-campaign-test-inputs",
-            "request-sha",
+            &request_sha256,
+            b"{}",
             "alpha-campaign-test",
             "job-uid",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn campaign_secret_readback_rejects_request_byte_drift() {
+        let request_sha256 = "44136fa355b3678a1146ad16f7e8649e94fb4fc21f1d4a1765e83105416dc9f9";
+        let secret = json!({
+            "metadata": {
+                "name": "alpha-campaign-test-inputs",
+                "annotations": { "research.monday/request-sha256": request_sha256 },
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "alpha-campaign-test",
+                    "uid": "job-uid",
+                }],
+            },
+            "immutable": true,
+            "data": { "campaign.json": "eyJmb28iOiJiYXIifQ==" },
+        });
+
+        assert!(validate_secret_readback(
+            &secret,
+            "alpha-campaign-test-inputs",
+            request_sha256,
+            b"{}",
+            "alpha-campaign-test",
+            "job-uid",
+        )
+        .is_err());
     }
 
     #[test]
@@ -667,6 +856,31 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn create_conflict_only_adopts_already_exists_jobs() {
+        assert!(is_job_create_conflict(&anyhow::anyhow!(
+            "kubectl failed to create immutable CEX Campaign Job: jobs.batch \"x\" AlreadyExists"
+        )));
+        assert!(!is_job_create_conflict(&anyhow::anyhow!(
+            "kubectl failed to create immutable CEX Campaign Job: i/o timeout"
+        )));
+    }
+
+    #[test]
+    fn image_digest_rejects_non_canonical_repository_forms() {
+        let digest = "1".repeat(64);
+        for image in [
+            format!("registry/research:latest@sha256:{digest}"),
+            format!("Registry/research-runner@sha256:{digest}"),
+            format!("registry/research-runner@@sha256:{digest}"),
+            format!("registry/research runner@sha256:{digest}"),
+        ] {
+            assert!(image_digest(&image).is_err(), "{image}");
+        }
+
+        assert!(image_digest(&format!("localhost:5000/research/runner@sha256:{digest}")).is_ok());
     }
 
     fn valid_submission() -> MissionDispatchSubmission {

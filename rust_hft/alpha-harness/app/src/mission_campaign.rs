@@ -5,13 +5,13 @@ use crate::{
     data_mission,
     mission_render::render_cex_bundle,
     mission_runner::{
-        ensure_holdout_claim_absent, execute_report, fetch_to_file, normalized_sha256,
-        publish_immutable_file, valid_git_revision, validate_cex_holdout_id, ExecutionBinding,
+        execute_report, fetch_to_file, normalized_sha256, publish_immutable_file,
+        recover_execution_report_from_published_result, valid_git_revision,
+        validate_cex_holdout_id, ExecutionBinding,
     },
     prediction_dispatch::{
-        canonical_https_object, canonical_tokyo_oss_internal_object,
-        cex_campaign_round_result_and_holdout_claim, cex_campaign_round_root, sha256_text,
-        validate_dns_label,
+        canonical_tokyo_oss_internal_object, cex_campaign_round_result_and_holdout_claim,
+        cex_campaign_round_root, sha256_text, validate_dns_label,
     },
 };
 use alpha_domain::canonical_json_hash;
@@ -152,7 +152,6 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         .timeout(Duration::from_secs(120))
         .redirect(Policy::none())
         .build()?;
-    ensure_holdout_claim_absent(&client, &loaded.request.holdout_claim_readback_url)?;
     data_mission::write_json_atomic(&local_request_path, &loaded.request)?;
 
     let feature_path = shared_input_dir.join("features.jsonl");
@@ -209,40 +208,54 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let mission_local_path = mission_publish_dir.join("mission.json");
     data_mission::write_json_atomic(&mission_local_path, &rendered.mission)?;
     let mission_readback_path = mission_publish_dir.join("mission-readback.json");
-    let mission_sha256 = publish_round_mission(
+    let mission_sha256 = publish_create_once_json(
         &client,
+        "Mission",
         &round.mission_put_url,
         &round.mission_readback_url,
         &mission_local_path,
         &mission_readback_path,
     )?;
 
-    let report = execute_report(
-        ExecuteMissionArgs {
-            work_dir: round_dir.join("execute"),
-            mission_id: rendered.mission_id.clone(),
-            holdout_id: loaded.request.holdout_id.clone(),
-            mission_url: mission_readback_path.to_string_lossy().into_owned(),
-            mission_sha256: mission_sha256.clone(),
-            feature_url: feature_path.to_string_lossy().into_owned(),
-            materialization_url: materialization_path.to_string_lossy().into_owned(),
-            replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
-            replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
-            replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
-            replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
-            resume_url: None,
-            resume_sha256: None,
-            result_put_url: round.result_put_url.clone(),
-            result_readback_url: round.result_readback_url.clone(),
-            holdout_claim_put_url: loaded.request.holdout_claim_put_url.clone(),
-            holdout_claim_readback_url: loaded.request.holdout_claim_readback_url.clone(),
-        },
-        ExecutionBinding::Campaign {
-            campaign_id: loaded.request.campaign_id.clone(),
-            round_id: round.round_id.clone(),
-            request_sha256: loaded.sha256.clone(),
-        },
-    )?;
+    let binding = ExecutionBinding::Campaign {
+        campaign_id: loaded.request.campaign_id.clone(),
+        round_id: round.round_id.clone(),
+        request_sha256: loaded.sha256.clone(),
+    };
+    let recovered_result_path = round_dir.join("published-result-readback.zip");
+    let report = if let Some(report) = recover_execution_report_from_published_result(
+        &client,
+        &round.result_readback_url,
+        &recovered_result_path,
+        &rendered.mission_id,
+        &mission_sha256,
+        &binding,
+    )? {
+        report
+    } else {
+        execute_report(
+            ExecuteMissionArgs {
+                work_dir: round_dir.join("execute"),
+                mission_id: rendered.mission_id.clone(),
+                holdout_id: loaded.request.holdout_id.clone(),
+                mission_url: mission_readback_path.to_string_lossy().into_owned(),
+                mission_sha256: mission_sha256.clone(),
+                feature_url: feature_path.to_string_lossy().into_owned(),
+                materialization_url: materialization_path.to_string_lossy().into_owned(),
+                replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+                replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
+                replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+                replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
+                resume_url: None,
+                resume_sha256: None,
+                result_put_url: round.result_put_url.clone(),
+                result_readback_url: round.result_readback_url.clone(),
+                holdout_claim_put_url: loaded.request.holdout_claim_put_url.clone(),
+                holdout_claim_readback_url: loaded.request.holdout_claim_readback_url.clone(),
+            },
+            binding,
+        )?
+    };
     let mission = CampaignMissionLedgerV1 {
         round_id: round.round_id.clone(),
         seed: round.seed,
@@ -281,27 +294,19 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         promotion_id,
     };
     data_mission::write_json_atomic(&local_result_path, &result)?;
-    let result_sha256 = crate::mission_runner::sha256_file(&local_result_path)?;
-    publish_immutable_file(
+    let result_sha256 = publish_create_once_json(
         &client,
+        "campaign result",
         &loaded.request.campaign_result_put_url,
-        &local_result_path,
-        "application/json",
-    )?;
-    let (_, readback_sha256) = fetch_to_file(
-        &client,
         &loaded.request.campaign_result_readback_url,
+        &local_result_path,
         &local_result_readback_path,
-        MAX_CAMPAIGN_RESULT_BYTES,
     )?;
-    if readback_sha256 != result_sha256 {
-        bail!("published campaign result readback SHA256 mismatch");
-    }
     print_json(&serde_json::json!({
         "campaign_id": result.campaign_id,
         "request_sha256": result.request_sha256,
         "campaign_result_sha256": result_sha256,
-        "campaign_result_readback_sha256": readback_sha256,
+        "campaign_result_readback_sha256": result_sha256,
         "termination_reason": result.termination_reason,
         "sealed_passed": result.sealed_passed,
         "promotion_id": result.promotion_id,
@@ -535,33 +540,34 @@ fn fetch_verified(
     Ok(())
 }
 
-fn publish_round_mission(
+fn publish_create_once_json(
     client: &Client,
+    label: &str,
     destination: &str,
     readback_url: &str,
     source: &Path,
     readback_path: &Path,
 ) -> anyhow::Result<String> {
-    let mission_sha256 = crate::mission_runner::sha256_file(source)?;
+    let published_sha256 = crate::mission_runner::sha256_file(source)?;
     let already_exists =
         match publish_immutable_file(client, destination, source, "application/json") {
             Ok(()) => false,
             Err(error) if immutable_publish_conflict(&error) => true,
-            Err(error) => return Err(error).context("publish Mission"),
+            Err(error) => return Err(error).with_context(|| format!("publish {label}")),
         };
-    let (_, mission_readback_sha256) = fetch_to_file(
+    let (_, readback_sha256) = fetch_to_file(
         client,
         readback_url,
         readback_path,
-        source.metadata()?.len(),
+        source.metadata()?.len().max(MAX_CAMPAIGN_RESULT_BYTES),
     )?;
-    if mission_readback_sha256 != mission_sha256 {
+    if readback_sha256 != published_sha256 {
         if already_exists {
-            bail!("published Mission already exists with different bytes");
+            bail!("published {label} already exists with different bytes");
         }
-        bail!("published Mission readback SHA256 mismatch");
+        bail!("published {label} readback SHA256 mismatch");
     }
-    Ok(mission_sha256)
+    Ok(published_sha256)
 }
 
 fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
@@ -577,15 +583,11 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 }
 
 fn canonical_input_object(label: &str, value: &str) -> anyhow::Result<String> {
-    canonical_object(label, value)
+    canonical_tokyo_oss_internal_object(label, value)
 }
 
 fn canonical_output_object(label: &str, value: &str) -> anyhow::Result<String> {
     canonical_tokyo_oss_internal_object(label, value)
-}
-
-fn canonical_object(label: &str, value: &str) -> anyhow::Result<String> {
-    canonical_https_object(label, value)
 }
 
 #[cfg(test)]
@@ -644,6 +646,27 @@ mod tests {
         let mut request = valid_request();
         request.feature_url = request.feature_url.replacen("https://", "http://", 1);
 
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_request_rejects_non_oss_campaign_inputs() {
+        let mut request = valid_request();
+        request.feature_url = "https://example.com/research/features.jsonl".to_string();
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.materialization_url =
+            "https://example.com/research/materialization.json".to_string();
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.replay_artifact_url = "https://example.com/research/replay.parquet".to_string();
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.replay_manifest_url =
+            "https://example.com/research/replay-manifest.json".to_string();
         assert!(validate_request(&request).is_err());
     }
 
@@ -779,13 +802,13 @@ mod tests {
             campaign_id: String::new(),
             build_source_revision: "a".repeat(40),
             image_identity: "1".repeat(64),
-            feature_url: "https://oss-internal/research/features.jsonl".to_string(),
+            feature_url: format!("{TEST_ROOT}/features.jsonl"),
             feature_sha256: "1".repeat(64),
-            materialization_url: "https://oss-internal/research/materialization.json".to_string(),
+            materialization_url: format!("{TEST_ROOT}/materialization.json"),
             materialization_sha256: "2".repeat(64),
-            replay_artifact_url: "https://oss-internal/research/replay.parquet".to_string(),
+            replay_artifact_url: format!("{TEST_ROOT}/replay.parquet"),
             replay_artifact_sha256: "3".repeat(64),
-            replay_manifest_url: "https://oss-internal/research/replay-manifest.json".to_string(),
+            replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
             replay_manifest_sha256: "4".repeat(64),
             holdout_id: "cex-holdout-test".to_string(),
             round: CampaignRoundRequest {
