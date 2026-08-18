@@ -15,6 +15,7 @@ use alpha_domain::{
     FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy, MissionStatus,
     PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage, StrategyBundle,
     ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1, MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
@@ -849,7 +850,7 @@ pub(crate) fn execute_report(
     )?;
     drop(store);
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
-    let bundle_bytes = bundle.metadata()?.len();
+    let bundle_bytes = checked_result_bundle_bytes(&bundle)?;
     let bundle_sha256 = sha256_file(&bundle)?;
     publish_result(&client, &args.result_put_url, &bundle)?;
     let readback_bundle = input_dir.join("published-result-readback.zip");
@@ -1839,8 +1840,6 @@ fn validate_holdout_claim_binding(
         bail!("CEX result and holdout claim transports must match");
     }
     if put_is_remote {
-        let result_object =
-            prediction_dispatch::canonical_https_object("CEX result", &args.result_put_url)?;
         let claim_object = prediction_dispatch::canonical_https_object(
             "CEX holdout claim",
             &args.holdout_claim_put_url,
@@ -1853,11 +1852,9 @@ fn validate_holdout_claim_binding(
             bail!("CEX holdout claim readback URL must identify the same immutable object");
         }
         let expected_claim_object =
-            expected_holdout_claim_object(&result_object, &args.mission_id, holdout_id, binding)?;
+            prediction_dispatch::cex_global_holdout_claim_object(holdout_id)?;
         if claim_object != expected_claim_object {
-            bail!(
-                "CEX holdout claim object must be the holdout-scoped sibling of the Mission results"
-            );
+            bail!("CEX holdout claim object must use the global holdout claim path");
         }
     } else {
         let result_object = normalized_local_object(&args.result_put_url)?;
@@ -1866,8 +1863,12 @@ fn validate_holdout_claim_binding(
         if claim_object != claim_readback_object {
             bail!("CEX holdout claim readback path must identify the same immutable object");
         }
-        let expected_claim_object =
-            expected_holdout_claim_object(&result_object, &args.mission_id, holdout_id, binding)?;
+        let expected_claim_object = expected_local_holdout_claim_object(
+            &result_object,
+            &args.mission_id,
+            holdout_id,
+            binding,
+        )?;
         if claim_object != expected_claim_object {
             bail!(
                 "CEX holdout claim path must be the holdout-scoped sibling of the Mission results"
@@ -1877,7 +1878,7 @@ fn validate_holdout_claim_binding(
     Ok(())
 }
 
-fn expected_holdout_claim_object(
+fn expected_local_holdout_claim_object(
     result_object: &str,
     mission_id: &str,
     holdout_id: &str,
@@ -2239,6 +2240,16 @@ pub(crate) fn recover_execution_report_from_published_result(
         bail!("published result bundle Mission SHA256 does not match the Campaign Mission");
     }
     validate_recovered_binding(&admission, binding)?;
+    let control_mission: CexResearchMissionArtifactV1 = read_bundle_json(
+        &mut archive,
+        "results/control-plane-mission.json",
+        MAX_MISSION_BYTES,
+    )?
+    .context("published result bundle is missing results/control-plane-mission.json")?;
+    control_mission.validate()?;
+    if control_mission.semantic_id()? != expected_mission_id {
+        bail!("published result bundle Mission artifact does not match the Campaign Mission");
+    }
 
     let replay_receipt: Option<CexEventReplayReceiptV1> = read_bundle_json(
         &mut archive,
@@ -2255,7 +2266,13 @@ pub(crate) fn recover_execution_report_from_published_result(
     let finalization: Option<CexFinalizationReportV1> =
         read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)?;
     let finalization = if let Some(report) = finalization {
-        validate_recovered_finalization(&mut archive, &report, replay_receipt.as_ref())?;
+        validate_recovered_finalization(
+            &mut archive,
+            &report,
+            &control_mission,
+            replay_receipt.as_ref(),
+            expected_mission_id,
+        )?;
         Some(report)
     } else {
         if replay_receipt
@@ -2373,7 +2390,9 @@ fn validate_recovered_binding(
 fn validate_recovered_finalization(
     archive: &mut ZipArchive<File>,
     report: &CexFinalizationReportV1,
+    control_mission: &CexResearchMissionArtifactV1,
     replay_receipt: Option<&CexEventReplayReceiptV1>,
+    expected_mission_id: &str,
 ) -> anyhow::Result<()> {
     if !replay_receipt.is_some_and(|receipt| receipt.gate.passed) {
         bail!("published result bundle finalization lacks a passing replay receipt");
@@ -2382,9 +2401,36 @@ fn validate_recovered_finalization(
         read_bundle_json(archive, "results/final-precommit.json", 512 * 1024)?
             .context("published result bundle is missing results/final-precommit.json")?;
     precommit.validate()?;
+    let semantic_mission = serde_json::json!({
+        "schema_version": &control_mission.schema_version,
+        "spec": &control_mission.spec,
+    });
+    if precommit.mission.id != expected_mission_id
+        || precommit.mission.content_sha256 != canonical_json_hash(&semantic_mission)?
+        || precommit.holdout_id != control_mission.spec.holdout.holdout_id
+        || precommit.holdout_state != control_mission.spec.holdout.state
+    {
+        bail!("published result bundle precommit does not match the exact Campaign Mission");
+    }
     if precommit.precommit_id != report.precommit_id {
         bail!("published result bundle precommit evidence does not match its finalization report");
     }
+    let replay_receipt = replay_receipt.expect("passing replay receipt already required");
+    if replay_receipt.receipt_id != precommit.replay_receipt.id
+        || canonical_json_hash(replay_receipt)? != precommit.replay_receipt.content_sha256
+        || replay_receipt.mission_id != precommit.mission.id
+        || replay_receipt.strategy != precommit.four_stage_strategy
+        || replay_receipt.dataset != precommit.dataset
+        || replay_receipt.source != precommit.source
+        || replay_receipt.holdout_id != precommit.holdout_id
+        || replay_receipt.holdout_state != precommit.holdout_state
+        || replay_receipt.capabilities_sha256 != precommit.replay_capabilities_sha256
+        || replay_receipt.deployment_authority
+        || replay_receipt.order_submission_authority
+    {
+        bail!("published result bundle replay receipt does not prove the exact final precommit");
+    }
+    let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
     let sealed_receipt: RegistryRevision =
         read_bundle_json(archive, "results/sealed-holdout-receipt.json", 512 * 1024)?
             .context("published result bundle is missing results/sealed-holdout-receipt.json")?;
@@ -2400,7 +2446,54 @@ fn validate_recovered_finalization(
     )
     .context("published result bundle sealed receipt carries invalid evaluation")?;
     sealed.validate()?;
-    if sealed.passed != report.sealed_passed {
+    let (_, protocol_hash) = sealed.protocol_binding()?;
+    if sealed_receipt.registry_kind != "sealed_evaluation"
+        || sealed_receipt.asset_id != claim.candidate.id
+        || sealed_receipt.parent_revision_id.as_deref() != Some(claim.claim_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.mission_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.candidate.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(precommit.dataset_manifest_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.evaluation_protocol.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("precommit_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.precommit.id.as_str())
+        || sealed_receipt
+            .payload
+            .get("precommit_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.precommit.content_sha256.as_str())
+        || sealed_receipt
+            .payload
+            .get("sealed_access_claim_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.claim_id.as_str())
+        || sealed_receipt
+            .payload
+            .get("holdout_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.holdout_id.as_str())
+        || sealed.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+        || protocol_hash != claim.evaluation_protocol.content_sha256
+        || sealed.passed != report.sealed_passed
+    {
         bail!("published result bundle sealed evaluation does not match its finalization report");
     }
     if report.sealed_passed {
@@ -2408,6 +2501,20 @@ fn validate_recovered_finalization(
             read_bundle_json(archive, "results/strategy-bundle.json", 4 * 1024 * 1024)?
                 .context("published result bundle is missing results/strategy-bundle.json")?;
         strategy_bundle.validate()?;
+        if strategy_bundle.candidate_id != precommit.final_candidate.id
+            || strategy_bundle.candidate_content_hash != precommit.final_candidate.content_sha256
+        {
+            bail!("published result bundle strategy lineage does not match the final precommit");
+        }
+        let alpha_domain::StrategyBundleArtifact::CexFourStage {
+            strategy: bundled_strategy,
+        } = &strategy_bundle.artifact
+        else {
+            bail!(
+                "published result bundle strategy lineage is not a final CEX four-stage strategy"
+            );
+        };
+        bundled_strategy.validate_against_precommit(&precommit)?;
         if strategy_bundle.bundle_id
             != report
                 .strategy_bundle_id
@@ -2422,6 +2529,11 @@ fn validate_recovered_finalization(
             read_bundle_json(archive, "results/promotion-record.json", 512 * 1024)?
                 .context("published result bundle is missing results/promotion-record.json")?;
         promotion.validate(&strategy_bundle)?;
+        if promotion.candidate_id != precommit.final_candidate.id
+            || promotion.candidate_content_hash != precommit.final_candidate.content_sha256
+        {
+            bail!("published result bundle promotion lineage does not match the final precommit");
+        }
         if promotion.promotion_id
             != report
                 .promotion_id
@@ -2511,7 +2623,20 @@ pub(crate) fn publish_result(
     destination: &str,
     bundle: &Path,
 ) -> anyhow::Result<()> {
+    checked_result_bundle_bytes(bundle)?;
     publish_immutable_file(client, destination, bundle, "application/zip")
+}
+
+fn checked_result_bundle_bytes(bundle: &Path) -> anyhow::Result<u64> {
+    let bundle_bytes = bundle.metadata()?.len();
+    if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
+        bail!(
+            "result bundle exceeds the allowed size: {} bytes > {} bytes",
+            bundle_bytes,
+            MAX_RESULT_BUNDLE_BYTES
+        );
+    }
+    Ok(bundle_bytes)
 }
 
 pub(crate) fn publish_immutable_file(
@@ -5043,6 +5168,61 @@ mod tests {
     }
 
     #[test]
+    fn publish_result_rejects_a_bundle_larger_than_the_readback_limit() {
+        let root = tempfile::tempdir().expect("create result publication test root");
+        let bundle = root.path().join("oversized-result.zip");
+        File::create(&bundle)
+            .unwrap()
+            .set_len(MAX_RESULT_BUNDLE_BYTES + 1)
+            .unwrap();
+        let destination = root.path().join("published-result.zip");
+        let client = Client::builder().build().unwrap();
+
+        let error = publish_result(&client, &destination.to_string_lossy(), &bundle).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("result bundle exceeds the allowed size"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn validate_holdout_claim_binding_uses_the_global_remote_claim_object() {
+        let mut fixture = fixture("remote-global-holdout-claim");
+        fixture.args.result_put_url = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/anything/results.zip".to_string();
+        fixture.args.result_readback_url = fixture.args.result_put_url.clone();
+        fixture.args.holdout_claim_put_url =
+            prediction_dispatch::cex_global_holdout_claim_object(&fixture.args.holdout_id).unwrap();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+
+        validate_holdout_claim_binding(
+            &fixture.args,
+            &fixture.args.holdout_id,
+            &ExecutionBinding::Direct,
+        )
+        .unwrap();
+
+        fixture.args.holdout_claim_put_url =
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/not-global/sealed-holdout-claim.json".to_string();
+        fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
+        let error = validate_holdout_claim_binding(
+            &fixture.args,
+            &fixture.args.holdout_id,
+            &ExecutionBinding::Campaign {
+                campaign_id: "cex-campaign-test".to_string(),
+                round_id: "r1".to_string(),
+                request_sha256: "a".repeat(64),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("CEX holdout claim object must use the global holdout claim path"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn recover_execution_report_from_an_existing_campaign_result_bundle() {
         let mut fixture = fixture("recover-campaign-result");
         let binding = campaign_binding_fixture(&mut fixture);
@@ -5137,44 +5317,48 @@ mod tests {
     }
 
     #[test]
-    fn recover_execution_report_rejects_a_sealed_pass_mismatch_in_finalization() {
-        let mut fixture = fixture("recover-campaign-sealed-pass-mismatch");
-        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
-        rewrite_features_indexed(&mut fixture, |index, row| {
-            let direction = if index % 2 == 0 { 1.0 } else { -1.0 };
-            row.features.insert("book_imbalance".to_string(), direction);
-            row.label = if index < 130 {
-                direction * 0.001
-            } else {
-                -direction * 0.001
-            };
-        });
-        rebind_mission_inputs(&mut fixture);
-        let binding = campaign_binding_fixture(&mut fixture);
-        execute_report(fixture.args.clone(), binding.clone()).unwrap();
-        rewrite_bundle_json_entry(
-            &fixture.result_path,
+    fn recover_execution_report_rejects_mixed_foreign_finalization_evidence() {
+        let mut primary = finalizing_fixture("recover-campaign-foreign-finalization");
+        let binding = campaign_binding_fixture(&mut primary);
+        execute_report(primary.args.clone(), binding.clone()).unwrap();
+
+        let mut foreign = finalizing_fixture("recover-campaign-foreign-source");
+        let foreign_binding = campaign_binding_fixture(&mut foreign);
+        execute_report(foreign.args.clone(), foreign_binding).unwrap();
+
+        let foreign_results = foreign.args.work_dir.join("results");
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
             "results/finalization-report.json",
-            |value| {
-                value["sealed_passed"] =
-                    serde_json::json!(!value["sealed_passed"].as_bool().unwrap());
-            },
+            std::fs::read(foreign_results.join("finalization-report.json")).unwrap(),
         );
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/final-precommit.json",
+            std::fs::read(foreign_results.join("final-precommit.json")).unwrap(),
+        );
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/sealed-holdout-receipt.json",
+            std::fs::read(foreign_results.join("sealed-holdout-receipt.json")).unwrap(),
+        );
+
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         let error = recover_execution_report_from_published_result(
             &client,
-            fixture.args.result_readback_url.as_str(),
-            &fixture.root.join("recovered-sealed-pass-mismatch.zip"),
-            &fixture.args.mission_id,
-            &fixture.args.mission_sha256,
+            primary.args.result_readback_url.as_str(),
+            &primary.root.join("recovered-foreign-finalization.zip"),
+            &primary.args.mission_id,
+            &primary.args.mission_sha256,
             &binding,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains(
-            "published result bundle sealed evaluation does not match its finalization report"
+            "published result bundle precommit does not match the exact Campaign Mission"
         ));
-        std::fs::remove_dir_all(fixture.root).unwrap();
+        std::fs::remove_dir_all(primary.root).unwrap();
+        std::fs::remove_dir_all(foreign.root).unwrap();
     }
 
     fn campaign_binding_fixture(fixture: &mut Fixture) -> ExecutionBinding {
@@ -5206,11 +5390,28 @@ mod tests {
         }
     }
 
-    fn rewrite_bundle_json_entry(
-        bundle_path: &Path,
-        entry_name: &str,
-        mutate: impl FnOnce(&mut serde_json::Value),
-    ) {
+    fn finalizing_fixture(name: &str) -> Fixture {
+        let mut fixture = fixture(name);
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        fixture
+    }
+
+    fn rewrite_bundle_entry_bytes(bundle_path: &Path, entry_name: &str, replacement: Vec<u8>) {
+        let mut entries = read_bundle_entries(bundle_path);
+        let entry_index = entries
+            .iter()
+            .position(|(name, _)| name == entry_name)
+            .expect("bundle entry must exist");
+        entries[entry_index].1 = replacement;
+        rewrite_bundle_entries(bundle_path, entries);
+    }
+
+    fn read_bundle_entries(bundle_path: &Path) -> Vec<(String, Vec<u8>)> {
         let mut archive = ZipArchive::new(File::open(bundle_path).unwrap()).unwrap();
         let mut entries = Vec::with_capacity(archive.len());
         for index in 0..archive.len() {
@@ -5219,15 +5420,10 @@ mod tests {
             entry.read_to_end(&mut bytes).unwrap();
             entries.push((entry.name().to_string(), bytes));
         }
-        let entry_index = entries
-            .iter()
-            .position(|(name, _)| name == entry_name)
-            .expect("bundle entry must exist");
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&entries[entry_index].1).expect("bundle entry must be JSON");
-        mutate(&mut value);
-        entries[entry_index].1 = serde_json::to_vec_pretty(&value).unwrap();
+        entries
+    }
 
+    fn rewrite_bundle_entries(bundle_path: &Path, entries: Vec<(String, Vec<u8>)>) {
         let rewritten = bundle_path.with_extension("rewritten.zip");
         let file = File::create(&rewritten).unwrap();
         let mut writer = ZipWriter::new(file);

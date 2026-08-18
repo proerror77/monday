@@ -10,8 +10,8 @@ use crate::{
         validate_cex_holdout_id, ExecutionBinding,
     },
     prediction_dispatch::{
-        canonical_tokyo_oss_internal_object, cex_campaign_round_result_and_holdout_claim,
-        cex_campaign_round_root, sha256_text, validate_dns_label,
+        canonical_tokyo_oss_internal_object, cex_campaign_round_root,
+        cex_global_holdout_claim_object, validate_dns_label,
     },
 };
 use alpha_domain::canonical_json_hash;
@@ -400,13 +400,9 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if campaign_result_object != expected_campaign_result_object {
         bail!("campaign result object must bind the exact Campaign ID");
     }
-    let expected_claim_object = format!(
-        "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
-        campaign_root,
-        sha256_text(&request.holdout_id),
-    );
+    let expected_claim_object = cex_global_holdout_claim_object(&request.holdout_id)?;
     if claim_object != expected_claim_object {
-        bail!("campaign holdout claim object must live at the Campaign root");
+        bail!("campaign holdout claim object must use the global sealed holdout namespace");
     }
 
     let round = &request.round;
@@ -439,14 +435,9 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if root != campaign_root {
         bail!("campaign result must share one Campaign root");
     }
-    let expected_claim = cex_campaign_round_result_and_holdout_claim(
-        &result_object,
-        &request.campaign_id,
-        &round.round_id,
-        &request.holdout_id,
-    )?;
+    let expected_claim = cex_global_holdout_claim_object(&request.holdout_id)?;
     if expected_claim != claim_object {
-        bail!("campaign result and holdout claim must share one Campaign root");
+        bail!("campaign result and holdout claim must bind the same global holdout fence");
     }
     let expected_id = expected_campaign_id(request)?;
     if request.campaign_id != expected_id {
@@ -673,16 +664,8 @@ mod tests {
     #[test]
     fn round_result_path_binds_the_shared_holdout_claim() {
         let request = valid_request();
-        let claim = cex_campaign_round_result_and_holdout_claim(
-            &canonical_output_object("result", &request.round.result_put_url).unwrap(),
-            &request.campaign_id,
-            &request.round.round_id,
-            &request.holdout_id,
-        )
-        .unwrap();
-
         assert_eq!(
-            claim,
+            cex_global_holdout_claim_object(&request.holdout_id).unwrap(),
             canonical_output_object("holdout", &request.holdout_claim_put_url).unwrap()
         );
     }
@@ -707,6 +690,37 @@ mod tests {
                 .to_string();
         request.round.mission_readback_url = request.round.mission_put_url.clone();
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn same_holdout_keeps_one_global_claim_across_output_roots() {
+        let request = valid_request();
+        let claim = request.holdout_claim_put_url.clone();
+        let rebased = rebind_request_to_output_root(request, "other-root");
+
+        assert_eq!(rebased.holdout_claim_put_url, claim);
+        assert_eq!(rebased.holdout_claim_readback_url, claim);
+        validate_request(&rebased).unwrap();
+    }
+
+    #[test]
+    fn validate_request_rejects_a_campaign_root_scoped_claim() {
+        let mut request = valid_request();
+        let campaign_root = campaign_output_root(
+            &canonical_output_object("result", &request.campaign_result_put_url).unwrap(),
+        )
+        .unwrap();
+        request.holdout_claim_put_url = format!(
+            "{campaign_root}/holdout-id-sha256={}/sealed-holdout-claim.json",
+            crate::prediction_dispatch::sha256_text(&request.holdout_id)
+        );
+        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
+
+        let error = validate_request(&request).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("global sealed holdout namespace"));
     }
 
     #[test]
@@ -910,20 +924,62 @@ mod tests {
             "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
             request.campaign_id, request.round.round_id
         );
-        request.holdout_claim_put_url = format!(
-            "{TEST_ROOT}/holdout-id-sha256={}/sealed-holdout-claim.json",
-            sha256_text(&request.holdout_id)
-        );
-        request.holdout_claim_readback_url = format!(
-            "{TEST_ROOT}/holdout-id-sha256={}/sealed-holdout-claim.json?readback=1",
-            sha256_text(&request.holdout_id)
-        );
+        request.holdout_claim_put_url =
+            cex_global_holdout_claim_object(&request.holdout_id).unwrap();
+        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
         request.campaign_result_put_url = format!(
             "{TEST_ROOT}/campaign-id={}/campaign-result.json",
             request.campaign_id
         );
         request.campaign_result_readback_url = format!(
             "{TEST_ROOT}/campaign-id={}/campaign-result.json?readback=1",
+            request.campaign_id
+        );
+        request
+    }
+
+    fn rebind_request_to_output_root(
+        mut request: CampaignRequest,
+        root_name: &str,
+    ) -> CampaignRequest {
+        let root = format!(
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/{root_name}"
+        );
+        request.round.mission_put_url =
+            format!("{root}/campaign-id=placeholder/round=r1/mission.json");
+        request.round.mission_readback_url =
+            format!("{root}/campaign-id=placeholder/round=r1/mission.json?readback=1");
+        request.round.result_put_url =
+            format!("{root}/campaign-id=placeholder/round=r1/results.zip");
+        request.round.result_readback_url =
+            format!("{root}/campaign-id=placeholder/round=r1/results.zip?readback=1");
+        request.campaign_result_put_url =
+            format!("{root}/campaign-id=placeholder/campaign-result.json");
+        request.campaign_result_readback_url =
+            format!("{root}/campaign-id=placeholder/campaign-result.json?readback=1");
+        request.campaign_id = expected_campaign_id(&request).unwrap();
+        request.round.mission_put_url = format!(
+            "{root}/campaign-id={}/round={}/mission.json",
+            request.campaign_id, request.round.round_id
+        );
+        request.round.mission_readback_url = format!(
+            "{root}/campaign-id={}/round={}/mission.json?readback=1",
+            request.campaign_id, request.round.round_id
+        );
+        request.round.result_put_url = format!(
+            "{root}/campaign-id={}/round={}/results.zip",
+            request.campaign_id, request.round.round_id
+        );
+        request.round.result_readback_url = format!(
+            "{root}/campaign-id={}/round={}/results.zip?readback=1",
+            request.campaign_id, request.round.round_id
+        );
+        request.campaign_result_put_url = format!(
+            "{root}/campaign-id={}/campaign-result.json",
+            request.campaign_id
+        );
+        request.campaign_result_readback_url = format!(
+            "{root}/campaign-id={}/campaign-result.json?readback=1",
             request.campaign_id
         );
         request

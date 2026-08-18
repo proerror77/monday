@@ -82,8 +82,9 @@ it grants no promotion or runtime authority.
 The production CEX entrypoint consumes a private Campaign submission whose
 request binds the exact input objects and SHA-256 values, source revision,
 image digest, holdout identity, one search seed, output root, and create-once
-Mission/result/claim objects. Signed URL query parameters are transport only;
-the query-free objects are part of the Campaign identity.
+Mission/result objects plus one global sealed-holdout claim object. Signed URL
+query parameters are transport only; the query-free objects are part of the
+Campaign identity.
 
 ```bash
 cargo run -p alpha-harness -- mission campaign-id \

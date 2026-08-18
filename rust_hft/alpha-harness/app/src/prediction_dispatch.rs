@@ -30,6 +30,8 @@ const RESOURCE_PROFILE: &str = "standard-v1";
 const ACTIVE_DEADLINE_SECONDS: u64 = 1800;
 const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v2";
 pub(crate) const TOKYO_OSS_INTERNAL_ENDPOINT: &str = "oss-ap-northeast-1-internal.aliyuncs.com";
+pub(crate) const CEX_GLOBAL_HOLDOUT_CLAIM_ROOT: &str =
+    "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/artifacts/alpha-results/cex-holdout-claims";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1362,6 +1364,17 @@ pub(crate) fn cex_campaign_round_result_and_holdout_claim(
     Ok(format!(
         "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
         cex_campaign_round_root(result_object, campaign_id, round_id, "results.zip")?,
+        sha256_text(holdout_id),
+    ))
+}
+
+pub(crate) fn cex_global_holdout_claim_object(holdout_id: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
+        canonical_tokyo_oss_internal_object(
+            "CEX sealed holdout claim root",
+            CEX_GLOBAL_HOLDOUT_CLAIM_ROOT,
+        )?,
         sha256_text(holdout_id),
     ))
 }
