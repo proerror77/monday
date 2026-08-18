@@ -1260,6 +1260,9 @@ pub(crate) fn canonical_https_object(label: &str, value: &str) -> anyhow::Result
     if value != value.trim() || value.chars().any(char::is_control) {
         bail!("{label} URL must not contain surrounding whitespace or control characters");
     }
+    if !value.starts_with("https://") {
+        bail!("{label} URL must start with canonical https://");
+    }
     let mut url = reqwest::Url::parse(value).with_context(|| format!("{label} URL is invalid"))?;
     if url.scheme() != "https" || url.host_str().is_none() {
         bail!("{label} URL must be HTTPS with a host");
@@ -1738,6 +1741,7 @@ mod tests {
         for url in [
             "https://token@oss-internal/missions/mission.json?signature=x",
             " https://oss-internal/missions/mission.json?signature=x",
+            "HTTPS://oss-internal/missions/mission.json?signature=x",
         ] {
             let mut submission = valid_submission();
             submission.mission_url = url.to_owned();

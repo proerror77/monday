@@ -17,6 +17,7 @@ metadata:
     app.kubernetes.io/part-of: monday
     research.monday/campaign-id: REPLACE_CAMPAIGN_ID
 spec:
+  suspend: true
   backoffLimit: 0
   activeDeadlineSeconds: 3600
   ttlSecondsAfterFinished: 86400

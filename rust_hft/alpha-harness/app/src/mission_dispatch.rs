@@ -45,16 +45,6 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     let manifest = render_manifest(validated, &args.namespace)?;
     let kubectl = kubectl_binary();
 
-    let secret_body = serde_json::to_vec(&manifest["items"][0])?;
-    let output = kubectl_with_input(
-        &kubectl,
-        &args.context,
-        &args.namespace,
-        ["create", "-f", "-"],
-        &secret_body,
-    )?;
-    ensure_kubectl_success(output, "create immutable CEX Campaign input Secret")?;
-
     let job_body = serde_json::to_vec(&manifest["items"][1])?;
     let job_create = kubectl_with_input(
         &kubectl,
@@ -66,18 +56,10 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     .and_then(|output| {
         ensure_kubectl_success(output, "create immutable CEX Campaign Job").map(|_| ())
     });
-    if let Err(error) = job_create {
-        let cleanup =
-            delete_campaign_secret(&kubectl, &args.context, &args.namespace, &secret_name);
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(error.context(format!(
-                "input Secret {secret_name} retained for reconciliation: {cleanup_error:#}"
-            ))),
-        };
-    }
+    job_create?;
 
     let result = (|| -> anyhow::Result<()> {
+        let expected_job = &manifest["items"][1];
         let job = kubectl_json(
             &kubectl,
             &args.context,
@@ -85,27 +67,20 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             ["get", "job", &job_name, "-o", "json"],
             "read back immutable CEX Campaign Job",
         )?;
-        validate_job_readback(&job, &job_name, &request_sha256, true)?;
+        validate_job_readback(&job, expected_job, &job_name, &request_sha256, true)?;
         let job_uid = job["metadata"]["uid"]
             .as_str()
             .context("CEX Campaign Job readback is missing its UID")?;
-        let owner_patch = job_owner_patch(&job_name, job_uid)?;
-        let owner_patch_json = serde_json::to_string(&owner_patch)?;
+        let secret = secret_with_owner(&manifest["items"][0], &job_name, job_uid)?;
+        let secret_body = serde_json::to_vec(&secret)?;
         let output = kubectl_with_input(
             &kubectl,
             &args.context,
             &args.namespace,
-            [
-                "patch",
-                "secret",
-                &secret_name,
-                "--type=merge",
-                "--patch",
-                &owner_patch_json,
-            ],
-            &[],
+            ["create", "-f", "-"],
+            &secret_body,
         )?;
-        ensure_kubectl_success(output, "bind CEX Campaign input Secret to its TTL Job")?;
+        ensure_kubectl_success(output, "create immutable CEX Campaign input Secret")?;
         let secret = kubectl_json(
             &kubectl,
             &args.context,
@@ -136,7 +111,13 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             "release CEX Campaign Job after identity verification",
         )?)
         .context("parse kubectl output for release CEX Campaign Job after identity verification")?;
-        validate_job_readback(&released_job, &job_name, &request_sha256, false)?;
+        validate_job_readback(
+            &released_job,
+            expected_job,
+            &job_name,
+            &request_sha256,
+            false,
+        )?;
         if released_job["metadata"]["uid"] != job_uid {
             bail!("released CEX Campaign Job readback does not match the created Job UID");
         }
@@ -168,22 +149,24 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     }))
 }
 
-fn job_owner_patch(job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
+fn job_owner_reference(job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
     if job_uid.trim().is_empty() || job_uid.chars().any(char::is_control) {
         bail!("CEX Campaign Job UID is invalid");
     }
-    Ok(json!({
-        "metadata": {
-            "ownerReferences": [{
-                "apiVersion": "batch/v1",
-                "kind": "Job",
-                "name": job_name,
-                "uid": job_uid,
-                "controller": false,
-                "blockOwnerDeletion": false,
-            }]
-        }
-    }))
+    Ok(json!([{
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "name": job_name,
+        "uid": job_uid,
+        "controller": false,
+        "blockOwnerDeletion": false,
+    }]))
+}
+
+fn secret_with_owner(secret: &Value, job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
+    let mut owned = secret.clone();
+    owned["metadata"]["ownerReferences"] = job_owner_reference(job_name, job_uid)?;
+    Ok(owned)
 }
 
 fn release_job_patch() -> Value {
@@ -196,6 +179,7 @@ fn release_job_patch() -> Value {
 
 fn validate_job_readback(
     job: &Value,
+    expected_job: &Value,
     job_name: &str,
     request_sha256: &str,
     suspended: bool,
@@ -203,10 +187,70 @@ fn validate_job_readback(
     if job["metadata"]["name"] != job_name
         || job["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
         || job["spec"]["suspend"] != suspended
+        || job_execution_projection(job) != job_execution_projection(expected_job)
     {
         bail!("CEX Campaign Job readback does not match the submitted identity");
     }
     Ok(())
+}
+
+fn job_execution_projection(job: &Value) -> Value {
+    let pod = &job["spec"]["template"]["spec"];
+    let containers = pod["containers"].as_array();
+    let container = containers
+        .and_then(|values| values.first())
+        .unwrap_or(&Value::Null);
+    let volumes = pod["volumes"].as_array();
+    let volume_projection = volumes
+        .into_iter()
+        .flatten()
+        .map(|volume| {
+            json!({
+                "name": volume["name"].clone(),
+                "emptyDir": volume["emptyDir"].clone(),
+                "secretName": volume["secret"]["secretName"].clone(),
+                "secretItems": volume["secret"]["items"].clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "spec": {
+            "backoffLimit": job["spec"]["backoffLimit"].clone(),
+            "activeDeadlineSeconds": job["spec"]["activeDeadlineSeconds"].clone(),
+            "ttlSecondsAfterFinished": job["spec"]["ttlSecondsAfterFinished"].clone(),
+            "template": {
+                "spec": {
+                    "restartPolicy": pod["restartPolicy"].clone(),
+                    "automountServiceAccountToken": pod["automountServiceAccountToken"].clone(),
+                    "serviceAccountName": pod["serviceAccountName"].as_str().unwrap_or("default"),
+                    "hostNetwork": pod["hostNetwork"].as_bool().unwrap_or(false),
+                    "hostPID": pod["hostPID"].as_bool().unwrap_or(false),
+                    "hostIPC": pod["hostIPC"].as_bool().unwrap_or(false),
+                    "shareProcessNamespace": pod["shareProcessNamespace"].as_bool().unwrap_or(false),
+                    "nodeName": pod["nodeName"].as_str().unwrap_or(""),
+                    "imagePullSecrets": pod["imagePullSecrets"].clone(),
+                    "nodeSelector": pod["nodeSelector"].clone(),
+                    "securityContext": pod["securityContext"].clone(),
+                    "initContainers": pod["initContainers"].clone(),
+                    "containerCount": containers.map_or(0, Vec::len),
+                    "container": {
+                        "name": container["name"].clone(),
+                        "image": container["image"].clone(),
+                        "imagePullPolicy": container["imagePullPolicy"].clone(),
+                        "command": container["command"].clone(),
+                        "args": container["args"].clone(),
+                        "resources": container["resources"].clone(),
+                        "securityContext": container["securityContext"].clone(),
+                        "volumeMounts": container["volumeMounts"].clone(),
+                        "env": container["env"].clone(),
+                        "envFrom": container["envFrom"].clone(),
+                    },
+                    "volumeCount": volumes.map_or(0, Vec::len),
+                    "volumes": volume_projection,
+                }
+            }
+        }
+    })
 }
 
 fn validate_secret_readback(
@@ -492,13 +536,24 @@ mod tests {
 
     #[test]
     fn campaign_secret_is_owned_by_the_ttl_job() {
-        let owner = job_owner_patch("alpha-campaign-test", "job-uid").unwrap();
+        let owner = job_owner_reference("alpha-campaign-test", "job-uid").unwrap();
+
+        assert_eq!(owner[0]["name"], "alpha-campaign-test");
+        assert_eq!(owner[0]["uid"], "job-uid");
+    }
+
+    #[test]
+    fn campaign_secret_creation_inlines_job_owner_reference() {
+        let rendered =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+        let secret =
+            secret_with_owner(&rendered["items"][0], "alpha-campaign-test", "job-uid").unwrap();
 
         assert_eq!(
-            owner["metadata"]["ownerReferences"][0]["name"],
+            secret["metadata"]["ownerReferences"][0]["name"],
             "alpha-campaign-test"
         );
-        assert_eq!(owner["metadata"]["ownerReferences"][0]["uid"], "job-uid");
+        assert_eq!(secret["metadata"]["ownerReferences"][0]["uid"], "job-uid");
     }
 
     #[test]
@@ -535,18 +590,83 @@ mod tests {
 
     #[test]
     fn job_readback_requires_expected_suspend_state() {
+        let expected_job =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job = json!({
             "metadata": {
-                "name": "alpha-campaign-test",
+                "name": expected_job["items"][1]["metadata"]["name"].clone(),
                 "annotations": { "research.monday/request-sha256": "request-sha" },
             },
             "spec": {
                 "suspend": true,
+                "backoffLimit": 0,
+                "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
+                "ttlSecondsAfterFinished": 86400,
+                "template": expected_job["items"][1]["spec"]["template"].clone(),
             },
         });
+        let mut job = job;
+        job["spec"]["template"]["spec"]["dnsPolicy"] = json!("ClusterFirst");
+        job["spec"]["template"]["spec"]["containers"][0]["terminationMessagePath"] =
+            json!("/dev/termination-log");
+        job["spec"]["template"]["spec"]["volumes"][2]["secret"]["defaultMode"] = json!(420);
 
-        validate_job_readback(&job, "alpha-campaign-test", "request-sha", true).unwrap();
-        assert!(validate_job_readback(&job, "alpha-campaign-test", "request-sha", false).is_err());
+        validate_job_readback(
+            &job,
+            &expected_job["items"][1],
+            expected_job["items"][1]["metadata"]["name"]
+                .as_str()
+                .unwrap(),
+            "request-sha",
+            true,
+        )
+        .unwrap();
+        assert!(validate_job_readback(
+            &job,
+            &expected_job["items"][1],
+            expected_job["items"][1]["metadata"]["name"]
+                .as_str()
+                .unwrap(),
+            "request-sha",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn job_readback_rejects_execution_template_drift() {
+        let expected_job =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+        let mut job = expected_job["items"][1].clone();
+        job["metadata"]["annotations"]["research.monday/request-sha256"] = json!("request-sha");
+        job["spec"]["template"]["spec"]["containers"][0]["env"] =
+            json!([{ "name": "INJECTED", "value": "1" }]);
+
+        assert!(validate_job_readback(
+            &job,
+            &expected_job["items"][1],
+            expected_job["items"][1]["metadata"]["name"]
+                .as_str()
+                .unwrap(),
+            "request-sha",
+            true
+        )
+        .is_err());
+
+        let mut privileged_job = expected_job["items"][1].clone();
+        privileged_job["metadata"]["annotations"]["research.monday/request-sha256"] =
+            json!("request-sha");
+        privileged_job["spec"]["template"]["spec"]["hostPID"] = json!(true);
+        assert!(validate_job_readback(
+            &privileged_job,
+            &expected_job["items"][1],
+            expected_job["items"][1]["metadata"]["name"]
+                .as_str()
+                .unwrap(),
+            "request-sha",
+            true
+        )
+        .is_err());
     }
 
     fn valid_submission() -> MissionDispatchSubmission {

@@ -95,9 +95,10 @@ cargo run -p alpha-harness -- mission dispatch submit \
   --namespace monday-research
 ```
 
-The submit command creates the immutable Secret before the Job, verifies both
-objects by cluster readback, and attaches the Secret to the TTL Job for garbage
-collection. It prints identities only, never the signed URLs. The Pod rejects
+The submit command creates the Job suspended, verifies its pinned execution
+template, then creates the immutable Secret with that Job as its owner. It reads
+the Secret back before releasing the Job and prints identities only, never the
+signed URLs. The Pod rejects
 redirects, input/hash drift, an existing holdout claim, and any Mission or
 result readback mismatch before accepting terminal evidence.
 

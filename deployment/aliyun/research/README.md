@@ -301,9 +301,10 @@ alpha-harness mission dispatch submit \
   --namespace monday-research
 ```
 
-The submitter creates the immutable input Secret before the Job, reads both
-objects back, and attaches the Secret to the TTL Job for garbage collection.
-It never prints the Secret or signed URLs. The Pod uses no ServiceAccount token,
+The submitter creates the Job suspended, reads back its pinned execution
+template, then creates the immutable input Secret with the Job owner reference
+already attached. It reads the Secret back before releasing the Job and never
+prints the Secret or signed URLs. The Pod uses no ServiceAccount token,
 exchange account file, API key, or order/execution entrypoint.
 
 One Campaign maps to one Mission. The fixed Mission contract remains
