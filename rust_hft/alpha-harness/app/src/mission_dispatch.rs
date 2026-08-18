@@ -85,11 +85,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             ["get", "job", &job_name, "-o", "json"],
             "read back immutable CEX Campaign Job",
         )?;
-        if job["metadata"]["name"] != job_name
-            || job["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
-        {
-            bail!("CEX Campaign Job readback does not match the submitted identity");
-        }
+        validate_job_readback(&job, &job_name, &request_sha256, true)?;
         let job_uid = job["metadata"]["uid"]
             .as_str()
             .context("CEX Campaign Job readback is missing its UID")?;
@@ -118,6 +114,32 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             "read back immutable CEX Campaign input Secret",
         )?;
         validate_secret_readback(&secret, &secret_name, &request_sha256, &job_name, job_uid)?;
+        let release_patch_json = serde_json::to_string(&release_job_patch())?;
+        let release_output = kubectl_with_input(
+            &kubectl,
+            &args.context,
+            &args.namespace,
+            [
+                "patch",
+                "job",
+                &job_name,
+                "--type=merge",
+                "--patch",
+                &release_patch_json,
+                "-o",
+                "json",
+            ],
+            &[],
+        )?;
+        let released_job = serde_json::from_slice(&ensure_kubectl_success(
+            release_output,
+            "release CEX Campaign Job after identity verification",
+        )?)
+        .context("parse kubectl output for release CEX Campaign Job after identity verification")?;
+        validate_job_readback(&released_job, &job_name, &request_sha256, false)?;
+        if released_job["metadata"]["uid"] != job_uid {
+            bail!("released CEX Campaign Job readback does not match the created Job UID");
+        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -162,6 +184,29 @@ fn job_owner_patch(job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
             }]
         }
     }))
+}
+
+fn release_job_patch() -> Value {
+    json!({
+        "spec": {
+            "suspend": false,
+        }
+    })
+}
+
+fn validate_job_readback(
+    job: &Value,
+    job_name: &str,
+    request_sha256: &str,
+    suspended: bool,
+) -> anyhow::Result<()> {
+    if job["metadata"]["name"] != job_name
+        || job["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
+        || job["spec"]["suspend"] != suspended
+    {
+        bail!("CEX Campaign Job readback does not match the submitted identity");
+    }
+    Ok(())
 }
 
 fn validate_secret_readback(
@@ -317,6 +362,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                     "annotations": annotations,
                 },
                 "spec": {
+                    "suspend": true,
                     "backoffLimit": 0,
                     "activeDeadlineSeconds": ACTIVE_DEADLINE_SECONDS,
                     "ttlSecondsAfterFinished": 86400,
@@ -432,6 +478,7 @@ mod tests {
             render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
         let job = &rendered["items"][1];
 
+        assert_eq!(job["spec"]["suspend"], true);
         assert_eq!(job["spec"]["backoffLimit"], 0);
         assert_eq!(
             job["spec"]["template"]["spec"]["automountServiceAccountToken"],
@@ -479,6 +526,27 @@ mod tests {
             "job-uid",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn release_patch_clears_job_suspend() {
+        assert_eq!(release_job_patch()["spec"]["suspend"], false);
+    }
+
+    #[test]
+    fn job_readback_requires_expected_suspend_state() {
+        let job = json!({
+            "metadata": {
+                "name": "alpha-campaign-test",
+                "annotations": { "research.monday/request-sha256": "request-sha" },
+            },
+            "spec": {
+                "suspend": true,
+            },
+        });
+
+        validate_job_readback(&job, "alpha-campaign-test", "request-sha", true).unwrap();
+        assert!(validate_job_readback(&job, "alpha-campaign-test", "request-sha", false).is_err());
     }
 
     fn valid_submission() -> MissionDispatchSubmission {

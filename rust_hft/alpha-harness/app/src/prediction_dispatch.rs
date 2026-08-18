@@ -29,6 +29,7 @@ const SNAPSHOT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_PROFILE: &str = "standard-v1";
 const ACTIVE_DEADLINE_SECONDS: u64 = 1800;
 const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v2";
+pub(crate) const TOKYO_OSS_INTERNAL_ENDPOINT: &str = "oss-ap-northeast-1-internal.aliyuncs.com";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1274,6 +1275,44 @@ pub(crate) fn canonical_https_object(label: &str, value: &str) -> anyhow::Result
     Ok(url.to_string())
 }
 
+pub(crate) fn canonical_tokyo_oss_internal_object(
+    label: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let canonical = canonical_https_object(label, value)?;
+    let url = reqwest::Url::parse(&canonical).expect("canonical HTTPS object must parse");
+    if url.port().is_some() {
+        bail!("{label} URL must not override the OSS port");
+    }
+    let host = url
+        .host_str()
+        .context("canonical HTTPS object must retain a host")?;
+    let path = url.path().trim_start_matches('/');
+    let (bucket, object) = if host == TOKYO_OSS_INTERNAL_ENDPOINT {
+        let mut segments = url
+            .path_segments()
+            .context("OSS endpoint URL must identify one bucket and object")?;
+        let bucket = segments
+            .next()
+            .context("OSS endpoint URL must include the bucket as the first path segment")?;
+        validate_dns_label("OSS bucket", bucket)?;
+        let object = segments.collect::<Vec<_>>().join("/");
+        if object.is_empty() {
+            bail!("{label} URL must identify one OSS object");
+        }
+        (bucket.to_owned(), object)
+    } else if let Some(bucket) = host.strip_suffix(&format!(".{TOKYO_OSS_INTERNAL_ENDPOINT}")) {
+        validate_dns_label("OSS bucket", bucket)?;
+        if path.is_empty() {
+            bail!("{label} URL must identify one OSS object");
+        }
+        (bucket.to_owned(), path.to_owned())
+    } else {
+        bail!("{label} URL must target the Tokyo OSS internal endpoint");
+    };
+    Ok(format!("oss://{bucket}/{object}"))
+}
+
 pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> anyhow::Result<bool> {
     let url = reqwest::Url::parse(object)?;
     Ok(url.path_segments().into_iter().flatten().any(|segment| {
@@ -1719,6 +1758,37 @@ mod tests {
             let mut submission = valid_submission();
             submission.mission_url = url.to_owned();
             assert!(validate_submission(submission).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_tokyo_oss_internal_object_normalizes_virtual_host_and_path_style_urls() {
+        let virtual_host = canonical_tokyo_oss_internal_object(
+            "result",
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaign-id=test/campaign-result.json?signature=x",
+        )
+        .unwrap();
+        let path_style = canonical_tokyo_oss_internal_object(
+            "result",
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/monday-lob-apne1-1045353359/research/campaign-id=test/campaign-result.json?read=x",
+        )
+        .unwrap();
+
+        assert_eq!(
+            virtual_host,
+            "oss://monday-lob-apne1-1045353359/research/campaign-id=test/campaign-result.json"
+        );
+        assert_eq!(virtual_host, path_style);
+    }
+
+    #[test]
+    fn canonical_tokyo_oss_internal_object_rejects_non_internal_hosts() {
+        for url in [
+            "https://example.com/research/campaign-id=test/campaign-result.json",
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1.aliyuncs.com/research/campaign-id=test/campaign-result.json",
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/research-only",
+        ] {
+            assert!(canonical_tokyo_oss_internal_object("result", url).is_err());
         }
     }
 

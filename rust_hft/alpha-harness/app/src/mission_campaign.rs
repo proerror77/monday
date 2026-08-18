@@ -9,13 +9,14 @@ use crate::{
         publish_immutable_file, valid_git_revision, validate_cex_holdout_id, ExecutionBinding,
     },
     prediction_dispatch::{
-        canonical_https_object, cex_campaign_round_result_and_holdout_claim,
-        cex_campaign_round_root, sha256_text, validate_dns_label,
+        canonical_https_object, canonical_tokyo_oss_internal_object,
+        cex_campaign_round_result_and_holdout_claim, cex_campaign_round_root, sha256_text,
+        validate_dns_label,
     },
 };
 use alpha_domain::canonical_json_hash;
 use anyhow::{bail, Context};
-use reqwest::{blocking::Client, redirect::Policy};
+use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
@@ -207,23 +208,14 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&mission_publish_dir)?;
     let mission_local_path = mission_publish_dir.join("mission.json");
     data_mission::write_json_atomic(&mission_local_path, &rendered.mission)?;
-    let mission_sha256 = crate::mission_runner::sha256_file(&mission_local_path)?;
-    publish_immutable_file(
+    let mission_readback_path = mission_publish_dir.join("mission-readback.json");
+    let mission_sha256 = publish_round_mission(
         &client,
         &round.mission_put_url,
-        &mission_local_path,
-        "application/json",
-    )?;
-    let mission_readback_path = mission_publish_dir.join("mission-readback.json");
-    let (_, mission_readback_sha256) = fetch_to_file(
-        &client,
         &round.mission_readback_url,
+        &mission_local_path,
         &mission_readback_path,
-        mission_local_path.metadata()?.len(),
     )?;
-    if mission_readback_sha256 != mission_sha256 {
-        bail!("published Mission readback SHA256 mismatch");
-    }
 
     let report = execute_report(
         ExecuteMissionArgs {
@@ -543,12 +535,53 @@ fn fetch_verified(
     Ok(())
 }
 
+fn publish_round_mission(
+    client: &Client,
+    destination: &str,
+    readback_url: &str,
+    source: &Path,
+    readback_path: &Path,
+) -> anyhow::Result<String> {
+    let mission_sha256 = crate::mission_runner::sha256_file(source)?;
+    let already_exists =
+        match publish_immutable_file(client, destination, source, "application/json") {
+            Ok(()) => false,
+            Err(error) if immutable_publish_conflict(&error) => true,
+            Err(error) => return Err(error).context("publish Mission"),
+        };
+    let (_, mission_readback_sha256) = fetch_to_file(
+        client,
+        readback_url,
+        readback_path,
+        source.metadata()?.len(),
+    )?;
+    if mission_readback_sha256 != mission_sha256 {
+        if already_exists {
+            bail!("published Mission already exists with different bytes");
+        }
+        bail!("published Mission readback SHA256 mismatch");
+    }
+    Ok(mission_sha256)
+}
+
+fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .starts_with("result destination already exists:")
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status)
+                .is_some_and(|status| status == StatusCode::CONFLICT)
+        })
+}
+
 fn canonical_input_object(label: &str, value: &str) -> anyhow::Result<String> {
     canonical_object(label, value)
 }
 
 fn canonical_output_object(label: &str, value: &str) -> anyhow::Result<String> {
-    canonical_object(label, value)
+    canonical_tokyo_oss_internal_object(label, value)
 }
 
 fn canonical_object(label: &str, value: &str) -> anyhow::Result<String> {
@@ -558,6 +591,7 @@ fn canonical_object(label: &str, value: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn expected_campaign_id_ignores_signed_queries_and_output_transports() {
@@ -623,7 +657,87 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(claim, request.holdout_claim_put_url);
+        assert_eq!(
+            claim,
+            canonical_output_object("holdout", &request.holdout_claim_put_url).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_request_rejects_non_oss_campaign_outputs() {
+        let mut request = valid_request();
+        request.holdout_claim_put_url =
+            "https://example.com/research/sealed-holdout-claim.json".to_string();
+        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.campaign_result_put_url =
+            "https://example.com/research/campaign-id=placeholder/campaign-result.json".to_string();
+        request.campaign_result_readback_url = request.campaign_result_put_url.clone();
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.round.mission_put_url =
+            "https://example.com/research/campaign-id=placeholder/round=r1/mission.json"
+                .to_string();
+        request.round.mission_readback_url = request.round.mission_put_url.clone();
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn publish_round_mission_accepts_an_existing_identical_object() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("rendered-mission.json");
+        let destination = root.path().join("published-mission.json");
+        let readback = root.path().join("mission-readback.json");
+        std::fs::write(&source, br#"{"mission":"same"}"#).unwrap();
+        std::fs::write(&destination, br#"{"mission":"same"}"#).unwrap();
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let mission_sha256 = publish_round_mission(
+            &client,
+            &destination.to_string_lossy(),
+            &destination.to_string_lossy(),
+            &source,
+            &readback,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mission_sha256,
+            crate::mission_runner::sha256_file(&destination).unwrap()
+        );
+        assert_eq!(
+            crate::mission_runner::sha256_file(&readback).unwrap(),
+            mission_sha256
+        );
+    }
+
+    #[test]
+    fn publish_round_mission_rejects_an_existing_different_object() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("rendered-mission.json");
+        let destination = root.path().join("published-mission.json");
+        let readback = root.path().join("mission-readback.json");
+        std::fs::write(&source, br#"{"mission":"new"}"#).unwrap();
+        let mut file = std::fs::File::create(&destination).unwrap();
+        file.write_all(br#"{"mission":"old"}"#).unwrap();
+        file.flush().unwrap();
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = publish_round_mission(
+            &client,
+            &destination.to_string_lossy(),
+            &destination.to_string_lossy(),
+            &source,
+            &readback,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("published Mission already exists with different bytes"));
     }
 
     pub(crate) fn valid_request_for_other_modules() -> CampaignRequest {
@@ -631,6 +745,9 @@ mod tests {
     }
 
     fn valid_request() -> CampaignRequest {
+        const TEST_BUCKET: &str = "monday-lob-apne1-1045353359";
+        const TEST_ROOT: &str =
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
         let mut request = CampaignRequest {
             schema_version: CAMPAIGN_REQUEST_SCHEMA_V1.to_string(),
             campaign_id: String::new(),
@@ -648,49 +765,55 @@ mod tests {
             round: CampaignRoundRequest {
                 round_id: "r1".to_string(),
                 seed: 11,
-                mission_put_url:
-                    "https://oss-internal/research/campaign-id=placeholder/round=r1/mission.json"
-                        .to_string(),
-                mission_readback_url:
-                    "https://oss-internal/research/campaign-id=placeholder/round=r1/mission.json"
-                        .to_string(),
-                result_put_url:
-                    "https://oss-internal/research/campaign-id=placeholder/round=r1/results.zip"
-                        .to_string(),
-                result_readback_url:
-                    "https://oss-internal/research/campaign-id=placeholder/round=r1/results.zip"
-                        .to_string(),
+                mission_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"),
+                mission_readback_url: format!(
+                    "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/round=r1/mission.json"
+                ),
+                result_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"),
+                result_readback_url: format!(
+                    "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/round=r1/results.zip"
+                ),
             },
             holdout_claim_put_url: String::new(),
             holdout_claim_readback_url: String::new(),
-            campaign_result_put_url:
-                "https://oss-internal/research/campaign-id=placeholder/campaign-result.json"
-                    .to_string(),
-            campaign_result_readback_url:
-                "https://oss-internal/research/campaign-id=placeholder/campaign-result.json"
-                    .to_string(),
+            campaign_result_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/campaign-result.json"),
+            campaign_result_readback_url: format!(
+                "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/campaign-result.json"
+            ),
         };
         request.campaign_id = expected_campaign_id(&request).unwrap();
         request.round.mission_put_url = format!(
-            "https://oss-internal/research/campaign-id={}/round={}/mission.json",
+            "{TEST_ROOT}/campaign-id={}/round={}/mission.json",
             request.campaign_id, request.round.round_id
         );
-        request.round.mission_readback_url = request.round.mission_put_url.clone();
+        request.round.mission_readback_url = format!(
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/round={}/mission.json",
+            request.campaign_id, request.round.round_id
+        );
         request.round.result_put_url = format!(
-            "https://oss-internal/research/campaign-id={}/round={}/results.zip",
+            "{TEST_ROOT}/campaign-id={}/round={}/results.zip",
             request.campaign_id, request.round.round_id
         );
-        request.round.result_readback_url = request.round.result_put_url.clone();
+        request.round.result_readback_url = format!(
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/round={}/results.zip",
+            request.campaign_id, request.round.round_id
+        );
         request.holdout_claim_put_url = format!(
-            "https://oss-internal/research/holdout-id-sha256={}/sealed-holdout-claim.json",
+            "{TEST_ROOT}/holdout-id-sha256={}/sealed-holdout-claim.json",
             sha256_text(&request.holdout_id)
         );
-        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
+        request.holdout_claim_readback_url = format!(
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/holdout-id-sha256={}/sealed-holdout-claim.json",
+            sha256_text(&request.holdout_id)
+        );
         request.campaign_result_put_url = format!(
-            "https://oss-internal/research/campaign-id={}/campaign-result.json",
+            "{TEST_ROOT}/campaign-id={}/campaign-result.json",
             request.campaign_id
         );
-        request.campaign_result_readback_url = request.campaign_result_put_url.clone();
+        request.campaign_result_readback_url = format!(
+            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/campaign-result.json",
+            request.campaign_id
+        );
         request
     }
 }
