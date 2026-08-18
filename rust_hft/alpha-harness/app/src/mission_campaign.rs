@@ -745,7 +745,6 @@ mod tests {
     }
 
     fn valid_request() -> CampaignRequest {
-        const TEST_BUCKET: &str = "monday-lob-apne1-1045353359";
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
         let mut request = CampaignRequest {
@@ -765,20 +764,24 @@ mod tests {
             round: CampaignRoundRequest {
                 round_id: "r1".to_string(),
                 seed: 11,
-                mission_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"),
+                mission_put_url: format!(
+                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
+                ),
                 mission_readback_url: format!(
-                    "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/round=r1/mission.json"
+                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json?readback=1"
                 ),
                 result_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"),
                 result_readback_url: format!(
-                    "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/round=r1/results.zip"
+                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip?readback=1"
                 ),
             },
             holdout_claim_put_url: String::new(),
             holdout_claim_readback_url: String::new(),
-            campaign_result_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/campaign-result.json"),
+            campaign_result_put_url: format!(
+                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json"
+            ),
             campaign_result_readback_url: format!(
-                "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id=placeholder/campaign-result.json"
+                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json?readback=1"
             ),
         };
         request.campaign_id = expected_campaign_id(&request).unwrap();
@@ -787,7 +790,7 @@ mod tests {
             request.campaign_id, request.round.round_id
         );
         request.round.mission_readback_url = format!(
-            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/round={}/mission.json",
+            "{TEST_ROOT}/campaign-id={}/round={}/mission.json?readback=1",
             request.campaign_id, request.round.round_id
         );
         request.round.result_put_url = format!(
@@ -795,7 +798,7 @@ mod tests {
             request.campaign_id, request.round.round_id
         );
         request.round.result_readback_url = format!(
-            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/round={}/results.zip",
+            "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
             request.campaign_id, request.round.round_id
         );
         request.holdout_claim_put_url = format!(
@@ -803,7 +806,7 @@ mod tests {
             sha256_text(&request.holdout_id)
         );
         request.holdout_claim_readback_url = format!(
-            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/holdout-id-sha256={}/sealed-holdout-claim.json",
+            "{TEST_ROOT}/holdout-id-sha256={}/sealed-holdout-claim.json?readback=1",
             sha256_text(&request.holdout_id)
         );
         request.campaign_result_put_url = format!(
@@ -811,7 +814,7 @@ mod tests {
             request.campaign_id
         );
         request.campaign_result_readback_url = format!(
-            "https://oss-ap-northeast-1-internal.aliyuncs.com/{TEST_BUCKET}/research/campaign-id={}/campaign-result.json",
+            "{TEST_ROOT}/campaign-id={}/campaign-result.json?readback=1",
             request.campaign_id
         );
         request
