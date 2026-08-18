@@ -2527,6 +2527,17 @@ impl ReferenceCollector {
                 // pending recovery to finish and ordinary hour rotation to
                 // resume — and the carried rows are far below the threshold,
                 // so restarts do not churn.
+                // The carry writes and syncs a staged tape, so apply the same
+                // fail-closed disk probe the cycle path uses instead of
+                // risking an unhandled ENOSPC mid-startup.
+                let floor = reference_low_disk_floor_bytes(&config)?;
+                let available = available_disk_bytes(&config.spool_dir)?;
+                if available < floor {
+                    return Err(low_disk_error(format!(
+                        "low disk: {available} bytes available < {floor} byte floor; \
+                         refusing startup carry rotation to avoid ENOSPC"
+                    )));
+                }
                 writer.rotate_with_pending_carry(startup_at)?;
             }
         }
@@ -7433,6 +7444,54 @@ mod tests {
         assert_eq!(rotated_tapes(root.path()).len(), 1);
         assert!(restarted.state.recovered_trade_ids["condition-1"].contains(&record_id));
         restarted.writer.close().unwrap();
+    }
+
+    #[test]
+    fn startup_carry_refuses_a_near_cap_pending_tape_when_disk_is_low() {
+        let root = TestDir::new();
+        let recorded_at = utc_now();
+        let metadata = valid_metadata_update(recorded_at);
+        let trade = valid_trade_update(recorded_at, recorded_at.timestamp());
+        let mut filler = valid_metadata_update(recorded_at);
+        filler["payload"] = json!("x".repeat(400_000));
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2", "trade_completion_version": "v1"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer.tape_max_bytes = MIN_TAPE_MAX_BYTES;
+            writer
+                .write_updates(&[metadata, trade], recorded_at)
+                .unwrap();
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer
+                .write_updates(std::slice::from_ref(&filler), recorded_at)
+                .unwrap();
+            writer.close().unwrap();
+        }
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            tape_max_bytes: MIN_TAPE_MAX_BYTES,
+            low_disk_floor_bytes: Some(u64::MAX),
+            ..ReferenceConfig::default()
+        };
+
+        let error = ReferenceCollector::new(config)
+            .err()
+            .expect("startup carry must fail closed on low disk");
+
+        assert!(error.to_string().contains("low disk"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert!(rotated_tapes(root.path()).is_empty());
     }
 
     #[test]
