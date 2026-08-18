@@ -48,6 +48,7 @@ use hft_research_manifest::{
 use reqwest::{
     blocking::Client,
     header::{HeaderValue, CONTENT_TYPE},
+    redirect::Policy,
     StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -69,8 +70,8 @@ const CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str = "cex_event_replay_receipt";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES: u64 = 64 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
-const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
@@ -131,20 +132,37 @@ struct SourceSegment {
     events: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct ExecutionReport<'a> {
-    mission_id: &'a str,
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExecutionReport {
+    pub(crate) mission_id: String,
+    pub(crate) mission_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) campaign_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) round_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_sha256: Option<String>,
     engine: &'static str,
-    bundle_bytes: u64,
-    bundle_sha256: String,
-    readback_bundle_sha256: String,
-    replay_receipt_id: Option<String>,
-    replay_gate_passed: Option<bool>,
-    final_precommit_id: Option<String>,
-    sealed_receipt_id: Option<String>,
-    sealed_passed: Option<bool>,
-    strategy_bundle_id: Option<String>,
-    promotion_id: Option<String>,
+    pub(crate) bundle_bytes: u64,
+    pub(crate) bundle_sha256: String,
+    pub(crate) readback_bundle_sha256: String,
+    pub(crate) replay_receipt_id: Option<String>,
+    pub(crate) replay_gate_passed: Option<bool>,
+    pub(crate) final_precommit_id: Option<String>,
+    pub(crate) sealed_receipt_id: Option<String>,
+    pub(crate) sealed_passed: Option<bool>,
+    pub(crate) strategy_bundle_id: Option<String>,
+    pub(crate) promotion_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutionBinding {
+    Direct,
+    Campaign {
+        campaign_id: String,
+        round_id: String,
+        request_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,9 +380,17 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
 }
 
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
-    validate_args(&args)?;
+    print_json(&execute_report(args, ExecutionBinding::Direct)?)
+}
+
+pub(crate) fn execute_report(
+    args: ExecuteMissionArgs,
+    binding: ExecutionBinding,
+) -> anyhow::Result<ExecutionReport> {
+    validate_args(&args, &binding)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
         .build()?;
     ensure_holdout_claim_absent(&client, &args.holdout_claim_readback_url)?;
     let input_dir = args.work_dir.join("input");
@@ -450,7 +476,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     if control_mission.spec.holdout.holdout_id != args.holdout_id {
         bail!("CEX Research Mission holdout ID does not match the requested holdout ID");
     }
-    validate_holdout_claim_binding(&args, &control_mission.spec.holdout.holdout_id)?;
+    validate_holdout_claim_binding(&args, &control_mission.spec.holdout.holdout_id, &binding)?;
     let validation = ValidationArgs::from_protocol(&control_mission.spec.evaluation_protocol);
     let engine = EngineChoice::Gp;
 
@@ -575,6 +601,18 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         &results_dir.join("control-plane-mission.json"),
         &control_mission,
     )?;
+    let (campaign_id, round_id) = match &binding {
+        ExecutionBinding::Direct => (None, None),
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            ..
+        } => (Some(campaign_id.clone()), Some(round_id.clone())),
+    };
+    let request_sha256 = match &binding {
+        ExecutionBinding::Direct => None,
+        ExecutionBinding::Campaign { request_sha256, .. } => Some(request_sha256.clone()),
+    };
     data_mission::write_json_atomic(
         &results_dir.join("mission-admission.json"),
         &serde_json::json!({
@@ -582,6 +620,9 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
             "mission_id": &mission_id,
             "mission_artifact_sha256": &mission_sha256,
             "dataset_manifest_id": &dataset_manifest.manifest_id,
+            "campaign_id": campaign_id.clone(),
+            "round_id": round_id.clone(),
+            "request_sha256": request_sha256.clone(),
         }),
     )?;
     let research_mission = ResearchMission {
@@ -811,8 +852,12 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     if readback_sha256 != bundle_sha256 {
         bail!("published CEX result readback SHA256 mismatch");
     }
-    print_json(&ExecutionReport {
-        mission_id: &mission_id,
+    Ok(ExecutionReport {
+        mission_id,
+        mission_sha256,
+        campaign_id,
+        round_id,
+        request_sha256,
         engine: "gp_then_factor_bank_subset_mcts",
         bundle_bytes,
         bundle_sha256,
@@ -1737,7 +1782,7 @@ fn build_factor_bank(
     )?)
 }
 
-fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
+fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyhow::Result<()> {
     if args.work_dir.as_os_str().is_empty()
         || [
             args.mission_url.as_str(),
@@ -1765,13 +1810,14 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
     }
     resume_source(args)?;
     validate_result_readback_binding(&args.result_put_url, &args.result_readback_url)?;
-    validate_holdout_claim_binding(args, &args.holdout_id)?;
+    validate_holdout_claim_binding(args, &args.holdout_id, binding)?;
     Ok(())
 }
 
 fn validate_holdout_claim_binding(
     args: &ExecuteMissionArgs,
     holdout_id: &str,
+    binding: &ExecutionBinding,
 ) -> anyhow::Result<()> {
     let result_is_remote =
         args.result_put_url.starts_with("http://") || args.result_put_url.starts_with("https://");
@@ -1796,11 +1842,8 @@ fn validate_holdout_claim_binding(
         if claim_object != claim_readback_object {
             bail!("CEX holdout claim readback URL must identify the same immutable object");
         }
-        let (_, expected_claim_object) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
-            &result_object,
-            &args.mission_id,
-            holdout_id,
-        )?;
+        let expected_claim_object =
+            expected_holdout_claim_object(&result_object, &args.mission_id, holdout_id, binding)?;
         if claim_object != expected_claim_object {
             bail!(
                 "CEX holdout claim object must be the holdout-scoped sibling of the Mission results"
@@ -1813,11 +1856,8 @@ fn validate_holdout_claim_binding(
         if claim_object != claim_readback_object {
             bail!("CEX holdout claim readback path must identify the same immutable object");
         }
-        let (_, expected_claim_object) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
-            &result_object,
-            &args.mission_id,
-            holdout_id,
-        )?;
+        let expected_claim_object =
+            expected_holdout_claim_object(&result_object, &args.mission_id, holdout_id, binding)?;
         if claim_object != expected_claim_object {
             bail!(
                 "CEX holdout claim path must be the holdout-scoped sibling of the Mission results"
@@ -1825,6 +1865,32 @@ fn validate_holdout_claim_binding(
         }
     }
     Ok(())
+}
+
+fn expected_holdout_claim_object(
+    result_object: &str,
+    mission_id: &str,
+    holdout_id: &str,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<String> {
+    match binding {
+        ExecutionBinding::Direct => Ok(prediction_dispatch::cex_result_attempt_and_holdout_claim(
+            result_object,
+            mission_id,
+            holdout_id,
+        )?
+        .1),
+        ExecutionBinding::Campaign {
+            campaign_id,
+            round_id,
+            ..
+        } => prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+            result_object,
+            campaign_id,
+            round_id,
+            holdout_id,
+        ),
+    }
 }
 
 fn normalized_local_object(value: &str) -> anyhow::Result<String> {
@@ -1845,7 +1911,7 @@ fn normalized_local_object(value: &str) -> anyhow::Result<String> {
     ))
 }
 
-fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
     let exists = if source.starts_with("http://") || source.starts_with("https://") {
         let response = client.get(source).send()?;
         match response.status() {
@@ -2034,8 +2100,11 @@ pub(crate) fn validate_materialization(
         bail!("evaluation funding cost does not match the verified CEX replay snapshot");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
+    let source_revision = normalized_sha256("source revision", &materialization.source_revision)?;
+    let mut source_sha256s = Vec::with_capacity(materialization.source_segments.len());
     for segment in &materialization.source_segments {
         let source_sha256 = normalized_sha256("source segment", &segment.sha256)?;
+        source_sha256s.push(source_sha256.clone());
         normalized_sha256(
             "source collector manifest",
             &segment.collector_manifest_sha256,
@@ -2045,6 +2114,11 @@ pub(crate) fn validate_materialization(
         if success_marker_sha256 != hex::encode(Sha256::digest(format!("{source_sha256}\n"))) {
             bail!("source success marker does not bind its segment");
         }
+    }
+    if hft_collector::lob_archiver::source_revision(source_sha256s.iter().map(String::as_str))
+        != source_revision
+    {
+        bail!("materialization source revision does not bind its source segments");
     }
     if artifact_sha256 != feature_sha256 {
         bail!("PIT feature artifact does not match materialization");
@@ -2081,7 +2155,7 @@ pub(crate) fn validate_cex_holdout_id(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn valid_git_revision(value: &str) -> bool {
+pub(crate) fn valid_git_revision(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
@@ -2179,7 +2253,7 @@ pub(crate) fn publish_result(
     publish_immutable_file(client, destination, bundle, "application/zip")
 }
 
-fn publish_immutable_file(
+pub(crate) fn publish_immutable_file(
     client: &Client,
     destination: &str,
     source: &Path,
@@ -2761,14 +2835,13 @@ mod tests {
             row.source_revisions
                 .insert("binance-usdm-lob".to_string(), forged_revision.clone());
         });
-        fixture.materialization["source_revision"] = serde_json::json!(forged_revision);
-        resign_materialization(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("feature source revision does not match the CEX replay snapshot"));
+        assert!(
+            format!("{error:#}").contains("registered feature lineage or label facts do not match"),
+            "{error:#}"
+        );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

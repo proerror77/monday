@@ -1,8 +1,10 @@
 use crate::{
-    cli::{print_json, MissionDispatchRenderArgs},
-    mission_runner::{normalized_sha256, validate_cex_holdout_id, validate_cex_mission_id},
+    cli::{print_json, MissionDispatchSubmitArgs},
+    mission_campaign::{serialize_request, validate_request, CampaignRequest},
+    mission_runner::normalized_sha256,
     prediction_dispatch::{
-        canonical_https_object, cex_result_attempt_and_holdout_claim, validate_dns_label,
+        ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,
+        validate_cluster_target, validate_dns_label,
     },
 };
 use anyhow::{bail, Context};
@@ -11,61 +13,214 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
-const ACTIVE_DEADLINE_SECONDS: u64 = 900;
+const ACTIVE_DEADLINE_SECONDS: u64 = 3600;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MissionDispatchSubmission {
     attempt_id: String,
-    mission_id: String,
-    holdout_id: String,
     image: String,
-    mission_url: String,
-    mission_sha256: String,
-    feature_url: String,
-    materialization_url: String,
-    replay_artifact_url: String,
-    replay_artifact_sha256: String,
-    replay_manifest_url: String,
-    replay_manifest_sha256: String,
-    result_put_url: String,
-    result_readback_url: String,
-    holdout_claim_put_url: String,
-    holdout_claim_readback_url: String,
-    #[serde(default)]
-    resume_url: Option<String>,
-    #[serde(default)]
-    resume_sha256: Option<String>,
+    request: CampaignRequest,
 }
 
 #[derive(Debug)]
 struct ValidatedSubmission {
     submission: MissionDispatchSubmission,
     image_digest: String,
-    mission_sha256: String,
-    replay_artifact_sha256: String,
-    replay_manifest_sha256: String,
-    mission_object: String,
-    feature_object: String,
-    materialization_object: String,
-    replay_artifact_object: String,
-    replay_manifest_object: String,
-    result_object: String,
-    result_readback_object: String,
-    holdout_claim_object: String,
-    holdout_claim_readback_object: String,
-    resume_sha256: Option<String>,
-    result_identity_sha256: String,
-    result_identity_label: String,
+    request_sha256: String,
+    request_json: String,
+    submission_identity_sha256: String,
     job_name: String,
     secret_name: String,
 }
 
-pub fn render(args: MissionDispatchRenderArgs) -> anyhow::Result<()> {
+pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    validate_cluster_target(&args.context, &args.namespace)?;
     let submission = load_submission(&args.submission)?;
     let validated = validate_submission(submission)?;
+    let job_name = validated.job_name.clone();
+    let secret_name = validated.secret_name.clone();
+    let campaign_id = validated.submission.request.campaign_id.clone();
+    let request_sha256 = validated.request_sha256.clone();
     let manifest = render_manifest(validated, &args.namespace)?;
-    print_json(&manifest)
+    let kubectl = kubectl_binary();
+
+    let secret_body = serde_json::to_vec(&manifest["items"][0])?;
+    let output = kubectl_with_input(
+        &kubectl,
+        &args.context,
+        &args.namespace,
+        ["create", "-f", "-"],
+        &secret_body,
+    )?;
+    ensure_kubectl_success(output, "create immutable CEX Campaign input Secret")?;
+
+    let job_body = serde_json::to_vec(&manifest["items"][1])?;
+    let job_create = kubectl_with_input(
+        &kubectl,
+        &args.context,
+        &args.namespace,
+        ["create", "-f", "-"],
+        &job_body,
+    )
+    .and_then(|output| {
+        ensure_kubectl_success(output, "create immutable CEX Campaign Job").map(|_| ())
+    });
+    if let Err(error) = job_create {
+        let cleanup =
+            delete_campaign_secret(&kubectl, &args.context, &args.namespace, &secret_name);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "input Secret {secret_name} retained for reconciliation: {cleanup_error:#}"
+            ))),
+        };
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        let job = kubectl_json(
+            &kubectl,
+            &args.context,
+            &args.namespace,
+            ["get", "job", &job_name, "-o", "json"],
+            "read back immutable CEX Campaign Job",
+        )?;
+        if job["metadata"]["name"] != job_name
+            || job["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
+        {
+            bail!("CEX Campaign Job readback does not match the submitted identity");
+        }
+        let job_uid = job["metadata"]["uid"]
+            .as_str()
+            .context("CEX Campaign Job readback is missing its UID")?;
+        let owner_patch = job_owner_patch(&job_name, job_uid)?;
+        let owner_patch_json = serde_json::to_string(&owner_patch)?;
+        let output = kubectl_with_input(
+            &kubectl,
+            &args.context,
+            &args.namespace,
+            [
+                "patch",
+                "secret",
+                &secret_name,
+                "--type=merge",
+                "--patch",
+                &owner_patch_json,
+            ],
+            &[],
+        )?;
+        ensure_kubectl_success(output, "bind CEX Campaign input Secret to its TTL Job")?;
+        let secret = kubectl_json(
+            &kubectl,
+            &args.context,
+            &args.namespace,
+            ["get", "secret", &secret_name, "-o", "json"],
+            "read back immutable CEX Campaign input Secret",
+        )?;
+        validate_secret_readback(&secret, &secret_name, &request_sha256, &job_name, job_uid)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let cleanup = delete_campaign_objects(
+            &kubectl,
+            &args.context,
+            &args.namespace,
+            &job_name,
+            &secret_name,
+        );
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "incomplete submission retained for reconciliation: {cleanup_error:#}"
+            ))),
+        };
+    }
+
+    print_json(&json!({
+        "status": "submitted",
+        "context": args.context,
+        "namespace": args.namespace,
+        "campaign_id": campaign_id,
+        "request_sha256": request_sha256,
+        "job_name": job_name,
+    }))
+}
+
+fn job_owner_patch(job_name: &str, job_uid: &str) -> anyhow::Result<Value> {
+    if job_uid.trim().is_empty() || job_uid.chars().any(char::is_control) {
+        bail!("CEX Campaign Job UID is invalid");
+    }
+    Ok(json!({
+        "metadata": {
+            "ownerReferences": [{
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "name": job_name,
+                "uid": job_uid,
+                "controller": false,
+                "blockOwnerDeletion": false,
+            }]
+        }
+    }))
+}
+
+fn validate_secret_readback(
+    secret: &Value,
+    secret_name: &str,
+    request_sha256: &str,
+    job_name: &str,
+    job_uid: &str,
+) -> anyhow::Result<()> {
+    let owner = &secret["metadata"]["ownerReferences"][0];
+    if secret["metadata"]["name"] != secret_name
+        || secret["immutable"] != true
+        || secret["metadata"]["annotations"]["research.monday/request-sha256"] != request_sha256
+        || secret["data"]["campaign.json"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || owner["apiVersion"] != "batch/v1"
+        || owner["kind"] != "Job"
+        || owner["name"] != job_name
+        || owner["uid"] != job_uid
+    {
+        bail!("CEX Campaign input Secret readback does not match the submitted identity");
+    }
+    Ok(())
+}
+
+fn delete_campaign_secret(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    secret_name: &str,
+) -> anyhow::Result<()> {
+    let output = kubectl_with_input(
+        kubectl,
+        context,
+        namespace,
+        ["delete", "secret", secret_name, "--ignore-not-found=true"],
+        &[],
+    )?;
+    ensure_kubectl_success(output, "clean up incomplete CEX Campaign input Secret")?;
+    Ok(())
+}
+
+fn delete_campaign_objects(
+    kubectl: &std::path::Path,
+    context: &str,
+    namespace: &str,
+    job_name: &str,
+    secret_name: &str,
+) -> anyhow::Result<()> {
+    let output = kubectl_with_input(
+        kubectl,
+        context,
+        namespace,
+        ["delete", "job", job_name, "--ignore-not-found=true"],
+        &[],
+    )?;
+    ensure_kubectl_success(output, "clean up incomplete CEX Campaign submission")?;
+    delete_campaign_secret(kubectl, context, namespace, secret_name)
 }
 
 fn load_submission(path: &std::path::Path) -> anyhow::Result<MissionDispatchSubmission> {
@@ -82,87 +237,31 @@ fn validate_submission(
     submission: MissionDispatchSubmission,
 ) -> anyhow::Result<ValidatedSubmission> {
     validate_dns_label("attempt id", &submission.attempt_id)?;
-    validate_cex_mission_id(&submission.mission_id)?;
-    validate_cex_holdout_id(&submission.holdout_id)?;
+    validate_request(&submission.request)?;
     let image_digest = image_digest(&submission.image)?;
-    let mission_sha256 = normalized_sha256("mission", &submission.mission_sha256)?;
-    let replay_artifact_sha256 =
-        normalized_sha256("replay artifact", &submission.replay_artifact_sha256)?;
-    let replay_manifest_sha256 =
-        normalized_sha256("replay manifest", &submission.replay_manifest_sha256)?;
-    let mission_object = canonical_https_object("mission", &submission.mission_url)?;
-    let feature_object = canonical_https_object("feature", &submission.feature_url)?;
-    let materialization_object =
-        canonical_https_object("materialization", &submission.materialization_url)?;
-    let replay_artifact_object =
-        canonical_https_object("replay artifact", &submission.replay_artifact_url)?;
-    let replay_manifest_object =
-        canonical_https_object("replay manifest", &submission.replay_manifest_url)?;
-    let result_object = canonical_https_object("result", &submission.result_put_url)?;
-    let result_readback_object =
-        canonical_https_object("result readback", &submission.result_readback_url)?;
-    if result_object != result_readback_object {
-        bail!("result readback URL must identify the same immutable result object");
+    if submission.request.image_identity != image_digest {
+        bail!("campaign request image identity must match the pinned Job image digest");
     }
-    let (result_attempt_id, expected_holdout_claim_object) = cex_result_attempt_and_holdout_claim(
-        &result_object,
-        &submission.mission_id,
-        &submission.holdout_id,
-    )?;
-    if result_attempt_id != submission.attempt_id {
-        bail!("result object must bind the exact attempt id");
+    let request_bytes = serialize_request(&submission.request)?;
+    if request_bytes.len() as u64 > MAX_SUBMISSION_BYTES {
+        bail!("campaign request exceeds {MAX_SUBMISSION_BYTES} bytes");
     }
-    let holdout_claim_object =
-        canonical_https_object("holdout claim", &submission.holdout_claim_put_url)?;
-    let holdout_claim_readback_object = canonical_https_object(
-        "holdout claim readback",
-        &submission.holdout_claim_readback_url,
-    )?;
-    if holdout_claim_object != holdout_claim_readback_object {
-        bail!("holdout claim readback URL must identify the same immutable object");
-    }
-    if holdout_claim_object != expected_holdout_claim_object {
-        bail!("holdout claim object must be the holdout-scoped sibling of the Mission results");
-    }
-    let resume_sha256 = match (
-        submission
-            .resume_url
-            .as_deref()
-            .filter(|value| !value.is_empty()),
-        submission
-            .resume_sha256
-            .as_deref()
-            .filter(|value| !value.is_empty()),
-    ) {
-        (None, None) => None,
-        (Some(url), Some(sha256)) => {
-            canonical_https_object("resume", url)?;
-            Some(normalized_sha256("resume", sha256)?)
-        }
-        _ => bail!("mission resume URL and SHA256 must be supplied together"),
-    };
-    let result_identity_sha256 = sha256_text(&result_object);
-    let result_identity_label = result_identity_sha256[..32].to_string();
-    let job_name = format!("alpha-mission-{result_identity_label}");
+    let request_sha256 = hex::encode(Sha256::digest(&request_bytes));
+    let request_json = String::from_utf8(request_bytes)
+        .context("campaign request must serialize as UTF-8 JSON")?;
+    let submission_identity_sha256 = sha256_text(&format!(
+        "{}:{}",
+        submission.attempt_id, submission.request.campaign_id
+    ));
+    let submission_identity_label = submission_identity_sha256[..32].to_string();
+    let job_name = format!("alpha-campaign-{submission_identity_label}");
     let secret_name = format!("{job_name}-inputs");
     Ok(ValidatedSubmission {
         submission,
         image_digest,
-        mission_sha256,
-        replay_artifact_sha256,
-        replay_manifest_sha256,
-        mission_object,
-        feature_object,
-        materialization_object,
-        replay_artifact_object,
-        replay_manifest_object,
-        result_object,
-        result_readback_object,
-        holdout_claim_object,
-        holdout_claim_readback_object,
-        resume_sha256,
-        result_identity_sha256,
-        result_identity_label,
+        request_sha256,
+        request_json,
+        submission_identity_sha256,
         job_name,
         secret_name,
     })
@@ -170,33 +269,20 @@ fn validate_submission(
 
 fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::Result<Value> {
     validate_dns_label("namespace", namespace)?;
-    let resume_url = validated.submission.resume_url.as_deref().unwrap_or("");
-    let resume_sha256 = validated.resume_sha256.as_deref().unwrap_or("");
-    let mission_id_arg = format!("--mission-id={}", validated.submission.mission_id);
-    let holdout_id_arg = format!("--holdout-id={}", validated.submission.holdout_id);
+    let attempt_id = validated.submission.attempt_id.clone();
+    let campaign_id = validated.submission.request.campaign_id.clone();
     let labels = json!({
-        "app.kubernetes.io/name": "monday-alpha-mission",
+        "app.kubernetes.io/name": "monday-alpha-campaign",
         "app.kubernetes.io/part-of": "monday",
-        "research.monday/result-id": validated.result_identity_label,
+        "research.monday/campaign-id": &campaign_id,
     });
     let annotations = json!({
-        "research.monday/attempt-id": validated.submission.attempt_id,
-        "research.monday/mission-id": validated.submission.mission_id,
-        "research.monday/mission-sha256": validated.mission_sha256,
-        "research.monday/mission-object": validated.mission_object,
-        "research.monday/feature-object": validated.feature_object,
-        "research.monday/materialization-object": validated.materialization_object,
-        "research.monday/replay-artifact-object": validated.replay_artifact_object,
-        "research.monday/replay-artifact-sha256": validated.replay_artifact_sha256,
-        "research.monday/replay-manifest-object": validated.replay_manifest_object,
-        "research.monday/replay-manifest-sha256": validated.replay_manifest_sha256,
-        "research.monday/result-object": validated.result_object,
-        "research.monday/result-readback-object": validated.result_readback_object,
-        "research.monday/holdout-claim-object": validated.holdout_claim_object,
-        "research.monday/holdout-claim-readback-object": validated.holdout_claim_readback_object,
-        "research.monday/result-identity-sha256": validated.result_identity_sha256,
-        "research.monday/image-digest": validated.image_digest,
-        "research.monday/lane": "cex_research",
+        "research.monday/attempt-id": &attempt_id,
+        "research.monday/campaign-id": &campaign_id,
+        "research.monday/request-sha256": &validated.request_sha256,
+        "research.monday/submission-identity-sha256": &validated.submission_identity_sha256,
+        "research.monday/image-digest": &validated.image_digest,
+        "research.monday/lane": "cex_research_campaign",
     });
     Ok(json!({
         "apiVersion": "v1",
@@ -210,25 +296,15 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                     "namespace": namespace,
                     "labels": labels,
                     "annotations": {
-                        "research.monday/result-identity-sha256": validated.result_identity_sha256,
-                        "research.monday/attempt-id": validated.submission.attempt_id,
-                        "research.monday/mission-id": validated.submission.mission_id,
+                        "research.monday/attempt-id": &attempt_id,
+                        "research.monday/campaign-id": &campaign_id,
+                        "research.monday/request-sha256": &validated.request_sha256,
                     }
                 },
                 "type": "Opaque",
                 "immutable": true,
                 "stringData": {
-                    "mission-url": validated.submission.mission_url,
-                    "feature-url": validated.submission.feature_url,
-                    "materialization-url": validated.submission.materialization_url,
-                    "replay-artifact-url": validated.submission.replay_artifact_url,
-                    "replay-manifest-url": validated.submission.replay_manifest_url,
-                    "result-put-url": validated.submission.result_put_url,
-                    "result-readback-url": validated.submission.result_readback_url,
-                    "holdout-claim-put-url": validated.submission.holdout_claim_put_url,
-                    "holdout-claim-readback-url": validated.submission.holdout_claim_readback_url,
-                    "resume-url": resume_url,
-                    "resume-sha256": resume_sha256,
+                    "campaign.json": validated.request_json,
                 },
             },
             {
@@ -259,46 +335,18 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                 "seccompProfile": { "type": "RuntimeDefault" }
                             },
                             "containers": [{
-                                "name": "alpha-mission",
+                                "name": "alpha-campaign",
                                 "image": validated.submission.image,
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": ["/usr/local/bin/alpha-harness"],
                                 "args": [
                                     "mission",
-                                    "execute",
+                                    "campaign-execute",
                                     "--work-dir", "/work",
-                                    mission_id_arg,
-                                    holdout_id_arg,
-                                    "--mission-url", "$(MISSION_URL)",
-                                    "--mission-sha256", "$(MISSION_SHA256)",
-                                    "--feature-url", "$(FEATURE_URL)",
-                                    "--materialization-url", "$(MATERIALIZATION_URL)",
-                                    "--replay-artifact-url", "$(REPLAY_ARTIFACT_URL)",
-                                    "--replay-artifact-sha256", "$(REPLAY_ARTIFACT_SHA256)",
-                                    "--replay-manifest-url", "$(REPLAY_MANIFEST_URL)",
-                                    "--replay-manifest-sha256", "$(REPLAY_MANIFEST_SHA256)",
-                                    "--resume-url", "$(RESUME_URL)",
-                                    "--resume-sha256", "$(RESUME_SHA256)",
-                                    "--result-put-url", "$(RESULT_PUT_URL)",
-                                    "--result-readback-url", "$(RESULT_READBACK_URL)",
-                                    "--holdout-claim-put-url", "$(HOLDOUT_CLAIM_PUT_URL)",
-                                    "--holdout-claim-readback-url", "$(HOLDOUT_CLAIM_READBACK_URL)"
-                                ],
-                                "env": [
-                                    secret_env("MISSION_URL", &validated.secret_name, "mission-url"),
-                                    json!({ "name": "MISSION_SHA256", "value": validated.mission_sha256 }),
-                                    secret_env("FEATURE_URL", &validated.secret_name, "feature-url"),
-                                    secret_env("MATERIALIZATION_URL", &validated.secret_name, "materialization-url"),
-                                    secret_env("REPLAY_ARTIFACT_URL", &validated.secret_name, "replay-artifact-url"),
-                                    json!({ "name": "REPLAY_ARTIFACT_SHA256", "value": validated.replay_artifact_sha256 }),
-                                    secret_env("REPLAY_MANIFEST_URL", &validated.secret_name, "replay-manifest-url"),
-                                    json!({ "name": "REPLAY_MANIFEST_SHA256", "value": validated.replay_manifest_sha256 }),
-                                    secret_env("RESUME_URL", &validated.secret_name, "resume-url"),
-                                    secret_env("RESUME_SHA256", &validated.secret_name, "resume-sha256"),
-                                    secret_env("RESULT_PUT_URL", &validated.secret_name, "result-put-url"),
-                                    secret_env("RESULT_READBACK_URL", &validated.secret_name, "result-readback-url"),
-                                    secret_env("HOLDOUT_CLAIM_PUT_URL", &validated.secret_name, "holdout-claim-put-url"),
-                                    secret_env("HOLDOUT_CLAIM_READBACK_URL", &validated.secret_name, "holdout-claim-readback-url")
+                                    "--campaign-id", &campaign_id,
+                                    "--image-identity", &validated.image_digest,
+                                    "--request", "/inputs/campaign.json",
+                                    "--request-sha256", &validated.request_sha256
                                 ],
                                 "resources": {
                                     "requests": { "cpu": "3500m", "memory": "8Gi" },
@@ -311,12 +359,20 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
                                 },
                                 "volumeMounts": [
                                     { "name": "work", "mountPath": "/work" },
-                                    { "name": "tmp", "mountPath": "/tmp" }
+                                    { "name": "tmp", "mountPath": "/tmp" },
+                                    { "name": "inputs", "mountPath": "/inputs", "readOnly": true }
                                 ]
                             }],
                             "volumes": [
                                 { "name": "work", "emptyDir": { "sizeLimit": "20Gi" } },
-                                { "name": "tmp", "emptyDir": {} }
+                                { "name": "tmp", "emptyDir": {} },
+                                {
+                                    "name": "inputs",
+                                    "secret": {
+                                        "secretName": validated.secret_name,
+                                        "items": [{ "key": "campaign.json", "path": "campaign.json" }]
+                                    }
+                                }
                             ]
                         }
                     }
@@ -324,18 +380,6 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
             }
         ]
     }))
-}
-
-fn secret_env(name: &str, secret_name: &str, key: &str) -> Value {
-    json!({
-        "name": name,
-        "valueFrom": {
-            "secretKeyRef": {
-                "name": secret_name,
-                "key": key
-            }
-        }
-    })
 }
 
 fn image_digest(image: &str) -> anyhow::Result<String> {
@@ -358,130 +402,90 @@ fn sha256_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission_campaign::valid_request_for_tests;
 
     #[test]
-    fn render_is_stable_for_the_same_query_free_result_identity() {
-        let first_put = result_url("results.zip?signature=first");
-        let first_readback = result_url("results.zip?signature=second");
-        let first = validate_submission(valid_submission(&first_put, &first_readback)).unwrap();
-        let second_put = result_url("results.zip?signature=third");
-        let second_readback = result_url("results.zip?signature=fourth");
-        let second = validate_submission(valid_submission(&second_put, &second_readback)).unwrap();
+    fn render_is_stable_for_the_same_campaign_identity() {
+        let first = validate_submission(valid_submission()).unwrap();
+        let second = validate_submission(valid_submission()).unwrap();
 
         assert_eq!(first.job_name, second.job_name);
         assert_eq!(first.secret_name, second.secret_name);
-        assert_eq!(first.result_identity_sha256, second.result_identity_sha256);
+        assert_eq!(
+            first.submission_identity_sha256,
+            second.submission_identity_sha256
+        );
     }
 
     #[test]
-    fn render_rejects_result_identity_drift() {
-        let result = result_url("results.zip");
-        let other = result_url("other.zip");
-        let error = validate_submission(valid_submission(&result, &other)).unwrap_err();
-        assert!(format!("{error:#}").contains("same immutable result object"));
-    }
+    fn render_rejects_unpinned_images() {
+        let mut submission = valid_submission();
+        submission.image = "registry/research-runner:latest".to_string();
 
-    #[test]
-    fn render_rejects_attempt_identity_drift() {
-        let result = result_url("results.zip");
-        let mut submission = valid_submission(&result, &result);
-        submission.attempt_id = "002".to_string();
         let error = validate_submission(submission).unwrap_err();
-        assert!(format!("{error:#}").contains("exact attempt id"));
+        assert!(format!("{error:#}").contains("@sha256 digest"));
     }
 
     #[test]
-    fn render_rejects_noncanonical_attempt_filenames() {
-        let result = format!(
-            "https://oss-internal/results/mission-id={}/attempt-001.zip",
-            mission_id()
+    fn render_job_disables_service_account_token() {
+        let rendered =
+            render_manifest(validate_submission(valid_submission()).unwrap(), "monday").unwrap();
+        let job = &rendered["items"][1];
+
+        assert_eq!(job["spec"]["backoffLimit"], 0);
+        assert_eq!(
+            job["spec"]["template"]["spec"]["automountServiceAccountToken"],
+            false
         );
-        let error = validate_submission(valid_submission(&result, &result)).unwrap_err();
-        assert!(format!("{error:#}").contains("attempt=<id>/results.zip"));
+        assert_eq!(
+            job["spec"]["template"]["spec"]["containers"][0]["args"][1],
+            "campaign-execute"
+        );
     }
 
     #[test]
-    fn render_rejects_attempt_scoped_holdout_claims() {
-        let result = result_url("results.zip");
-        let mut submission = valid_submission(&result, &result);
-        submission.holdout_claim_put_url = format!(
-            "https://oss-internal/results/mission-id={}/attempt=001/sealed-holdout-claim.json",
-            mission_id()
+    fn campaign_secret_is_owned_by_the_ttl_job() {
+        let owner = job_owner_patch("alpha-campaign-test", "job-uid").unwrap();
+
+        assert_eq!(
+            owner["metadata"]["ownerReferences"][0]["name"],
+            "alpha-campaign-test"
         );
-        submission.holdout_claim_readback_url = submission.holdout_claim_put_url.clone();
-        let error = validate_submission(submission).unwrap_err();
-        assert!(format!("{error:#}").contains("holdout-scoped sibling"));
+        assert_eq!(owner["metadata"]["ownerReferences"][0]["uid"], "job-uid");
     }
 
     #[test]
-    fn the_same_holdout_uses_one_claim_across_missions() {
-        let first_mission = mission_id();
-        let second_mission = format!("cex-mission-{}", "b".repeat(64));
-        let first_result = format!(
-            "https://oss-internal/results/mission-id={first_mission}/attempt=001/results.zip"
-        );
-        let second_result = format!(
-            "https://oss-internal/results/mission-id={second_mission}/attempt=001/results.zip"
-        );
-        let (_, first_claim) =
-            cex_result_attempt_and_holdout_claim(&first_result, &first_mission, holdout_id())
-                .unwrap();
-        let (_, second_claim) =
-            cex_result_attempt_and_holdout_claim(&second_result, &second_mission, holdout_id())
-                .unwrap();
+    fn campaign_secret_readback_binds_request_and_job() {
+        let secret = json!({
+            "metadata": {
+                "name": "alpha-campaign-test-inputs",
+                "annotations": { "research.monday/request-sha256": "request-sha" },
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "alpha-campaign-test",
+                    "uid": "job-uid",
+                }],
+            },
+            "immutable": true,
+            "data": { "campaign.json": "e30=" },
+        });
 
-        assert_eq!(first_claim, second_claim);
-    }
-
-    fn result_url(file: &str) -> String {
-        format!(
-            "https://oss-internal/results/mission-id={}/attempt=001/{file}",
-            mission_id()
-        )
-    }
-
-    fn mission_id() -> String {
-        format!("cex-mission-{}", "a".repeat(64))
-    }
-
-    fn holdout_id() -> &'static str {
-        "cex-holdout-1"
-    }
-
-    fn valid_submission(
-        result_put_url: &str,
-        result_readback_url: &str,
-    ) -> MissionDispatchSubmission {
-        let mission_sha256 = "2".repeat(64);
-        MissionDispatchSubmission {
-            attempt_id: "001".to_string(),
-            mission_id: mission_id(),
-            holdout_id: holdout_id().to_string(),
-            image: "registry/research-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
-            mission_url: "https://oss-internal/missions/mission.json?signature=x".to_string(),
-            mission_sha256: mission_sha256.clone(),
-            feature_url: "https://oss-internal/features/features.jsonl?signature=x".to_string(),
-            materialization_url: "https://oss-internal/materialization/report.json?signature=x".to_string(),
-            replay_artifact_url: "https://oss-internal/replay/data.parquet?signature=x".to_string(),
-            replay_artifact_sha256: "3".repeat(64),
-            replay_manifest_url: "https://oss-internal/replay/manifest.json?signature=x".to_string(),
-            replay_manifest_sha256: "4".repeat(64),
-            result_put_url: result_put_url.to_string(),
-            result_readback_url: result_readback_url.to_string(),
-            holdout_claim_put_url: format!("{}?signature=put", holdout_claim_url()),
-            holdout_claim_readback_url: format!("{}?signature=get", holdout_claim_url()),
-            resume_url: None,
-            resume_sha256: None,
-        }
-    }
-
-    fn holdout_claim_url() -> String {
-        let (_, claim) = cex_result_attempt_and_holdout_claim(
-            &result_url("results.zip"),
-            &mission_id(),
-            holdout_id(),
+        validate_secret_readback(
+            &secret,
+            "alpha-campaign-test-inputs",
+            "request-sha",
+            "alpha-campaign-test",
+            "job-uid",
         )
         .unwrap();
-        claim
+    }
+
+    fn valid_submission() -> MissionDispatchSubmission {
+        MissionDispatchSubmission {
+            attempt_id: "attempt1".to_string(),
+            image: "registry/research-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            request: valid_request_for_tests(),
+        }
     }
 }

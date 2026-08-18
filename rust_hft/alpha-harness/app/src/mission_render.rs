@@ -1,8 +1,9 @@
 use crate::{
-    cli::{print_json, RenderCexMissionArgs, ValidationArgs},
+    cli::ValidationArgs,
     data_mission,
     mission_runner::{
         decode_materialization, normalized_sha256, sha256_file, validate_materialization,
+        MAX_FEATURE_BYTES, MAX_MATERIALIZATION_BYTES,
     },
 };
 use alpha_domain::{
@@ -20,7 +21,7 @@ use anyhow::{bail, Context};
 use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
 use hft_research_manifest::CexReplayDatasetManifestV4;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-dynamic-v2";
 const STABLE_HYPOTHESIS_ID: &str = "signed-rolling-imbalance-dynamic-v2";
@@ -43,6 +44,12 @@ const EVALUATION_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-evaluation-p
 const HOLDOUT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-holdout-policy";
 const FEATURE_FIELDS: [&str; 2] = ["book_imbalance", "spread_bps"];
 
+#[derive(Debug)]
+pub(crate) struct RenderedCexMission {
+    pub(crate) mission: CexResearchMissionArtifactV1,
+    pub(crate) mission_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RenderedHoldoutPolicyV1 {
@@ -52,36 +59,22 @@ struct RenderedHoldoutPolicyV1 {
     state: CexResearchHoldoutStateV1,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RenderReportV1 {
-    schema_version: &'static str,
-    stable_version: &'static str,
-    frozen_input_sha256: String,
-    mission_id: String,
-    mission_sha256: String,
-    gp_policy_content_sha256: String,
-    gp_policy_file_sha256: String,
-    holdout_policy_content_sha256: String,
-    holdout_policy_file_sha256: String,
-    feature_manifest_id: String,
-    feature_sha256: String,
-    materialization_sha256: String,
-    row_count: usize,
-    source_revision: String,
-}
-
-pub fn render_cex(args: RenderCexMissionArgs) -> anyhow::Result<()> {
-    let feature_sha256 = sha256_file(&args.feature)?;
-    let materialization_sha256 = sha256_file(&args.materialization)?;
+pub(crate) fn render_cex_bundle(
+    feature: &Path,
+    materialization_path: &Path,
+    seed: u64,
+) -> anyhow::Result<RenderedCexMission> {
+    validate_input_sizes(feature, materialization_path)?;
+    let feature_sha256 = sha256_file(feature)?;
+    let materialization_sha256 = sha256_file(materialization_path)?;
     let materialization = decode_materialization(
-        &std::fs::read(&args.materialization)
-            .with_context(|| format!("read {}", args.materialization.display()))?,
+        &std::fs::read(materialization_path)
+            .with_context(|| format!("read {}", materialization_path.display()))?,
     )?;
     let feature_artifacts = tempfile::tempdir().context("create feature validation directory")?;
     let feature_manifest = import_feature_manifest(
         &materialization.mission_id,
-        &args.feature,
+        feature,
         feature_artifacts.path(),
     )?;
     ensure_materialization_scope(&materialization, &feature_manifest, &feature_sha256)?;
@@ -104,12 +97,15 @@ pub fn render_cex(args: RenderCexMissionArgs) -> anyhow::Result<()> {
         "snapshot_sha256": snapshot_sha256,
         "source_revision": materialization.source_revision,
     }))?;
-    let search_lineage_id = format!("{STABLE_VERSION}-lineage-{}", &frozen_input_sha256[..16]);
+    let search_lineage_id = format!(
+        "{STABLE_VERSION}-lineage-seed-{seed}-{}",
+        &frozen_input_sha256[..16]
+    );
     let input_lineage_id = format!("{STABLE_VERSION}-input-{}", &materialization_sha256[..16]);
     let holdout_id = format!("{STABLE_VERSION}-holdout-{}", &frozen_input_sha256[..16]);
     let evaluation_protocol = approved_evaluation_protocol(&materialization)?;
     let search = CexResearchSearchPlanV1 {
-        seed: 7,
+        seed,
         budget: SearchBudget {
             max_candidates: MAX_CANDIDATES,
             max_expansions: MAX_EXPANSIONS,
@@ -257,70 +253,27 @@ pub fn render_cex(args: RenderCexMissionArgs) -> anyhow::Result<()> {
             search,
             evaluation_protocol,
             holdout: CexResearchHoldoutV1 {
-                holdout_id: holdout_id.clone(),
+                holdout_id,
                 state: CexResearchHoldoutStateV1::Unopened,
             },
         },
         operational: CexResearchOperationalMetadataV1::default(),
     };
     mission.validate()?;
-    let output_dir = create_output_dir(&args.output_dir)?;
-    let render_result = (|| -> anyhow::Result<serde_json::Value> {
-        let mission_id = mission.semantic_id()?;
-        let mission_path = output_dir.join("mission.json");
-        let holdout_policy_path = output_dir.join("holdout-policy.json");
-        let gp_policy_path = output_dir.join("gp-policy.json");
-        let report_path = output_dir.join("render-report.json");
-        data_mission::write_json_atomic(&mission_path, &mission)?;
-        data_mission::write_json_atomic(&holdout_policy_path, &holdout_policy)?;
-        data_mission::write_json_atomic(&gp_policy_path, &gp_policy)?;
-        let report = RenderReportV1 {
-            schema_version: "cex-mission-render-report-v1",
-            stable_version: STABLE_VERSION,
-            frozen_input_sha256,
-            mission_id,
-            mission_sha256: sha256_file(&mission_path)?,
-            gp_policy_content_sha256,
-            gp_policy_file_sha256: sha256_file(&gp_policy_path)?,
-            holdout_policy_content_sha256,
-            holdout_policy_file_sha256: sha256_file(&holdout_policy_path)?,
-            feature_manifest_id: feature_manifest.manifest_id,
-            feature_sha256,
-            materialization_sha256,
-            row_count: materialization.rows,
-            source_revision: materialization.source_revision,
-        };
-        data_mission::write_json_atomic(&report_path, &report)?;
-        Ok(serde_json::json!({
-        "mission": mission_path,
-        "holdout_policy": holdout_policy_path,
-        "gp_policy": gp_policy_path,
-        "report": report_path,
-        }))
-    })();
-    let rendered = match render_result {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            if let Err(cleanup_error) = std::fs::remove_dir_all(&output_dir) {
-                return Err(error.context(format!(
-                    "remove partial render output {}: {cleanup_error}",
-                    output_dir.display()
-                )));
-            }
-            return Err(error);
-        }
-    };
-    print_json(&rendered)
+    let mission_id = mission.semantic_id()?;
+    Ok(RenderedCexMission {
+        mission,
+        mission_id,
+    })
 }
 
-fn create_output_dir(path: &Path) -> anyhow::Result<PathBuf> {
-    match std::fs::create_dir(path) {
-        Ok(()) => Ok(path.to_path_buf()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("render output directory already exists: {}", path.display())
-        }
-        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+fn validate_input_sizes(feature: &Path, materialization: &Path) -> anyhow::Result<()> {
+    if feature.metadata()?.len() > MAX_FEATURE_BYTES
+        || materialization.metadata()?.len() > MAX_MATERIALIZATION_BYTES
+    {
+        bail!("source exceeds the allowed size");
     }
+    Ok(())
 }
 
 fn import_feature_manifest(
@@ -431,23 +384,20 @@ fn ensure_materialization_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::CEX_GP_POLICY_SCHEMA_V2;
     use chrono::{Duration as ChronoDuration, Utc};
     use hft_collector::{DataModality, PointInTimeFeatureRow};
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
 
     #[test]
-    fn render_cex_writes_a_dynamic_v2_mission_bundle() {
+    fn cloud_renderer_builds_a_dynamic_v2_mission() {
         let fixture = Fixture::new(1232);
-        let feature_sha256 = sha256_file(&fixture.feature_path).unwrap();
-        let materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
-        render_cex(fixture.args()).unwrap();
-
-        let mission: CexResearchMissionArtifactV1 = serde_json::from_slice(
-            &std::fs::read(fixture.output_dir.join("mission.json")).unwrap(),
-        )
-        .unwrap();
+        let rendered =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap();
+        let mission = rendered.mission;
         assert_eq!(mission.spec.search.budget.max_candidates, MAX_CANDIDATES);
         assert_eq!(mission.spec.search.budget.max_expansions, MAX_EXPANSIONS);
         assert_eq!(
@@ -487,55 +437,90 @@ mod tests {
             mission.spec.hypotheses[0].required_template_families,
             vec!["signed_rolling_imbalance".to_string()]
         );
-        let gp_policy: CexGpPolicyV1 = serde_json::from_slice(
-            &std::fs::read(fixture.output_dir.join("gp-policy.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(gp_policy.schema_version, CEX_GP_POLICY_SCHEMA_V2);
-        let report: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(fixture.output_dir.join("render-report.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(report["feature_sha256"], feature_sha256);
-        assert_eq!(report["materialization_sha256"], materialization_sha256);
-        assert_ne!(report["feature_sha256"], report["materialization_sha256"]);
-        let mut output_names = std::fs::read_dir(&fixture.output_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        output_names.sort();
-        assert_eq!(
-            output_names,
-            [
-                "gp-policy.json",
-                "holdout-policy.json",
-                "mission.json",
-                "render-report.json",
-            ]
-        );
+        assert_eq!(mission.spec.policies.gp.id, GP_POLICY_ID);
     }
 
     #[test]
     fn render_cex_rejects_short_materializations() {
         let fixture = Fixture::new(MIN_ROWS - 1);
-        let error = render_cex(fixture.args()).unwrap_err();
+        let error =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
         assert!(format!("{error:#}").contains("at least 1232 point-in-time rows"));
-        assert!(!fixture.output_dir.exists());
     }
 
     #[test]
     fn render_cex_rejects_feature_source_drift_without_leaving_output() {
         let fixture = Fixture::with_feature_source(MIN_ROWS, "d".repeat(64));
-        let error = render_cex(fixture.args()).unwrap_err();
+        let error =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
         assert!(format!("{error:#}").contains("feature source revision"));
-        assert!(!fixture.output_dir.exists());
+    }
+
+    #[test]
+    fn render_cex_rejects_execution_oversized_inputs() {
+        let fixture = Fixture::new(MIN_ROWS);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.feature_path)
+            .unwrap()
+            .set_len(MAX_FEATURE_BYTES + 1)
+            .unwrap();
+        let error =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        assert!(format!("{error:#}").contains("source exceeds the allowed size"));
+
+        let fixture = Fixture::new(MIN_ROWS);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.materialization_path)
+            .unwrap()
+            .set_len(MAX_MATERIALIZATION_BYTES + 1)
+            .unwrap();
+        let error =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        assert!(format!("{error:#}").contains("source exceeds the allowed size"));
+    }
+
+    #[test]
+    fn render_cex_rejects_materialization_source_revision_drift() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let mut materialization: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.materialization_path).unwrap()).unwrap();
+        materialization["source_revision"] = serde_json::json!("9".repeat(64));
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&materialization).unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        assert!(format!("{error:#}").contains("source revision does not bind"));
+    }
+
+    #[test]
+    fn render_cex_bundle_changes_search_lineage_per_seed_but_keeps_holdout() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let first =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap();
+        let second =
+            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 11).unwrap();
+
+        assert_ne!(first.mission_id, second.mission_id);
+        assert_ne!(
+            first.mission.spec.search_lineage_id,
+            second.mission.spec.search_lineage_id
+        );
+        assert_eq!(
+            first.mission.spec.holdout.holdout_id,
+            second.mission.spec.holdout.holdout_id
+        );
     }
 
     struct Fixture {
         _root: tempfile::TempDir,
         feature_path: PathBuf,
         materialization_path: PathBuf,
-        output_dir: PathBuf,
     }
 
     impl Fixture {
@@ -554,7 +539,6 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let feature_path = root.path().join("features.jsonl");
             let materialization_path = root.path().join("materialization.json");
-            let output_dir = root.path().join("rendered");
             let source_content_sha256 = "b".repeat(64);
             let source_revision =
                 hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
@@ -672,15 +656,6 @@ mod tests {
                 _root: root,
                 feature_path,
                 materialization_path,
-                output_dir,
-            }
-        }
-
-        fn args(&self) -> RenderCexMissionArgs {
-            RenderCexMissionArgs {
-                feature: self.feature_path.clone(),
-                materialization: self.materialization_path.clone(),
-                output_dir: self.output_dir.clone(),
             }
         }
     }

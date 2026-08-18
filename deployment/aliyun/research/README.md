@@ -256,54 +256,69 @@ The image contains eight stable entrypoints:
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`
 
-`k8s/alpha-mission-job.example.yaml` remains the Pod-shape reference only. The
-blessed CEX Mission identity is now rendered offline from frozen inputs instead
-of hand-editing `REPLACE_*` YAML.
+`k8s/alpha-mission-job.example.yaml` is only the generated Pod-shape reference.
+The production CEX path does not render a Mission or scan feature rows on the
+workstation. The workstation prepares one private, immutable Campaign request,
+signs exact OSS objects, and submits it. The ACK Pod then performs the complete
+sequence:
 
-Render the governed BTCUSDT USD-M 1s/h5/top5 Mission from the actual V5 PIT
-rows and the matching materialization evidence:
-
-```bash
-alpha-harness mission render-cex \
-  --feature /path/to/ACTUAL_FEATURE_ROWS.jsonl \
-  --materialization /path/to/ACTUAL_REPORT.materialization.json \
-  --output-dir /tmp/cex-render
+```text
+input GET + SHA admission
+  -> Mission render
+  -> Mission create-once PUT + GET/SHA readback
+  -> GP + screening + Factor Bank + Ridge/CART + subset MCTS
+  -> event replay + final precommit + at-most-once sealed holdout
+  -> results.zip PUT + GET/SHA readback
+  -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The render step fails closed unless the inputs bind the approved Binance USD-M
-BTCUSDT 1-second / horizon-5 / top5 snapshot, the PIT rows and snapshot hashes
-match, and the materialization carries at least 1232 rows. It writes:
+The request schema is `cex-campaign-request-v1`. It binds the exact Git source
+revision, digest-pinned image, feature/materialization/replay objects and
+SHA-256 values, expected holdout ID, and one `round` containing one seed plus
+Mission/result PUT and readback URLs. It also carries the global
+`holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
+Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
+signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
 
-- `mission.json`
-- `holdout-policy.json`
-- `gp-policy.json`
-- `render-report.json`
-
-The Mission keeps the fixed research contract: `200 + 3x256 + holdout256`,
-search budget `8 / 256`, schema `v1`, GP policy `controlled_dynamic_v2`, and
-template family `signed_rolling_imbalance`.
-
-Create a private dispatch submission JSON; never commit signed URLs. Include the
-attempt id, semantic Mission ID, exact Mission holdout ID, digest-pinned image, mission URL/SHA, feature/materialization/replay
-URLs and replay SHAs, result PUT/readback URLs, and an optional complete resume
-pair. The result path must end exactly with
-`mission-id=<SEMANTIC_MISSION_ID>/attempt=<ATTEMPT_ID>/results.zip`. Also include
-PUT/readback URLs for the fixed
-`holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` object; this create-once object is
-written immediately before sealed holdout access and prevents another attempt
-or Mission from opening the same holdout. If that claim exists without a sealed
-receipt or result, stop: the holdout is terminal and inconclusive, and it must
-not be retried. Render the Kubernetes Secret + Job offline with:
+Compute `campaign_id` from an unsigned request skeleton after choosing the
+input identities, image/source identities, seed, and output root. Replace the
+placeholder ID in the exact output keys, then sign those final keys. Signed
+query parameters are excluded from semantic identity, while the query-free
+input objects and output root are bound:
 
 ```bash
-alpha-harness mission dispatch render \
-  --submission /path/to/submission.json \
+alpha-harness mission campaign-id \
+  --request /private/path/campaign-request.json
+```
+
+Wrap the final request with `attempt_id` and the exact digest-pinned `image` in
+the private submission file, then submit it directly:
+
+```bash
+alpha-harness mission dispatch submit \
+  --submission /private/path/campaign-submission.json \
+  --context monday-research-apne1 \
   --namespace monday-research
 ```
 
-This prints one Kubernetes `List` JSON containing an immutable Secret and one
-Job. Review it, then apply it with native `kubectl`. Do not add a separate
-submit wrapper here.
+The submitter creates the immutable input Secret before the Job, reads both
+objects back, and attaches the Secret to the TTL Job for garbage collection.
+It never prints the Secret or signed URLs. The Pod uses no ServiceAccount token,
+exchange account file, API key, or order/execution entrypoint.
+
+One Campaign maps to one Mission. The fixed Mission contract remains
+`200 + 3x256 + holdout256`, search budget `8 / 256`, GP policy
+`controlled_dynamic_v2`, and template family `signed_rolling_imbalance`.
+GP and subset MCTS already provide the bounded search iterations. A negative
+result terminates the Campaign; it must not trigger another seeded Mission
+without a separately designed Campaign-wide multiple-testing and holdout
+contract. A claim without a complete sealed receipt/result is terminal and
+inconclusive, not retry authority.
+
+Job completion alone is not research completion. Require the exact image ID,
+terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign
+result readback SHA. This path may emit a research promotion lineage, but it
+does not prove or authorize Paper, Shadow, or Live runtime.
 
 `k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
 security context, signed-URL input transport, and immutable result upload for one

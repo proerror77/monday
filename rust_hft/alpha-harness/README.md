@@ -12,7 +12,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
-| CEX `mission execute` | Implemented through GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once result bundle plus independent readback with an exact SHA-256 match |
+| CEX Cloud Campaign | Implemented through cloud admission, GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once Mission/result objects plus independent readback with exact SHA-256 matches |
 | Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
 | Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt and explicit queue/partial-fill/impact/capacity disclosures |
@@ -21,9 +21,12 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | Exact-main CEX run and readback | Pending [#606](https://github.com/proerror77/monday/issues/606) | A fresh credential-free USD-M Mission still needs cloud Runtime and independent result readback |
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
 
-`mission execute` is the CEX operator acceptance seam. Low-level Mission and
-LoopRun commands remain diagnostics and implementation surfaces; they are not
-alternate evidence paths around the acceptance contracts above.
+`mission dispatch submit` is the CEX operator acceptance seam. It submits one
+immutable Campaign request and does not read feature rows, render a Mission, or
+run strategy search locally. One ACK Job/Pod performs input admission, Mission
+render and readback, research execution, and result readback. Low-level Mission
+and LoopRun commands remain diagnostics and implementation surfaces; they are
+not alternate evidence paths around this contract.
 
 ## Data Mission
 
@@ -76,29 +79,35 @@ per-fold and aggregate net return, drawdown, turnover, trade count, and the
 unannualized per-observation net Sharpe). It is read-only evidence readback;
 it grants no promotion or runtime authority.
 
-The bounded CEX entrypoint consumes a separate Agent-produced,
-content-addressed `cex-research-mission-v1` artifact:
+The production CEX entrypoint consumes a private Campaign submission whose
+request binds the exact input objects and SHA-256 values, source revision,
+image digest, holdout identity, one search seed, output root, and create-once
+Mission/result/claim objects. Signed URL query parameters are transport only;
+the query-free objects are part of the Campaign identity.
 
 ```bash
-HOLDOUT_ID='the exact spec.holdout.holdout_id from mission.json'
-HOLDOUT_ID_SHA256=$(printf '%s' "$HOLDOUT_ID" | sha256sum | awk '{print $1}')
+cargo run -p alpha-harness -- mission campaign-id \
+  --request var/submissions/campaign-request.json
 
-cargo run -p alpha-harness -- mission execute \
-  --work-dir var/runs/cex-mission-1 \
-  --mission-id "$MISSION_ID" \
-  --holdout-id "$HOLDOUT_ID" \
-  --mission-url var/missions/cex-mission.json \
-  --mission-sha256 "$MISSION_SHA256" \
-  --feature-url var/materializations/features.jsonl \
-  --materialization-url var/materializations/materialization.json \
-  --result-put-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
-  --result-readback-url "var/results/mission-id=$MISSION_ID/attempt=001/results.zip" \
-  --holdout-claim-put-url "var/results/holdout-id-sha256=$HOLDOUT_ID_SHA256/sealed-holdout-claim.json" \
-  --holdout-claim-readback-url "var/results/holdout-id-sha256=$HOLDOUT_ID_SHA256/sealed-holdout-claim.json"
+cargo run -p alpha-harness -- mission dispatch submit \
+  --submission var/submissions/campaign-submission.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
 ```
 
-For local paths, immutable publication creates missing real parent directories
-and rejects symbolic-link ancestors before writing.
+The submit command creates the immutable Secret before the Job, verifies both
+objects by cluster readback, and attaches the Secret to the TTL Job for garbage
+collection. It prints identities only, never the signed URLs. The Pod rejects
+redirects, input/hash drift, an existing holdout claim, and any Mission or
+result readback mismatch before accepting terminal evidence.
+
+One Campaign contains exactly one Mission. That Mission already performs the
+bounded GP and subset-MCTS iterations under one multiple-testing family. A
+negative result is terminal for the Campaign; it is not silently converted into
+another seeded Mission that keeps trying against the same holdout.
+
+The direct `mission execute` and checkpoint-resume surfaces remain diagnostic.
+They are not the cloud Campaign production path.
 
 Resume a persisted subset-search checkpoint into a fresh work directory by
 adding `--resume-url <checkpoint.json>` and

@@ -1,5 +1,5 @@
 use crate::{
-    data_mission, governance, loop_control, mission, mission_dispatch, mission_render,
+    data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
     mission_runner, prediction_dispatch, prediction_runner, prediction_snapshot,
 };
 use alpha_domain::{
@@ -77,7 +77,8 @@ enum Command {
 enum MissionCommand {
     Create(CreateMissionArgs),
     Execute(Box<ExecuteMissionArgs>),
-    RenderCex(RenderCexMissionArgs),
+    CampaignExecute(CampaignExecuteArgs),
+    CampaignId(CampaignIdArgs),
     Dispatch {
         #[command(subcommand)]
         command: MissionDispatchCommand,
@@ -121,27 +122,37 @@ enum PredictionDispatchCommand {
 
 #[derive(Debug, Subcommand)]
 enum MissionDispatchCommand {
-    Render(MissionDispatchRenderArgs),
+    Submit(MissionDispatchSubmitArgs),
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct MissionDispatchRenderArgs {
+pub struct MissionDispatchSubmitArgs {
     #[arg(long)]
     pub submission: PathBuf,
+    #[arg(long)]
+    pub context: String,
     #[arg(long)]
     pub namespace: String,
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct RenderCexMissionArgs {
-    /// Content-addressed V5 PIT feature rows (.jsonl).
+pub struct CampaignExecuteArgs {
     #[arg(long)]
-    pub feature: PathBuf,
-    /// The matching V5 materialization report (.materialization.json).
+    pub work_dir: PathBuf,
     #[arg(long)]
-    pub materialization: PathBuf,
+    pub campaign_id: String,
     #[arg(long)]
-    pub output_dir: PathBuf,
+    pub image_identity: String,
+    #[arg(long)]
+    pub request: PathBuf,
+    #[arg(long)]
+    pub request_sha256: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignIdArgs {
+    #[arg(long)]
+    pub request: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -693,9 +704,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("mission execution worker failed")?
             }
-            MissionCommand::RenderCex(args) => mission_render::render_cex(args),
+            MissionCommand::CampaignExecute(args) => {
+                tokio::task::spawn_blocking(move || mission_campaign::execute(args))
+                    .await
+                    .context("campaign execution worker failed")?
+            }
+            MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::Dispatch { command } => match command {
-                MissionDispatchCommand::Render(args) => mission_dispatch::render(args),
+                MissionDispatchCommand::Submit(args) => mission_dispatch::submit(args),
             },
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
@@ -979,14 +995,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_mission_render_cex() {
-        let args = "alpha-harness mission render-cex --feature features.jsonl --materialization materialization.json --output-dir rendered";
+    fn parses_mission_campaign_execute() {
+        let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
     #[test]
-    fn parses_mission_dispatch_render() {
-        let args = "alpha-harness mission dispatch render --submission submission.json --namespace monday-research";
+    fn parses_mission_campaign_id() {
+        let args = "alpha-harness mission campaign-id --request campaign.json";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_dispatch_submit() {
+        let args = "alpha-harness mission dispatch submit --submission submission.json --context ack --namespace monday-research";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 

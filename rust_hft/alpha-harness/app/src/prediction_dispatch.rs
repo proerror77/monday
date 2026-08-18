@@ -843,6 +843,7 @@ fn read_verified_mission_for_admission(
     let mission_path = root.path().join("mission.json");
     let client = Client::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build mission admission client")?;
     let (_, mission_sha256) = fetch_to_file(
@@ -1310,6 +1311,35 @@ pub(crate) fn cex_result_attempt_and_holdout_claim(
     ))
 }
 
+pub(crate) fn cex_campaign_round_root(
+    object: &str,
+    campaign_id: &str,
+    round_id: &str,
+    file_name: &str,
+) -> anyhow::Result<String> {
+    let suffix = format!("/campaign-id={campaign_id}/round={round_id}/{file_name}");
+    let root = object.strip_suffix(&suffix).with_context(|| {
+        format!("CEX campaign object must end with campaign-id=<id>/round=<id>/{file_name}")
+    })?;
+    if root.is_empty() || root.contains("/campaign-id=") || root.contains("/round=") {
+        bail!("CEX campaign object contains duplicate Campaign ID bindings");
+    }
+    Ok(root.trim_end_matches('/').to_string())
+}
+
+pub(crate) fn cex_campaign_round_result_and_holdout_claim(
+    result_object: &str,
+    campaign_id: &str,
+    round_id: &str,
+    holdout_id: &str,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
+        cex_campaign_round_root(result_object, campaign_id, round_id, "results.zip")?,
+        sha256_text(holdout_id),
+    ))
+}
+
 fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
@@ -1401,16 +1431,16 @@ pub(crate) fn validate_dns_label(label: &str, value: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-fn validate_cluster_target(context: &str, namespace: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_cluster_target(context: &str, namespace: &str) -> anyhow::Result<()> {
     validate_identifier("Kubernetes context", context)?;
     validate_dns_label("namespace", namespace)
 }
 
-fn sha256_text(value: &str) -> String {
+pub(crate) fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn kubectl_binary() -> PathBuf {
+pub(crate) fn kubectl_binary() -> PathBuf {
     std::env::var_os("MONDAY_KUBECTL_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("kubectl"))
@@ -1473,7 +1503,7 @@ fn create_failure_recovered(
     }
 }
 
-fn kubectl_json<const N: usize>(
+pub(crate) fn kubectl_json<const N: usize>(
     kubectl: &Path,
     context: &str,
     namespace: &str,
@@ -1492,7 +1522,7 @@ fn kubectl_json<const N: usize>(
     serde_json::from_slice(&stdout).with_context(|| format!("parse kubectl output for {action}"))
 }
 
-fn kubectl_with_input<const N: usize>(
+pub(crate) fn kubectl_with_input<const N: usize>(
     kubectl: &Path,
     context: &str,
     namespace: &str,
@@ -1536,7 +1566,7 @@ fn delete_input_secret(
     Ok(())
 }
 
-fn ensure_kubectl_success(output: Output, action: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn ensure_kubectl_success(output: Output, action: &str) -> anyhow::Result<Vec<u8>> {
     if !output.status.success() {
         bail!(
             "kubectl failed to {action}: {}",
