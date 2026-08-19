@@ -6500,6 +6500,196 @@ if grep -Fq ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-' "$CI_WORKFLOW
 fi
 grep -Fq -- '--allow-match-regex "${legacy_runtime_reference_allowlist}"' "$CI_WORKFLOW"
 grep -Fq 'deployment/aliyun/polymarket-raw-ops-cutover[.]sh:' "$CI_WORKFLOW"
+
+# Cross-version uploader transition contract: before promotion the active
+# upload units belong to the baseline release, so their ExecStart lines are
+# verified against the control bundle that verify_control_release bound to the
+# gated baseline release — never against the candidate bundle constants, which
+# may legitimately differ (e.g. --upload-concurrency 1 baseline vs 2 candidate).
+cutover_joined="$tmp_dir/cutover-joined.sh"
+join_shell_continuations "$CUTOVER" >"$cutover_joined"
+[[ $(grep -c \
+  '^[[:space:]]*verify_upload_units "\$baseline_pinned_upload_env" "\$baseline_reference_upload_exec" "\$baseline_market_upload_exec" ' \
+  "$cutover_joined") -eq 2 ]] || {
+  printf 'cutover no longer verifies baseline upload units against baseline identity\n' >&2
+  exit 1
+}
+[[ $(grep -c \
+  '^[[:space:]]*verify_upload_units "\$pinned_upload_env" "\$REFERENCE_UPLOAD_EXEC" "\$MARKET_UPLOAD_EXEC" ' \
+  "$cutover_joined") -eq 5 ]] || {
+  printf 'cutover no longer verifies promoted upload units against candidate identity\n' >&2
+  exit 1
+}
+[[ $(grep -c '^[[:space:]]*verify_upload_units "' "$cutover_joined") -eq 7 ]] || {
+  printf 'unexpected verify_upload_units call count in cutover\n' >&2
+  exit 1
+}
+if grep -Ev '^[[:space:]]*verify_upload_units "[^"]+" "[^"]+" "[^"]+" \|\|' "$cutover_joined" \
+  | grep -q '^[[:space:]]*verify_upload_units "'; then
+  printf 'cutover still verifies upload units without an explicit exec identity\n' >&2
+  exit 1
+fi
+baseline_control_release_line=$(grep -n \
+  'verify_control_release "\$CONTROL_DIR" "\$gate_baseline_release_sha"' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
+baseline_reference_exec_line=$(grep -n \
+  '^  baseline_reference_upload_exec=$(unit_exec_start "\$CONTROL_DIR/\$REFERENCE_UPLOAD_UNIT")' \
+  "$CUTOVER" | cut -d: -f1)
+baseline_market_exec_line=$(grep -n \
+  '^  baseline_market_upload_exec=$(unit_exec_start "\$CONTROL_DIR/\$MARKET_UPLOAD_UNIT")' \
+  "$CUTOVER" | cut -d: -f1)
+first_baseline_verify_line=$(grep -n \
+  '^[[:space:]]*verify_upload_units "\$baseline_pinned_upload_env"' "$CUTOVER" | head -1 | cut -d: -f1)
+[[ -n $baseline_control_release_line && -n $baseline_reference_exec_line \
+  && -n $baseline_market_exec_line && -n $first_baseline_verify_line \
+  && $baseline_control_release_line -lt $baseline_reference_exec_line \
+  && $baseline_reference_exec_line -lt $baseline_market_exec_line \
+  && $baseline_market_exec_line -lt $first_baseline_verify_line ]] || {
+  printf 'baseline upload identity is not derived from the bound baseline controls\n' >&2
+  exit 1
+}
+# The post-promotion constants must stay byte-identical to the bundle unit
+# ExecStart lines they verify.
+candidate_reference_exec=$(sed -n 's/^ExecStart=//p' \
+  "$SCRIPT_DIR/polymarket-reference-upload.service")
+candidate_market_exec=$(sed -n 's/^ExecStart=//p' \
+  "$SCRIPT_DIR/polymarket-market-tape-upload.service")
+[[ -n $candidate_reference_exec && -n $candidate_market_exec ]] || {
+  printf 'could not derive candidate uploader ExecStart identities\n' >&2
+  exit 1
+}
+# The constants reference the binary through $ACTIVE_BINARY while the units
+# spell out the literal path; normalize before the byte-exact comparison.
+active_binary_marker='$ACTIVE_BINARY'
+constant_reference_exec=${candidate_reference_exec//\/opt\/monday\/bin\/polymarket-raw-ops/$active_binary_marker}
+constant_market_exec=${candidate_market_exec//\/opt\/monday\/bin\/polymarket-raw-ops/$active_binary_marker}
+grep -Fxq "readonly REFERENCE_UPLOAD_EXEC=\"$constant_reference_exec\"" "$CUTOVER" || {
+  printf 'REFERENCE_UPLOAD_EXEC differs from the reference uploader unit\n' >&2
+  exit 1
+}
+grep -Fxq "readonly MARKET_UPLOAD_EXEC=\"$constant_market_exec\"" "$CUTOVER" || {
+  printf 'MARKET_UPLOAD_EXEC differs from the market uploader unit\n' >&2
+  exit 1
+}
+
+upload_unit_functions="$tmp_dir/upload-unit-functions.sh"
+awk '
+  /^effective_exec_argv\(\) \{$/ || /^verify_effective_unit\(\) \{$/ \
+    || /^unit_exec_start\(\) \{$/ || /^verify_upload_units\(\) \{$/ { copy=1 }
+  copy {print}
+  copy && /^\}$/ {copy=0}
+' "$CUTOVER" >"$upload_unit_functions"
+for extracted in effective_exec_argv verify_effective_unit unit_exec_start \
+  verify_upload_units; do
+  grep -q "^$extracted() {" "$upload_unit_functions" || {
+    printf 'could not extract %s from the cutover script\n' "$extracted" >&2
+    exit 1
+  }
+done
+
+upload_fixture_root="$tmp_dir/upload-unit-fixtures"
+mkdir -p "$upload_fixture_root/baseline" "$upload_fixture_root/candidate" \
+  "$upload_fixture_root/installed"
+upload_pinned_env=/etc/monday/polymarket-market-tape-upload.env
+write_upload_fixture_units() {
+  local directory=$1 concurrency=$2
+  cat >"$directory/polymarket-reference-upload.service" <<EOF
+[Service]
+EnvironmentFile=$upload_pinned_env
+ExecStart=$candidate_reference_exec
+EOF
+  cat >"$directory/polymarket-market-tape-upload.service" <<EOF
+[Service]
+EnvironmentFile=$upload_pinned_env
+ExecStart=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency $concurrency
+EOF
+}
+# The baseline fixture is a pre-#921 bundle: identical except the market
+# uploader still runs --upload-concurrency 1.
+write_upload_fixture_units "$upload_fixture_root/baseline" 1
+write_upload_fixture_units "$upload_fixture_root/candidate" 2
+
+upload_transition_execs=$(
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  # shellcheck disable=SC1090
+  source "$upload_unit_functions"
+  unit_exec_start \
+    "$upload_fixture_root/baseline/polymarket-reference-upload.service" \
+    || exit 1
+  unit_exec_start \
+    "$upload_fixture_root/baseline/polymarket-market-tape-upload.service" \
+    || exit 1
+)
+{
+  IFS= read -r baseline_reference_exec
+  IFS= read -r baseline_market_exec
+} <<<"$upload_transition_execs"
+[[ $baseline_reference_exec == "$candidate_reference_exec" \
+  && $baseline_market_exec == "${candidate_market_exec%2}1" ]] || {
+  printf 'unit_exec_start did not extract the baseline uploader identities\n' >&2
+  exit 1
+}
+
+run_upload_units_case() (
+  local test_case=$1 expected_reference_exec=$2 expected_market_exec=$3
+  local installed_concurrency=2
+  [[ $test_case == promoted ]] || installed_concurrency=1
+  REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
+  MARKET_UPLOAD_UNIT=polymarket-market-tape-upload.service
+  REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
+  MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  grep() {
+    local args=("$@") last_index=$(($# - 1))
+    if [[ ${args[last_index]} == /etc/systemd/system/* ]]; then
+      args[last_index]="$upload_fixture_root/installed/${args[last_index]##*/}"
+    fi
+    command grep "${args[@]}"
+  }
+  systemctl() {
+    [[ $1 == show && $2 == --property=* && $3 == --value ]] || return 2
+    case "$2" in
+      --property=FragmentPath) printf '/etc/systemd/system/%s\n' "$4" ;;
+      --property=DropInPaths) printf '\n' ;;
+      --property=ExecStart)
+        case "$4" in
+          "$REFERENCE_UPLOAD_UNIT")
+            printf '{ argv[]=%s ; }\n' "$candidate_reference_exec" ;;
+          "$MARKET_UPLOAD_UNIT")
+            printf '{ argv[]=/usr/bin/env ZSTD_THREADS=1 /opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 0 --upload-concurrency %s ; }\n' \
+              "$installed_concurrency" ;;
+          *) return 2 ;;
+        esac ;;
+      *) return 2 ;;
+    esac
+  }
+  write_upload_fixture_units "$upload_fixture_root/installed" "$installed_concurrency"
+  # shellcheck disable=SC1090
+  source "$upload_unit_functions"
+  verify_upload_units "$upload_pinned_env" \
+    "$expected_reference_exec" "$expected_market_exec"
+)
+
+# Transition: a pre-#921 baseline (concurrency 1) passes pre-promotion
+# verification when compared against its own bound control bundle.
+run_upload_units_case transition "$baseline_reference_exec" "$baseline_market_exec" || {
+  printf 'cross-version baseline upload units rejected before promotion\n' >&2
+  exit 1
+}
+# The old behaviour: candidate constants (concurrency 2) exact-matched against
+# the same baseline units must still fail, so post-promotion checks keep
+# detecting a uploader that was never re-rendered.
+if run_upload_units_case candidate-against-baseline \
+  "$candidate_reference_exec" "$candidate_market_exec"; then
+  printf 'candidate constants accepted baseline-concurrency units\n' >&2
+  exit 1
+fi
+# Post-promotion: freshly rendered candidate units pass the candidate identity.
+run_upload_units_case promoted "$candidate_reference_exec" "$candidate_market_exec" || {
+  printf 'promoted upload units rejected against candidate identity\n' >&2
+  exit 1
+}
+
 legacy_test_reference_allowlist=$(sed -n \
   "s/^[[:space:]]*legacy_runtime_reference_allowlist='\(.*\)'$/\1/p" "$CI_WORKFLOW")
 [[ -n $legacy_test_reference_allowlist ]] || {
