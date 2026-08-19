@@ -51,6 +51,10 @@ const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const MAX_TRADE_ROWS_PER_SNAPSHOT: usize = 20_000;
+// data-api /trades rejects offsets beyond this hard limit, so a market with
+// more trades than one page at this offset can only be partially fetched in a
+// cycle. That is an upstream bound, not local data corruption.
+const TRADE_PAGINATION_MAX_OFFSET: u64 = 10_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -2824,7 +2828,7 @@ impl ReferenceCollector {
         let mut trades = Vec::new();
         let mut truncated = false;
         let mut non_object_rows = 0_u64;
-        for offset in [0_u64, 10_000] {
+        for offset in [0_u64, TRADE_PAGINATION_MAX_OFFSET] {
             let payload = self
                 .get_json_rate_limited(
                     &self.endpoints.data_trades,
@@ -2846,7 +2850,7 @@ impl ReferenceCollector {
             if page_len < 10_000 {
                 break;
             }
-            if offset == 10_000 {
+            if offset == TRADE_PAGINATION_MAX_OFFSET {
                 truncated = true;
             }
         }
@@ -3089,6 +3093,7 @@ impl ReferenceCollector {
                     match trade_fetch {
                         Ok((trades, truncated, non_object_rows)) => {
                             successful_trade_polls += 1;
+                            let fetched_trade_rows = trades.len();
                             let (snapshot, mut malformed) =
                                 parse_trade_snapshot(&condition_id, trades);
                             // The data API paginates a live trade feed, so the
@@ -3121,7 +3126,15 @@ impl ReferenceCollector {
                                 tracked.trade_last_error = Some(detail);
                             }
                             if truncated {
+                                // The offset limit is a hard data-api bound, not
+                                // local corruption: this market is deferred to
+                                // the next cycle (its snapshot and finalization
+                                // stay untouched below) while the rest of the
+                                // cycle keeps running.
                                 truncated_markets.push(condition_id.clone());
+                                errors.push(format!(
+                                    "trades {condition_id}: trade pagination exceeded API offset limit; deferred market after {fetched_trade_rows} rows fetched through offset {TRADE_PAGINATION_MAX_OFFSET}"
+                                ));
                             }
                             let snapshot_changed = tracked.trade_snapshot_count != snapshot.count()
                                 || tracked.trade_snapshot_ids_sha256.as_deref()
@@ -3313,12 +3326,9 @@ impl ReferenceCollector {
             ))
             .into());
         }
-        if !truncated_markets.is_empty() {
-            return Err(DataCompletenessError(format!(
-                "trade pagination exceeded API offset limit for {truncated_markets:?}"
-            ))
-            .into());
-        }
+        // Truncated trade markets are deferred at market level above: hitting
+        // the data-api pagination offset limit only means this market cannot
+        // be fully fetched this cycle, so it must not fail the whole process.
         if !non_object_trade_markets.is_empty() {
             return Err(DataCompletenessError(format!(
                 "non-object trade rows for {non_object_trade_markets:?}"
@@ -3986,6 +3996,112 @@ mod tests {
             trades.len(),
             0,
             "trade rows must wait for consecutive stable settlement polls"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_pagination_offset_limit_defers_market_without_failing_cycle() {
+        let now = fixed_time("2026-07-21T03:00:00Z");
+        let discovery = serde_json::to_vec(&json!({
+            "markets": [market(
+                "Bitcoin Up or Down - 5 minutes",
+                "2026-07-21T02:59:00Z",
+                "2026-07-21T03:04:00Z",
+            )],
+            "next_cursor": "",
+        }))
+        .unwrap();
+        // Both offset pages return a full page, which is exactly how the data
+        // API signals that more trades exist beyond its hard offset limit.
+        let full_page = serde_json::to_vec(
+            &(0..10_000_i64)
+                .map(|index| {
+                    let mut trade = valid_trade(now.timestamp() - 600 + index);
+                    trade["transactionHash"] = json!(format!("0xtx{index}"));
+                    trade
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut last_request_at = None::<Instant>;
+            let mut trade_requests = 0_u64;
+            while started.elapsed() < Duration::from_secs(10)
+                && last_request_at.is_none_or(|at| at.elapsed() < Duration::from_millis(500))
+            {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                let path = read_http_request_path(&mut connection);
+                let body = if path.starts_with("/trades?") {
+                    trade_requests += 1;
+                    &full_page
+                } else if path.starts_with("/markets/keyset?") {
+                    &discovery
+                } else {
+                    panic!("unexpected test request: {path}");
+                };
+                last_request_at = Some(Instant::now());
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(body).unwrap();
+                connection.flush().unwrap();
+            }
+            trade_requests
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+        collector.clock = Box::new(move || now);
+
+        let health = collector
+            .collect_once()
+            .await
+            .expect("API offset limit must defer the market, not fail the cycle");
+        let trade_requests = server.join().unwrap();
+
+        assert_eq!(
+            trade_requests, 2,
+            "both offset pages are fetched before the market defers"
+        );
+        assert_eq!(
+            health["truncated_trade_markets"],
+            json!(["condition-1"]),
+            "health must still report the deferred market for the gate policy"
+        );
+        let api_errors = health["api_errors"].as_array().cloned().unwrap_or_default();
+        assert!(
+            api_errors.iter().any(|entry| {
+                let entry = entry.as_str().unwrap_or_default();
+                entry.contains("condition-1")
+                    && entry.contains("offset")
+                    && entry.contains("10000")
+            }),
+            "deferral must log condition id, offset, and fetched rows: {api_errors:?}"
         );
     }
 
