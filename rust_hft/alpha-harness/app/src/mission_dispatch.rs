@@ -1,5 +1,6 @@
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
+    data_mission,
     mission_campaign::{serialize_request, validate_request, CampaignRequest},
     mission_runner::normalized_sha256,
     prediction_dispatch::{
@@ -8,19 +9,28 @@ use crate::{
     },
 };
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 
 const MAX_SUBMISSION_BYTES: u64 = 1024 * 1024;
 const ACTIVE_DEADLINE_SECONDS: u64 = 3600;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MissionDispatchSubmission {
     attempt_id: String,
     image: String,
     request: CampaignRequest,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubmissionRenderReport {
+    pub(crate) request_sha256: String,
+    pub(crate) submission_identity_sha256: String,
+    pub(crate) job_name: String,
+    pub(crate) secret_name: String,
 }
 
 #[derive(Debug)]
@@ -597,6 +607,26 @@ fn validate_submission(
         submission_identity_sha256,
         job_name,
         secret_name,
+    })
+}
+
+pub(crate) fn write_submission(
+    path: &Path,
+    attempt_id: &str,
+    image: &str,
+    request: CampaignRequest,
+) -> anyhow::Result<SubmissionRenderReport> {
+    let validated = validate_submission(MissionDispatchSubmission {
+        attempt_id: attempt_id.to_string(),
+        image: image.to_string(),
+        request,
+    })?;
+    data_mission::write_json_atomic(path, &validated.submission)?;
+    Ok(SubmissionRenderReport {
+        request_sha256: validated.request_sha256,
+        submission_identity_sha256: validated.submission_identity_sha256,
+        job_name: validated.job_name,
+        secret_name: validated.secret_name,
     })
 }
 

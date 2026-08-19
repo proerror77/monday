@@ -1,8 +1,9 @@
 use crate::{
     cli::{
-        print_json, CampaignExecuteArgs, CampaignIdArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
+        print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
+        ExecuteMissionArgs, BUILD_SOURCE_REVISION,
     },
-    data_mission,
+    data_mission, mission_dispatch,
     mission_render::render_cex_bundle,
     mission_runner::{
         execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
@@ -20,9 +21,16 @@ use anyhow::{bail, Context};
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Read, path::Path, time::Duration};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use zip::ZipArchive;
 
+const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
+const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V2: &str = "cex-campaign-request-v2";
 const CAMPAIGN_RESULT_SCHEMA_V2: &str = "cex-campaign-result-v2";
 const CAMPAIGN_IDENTITY_SCHEMA_V2: &str = "cex-campaign-identity-v2";
@@ -31,7 +39,7 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
 const MAX_RESULT_BUNDLE_FILES: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CampaignRequest {
     pub(crate) schema_version: String,
@@ -55,7 +63,7 @@ pub(crate) struct CampaignRequest {
     pub(crate) campaign_result_readback_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CampaignRoundRequest {
     pub(crate) round_id: String,
@@ -64,6 +72,78 @@ pub(crate) struct CampaignRoundRequest {
     pub(crate) mission_readback_url: String,
     pub(crate) result_put_url: String,
     pub(crate) result_readback_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenCampaignPlan {
+    schema_version: String,
+    campaign_inputs_sha256: String,
+    canonical_request: CampaignRequest,
+    signing_plan: CampaignSigningPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInputsReceipt {
+    schema_version: String,
+    run_id: String,
+    source_revision: String,
+    image_ref: String,
+    mission_id: String,
+    market: String,
+    symbol: String,
+    output_prefix: String,
+    output_object_base_url: String,
+    readback_scope: String,
+    feature: CampaignInputReceiptItem,
+    materialization: CampaignInputReceiptItem,
+    replay_artifact: CampaignInputReceiptItem,
+    replay_manifest: CampaignInputReceiptItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInputReceiptItem {
+    relative_path: PathBuf,
+    object_url: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CampaignSigningPlan {
+    actions: Vec<CampaignSigningAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CampaignSigningAction {
+    name: String,
+    object: String,
+    method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    required_headers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CampaignFreezeReport {
+    campaign_id: String,
+    holdout_id: String,
+    declared_total_trials: usize,
+    output: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CampaignFinalizeReport {
+    campaign_id: String,
+    holdout_id: String,
+    request_sha256: String,
+    submission_identity_sha256: String,
+    job_name: String,
+    request_out: String,
+    submission_out: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +241,50 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         bail!("alpha-harness was built without an exact source revision");
     }
     execute_loaded_request(args, loaded)
+}
+
+pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
+    let (request, campaign_inputs_sha256) = freeze_request(&args)?;
+    let plan = FrozenCampaignPlan {
+        schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
+        campaign_inputs_sha256,
+        signing_plan: signing_plan(&request)?,
+        canonical_request: request.clone(),
+    };
+    data_mission::write_json_atomic(&args.output, &plan)?;
+    print_json(&CampaignFreezeReport {
+        campaign_id: request.campaign_id.clone(),
+        holdout_id: request.holdout_id.clone(),
+        declared_total_trials: request.declared_total_trials,
+        output: args.output.display().to_string(),
+    })
+}
+
+pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
+    let plan = load_freeze_plan(&args.freeze)?;
+    validate_request(&plan.canonical_request)?;
+    if expected_campaign_id(&plan.canonical_request)? != plan.canonical_request.campaign_id {
+        bail!("frozen campaign request campaign_id does not match its semantic identity");
+    }
+
+    let loaded = load_request(&args.signed_request)?;
+    validate_request_matches_freeze(&loaded.request, &plan)?;
+    data_mission::write_json_atomic(&args.request_out, &loaded.request)?;
+    let rendered = mission_dispatch::write_submission(
+        &args.submission_out,
+        &args.attempt_id,
+        &args.image,
+        loaded.request.clone(),
+    )?;
+    print_json(&CampaignFinalizeReport {
+        campaign_id: loaded.request.campaign_id.clone(),
+        holdout_id: loaded.request.holdout_id.clone(),
+        request_sha256: rendered.request_sha256,
+        submission_identity_sha256: rendered.submission_identity_sha256,
+        job_name: rendered.job_name,
+        request_out: args.request_out.display().to_string(),
+        submission_out: args.submission_out.display().to_string(),
+    })
 }
 
 #[cfg(not(test))]
@@ -446,6 +570,248 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     }))
 }
 
+fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest, String)> {
+    let (receipt, campaign_inputs_sha256) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
+    validate_campaign_inputs_receipt(&receipt)?;
+    let feature_url =
+        canonical_tokyo_oss_internal_object("campaign feature", &receipt.feature.object_url)?;
+    let materialization_url = canonical_tokyo_oss_internal_object(
+        "campaign materialization",
+        &receipt.materialization.object_url,
+    )?;
+    let replay_artifact_url = canonical_tokyo_oss_internal_object(
+        "campaign replay artifact",
+        &receipt.replay_artifact.object_url,
+    )?;
+    let replay_manifest_url = canonical_tokyo_oss_internal_object(
+        "campaign replay manifest",
+        &receipt.replay_manifest.object_url,
+    )?;
+    let campaign_root = canonical_tokyo_oss_internal_object("campaign root", &args.campaign_root)?;
+    let image_identity = image_identity_from_ref(&receipt.image_ref)?;
+    let feature_path = args.input_root.join(&receipt.feature.relative_path);
+    let materialization_path = args.input_root.join(&receipt.materialization.relative_path);
+    let replay_artifact_path = args.input_root.join(&receipt.replay_artifact.relative_path);
+    let replay_manifest_path = args.input_root.join(&receipt.replay_manifest.relative_path);
+    let feature_sha256 =
+        verify_local_receipt_item("campaign feature", &feature_path, &receipt.feature.sha256)?;
+    let materialization_sha256 = verify_local_receipt_item(
+        "campaign materialization",
+        &materialization_path,
+        &receipt.materialization.sha256,
+    )?;
+    let replay_artifact_sha256 = verify_local_receipt_item(
+        "campaign replay artifact",
+        &replay_artifact_path,
+        &receipt.replay_artifact.sha256,
+    )?;
+    let replay_manifest_sha256 = verify_local_receipt_item(
+        "campaign replay manifest",
+        &replay_manifest_path,
+        &receipt.replay_manifest.sha256,
+    )?;
+    let declared_total_trials = crate::mission_render::max_candidates_for_tests()
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(args.seeds.len()))
+        .context("campaign declared_total_trials overflowed")?;
+    let probe_seed = *args
+        .seeds
+        .first()
+        .context("campaign freeze requires at least one seed")?;
+    let rendered = render_cex_bundle(
+        &feature_path,
+        &materialization_path,
+        probe_seed,
+        declared_total_trials,
+    )?;
+    Ok((
+        build_request_from_parts(
+            &feature_url,
+            &feature_sha256,
+            &materialization_url,
+            &materialization_sha256,
+            &replay_artifact_url,
+            &replay_artifact_sha256,
+            &replay_manifest_url,
+            &replay_manifest_sha256,
+            &image_identity,
+            &campaign_root,
+            &rendered.mission.spec.holdout.holdout_id,
+            &args.seeds,
+        )?,
+        campaign_inputs_sha256,
+    ))
+}
+
+fn load_campaign_inputs_receipt(path: &Path) -> anyhow::Result<(CampaignInputsReceipt, String)> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open campaign inputs receipt {}", path.display()))?;
+    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+        bail!("campaign inputs receipt exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let receipt: CampaignInputsReceipt = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse campaign inputs receipt {}", path.display()))?;
+    Ok((receipt, hex::encode(Sha256::digest(&bytes))))
+}
+
+fn validate_campaign_inputs_receipt(receipt: &CampaignInputsReceipt) -> anyhow::Result<()> {
+    if receipt.schema_version != CAMPAIGN_INPUTS_SCHEMA_V1 {
+        bail!("campaign inputs receipt schema_version must be {CAMPAIGN_INPUTS_SCHEMA_V1}");
+    }
+    validate_receipt_identifier("campaign inputs run_id", &receipt.run_id)?;
+    if receipt.source_revision != BUILD_SOURCE_REVISION {
+        bail!("campaign inputs receipt source_revision does not match this build");
+    }
+    if !valid_git_revision(&receipt.source_revision) {
+        bail!("campaign inputs receipt source_revision must be an exact git revision");
+    }
+    validate_receipt_identifier("campaign inputs mission_id", &receipt.mission_id)?;
+    if receipt.market != "usdm" {
+        bail!("campaign inputs receipt market must be usdm");
+    }
+    if receipt.symbol != "BTCUSDT" {
+        bail!("campaign inputs receipt symbol must be BTCUSDT");
+    }
+    if receipt.readback_scope != "same-mounted-ossfs-prefix" {
+        bail!("campaign inputs receipt readback_scope must be same-mounted-ossfs-prefix");
+    }
+    let output_root = campaign_inputs_output_root(receipt)?;
+    image_identity_from_ref(&receipt.image_ref)?;
+    validate_campaign_input_receipt_item("campaign feature", &receipt.feature, &output_root)?;
+    validate_campaign_input_receipt_item(
+        "campaign materialization",
+        &receipt.materialization,
+        &output_root,
+    )?;
+    validate_campaign_input_receipt_item(
+        "campaign replay artifact",
+        &receipt.replay_artifact,
+        &output_root,
+    )?;
+    validate_campaign_input_receipt_item(
+        "campaign replay manifest",
+        &receipt.replay_manifest,
+        &output_root,
+    )?;
+    Ok(())
+}
+
+fn validate_campaign_input_receipt_item(
+    label: &str,
+    item: &CampaignInputReceiptItem,
+    output_root: &str,
+) -> anyhow::Result<()> {
+    let object = canonical_tokyo_oss_internal_object(label, &item.object_url)?;
+    normalized_sha256(label, &item.sha256)?;
+    if item.relative_path.as_os_str().is_empty()
+        || item.relative_path.is_absolute()
+        || item
+            .relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("{label} relative_path must be a safe relative path");
+    }
+    if !object.starts_with(&format!("{output_root}/")) {
+        bail!("{label} object_url must live under the campaign inputs output root");
+    }
+    Ok(())
+}
+
+fn campaign_inputs_output_root(receipt: &CampaignInputsReceipt) -> anyhow::Result<String> {
+    let base = canonical_https_object_prefix(
+        "campaign inputs output_object_base_url",
+        &receipt.output_object_base_url,
+    )?;
+    validate_relative_output_prefix(&receipt.output_prefix)?;
+    Ok(format!(
+        "{base}/{}",
+        receipt.output_prefix.trim_matches('/')
+    ))
+}
+
+fn canonical_https_object_prefix(label: &str, value: &str) -> anyhow::Result<String> {
+    if value != value.trim() || value.chars().any(char::is_control) {
+        bail!("{label} must not contain surrounding whitespace or control characters");
+    }
+    let mut url = reqwest::Url::parse(value).with_context(|| format!("{label} is invalid"))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        bail!("{label} must be HTTPS with a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() {
+        bail!("{label} must not contain credentials or a query");
+    }
+    if url.fragment().is_some() || url.path() == "/" || url.path().ends_with('/') {
+        bail!("{label} must identify a canonical prefix path");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let canonical = url.to_string();
+    let host = url
+        .host_str()
+        .context("campaign inputs output root host is missing")?;
+    if !host.ends_with(&format!(
+        ".{}",
+        crate::prediction_dispatch::TOKYO_OSS_INTERNAL_ENDPOINT
+    )) {
+        bail!("{label} must target the Tokyo OSS internal endpoint");
+    }
+    Ok(canonical)
+}
+
+fn validate_relative_output_prefix(value: &str) -> anyhow::Result<()> {
+    let value = value.trim_matches('/');
+    if value.is_empty() {
+        bail!("campaign inputs output_prefix is invalid");
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("campaign inputs output_prefix must be a safe relative path");
+    }
+    Ok(())
+}
+
+fn validate_receipt_identifier(label: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        bail!("{label} is invalid");
+    }
+    Ok(())
+}
+
+fn verify_local_receipt_item(
+    label: &str,
+    path: &Path,
+    expected_sha256: &str,
+) -> anyhow::Result<String> {
+    let actual = crate::mission_runner::sha256_file(path)?;
+    if actual != normalized_sha256(label, expected_sha256)? {
+        bail!("{label} local file SHA256 does not match the receipt");
+    }
+    Ok(actual)
+}
+
+fn image_identity_from_ref(image_ref: &str) -> anyhow::Result<String> {
+    if image_ref != image_ref.trim() || image_ref.chars().any(char::is_control) {
+        bail!("campaign image_ref must not contain surrounding whitespace or control characters");
+    }
+    let (_, digest) = image_ref
+        .rsplit_once("@sha256:")
+        .context("campaign image_ref must be pinned by @sha256 digest")?;
+    normalized_sha256("campaign image identity", digest)
+}
+
 fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
     if destination.try_exists()? {
         return Ok(());
@@ -582,6 +948,22 @@ fn compare_round_selection(
 
 fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
     serde_json::from_slice(&std::fs::read(path)?).map_err(anyhow::Error::new)
+}
+
+fn load_freeze_plan(path: &Path) -> anyhow::Result<FrozenCampaignPlan> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open campaign freeze plan {}", path.display()))?;
+    if file.metadata()?.len() > MAX_REQUEST_BYTES {
+        bail!("campaign freeze plan exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let plan: FrozenCampaignPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse campaign freeze plan {}", path.display()))?;
+    if plan.schema_version != CAMPAIGN_FREEZE_SCHEMA_V1 {
+        bail!("campaign freeze plan schema_version must be {CAMPAIGN_FREEZE_SCHEMA_V1}");
+    }
+    Ok(plan)
 }
 
 pub fn print_expected_id(args: CampaignIdArgs) -> anyhow::Result<()> {
@@ -738,6 +1120,269 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request campaign_id does not match its semantic identity");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_from_parts(
+    feature_url: &str,
+    feature_sha256: &str,
+    materialization_url: &str,
+    materialization_sha256: &str,
+    replay_artifact_url: &str,
+    replay_artifact_sha256: &str,
+    replay_manifest_url: &str,
+    replay_manifest_sha256: &str,
+    image_identity: &str,
+    campaign_root: &str,
+    holdout_id: &str,
+    seeds: &[u64],
+) -> anyhow::Result<CampaignRequest> {
+    let mut request = CampaignRequest {
+        schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
+        campaign_id: "placeholder".to_string(),
+        build_source_revision: BUILD_SOURCE_REVISION.to_string(),
+        image_identity: image_identity.to_string(),
+        feature_url: feature_url.to_string(),
+        feature_sha256: feature_sha256.to_string(),
+        materialization_url: materialization_url.to_string(),
+        materialization_sha256: materialization_sha256.to_string(),
+        replay_artifact_url: replay_artifact_url.to_string(),
+        replay_artifact_sha256: replay_artifact_sha256.to_string(),
+        replay_manifest_url: replay_manifest_url.to_string(),
+        replay_manifest_sha256: replay_manifest_sha256.to_string(),
+        holdout_id: holdout_id.to_string(),
+        declared_total_trials: crate::mission_render::max_candidates_for_tests()
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(seeds.len()))
+            .context("campaign declared_total_trials overflowed")?,
+        rounds: seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| CampaignRoundRequest {
+                round_id: format!("r{}", index + 1),
+                seed: *seed,
+                mission_put_url: format!(
+                    "{campaign_root}/campaign-id=placeholder/round=r{}/mission.json",
+                    index + 1
+                ),
+                mission_readback_url: format!(
+                    "{campaign_root}/campaign-id=placeholder/round=r{}/mission.json",
+                    index + 1
+                ),
+                result_put_url: format!(
+                    "{campaign_root}/campaign-id=placeholder/round=r{}/results.zip",
+                    index + 1
+                ),
+                result_readback_url: format!(
+                    "{campaign_root}/campaign-id=placeholder/round=r{}/results.zip",
+                    index + 1
+                ),
+            })
+            .collect(),
+        holdout_claim_put_url: cex_global_holdout_claim_object(holdout_id)?,
+        holdout_claim_readback_url: cex_global_holdout_claim_object(holdout_id)?,
+        campaign_result_put_url: format!(
+            "{campaign_root}/campaign-id=placeholder/campaign-result.json"
+        ),
+        campaign_result_readback_url: format!(
+            "{campaign_root}/campaign-id=placeholder/campaign-result.json"
+        ),
+    };
+    request.campaign_id = expected_campaign_id(&request)?;
+    for round in &mut request.rounds {
+        round.mission_put_url = format!(
+            "{campaign_root}/campaign-id={}/round={}/mission.json",
+            request.campaign_id, round.round_id
+        );
+        round.mission_readback_url = round.mission_put_url.clone();
+        round.result_put_url = format!(
+            "{campaign_root}/campaign-id={}/round={}/results.zip",
+            request.campaign_id, round.round_id
+        );
+        round.result_readback_url = round.result_put_url.clone();
+    }
+    request.campaign_result_put_url = format!(
+        "{campaign_root}/campaign-id={}/campaign-result.json",
+        request.campaign_id
+    );
+    request.campaign_result_readback_url = request.campaign_result_put_url.clone();
+    validate_request(&request)?;
+    Ok(request)
+}
+
+fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<CampaignRequest> {
+    let mut canonical = request.clone();
+    canonical.image_identity =
+        normalized_sha256("campaign image identity", &canonical.image_identity)?;
+    canonical.feature_url =
+        canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
+    canonical.materialization_url = canonical_tokyo_oss_internal_object(
+        "campaign materialization",
+        &canonical.materialization_url,
+    )?;
+    canonical.replay_artifact_url = canonical_tokyo_oss_internal_object(
+        "campaign replay artifact",
+        &canonical.replay_artifact_url,
+    )?;
+    canonical.replay_manifest_url = canonical_tokyo_oss_internal_object(
+        "campaign replay manifest",
+        &canonical.replay_manifest_url,
+    )?;
+    canonical.holdout_claim_put_url = canonical_tokyo_oss_internal_object(
+        "campaign holdout claim",
+        &canonical.holdout_claim_put_url,
+    )?;
+    canonical.holdout_claim_readback_url = canonical_tokyo_oss_internal_object(
+        "campaign holdout claim readback",
+        &canonical.holdout_claim_readback_url,
+    )?;
+    canonical.campaign_result_put_url =
+        canonical_tokyo_oss_internal_object("campaign result", &canonical.campaign_result_put_url)?;
+    canonical.campaign_result_readback_url = canonical_tokyo_oss_internal_object(
+        "campaign result readback",
+        &canonical.campaign_result_readback_url,
+    )?;
+    for round in &mut canonical.rounds {
+        round.mission_put_url =
+            canonical_tokyo_oss_internal_object("campaign mission", &round.mission_put_url)?;
+        round.mission_readback_url = canonical_tokyo_oss_internal_object(
+            "campaign mission readback",
+            &round.mission_readback_url,
+        )?;
+        round.result_put_url =
+            canonical_tokyo_oss_internal_object("campaign result", &round.result_put_url)?;
+        round.result_readback_url = canonical_tokyo_oss_internal_object(
+            "campaign result readback",
+            &round.result_readback_url,
+        )?;
+    }
+    Ok(canonical)
+}
+
+fn signing_plan(request: &CampaignRequest) -> anyhow::Result<CampaignSigningPlan> {
+    let feature_object =
+        canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
+    let materialization_object = canonical_tokyo_oss_internal_object(
+        "campaign materialization",
+        &request.materialization_url,
+    )?;
+    let replay_artifact_object = canonical_tokyo_oss_internal_object(
+        "campaign replay artifact",
+        &request.replay_artifact_url,
+    )?;
+    let replay_manifest_object = canonical_tokyo_oss_internal_object(
+        "campaign replay manifest",
+        &request.replay_manifest_url,
+    )?;
+    let holdout_claim_object = canonical_tokyo_oss_internal_object(
+        "campaign holdout claim",
+        &request.holdout_claim_put_url,
+    )?;
+    let campaign_result_object =
+        canonical_tokyo_oss_internal_object("campaign result", &request.campaign_result_put_url)?;
+    let _campaign_root = campaign_output_root(&campaign_result_object)?;
+    let mut actions = vec![
+        signing_action_get("feature_get", feature_object),
+        signing_action_get("materialization_get", materialization_object),
+        signing_action_get("replay_artifact_get", replay_artifact_object),
+        signing_action_get("replay_manifest_get", replay_manifest_object),
+    ];
+    for round in &request.rounds {
+        actions.push(signing_action_put_json(
+            &format!("{}_mission_put", round.round_id),
+            canonical_tokyo_oss_internal_object("campaign mission", &round.mission_put_url)?,
+        ));
+        actions.push(signing_action_get(
+            &format!("{}_mission_readback_get", round.round_id),
+            canonical_tokyo_oss_internal_object(
+                "campaign mission readback",
+                &round.mission_readback_url,
+            )?,
+        ));
+        actions.push(signing_action_put_zip(
+            &format!("{}_result_put", round.round_id),
+            canonical_tokyo_oss_internal_object("campaign result", &round.result_put_url)?,
+        ));
+        actions.push(signing_action_get(
+            &format!("{}_result_readback_get", round.round_id),
+            canonical_tokyo_oss_internal_object(
+                "campaign result readback",
+                &round.result_readback_url,
+            )?,
+        ));
+    }
+    actions.push(signing_action_put_json(
+        "holdout_claim_put",
+        holdout_claim_object.clone(),
+    ));
+    actions.push(signing_action_get(
+        "holdout_claim_readback_get",
+        canonical_tokyo_oss_internal_object(
+            "campaign holdout claim readback",
+            &request.holdout_claim_readback_url,
+        )?,
+    ));
+    actions.push(signing_action_put_json(
+        "campaign_result_put",
+        campaign_result_object.clone(),
+    ));
+    actions.push(signing_action_get(
+        "campaign_result_readback_get",
+        canonical_tokyo_oss_internal_object(
+            "campaign result readback",
+            &request.campaign_result_readback_url,
+        )?,
+    ));
+    Ok(CampaignSigningPlan { actions })
+}
+
+fn validate_request_matches_freeze(
+    signed_request: &CampaignRequest,
+    plan: &FrozenCampaignPlan,
+) -> anyhow::Result<()> {
+    validate_request(signed_request)?;
+    let canonical_signed = canonicalize_request_transport(signed_request)?;
+    if canonical_signed != plan.canonical_request {
+        bail!("signed campaign request drifted from the frozen canonical identity");
+    }
+    if signing_plan(&canonical_signed)? != plan.signing_plan {
+        bail!("signed campaign request signing plan drifted from the frozen execution plan");
+    }
+    if expected_campaign_id(signed_request)? != plan.canonical_request.campaign_id {
+        bail!("signed campaign request campaign_id drifted from the frozen identity");
+    }
+    Ok(())
+}
+
+fn signing_action_get(name: &str, object: String) -> CampaignSigningAction {
+    CampaignSigningAction {
+        name: name.to_string(),
+        object,
+        method: "GET".to_string(),
+        content_type: None,
+        required_headers: std::collections::BTreeMap::new(),
+    }
+}
+
+fn signing_action_put_json(name: &str, object: String) -> CampaignSigningAction {
+    signing_action_put(name, object, "application/json")
+}
+
+fn signing_action_put_zip(name: &str, object: String) -> CampaignSigningAction {
+    signing_action_put(name, object, "application/zip")
+}
+
+fn signing_action_put(name: &str, object: String, content_type: &str) -> CampaignSigningAction {
+    CampaignSigningAction {
+        name: name.to_string(),
+        object,
+        method: "PUT".to_string(),
+        content_type: Some(content_type.to_string()),
+        required_headers: std::collections::BTreeMap::from([(
+            "x-oss-forbid-overwrite".to_string(),
+            "true".to_string(),
+        )]),
+    }
 }
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
@@ -1121,6 +1766,253 @@ mod tests {
         assert_eq!(rebased.holdout_claim_put_url, claim);
         assert_eq!(rebased.holdout_claim_readback_url, claim);
         validate_request(&rebased).unwrap();
+    }
+
+    #[test]
+    fn finalize_preserves_frozen_campaign_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let freeze_path = root.path().join("freeze.json");
+        let request_out = root.path().join("request.json");
+        let submission_out = root.path().join("submission.json");
+        let canonical_request = canonicalize_request_transport(&valid_request()).unwrap();
+        let frozen = FrozenCampaignPlan {
+            schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
+            campaign_inputs_sha256: "a".repeat(64),
+            signing_plan: signing_plan(&canonical_request).unwrap(),
+            canonical_request: canonical_request.clone(),
+        };
+        data_mission::write_json_atomic(&freeze_path, &frozen).unwrap();
+
+        let mut signed = valid_request();
+        signed.feature_url.push_str("?feature-signature=1");
+        signed
+            .materialization_url
+            .push_str("?materialization-signature=1");
+        signed.replay_artifact_url.push_str("?replay-signature=1");
+        signed.replay_manifest_url.push_str("?manifest-signature=1");
+        signed.holdout_claim_put_url.push_str("?claim-signature=1");
+        signed
+            .holdout_claim_readback_url
+            .push_str("?claim-readback-signature=1");
+        signed
+            .campaign_result_put_url
+            .push_str("?campaign-result-signature=1");
+        signed
+            .campaign_result_readback_url
+            .push_str("?campaign-result-readback-signature=1");
+        for round in &mut signed.rounds {
+            round.mission_put_url.push_str("?mission-signature=1");
+            round
+                .mission_readback_url
+                .push_str("?mission-readback-signature=1");
+            round.result_put_url.push_str("?result-signature=1");
+            round
+                .result_readback_url
+                .push_str("?result-readback-signature=1");
+        }
+        let signed_request_path = root.path().join("signed-request.json");
+        data_mission::write_json_atomic(&signed_request_path, &signed).unwrap();
+
+        finalize(CampaignFinalizeArgs {
+            freeze: freeze_path,
+            signed_request: signed_request_path,
+            attempt_id: "attempt-001".to_string(),
+            image: format!("registry/research-runner@sha256:{}", "1".repeat(64)),
+            request_out: request_out.clone(),
+            submission_out: submission_out.clone(),
+        })
+        .unwrap();
+
+        let finalized_request: CampaignRequest =
+            serde_json::from_slice(&std::fs::read(&request_out).unwrap()).unwrap();
+        assert_eq!(
+            canonicalize_request_transport(&finalized_request).unwrap(),
+            canonical_request
+        );
+        let submission: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&submission_out).unwrap()).unwrap();
+        assert_eq!(
+            submission["request"]["campaign_id"],
+            serde_json::json!(finalized_request.campaign_id)
+        );
+        assert_eq!(
+            submission["request"]["holdout_id"],
+            serde_json::json!(finalized_request.holdout_id)
+        );
+    }
+
+    #[test]
+    fn build_request_from_parts_derives_campaign_id_and_global_holdout_claim() {
+        let request = build_request_from_parts(
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/features.jsonl",
+            &"1".repeat(64),
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/materialization.json",
+            &"2".repeat(64),
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/replay.parquet",
+            &"3".repeat(64),
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/replay-manifest.json",
+            &"4".repeat(64),
+            &"1".repeat(64),
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns",
+            "cex-holdout-test",
+            &[7, 11],
+        )
+        .unwrap();
+
+        assert_eq!(request.campaign_id, expected_campaign_id(&request).unwrap());
+        assert_eq!(
+            canonical_tokyo_oss_internal_object("holdout", &request.holdout_claim_put_url).unwrap(),
+            cex_global_holdout_claim_object(&request.holdout_id).unwrap()
+        );
+        validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn freeze_from_receipt_derives_identity_and_plan() {
+        const TEST_ROOT: &str =
+            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
+        let fixture = campaign_e2e_fixture("campaign-freeze", false, false);
+        let root = tempfile::tempdir().unwrap();
+        let input_root = root.path().join("remounted-run");
+        std::fs::create_dir_all(&input_root).unwrap();
+        let feature_relative = PathBuf::from("features.jsonl");
+        let materialization_relative = PathBuf::from("materialization.json");
+        let replay_artifact_relative = PathBuf::from("replay.parquet");
+        let replay_manifest_relative = PathBuf::from("replay-manifest.json");
+        std::fs::copy(
+            &fixture._render_fixture.feature_path,
+            input_root.join(&feature_relative),
+        )
+        .unwrap();
+        std::fs::copy(
+            &fixture._render_fixture.materialization_path,
+            input_root.join(&materialization_relative),
+        )
+        .unwrap();
+        std::fs::copy(
+            &fixture.replay_artifact_path,
+            input_root.join(&replay_artifact_relative),
+        )
+        .unwrap();
+        std::fs::copy(
+            &fixture.replay_manifest_path,
+            input_root.join(&replay_manifest_relative),
+        )
+        .unwrap();
+        let receipt_path = root.path().join("campaign-inputs.json");
+        let receipt = CampaignInputsReceipt {
+            schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.to_string(),
+            run_id: "20260819t000000z-1".to_string(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image_ref: format!("registry/research-runner@sha256:{}", "1".repeat(64)),
+            mission_id: "campaign-inputs-test".to_string(),
+            market: "usdm".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            output_prefix: "runs/campaign-freeze".to_string(),
+            output_object_base_url: TEST_ROOT.to_string(),
+            readback_scope: "same-mounted-ossfs-prefix".to_string(),
+            feature: CampaignInputReceiptItem {
+                relative_path: feature_relative.clone(),
+                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/features.jsonl"),
+                sha256: crate::mission_runner::sha256_file(&input_root.join(&feature_relative))
+                    .unwrap(),
+            },
+            materialization: CampaignInputReceiptItem {
+                relative_path: materialization_relative.clone(),
+                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/materialization.json"),
+                sha256: crate::mission_runner::sha256_file(
+                    &input_root.join(&materialization_relative),
+                )
+                .unwrap(),
+            },
+            replay_artifact: CampaignInputReceiptItem {
+                relative_path: replay_artifact_relative.clone(),
+                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay.parquet"),
+                sha256: crate::mission_runner::sha256_file(
+                    &input_root.join(&replay_artifact_relative),
+                )
+                .unwrap(),
+            },
+            replay_manifest: CampaignInputReceiptItem {
+                relative_path: replay_manifest_relative.clone(),
+                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay-manifest.json"),
+                sha256: crate::mission_runner::sha256_file(
+                    &input_root.join(&replay_manifest_relative),
+                )
+                .unwrap(),
+            },
+        };
+        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
+        let output = root.path().join("freeze.json");
+
+        freeze(CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root,
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: output.clone(),
+        })
+        .unwrap();
+
+        let (receipt_again, receipt_sha256) = load_campaign_inputs_receipt(&receipt_path).unwrap();
+        assert_eq!(receipt_again.source_revision, BUILD_SOURCE_REVISION);
+        let frozen = load_freeze_plan(&output).unwrap();
+        assert_eq!(frozen.campaign_inputs_sha256, receipt_sha256);
+        assert_eq!(
+            frozen.canonical_request.image_identity,
+            image_identity_from_ref(&receipt.image_ref).unwrap()
+        );
+        assert_eq!(
+            frozen.signing_plan,
+            signing_plan(&frozen.canonical_request).unwrap()
+        );
+
+        let mut sibling = receipt.clone();
+        sibling.feature.object_url =
+            format!("{TEST_ROOT}/runs/campaign-freeze-sibling/features.jsonl");
+        assert!(validate_campaign_inputs_receipt(&sibling)
+            .unwrap_err()
+            .to_string()
+            .contains("must live under the campaign inputs output root"));
+
+        let mut escaped = receipt;
+        escaped.feature.relative_path = PathBuf::from("../features.jsonl");
+        assert!(validate_campaign_inputs_receipt(&escaped)
+            .unwrap_err()
+            .to_string()
+            .contains("relative_path must be a safe relative path"));
+    }
+
+    #[test]
+    fn finalize_rejects_signing_plan_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let freeze_path = root.path().join("freeze.json");
+        let canonical_request = canonicalize_request_transport(&valid_request()).unwrap();
+        let mut signing_plan = signing_plan(&canonical_request).unwrap();
+        signing_plan.actions[0].method = "PUT".to_string();
+        let frozen = FrozenCampaignPlan {
+            schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
+            campaign_inputs_sha256: "a".repeat(64),
+            signing_plan,
+            canonical_request: canonical_request.clone(),
+        };
+        data_mission::write_json_atomic(&freeze_path, &frozen).unwrap();
+        let signed_request_path = root.path().join("signed-request.json");
+        data_mission::write_json_atomic(&signed_request_path, &valid_request()).unwrap();
+
+        let error = finalize(CampaignFinalizeArgs {
+            freeze: freeze_path,
+            signed_request: signed_request_path,
+            attempt_id: "attempt-001".to_string(),
+            image: format!("registry/research-runner@sha256:{}", "1".repeat(64)),
+            request_out: root.path().join("request.json"),
+            submission_out: root.path().join("submission.json"),
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("signing plan drifted from the frozen execution plan"));
     }
 
     #[test]
@@ -1527,6 +2419,8 @@ mod tests {
         _root: tempfile::TempDir,
         _replay_root: tempfile::TempDir,
         _render_fixture: mission_render::tests::Fixture,
+        replay_artifact_path: PathBuf,
+        replay_manifest_path: PathBuf,
         args: CampaignExecuteArgs,
         work_dir: PathBuf,
         global_claim_path: PathBuf,
@@ -1609,6 +2503,8 @@ mod tests {
             _root: root,
             _replay_root: replay_root,
             _render_fixture: render_fixture,
+            replay_artifact_path,
+            replay_manifest_path,
             args: CampaignExecuteArgs {
                 work_dir: work_dir.clone(),
                 campaign_id: request.campaign_id.clone(),
@@ -1627,7 +2523,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(materialization_path).unwrap()).unwrap();
         materialization["artifact_sha256"] = serde_json::json!(feature_sha256.clone());
         materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(feature_sha256);
-        let snapshot: hft_research_manifest::CexReplaySnapshotV4 =
+        let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
             serde_json::from_value(materialization["snapshot"].clone()).unwrap();
         materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         std::fs::write(

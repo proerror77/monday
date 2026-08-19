@@ -41,11 +41,11 @@ use hft_backtest::{
     },
 };
 use hft_research_manifest::{
-    CexInstrumentRulesV2, CexReplayDatasetManifestV4, CexReplaySnapshotV1, CexReplaySnapshotV2,
-    CexReplaySnapshotV3, CexReplaySnapshotV4, ManifestId,
+    CexInstrumentRulesV2, CexReplayDatasetManifestV5, CexReplaySnapshotV1, CexReplaySnapshotV2,
+    CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5, ManifestId,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
 };
 use reqwest::{
     blocking::Client,
@@ -122,7 +122,7 @@ pub(crate) struct Materialization {
     pub(crate) rows: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
-    pub(crate) snapshot: CexReplaySnapshotV4,
+    pub(crate) snapshot: CexReplaySnapshotV5,
     snapshot_sha256: String,
 }
 
@@ -1372,16 +1372,29 @@ pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materializa
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
     {
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7) => {
+            serde_json::from_value(value).context("V7 materialization manifest is invalid")
+        }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6) => {
-            serde_json::from_value(value).context("V6 materialization manifest is invalid")
+            let snapshot: CexReplaySnapshotV4 = serde_json::from_value(
+                value
+                    .get("snapshot")
+                    .cloned()
+                    .context("historical V6 materialization has no snapshot")?,
+            )
+            .context("historical V6 materialization snapshot is invalid")?;
+            snapshot.validate().map_err(anyhow::Error::new)?;
+            bail!("historical V6 materialization is read-only and cannot execute")
         }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5) => {
-            let materialization: Materialization = serde_json::from_value(value)
-                .context("historical V5 materialization is invalid")?;
-            materialization
-                .snapshot
-                .validate()
-                .map_err(anyhow::Error::new)?;
+            let snapshot: CexReplaySnapshotV4 = serde_json::from_value(
+                value
+                    .get("snapshot")
+                    .cloned()
+                    .context("historical V5 materialization has no snapshot")?,
+            )
+            .context("historical V5 materialization snapshot is invalid")?;
+            snapshot.validate().map_err(anyhow::Error::new)?;
             bail!("historical V5 materialization is read-only and cannot execute")
         }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2) => {
@@ -2208,7 +2221,7 @@ fn validate_mission_materialization_binding(
 fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
-    dataset: &CexReplayDatasetManifestV4,
+    dataset: &CexReplayDatasetManifestV5,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
         || mission.spec.inputs.feature.content_sha256 != features.artifact_sha256
@@ -2235,7 +2248,7 @@ pub(crate) fn validate_materialization(
         bail!("CEX replay snapshot SHA256 mismatch");
     }
     if materialization.dataset_kind != MATERIALIZATION_KIND
-        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6
+        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7
     {
         bail!("materialization kind or schema is unsupported");
     }
@@ -2280,9 +2293,8 @@ pub(crate) fn validate_materialization(
     {
         bail!("evaluation label horizon or frequency does not match the materialization");
     }
-    let funding_bps = data_mission::cex_snapshot_funding_bps(&materialization.snapshot)?;
-    if validation.funding_bps.to_bits() != funding_bps.to_bits() {
-        bail!("evaluation funding cost does not match the verified CEX replay snapshot");
+    if validation.funding_bps.to_bits() != 0.0f64.to_bits() {
+        bail!("current L2-only CEX replay requires zero funding cost");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
     let source_revision = normalized_sha256("source revision", &materialization.source_revision)?;
@@ -2936,6 +2948,17 @@ pub(crate) mod tests {
             success_sha256: byte.to_string().repeat(64),
         }
     }
+
+    fn indexed_cex_triplet(index: usize) -> hft_research_manifest::CexArtifactTripletV2 {
+        let data_sha256 = hex::encode(Sha256::digest(format!("runner-reference-data-{index}")));
+        hft_research_manifest::CexArtifactTripletV2 {
+            manifest_sha256: hex::encode(Sha256::digest(format!(
+                "runner-reference-manifest-{index}"
+            ))),
+            success_sha256: data_sha256.clone(),
+            data_sha256,
+        }
+    }
     use chrono::{Duration as ChronoDuration, Utc};
     use hft_collector::{DataModality, PointInTimeFeatureRow};
     use parquet::{
@@ -3336,7 +3359,7 @@ pub(crate) mod tests {
         fixture.materialization["artifact_sha256"] = serde_json::json!("0".repeat(64));
         fixture.materialization["snapshot"]["feature_artifact_sha256"] =
             serde_json::json!("0".repeat(64));
-        let snapshot: CexReplaySnapshotV4 =
+        let snapshot: CexReplaySnapshotV5 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         resign_materialization_outer(&mut fixture);
@@ -3359,6 +3382,20 @@ pub(crate) mod tests {
         let error = execute(fixture.args.clone()).unwrap_err();
 
         assert!(error.to_string().contains("required modalities"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_non_zero_current_funding_cost() {
+        let mut fixture = fixture("non-zero-current-funding");
+        fixture.mission.spec.evaluation_protocol.costs.funding_bps = 0.1;
+        resign_mission(&mut fixture);
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("current L2-only CEX replay requires zero funding cost"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -3451,6 +3488,8 @@ pub(crate) mod tests {
             + ChronoDuration::seconds(1);
         fixture.materialization["first_event_time"] = serde_json::json!(first_event_time);
         fixture.materialization["snapshot"]["first_event_time"] =
+            serde_json::json!(first_event_time);
+        fixture.materialization["snapshot"]["series"][0]["first_event_time"] =
             serde_json::json!(first_event_time);
         resign_materialization(&mut fixture);
 
@@ -4918,7 +4957,7 @@ pub(crate) mod tests {
         let producer_id = fixture.mission.semantic_id().unwrap();
         let source = AlphaStore::open(&source_db).unwrap();
         let producer = source.get_mission(&producer_id).unwrap();
-        let dataset_manifest: CexReplayDatasetManifestV4 = serde_json::from_slice(
+        let dataset_manifest: CexReplayDatasetManifestV5 = serde_json::from_slice(
             &std::fs::read(results.join("cex-replay-dataset-manifest.json")).unwrap(),
         )
         .unwrap();
@@ -5974,19 +6013,12 @@ message binance_replay {
                         "binance-usdm-lob".to_string(),
                         source_revision.clone(),
                     )]),
-                    modalities: BTreeSet::from([
-                        DataModality::Lob,
-                        DataModality::TradeTick,
-                        DataModality::Funding,
-                        DataModality::OpenInterest,
-                    ]),
+                    modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
                     features: BTreeMap::from([
                         ("ask_depth_top5".to_string(), 10.0),
                         ("bid_depth_top5".to_string(), 10.0),
                         ("book_imbalance".to_string(), index as f64 / 100.0),
                         ("mid_price".to_string(), 60_000.0),
-                        ("funding_rate".to_string(), 0.0001),
-                        ("open_interest".to_string(), 12_345.5),
                         ("spread_bps".to_string(), (index as f64 / 10.0).sin().abs()),
                     ]),
                     label: if index % 2 == 0 { 0.001 } else { -0.0005 },
@@ -6009,8 +6041,9 @@ message binance_replay {
         )
         .unwrap();
         let source_end_ns = u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-        let snapshot = CexReplaySnapshotV4 {
-            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
+        let instrument_rules_evidence = (0..256).map(indexed_cex_triplet).collect::<Vec<_>>();
+        let snapshot = CexReplaySnapshotV5 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
             venue: "binance".to_string(),
             instrument_type: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -6018,8 +6051,6 @@ message binance_replay {
             required_modalities: BTreeSet::from([
                 hft_research_manifest::CEX_MODALITY_LOB.to_string(),
                 hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
-                hft_research_manifest::CEX_MODALITY_FUNDING.to_string(),
-                hft_research_manifest::CEX_MODALITY_OPEN_INTEREST.to_string(),
             ]),
             source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
                 content_sha256: source_content_sha256.clone(),
@@ -6042,30 +6073,25 @@ message binance_replay {
                 min_notional: "5".to_string(),
                 available_at: first_event_time - ChronoDuration::seconds(1),
                 valid_through: last_event_time + ChronoDuration::seconds(5),
-                evidence: vec![cex_triplet('4')],
+                evidence: instrument_rules_evidence.clone(),
             },
-            derivatives_reference: Some(hft_research_manifest::CexDerivativesReferenceV2 {
-                funding: hft_research_manifest::CexPitSeriesEvidenceV2 {
-                    evidence: vec![cex_triplet('6'), cex_triplet('a'), cex_triplet('b')],
+            series: vec![hft_research_manifest::CexReplaySeriesV1 {
+                series_id: 1,
+                first_event_time,
+                last_event_time,
+                instrument_rules_coverage: hft_research_manifest::CexPitSeriesEvidenceV2 {
+                    evidence: instrument_rules_evidence,
                     first_available_at: first_event_time - ChronoDuration::seconds(1),
                     last_available_at: last_event_time + ChronoDuration::seconds(5),
-                    observations: 3,
-                    max_gap_ns: 90_000_000_000,
+                    observations: 256,
+                    max_gap_ns: hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
                 },
-                open_interest: hft_research_manifest::CexPitSeriesEvidenceV2 {
-                    evidence: vec![cex_triplet('7'), cex_triplet('c'), cex_triplet('d')],
-                    first_available_at: first_event_time - ChronoDuration::seconds(1),
-                    last_available_at: last_event_time + ChronoDuration::seconds(5),
-                    observations: 3,
-                    max_gap_ns: 90_000_000_000,
-                },
-                evaluation_funding_bps_per_bucket: "0".to_string(),
-            }),
+            }],
         };
         let snapshot_sha256 = snapshot.sha256();
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
-            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
+            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
             "mission_id": "data-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
@@ -6173,7 +6199,7 @@ message binance_replay {
         let materialization_sha256 = sha256_file(&materialization_path).unwrap();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
         let dataset =
-            CexReplayDatasetManifestV4::new(format!("dataset-{feature_sha256}"), snapshot.clone())
+            CexReplayDatasetManifestV5::new(format!("dataset-{feature_sha256}"), snapshot.clone())
                 .unwrap();
         let mut mission = CexResearchMissionArtifactV1 {
             schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
@@ -6354,6 +6380,44 @@ message binance_replay {
         );
     }
 
+    fn insert_historical_derivatives_reference(
+        snapshot: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        let first_event_time: chrono::DateTime<Utc> =
+            serde_json::from_value(snapshot["first_event_time"].clone()).unwrap();
+        let last_event_time: chrono::DateTime<Utc> =
+            serde_json::from_value(snapshot["last_event_time"].clone()).unwrap();
+        snapshot.insert(
+            "required_modalities".to_string(),
+            serde_json::json!([
+                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE,
+                hft_research_manifest::CEX_MODALITY_FUNDING,
+                hft_research_manifest::CEX_MODALITY_LOB,
+                hft_research_manifest::CEX_MODALITY_OPEN_INTEREST
+            ]),
+        );
+        snapshot.insert(
+            "derivatives_reference".to_string(),
+            serde_json::json!({
+                "funding": {
+                    "evidence": [cex_triplet('6'), cex_triplet('a'), cex_triplet('b')],
+                    "first_available_at": first_event_time - ChronoDuration::seconds(1),
+                    "last_available_at": last_event_time + ChronoDuration::seconds(5),
+                    "observations": 3,
+                    "max_gap_ns": 90_000_000_000u64,
+                },
+                "open_interest": {
+                    "evidence": [cex_triplet('7'), cex_triplet('c'), cex_triplet('d')],
+                    "first_available_at": first_event_time - ChronoDuration::seconds(1),
+                    "last_available_at": last_event_time + ChronoDuration::seconds(5),
+                    "observations": 3,
+                    "max_gap_ns": 90_000_000_000u64,
+                },
+                "evaluation_funding_bps_per_bucket": "0"
+            }),
+        );
+    }
+
     #[test]
     fn historical_v2_materialization_decodes_read_only() {
         let fixture = fixture("historical-v2-read-only");
@@ -6371,6 +6435,7 @@ message binance_replay {
                 hft_research_manifest::CEX_MODALITY_LOB
             ]),
         );
+        snapshot.remove("series");
         for field in ["instrument_rules", "fee_schedule", "derivatives_reference"] {
             snapshot.remove(field);
         }
@@ -6393,7 +6458,9 @@ message binance_replay {
             "schema_version".to_string(),
             serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2),
         );
+        snapshot.remove("series");
         insert_historical_fee_schedule(snapshot);
+        insert_historical_derivatives_reference(snapshot);
         let first_event_time: chrono::DateTime<Utc> =
             serde_json::from_value(snapshot["first_event_time"].clone()).unwrap();
         snapshot.insert(
@@ -6436,7 +6503,9 @@ message binance_replay {
             "schema_version".to_string(),
             serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V3),
         );
+        snapshot.remove("series");
         insert_historical_fee_schedule(snapshot);
+        insert_historical_derivatives_reference(snapshot);
 
         let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
 
@@ -6451,6 +6520,13 @@ message binance_replay {
         let fixture = fixture("historical-v5-read-only");
         let mut value = fixture.materialization.clone();
         value["schema_version"] = serde_json::json!(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5);
+        let snapshot = value["snapshot"].as_object_mut().unwrap();
+        snapshot.insert(
+            "schema_version".to_string(),
+            serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V4),
+        );
+        snapshot.remove("series");
+        insert_historical_derivatives_reference(snapshot);
 
         let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
 
@@ -6744,7 +6820,7 @@ message binance_replay {
     }
 
     fn rebind_mission_inputs(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV4 =
+        let snapshot: CexReplaySnapshotV5 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         let snapshot_sha256 = snapshot.sha256();
         let partition_sha256 = canonical_json_hash(&snapshot.source_segments).unwrap();
@@ -6758,7 +6834,7 @@ message binance_replay {
             .unwrap()
             .to_string();
         let dataset =
-            CexReplayDatasetManifestV4::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
+            CexReplayDatasetManifestV5::new(format!("dataset-{feature_sha256}"), snapshot).unwrap();
         fixture.mission.spec.data_mission_id = data_mission_id.clone();
         fixture.mission.spec.inputs = CexResearchInputBindingsV1 {
             dataset: CexResearchContentRefV1 {
@@ -6801,7 +6877,7 @@ message binance_replay {
     }
 
     fn resign_materialization(fixture: &mut Fixture) {
-        let snapshot: CexReplaySnapshotV4 =
+        let snapshot: CexReplaySnapshotV5 =
             serde_json::from_value(fixture.materialization["snapshot"].clone()).unwrap();
         fixture.materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         std::fs::write(
