@@ -565,6 +565,17 @@ the candidate binary digest, source revision, symbol set, settled market payload
 and upload readback. Any stale health, missing symbol, sequence gap, or identity
 mismatch blocks promotion. Live execution remains disabled; this lane only collects
 and archives public market data.
+The fail-closed health check admits one bounded exception: the Polymarket
+data-api enforces a hard pagination offset ceiling (10000) on the trades
+endpoint, so a market whose trade history grows past it can no longer be fully
+fetched. The collector defers such a market to the next cycle instead of
+crashing; the defer is designed behavior, not data corruption. The Rust health
+policy admits `api_errors` only when every entry is a pagination-defer notice
+within the same bound as the legacy bounded HTTP 429 tolerance
+(`ceil(target_markets/100)` clamped to 3..32) and `truncated_trade_markets` is
+exactly the set of condition_ids those notices cover. Any other `api_errors`
+entry, an uncovered or duplicated truncated market, a defer notice without a
+matching truncated entry, or a defer count above the bound still fails closed.
 The gate detects either the legacy Python writer or the active immutable Rust
 release. A legacy-Python Gate does not wait for health publication or freeze the
 writer identity; the hardlinked baseline tape snapshot in the evidence

@@ -5991,6 +5991,137 @@ if jq -e -f "$RUST_HEALTH_POLICY" \
   printf 'Rust health policy accepted a legacy trades rate limit\n' >&2
   exit 1
 fi
+# Bounded pagination-defer adjudication (#933/#934): hitting the Polymarket
+# data-api pagination offset ceiling defers the market instead of crashing.
+pagination_defer_market_a='0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+pagination_defer_market_b='0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+pagination_defer_market_c='0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+pagination_defer_market_d='0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+pagination_defer_notice() {
+  printf 'trades %s: trade pagination exceeded API offset limit; deferred market after %s rows fetched through offset %s' \
+    "$1" "$2" "$3"
+}
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  --arg market "$pagination_defer_market_a" \
+  '.api_errors = [$error] | .truncated_trade_markets = [$market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/deferred-rust-health.json"
+jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/deferred-rust-health.json" \
+  >/dev/null || {
+  printf 'Rust health policy rejected a bounded pagination defer\n' >&2
+  exit 1
+}
+# The defer bound follows the legacy 429 formula: ceil(target/100) clamped to
+# 3..32, so the 120-market fixture admits exactly 3 deferred markets.
+jq --arg market_a "$pagination_defer_market_a" \
+  --arg market_b "$pagination_defer_market_b" \
+  --arg market_c "$pagination_defer_market_c" \
+  '.api_errors = [$market_c, $market_a, $market_b
+      | "trades " + . + ": trade pagination exceeded API offset limit; deferred market after 1 rows fetched through offset 10000"]
+    | .truncated_trade_markets = [$market_a, $market_b, $market_c]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/bounded-deferred-rust-health.json"
+jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/bounded-deferred-rust-health.json" >/dev/null || {
+  printf 'Rust health policy rejected 3 pagination defers for 120 markets\n' >&2
+  exit 1
+}
+jq --arg market_a "$pagination_defer_market_a" \
+  --arg market_b "$pagination_defer_market_b" \
+  --arg market_c "$pagination_defer_market_c" \
+  --arg market_d "$pagination_defer_market_d" \
+  '.api_errors = [$market_a, $market_b, $market_c, $market_d
+      | "trades " + . + ": trade pagination exceeded API offset limit; deferred market after 1 rows fetched through offset 10000"]
+    | .truncated_trade_markets = [$market_a, $market_b, $market_c, $market_d]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/excessive-deferred-rust-health.json"
+if jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/excessive-deferred-rust-health.json" >/dev/null; then
+  printf 'Rust health policy accepted 4 pagination defers for 120 markets\n' >&2
+  exit 1
+fi
+jq '.target_markets = 10000
+    | .truncated_trade_markets = [range(0; 33)
+      | "0x" + ((("0" * 64) + (. | tostring))[-64:])]
+    | .api_errors = [.truncated_trade_markets[]
+      | "trades " + . + ": trade pagination exceeded API offset limit; deferred market after 1 rows fetched through offset 10000"]' \
+  "$tmp_dir/rust-health.json" \
+  >"$tmp_dir/absolute-cap-deferred-rust-health.json"
+jq -e '.api_errors | length == 33
+    and all(.[]; test("^trades 0x[0-9a-f]{64}: "))' \
+  "$tmp_dir/absolute-cap-deferred-rust-health.json" >/dev/null || {
+  printf 'absolute-cap pagination defer fixture is malformed\n' >&2
+  exit 1
+}
+if jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/absolute-cap-deferred-rust-health.json" >/dev/null; then
+  printf 'Rust health policy accepted more than 32 pagination defers\n' >&2
+  exit 1
+fi
+# Any other api_errors entry, even beside an admissible defer, fails closed.
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  --arg market "$pagination_defer_market_a" \
+  '.api_errors = [$error, "Gamma unavailable"]
+    | .truncated_trade_markets = [$market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/mixed-deferred-rust-health.json"
+if jq -e -f "$RUST_HEALTH_POLICY" \
+  "$tmp_dir/mixed-deferred-rust-health.json" >/dev/null; then
+  printf 'Rust health policy accepted a non-defer api_error beside a defer\n' >&2
+  exit 1
+fi
+# truncated_trade_markets must be exactly the defer-covered condition_id set:
+# an uncovered truncated market, a defer without a truncated entry, a
+# duplicated truncated entry, and a non-string truncated entry all fail.
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  --arg market "$pagination_defer_market_a" \
+  --arg extra "$pagination_defer_market_b" \
+  '.api_errors = [$error] | .truncated_trade_markets = [$market, $extra]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/uncovered-truncated-rust-health.json"
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  '.api_errors = [$error]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/unrecorded-defer-rust-health.json"
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  --arg market "$pagination_defer_market_a" \
+  '.api_errors = [$error] | .truncated_trade_markets = [$market, $market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/duplicate-truncated-rust-health.json"
+jq --arg error "$(pagination_defer_notice "$pagination_defer_market_a" 10050 10000)" \
+  --arg market "$pagination_defer_market_a" \
+  '.api_errors = [$error] | .truncated_trade_markets = [$market, 1]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/nonstr-truncated-rust-health.json"
+for inconsistent in \
+  uncovered-truncated-rust-health \
+  unrecorded-defer-rust-health \
+  duplicate-truncated-rust-health \
+  nonstr-truncated-rust-health; do
+  if jq -e -f "$RUST_HEALTH_POLICY" \
+    "$tmp_dir/$inconsistent.json" >/dev/null; then
+    printf 'Rust health policy accepted inconsistent defer evidence: %s\n' \
+      "$inconsistent" >&2
+    exit 1
+  fi
+done
+# The defer notice shape is exact: uppercase hex, altered wording, or a
+# trailing suffix are not adjudicated.
+jq --arg market "$pagination_defer_market_a" \
+  '.api_errors = ["trades 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA: trade pagination exceeded API offset limit; deferred market after 1 rows fetched through offset 10000"]
+    | .truncated_trade_markets = [$market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/uppercase-defer-rust-health.json"
+jq --arg market "$pagination_defer_market_a" \
+  '.api_errors = ["trades " + $market + ": trade pagination exceeded API offset limit"]
+    | .truncated_trade_markets = [$market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/reworded-defer-rust-health.json"
+jq --arg market "$pagination_defer_market_a" \
+  '.api_errors = ["trades " + $market + ": trade pagination exceeded API offset limit; deferred market after 1 rows fetched through offset 10000 "]
+    | .truncated_trade_markets = [$market]' \
+  "$tmp_dir/rust-health.json" >"$tmp_dir/suffixed-defer-rust-health.json"
+for malformed_defer in \
+  uppercase-defer-rust-health \
+  reworded-defer-rust-health \
+  suffixed-defer-rust-health; do
+  if jq -e -f "$RUST_HEALTH_POLICY" \
+    "$tmp_dir/$malformed_defer.json" >/dev/null; then
+    printf 'Rust health policy accepted malformed defer evidence: %s\n' \
+      "$malformed_defer" >&2
+    exit 1
+  fi
+done
 jq '.overdue_unresolved_markets = ["historical-market"]' \
   "$tmp_dir/rust-health.json" >"$tmp_dir/historical-overdue-rust-health.json"
 jq -e -f "$RUST_HEALTH_POLICY" \
@@ -6317,6 +6448,11 @@ for invalid_control_group in \
   fi
 done
 grep -Fq '.missing_target_symbols == []' "$RUST_HEALTH_POLICY"
+grep -Fq 'and bounded_pagination_defer_adjudication' "$RUST_HEALTH_POLICY"
+grep -Fq 'def pagination_defer_limit:' "$RUST_HEALTH_POLICY"
+grep -Fq 'def pagination_deferred_markets:' "$RUST_HEALTH_POLICY"
+grep -Fq 'trade pagination exceeded API offset limit; deferred market after' \
+  "$RUST_HEALTH_POLICY"
 grep -Fq 'systemctl restart "$COLLECTOR_UNIT"' "$CUTOVER"
 grep -Fq 'clear_health_before_restart "$evidence_dir" pre-cutover' "$CUTOVER"
 grep -Fq 'readlink -f "/proc/$pid/exe"' "$CUTOVER"
