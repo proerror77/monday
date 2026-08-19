@@ -790,12 +790,21 @@ verify_deferred_market_upload() {
   return 1
 }
 
+# The expected ExecStart of a unit rendered from a given control bundle is the
+# bundle's own ExecStart line: render_upload_unit rewrites only EnvironmentFile.
+unit_exec_start() {
+  local unit_file=$1
+  secure_regular_file "$unit_file" || return 1
+  [[ $(grep -c '^ExecStart=' "$unit_file" || true) -eq 1 ]] || return 1
+  sed -n 's/^ExecStart=//p' "$unit_file"
+}
+
 verify_upload_units() {
-  local pinned_upload_env=$1 unit_file
+  local pinned_upload_env=$1 expected_reference_exec=$2 expected_market_exec=$3 unit_file
   verify_effective_unit "$REFERENCE_UPLOAD_UNIT" \
-    "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_EXEC" || return 1
+    "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" "$expected_reference_exec" || return 1
   verify_effective_unit "$MARKET_UPLOAD_UNIT" \
-    "/etc/systemd/system/$MARKET_UPLOAD_UNIT" "$MARKET_UPLOAD_EXEC" || return 1
+    "/etc/systemd/system/$MARKET_UPLOAD_UNIT" "$expected_market_exec" || return 1
   for unit_file in "/etc/systemd/system/$REFERENCE_UPLOAD_UNIT" \
     "/etc/systemd/system/$MARKET_UPLOAD_UNIT"; do
     secure_regular_file "$unit_file"
@@ -1779,7 +1788,17 @@ elif [[ $baseline_mode == rust_release ]]; then
   secure_regular_file "$baseline_pinned_upload_env"
   [[ $(oss_config_sha256 "$baseline_pinned_upload_env") == "$gate_oss_config_sha" ]] \
     || die 'active Rust uploader environment differs from the shadow gate'
+  # The baseline upload units belong to the baseline release, whose exec lines
+  # may differ from the candidate bundle constants (e.g. uploader concurrency
+  # changes). Compare them against the control bundle that verify_control_release
+  # just bound to the gated baseline release, so a cross-version transition
+  # remains promotable while drift from the baseline's own units still fails.
+  baseline_reference_upload_exec=$(unit_exec_start "$CONTROL_DIR/$REFERENCE_UPLOAD_UNIT") \
+    || die 'baseline control bundle has no exact reference uploader ExecStart'
+  baseline_market_upload_exec=$(unit_exec_start "$CONTROL_DIR/$MARKET_UPLOAD_UNIT") \
+    || die 'baseline control bundle has no exact market uploader ExecStart'
   verify_upload_units "$baseline_pinned_upload_env" \
+    "$baseline_reference_upload_exec" "$baseline_market_upload_exec" \
     || die 'active Rust upload units do not bind the baseline release'
 else
   [[ $baseline_runtime_stability_required == true ]] \
@@ -1869,6 +1888,7 @@ grep -Fxq "EnvironmentFile=$pinned_upload_env" \
   || die 'legacy reference uploader is not pinned to the gated OSS configuration'
 elif [[ $baseline_mode == rust_release ]]; then
   verify_upload_units "$baseline_pinned_upload_env" \
+    "$baseline_reference_upload_exec" "$baseline_market_upload_exec" \
     || die 'Rust baseline upload units changed before drain'
 fi
 if [[ $contained_recovery == false && $baseline_mode != rust_bootstrap ]]; then
@@ -1944,6 +1964,7 @@ for asset in "${UNIT_ASSETS[@]}"; do
 done
 systemctl daemon-reload
 verify_upload_units "$pinned_upload_env" \
+  "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit or timer identity differs from the gated configuration'
 
 reset_failed_unit_if_needed "$COLLECTOR_UNIT"
@@ -1994,6 +2015,7 @@ verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invo
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed before Rust uploader verification'
 verify_upload_units "$pinned_upload_env" \
+  "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit or timer identity changed before execution'
 systemctl start "$REFERENCE_UPLOAD_UNIT"
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
@@ -2017,6 +2039,7 @@ unit_active "$MARKET_UPLOAD_TIMER" \
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while enabling upload timers'
 verify_upload_units "$pinned_upload_env" \
+  "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit or timer identity changed while enabling timers'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed while enabling upload timers'
@@ -2094,6 +2117,7 @@ jq -n \
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while cutover evidence was being prepared'
 verify_upload_units "$pinned_upload_env" \
+  "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit identity changed while cutover evidence was being prepared'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed while cutover evidence was being prepared'
@@ -2104,6 +2128,7 @@ sync -f "$candidate_binary"
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed before cutover completion'
 verify_upload_units "$pinned_upload_env" \
+  "$REFERENCE_UPLOAD_EXEC" "$MARKET_UPLOAD_EXEC" \
   || die 'Rust upload unit identity changed before cutover completion'
 ! systemctl is-failed --quiet "$MARKET_UPLOAD_UNIT" \
   || die 'Rust market uploader failed before cutover completion'
