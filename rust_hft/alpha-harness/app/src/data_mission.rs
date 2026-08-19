@@ -1302,15 +1302,10 @@ mod tests {
 
     #[test]
     fn registered_current_cex_replay_v5_loads_as_l2_only_without_pit_funding() {
-        let directory = std::env::temp_dir().join(format!(
-            "alpha-cex-replay-v5-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let input = directory.join("input.jsonl");
-        let manifest_path = directory.join("cex-replay-dataset.json");
-        let artifacts = directory.join("artifacts");
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let manifest_path = directory.path().join("cex-replay-dataset.json");
+        let artifacts = directory.path().join("artifacts");
         let ingestion = Utc::now() - Duration::seconds(1);
         let source_content_sha256 = "a".repeat(64);
         let source_revision = source_revision([source_content_sha256.as_str()]);
@@ -1446,19 +1441,13 @@ mod tests {
         assert_eq!(loaded[0].funding_bps, 0.0);
         assert!(!loaded[0].pit_funding);
         assert!(!loaded[0].features.contains_key("funding_cost_bps"));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn current_cex_replay_v5_rejects_series_label_availability_that_stretches_into_gap() {
-        let directory = std::env::temp_dir().join(format!(
-            "alpha-cex-replay-v5-gap-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let input = directory.join("input.jsonl");
-        let artifacts = directory.join("artifacts");
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let artifacts = directory.path().join("artifacts");
         let ingestion = Utc::now() - Duration::seconds(1);
         let source_content_sha256 = "1".repeat(64);
         let source_revision = source_revision([source_content_sha256.as_str()]);
@@ -1577,7 +1566,6 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("label horizon"));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn trace_fixture() -> (std::path::PathBuf, DatasetManifest, Vec<OhlcvTraceRow>) {
