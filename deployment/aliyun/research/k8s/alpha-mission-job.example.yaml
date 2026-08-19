@@ -1,6 +1,9 @@
 # Pod-shape reference only. `alpha-harness mission dispatch submit` generates
-# the real Job and its immutable, Job-owned input Secret. Do not apply this file
-# directly and never commit a campaign request containing signed URLs.
+# the real Job and its immutable, Job-owned input Secret from a v2 campaign
+# request. The cloud Pod downloads shared inputs once and records per-round
+# admission evidence that binds the current request SHA and round Mission SHA.
+# Do not apply this file directly and never commit a campaign request containing
+# signed URLs.
 apiVersion: batch/v1
 kind: Job
 metadata:

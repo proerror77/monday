@@ -20,6 +20,7 @@ pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2: &str = "binance-lob-pit-v2"
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3: &str = "binance-lob-pit-v3";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4: &str = "binance-lob-pit-v4";
 pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5: &str = "binance-lob-pit-v5";
+pub const BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6: &str = "binance-lob-pit-v6";
 pub const CEX_REPLAY_CLOCK_RECEIVED_AT_NS: &str = "received_at_ns";
 pub const CEX_FEATURE_AVAILABILITY_POLICY: &str = "feature_available_time_equals_event_time";
 pub const CEX_MODALITY_LOB: &str = "lob";

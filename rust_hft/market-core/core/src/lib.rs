@@ -2,6 +2,7 @@
 //! - Newtypes / IDs / Errors / Constants
 //! - 穩定介面依賴最小化
 
+pub mod book_features;
 pub mod error;
 pub mod fixed_point;
 pub mod latency;
@@ -10,6 +11,9 @@ pub mod types;
 pub mod unified_timestamp;
 
 // 對外穩定導出
+pub use book_features::{
+    top5_book_features, top5_quantity_features, Top5BookFeatures, Top5QuantityFeatures, TOP5_DEPTH,
+};
 pub use error::{HftError, HftResult};
 pub use fixed_point::{FixedBps, FixedPrice, FixedQuantity};
 pub use latency::{

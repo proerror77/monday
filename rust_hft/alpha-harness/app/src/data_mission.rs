@@ -21,6 +21,13 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeatureDecisionClock {
+    pub(crate) series_id: u64,
+    pub(crate) feature_available_time: DateTime<Utc>,
+    pub(crate) series_close_time: DateTime<Utc>,
+}
+
 struct BoundedWriter<W> {
     inner: W,
     remaining: u64,
@@ -686,6 +693,7 @@ pub fn load_research_rows(
             bail!("derived research return is not finite");
         }
         rows.push(ResearchRow {
+            series_id: 1,
             // The forward label is only observable when the next bar is available.
             available_time: trace[index + 1].available_time,
             signal,
@@ -736,6 +744,7 @@ fn load_feature_research_rows(
                 bail!("PIT row funding cost exceeds the verified evaluation bound");
             }
             Ok(ResearchRow {
+                series_id: row.series_id,
                 // Training labels cannot enter the research row before their availability time.
                 available_time: row.label_available_time,
                 signal: 0.0,
@@ -750,13 +759,27 @@ fn load_feature_research_rows(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn feature_available_times(
     manifest: &FeatureDatasetManifest,
 ) -> anyhow::Result<Vec<DateTime<Utc>>> {
+    Ok(feature_decision_clocks(manifest)?
+        .into_iter()
+        .map(|row| row.feature_available_time)
+        .collect())
+}
+
+pub(crate) fn feature_decision_clocks(
+    manifest: &FeatureDatasetManifest,
+) -> anyhow::Result<Vec<FeatureDecisionClock>> {
     Ok(read_feature_rows(manifest)
         .map_err(anyhow::Error::msg)?
         .into_iter()
-        .map(|row| row.feature_available_time)
+        .map(|row| FeatureDecisionClock {
+            series_id: row.series_id,
+            feature_available_time: row.feature_available_time,
+            series_close_time: row.label_available_time,
+        })
         .collect())
 }
 
@@ -1050,6 +1073,7 @@ mod tests {
             .map(|index| {
                 let event_time = ingestion - Duration::minutes(10 - index);
                 PointInTimeFeatureRow {
+                    series_id: 1,
                     event_time,
                     feature_available_time: event_time + Duration::seconds(1),
                     label_available_time: event_time + Duration::minutes(1),
@@ -1109,10 +1133,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded[0].available_time, rows[0].label_available_time);
+        assert_eq!(loaded[0].series_id, 1);
         assert_eq!(
             feature_available_times(&manifest).unwrap(),
             rows.iter()
                 .map(|row| row.feature_available_time)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            feature_decision_clocks(&manifest).unwrap(),
+            rows.iter()
+                .map(|row| FeatureDecisionClock {
+                    series_id: row.series_id,
+                    feature_available_time: row.feature_available_time,
+                    series_close_time: row.label_available_time,
+                })
                 .collect::<Vec<_>>()
         );
         assert_eq!(loaded[0].features["lob_imbalance"], 0.0);

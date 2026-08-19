@@ -747,6 +747,7 @@ mod tests {
                         index as f64
                     };
                     ResearchRow {
+                        series_id: 1,
                         available_time: start + Duration::seconds(index),
                         signal,
                         features: BTreeMap::new(),

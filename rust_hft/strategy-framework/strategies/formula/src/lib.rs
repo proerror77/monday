@@ -1,4 +1,7 @@
-use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+use hft_core::{
+    top5_book_features, OrderType, Price, Quantity, Side, Symbol, TimeInForce, Top5BookFeatures,
+    TOP5_DEPTH,
+};
 use hft_factor_dsl::{
     evaluate_live_formula_series, validate_live_formula, FactorAst, FactorDslError, FactorOperator,
     FactorTerminal, LiveEventDomain, LiveFormulaCapabilityError,
@@ -615,10 +618,24 @@ impl Strategy for FormulaStrategy {
             .book
             .filter(|book| book.symbol == &self.config.symbol)
         else {
+            if self.config.target_position {
+                self.reset_target_series();
+            }
             return Vec::new();
         };
+        if self.config.target_position
+            && self
+                .config
+                .target_venue
+                .is_some_and(|target| target != book.venue)
+        {
+            return Vec::new();
+        }
         let (Some(best_bid), Some(best_ask)) = (book.bid_prices.first(), book.ask_prices.first())
         else {
+            if self.config.target_position {
+                self.reset_target_series();
+            }
             return Vec::new();
         };
         let best_bid = Price::from(*best_bid).0;
@@ -626,6 +643,7 @@ impl Strategy for FormulaStrategy {
         if self.config.target_position {
             let Some(fields) = sample_fields(&self.field_names, |field| book_value(book, field))
             else {
+                self.reset_target_series();
                 return Vec::new();
             };
             let timestamp = event
@@ -852,8 +870,35 @@ fn snapshot_value(snapshot: &MarketSnapshot, field: &str) -> Option<f64> {
         "bid_size" => Some(bid_size),
         "ask_size" => Some(ask_size),
         "book_imbalance" => finite((bid_size - ask_size) / (bid_size + ask_size)),
+        "bid_depth_top5" => Some(snapshot_top5(snapshot)?.bid_depth),
+        "ask_depth_top5" => Some(snapshot_top5(snapshot)?.ask_depth),
+        "book_imbalance_top5" => Some(snapshot_top5(snapshot)?.book_imbalance),
+        "weighted_book_imbalance_top5" => Some(snapshot_top5(snapshot)?.weighted_book_imbalance),
+        "near_depth_concentration_skew_top5" => {
+            Some(snapshot_top5(snapshot)?.near_depth_concentration_skew)
+        }
+        "vwap_center_deviation_top5_bps" => {
+            Some(snapshot_top5(snapshot)?.vwap_center_deviation_bps)
+        }
         _ => None,
     }
+}
+
+fn snapshot_top5(snapshot: &MarketSnapshot) -> Option<Top5BookFeatures> {
+    top5_book_features(
+        snapshot.bids.iter().map(|level| {
+            (
+                decimal_to_f64(level.price.0).unwrap_or(f64::NAN),
+                decimal_to_f64(level.quantity.0).unwrap_or(f64::NAN),
+            )
+        }),
+        snapshot.asks.iter().map(|level| {
+            (
+                decimal_to_f64(level.price.0).unwrap_or(f64::NAN),
+                decimal_to_f64(level.quantity.0).unwrap_or(f64::NAN),
+            )
+        }),
+    )
 }
 
 fn book_value(book: L2BookView<'_>, field: &str) -> Option<f64> {
@@ -882,8 +927,34 @@ fn book_value(book: L2BookView<'_>, field: &str) -> Option<f64> {
         "bid_size" => Some(bid_size),
         "ask_size" => Some(ask_size),
         "book_imbalance" => Some((bid_size - ask_size) / (bid_size + ask_size)),
+        "bid_depth_top5" => Some(book_top5(book)?.bid_depth),
+        "ask_depth_top5" => Some(book_top5(book)?.ask_depth),
+        "book_imbalance_top5" => Some(book_top5(book)?.book_imbalance),
+        "weighted_book_imbalance_top5" => Some(book_top5(book)?.weighted_book_imbalance),
+        "near_depth_concentration_skew_top5" => {
+            Some(book_top5(book)?.near_depth_concentration_skew)
+        }
+        "vwap_center_deviation_top5_bps" => Some(book_top5(book)?.vwap_center_deviation_bps),
         _ => None,
     }
+}
+
+fn book_top5(book: L2BookView<'_>) -> Option<Top5BookFeatures> {
+    if book.bid_prices.len() < TOP5_DEPTH || book.ask_prices.len() < TOP5_DEPTH {
+        return None;
+    }
+    top5_book_features(
+        book.bid_prices
+            .iter()
+            .copied()
+            .zip(book.bid_quantities.iter().copied())
+            .map(|(price, quantity)| (price.to_f64(), quantity.to_f64())),
+        book.ask_prices
+            .iter()
+            .copied()
+            .zip(book.ask_quantities.iter().copied())
+            .map(|(price, quantity)| (price.to_f64(), quantity.to_f64())),
+    )
 }
 
 fn evaluate_book_formula(ast: &FactorAst, book: L2BookView<'_>) -> Option<f64> {
@@ -1231,6 +1302,87 @@ mod tests {
             let mut strategy = FormulaStrategy::new(config).unwrap();
             assert_eq!(intents(&mut strategy, &bar(100, 102)).len(), 1, "{name}");
         }
+    }
+
+    #[test]
+    fn snapshot_and_canonical_book_share_top5_feature_values() {
+        let symbol = Symbol::from("BTCUSDT");
+        let bid_prices = [100, 99, 98, 97, 96, 95];
+        let ask_prices = [101, 102, 103, 104, 105, 106];
+        let bid_quantities = [10, 8, 6, 4, 2, 1_000];
+        let ask_quantities = [2, 4, 6, 8, 10, 1_000];
+        let snapshot = MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: 1,
+            bids: bid_prices
+                .into_iter()
+                .zip(bid_quantities)
+                .map(|(price, quantity)| BookLevel {
+                    price: Price(Decimal::from(price)),
+                    quantity: Quantity(Decimal::from(quantity)),
+                })
+                .collect(),
+            asks: ask_prices
+                .into_iter()
+                .zip(ask_quantities)
+                .map(|(price, quantity)| BookLevel {
+                    price: Price(Decimal::from(price)),
+                    quantity: Quantity(Decimal::from(quantity)),
+                })
+                .collect(),
+            sequence: 1,
+            source_venue: Some(VenueId::BITGET),
+            timestamps: Default::default(),
+        };
+        let fixed_bid_prices = bid_prices.map(|value| FixedPrice::from_f64(value as f64));
+        let fixed_ask_prices = ask_prices.map(|value| FixedPrice::from_f64(value as f64));
+        let fixed_bid_quantities =
+            bid_quantities.map(|value| FixedQuantity::from_f64(value as f64));
+        let fixed_ask_quantities =
+            ask_quantities.map(|value| FixedQuantity::from_f64(value as f64));
+        let book = L2BookView {
+            symbol: &symbol,
+            venue: VenueId::BITGET,
+            timestamp: 1,
+            sequence: 1,
+            bid_prices: &fixed_bid_prices,
+            bid_quantities: &fixed_bid_quantities,
+            ask_prices: &fixed_ask_prices,
+            ask_quantities: &fixed_ask_quantities,
+        };
+
+        for (field, expected) in [
+            ("bid_depth_top5", 30.0),
+            ("ask_depth_top5", 30.0),
+            ("book_imbalance_top5", 0.0),
+            ("weighted_book_imbalance_top5", 2.0 / 9.0),
+            ("near_depth_concentration_skew_top5", 0.4),
+            ("vwap_center_deviation_top5_bps", 66.33499170812604),
+            ("book_imbalance", 2.0 / 3.0),
+        ] {
+            let snapshot_value = snapshot_value(&snapshot, field).unwrap();
+            let book_value = book_value(book, field).unwrap();
+            let tolerance = if field == "vwap_center_deviation_top5_bps" {
+                1e-12
+            } else {
+                f64::EPSILON
+            };
+            assert!((snapshot_value - expected).abs() < tolerance, "{field}");
+            assert!((book_value - expected).abs() < tolerance, "{field}");
+            assert!((snapshot_value - book_value).abs() < tolerance, "{field}");
+        }
+
+        let mut shallow_snapshot = snapshot.clone();
+        shallow_snapshot.bids.truncate(4);
+        assert!(snapshot_value(&shallow_snapshot, "book_imbalance_top5").is_none());
+        let shallow_book = L2BookView {
+            bid_prices: &fixed_bid_prices[..4],
+            bid_quantities: &fixed_bid_quantities[..4],
+            ask_prices: &fixed_ask_prices[..4],
+            ask_quantities: &fixed_ask_quantities[..4],
+            ..book
+        };
+        assert!(book_value(shallow_book, "book_imbalance_top5").is_none());
     }
 
     #[test]
@@ -1594,6 +1746,63 @@ mod tests {
         assert_eq!(strategy.on_clock(1_000_000, &account).len(), 1);
         assert!(strategy.on_clock(2_000_000, &account).is_empty());
         assert_eq!(strategy.on_clock(3_000_000, &account).len(), 1);
+    }
+
+    #[test]
+    fn invalid_target_book_clears_the_cached_bucket_sample() {
+        let mut target = config(field("weighted_book_imbalance_top5"));
+        target.max_order_notional = Decimal::from(50);
+        target.signal_threshold = f64::EPSILON;
+        target.target_position = true;
+        target.evaluation_interval_millis = Some(1_000);
+        let mut strategy = FormulaStrategy::new(target).unwrap();
+        let account = AccountView::default();
+        let symbol = Symbol::from("BTCUSDT");
+        let bid_prices = [100, 99, 98, 97, 96].map(|value| FixedPrice::from_f64(value as f64));
+        let ask_prices = [101, 102, 103, 104, 105].map(|value| FixedPrice::from_f64(value as f64));
+        let bid_quantities = [10, 8, 6, 4, 2].map(|value| FixedQuantity::from_f64(value as f64));
+        let ask_quantities = [2, 4, 6, 8, 10].map(|value| FixedQuantity::from_f64(value as f64));
+        let book = |timestamp, depth| L2BookView {
+            symbol: &symbol,
+            venue: VenueId::BITGET,
+            timestamp,
+            sequence: 1,
+            bid_prices: &bid_prices[..depth],
+            bid_quantities: &bid_quantities[..depth],
+            ask_prices: &ask_prices[..depth],
+            ask_quantities: &ask_quantities[..depth],
+        };
+
+        assert!(strategy
+            .on_market_event_with_context(
+                &snapshot_at(3, 1, 100_000),
+                &StrategyContext {
+                    account: &account,
+                    book: Some(book(100_000, 5)),
+                },
+            )
+            .is_empty());
+        assert!(strategy
+            .on_market_event_with_context(
+                &snapshot_at(3, 1, 900_000),
+                &StrategyContext {
+                    account: &account,
+                    book: Some(book(900_000, 4)),
+                },
+            )
+            .is_empty());
+        assert!(strategy.on_clock(1_000_000, &account).is_empty());
+
+        assert!(strategy
+            .on_market_event_with_context(
+                &snapshot_at(3, 1, 1_100_000),
+                &StrategyContext {
+                    account: &account,
+                    book: Some(book(1_100_000, 5)),
+                },
+            )
+            .is_empty());
+        assert_eq!(strategy.on_clock(2_000_000, &account).len(), 1);
     }
 
     #[test]

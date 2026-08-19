@@ -16,6 +16,8 @@ pub enum EvaluationError {
     NonFiniteValue,
     #[error("dataset feature schema is empty, inconsistent, or contains an invalid field")]
     InvalidFeatureSchema,
+    #[error("dataset series boundaries are invalid")]
+    InvalidSeriesTopology,
     #[error("taker spread crossing requires a finite non-negative spread_bps feature")]
     InvalidSpreadFeature,
     #[error(
@@ -28,6 +30,7 @@ pub enum EvaluationError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchRow {
+    pub series_id: u64,
     pub available_time: DateTime<Utc>,
     pub signal: f64,
     #[serde(default)]
@@ -215,6 +218,15 @@ pub fn prepare_dataset(
     {
         return Err(EvaluationError::InvalidFeatureSchema);
     }
+    if rows.first().is_some_and(|row| row.series_id != 1)
+        || rows.windows(2).any(|window| match window[1].series_id {
+            id if id == window[0].series_id => false,
+            id if id == window[0].series_id + 1 => false,
+            _ => true,
+        })
+    {
+        return Err(EvaluationError::InvalidSeriesTopology);
+    }
     if protocol.costs.cross_spread
         && rows.iter().any(|row| {
             row.features
@@ -300,6 +312,24 @@ pub fn evaluate_sealed_holdout<T>(
     evaluator(&dataset.rows[dataset.plan.sealed_holdout.clone()])
 }
 
+pub(crate) fn contiguous_series_ranges(rows: &[ResearchRow]) -> Vec<Range<usize>> {
+    if rows.is_empty() {
+        return vec![];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let series_id = rows[start].series_id;
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].series_id == series_id {
+            end += 1;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +340,7 @@ mod tests {
         let start = Utc::now();
         (0..count)
             .map(|index| ResearchRow {
+                series_id: 1,
                 available_time: start + Duration::seconds(index as i64),
                 signal: index as f64,
                 features: BTreeMap::new(),
@@ -442,6 +473,23 @@ mod tests {
         assert_eq!(
             prepare_dataset(rows, &protocol()).unwrap_err(),
             EvaluationError::NonMonotonicAvailability
+        );
+    }
+
+    #[test]
+    fn walk_forward_rejects_non_contiguous_series_ids() {
+        let mut input = rows(50);
+        input[0].series_id = 2;
+        assert_eq!(
+            prepare_dataset(input, &protocol()).unwrap_err(),
+            EvaluationError::InvalidSeriesTopology
+        );
+
+        let mut skipped = rows(50);
+        skipped[25].series_id = 3;
+        assert_eq!(
+            prepare_dataset(skipped, &protocol()).unwrap_err(),
+            EvaluationError::InvalidSeriesTopology
         );
     }
 

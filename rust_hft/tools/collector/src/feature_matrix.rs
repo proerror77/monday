@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const PIT_FEATURE_MATRIX_SCHEMA_V2: &str = "pit-feature-matrix-v2";
+const PIT_FEATURE_MATRIX_SCHEMA_V3: &str = "pit-feature-matrix-v3";
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataModality {
@@ -22,6 +25,7 @@ pub enum DataModality {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointInTimeFeatureRow {
+    pub series_id: u64,
     pub event_time: DateTime<Utc>,
     pub feature_available_time: DateTime<Utc>,
     pub label_available_time: DateTime<Utc>,
@@ -65,6 +69,8 @@ pub struct FeatureDatasetManifest {
     pub modalities: BTreeSet<DataModality>,
     pub feature_names: Vec<String>,
     pub label_spec: FeatureLabelSpec,
+    #[serde(default = "default_series_count")]
+    pub series_count: usize,
     pub rows: usize,
     pub time_bounds: FeatureDatasetTimeBounds,
     pub artifact_path: PathBuf,
@@ -75,11 +81,16 @@ pub struct FeatureDatasetManifest {
 impl FeatureDatasetManifest {
     pub fn validate_trace(&self, rows: &[PointInTimeFeatureRow]) -> Result<(), String> {
         if self.dataset_kind != "point_in_time_feature_matrix"
-            || self.schema_version != "pit-feature-matrix-v2"
+            || !matches!(
+                self.schema_version.as_str(),
+                PIT_FEATURE_MATRIX_SCHEMA_V2 | PIT_FEATURE_MATRIX_SCHEMA_V3
+            )
             || self.mission_id.trim().is_empty()
             || self.symbol.trim().is_empty()
             || self.rows != rows.len()
             || self.rows < 3
+            || self.series_count == 0
+            || (self.schema_version == PIT_FEATURE_MATRIX_SCHEMA_V2 && self.series_count != 1)
         {
             return Err("feature dataset manifest identity is invalid".to_string());
         }
@@ -89,6 +100,7 @@ impl FeatureDatasetManifest {
             || self.modalities != facts.modalities
             || self.feature_names != facts.feature_names
             || self.label_spec != facts.label_spec
+            || self.series_count != facts.series_count
             || self.time_bounds != facts.time_bounds
         {
             return Err("feature dataset manifest does not match trace facts".to_string());
@@ -103,6 +115,7 @@ struct TraceFacts {
     modalities: BTreeSet<DataModality>,
     feature_names: Vec<String>,
     label_spec: FeatureLabelSpec,
+    series_count: usize,
     time_bounds: FeatureDatasetTimeBounds,
 }
 
@@ -117,7 +130,7 @@ pub fn import_feature_dataset(
     }
     let input_bytes =
         std::fs::read(input).map_err(|error| format!("failed to read feature matrix: {error}"))?;
-    let rows = parse_feature_rows(&input_bytes)?;
+    let rows = parse_feature_rows(&input_bytes, SeriesFieldRequirement::Required)?;
     let created_at = Utc::now();
     let facts = validate_rows(&rows, created_at)?;
 
@@ -137,11 +150,12 @@ pub fn import_feature_dataset(
         manifest_id: format!("dataset-{hash}"),
         mission_id,
         symbol: facts.symbol,
-        schema_version: "pit-feature-matrix-v2".to_string(),
+        schema_version: PIT_FEATURE_MATRIX_SCHEMA_V3.to_string(),
         source_revisions: facts.source_revisions,
         modalities: facts.modalities,
         feature_names: facts.feature_names,
         label_spec: facts.label_spec,
+        series_count: facts.series_count,
         rows: rows.len(),
         time_bounds: facts.time_bounds,
         artifact_path,
@@ -166,19 +180,50 @@ pub fn read_feature_rows(
     {
         return Err("feature artifact does not match its content-addressed manifest".to_string());
     }
-    let rows = parse_feature_rows(&bytes)?;
+    let rows = parse_feature_rows(
+        &bytes,
+        match manifest.schema_version.as_str() {
+            PIT_FEATURE_MATRIX_SCHEMA_V2 => SeriesFieldRequirement::AllowLegacySingleSeries,
+            PIT_FEATURE_MATRIX_SCHEMA_V3 => SeriesFieldRequirement::Required,
+            _ => return Err("feature dataset manifest identity is invalid".to_string()),
+        },
+    )?;
     manifest.validate_trace(&rows)?;
     Ok(rows)
 }
 
-fn parse_feature_rows(bytes: &[u8]) -> Result<Vec<PointInTimeFeatureRow>, String> {
+enum SeriesFieldRequirement {
+    Required,
+    AllowLegacySingleSeries,
+}
+
+fn parse_feature_rows(
+    bytes: &[u8],
+    series_field_requirement: SeriesFieldRequirement,
+) -> Result<Vec<PointInTimeFeatureRow>, String> {
     std::io::BufReader::new(bytes)
         .lines()
         .enumerate()
         .map(|(index, line)| {
             let line =
                 line.map_err(|error| format!("feature row {} read failed: {error}", index + 1))?;
-            serde_json::from_str(&line)
+            let mut value: serde_json::Value = serde_json::from_str(&line)
+                .map_err(|error| format!("feature row {} is invalid: {error}", index + 1))?;
+            let has_series_id = value.get("series_id").is_some();
+            match series_field_requirement {
+                SeriesFieldRequirement::Required if !has_series_id => {
+                    return Err(format!("feature row {} is missing series_id", index + 1));
+                }
+                SeriesFieldRequirement::AllowLegacySingleSeries if !has_series_id => {
+                    value
+                        .as_object_mut()
+                        .expect("feature rows decode as JSON objects")
+                        .insert("series_id".to_string(), serde_json::json!(1_u64));
+                }
+                SeriesFieldRequirement::Required
+                | SeriesFieldRequirement::AllowLegacySingleSeries => {}
+            }
+            serde_json::from_value(value)
                 .map_err(|error| format!("feature row {} is invalid: {error}", index + 1))
         })
         .collect()
@@ -193,6 +238,7 @@ fn validate_rows(
         .ok_or_else(|| "feature matrix is empty".to_string())?;
     let last = rows.last().expect("non-empty rows have a last row");
     if rows.len() < 3
+        || first.series_id != 1
         || first.symbol.trim().is_empty()
         || first.source_revisions.is_empty()
         || first.modalities.is_empty()
@@ -213,6 +259,7 @@ fn validate_rows(
     }
     for row in rows {
         if row.symbol != first.symbol
+            || row.series_id == 0
             || row.source_revisions != first.source_revisions
             || row.modalities != first.modalities
             || row.features.keys().cloned().collect::<Vec<_>>() != feature_names
@@ -228,17 +275,9 @@ fn validate_rows(
             );
         }
     }
-    if rows.windows(2).any(|window| {
-        window[0].event_time >= window[1].event_time
-            || window[0].feature_available_time >= window[1].feature_available_time
-            || window[0].label_available_time >= window[1].label_available_time
-            || window[0].ingestion_time > window[1].ingestion_time
-    }) {
-        return Err("feature matrix times must be strictly ordered".to_string());
-    }
     let observation_frequency_millis = rows
         .windows(2)
-        .next()
+        .find(|window| window[0].series_id == window[1].series_id)
         .map(|window| {
             window[1]
                 .event_time
@@ -248,14 +287,34 @@ fn validate_rows(
         .filter(|frequency| *frequency > 0)
         .and_then(|frequency| u64::try_from(frequency).ok())
         .ok_or_else(|| "feature matrix observation frequency is invalid".to_string())?;
-    if rows.windows(2).any(|window| {
-        window[1]
-            .event_time
-            .signed_duration_since(window[0].event_time)
-            .num_milliseconds()
-            != observation_frequency_millis as i64
-    }) {
-        return Err("feature matrix observation frequency is not uniform".to_string());
+    for window in rows.windows(2) {
+        if window[0].event_time >= window[1].event_time
+            || window[0].feature_available_time >= window[1].feature_available_time
+            || window[0].label_available_time >= window[1].label_available_time
+            || window[0].ingestion_time > window[1].ingestion_time
+        {
+            return Err("feature matrix times must be strictly ordered".to_string());
+        }
+        match window[1].series_id {
+            id if id == window[0].series_id => {
+                if window[1]
+                    .event_time
+                    .signed_duration_since(window[0].event_time)
+                    .num_milliseconds()
+                    != observation_frequency_millis as i64
+                {
+                    return Err("feature matrix observation frequency is not uniform".to_string());
+                }
+            }
+            id if id == window[0].series_id + 1 => {
+                if window[0].label_available_time >= window[1].event_time {
+                    return Err("feature matrix labels cross a series boundary".to_string());
+                }
+            }
+            _ => {
+                return Err("feature matrix series ids must be contiguous".to_string());
+            }
+        }
     }
     let horizon_millis = first
         .label_available_time
@@ -285,6 +344,8 @@ fn validate_rows(
             horizon_buckets,
             observation_frequency_millis,
         },
+        series_count: usize::try_from(last.series_id)
+            .map_err(|_| "feature matrix series count is out of range".to_string())?,
         time_bounds: FeatureDatasetTimeBounds {
             first_event_time: first.event_time,
             last_event_time: last.event_time,
@@ -298,6 +359,10 @@ fn validate_rows(
     })
 }
 
+const fn default_series_count() -> usize {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +374,7 @@ mod tests {
             .map(|index| {
                 let event_time = ingestion - Duration::minutes(10 - index);
                 PointInTimeFeatureRow {
+                    series_id: 1,
                     event_time,
                     feature_available_time: event_time + Duration::seconds(1),
                     label_available_time: event_time + Duration::minutes(1),
@@ -366,6 +432,8 @@ mod tests {
             manifest.feature_names,
             vec!["lob_imbalance", "onchain_flow"]
         );
+        assert_eq!(manifest.schema_version, PIT_FEATURE_MATRIX_SCHEMA_V3);
+        assert_eq!(manifest.series_count, 1);
         assert_eq!(manifest.label_spec.observation_frequency_millis, 60_000);
         assert_eq!(manifest.label_spec.horizon_buckets, 1);
         let mut legacy_manifest = serde_json::to_value(&manifest).unwrap();
@@ -384,6 +452,10 @@ mod tests {
         leaked[1].feature_available_time = leaked[1].label_available_time + Duration::seconds(1);
         assert!(validate_rows(&leaked, Utc::now()).is_err());
 
+        let mut invalid_series = rows();
+        invalid_series[0].series_id = 2;
+        assert!(validate_rows(&invalid_series, Utc::now()).is_err());
+
         let mut drifted = rows();
         drifted[1].features.remove("onchain_flow");
         assert!(validate_rows(&drifted, Utc::now()).is_err());
@@ -391,5 +463,44 @@ mod tests {
         let mut inconsistent_label_horizon = rows();
         inconsistent_label_horizon[1].label_available_time += Duration::minutes(1);
         assert!(validate_rows(&inconsistent_label_horizon, Utc::now()).is_err());
+    }
+
+    #[test]
+    fn imports_multiseries_rows_and_rejects_missing_v3_ids() {
+        let mut input_rows = rows();
+        let series_start = input_rows[2].event_time + Duration::minutes(5);
+        input_rows[2].series_id = 2;
+        input_rows[2].event_time = series_start;
+        input_rows[2].feature_available_time = series_start + Duration::seconds(1);
+        input_rows[2].label_available_time = series_start + Duration::minutes(1);
+        input_rows[3].series_id = 2;
+        input_rows[3].event_time = series_start + Duration::minutes(1);
+        input_rows[3].feature_available_time = input_rows[3].event_time + Duration::seconds(1);
+        input_rows[3].label_available_time = input_rows[3].event_time + Duration::minutes(1);
+        let input = write_input(&input_rows);
+        let output = input.with_extension("artifacts");
+
+        let manifest = import_feature_dataset("data-2", &input, &output).unwrap();
+
+        assert_eq!(manifest.series_count, 2);
+        assert_eq!(read_feature_rows(&manifest).unwrap(), input_rows);
+
+        let legacy_bytes = std::fs::read_to_string(&input)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value.as_object_mut().unwrap().remove("series_id");
+                serde_json::to_string(&value).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&input, legacy_bytes).unwrap();
+        let error = import_feature_dataset("data-3", &input, &output).unwrap_err();
+        assert!(error.contains("missing series_id"));
+
+        std::fs::remove_file(input).unwrap();
+        std::fs::remove_dir_all(output).unwrap();
     }
 }

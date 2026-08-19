@@ -5,28 +5,31 @@ use crate::{
     data_mission,
     mission_render::render_cex_bundle,
     mission_runner::{
-        execute_report, fetch_to_file, normalized_sha256, publish_immutable_file,
-        recover_execution_report_from_published_result, valid_git_revision,
-        validate_cex_holdout_id, ExecutionBinding,
+        execute_report, fetch_to_file, finalize_existing_search_round, normalized_sha256,
+        publish_immutable_file, recover_execution_report_from_published_result, valid_git_revision,
+        validate_cex_holdout_id, ExecutionBinding, MAX_RESULT_BUNDLE_BYTES,
     },
     prediction_dispatch::{
         canonical_tokyo_oss_internal_object, cex_campaign_round_root,
         cex_global_holdout_claim_object, validate_dns_label,
     },
 };
-use alpha_domain::canonical_json_hash;
+use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
+use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
+use std::{fs::File, io::Read, path::Path, time::Duration};
+use zip::ZipArchive;
 
-const CAMPAIGN_REQUEST_SCHEMA_V1: &str = "cex-campaign-request-v1";
-const CAMPAIGN_RESULT_SCHEMA_V1: &str = "cex-campaign-result-v1";
-const CAMPAIGN_IDENTITY_SCHEMA_V1: &str = "cex-campaign-identity-v1";
-const STOP_RULE_V1: &str = "single-mission-terminal";
+const CAMPAIGN_REQUEST_SCHEMA_V2: &str = "cex-campaign-request-v2";
+const CAMPAIGN_RESULT_SCHEMA_V2: &str = "cex-campaign-result-v2";
+const CAMPAIGN_IDENTITY_SCHEMA_V2: &str = "cex-campaign-identity-v2";
+const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
+const MAX_RESULT_BUNDLE_FILES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +47,8 @@ pub(crate) struct CampaignRequest {
     pub(crate) replay_manifest_url: String,
     pub(crate) replay_manifest_sha256: String,
     pub(crate) holdout_id: String,
-    pub(crate) round: CampaignRoundRequest,
+    pub(crate) declared_total_trials: usize,
+    pub(crate) rounds: Vec<CampaignRoundRequest>,
     pub(crate) holdout_claim_put_url: String,
     pub(crate) holdout_claim_readback_url: String,
     pub(crate) campaign_result_put_url: String,
@@ -68,12 +72,13 @@ struct CampaignIdReport {
     matches_request: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CampaignMissionLedgerV1 {
     round_id: String,
     seed: u64,
     mission_id: String,
     mission_sha256: String,
+    request_sha256: Option<String>,
     result_bundle_sha256: String,
     result_readback_bundle_sha256: String,
     replay_receipt_id: Option<String>,
@@ -83,6 +88,31 @@ struct CampaignMissionLedgerV1 {
     sealed_passed: Option<bool>,
     strategy_bundle_id: Option<String>,
     promotion_id: Option<String>,
+    selected_candidate_id: Option<String>,
+    selected_candidate_content_hash: Option<String>,
+    selected_score: Option<f64>,
+    consumed_trials: usize,
+    termination_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CampaignFinalizationV1 {
+    round_id: String,
+    precommit_id: String,
+    sealed_receipt_id: String,
+    sealed_passed: bool,
+    strategy_bundle_id: Option<String>,
+    promotion_id: Option<String>,
+    final_precommit: serde_json::Value,
+    sealed_holdout_claim: serde_json::Value,
+    sealed_holdout_receipt: serde_json::Value,
+    strategy_bundle: Option<serde_json::Value>,
+    promotion_record: Option<serde_json::Value>,
+    final_precommit_sha256: String,
+    sealed_holdout_claim_sha256: String,
+    sealed_holdout_receipt_sha256: String,
+    strategy_bundle_sha256: Option<String>,
+    promotion_record_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,11 +123,15 @@ struct CampaignResultV1 {
     build_source_revision: String,
     image_identity: String,
     holdout_id: String,
+    declared_total_trials: usize,
+    consumed_trials: usize,
     stop_rule: &'static str,
     termination_reason: String,
-    mission: CampaignMissionLedgerV1,
-    sealed_passed: Option<bool>,
-    promotion_id: Option<String>,
+    rounds: Vec<CampaignMissionLedgerV1>,
+    selected_round_id: Option<String>,
+    selected_candidate_id: Option<String>,
+    selected_candidate_content_hash: Option<String>,
+    finalization: Option<CampaignFinalizationV1>,
 }
 
 #[derive(Debug)]
@@ -111,7 +145,7 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
         bail!("campaign request SHA256 mismatch");
     }
-    validate_request(&loaded.request)?;
+    validate_request_for_execute(&loaded.request)?;
     if loaded.request.campaign_id != args.campaign_id {
         bail!("campaign request does not match the requested Campaign ID");
     }
@@ -126,6 +160,20 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if !valid_git_revision(BUILD_SOURCE_REVISION) {
         bail!("alpha-harness was built without an exact source revision");
     }
+    execute_loaded_request(args, loaded)
+}
+
+#[cfg(not(test))]
+fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+    validate_request(request)
+}
+
+#[cfg(test)]
+fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+    validate_request(request).or_else(|_| validate_local_test_request(request))
+}
+
+fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
     let shared_input_dir = args.work_dir.join("shared-inputs");
     let mission_dir = args.work_dir.join("mission");
     let local_request_path = args.work_dir.join("campaign-request.json");
@@ -197,106 +245,186 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         16 * 1024 * 1024,
     )?;
 
-    let round = &loaded.request.round;
-    let rendered = render_cex_bundle(&feature_path, &materialization_path, round.seed)?;
-    if rendered.mission.spec.holdout.holdout_id != loaded.request.holdout_id {
-        bail!("rendered Mission holdout ID drifted from the Campaign request");
-    }
-    let round_dir = mission_dir.join(&round.round_id);
-    let mission_publish_dir = round_dir.join("admission");
-    std::fs::create_dir_all(&mission_publish_dir)?;
-    let mission_local_path = mission_publish_dir.join("mission.json");
-    data_mission::write_json_atomic(&mission_local_path, &rendered.mission)?;
-    let mission_readback_path = mission_publish_dir.join("mission-readback.json");
-    let mission_sha256 = publish_create_once_json(
-        &client,
-        "Mission",
-        &round.mission_put_url,
-        &round.mission_readback_url,
-        &mission_local_path,
-        &mission_readback_path,
-    )?;
+    let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
+    let mut selected_round = None;
+    let mut selected_mission = None;
+    let mut selected_execute_dir = None;
+    for round in &loaded.request.rounds {
+        let rendered = render_cex_bundle(
+            &feature_path,
+            &materialization_path,
+            round.seed,
+            loaded.request.declared_total_trials,
+        )?;
+        if rendered.mission.spec.holdout.holdout_id != loaded.request.holdout_id {
+            bail!("rendered Mission holdout ID drifted from the Campaign request");
+        }
+        let round_dir = mission_dir.join(&round.round_id);
+        let mission_publish_dir = round_dir.join("admission");
+        std::fs::create_dir_all(&mission_publish_dir)?;
+        let mission_local_path = mission_publish_dir.join("mission.json");
+        data_mission::write_json_atomic(&mission_local_path, &rendered.mission)?;
+        let mission_readback_path = mission_publish_dir.join("mission-readback.json");
+        let mission_sha256 = publish_create_once_json(
+            &client,
+            "Mission",
+            &round.mission_put_url,
+            &round.mission_readback_url,
+            &mission_local_path,
+            &mission_readback_path,
+        )?;
 
-    let binding = ExecutionBinding::Campaign {
-        campaign_id: loaded.request.campaign_id.clone(),
-        round_id: round.round_id.clone(),
-        request_sha256: loaded.sha256.clone(),
-    };
-    let recovered_result_path = round_dir.join("published-result-readback.zip");
-    let report = if let Some(report) = recover_execution_report_from_published_result(
-        &client,
-        &round.result_readback_url,
-        &recovered_result_path,
-        &rendered.mission_id,
-        &mission_sha256,
-        &binding,
-    )? {
-        report
-    } else {
-        execute_report(
-            ExecuteMissionArgs {
-                work_dir: round_dir.join("execute"),
-                mission_id: rendered.mission_id.clone(),
-                holdout_id: loaded.request.holdout_id.clone(),
-                mission_url: mission_readback_path.to_string_lossy().into_owned(),
-                mission_sha256: mission_sha256.clone(),
-                feature_url: feature_path.to_string_lossy().into_owned(),
-                materialization_url: materialization_path.to_string_lossy().into_owned(),
-                replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
-                replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
-                replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
-                replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
-                resume_url: None,
-                resume_sha256: None,
-                result_put_url: round.result_put_url.clone(),
-                result_readback_url: round.result_readback_url.clone(),
-                holdout_claim_put_url: loaded.request.holdout_claim_put_url.clone(),
-                holdout_claim_readback_url: loaded.request.holdout_claim_readback_url.clone(),
-            },
-            binding,
-        )?
-    };
-    let mission = CampaignMissionLedgerV1 {
-        round_id: round.round_id.clone(),
-        seed: round.seed,
-        mission_id: report.mission_id.clone(),
-        mission_sha256: report.mission_sha256.clone(),
-        result_bundle_sha256: report.bundle_sha256.clone(),
-        result_readback_bundle_sha256: report.readback_bundle_sha256.clone(),
-        replay_receipt_id: report.replay_receipt_id.clone(),
-        replay_gate_passed: report.replay_gate_passed,
-        final_precommit_id: report.final_precommit_id.clone(),
-        sealed_receipt_id: report.sealed_receipt_id.clone(),
-        sealed_passed: report.sealed_passed,
-        strategy_bundle_id: report.strategy_bundle_id.clone(),
-        promotion_id: report.promotion_id.clone(),
-    };
-    let termination_reason =
-        if report.final_precommit_id.is_some() || report.sealed_receipt_id.is_some() {
-            "single_mission_finalized".to_string()
-        } else {
-            "single_mission_completed_without_finalization".to_string()
+        let binding = ExecutionBinding::Campaign {
+            campaign_id: loaded.request.campaign_id.clone(),
+            round_id: round.round_id.clone(),
+            request_sha256: loaded.sha256.clone(),
         };
-    let request_sha256 = report
-        .request_sha256
-        .clone()
-        .context("Campaign execution report is missing request SHA256")?;
-    let sealed_passed = mission.sealed_passed;
-    let promotion_id = mission.promotion_id.clone();
+        let recovered_result_path = round_dir.join("published-result-readback.zip");
+        let execute_dir = round_dir.join("execute");
+        let report = if let Some(report) = recover_execution_report_from_published_result(
+            &client,
+            &round.result_readback_url,
+            &recovered_result_path,
+            &rendered.mission_id,
+            &mission_sha256,
+            &binding,
+        )? {
+            extract_bundle(&recovered_result_path, &execute_dir)?;
+            report
+        } else {
+            let (round_claim_put_url, round_claim_readback_url) =
+                campaign_round_claim_urls(&loaded.request, round)?;
+            execute_report(
+                ExecuteMissionArgs {
+                    work_dir: execute_dir.clone(),
+                    mission_id: rendered.mission_id.clone(),
+                    holdout_id: loaded.request.holdout_id.clone(),
+                    mission_url: mission_readback_path.to_string_lossy().into_owned(),
+                    mission_sha256: mission_sha256.clone(),
+                    feature_url: feature_path.to_string_lossy().into_owned(),
+                    materialization_url: materialization_path.to_string_lossy().into_owned(),
+                    replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+                    replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
+                    replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+                    replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
+                    resume_url: None,
+                    resume_sha256: None,
+                    result_put_url: round.result_put_url.clone(),
+                    result_readback_url: round.result_readback_url.clone(),
+                    holdout_claim_put_url: round_claim_put_url,
+                    holdout_claim_readback_url: round_claim_readback_url,
+                },
+                binding,
+            )?
+        };
+        let ledger = collect_round_ledger(&execute_dir, round, &report)?;
+        let is_better = selected_round
+            .as_ref()
+            .is_none_or(|current: &CampaignMissionLedgerV1| {
+                compare_round_selection(&ledger, current).is_gt()
+            });
+        if ledger.replay_gate_passed == Some(true) && ledger.selected_score.is_some() && is_better {
+            selected_round = Some(ledger.clone());
+            selected_mission = Some(rendered.mission);
+            selected_execute_dir = Some(execute_dir.clone());
+        }
+        ledgers.push(ledger);
+    }
+
+    let consumed_trials = ledgers.iter().map(|round| round.consumed_trials).sum();
+    if consumed_trials > loaded.request.declared_total_trials {
+        bail!("campaign consumed trials exceeded declared_total_trials");
+    }
+    let finalization =
+        if let (Some(selected_round), Some(selected_mission), Some(selected_execute_dir)) =
+            (&selected_round, &selected_mission, &selected_execute_dir)
+        {
+            let finalization_dir = mission_dir.join("finalization");
+            let report = finalize_existing_search_round(
+                selected_execute_dir,
+                &finalization_dir,
+                &loaded.request.holdout_claim_put_url,
+                &loaded.request.holdout_claim_readback_url,
+                selected_mission,
+            )?;
+            let final_precommit = read_json_value(&finalization_dir.join("final-precommit.json"))?;
+            let sealed_holdout_claim =
+                read_json_value(&finalization_dir.join("sealed-holdout-claim.json"))?;
+            let sealed_holdout_receipt =
+                read_json_value(&finalization_dir.join("sealed-holdout-receipt.json"))?;
+            let strategy_bundle_path = finalization_dir.join("strategy-bundle.json");
+            let promotion_record_path = finalization_dir.join("promotion-record.json");
+            Some(CampaignFinalizationV1 {
+                round_id: selected_round.round_id.clone(),
+                precommit_id: report.precommit_id.clone(),
+                sealed_receipt_id: report.sealed_receipt_id.clone(),
+                sealed_passed: report.sealed_passed,
+                strategy_bundle_id: report.strategy_bundle_id.clone(),
+                promotion_id: report.promotion_id.clone(),
+                final_precommit,
+                sealed_holdout_claim,
+                sealed_holdout_receipt,
+                strategy_bundle: strategy_bundle_path
+                    .try_exists()?
+                    .then(|| read_json_value(&strategy_bundle_path))
+                    .transpose()?,
+                promotion_record: promotion_record_path
+                    .try_exists()?
+                    .then(|| read_json_value(&promotion_record_path))
+                    .transpose()?,
+                final_precommit_sha256: crate::mission_runner::sha256_file(
+                    &finalization_dir.join("final-precommit.json"),
+                )?,
+                sealed_holdout_claim_sha256: crate::mission_runner::sha256_file(
+                    &finalization_dir.join("sealed-holdout-claim.json"),
+                )?,
+                sealed_holdout_receipt_sha256: crate::mission_runner::sha256_file(
+                    &finalization_dir.join("sealed-holdout-receipt.json"),
+                )?,
+                strategy_bundle_sha256: strategy_bundle_path
+                    .try_exists()?
+                    .then(|| crate::mission_runner::sha256_file(&strategy_bundle_path))
+                    .transpose()?,
+                promotion_record_sha256: promotion_record_path
+                    .try_exists()?
+                    .then(|| crate::mission_runner::sha256_file(&promotion_record_path))
+                    .transpose()?,
+            })
+        } else {
+            None
+        };
+
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V1,
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V2,
         campaign_id: loaded.request.campaign_id.clone(),
-        request_sha256,
+        request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
         image_identity: loaded.request.image_identity.clone(),
         holdout_id: loaded.request.holdout_id.clone(),
-        stop_rule: STOP_RULE_V1,
-        termination_reason,
-        mission,
-        sealed_passed,
-        promotion_id,
+        declared_total_trials: loaded.request.declared_total_trials,
+        consumed_trials,
+        stop_rule: STOP_RULE_V2,
+        termination_reason: if finalization.is_some() {
+            "campaign_finalized".to_string()
+        } else if selected_round.is_some() {
+            "campaign_selected_pre_holdout".to_string()
+        } else {
+            "campaign_no_candidate".to_string()
+        },
+        rounds: ledgers,
+        selected_round_id: selected_round.as_ref().map(|round| round.round_id.clone()),
+        selected_candidate_id: selected_round
+            .as_ref()
+            .and_then(|round| round.selected_candidate_id.clone()),
+        selected_candidate_content_hash: selected_round
+            .as_ref()
+            .and_then(|round| round.selected_candidate_content_hash.clone()),
+        finalization,
     };
     data_mission::write_json_atomic(&local_result_path, &result)?;
+    if local_result_path.metadata()?.len() > MAX_CAMPAIGN_RESULT_BYTES {
+        bail!("campaign result exceeds {MAX_CAMPAIGN_RESULT_BYTES} bytes");
+    }
     let result_sha256 = publish_create_once_json(
         &client,
         "campaign result",
@@ -311,10 +439,149 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         "campaign_result_sha256": result_sha256,
         "campaign_result_readback_sha256": result_sha256,
         "termination_reason": result.termination_reason,
-        "sealed_passed": result.sealed_passed,
-        "promotion_id": result.promotion_id,
-        "mission": result.mission,
+        "selected_round_id": result.selected_round_id,
+        "selected_candidate_id": result.selected_candidate_id,
+        "finalization": result.finalization,
+        "rounds": result.rounds,
     }))
+}
+
+fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
+    if destination.try_exists()? {
+        return Ok(());
+    }
+    std::fs::create_dir_all(destination)?;
+    let mut archive = ZipArchive::new(File::open(bundle)?)?;
+    if archive.len() > MAX_RESULT_BUNDLE_FILES {
+        bail!("published result bundle contains too many entries");
+    }
+    let mut extracted_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let enclosed = entry
+            .enclosed_name()
+            .context("published result bundle contains a non-enclosed path")?
+            .to_owned();
+        let output = destination.join(&enclosed);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(&output)?;
+        let remaining = MAX_RESULT_BUNDLE_BYTES
+            .checked_sub(extracted_bytes)
+            .context("published result bundle exceeds its extracted-size limit")?;
+        let bytes = std::io::copy(&mut entry.by_ref().take(remaining + 1), &mut file)?;
+        if bytes > remaining {
+            bail!("published result bundle exceeds its extracted-size limit");
+        }
+        extracted_bytes += bytes;
+    }
+    Ok(())
+}
+
+fn collect_round_ledger(
+    execute_dir: &Path,
+    round: &CampaignRoundRequest,
+    report: &crate::mission_runner::ExecutionReport,
+) -> anyhow::Result<CampaignMissionLedgerV1> {
+    let results = execute_dir.join("results");
+    let factor_bank: CexFactorBankRevisionV2 =
+        serde_json::from_slice(&std::fs::read(results.join("factor-bank.json"))?)?;
+    let consumed_trials = factor_bank.attempts.len() + round_subset_candidates(&results)?;
+    let strategy_path = results.join("combination-walk-forward.json");
+    let (selected_candidate_id, selected_candidate_content_hash, selected_score) =
+        if strategy_path.try_exists()? && report.replay_gate_passed == Some(true) {
+            let strategy: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&strategy_path)?)?;
+            (
+                strategy["artifact_id"].as_str().map(str::to_string),
+                Some(canonical_json_hash(&strategy)?),
+                strategy["walk_forward_evidence"]["selected"]["evaluation"]["score"].as_f64(),
+            )
+        } else {
+            (None, None, None)
+        };
+    Ok(CampaignMissionLedgerV1 {
+        round_id: round.round_id.clone(),
+        seed: round.seed,
+        mission_id: report.mission_id.clone(),
+        mission_sha256: report.mission_sha256.clone(),
+        request_sha256: report.request_sha256.clone(),
+        result_bundle_sha256: report.bundle_sha256.clone(),
+        result_readback_bundle_sha256: report.readback_bundle_sha256.clone(),
+        replay_receipt_id: report.replay_receipt_id.clone(),
+        replay_gate_passed: report.replay_gate_passed,
+        final_precommit_id: report.final_precommit_id.clone(),
+        sealed_receipt_id: report.sealed_receipt_id.clone(),
+        sealed_passed: report.sealed_passed,
+        strategy_bundle_id: report.strategy_bundle_id.clone(),
+        promotion_id: report.promotion_id.clone(),
+        selected_candidate_id,
+        selected_candidate_content_hash,
+        selected_score,
+        consumed_trials,
+        termination_reason: if report.replay_gate_passed == Some(true) {
+            "pre_holdout_candidate_kept".to_string()
+        } else if report.replay_receipt_id.is_some() {
+            "replay_gate_failed".to_string()
+        } else {
+            "no_passing_subset".to_string()
+        },
+    })
+}
+
+fn campaign_round_claim_urls(
+    request: &CampaignRequest,
+    round: &CampaignRoundRequest,
+) -> anyhow::Result<(String, String)> {
+    let remote =
+        round.result_put_url.starts_with("https://") || round.result_put_url.starts_with("http://");
+    if remote {
+        Ok((
+            request.holdout_claim_put_url.clone(),
+            request.holdout_claim_readback_url.clone(),
+        ))
+    } else {
+        let claim = crate::prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+            &round.result_put_url,
+            &request.campaign_id,
+            &round.round_id,
+            &request.holdout_id,
+        )?;
+        Ok((claim.clone(), claim))
+    }
+}
+
+fn round_subset_candidates(results: &Path) -> anyhow::Result<usize> {
+    let subset_path = results.join("factor-subset-mcts-result.json");
+    if !subset_path.try_exists()? {
+        return Ok(0);
+    }
+    let subset: CexFactorBankMctsResultV1 = serde_json::from_slice(&std::fs::read(subset_path)?)?;
+    Ok(subset.candidates_evaluated)
+}
+
+fn compare_round_selection(
+    left: &CampaignMissionLedgerV1,
+    right: &CampaignMissionLedgerV1,
+) -> std::cmp::Ordering {
+    left.selected_score
+        .partial_cmp(&right.selected_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            right
+                .selected_candidate_content_hash
+                .cmp(&left.selected_candidate_content_hash)
+        })
+        .then_with(|| right.round_id.cmp(&left.round_id))
+}
+
+fn read_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(path)?).map_err(anyhow::Error::new)
 }
 
 pub fn print_expected_id(args: CampaignIdArgs) -> anyhow::Result<()> {
@@ -352,8 +619,8 @@ pub(crate) fn valid_request_for_tests() -> CampaignRequest {
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V1 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V1}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V2 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V2}");
     }
     validate_campaign_id(&request.campaign_id)?;
     if request.image_identity
@@ -368,18 +635,20 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign source revision must be an exact git revision");
     }
     validate_cex_holdout_id(&request.holdout_id)?;
-    canonical_input_object("campaign feature", &request.feature_url)?;
+    canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
     normalized_sha256("campaign feature", &request.feature_sha256)?;
-    canonical_input_object("campaign materialization", &request.materialization_url)?;
+    canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?;
     normalized_sha256("campaign materialization", &request.materialization_sha256)?;
-    canonical_input_object("campaign replay artifact", &request.replay_artifact_url)?;
+    canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?;
     normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?;
-    canonical_input_object("campaign replay manifest", &request.replay_manifest_url)?;
+    canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?;
     normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?;
 
-    let claim_object =
-        canonical_output_object("campaign holdout claim", &request.holdout_claim_put_url)?;
-    let claim_readback_object = canonical_output_object(
+    let claim_object = canonical_tokyo_oss_internal_object(
+        "campaign holdout claim",
+        &request.holdout_claim_put_url,
+    )?;
+    let claim_readback_object = canonical_tokyo_oss_internal_object(
         "campaign holdout claim readback",
         &request.holdout_claim_readback_url,
     )?;
@@ -387,8 +656,8 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign holdout claim readback URL must identify the same immutable object");
     }
     let campaign_result_object =
-        canonical_output_object("campaign result", &request.campaign_result_put_url)?;
-    let campaign_result_readback_object = canonical_output_object(
+        canonical_tokyo_oss_internal_object("campaign result", &request.campaign_result_put_url)?;
+    let campaign_result_readback_object = canonical_tokyo_oss_internal_object(
         "campaign result readback",
         &request.campaign_result_readback_url,
     )?;
@@ -408,35 +677,57 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign holdout claim object must use the global sealed holdout namespace");
     }
 
-    let round = &request.round;
-    validate_dns_label("campaign round id", &round.round_id)?;
-    let mission_object = canonical_output_object("campaign mission", &round.mission_put_url)?;
-    let mission_readback_object =
-        canonical_output_object("campaign mission readback", &round.mission_readback_url)?;
-    if mission_object != mission_readback_object {
-        bail!("campaign Mission readback URL must identify the same immutable object");
+    if request.rounds.len() < 2 {
+        bail!("campaign request must declare at least two rounds");
     }
-    let expected_mission_object = format!(
-        "{campaign_root}/campaign-id={}/round={}/mission.json",
-        request.campaign_id, round.round_id,
-    );
-    if mission_object != expected_mission_object {
-        bail!("campaign Mission object must live at campaign-id=<id>/round=<id>/mission.json");
+    let per_round_trials = crate::mission_render::max_candidates_for_tests() * 2;
+    let minimum_total_trials = per_round_trials
+        .checked_mul(request.rounds.len())
+        .context("campaign total trials overflowed")?;
+    if request.declared_total_trials < minimum_total_trials {
+        bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
-    let result_object = canonical_output_object("campaign result", &round.result_put_url)?;
-    let result_readback_object =
-        canonical_output_object("campaign result readback", &round.result_readback_url)?;
-    if result_object != result_readback_object {
-        bail!("campaign result readback URL must identify the same immutable object");
-    }
-    let root = cex_campaign_round_root(
-        &result_object,
-        &request.campaign_id,
-        &round.round_id,
-        "results.zip",
-    )?;
-    if root != campaign_root {
-        bail!("campaign result must share one Campaign root");
+    let mut round_ids = std::collections::BTreeSet::new();
+    let mut seeds = std::collections::BTreeSet::new();
+    for round in &request.rounds {
+        validate_dns_label("campaign round id", &round.round_id)?;
+        if !round_ids.insert(round.round_id.as_str()) || !seeds.insert(round.seed) {
+            bail!("campaign rounds must have unique ids and seeds");
+        }
+        let mission_object =
+            canonical_tokyo_oss_internal_object("campaign mission", &round.mission_put_url)?;
+        let mission_readback_object = canonical_tokyo_oss_internal_object(
+            "campaign mission readback",
+            &round.mission_readback_url,
+        )?;
+        if mission_object != mission_readback_object {
+            bail!("campaign Mission readback URL must identify the same immutable object");
+        }
+        let expected_mission_object = format!(
+            "{campaign_root}/campaign-id={}/round={}/mission.json",
+            request.campaign_id, round.round_id,
+        );
+        if mission_object != expected_mission_object {
+            bail!("campaign Mission object must live at campaign-id=<id>/round=<id>/mission.json");
+        }
+        let result_object =
+            canonical_tokyo_oss_internal_object("campaign result", &round.result_put_url)?;
+        let result_readback_object = canonical_tokyo_oss_internal_object(
+            "campaign result readback",
+            &round.result_readback_url,
+        )?;
+        if result_object != result_readback_object {
+            bail!("campaign result readback URL must identify the same immutable object");
+        }
+        let root = cex_campaign_round_root(
+            &result_object,
+            &request.campaign_id,
+            &round.round_id,
+            "results.zip",
+        )?;
+        if root != campaign_root {
+            bail!("campaign result must share one Campaign root");
+        }
     }
     let expected_claim = cex_global_holdout_claim_object(&request.holdout_id)?;
     if expected_claim != claim_object {
@@ -451,36 +742,41 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
     let identity = serde_json::json!({
-        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V1,
+        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V2,
         "request_schema_version": request.schema_version,
         "build_source_revision": request.build_source_revision,
         "image_identity": normalized_sha256("campaign image identity", &request.image_identity)?,
         "feature": {
-            "object": canonical_input_object("campaign feature", &request.feature_url)?,
+            "object": canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?,
             "sha256": normalized_sha256("campaign feature", &request.feature_sha256)?,
         },
         "materialization": {
-            "object": canonical_input_object("campaign materialization", &request.materialization_url)?,
+            "object": canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?,
             "sha256": normalized_sha256("campaign materialization", &request.materialization_sha256)?,
         },
         "replay_artifact": {
-            "object": canonical_input_object("campaign replay artifact", &request.replay_artifact_url)?,
+            "object": canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?,
             "sha256": normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?,
         },
         "replay_manifest": {
-            "object": canonical_input_object("campaign replay manifest", &request.replay_manifest_url)?,
+            "object": canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?,
             "sha256": normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?,
         },
         "holdout_id": request.holdout_id,
-        "output_root": campaign_output_root(&canonical_output_object(
+        "declared_total_trials": request.declared_total_trials,
+        "output_root": campaign_output_root(&canonical_tokyo_oss_internal_object(
             "campaign result",
             &request.campaign_result_put_url,
         )?)?,
-        "round": {
-            "round_id": request.round.round_id,
-            "seed": request.round.seed,
-        },
-        "stop_rule": STOP_RULE_V1,
+        "rounds": request
+            .rounds
+            .iter()
+            .map(|round| serde_json::json!({
+                "round_id": round.round_id,
+                "seed": round.seed,
+            }))
+            .collect::<Vec<_>>(),
+        "stop_rule": STOP_RULE_V2,
     });
     Ok(format!(
         "cex-campaign-{}",
@@ -576,19 +872,79 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
         })
 }
 
-fn canonical_input_object(label: &str, value: &str) -> anyhow::Result<String> {
-    canonical_tokyo_oss_internal_object(label, value)
-}
-
-fn canonical_output_object(label: &str, value: &str) -> anyhow::Result<String> {
-    canonical_tokyo_oss_internal_object(label, value)
+#[cfg(test)]
+fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V2 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V2}");
+    }
+    validate_campaign_id(&request.campaign_id)?;
+    normalized_sha256("campaign image identity", &request.image_identity)?;
+    if request.build_source_revision != BUILD_SOURCE_REVISION
+        || !valid_git_revision(&request.build_source_revision)
+    {
+        bail!("campaign source revision must match the test build");
+    }
+    validate_cex_holdout_id(&request.holdout_id)?;
+    if request.rounds.len() < 2 {
+        bail!("campaign request must declare at least two rounds");
+    }
+    let per_round_trials = crate::mission_render::max_candidates_for_tests() * 2;
+    let minimum_total_trials = per_round_trials
+        .checked_mul(request.rounds.len())
+        .context("campaign total trials overflowed")?;
+    if request.declared_total_trials < minimum_total_trials {
+        bail!("campaign declared_total_trials is below the minimum multi-round trial family");
+    }
+    let mut round_ids = std::collections::BTreeSet::new();
+    let mut seeds = std::collections::BTreeSet::new();
+    for path in [
+        &request.feature_url,
+        &request.materialization_url,
+        &request.replay_artifact_url,
+        &request.replay_manifest_url,
+        &request.holdout_claim_put_url,
+        &request.holdout_claim_readback_url,
+        &request.campaign_result_put_url,
+        &request.campaign_result_readback_url,
+    ] {
+        if path.trim().is_empty() {
+            bail!("local test request paths must be non-empty");
+        }
+    }
+    if request.holdout_claim_put_url != request.holdout_claim_readback_url
+        || request.campaign_result_put_url != request.campaign_result_readback_url
+    {
+        bail!("local test request readback paths must match their put paths");
+    }
+    for round in &request.rounds {
+        validate_dns_label("campaign round id", &round.round_id)?;
+        if !round_ids.insert(round.round_id.as_str()) || !seeds.insert(round.seed) {
+            bail!("campaign rounds must have unique ids and seeds");
+        }
+        if round.mission_put_url != round.mission_readback_url
+            || round.result_put_url != round.result_readback_url
+        {
+            bail!("local test round readback paths must match their put paths");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission_render;
+    use parquet::{
+        data_type::{ByteArray, ByteArrayType, Int64Type},
+        file::{
+            properties::WriterProperties,
+            writer::{SerializedFileWriter, SerializedRowGroupWriter},
+        },
+        schema::parser::parse_message_type,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::{fs::File, path::PathBuf, sync::Arc};
 
     #[test]
     fn expected_campaign_id_ignores_signed_queries_and_output_transports() {
@@ -606,16 +962,12 @@ mod tests {
         request
             .campaign_result_readback_url
             .push_str("?signature=ignored");
-        request.round.mission_put_url.push_str("?signature=ignored");
-        request
-            .round
-            .mission_readback_url
-            .push_str("?signature=ignored");
-        request.round.result_put_url.push_str("?signature=ignored");
-        request
-            .round
-            .result_readback_url
-            .push_str("?signature=ignored");
+        for round in &mut request.rounds {
+            round.mission_put_url.push_str("?signature=ignored");
+            round.mission_readback_url.push_str("?signature=ignored");
+            round.result_put_url.push_str("?signature=ignored");
+            round.result_readback_url.push_str("?signature=ignored");
+        }
         request.holdout_claim_put_url.push_str("?signature=ignored");
         request
             .holdout_claim_readback_url
@@ -669,7 +1021,7 @@ mod tests {
         let request = valid_request();
         assert_eq!(
             cex_global_holdout_claim_object(&request.holdout_id).unwrap(),
-            canonical_output_object("holdout", &request.holdout_claim_put_url).unwrap()
+            canonical_tokyo_oss_internal_object("holdout", &request.holdout_claim_put_url).unwrap()
         );
     }
 
@@ -688,11 +1040,76 @@ mod tests {
         assert!(validate_request(&request).is_err());
 
         let mut request = valid_request();
-        request.round.mission_put_url =
+        request.rounds[0].mission_put_url =
             "https://example.com/research/campaign-id=placeholder/round=r1/mission.json"
                 .to_string();
-        request.round.mission_readback_url = request.round.mission_put_url.clone();
+        request.rounds[0].mission_readback_url = request.rounds[0].mission_put_url.clone();
         assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_request_rejects_single_round_campaign() {
+        let mut request = valid_request();
+        request.rounds.truncate(1);
+        request.campaign_id = expected_campaign_id(&request).unwrap();
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_request_rejects_underdeclared_total_trials() {
+        let mut request = valid_request();
+        request.declared_total_trials = crate::mission_render::max_candidates_for_tests() * 2;
+        request.campaign_id = expected_campaign_id(&request).unwrap();
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn selection_tie_break_is_deterministic() {
+        let lower_hash = CampaignMissionLedgerV1 {
+            round_id: "r1".to_string(),
+            seed: 11,
+            request_sha256: Some("0".repeat(64)),
+            mission_id: "m1".to_string(),
+            mission_sha256: "a".repeat(64),
+            result_bundle_sha256: "b".repeat(64),
+            result_readback_bundle_sha256: "b".repeat(64),
+            replay_receipt_id: Some("receipt-1".to_string()),
+            replay_gate_passed: Some(true),
+            final_precommit_id: None,
+            sealed_receipt_id: None,
+            sealed_passed: None,
+            strategy_bundle_id: None,
+            promotion_id: None,
+            selected_candidate_id: Some("candidate-1".to_string()),
+            selected_candidate_content_hash: Some("0".repeat(64)),
+            selected_score: Some(10.0),
+            consumed_trials: 4,
+            termination_reason: "pre_holdout_candidate_kept".to_string(),
+        };
+        let higher_hash = CampaignMissionLedgerV1 {
+            round_id: "r2".to_string(),
+            seed: 17,
+            request_sha256: Some("1".repeat(64)),
+            mission_id: "m2".to_string(),
+            mission_sha256: "c".repeat(64),
+            result_bundle_sha256: "d".repeat(64),
+            result_readback_bundle_sha256: "d".repeat(64),
+            replay_receipt_id: Some("receipt-2".to_string()),
+            replay_gate_passed: Some(true),
+            final_precommit_id: None,
+            sealed_receipt_id: None,
+            sealed_passed: None,
+            strategy_bundle_id: None,
+            promotion_id: None,
+            selected_candidate_id: Some("candidate-2".to_string()),
+            selected_candidate_content_hash: Some("f".repeat(64)),
+            selected_score: Some(10.0),
+            consumed_trials: 4,
+            termination_reason: "pre_holdout_candidate_kept".to_string(),
+        };
+
+        assert!(compare_round_selection(&higher_hash, &lower_hash).is_lt());
+        assert!(compare_round_selection(&lower_hash, &higher_hash).is_gt());
     }
 
     #[test]
@@ -710,7 +1127,8 @@ mod tests {
     fn validate_request_rejects_a_campaign_root_scoped_claim() {
         let mut request = valid_request();
         let campaign_root = campaign_output_root(
-            &canonical_output_object("result", &request.campaign_result_put_url).unwrap(),
+            &canonical_tokyo_oss_internal_object("result", &request.campaign_result_put_url)
+                .unwrap(),
         )
         .unwrap();
         request.holdout_claim_put_url = format!(
@@ -841,6 +1259,147 @@ mod tests {
     }
 
     #[test]
+    fn execute_runs_two_rounds_and_finalizes_exactly_once() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false);
+        execute(fixture.args).unwrap();
+
+        let work_dir = fixture.work_dir;
+        assert!(work_dir.join("shared-inputs/features.jsonl").exists());
+        assert!(work_dir.join("shared-inputs/materialization.json").exists());
+        assert!(work_dir
+            .join("mission/r1/admission/mission-readback.json")
+            .exists());
+        assert!(work_dir
+            .join("mission/r2/admission/mission-readback.json")
+            .exists());
+        assert!(work_dir
+            .join("mission/r1/execute/results/factor-bank.json")
+            .exists());
+        assert!(work_dir
+            .join("mission/r2/execute/results/factor-bank.json")
+            .exists());
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
+                .unwrap();
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V2);
+        assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
+        assert_eq!(result["declared_total_trials"], 64);
+        assert_eq!(result["consumed_trials"], 64);
+        for round in ["r1", "r2"] {
+            let mission: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    work_dir.join(format!("mission/{round}/admission/mission-readback.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mission["spec"]["search"]["multiple_testing_trials"], 64);
+            let subset: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(work_dir.join(format!(
+                    "mission/{round}/execute/results/factor-subset-mcts-result.json"
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                subset["selected"]["evaluation"]["evaluator_config"]["multiple_testing_trials"],
+                64
+            );
+        }
+        assert!(result["selected_round_id"].is_string());
+        assert!(result["finalization"].is_object());
+        let finalization = &result["finalization"];
+        assert!(finalization["final_precommit"].is_object());
+        assert!(finalization["sealed_holdout_claim"].is_object());
+        assert!(finalization["sealed_holdout_receipt"].is_object());
+        assert!(fixture.global_claim_path.exists());
+    }
+
+    #[test]
+    fn execute_negative_campaign_creates_no_claim() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false);
+        execute(fixture.args).unwrap();
+
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["termination_reason"], "campaign_no_candidate");
+        assert!(result["finalization"].is_null());
+        assert!(!fixture.global_claim_path.exists());
+    }
+
+    #[test]
+    fn existing_global_claim_blocks_finalize_but_search_rounds_complete() {
+        let fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true);
+        let error = execute(fixture.args).unwrap_err();
+
+        assert!(
+            error.to_string().contains("already claimed")
+                || error.to_string().contains("terminal and inconclusive")
+        );
+        assert!(fixture
+            .work_dir
+            .join("mission/r1/execute/results/factor-bank.json")
+            .exists());
+        assert!(fixture
+            .work_dir
+            .join("mission/r2/execute/results/factor-bank.json")
+            .exists());
+        assert!(!fixture
+            .work_dir
+            .join("mission/finalization/final-precommit.json")
+            .exists());
+    }
+
+    #[test]
+    fn extract_bundle_rejects_zip_slip_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle.zip");
+        let file = File::create(&bundle).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("../escape.txt", options).unwrap();
+        writer.write_all(b"escape").unwrap();
+        writer.finish().unwrap();
+
+        let error = extract_bundle(&bundle, &root.path().join("extract")).unwrap_err();
+
+        assert!(error.to_string().contains("non-enclosed path"));
+    }
+
+    #[test]
+    fn extract_bundle_rejects_too_many_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&bundle).unwrap());
+        for index in 0..=MAX_RESULT_BUNDLE_FILES {
+            writer
+                .start_file(
+                    format!("entry-{index}"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = extract_bundle(&bundle, &root.path().join("extract")).unwrap_err();
+
+        assert!(error.to_string().contains("too many entries"));
+    }
+
+    #[test]
+    fn round_subset_candidates_rejects_invalid_json() {
+        let root = tempfile::tempdir().unwrap();
+        let results = root.path().join("results");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::write(results.join("factor-subset-mcts-result.json"), b"{").unwrap();
+
+        assert!(round_subset_candidates(&results).is_err());
+    }
+
+    #[test]
     fn immutable_publish_conflict_recognizes_http_conflict() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -874,7 +1433,7 @@ mod tests {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
         let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V1.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
             campaign_id: String::new(),
             build_source_revision: "a".repeat(40),
             image_identity: "1".repeat(64),
@@ -887,20 +1446,41 @@ mod tests {
             replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
             replay_manifest_sha256: "4".repeat(64),
             holdout_id: "cex-holdout-test".to_string(),
-            round: CampaignRoundRequest {
-                round_id: "r1".to_string(),
-                seed: 11,
-                mission_put_url: format!(
-                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
-                ),
-                mission_readback_url: format!(
-                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json?readback=1"
-                ),
-                result_put_url: format!("{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"),
-                result_readback_url: format!(
-                    "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip?readback=1"
-                ),
-            },
+            declared_total_trials: crate::mission_render::max_candidates_for_tests() * 4,
+            rounds: vec![
+                CampaignRoundRequest {
+                    round_id: "r1".to_string(),
+                    seed: 11,
+                    mission_put_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
+                    ),
+                    mission_readback_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json?readback=1"
+                    ),
+                    result_put_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"
+                    ),
+                    result_readback_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip?readback=1"
+                    ),
+                },
+                CampaignRoundRequest {
+                    round_id: "r2".to_string(),
+                    seed: 17,
+                    mission_put_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json"
+                    ),
+                    mission_readback_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json?readback=1"
+                    ),
+                    result_put_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip"
+                    ),
+                    result_readback_url: format!(
+                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip?readback=1"
+                    ),
+                },
+            ],
             holdout_claim_put_url: String::new(),
             holdout_claim_readback_url: String::new(),
             campaign_result_put_url: format!(
@@ -911,22 +1491,24 @@ mod tests {
             ),
         };
         request.campaign_id = expected_campaign_id(&request).unwrap();
-        request.round.mission_put_url = format!(
-            "{TEST_ROOT}/campaign-id={}/round={}/mission.json",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.mission_readback_url = format!(
-            "{TEST_ROOT}/campaign-id={}/round={}/mission.json?readback=1",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.result_put_url = format!(
-            "{TEST_ROOT}/campaign-id={}/round={}/results.zip",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.result_readback_url = format!(
-            "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
-            request.campaign_id, request.round.round_id
-        );
+        for round in &mut request.rounds {
+            round.mission_put_url = format!(
+                "{TEST_ROOT}/campaign-id={}/round={}/mission.json",
+                request.campaign_id, round.round_id
+            );
+            round.mission_readback_url = format!(
+                "{TEST_ROOT}/campaign-id={}/round={}/mission.json?readback=1",
+                request.campaign_id, round.round_id
+            );
+            round.result_put_url = format!(
+                "{TEST_ROOT}/campaign-id={}/round={}/results.zip",
+                request.campaign_id, round.round_id
+            );
+            round.result_readback_url = format!(
+                "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
+                request.campaign_id, round.round_id
+            );
+        }
         request.holdout_claim_put_url =
             cex_global_holdout_claim_object(&request.holdout_id).unwrap();
         request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
@@ -941,6 +1523,351 @@ mod tests {
         request
     }
 
+    struct CampaignE2eFixture {
+        _root: tempfile::TempDir,
+        _replay_root: tempfile::TempDir,
+        _render_fixture: mission_render::tests::Fixture,
+        args: CampaignExecuteArgs,
+        work_dir: PathBuf,
+        global_claim_path: PathBuf,
+    }
+
+    fn campaign_e2e_fixture(
+        name: &str,
+        zero_labels: bool,
+        preexisting_claim: bool,
+    ) -> CampaignE2eFixture {
+        let render_fixture = mission_render::tests::Fixture::new(21_608);
+        let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
+        if zero_labels {
+            for row in &mut rows {
+                row.label = 0.0;
+            }
+        } else {
+            for (index, row) in rows.iter_mut().enumerate() {
+                let direction: f64 = if (index / 100).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                row.features
+                    .insert("ask_depth_top5".to_string(), 10.0 + direction);
+                row.features
+                    .insert("bid_depth_top5".to_string(), 10.0 - direction);
+                row.features.insert("book_imbalance".to_string(), direction);
+                row.features
+                    .insert("book_imbalance_top5".to_string(), direction);
+                row.features
+                    .insert("near_depth_concentration_skew_top5".to_string(), direction);
+                row.features
+                    .insert("spread_bps".to_string(), 0.5 + direction * 0.05);
+                row.features
+                    .insert("vwap_center_deviation_top5_bps".to_string(), direction);
+                row.features
+                    .insert("weighted_book_imbalance_top5".to_string(), direction);
+                row.label = direction * 0.001;
+            }
+        }
+        mission_render::tests::rewrite_feature_rows(&render_fixture.feature_path, &rows);
+        rebind_materialization_feature_artifact(
+            &render_fixture.materialization_path,
+            &render_fixture.feature_path,
+        );
+        let replay_root = tempfile::tempdir().unwrap();
+        let (replay_artifact_path, replay_manifest_path) = write_campaign_replay_fixture(
+            replay_root.path(),
+            &render_fixture.feature_path,
+            &render_fixture.materialization_path,
+        );
+        let rendered = render_cex_bundle(
+            &render_fixture.feature_path,
+            &render_fixture.materialization_path,
+            7,
+            crate::mission_render::max_candidates_for_tests() * 4,
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let global_claim_path = root.path().join("global-holdout-claim.json");
+        if preexisting_claim {
+            std::fs::write(&global_claim_path, b"claimed").unwrap();
+        }
+        let request = local_request_from_paths(
+            root.path(),
+            &render_fixture.feature_path,
+            &render_fixture.materialization_path,
+            &replay_artifact_path,
+            &replay_manifest_path,
+            &rendered.mission.spec.holdout.holdout_id,
+            &[7, 11],
+        );
+        let request_path = root.path().join(format!("{name}-request.json"));
+        let request_bytes = serialize_request(&request).unwrap();
+        std::fs::write(&request_path, &request_bytes).unwrap();
+        let request_sha256 = hex::encode(Sha256::digest(&request_bytes));
+        let work_dir = root.path().join("campaign-work");
+        CampaignE2eFixture {
+            _root: root,
+            _replay_root: replay_root,
+            _render_fixture: render_fixture,
+            args: CampaignExecuteArgs {
+                work_dir: work_dir.clone(),
+                campaign_id: request.campaign_id.clone(),
+                image_identity: request.image_identity.clone(),
+                request: request_path,
+                request_sha256,
+            },
+            work_dir,
+            global_claim_path,
+        }
+    }
+
+    fn rebind_materialization_feature_artifact(materialization_path: &Path, feature_path: &Path) {
+        let feature_sha256 = crate::mission_runner::sha256_file(feature_path).unwrap();
+        let mut materialization: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(materialization_path).unwrap()).unwrap();
+        materialization["artifact_sha256"] = serde_json::json!(feature_sha256.clone());
+        materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(feature_sha256);
+        let snapshot: hft_research_manifest::CexReplaySnapshotV4 =
+            serde_json::from_value(materialization["snapshot"].clone()).unwrap();
+        materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+        std::fs::write(
+            materialization_path,
+            serde_json::to_vec_pretty(&materialization).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn local_request_from_paths(
+        root: &Path,
+        feature_path: &Path,
+        materialization_path: &Path,
+        replay_artifact_path: &Path,
+        replay_manifest_path: &Path,
+        holdout_id: &str,
+        seeds: &[u64],
+    ) -> CampaignRequest {
+        let seed_bytes = seeds
+            .iter()
+            .flat_map(|seed| seed.to_be_bytes())
+            .collect::<Vec<_>>();
+        let campaign_id = format!(
+            "cex-campaign-local-{}",
+            &hex::encode(Sha256::digest(&seed_bytes))[..16]
+        );
+        let published = root.join("published");
+        CampaignRequest {
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
+            campaign_id: campaign_id.clone(),
+            build_source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image_identity: "1".repeat(64),
+            feature_url: feature_path.to_string_lossy().into_owned(),
+            feature_sha256: crate::mission_runner::sha256_file(feature_path).unwrap(),
+            materialization_url: materialization_path.to_string_lossy().into_owned(),
+            materialization_sha256: crate::mission_runner::sha256_file(materialization_path)
+                .unwrap(),
+            replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+            replay_artifact_sha256: crate::mission_runner::sha256_file(replay_artifact_path)
+                .unwrap(),
+            replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+            replay_manifest_sha256: crate::mission_runner::sha256_file(replay_manifest_path)
+                .unwrap(),
+            holdout_id: holdout_id.to_string(),
+            declared_total_trials: crate::mission_render::max_candidates_for_tests()
+                * 2
+                * seeds.len(),
+            rounds: seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| CampaignRoundRequest {
+                    round_id: format!("r{}", index + 1),
+                    seed: *seed,
+                    mission_put_url: published
+                        .join(format!(
+                            "campaign-id={campaign_id}/round=r{}/mission.json",
+                            index + 1
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                    mission_readback_url: published
+                        .join(format!(
+                            "campaign-id={campaign_id}/round=r{}/mission.json",
+                            index + 1
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                    result_put_url: published
+                        .join(format!(
+                            "campaign-id={campaign_id}/round=r{}/results.zip",
+                            index + 1
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                    result_readback_url: published
+                        .join(format!(
+                            "campaign-id={campaign_id}/round=r{}/results.zip",
+                            index + 1
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+                .collect(),
+            holdout_claim_put_url: root
+                .join("global-holdout-claim.json")
+                .to_string_lossy()
+                .into_owned(),
+            holdout_claim_readback_url: root
+                .join("global-holdout-claim.json")
+                .to_string_lossy()
+                .into_owned(),
+            campaign_result_put_url: published
+                .join(format!("campaign-id={campaign_id}/campaign-result.json"))
+                .to_string_lossy()
+                .into_owned(),
+            campaign_result_readback_url: published
+                .join(format!("campaign-id={campaign_id}/campaign-result.json"))
+                .to_string_lossy()
+                .into_owned(),
+        }
+    }
+
+    fn write_campaign_replay_fixture(
+        root: &Path,
+        feature_path: &Path,
+        materialization_path: &Path,
+    ) -> (PathBuf, PathBuf) {
+        const MESSAGE: &str = "
+message binance_replay {
+  REQUIRED INT64 timestamp_us;
+  REQUIRED INT64 sequence;
+  REQUIRED BINARY event (UTF8);
+  REQUIRED BINARY payload_json (UTF8);
+}
+";
+        let rows = mission_render::tests::read_feature_rows(feature_path);
+        let materialization: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(materialization_path).unwrap()).unwrap();
+        let source_revision = materialization["source_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_segments = materialization["source_segments"].as_array().unwrap();
+        let source_content_sha256 = source_segments[0]["sha256"].as_str().unwrap().to_string();
+        let source_manifest_sha256 = source_segments[0]["collector_manifest_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_start_ns = source_segments[0]["start_received_at_ns"].as_u64().unwrap();
+        let source_end_ns = source_segments[0]["end_received_at_ns"].as_u64().unwrap();
+        let source_events = source_segments[0]["events"].as_u64().unwrap();
+        let levels = serde_json::json!({
+            "bids": [["59999", "10"], ["59998", "10"], ["59997", "10"], ["59996", "10"], ["59995", "10"]],
+            "asks": [["60001", "10"], ["60002", "10"], ["60003", "10"], ["60004", "10"], ["60005", "10"]]
+        });
+        let mut timestamps = Vec::with_capacity(rows.len() + 2);
+        let mut sequences = Vec::with_capacity(rows.len() + 2);
+        let mut events = Vec::with_capacity(rows.len() + 2);
+        let mut payloads = Vec::with_capacity(rows.len() + 2);
+        for (index, row) in rows.iter().enumerate() {
+            if index == 0 {
+                timestamps.push(
+                    i64::try_from(
+                        source_start_ns / 1_000 + u64::from(!source_start_ns.is_multiple_of(1_000)),
+                    )
+                    .unwrap(),
+                );
+                sequences.push(1);
+                events.push("snapshot".to_string());
+                payloads.push(serde_json::to_string(&levels).unwrap());
+            }
+            timestamps.push(row.feature_available_time.timestamp_micros() + 100);
+            sequences.push(i64::try_from(index + 2).unwrap());
+            events.push("l2_update".to_string());
+            payloads.push(serde_json::to_string(&levels).unwrap());
+        }
+        timestamps.push(rows.last().unwrap().label_available_time.timestamp_micros() + 100);
+        sequences.push(i64::try_from(timestamps.len()).unwrap());
+        events.push("l2_update".to_string());
+        payloads.push(serde_json::to_string(&levels).unwrap());
+        let temporary_artifact = root.join("replay.parquet");
+        let schema = Arc::new(parse_message_type(MESSAGE).unwrap());
+        let properties = Arc::new(WriterProperties::builder().build());
+        let mut writer = SerializedFileWriter::new(
+            File::create(&temporary_artifact).unwrap(),
+            schema,
+            properties,
+        )
+        .unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        write_replay_i64_column(&mut group, &timestamps);
+        write_replay_i64_column(&mut group, &sequences);
+        write_replay_utf8_column(&mut group, &events);
+        write_replay_utf8_column(&mut group, &payloads);
+        group.close().unwrap();
+        writer.close().unwrap();
+        let replay_artifact_sha256 =
+            crate::mission_runner::sha256_file(&temporary_artifact).unwrap();
+        let replay_artifact_path = root.join(format!("{replay_artifact_sha256}.parquet"));
+        std::fs::rename(&temporary_artifact, &replay_artifact_path).unwrap();
+        let replay_manifest = serde_json::json!({
+            "dataset_kind": "backtest_canonical_replay_parquet",
+            "schema_version": "binance-replay-parquet-v1",
+            "format": "parquet",
+            "parquet_schema": "timestamp_us:int64,sequence:int64,event:utf8,payload_json:utf8",
+            "mission_id": materialization["mission_id"],
+            "market": materialization["market"],
+            "symbol": materialization["symbol"],
+            "dataset": "binance_usdm_lob",
+            "modalities": ["lob"],
+            "source_revision": source_revision,
+            "source_segments": [{
+                "file": "segment.jsonl.zst",
+                "sha256": source_content_sha256,
+                "collector_manifest_sha256": source_manifest_sha256,
+                "success_marker_sha256": hex::encode(Sha256::digest(format!("{source_content_sha256}\n"))),
+                "start_received_at_ns": source_start_ns,
+                "end_received_at_ns": source_end_ns,
+                "events": source_events
+            }],
+            "rows": timestamps.len(),
+            "first_event_time_us": timestamps[0],
+            "last_event_time_us": *timestamps.last().unwrap(),
+            "sequence_start": 1,
+            "sequence_end": timestamps.len(),
+            "artifact_path": replay_artifact_path.file_name().unwrap().to_str().unwrap(),
+            "artifact_sha256": &replay_artifact_sha256,
+            "point_in_time": true
+        });
+        let replay_manifest_path = root.join("replay-manifest.json");
+        std::fs::write(
+            &replay_manifest_path,
+            serde_json::to_vec_pretty(&replay_manifest).unwrap(),
+        )
+        .unwrap();
+        (replay_artifact_path, replay_manifest_path)
+    }
+
+    fn write_replay_i64_column(group: &mut SerializedRowGroupWriter<'_, File>, values: &[i64]) {
+        let mut column = group.next_column().unwrap().unwrap();
+        column
+            .typed::<Int64Type>()
+            .write_batch(values, None, None)
+            .unwrap();
+        column.close().unwrap();
+    }
+
+    fn write_replay_utf8_column(group: &mut SerializedRowGroupWriter<'_, File>, values: &[String]) {
+        let values = values
+            .iter()
+            .map(|value| ByteArray::from(value.as_str()))
+            .collect::<Vec<_>>();
+        let mut column = group.next_column().unwrap().unwrap();
+        column
+            .typed::<ByteArrayType>()
+            .write_batch(&values, None, None)
+            .unwrap();
+        column.close().unwrap();
+    }
+
     fn rebind_request_to_output_root(
         mut request: CampaignRequest,
         root_name: &str,
@@ -948,35 +1875,47 @@ mod tests {
         let root = format!(
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/{root_name}"
         );
-        request.round.mission_put_url =
-            format!("{root}/campaign-id=placeholder/round=r1/mission.json");
-        request.round.mission_readback_url =
-            format!("{root}/campaign-id=placeholder/round=r1/mission.json?readback=1");
-        request.round.result_put_url =
-            format!("{root}/campaign-id=placeholder/round=r1/results.zip");
-        request.round.result_readback_url =
-            format!("{root}/campaign-id=placeholder/round=r1/results.zip?readback=1");
+        for round in &mut request.rounds {
+            round.mission_put_url = format!(
+                "{root}/campaign-id=placeholder/round={}/mission.json",
+                round.round_id
+            );
+            round.mission_readback_url = format!(
+                "{root}/campaign-id=placeholder/round={}/mission.json?readback=1",
+                round.round_id
+            );
+            round.result_put_url = format!(
+                "{root}/campaign-id=placeholder/round={}/results.zip",
+                round.round_id
+            );
+            round.result_readback_url = format!(
+                "{root}/campaign-id=placeholder/round={}/results.zip?readback=1",
+                round.round_id
+            );
+        }
         request.campaign_result_put_url =
             format!("{root}/campaign-id=placeholder/campaign-result.json");
         request.campaign_result_readback_url =
             format!("{root}/campaign-id=placeholder/campaign-result.json?readback=1");
         request.campaign_id = expected_campaign_id(&request).unwrap();
-        request.round.mission_put_url = format!(
-            "{root}/campaign-id={}/round={}/mission.json",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.mission_readback_url = format!(
-            "{root}/campaign-id={}/round={}/mission.json?readback=1",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.result_put_url = format!(
-            "{root}/campaign-id={}/round={}/results.zip",
-            request.campaign_id, request.round.round_id
-        );
-        request.round.result_readback_url = format!(
-            "{root}/campaign-id={}/round={}/results.zip?readback=1",
-            request.campaign_id, request.round.round_id
-        );
+        for round in &mut request.rounds {
+            round.mission_put_url = format!(
+                "{root}/campaign-id={}/round={}/mission.json",
+                request.campaign_id, round.round_id
+            );
+            round.mission_readback_url = format!(
+                "{root}/campaign-id={}/round={}/mission.json?readback=1",
+                request.campaign_id, round.round_id
+            );
+            round.result_put_url = format!(
+                "{root}/campaign-id={}/round={}/results.zip",
+                request.campaign_id, round.round_id
+            );
+            round.result_readback_url = format!(
+                "{root}/campaign-id={}/round={}/results.zip?readback=1",
+                request.campaign_id, round.round_id
+            );
+        }
         request.campaign_result_put_url = format!(
             "{root}/campaign-id={}/campaign-result.json",
             request.campaign_id

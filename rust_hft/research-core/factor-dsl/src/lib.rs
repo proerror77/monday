@@ -220,8 +220,20 @@ fn validate_live_node(
         }
         FactorAst::Terminal(FactorTerminal::Field(field)) => {
             let current = match field.as_str() {
-                "best_bid" | "best_ask" | "mid_price" | "spread" | "spread_bps" | "bid_size"
-                | "ask_size" | "book_imbalance" => LiveEventDomain::Snapshot,
+                "best_bid"
+                | "best_ask"
+                | "mid_price"
+                | "spread"
+                | "spread_bps"
+                | "bid_size"
+                | "ask_size"
+                | "book_imbalance"
+                | "bid_depth_top5"
+                | "ask_depth_top5"
+                | "book_imbalance_top5"
+                | "weighted_book_imbalance_top5"
+                | "near_depth_concentration_skew_top5"
+                | "vwap_center_deviation_top5_bps" => LiveEventDomain::Snapshot,
                 "open" | "high" | "low" | "close" | "volume" | "trade_count" | "bar_return" => {
                     LiveEventDomain::Bar
                 }
@@ -568,6 +580,26 @@ mod tests {
                 history_rows: 1,
             }
         );
+
+        for field in [
+            "bid_depth_top5",
+            "ask_depth_top5",
+            "book_imbalance_top5",
+            "weighted_book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "vwap_center_deviation_top5_bps",
+        ] {
+            assert_eq!(
+                validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(
+                    field.to_string(),
+                )))
+                .unwrap(),
+                LiveFormulaCapability {
+                    event_domain: LiveEventDomain::Snapshot,
+                    history_rows: 1,
+                }
+            );
+        }
     }
 
     #[test]
@@ -594,7 +626,7 @@ mod tests {
             );
         }
 
-        for field in ["book_imbalance_top5", "ofi_top5", "signal"] {
+        for field in ["ofi_top5", "signal"] {
             let ast = FactorAst::Terminal(FactorTerminal::Field(field.to_string()));
             assert_eq!(
                 validate_live_formula(&ast).unwrap_err(),
