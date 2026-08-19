@@ -1950,6 +1950,7 @@ exercise_rust_baseline_identity() (
   mock_digest=true mock_runtime=true
   verify_runtime_identity() { [[ $mock_runtime == true ]]; }
   verify_legacy_identity() { return 1; }
+  adjudicate_baseline_crash_restart() { return 1; }
   secure_release_directory() { return 0; }
   secure_control_file() { return 0; }
   readlink() {
@@ -1987,6 +1988,7 @@ exercise_rust_bootstrap_identity() (
   mock_digest=true mock_runtime=true
   verify_runtime_identity() { [[ $mock_runtime == true ]]; }
   verify_legacy_identity() { return 1; }
+  adjudicate_baseline_crash_restart() { return 1; }
   secure_release_directory() { return 1; }
   secure_control_file() { [[ -f $1 && ! -L $1 ]]; }
   readlink() {
@@ -2017,6 +2019,342 @@ exercise_rust_bootstrap_identity() (
   return 0
 )
 exercise_rust_bootstrap_identity
+
+# Bounded supervised crash-restart adjudication: a baseline whose software
+# identity (binary digest, cmdline, fragment) is unchanged may be re-pinned
+# after a systemd-supervised crash restart, while every tamper shape — a
+# changed digest, command line, unit, operator restart, stalled health, or
+# restart thrash — still fails closed.
+crash_restart_contract="$tmp_dir/baseline-crash-restart.sh"
+sed -n \
+  -e '/^baseline_crash_restart_journal_evidence() {$/,/^}$/p' \
+  -e '/^adjudicate_baseline_crash_restart() {$/,/^}$/p' \
+  "$GATE" >"$crash_restart_contract"
+crash_identity_contract="$tmp_dir/crash-restart-identity.sh"
+sed -n \
+  -e '/^verify_runtime_identity() {$/,/^}$/p' \
+  -e '/^verify_baseline_identity() {$/,/^}$/p' \
+  "$GATE" >"$crash_identity_contract"
+
+crash_restart_mocks() {
+  systemctl() {
+    if [[ $1 == is-active ]]; then
+      [[ $mock_state == active ]]
+      return
+    fi
+    case "$*" in
+      *ActiveState*) printf '%s\n' "$mock_state" ;;
+      *MainPID*) printf '%s\n' "$mock_main_pid" ;;
+      *FragmentPath*) printf '%s\n' "$mock_fragment" ;;
+      *DropInPaths*) printf '%s\n' "$mock_drop_ins" ;;
+      *NRestarts*) printf '%s\n' "$mock_restarts" ;;
+      *InvocationID*) printf '%s\n' "$mock_invocation" ;;
+      *) return 1 ;;
+    esac
+  }
+  journalctl() {
+    if [[ $* == --sync ]]; then
+      return 0
+    fi
+    case "$mock_journal" in
+      crash)
+        printf '%s\n' \
+          '{"MESSAGE":"polymarket-reference-collector.service: Main process exited, code=exited, status=1/FAILURE"}' \
+          '{"MESSAGE":"polymarket-reference-collector.service: Scheduled restart job, restart counter is at '"$mock_restarts"'."}' \
+          '{"MESSAGE":"Stopped polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape."}' \
+          '{"MESSAGE":"Started polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape."}'
+        ;;
+      signal)
+        printf '%s\n' \
+          '{"MESSAGE":"polymarket-reference-collector.service: Main process exited, code=killed, signal=ABRT"}' \
+          '{"MESSAGE":"polymarket-reference-collector.service: Scheduled restart job, restart counter is at '"$mock_restarts"'."}'
+        ;;
+      manual)
+        printf '%s\n' \
+          '{"MESSAGE":"Stopping polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape..."}' \
+          '{"MESSAGE":"Stopped polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape."}' \
+          '{"MESSAGE":"Started polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape."}'
+        ;;
+      silent)
+        printf '%s\n' \
+          '{"MESSAGE":"Started polymarket-reference-collector.service - Monday Polymarket metadata, trade, and settlement tape."}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  effective_exec_argv() { printf '%s\n' "$mock_exec"; }
+  proc_cmdline() { printf '%s' "$mock_cmdline"; }
+  journal_cursor() { printf 'cursor-%s\n' "$mock_restarts"; }
+  verify_fresh_baseline_health() { [[ $mock_health == true ]]; }
+  sleep() {
+    SECONDS=$((SECONDS + $1))
+    if [[ $mock_settle == true ]]; then
+      mock_state=active
+      mock_main_pid=4343
+    fi
+  }
+}
+
+exercise_baseline_crash_restart_adjudication() (
+  set -euo pipefail
+  LEGACY_UNIT=polymarket-reference-collector.service
+  LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
+  LEGACY_SPOOL="$tmp_dir/crash-restart-spool"
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+  MAX_BASELINE_CRASH_RESTARTS=3
+  BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
+  mkdir -p "$LEGACY_SPOOL"
+  new_invocation_one=$(printf 'b%.0s' {1..32})
+  new_invocation_two=$(printf 'c%.0s' {1..32})
+  reset_crash_scenario() {
+    baseline_crash_restarts=0
+    baseline_crash_restart_evidence='[]'
+    legacy_pid=4242
+    legacy_restarts=1
+    legacy_invocation_id=$(printf 'a%.0s' {1..32})
+    legacy_journal_cursor=cursor-0
+    mock_state=active mock_main_pid=4343 mock_restarts=2
+    mock_invocation=$new_invocation_one
+    mock_fragment=$LEGACY_FRAGMENT mock_drop_ins=
+    mock_exec=$RUST_PRODUCTION_EXEC mock_cmdline="$RUST_PRODUCTION_EXEC "
+    mock_journal=crash mock_health=true mock_settle=true
+    SECONDS=100
+  }
+  crash_restart_mocks
+  # shellcheck source=/dev/null
+  source "$crash_restart_contract"
+
+  reset_crash_scenario
+  adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+    printf 'rejected a pure supervised crash restart\n' >&2
+    exit 1
+  }
+  [[ $legacy_pid == 4343 && $legacy_restarts == 2 \
+    && $legacy_invocation_id == "$new_invocation_one" \
+    && $baseline_crash_restarts == 1 \
+    && $legacy_journal_cursor == cursor-2 ]] || {
+    printf 'crash-restart adjudication did not repin the process identity\n' >&2
+    exit 1
+  }
+  jq -e --arg invocation "$new_invocation_one" '
+    length == 1
+    and .[0].from_main_pid == 4242 and .[0].to_main_pid == 4343
+    and .[0].from_restarts == 1 and .[0].to_restarts == 2
+    and .[0].to_invocation_id == $invocation
+    and (.[0].adjudicated_at | type == "string" and length > 0)' \
+    <<<"$baseline_crash_restart_evidence" >/dev/null || {
+    printf 'crash-restart adjudication did not record audit evidence\n' >&2
+    exit 1
+  }
+  # A second supervised crash restart stays within the Gate-wide bound.
+  mock_main_pid=4545 mock_restarts=3 mock_invocation=$new_invocation_two
+  adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+    printf 'rejected a second in-bound supervised crash restart\n' >&2
+    exit 1
+  }
+  [[ $baseline_crash_restarts == 2 ]] || {
+    printf 'crash-restart adjudication did not accumulate the restart budget\n' >&2
+    exit 1
+  }
+  # A restart sampled inside the RestartSec gap settles before verification.
+  reset_crash_scenario
+  mock_state=activating mock_main_pid=0
+  adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+    printf 'rejected a crash restart sampled inside the RestartSec gap\n' >&2
+    exit 1
+  }
+  # A unit stuck in the restart gap outlasts the bounded settle window.
+  reset_crash_scenario
+  mock_state=activating mock_main_pid=0 mock_settle=false
+  if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC"; then
+    printf 'accepted a baseline stuck inside the restart gap\n' >&2
+    exit 1
+  fi
+  # A signal-killed main process is a supervised crash as well.
+  reset_crash_scenario
+  mock_journal=signal
+  adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+    printf 'rejected a signal-killed supervised crash restart\n' >&2
+    exit 1
+  }
+  # Tamper and failure shapes: each must fail closed without mutating the
+  # pinned identity.
+  for failure in fragment drop_in exec cmdline invocation counter_stalled \
+    over_limit journal_manual journal_silent health_stale unit_failed; do
+    reset_crash_scenario
+    case "$failure" in
+      fragment) mock_fragment=/etc/systemd/system/tampered.service ;;
+      drop_in)
+        mock_drop_ins='/etc/systemd/system/polymarket-reference-collector.service.d/override.conf'
+        ;;
+      exec) mock_exec="$RUST_PRODUCTION_EXEC --once" ;;
+      cmdline) mock_cmdline="$RUST_PRODUCTION_EXEC --once " ;;
+      invocation) mock_invocation=not-an-invocation ;;
+      counter_stalled) mock_restarts=1 ;;
+      over_limit) baseline_crash_restarts=3 ;;
+      journal_manual) mock_journal=manual ;;
+      journal_silent) mock_journal=silent ;;
+      health_stale) mock_health=false ;;
+      unit_failed) mock_state=failed ;;
+    esac
+    if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC"; then
+      printf 'crash-restart adjudication accepted %s\n' "$failure" >&2
+      exit 1
+    fi
+    if [[ $failure == over_limit ]]; then
+      [[ $baseline_crash_restarts == 3 && $legacy_pid == 4242 ]] || {
+        printf 'over-limit rejection mutated the pinned identity\n' >&2
+        exit 1
+      }
+    else
+      [[ $legacy_pid == 4242 && $legacy_restarts == 1 \
+        && $baseline_crash_restarts == 0 ]] || {
+        printf 'failed crash-restart adjudication for %s mutated the pinned identity\n' \
+          "$failure" >&2
+        exit 1
+      }
+    fi
+  done
+  return 0
+)
+exercise_baseline_crash_restart_adjudication
+
+exercise_crash_restart_baseline_identity() (
+  set -euo pipefail
+  baseline_recovery=false baseline_mode=rust_release
+  LEGACY_UNIT=polymarket-reference-collector.service
+  LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
+  LEGACY_SPOOL="$tmp_dir/crash-identity-spool"
+  RUST_ACTIVE_BINARY="$tmp_dir/crash-active"
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
+  MAX_BASELINE_CRASH_RESTARTS=3
+  BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
+  baseline_crash_restarts=0
+  baseline_crash_restart_evidence='[]'
+  legacy_journal_cursor=cursor-0
+  baseline_release_sha=$(printf '9%.0s' {1..64})
+  baseline_release_path="$tmp_dir/$baseline_release_sha/polymarket-raw-ops"
+  mkdir -p "${baseline_release_path%/*}" "$LEGACY_SPOOL"
+  printf 'test\n' >"$baseline_release_path"
+  chmod +x "$baseline_release_path"
+  invocation_one=$(printf 'a%.0s' {1..32})
+  invocation_two=$(printf 'b%.0s' {1..32})
+  invocation_three=$(printf 'c%.0s' {1..32})
+  invocation_four=$(printf 'd%.0s' {1..32})
+  legacy_pid=4242 legacy_restarts=1 legacy_invocation_id=$invocation_one
+  mock_state=active mock_main_pid=4242 mock_restarts=1
+  mock_invocation=$invocation_one
+  mock_fragment=$LEGACY_FRAGMENT mock_drop_ins=
+  mock_exec=$RUST_PRODUCTION_EXEC mock_cmdline="$RUST_PRODUCTION_EXEC "
+  mock_journal=crash mock_health=true mock_settle=true
+  mock_active=$baseline_release_path mock_proc=$baseline_release_path
+  mock_digest=true
+  crash_restart_mocks
+  verify_legacy_identity() { return 1; }
+  verify_contained_recovery_baseline() { return 1; }
+  secure_release_directory() { return 0; }
+  secure_control_file() { return 0; }
+  readlink() {
+    if [[ $3 == "$RUST_ACTIVE_BINARY" ]]; then
+      printf '%s\n' "$mock_active"
+    else
+      printf '%s\n' "$mock_proc"
+    fi
+  }
+  sha256sum() { cat >/dev/null; [[ $mock_digest == true ]]; }
+  # shellcheck source=/dev/null
+  source "$crash_restart_contract"
+  # shellcheck source=/dev/null
+  source "$crash_identity_contract"
+
+  # The exact pinned identity passes without adjudication.
+  verify_baseline_identity || {
+    printf 'rejected the exact pinned Rust baseline identity\n' >&2
+    exit 1
+  }
+  [[ $baseline_crash_restarts == 0 \
+    && $baseline_crash_restart_evidence == '[]' ]] || {
+    printf 'exact baseline identity was adjudicated as a crash restart\n' >&2
+    exit 1
+  }
+  # A pure supervised crash restart (sha/cmdline/fragment unchanged) passes.
+  mock_main_pid=4343 mock_restarts=2 mock_invocation=$invocation_two
+  verify_baseline_identity || {
+    printf 'rejected a pure supervised crash restart\n' >&2
+    exit 1
+  }
+  [[ $legacy_pid == 4343 && $baseline_crash_restarts == 1 ]] || {
+    printf 'crash-restart pass did not repin the baseline process identity\n' >&2
+    exit 1
+  }
+  # A changed command line still fails closed after a crash.
+  mock_main_pid=4545 mock_restarts=3 mock_invocation=$invocation_three
+  mock_cmdline="$RUST_PRODUCTION_EXEC --once "
+  if verify_baseline_identity; then
+    printf 'accepted a baseline command-line change after a crash\n' >&2
+    exit 1
+  fi
+  mock_cmdline="$RUST_PRODUCTION_EXEC "
+  # An operator restart has no scheduled-restart journal evidence.
+  mock_journal=manual
+  if verify_baseline_identity; then
+    printf 'accepted an operator systemctl restart as a crash\n' >&2
+    exit 1
+  fi
+  mock_journal=crash
+  # Stalled post-restart health fails closed.
+  mock_health=false
+  if verify_baseline_identity; then
+    printf 'accepted a crash restart with stalled baseline health\n' >&2
+    exit 1
+  fi
+  mock_health=true
+  [[ $legacy_pid == 4343 && $legacy_restarts == 2 \
+    && $baseline_crash_restarts == 1 ]] || {
+    printf 'rejected crash-restart drift mutated the pinned identity\n' >&2
+    exit 1
+  }
+  # A replaced binary (/proc/exe drift) still fails after adjudication.
+  mock_proc=/tmp/wrong
+  if verify_baseline_identity; then
+    printf 'accepted a replaced baseline binary after a crash restart\n' >&2
+    exit 1
+  fi
+  mock_proc=$baseline_release_path
+  [[ $legacy_pid == 4545 && $baseline_crash_restarts == 2 ]] || {
+    printf 'binary-drift rejection lost the adjudicated identity\n' >&2
+    exit 1
+  }
+  # A changed binary digest still fails after adjudication.
+  mock_main_pid=4646 mock_restarts=4 mock_invocation=$invocation_four
+  mock_digest=false
+  if verify_baseline_identity; then
+    printf 'accepted a baseline digest change after a crash restart\n' >&2
+    exit 1
+  fi
+  mock_digest=true
+  [[ $baseline_crash_restarts == 3 ]] || {
+    printf 'digest-drift rejection lost the adjudicated restart budget\n' >&2
+    exit 1
+  }
+  # The Gate-wide restart bound fails closed against thrash.
+  mock_main_pid=4747 mock_restarts=5 mock_invocation=$invocation_one
+  if verify_baseline_identity; then
+    printf 'accepted baseline crash restarts beyond the bound\n' >&2
+    exit 1
+  fi
+  # The audit trail recorded every adjudicated transition.
+  jq -e 'length == 3
+    and .[0].to_main_pid == 4343 and .[0].to_restarts == 2
+    and .[1].to_main_pid == 4545 and .[1].to_restarts == 3
+    and .[2].to_main_pid == 4646 and .[2].to_restarts == 4' \
+    <<<"$baseline_crash_restart_evidence" >/dev/null || {
+    printf 'crash-restart audit trail is incomplete\n' >&2
+    exit 1
+  }
+  return 0
+)
+exercise_crash_restart_baseline_identity
 
 bootstrap_baseline_selection="$tmp_dir/bootstrap-baseline-selection.sh"
 sed -n '/^  baseline_exec=$(effective_exec_argv/,/^  esac$/p' "$GATE" \
@@ -3972,6 +4310,7 @@ jq \
     baseline_emission:"continuous",
     parity_verifier:null,
     finalization_progress:null,
+    baseline_crash_restarts:[],
     baseline_health_start_required:true,
     baseline_runtime_stability_required:true,
     baseline_health_completion_required:true,
@@ -4898,6 +5237,61 @@ release_sha|.legacy_runtime.release_sha256 = "not-a-digest"
 proc_exe|.legacy_runtime.proc_exe = "/tmp/polymarket-raw-ops"
 candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
 EOF
+# An adjudicated supervised crash restart records the process-identity
+# transition; the recorded legacy runtime is the final adjudicated process.
+jq '.legacy_runtime.main_pid = 4343
+  | .legacy_runtime.restarts = 2
+  | .legacy_runtime.invocation_id = ("2" * 32)
+  | .baseline_crash_restarts = [{
+      adjudicated_at:"1970-01-01T00:30:00Z",
+      from_main_pid:12,to_main_pid:4343,
+      from_invocation_id:("1" * 32),to_invocation_id:("2" * 32),
+      from_restarts:0,to_restarts:2}]
+' "$tmp_dir/rust-release-gate.json" >"$tmp_dir/crash-restart-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/crash-restart-gate.json" >/dev/null || {
+  printf 'gate policy rejected an adjudicated supervised crash restart\n' >&2
+  exit 1
+}
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/crash-restart-gate.json" \
+    >"$tmp_dir/crash-restart-$name.json"
+  if jq -e -f "$POLICY" "$tmp_dir/crash-restart-$name.json" >/dev/null; then
+    printf 'gate policy accepted crash-restart evidence with %s\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+stale_runtime|.legacy_runtime.main_pid = 12
+stale_invocation|.legacy_runtime.invocation_id = ("1" * 32)
+stale_restarts|.legacy_runtime.restarts = 0
+backwards_counter|.baseline_crash_restarts[0].to_restarts = 0
+reused_invocation|.baseline_crash_restarts[0].to_invocation_id = ("1" * 32)
+EOF
+# Adjudicated restarts only exist for a digest-pinned Rust baseline.
+jq '.baseline_crash_restarts = [{
+    adjudicated_at:"1970-01-01T00:30:00Z",
+    from_main_pid:10,to_main_pid:4343,
+    from_invocation_id:("1" * 32),to_invocation_id:("2" * 32),
+    from_restarts:1,to_restarts:2}]
+' "$tmp_dir/gate.json" >"$tmp_dir/legacy-crash-restart-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/legacy-crash-restart-gate.json" >/dev/null; then
+  printf 'gate policy accepted crash-restart adjudication for the legacy-Python baseline\n' >&2
+  exit 1
+fi
+# The Gate-wide adjudicated restart budget is three.
+jq '[range(0; 4) | {
+    adjudicated_at:"1970-01-01T00:30:00Z",
+    from_main_pid:(12 + .),to_main_pid:(13 + .),
+    from_invocation_id:("1" * 32),to_invocation_id:("2" * 32),
+    from_restarts:.,to_restarts:(. + 1)}] as $restarts
+  | .baseline_crash_restarts = $restarts
+  | .legacy_runtime.main_pid = 16
+  | .legacy_runtime.restarts = 4
+  | .legacy_runtime.invocation_id = ("2" * 32)
+' "$tmp_dir/rust-release-gate.json" >"$tmp_dir/crash-restart-thrash-gate.json"
+if jq -e -f "$POLICY" "$tmp_dir/crash-restart-thrash-gate.json" >/dev/null; then
+  printf 'gate policy accepted four adjudicated crash restarts\n' >&2
+  exit 1
+fi
 jq '.baseline_mode = "rust_bootstrap"
   | .comparison_mode = "rust_self"
   | .trade_parity_mode = "rust_self"
@@ -6148,6 +6542,13 @@ grep -Fq 'shadow_restarts=$(systemctl show --property=NRestarts' "$GATE"
 grep -Fq 'legacy_restarts=$(systemctl show --property=NRestarts' "$GATE"
 grep -Fq \
   'verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"' \
+  "$GATE"
+grep -Fq 'readonly MAX_BASELINE_CRASH_RESTARTS=3' "$GATE"
+grep -Fq \
+  '|| adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || return 1' \
+  "$GATE"
+grep -Fq \
+  'baseline_crash_restart_journal_evidence "$legacy_journal_cursor" "$restarts"' \
   "$GATE"
 grep -Fq \
   'verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \

@@ -38,6 +38,21 @@ def runtime_identity($exec; $digest):
   and (.invocation_id | type == "string" and test("^[a-f0-9]{32}$"));
 def nonnegative_sub($left; $right):
   if $left < $right then 0 else ($left - $right) end;
+# One adjudicated supervised crash restart: the software identity stayed
+# pinned while the process identity moved forward exactly once under systemd
+# supervision (see adjudicate_baseline_crash_restart in the Gate).
+def crash_restart_adjudication:
+  type == "object"
+  and (.adjudicated_at | utc_iso8601_unix | type == "number")
+  and (.from_main_pid | positive_integer)
+  and (.to_main_pid | positive_integer)
+  and .to_main_pid != .from_main_pid
+  and (.from_invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+  and (.to_invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+  and .to_invocation_id != .from_invocation_id
+  and (.from_restarts | nonnegative_integer)
+  and (.to_restarts | positive_integer)
+  and .to_restarts > .from_restarts;
 def bounded_legacy_trade_rate_limits:
   . as $snapshot
   | ($snapshot.target_markets
@@ -171,6 +186,21 @@ and (.parity_window_ended_at_unix
   <= ((.started_at | utc_iso8601_unix) + .duration_seconds))
 and .production_eligible == true
 and .passed == true
+and (.baseline_crash_restarts | type == "array" and length <= 3
+  and all(.[]; crash_restart_adjudication)
+  and ([range(1; length) as $i
+      | .[$i].from_restarts >= .[$i - 1].to_restarts] | all)
+  and (((map(.to_restarts - .from_restarts) | add) // 0) <= 3))
+and (if (.baseline_crash_restarts | length) == 0 then true
+  else
+    # Adjudicated restarts only exist for a digest-pinned Rust baseline, and
+    # the recorded legacy runtime must be the final adjudicated process.
+    .baseline_mode != "legacy_python" and .recovery == null
+    and .baseline_crash_restarts[-1].to_main_pid == .legacy_runtime.main_pid
+    and (.baseline_crash_restarts[-1].to_invocation_id
+      == .legacy_runtime.invocation_id)
+    and .baseline_crash_restarts[-1].to_restarts == .legacy_runtime.restarts
+  end)
 and (
   (
     .baseline_mode == "legacy_python"

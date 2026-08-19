@@ -41,6 +41,14 @@ readonly LEGACY_RUNTIME_MAX_SECONDS=21600
 readonly LEGACY_RUNTIME_RESERVE_SECONDS=60
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
+# Bounded supervised crash-restart adjudication: see
+# adjudicate_baseline_crash_restart. At most this many baseline restarts may
+# be re-admitted per Gate; beyond the bound the Gate fails closed against
+# restart thrash. The settle window outlasts the baseline unit's RestartSec=5
+# so an observation sample that lands inside the supervised restart gap sees
+# the restarted process, never a transient empty MainPID.
+readonly MAX_BASELINE_CRASH_RESTARTS=3
+readonly BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
 # Mirrors TAPE_WINDOW_LOOKBACK_SECONDS in the parity verifier
 # (rust_hft/tools/collector/src/polymarket_parity.rs): the verifier reads
 # baseline tapes rotated within one hour before the parity window.
@@ -459,6 +467,107 @@ legacy_runtime_budget_observation() {
   ((remaining >= required))
 }
 
+# Bounded supervised crash-restart adjudication (issues #919 and #933): the
+# Gate pins the baseline *software* identity — the immutable release digest,
+# the exact command line, and the exact unit fragment — not one process ID. A
+# collector that crashes and is restarted by systemd (Restart=always) changes
+# only its process identity (MainPID, InvocationID, NRestarts), which the
+# strict check rejects. Such a transition is re-admitted only when every
+# condition holds:
+#   1. the unit fragment, drop-ins, and effective ExecStart are unchanged;
+#   2. the running process command line is unchanged;
+#   3. the baseline binary digest is unchanged — verify_baseline_identity
+#      re-verifies the pinned release sha256 and /proc/<new-pid>/exe
+#      immediately after this adjudication returns;
+#   4. NRestarts advanced strictly, and the running total of adjudicated
+#      restarts in this Gate stays within MAX_BASELINE_CRASH_RESTARTS, so
+#      restart thrash still fails closed;
+#   5. baseline health is still fresh and fail-closed clean, so a restarted
+#      process that stopped publishing cannot be admitted;
+#   6. the journal since the last verified identity shows the previous main
+#      process exiting with a failure status or signal and systemd's
+#      automatic "Scheduled restart job" record naming the new restart
+#      counter, with no operator "Stopping" record — an operator
+#      `systemctl restart` stops the unit explicitly and never schedules a
+#      restart job, so manual intervention still fails closed.
+# A swapped binary, a changed command line, or a replaced unit never
+# satisfies the hard conditions, so real tampering keeps failing closed.
+baseline_crash_restart_journal_evidence() {
+  local cursor=$1 restarts=$2
+  journalctl --sync || return 1
+  journalctl --unit "$LEGACY_UNIT" --after-cursor "$cursor" --output=json \
+    --no-pager \
+    | jq -s -e --argjson restarts "$restarts" '
+      def msg: .MESSAGE // "";
+      all(.[]; (msg | test("^Stopping ")) | not)
+      and any(.[]; msg
+        | (test("Main process exited, code=exited, status=[1-9][0-9]*/FAILURE")
+          or test("Main process exited, code=killed, signal=")))
+      and any(.[]; msg
+        | test("Scheduled restart job, restart counter is at "
+            + ($restarts | tostring) + "\\."))
+    ' >/dev/null
+}
+
+adjudicate_baseline_crash_restart() {
+  local expected_exec=$1 state pid restarts invocation_id deadline
+  # Outlast the unit's RestartSec so a sample inside the supervised restart
+  # gap sees the settled process instead of a transient empty MainPID.
+  deadline=$((SECONDS + BASELINE_CRASH_RESTART_SETTLE_SECONDS))
+  while :; do
+    state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT") \
+      || return 1
+    [[ $state == active || $state == activating ]] || return 1
+    pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT") || return 1
+    if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then
+      break
+    fi
+    ((SECONDS < deadline)) || return 1
+    sleep 1
+  done
+  # Hard software identity: fragment, drop-ins, effective ExecStart, and the
+  # live command line must match the pinned baseline exactly.
+  [[ $(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") \
+    == "$LEGACY_FRAGMENT" ]] || return 1
+  [[ -z $(systemctl show --property=DropInPaths --value "$LEGACY_UNIT") ]] \
+    || return 1
+  [[ $(effective_exec_argv "$LEGACY_UNIT") == "$expected_exec" ]] || return 1
+  [[ $(proc_cmdline "$pid") == "$expected_exec " ]] || return 1
+  restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT") \
+    || return 1
+  [[ $restarts =~ ^[0-9]+$ ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT") \
+    || return 1
+  [[ $invocation_id =~ ^[a-f0-9]{32}$ ]] || return 1
+  # Process identity may only move forward under supervision: a strictly
+  # increasing restart counter and a fresh invocation within the thrash bound.
+  ((restarts > legacy_restarts)) || return 1
+  ((baseline_crash_restarts + restarts - legacy_restarts \
+    <= MAX_BASELINE_CRASH_RESTARTS)) || return 1
+  baseline_crash_restart_journal_evidence "$legacy_journal_cursor" "$restarts" \
+    || return 1
+  verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" || return 1
+  baseline_crash_restart_evidence=$(jq -c \
+    --argjson from_pid "$legacy_pid" --argjson to_pid "$pid" \
+    --arg from_invocation "$legacy_invocation_id" \
+    --arg to_invocation "$invocation_id" \
+    --argjson from_restarts "$legacy_restarts" \
+    --argjson to_restarts "$restarts" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + [{adjudicated_at:$at,from_main_pid:$from_pid,to_main_pid:$to_pid,
+      from_invocation_id:$from_invocation,to_invocation_id:$to_invocation,
+      from_restarts:$from_restarts,to_restarts:$to_restarts}]' \
+    <<<"$baseline_crash_restart_evidence") || return 1
+  baseline_crash_restarts=$((baseline_crash_restarts \
+    + restarts - legacy_restarts))
+  printf 'adjudicated supervised baseline crash restart: pid %s -> %s, restarts %s -> %s\n' \
+    "$legacy_pid" "$pid" "$legacy_restarts" "$restarts" >&2
+  legacy_pid=$pid
+  legacy_restarts=$restarts
+  legacy_invocation_id=$invocation_id
+  legacy_journal_cursor=$(journal_cursor "$LEGACY_UNIT") || return 1
+}
+
 verify_baseline_identity() {
   if [[ ${baseline_recovery:-false} == true ]]; then
     verify_contained_recovery_baseline "$recovery_json" "$candidate_sha" \
@@ -466,11 +575,15 @@ verify_baseline_identity() {
     return
   fi
   if [[ $baseline_mode == legacy_python ]]; then
+    # The retiring legacy-Python lane has no immutable binary digest to bind,
+    # so its process identity stays exact; supervised crash-restart
+    # adjudication covers only the digest-pinned Rust baselines.
     verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
     return
   fi
   verify_runtime_identity "$RUST_PRODUCTION_EXEC" "$legacy_pid" \
-    "$legacy_restarts" "$legacy_invocation_id" || return 1
+    "$legacy_restarts" "$legacy_invocation_id" \
+    || adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || return 1
   if [[ $baseline_mode == rust_bootstrap ]]; then
     [[ $baseline_release_path == "$RUST_ACTIVE_BINARY" \
       && -f $RUST_ACTIVE_BINARY && ! -L $RUST_ACTIVE_BINARY ]] || return 1
@@ -1569,6 +1682,9 @@ recovery_json=$(jq -c '.recovery // null' \
 legacy_pid=0
 legacy_restarts=0
 legacy_invocation_id=
+legacy_journal_cursor=
+baseline_crash_restarts=0
+baseline_crash_restart_evidence='[]'
 if [[ $recovery_json != null ]]; then
   baseline_mode=rust_bootstrap
   baseline_label='contained Rust bootstrap'
@@ -1628,6 +1744,10 @@ else
   legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
   [[ $legacy_invocation_id =~ ^[a-f0-9]{32}$ ]] \
     || die 'active legacy collector has no verifiable systemd invocation ID'
+  # Journal position of the pinned identity: a later supervised crash restart
+  # must prove its crash/restart evidence strictly after this cursor.
+  legacy_journal_cursor=$(journal_cursor "$LEGACY_UNIT") \
+    || die 'active legacy collector has no verifiable journal cursor'
 fi
 if [[ $baseline_recovery == true ]]; then
   verify_recovery_admission "$recovery_json" "$candidate_sha" "$source_revision" \
@@ -1900,7 +2020,7 @@ while :; do
   if [[ $baseline_mode == rust_release || $baseline_mode == rust_bootstrap \
     || $LEGACY_RUNTIME_STABILITY_REQUIRED == true ]]; then
     verify_baseline_identity \
-      || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
+      || die 'baseline collector identity changed during gate and is not an admissible supervised crash restart'
   fi
   if baseline_health_requires_continuous_freshness "$baseline_mode"; then
     legacy_health="$LEGACY_SPOOL/health.json"
@@ -2355,6 +2475,7 @@ jq \
   --arg completed_at "$completed_at" \
   --arg baseline_mode "$baseline_mode" \
   --argjson recovery "$recovery_evidence" --argjson legacy_runtime "$legacy_runtime_json" \
+  --argjson baseline_crash_restarts "$baseline_crash_restart_evidence" \
   --arg shadow_exec "$shadow_exec_argv" \
   --arg shadow_cmdline "$shadow_cmdline_argv" \
   --arg shadow_invocation_id "$shadow_invocation_id" \
@@ -2436,6 +2557,7 @@ jq \
     finalization_progress:$finalization_progress,
     recovery:$recovery,
     legacy_runtime:$legacy_runtime,
+    baseline_crash_restarts:$baseline_crash_restarts,
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
       fragment_path:$shadow_fragment_path,drop_in_paths:$shadow_drop_in_paths,
       main_pid:$shadow_pid,restarts:$shadow_restarts,

@@ -571,7 +571,21 @@ writer identity; the hardlinked baseline tape snapshot in the evidence
 directory is the parity input and Python remains
 untouched for rollback. Cutover binds the current canonical Python identity only
 for its short transition. An active immutable Rust baseline still freezes its PID,
-systemd restart counter, and `InvocationID` throughout the Gate. After the baseline
+systemd restart counter, and `InvocationID` throughout the Gate, with one bounded
+exception: the pinned identity is the baseline *software* — the immutable release
+digest, the exact command line, and the exact unit fragment — not one process.
+If the baseline collector crashes and systemd (`Restart=always`) restarts it, the
+Gate re-admits the new MainPID and `InvocationID` only when the fragment,
+drop-ins, effective `ExecStart`, live command line, and release digest (re-bound
+through `/proc/<new-pid>/exe`) are all unchanged, the baseline health file is
+still fresh and fail-closed clean, and the journal since the last verified
+identity shows the failed main process plus systemd's automatic
+`Scheduled restart job` record for the new restart counter with no operator
+`Stopping` record — an operator `systemctl restart` never schedules a restart
+job, so manual intervention still fails closed. At most three such supervised
+crash restarts may be adjudicated per Gate; beyond that bound, or on any other
+identity change, the Gate fails closed. Every adjudicated transition is recorded
+in the gate evidence under `baseline_crash_restarts`. After the baseline
 writer is stopped, cutover explicitly resets the inherited counter and requires the
 new Rust process to remain at zero for post-start verification.
 PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
