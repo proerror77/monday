@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
@@ -2740,8 +2740,107 @@ fn ensure_upload_staging_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// A closed tape whose final bytes are not newline-terminated carries a torn
+// tail: the recorder crashed mid-line (the 2026-08-18 ENOSPC incident, #919)
+// and rotation later closed the segment around the partial record. Those
+// bytes can never become a valid record, but rejecting the segment
+// fail-closed stalled the whole upload queue on every pass. The repair
+// truncates only the unterminated tail of a rotated (closed) tape, audits
+// it, and lets the normal scan re-validate every kept line, so mid-tape
+// corruption, sequence gaps, and identity mismatches still fail closed.
+// Tails longer than this window are indistinguishable from mid-tape
+// corruption and refuse repair instead.
+const TORN_TAIL_REPAIR_WINDOW_BYTES: u64 = 1024 * 1024;
+
+fn complete_line_count(file: &File) -> Result<usize> {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut lines = 0_usize;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(lines);
+        }
+        if line.ends_with(b"\n") {
+            lines += 1;
+        }
+    }
+}
+
+fn audit_torn_tail_repair(
+    spool_dir: &Path,
+    source: &Path,
+    line_number: usize,
+    truncated_bytes: u64,
+    kept_bytes: u64,
+) -> Result<()> {
+    let record = json!({
+        "repaired_at": utc_now(),
+        "source": source.file_name().and_then(|name| name.to_str()),
+        "line_number": line_number,
+        "truncated_bytes": truncated_bytes,
+        "kept_bytes": kept_bytes,
+    });
+    eprintln!("Polymarket tape torn tail truncated: {record}");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool_dir.join("repaired-tape-tails.log"))?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Truncate the unterminated final record of a closed tape, returning the
+/// truncated byte count when a repair ran. `Ok(None)` means the tape already
+/// ends with a newline and was left untouched.
+fn repair_torn_tail(source: &Path) -> Result<Option<u64>> {
+    let identity = regular_identity(source)?;
+    if identity.bytes == 0 {
+        return Ok(None);
+    }
+    let file = File::open(source).with_context(|| format!("open tape {}", source.display()))?;
+    if FileIdentity::from_metadata(&file.metadata()?) != identity {
+        bail!("tape changed while being opened; refusing to repair an active file");
+    }
+    let window_bytes = identity.bytes.min(TORN_TAIL_REPAIR_WINDOW_BYTES);
+    let mut window = vec![0_u8; window_bytes as usize];
+    file.read_exact_at(&mut window, identity.bytes - window_bytes)?;
+    if window.ends_with(b"\n") {
+        return Ok(None);
+    }
+    let Some(last_newline) = window.iter().rposition(|byte| *byte == b'\n') else {
+        bail!(
+            "tape {} ends with more than {TORN_TAIL_REPAIR_WINDOW_BYTES} unterminated bytes; \
+             refusing to repair possible mid-tape corruption",
+            source.display()
+        );
+    };
+    let kept_bytes = identity.bytes - window_bytes + last_newline as u64 + 1;
+    let truncated_bytes = identity.bytes - kept_bytes;
+    let line_number = complete_line_count(&file)? + 1;
+    // Re-verify identity immediately before mutating: a changed file is an
+    // active tape, whose unterminated tail is a write in progress.
+    ensure_identity(source, identity)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(source)
+        .with_context(|| format!("open tape {} for torn tail repair", source.display()))?;
+    file.set_len(kept_bytes)?;
+    file.sync_all()?;
+    let spool_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    audit_torn_tail_repair(spool_dir, source, line_number, truncated_bytes, kept_bytes)?;
+    Ok(Some(truncated_bytes))
+}
+
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
     let _archive_activity = ArchiveActivity::enter();
+    // Only rotated (closed) tapes reach this path via discover_rotated_tapes;
+    // the active tape keeps its in-progress tail untouched.
+    repair_torn_tail(source)?;
     let source_scan = {
         let _seal_phase = PhaseAttribution::new("seal_lookup");
         matching_tape_seal(source, config)?
@@ -4601,6 +4700,111 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires price and size"));
+    }
+
+    fn write_torn_tape(root: &Path, name: &str, rows: &[Value], tail: &[u8]) -> PathBuf {
+        let path = write_tape(root, name, rows);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(tail).unwrap();
+        file.sync_all().unwrap();
+        path
+    }
+
+    #[test]
+    fn torn_tail_on_closed_segment_is_truncated_and_audited() {
+        let root = TestDir::new();
+        let tape = write_torn_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+            b"{\"sequence\":3,\"recorded_at\":\"2026-07-15T01:00",
+        );
+        let torn_bytes = fs::metadata(&tape).unwrap().len();
+        // The pre-repair failure mode from #919: the scan rejects the closed
+        // segment and the segment stalls the upload queue on every pass.
+        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete record"));
+
+        let truncated = repair_torn_tail(&tape)
+            .unwrap()
+            .expect("torn tail must be repaired");
+
+        assert_eq!(
+            truncated,
+            torn_bytes - fs::metadata(&tape).unwrap().len()
+        );
+        scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        let audit: Value = serde_json::from_str(
+            fs::read_to_string(root.path().join("repaired-tape-tails.log"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(audit["source"], "market-updates.20260715T010000.ndjson");
+        assert_eq!(audit["line_number"], 4);
+        assert_eq!(audit["truncated_bytes"], truncated);
+        assert_eq!(
+            audit["kept_bytes"],
+            fs::metadata(&tape).unwrap().len()
+        );
+        assert!(audit["repaired_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn terminated_closed_segment_is_not_repaired() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let before = fs::read(&tape).unwrap();
+
+        assert_eq!(repair_torn_tail(&tape).unwrap(), None);
+
+        assert_eq!(fs::read(&tape).unwrap(), before);
+        assert!(!root.path().join("repaired-tape-tails.log").exists());
+    }
+
+    #[test]
+    fn torn_tail_repair_keeps_mid_tape_corruption_fail_closed() {
+        let root = TestDir::new();
+        let mut rows = sample_rows();
+        rows[1]["update"]["bid"] = json!("not-a-number");
+        let tape = write_torn_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &rows,
+            b"{\"sequence\":3",
+        );
+
+        repair_torn_tail(&tape).unwrap();
+
+        assert!(scan_tape(&tape, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("bid must be numeric"));
+    }
+
+    #[test]
+    fn unterminated_run_beyond_repair_window_fails_closed() {
+        let root = TestDir::new();
+        let tail = vec![b'{'; (TORN_TAIL_REPAIR_WINDOW_BYTES + 1) as usize];
+        let tape = write_torn_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+            &tail,
+        );
+        let before = fs::metadata(&tape).unwrap().len();
+
+        let error = repair_torn_tail(&tape).unwrap_err().to_string();
+
+        assert!(error.contains("refusing to repair"));
+        assert_eq!(fs::metadata(&tape).unwrap().len(), before);
+        assert!(!root.path().join("repaired-tape-tails.log").exists());
     }
 
     #[test]
