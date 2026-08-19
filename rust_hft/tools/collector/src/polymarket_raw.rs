@@ -54,6 +54,14 @@ const MAX_TRADE_ROWS_PER_SNAPSHOT: usize = 20_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
+// Retention horizon for settled market state. Once a settled market's
+// end_time and its settlement observation are both older than this window,
+// the entry is never consulted again for settlement and its trade
+// finalization window has fully elapsed — the production first-aid prune of
+// 2026-08 deleted exactly these rows. Without eviction the state file grows
+// monotonically until it crosses max_markets and the fail-closed bound wedges
+// the collector into a restart loop.
+pub const DEFAULT_SETTLED_STATE_RETENTION_SECS: i64 = 172_800;
 pub const DEFAULT_TRADE_REQUEST_SPACING_MS: u64 = 125;
 // Default cap on one active tape's bytes before fail-closed rotation. At
 // tick-level recording a single UTC-hour tape reached 20-25 GiB (#655), and
@@ -247,6 +255,7 @@ pub struct ReferenceConfig {
     pub market_lookback_secs: i64,
     pub settlement_lookback_secs: i64,
     pub max_markets: usize,
+    pub settled_state_retention_secs: i64,
     pub max_trade_polls_per_cycle: usize,
     pub max_concurrent_trade_polls: usize,
     pub http_timeout: Duration,
@@ -275,6 +284,7 @@ impl Default for ReferenceConfig {
             market_lookback_secs: 7_200,
             settlement_lookback_secs: 86_400,
             max_markets: DEFAULT_MAX_MARKETS_PER_LANE,
+            settled_state_retention_secs: DEFAULT_SETTLED_STATE_RETENTION_SECS,
             max_trade_polls_per_cycle: DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
             max_concurrent_trade_polls: DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
             http_timeout: Duration::from_secs(20),
@@ -295,6 +305,7 @@ impl ReferenceConfig {
             || self.market_lookback_secs <= 0
             || self.settlement_lookback_secs <= 0
             || self.max_markets == 0
+            || self.settled_state_retention_secs <= 0
             || self.max_trade_polls_per_cycle == 0
             || self.max_concurrent_trade_polls == 0
             || self.http_timeout.is_zero()
@@ -2425,6 +2436,59 @@ fn validate_state_bounds(state: &CollectorState, max_markets: usize) -> Result<(
     Ok(())
 }
 
+// Evict settled markets once both their end_time and their settlement
+// observation are older than the retention horizon. Unsettled markets always
+// stay: they still owe settlement evidence, and the overdue-unresolved check
+// below is the fail-closed guard for them. A market that only just settled
+// keeps the full window after settlement_seen_at for trade finalization —
+// disputed resolutions routinely settle days after end_time, and their
+// resolution-time trades are still fresh in the bounded trade feed. Only
+// after that window does a settled entry stop being polled, so retaining it
+// would merely inflate collector-state.json toward the fail-closed
+// max_markets bound. Entries missing settlement_seen_at (pre-migration
+// state) or with an unparseable end_time fall back to the end_time check
+// alone, matching the manual first-aid prune; an unparseable end_time is
+// kept rather than evicted on a guess.
+fn evict_retired_market_state(
+    state: &mut CollectorState,
+    now: DateTime<Utc>,
+    retention_secs: i64,
+) -> bool {
+    let horizon = now - TimeDelta::seconds(retention_secs);
+    let prior_market_count = state.markets.len();
+    state.markets.retain(|_, tracked| {
+        if !tracked.settled {
+            return true;
+        }
+        if parse_optional_datetime(tracked.end_time.as_deref())
+            .is_none_or(|end_time| end_time >= horizon)
+        {
+            return true;
+        }
+        // Past the end_time horizon: keep the entry until the
+        // post-settlement finalization window has also fully elapsed.
+        // Pre-migration entries have no settlement observation to honor;
+        // an unparseable one is kept rather than evicted on a guess.
+        match &tracked.settlement_seen_at {
+            None => false,
+            Some(_) => parse_optional_datetime(tracked.settlement_seen_at.as_deref())
+                .is_none_or(|settled_at| settled_at >= horizon),
+        }
+    });
+    if state.markets.len() == prior_market_count {
+        return false;
+    }
+    let retained_conditions = state
+        .markets
+        .values()
+        .filter_map(|tracked| tracked.condition_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .recovered_trade_ids
+        .retain(|condition_id, _| retained_conditions.contains(condition_id));
+    true
+}
+
 fn validate_cycle_hour(target_hour: &str, recorded_at: DateTime<Utc>) -> Result<()> {
     if hour_key(recorded_at) != target_hour {
         bail!("collector cycle crossed a UTC-hour boundary; retrying with fresh context");
@@ -2504,11 +2568,14 @@ impl ReferenceCollector {
             cache_release?;
         }
         let state_scoped = retain_requested_market_state(&mut state, &config.market_ids);
+        let state_evicted =
+            evict_retired_market_state(&mut state, startup_at, config.settled_state_retention_secs);
         writer.recovery_pending = !state.recovered_trade_ids.is_empty();
         validate_state_bounds(&state, config.max_markets)?;
         // Rewrite old state once so the obsolete retained-ID map is removed.
         // The active tape remains the crash-recovery source until it is rotated.
-        if state_migrated || recovered_active || state_scoped || state_path.exists() {
+        if state_migrated || recovered_active || state_scoped || state_evicted || state_path.exists()
+        {
             atomic_write_json(&state_path, &state)?;
         }
         if recovered_active {
@@ -3129,6 +3196,11 @@ impl ReferenceCollector {
 
         let mut overdue_unresolved_markets = Vec::new();
         let mut invalid_end_time_markets = Vec::new();
+        evict_retired_market_state(
+            &mut next_state,
+            now,
+            self.config.settled_state_retention_secs,
+        );
         for (market_id, tracked) in &next_state.markets {
             match settlement_is_overdue(tracked, now, self.config.settlement_lookback_secs) {
                 Ok(true) => overdue_unresolved_markets.push(market_id.clone()),
@@ -4841,6 +4913,134 @@ mod tests {
 
         state.markets.pop_last();
         assert!(validate_state_bounds(&state, 1).is_ok());
+    }
+
+    #[test]
+    fn retired_settled_markets_are_evicted_while_live_work_is_retained() {
+        let now = fixed_time("2026-08-18T00:00:00Z");
+        let retention_secs = DEFAULT_SETTLED_STATE_RETENTION_SECS;
+        let tracked = |condition_id: &str, end_time: &str, settled: bool, trade_complete: bool| {
+            TrackedMarket {
+                condition_id: Some(condition_id.to_owned()),
+                end_time: Some(end_time.to_owned()),
+                settled,
+                trade_complete,
+                ..TrackedMarket::default()
+            }
+        };
+        let mut state = CollectorState::default();
+        // Older than the 48h retention horizon with no settlement_seen_at
+        // (pre-migration state): evicted whether or not trade finalization
+        // completed, matching the production first-aid prune.
+        state.markets.insert(
+            "settled-complete-old".to_owned(),
+            tracked("cond-complete-old", "2026-08-15T00:00:00Z", true, true),
+        );
+        state.markets.insert(
+            "settled-incomplete-old".to_owned(),
+            tracked("cond-incomplete-old", "2026-08-15T00:00:00Z", true, false),
+        );
+        // Settled long before the horizon and never finalized: the zombie
+        // shape that wedged production, evicted once the post-settlement
+        // finalization window has fully elapsed.
+        let mut zombie = tracked("cond-zombie", "2026-08-15T00:00:00Z", true, false);
+        zombie.settlement_seen_at = Some("2026-08-15T01:00:00Z".to_owned());
+        state.markets.insert("settled-zombie-old".to_owned(), zombie);
+        // A disputed market that resolved days after its end_time: settlement
+        // was only observed just now, so the full window remains for trade
+        // finalization and the entry must not be evicted in the same cycle.
+        let mut late = tracked("cond-late", "2026-08-15T00:00:00Z", true, false);
+        late.settlement_seen_at = Some("2026-08-17T23:30:00Z".to_owned());
+        state.markets.insert("settled-late-resolution".to_owned(), late);
+        // Inside the horizon: retained for the finalization pipeline.
+        state.markets.insert(
+            "settled-complete-recent".to_owned(),
+            tracked("cond-complete-recent", "2026-08-17T00:00:00Z", true, true),
+        );
+        state.markets.insert(
+            "settled-incomplete-recent".to_owned(),
+            tracked("cond-incomplete-recent", "2026-08-17T00:00:00Z", true, false),
+        );
+        // Unsettled markets are never evicted, however old.
+        state.markets.insert(
+            "unsettled-old".to_owned(),
+            tracked("cond-unsettled-old", "2026-08-15T00:00:00Z", false, false),
+        );
+        // An unparseable end_time is retained rather than evicted on a guess.
+        state.markets.insert(
+            "settled-invalid-end-time".to_owned(),
+            tracked("cond-invalid", "not-a-timestamp", true, true),
+        );
+        state
+            .recovered_trade_ids
+            .insert("cond-complete-old".to_owned(), BTreeSet::from(["t1".to_owned()]));
+        state
+            .recovered_trade_ids
+            .insert("cond-unsettled-old".to_owned(), BTreeSet::from(["t2".to_owned()]));
+
+        assert!(evict_retired_market_state(&mut state, now, retention_secs));
+        let retained = state.markets.keys().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            retained,
+            BTreeSet::from([
+                "settled-complete-recent".to_owned(),
+                "settled-incomplete-recent".to_owned(),
+                "settled-late-resolution".to_owned(),
+                "unsettled-old".to_owned(),
+                "settled-invalid-end-time".to_owned(),
+            ])
+        );
+        assert!(!state.recovered_trade_ids.contains_key("cond-complete-old"));
+        assert!(state.recovered_trade_ids.contains_key("cond-unsettled-old"));
+        // A second pass over the retained set changes nothing.
+        assert!(!evict_retired_market_state(&mut state, now, retention_secs));
+    }
+
+    #[test]
+    fn eviction_brings_organically_grown_state_back_under_the_market_limit() {
+        let now = fixed_time("2026-08-18T00:00:00Z");
+        let max_markets = 8;
+        let mut state = CollectorState::default();
+        // The incident shape: thousands of settled rows older than 48h plus a
+        // small live set push the state past the fail-closed bound.
+        for index in 0..max_markets {
+            state.markets.insert(
+                format!("settled-old-{index}"),
+                TrackedMarket {
+                    end_time: Some("2026-08-15T00:00:00Z".to_owned()),
+                    settled: true,
+                    trade_complete: true,
+                    ..TrackedMarket::default()
+                },
+            );
+        }
+        state.markets.insert(
+            "live-unsettled".to_owned(),
+            TrackedMarket {
+                end_time: Some("2026-08-18T01:00:00Z".to_owned()),
+                ..TrackedMarket::default()
+            },
+        );
+        assert!(validate_state_bounds(&state, max_markets).is_err());
+
+        assert!(evict_retired_market_state(
+            &mut state,
+            now,
+            DEFAULT_SETTLED_STATE_RETENTION_SECS
+        ));
+        assert!(validate_state_bounds(&state, max_markets).is_ok());
+        assert!(state.markets.contains_key("live-unsettled"));
+    }
+
+    #[test]
+    fn default_config_retains_settled_state_for_forty_eight_hours() {
+        let default = ReferenceConfig::default();
+        assert_eq!(default.settled_state_retention_secs, 172_800);
+        let invalid = ReferenceConfig {
+            settled_state_retention_secs: 0,
+            ..ReferenceConfig::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
