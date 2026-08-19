@@ -19,7 +19,7 @@ use alpha_domain::{
 };
 use anyhow::{bail, Context};
 use hft_collector::{import_feature_dataset, FeatureDatasetManifest};
-use hft_research_manifest::CexReplayDatasetManifestV4;
+use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::Serialize;
 use std::path::Path;
 
@@ -115,7 +115,7 @@ pub(crate) fn render_cex_bundle(
     data_mission::validate_cex_replay_features(&materialization.snapshot, &feature_manifest)?;
     let validation = approved_validation(&materialization)?;
     validate_materialization(&materialization, &feature_sha256, &validation)?;
-    let dataset = CexReplayDatasetManifestV4::new(
+    let dataset = CexReplayDatasetManifestV5::new(
         feature_manifest.manifest_id.clone(),
         materialization.snapshot.clone(),
     )
@@ -334,7 +334,7 @@ fn approved_validation(
         sealed_holdout_rows: HOLDOUT_ROWS,
         fee_bps: 2.0,
         rebate_bps: 0.0,
-        funding_bps: data_mission::cex_snapshot_funding_bps(&materialization.snapshot)?,
+        funding_bps: 0.0,
         latency_bps: 0.5,
         slippage_bps: 0.0,
         cross_spread: true,
@@ -361,7 +361,7 @@ fn approved_evaluation_protocol(
         EvaluationCostsV1 {
             fee_bps: 2.0,
             rebate_bps: 0.0,
-            funding_bps: data_mission::cex_snapshot_funding_bps(&materialization.snapshot)?,
+            funding_bps: 0.0,
             latency_bps: 0.5,
             slippage_bps: 0.0,
             cross_spread: true,
@@ -463,6 +463,7 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(mission.spec.evaluation_protocol.costs.fee_bps, 2.0);
+        assert_eq!(mission.spec.evaluation_protocol.costs.funding_bps, 0.0);
         assert_eq!(
             mission.spec.evaluation_protocol.costs.position_notional_usd,
             1_000.0
@@ -520,6 +521,60 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("feature source revision"));
+    }
+
+    #[test]
+    fn render_cex_rejects_forbidden_current_cex_feature_fields() {
+        for field in ["funding_cost_bps", "funding_rate", "open_interest"] {
+            let fixture = Fixture::new(MIN_ROWS);
+            let mut rows = read_feature_rows(&fixture.feature_path);
+            for row in &mut rows {
+                row.features.insert(field.to_string(), 0.0001);
+            }
+            rewrite_feature_rows(&fixture.feature_path, &rows);
+            let feature_sha256 = hex::encode(Sha256::digest(
+                std::fs::read(&fixture.feature_path).unwrap(),
+            ));
+            let mut materialization: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fixture.materialization_path).unwrap())
+                    .unwrap();
+            materialization["artifact_sha256"] = serde_json::json!(feature_sha256.clone());
+            materialization["snapshot"]["feature_artifact_sha256"] =
+                serde_json::json!(feature_sha256);
+            let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
+                serde_json::from_value(materialization["snapshot"].clone()).unwrap();
+            materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+            std::fs::write(
+                &fixture.materialization_path,
+                serde_json::to_vec_pretty(&materialization).unwrap(),
+            )
+            .unwrap();
+            let feature_artifacts = tempfile::tempdir().unwrap();
+            let feature_manifest = import_feature_manifest(
+                "data-mission-1",
+                &fixture.feature_path,
+                feature_artifacts.path(),
+            )
+            .unwrap();
+            let materialization = load_materialization(&fixture.materialization_path);
+            let error = data_mission::validate_cex_replay_features(
+                &materialization.snapshot,
+                &feature_manifest,
+            )
+            .unwrap_err();
+
+            assert!(format!("{error:#}").contains(&format!(
+                "current L2-only CEX replay cannot include {field}"
+            )));
+
+            assert!(render_cex_bundle(
+                &fixture.feature_path,
+                &fixture.materialization_path,
+                7,
+                default_trials(),
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -639,7 +694,7 @@ pub(crate) mod tests {
         materialization["mission_id"] = serde_json::json!("data-mission-rematerialized");
         materialization["artifact_sha256"] = serde_json::json!(feature_sha256);
         materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(feature_sha256);
-        let snapshot: hft_research_manifest::CexReplaySnapshotV4 =
+        let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
             serde_json::from_value(materialization["snapshot"].clone()).unwrap();
         materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
         materialization["created_at"] = serde_json::json!(shifted_ingestion_time);
@@ -743,9 +798,9 @@ pub(crate) mod tests {
             .unwrap();
             let source_end_ns =
                 u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-            let reference_evidence = (0..256).map(indexed_cex_triplet).collect::<Vec<_>>();
-            let snapshot = hft_research_manifest::CexReplaySnapshotV4 {
-                schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
+            let instrument_rules_evidence = (0..256).map(indexed_cex_triplet).collect::<Vec<_>>();
+            let snapshot = hft_research_manifest::CexReplaySnapshotV5 {
+                schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
                 venue: "binance".to_string(),
                 instrument_type: "usdm".to_string(),
                 symbol: "BTCUSDT".to_string(),
@@ -753,8 +808,6 @@ pub(crate) mod tests {
                 required_modalities: BTreeSet::from([
                     hft_research_manifest::CEX_MODALITY_LOB.to_string(),
                     hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
-                    hft_research_manifest::CEX_MODALITY_FUNDING.to_string(),
-                    hft_research_manifest::CEX_MODALITY_OPEN_INTEREST.to_string(),
                 ]),
                 source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
                     content_sha256: source_content_sha256.clone(),
@@ -777,30 +830,25 @@ pub(crate) mod tests {
                     min_notional: "5".to_string(),
                     available_at: first_event_time - ChronoDuration::seconds(1),
                     valid_through: last_event_time + ChronoDuration::seconds(5),
-                    evidence: vec![cex_triplet('e')],
+                    evidence: instrument_rules_evidence.clone(),
                 },
-                derivatives_reference: Some(hft_research_manifest::CexDerivativesReferenceV2 {
-                    funding: hft_research_manifest::CexPitSeriesEvidenceV2 {
-                        evidence: reference_evidence.clone(),
+                series: vec![hft_research_manifest::CexReplaySeriesV1 {
+                    series_id: 1,
+                    first_event_time,
+                    last_event_time,
+                    instrument_rules_coverage: hft_research_manifest::CexPitSeriesEvidenceV2 {
+                        evidence: instrument_rules_evidence,
                         first_available_at: first_event_time - ChronoDuration::seconds(1),
                         last_available_at: last_event_time + ChronoDuration::seconds(5),
-                        observations: reference_evidence.len() as u64,
-                        max_gap_ns: 90_000_000_000,
+                        observations: 256,
+                        max_gap_ns: hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
                     },
-                    open_interest: hft_research_manifest::CexPitSeriesEvidenceV2 {
-                        evidence: reference_evidence.clone(),
-                        first_available_at: first_event_time - ChronoDuration::seconds(1),
-                        last_available_at: last_event_time + ChronoDuration::seconds(5),
-                        observations: reference_evidence.len() as u64,
-                        max_gap_ns: 90_000_000_000,
-                    },
-                    evaluation_funding_bps_per_bucket: "0".to_string(),
-                }),
+                }],
             };
             let snapshot_sha256 = snapshot.sha256();
             let report = serde_json::json!({
                 "dataset_kind": "lob_point_in_time_materialization",
-                "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
+                "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
                 "mission_id": "data-mission-1",
                 "symbol": "BTCUSDT",
                 "market": "usdm",
@@ -855,12 +903,7 @@ pub(crate) mod tests {
                     "binance-usdm-lob".to_string(),
                     source_revision.to_string(),
                 )]),
-                modalities: BTreeSet::from([
-                    DataModality::Lob,
-                    DataModality::TradeTick,
-                    DataModality::Funding,
-                    DataModality::OpenInterest,
-                ]),
+                modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
                 features: BTreeMap::from([
                     ("ask_depth_top5".to_string(), 10.0),
                     ("bid_depth_top5".to_string(), 10.0),
@@ -868,8 +911,6 @@ pub(crate) mod tests {
                     ("book_imbalance_top5".to_string(), 0.08),
                     ("mid_price".to_string(), 60_000.0),
                     ("near_depth_concentration_skew_top5".to_string(), 0.04),
-                    ("funding_rate".to_string(), 0.0001),
-                    ("open_interest".to_string(), 12_345.0),
                     ("spread_bps".to_string(), 1.2),
                     ("vwap_center_deviation_top5_bps".to_string(), 0.7),
                     ("weighted_book_imbalance_top5".to_string(), 0.09),
@@ -879,18 +920,12 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn cex_triplet(byte: char) -> hft_research_manifest::CexArtifactTripletV2 {
-        hft_research_manifest::CexArtifactTripletV2 {
-            data_sha256: byte.to_string().repeat(64),
-            manifest_sha256: byte.to_string().repeat(64),
-            success_sha256: byte.to_string().repeat(64),
-        }
-    }
-
     fn indexed_cex_triplet(index: usize) -> hft_research_manifest::CexArtifactTripletV2 {
-        let data_sha256 = hex::encode(Sha256::digest(format!("reference-data-{index}")));
+        let data_sha256 = hex::encode(Sha256::digest(format!("render-reference-data-{index}")));
         hft_research_manifest::CexArtifactTripletV2 {
-            manifest_sha256: hex::encode(Sha256::digest(format!("reference-manifest-{index}"))),
+            manifest_sha256: hex::encode(Sha256::digest(format!(
+                "render-reference-manifest-{index}"
+            ))),
             success_sha256: data_sha256.clone(),
             data_sha256,
         }
