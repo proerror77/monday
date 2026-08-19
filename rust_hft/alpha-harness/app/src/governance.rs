@@ -1634,6 +1634,7 @@ mod tests {
         let start = Utc::now();
         let rows = (0..64)
             .map(|index| ResearchRow {
+                series_id: 1,
                 available_time: start + Duration::seconds(index),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: BTreeMap::new(),
@@ -1926,6 +1927,7 @@ mod tests {
         let start = Utc::now();
         let rows = (0..64)
             .map(|index| ResearchRow {
+                series_id: 1,
                 available_time: start + Duration::seconds(index),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: BTreeMap::new(),

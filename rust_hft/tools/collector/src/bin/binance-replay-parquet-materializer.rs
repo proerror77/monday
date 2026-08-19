@@ -4,9 +4,9 @@ use data::binance_lob_replay::{
     source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
 };
 use data::binance_market_tape_artifact::{
-    seal_binance_market_tape_triplet, verify_binance_market_tape_with_required_lob_continuity,
-    BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent,
-    VerifiedBinanceMarketTape,
+    seal_binance_market_tape_triplet,
+    verify_binance_market_tape_series_with_required_lob_continuity, BinanceMarketTapeTriplet,
+    BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent, VerifiedBinanceMarketTapeSeries,
 };
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
@@ -143,6 +143,11 @@ struct CanonicalCoverage {
     sequence_end: u64,
 }
 
+struct CanonicalSeriesReplay<'a> {
+    session_id: &'a str,
+    events: &'a [ReplayedBinanceBookEvent],
+}
+
 #[derive(Serialize)]
 struct ReplayPayload {
     bids: Vec<[String; 2]>,
@@ -165,24 +170,37 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
 
     let verified = verify_segments(args)?;
     if verified
-        .segments()
         .iter()
+        .flat_map(|series| series.verified().segments().iter())
         .any(|segment| segment.market != args.market.as_lob_market())
     {
         bail!("verified market-tape does not match requested market");
     }
     let source_segments = source_segment_evidence(&verified);
-    let replayed_book = verified
-        .replayed_books()
+    let replayed_series = verified
         .iter()
-        .find(|book| book.symbol == symbol)
-        .with_context(|| {
-            format!("verified market-tape does not contain requested symbol {symbol}")
-        })?;
+        .map(|series| {
+            let replayed_book = series
+                .verified()
+                .replayed_books()
+                .iter()
+                .find(|book| book.symbol == symbol)
+                .with_context(|| {
+                    format!(
+                        "verified market-tape series {} does not contain requested symbol {symbol}",
+                        series.session_id()
+                    )
+                })?;
+            Ok(CanonicalSeriesReplay {
+                session_id: series.session_id(),
+                events: replayed_book.events(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let artifact_dir = canonical_output_dir(&args.artifact_dir)?;
     let (temporary_artifact, temporary_output) =
         temporary_file(&artifact_dir.join("canonical-replay.parquet"))?;
-    let coverage = match write_parquet(temporary_output, replayed_book.events()) {
+    let coverage = match write_parquet(temporary_output, &replayed_series) {
         Ok(coverage) => coverage,
         Err(error) => {
             let _ = fs::remove_file(&temporary_artifact);
@@ -233,7 +251,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     })
 }
 
-fn verify_segments(args: &Args) -> Result<VerifiedBinanceMarketTape> {
+fn verify_segments(args: &Args) -> Result<Vec<VerifiedBinanceMarketTapeSeries>> {
     let count = args.segment.len();
     if count == 0
         || args.segment_content_sha256.len() != count
@@ -265,13 +283,15 @@ fn verify_segments(args: &Args) -> Result<VerifiedBinanceMarketTape> {
         let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    verify_binance_market_tape_with_required_lob_continuity(sealed)
+    verify_binance_market_tape_series_with_required_lob_continuity(sealed)
 }
 
-fn source_segment_evidence(verified: &VerifiedBinanceMarketTape) -> Vec<SourceSegmentEvidence> {
+fn source_segment_evidence(
+    verified: &[VerifiedBinanceMarketTapeSeries],
+) -> Vec<SourceSegmentEvidence> {
     verified
-        .segments()
         .iter()
+        .flat_map(|series| series.verified().segments().iter())
         .map(|segment| SourceSegmentEvidence {
             file: segment.file.clone(),
             success_marker_sha256: hex::encode(Sha256::digest(format!(
@@ -287,7 +307,7 @@ fn source_segment_evidence(verified: &VerifiedBinanceMarketTape) -> Vec<SourceSe
         .collect()
 }
 
-fn write_parquet(file: File, events: &[ReplayedBinanceBookEvent]) -> Result<CanonicalCoverage> {
+fn write_parquet(file: File, series: &[CanonicalSeriesReplay<'_>]) -> Result<CanonicalCoverage> {
     let schema = Arc::new(parse_message_type(PARQUET_MESSAGE)?);
     let properties = Arc::new(
         WriterProperties::builder()
@@ -307,38 +327,51 @@ fn write_parquet(file: File, events: &[ReplayedBinanceBookEvent]) -> Result<Cano
     let mut sequence_end = None;
     let mut emitted_rows = 0_usize;
 
-    for source_event in events {
-        let Some((timestamp_us, event, payload_json)) = canonical_event(source_event)? else {
-            continue;
-        };
-        if previous_timestamp.is_some_and(|previous| timestamp_us < previous) {
-            bail!("verified replay events are not ordered by receive time");
+    for replay_series in series {
+        if !matches!(
+            replay_series
+                .events
+                .iter()
+                .find(|event| matches!(event, ReplayedBinanceBookEvent::Replay(_))),
+            Some(ReplayedBinanceBookEvent::Replay(
+                ReplaySequenceEvent::Snapshot { .. }
+            ))
+        ) {
+            bail!(
+                "verified replay series {} has no snapshot-led event sequence",
+                replay_series.session_id
+            );
         }
-        if emitted_rows == 0 && event != "snapshot" {
-            bail!("verified replay tape has no snapshot-led event sequence");
-        }
-        previous_timestamp = Some(timestamp_us);
-        // This is a 1-based canonical tape ordinal, not a Binance update ID.
-        let sequence = u64::try_from(emitted_rows)
-            .context("canonical event sequence overflow")?
-            .checked_add(1)
-            .context("canonical event sequence overflow")?;
-        emitted_rows = emitted_rows
-            .checked_add(1)
-            .context("canonical event sequence overflow")?;
-        first_event_time_us.get_or_insert(timestamp_us);
-        sequence_start.get_or_insert(sequence);
-        last_event_time_us = Some(timestamp_us);
-        sequence_end = Some(sequence);
-        row_buffer.push(CanonicalEvent {
-            timestamp_us,
-            sequence,
-            event,
-            payload_json,
-        });
-        if row_buffer.len() == ROW_GROUP_ROWS {
-            write_parquet_row_group(&mut writer, &row_buffer)?;
-            row_buffer.clear();
+        for source_event in replay_series.events {
+            let Some((timestamp_us, event, payload_json)) = canonical_event(source_event)? else {
+                continue;
+            };
+            if previous_timestamp.is_some_and(|previous| timestamp_us < previous) {
+                bail!("verified replay events are not ordered by receive time");
+            }
+            previous_timestamp = Some(timestamp_us);
+            // This is a 1-based canonical tape ordinal, not a Binance update ID.
+            let sequence = u64::try_from(emitted_rows)
+                .context("canonical event sequence overflow")?
+                .checked_add(1)
+                .context("canonical event sequence overflow")?;
+            emitted_rows = emitted_rows
+                .checked_add(1)
+                .context("canonical event sequence overflow")?;
+            first_event_time_us.get_or_insert(timestamp_us);
+            sequence_start.get_or_insert(sequence);
+            last_event_time_us = Some(timestamp_us);
+            sequence_end = Some(sequence);
+            row_buffer.push(CanonicalEvent {
+                timestamp_us,
+                sequence,
+                event,
+                payload_json,
+            });
+            if row_buffer.len() == ROW_GROUP_ROWS {
+                write_parquet_row_group(&mut writer, &row_buffer)?;
+                row_buffer.clear();
+            }
         }
     }
 
@@ -592,4 +625,101 @@ fn file_name(path: &Path) -> Result<String> {
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .context("path has no UTF-8 file name")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+
+    fn levels(price: &str, quantity: &str) -> Vec<[String; 2]> {
+        vec![[price.to_string(), quantity.to_string()]]
+    }
+
+    #[test]
+    fn write_parquet_preserves_snapshot_boundaries_for_each_series() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("canonical.parquet");
+        let series_one = vec![
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns: 1_000,
+                bids: levels("100", "1"),
+                asks: levels("101", "1"),
+            }),
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns: 2_000,
+                bids: levels("101", "1"),
+                asks: levels("102", "1"),
+            }),
+        ];
+        let series_two = vec![
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns: 10_000,
+                bids: levels("90", "1"),
+                asks: levels("91", "1"),
+            }),
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns: 11_000,
+                bids: levels("91", "1"),
+                asks: levels("92", "1"),
+            }),
+        ];
+
+        let coverage = write_parquet(
+            File::create(&path).unwrap(),
+            &[
+                CanonicalSeriesReplay {
+                    session_id: "session-1",
+                    events: &series_one,
+                },
+                CanonicalSeriesReplay {
+                    session_id: "session-2",
+                    events: &series_two,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(coverage.rows, 4);
+        assert_eq!(coverage.sequence_end, 4);
+
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let events = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|row| row.unwrap().get_string(2).unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec!["snapshot", "l2_update", "snapshot", "l2_update"]
+        );
+    }
+
+    #[test]
+    fn write_parquet_rejects_a_series_without_a_snapshot_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("canonical.parquet");
+        let series = vec![
+            ReplayedBinanceBookEvent::Checkpoint {
+                received_at_ns: 1_000,
+            },
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns: 2_000,
+                bids: levels("101", "1"),
+                asks: levels("102", "1"),
+            }),
+        ];
+
+        let error = write_parquet(
+            File::create(&path).unwrap(),
+            &[CanonicalSeriesReplay {
+                session_id: "session-1",
+                events: &series,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("snapshot-led"));
+    }
 }

@@ -7,16 +7,18 @@ use data::binance_lob_replay::{
 use data::binance_market_tape::AggregateTrade;
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet,
-    verify_binance_market_tape_with_required_trade_and_lob_summaries, BinanceMarketTapeTriplet,
-    BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent, VerifiedBinanceMarketTape,
+    verify_binance_market_tape_series_with_required_trade_and_lob_summaries,
+    BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent,
+    VerifiedBinanceMarketTapeSeries,
 };
 use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact, PublishedReferenceArtifact,
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
+use hft_core::{top5_book_features, TOP5_DEPTH};
 use hft_research_manifest::{
     CexArtifactTripletV2, CexDerivativesReferenceV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2,
-    CexReplaySegmentIdentity, CexReplaySnapshotV4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
+    CexReplaySegmentIdentity, CexReplaySnapshotV4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
     CEX_FEATURE_AVAILABILITY_POLICY, CEX_MODALITY_AGGREGATE_TRADE, CEX_MODALITY_FUNDING,
     CEX_MODALITY_LOB, CEX_MODALITY_OPEN_INTEREST, CEX_REPLAY_CLOCK_RECEIVED_AT_NS,
     CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
@@ -138,6 +140,9 @@ struct BookSample {
     bid_depth: f64,
     ask_depth: f64,
     top_depth_imbalance: f64,
+    weighted_book_imbalance_top5: Option<f64>,
+    near_depth_concentration_skew_top5: Option<f64>,
+    vwap_center_deviation_top5_bps: Option<f64>,
     book_imbalance: f64,
 }
 
@@ -153,6 +158,7 @@ struct MaterializationReport {
     top_depth: usize,
     source_revision: String,
     source_segments: Vec<SourceSegmentEvidence>,
+    series_count: usize,
     rows: usize,
     first_event_time: DateTime<Utc>,
     last_event_time: DateTime<Utc>,
@@ -245,8 +251,23 @@ impl Replay {
             while end < events.len() && events[end].received_at_ns() == received_at_ns {
                 end += 1;
             }
-            self.emit_before(received_at_ns)?;
-            for event in &events[start..end] {
+            let batch = &events[start..end];
+            let has_snapshot = batch.iter().any(|event| {
+                matches!(
+                    event,
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot { .. })
+                )
+            });
+            let has_diff = batch.iter().any(|event| {
+                matches!(
+                    event,
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff { .. })
+                )
+            });
+            if has_diff && !has_snapshot {
+                self.emit_before(received_at_ns)?;
+            }
+            for event in batch {
                 match event {
                     ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
                         bids,
@@ -271,7 +292,9 @@ impl Replay {
                     ReplayedBinanceBookEvent::Checkpoint { .. } => {}
                 }
             }
-            self.emit_at(received_at_ns)?;
+            if has_snapshot || has_diff {
+                self.emit_at(received_at_ns)?;
+            }
             start = end;
         }
         Ok(())
@@ -297,31 +320,17 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.market != Market::Usdm {
         bail!("credential-free canonical materialization currently supports USD-M only");
     }
-    let (verified, segment_paths) = verify_segments(args)?;
-    if verified
-        .segments()
-        .iter()
-        .any(|segment| segment.market != args.market.as_lob_market())
-    {
+    let (verified_series, segment_paths) = verify_segments(args)?;
+    if verified_series.iter().any(|series| {
+        series
+            .verified()
+            .segments()
+            .iter()
+            .any(|segment| segment.market != args.market.as_lob_market())
+    }) {
         bail!("verified market-tape does not match requested market");
     }
-    let source_segments = source_segment_evidence(&verified, segment_paths)?;
-    let book = verified
-        .replayed_books()
-        .iter()
-        .find(|book| book.symbol == symbol)
-        .with_context(|| {
-            format!("verified market-tape does not contain requested symbol {symbol}")
-        })?;
-    if verified
-        .segments()
-        .iter()
-        .all(|segment| !segment.trade_summaries.contains_key(&symbol))
-    {
-        bail!(
-            "verified market-tape does not contain aggregate trades for requested symbol {symbol}"
-        );
-    }
+    let source_segments = source_segment_evidence(&verified_series, segment_paths)?;
     let mut context = ResearchContextV2::default();
     bind_usdm_reference(args, &symbol, &mut context)?;
 
@@ -330,7 +339,38 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .checked_mul(1_000_000)
         .context("bucket size overflow")?;
     let mut replay = Replay::new(bucket_ns, args.top_depth);
-    replay.consume(book.events())?;
+    let mut aggregate_trades = Vec::new();
+    for series in &verified_series {
+        let verified = series.verified();
+        let book = verified
+            .replayed_books()
+            .iter()
+            .find(|book| book.symbol == symbol)
+            .with_context(|| {
+                format!(
+                    "verified market-tape series {} does not contain requested symbol {symbol}",
+                    series.session_id()
+                )
+            })?;
+        if verified
+            .segments()
+            .iter()
+            .all(|segment| !segment.trade_summaries.contains_key(&symbol))
+        {
+            bail!(
+                "verified market-tape series {} does not contain aggregate trades for requested symbol {symbol}",
+                series.session_id()
+            );
+        }
+        aggregate_trades.extend(
+            verified
+                .aggregate_trades()
+                .iter()
+                .filter(|trade| trade.symbol == symbol)
+                .cloned(),
+        );
+        replay.consume(book.events())?;
+    }
 
     let revision = source_revision(&source_segments);
     let created_at = Utc::now();
@@ -347,7 +387,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     )]);
     let rows = materialize_rows(
         &replay.samples,
-        verified.aggregate_trades(),
+        &aggregate_trades,
         args,
         &source_revisions,
         &symbol,
@@ -411,7 +451,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
 
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
-        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5.to_string(),
+        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6.to_string(),
         mission_id: mission_id.to_string(),
         symbol,
         market: args.market.as_str().to_string(),
@@ -420,6 +460,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         top_depth: args.top_depth,
         source_revision: revision,
         source_segments,
+        series_count: usize::try_from(replay.series_id).context("series count overflow")?,
         rows: rows.len(),
         first_event_time,
         last_event_time,
@@ -442,7 +483,12 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     })
 }
 
-fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<String, PathBuf>)> {
+fn verify_segments(
+    args: &Args,
+) -> Result<(
+    Vec<VerifiedBinanceMarketTapeSeries>,
+    BTreeMap<String, PathBuf>,
+)> {
     let count = args.segment.len();
     if count == 0
         || args.segment_content_sha256.len() != count
@@ -472,7 +518,7 @@ fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<S
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
     Ok((
-        verify_binance_market_tape_with_required_trade_and_lob_summaries(sealed)?,
+        verify_binance_market_tape_series_with_required_trade_and_lob_summaries(sealed)?,
         paths,
     ))
 }
@@ -674,12 +720,12 @@ fn max_available_gap_ns(times: impl IntoIterator<Item = DateTime<Utc>>) -> Resul
 }
 
 fn source_segment_evidence(
-    verified: &VerifiedBinanceMarketTape,
+    verified_series: &[VerifiedBinanceMarketTapeSeries],
     mut paths: BTreeMap<String, PathBuf>,
 ) -> Result<Vec<SourceSegmentEvidence>> {
-    verified
-        .segments()
+    verified_series
         .iter()
+        .flat_map(|series| series.verified().segments().iter())
         .map(|segment| {
             let path = paths
                 .remove(&segment.content_sha256)
@@ -753,6 +799,27 @@ fn sample_book(
 ) -> Result<BookSample> {
     let bid_levels = state.bids.iter().rev().take(depth).collect::<Vec<_>>();
     let ask_levels = state.asks.iter().take(depth).collect::<Vec<_>>();
+    let top5 = if depth == TOP5_DEPTH {
+        Some(
+            top5_book_features(
+                state.bids.iter().rev().map(|(price, quantity)| {
+                    (
+                        price.to_f64().unwrap_or(f64::NAN),
+                        quantity.to_f64().unwrap_or(f64::NAN),
+                    )
+                }),
+                state.asks.iter().map(|(price, quantity)| {
+                    (
+                        price.to_f64().unwrap_or(f64::NAN),
+                        quantity.to_f64().unwrap_or(f64::NAN),
+                    )
+                }),
+            )
+            .context("order book needs five valid positive levels per side")?,
+        )
+    } else {
+        None
+    };
     let (best_bid, best_bid_quantity) = bid_levels.first().context("order book has no bids")?;
     let (best_ask, best_ask_quantity) = ask_levels.first().context("order book has no asks")?;
     if best_bid >= best_ask {
@@ -769,14 +836,26 @@ fn sample_book(
     if mid <= Decimal::ZERO || total_depth <= Decimal::ZERO {
         bail!("replayed order book has invalid depth");
     }
+    let (bid_depth, ask_depth, top_depth_imbalance) = match top5 {
+        Some(top5) => (top5.bid_depth, top5.ask_depth, top5.book_imbalance),
+        None => (
+            decimal_f64(bid_depth)?,
+            decimal_f64(ask_depth)?,
+            decimal_f64((bid_depth - ask_depth) / total_depth)?,
+        ),
+    };
     Ok(BookSample {
         series_id,
         time_ns,
         mid_price: decimal_f64(mid)?,
         spread_bps: decimal_f64((**best_ask - **best_bid) / mid * Decimal::from(10_000))?,
-        bid_depth: decimal_f64(bid_depth)?,
-        ask_depth: decimal_f64(ask_depth)?,
-        top_depth_imbalance: decimal_f64((bid_depth - ask_depth) / total_depth)?,
+        bid_depth,
+        ask_depth,
+        top_depth_imbalance,
+        weighted_book_imbalance_top5: top5.map(|features| features.weighted_book_imbalance),
+        near_depth_concentration_skew_top5: top5
+            .map(|features| features.near_depth_concentration_skew),
+        vwap_center_deviation_top5_bps: top5.map(|features| features.vwap_center_deviation_bps),
         book_imbalance: {
             let bid_size = decimal_f64(**best_bid_quantity)?;
             let ask_size = decimal_f64(**best_ask_quantity)?;
@@ -884,6 +963,15 @@ fn materialize_rows(
             ),
             ("spread_bps".to_string(), current.spread_bps),
         ]);
+        if let Some(value) = current.weighted_book_imbalance_top5 {
+            features.insert("weighted_book_imbalance_top5".to_string(), value);
+        }
+        if let Some(value) = current.near_depth_concentration_skew_top5 {
+            features.insert("near_depth_concentration_skew_top5".to_string(), value);
+        }
+        if let Some(value) = current.vwap_center_deviation_top5_bps {
+            features.insert("vwap_center_deviation_top5_bps".to_string(), value);
+        }
         let mut modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
         if args.market == Market::Usdm {
             let funding = context
@@ -936,6 +1024,7 @@ fn materialize_rows(
             bail!("materialized feature or label is not finite");
         }
         rows.push(PointInTimeFeatureRow {
+            series_id: current.series_id,
             event_time,
             feature_available_time: event_time,
             label_available_time: future_time,
@@ -1170,7 +1259,7 @@ mod tests {
         vec![
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":market,"symbols":1,"websocket_shards":2,"websocket_streams":2}),
             json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@aggTrade"],["btcusdt@depth@100ms"]]}),
-            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"],["98","4"],["97","3"],["96","2"]],"asks":[["102","4"],["103","6"],["104","5"],["105","4"],["106","3"]]}}),
             diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
             trade(700, 10),
             diff(1_400, 176, 176, 175, json!([]), json!([["101", "0"]])),
@@ -1180,8 +1269,45 @@ mod tests {
             diff(4_400, 179, 179, 178, json!([["101", "0"]]), json!([])),
             diff(5_400, 180, 180, 179, json!([["100", "12"]]), json!([])),
             diff(6_400, 181, 181, 180, json!([]), json!([["101.5", "5"]])),
-            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","12"],["99","5"]],"asks":[["101.5","5"],["102","4"],["103","6"]],"reason":"test","replay_safe":true}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"continuity_complete":true,"stream_coverage_verified":true,"bids":[["100","12"],["99","5"],["98","4"],["97","3"],["96","2"]],"asks":[["101.5","5"],["102","4"],["103","6"],["104","5"],["105","4"],["106","3"]],"reason":"test","replay_safe":true}),
         ]
+    }
+
+    fn shift_rows(rows: &mut [Value], delta_ns: u64) {
+        for row in rows {
+            let object = row.as_object_mut().unwrap();
+            let received_at_ns = object
+                .get("received_at_ns")
+                .and_then(Value::as_u64)
+                .unwrap();
+            object.insert(
+                "received_at_ns".to_string(),
+                json!(received_at_ns + delta_ns),
+            );
+            if let Some(request_started_at_ns) =
+                object.get("request_started_at_ns").and_then(Value::as_u64)
+            {
+                object.insert(
+                    "request_started_at_ns".to_string(),
+                    json!(request_started_at_ns + delta_ns),
+                );
+            }
+            if let Some(frame) = object.get_mut("frame").and_then(Value::as_object_mut) {
+                if let Some(data) = frame.get_mut("data").and_then(Value::as_object_mut) {
+                    for key in ["E", "T"] {
+                        if let Some(value) = data.get(key).and_then(Value::as_u64) {
+                            data.insert(key.to_string(), json!(value + delta_ns / 1_000_000));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn retag_session(rows: &mut [Value], session_id: &str) {
+        for row in rows {
+            row["session_id"] = json!(session_id);
+        }
     }
 
     struct Fixture {
@@ -1398,8 +1524,20 @@ mod tests {
         let events = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
                 received_at_ns,
-                bids: vec![level("100", "10")],
-                asks: vec![level("102", "4")],
+                bids: vec![
+                    level("100", "10"),
+                    level("99", "1"),
+                    level("98", "1"),
+                    level("97", "1"),
+                    level("96", "1"),
+                ],
+                asks: vec![
+                    level("102", "4"),
+                    level("103", "1"),
+                    level("104", "1"),
+                    level("105", "1"),
+                    level("106", "1"),
+                ],
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
                 received_at_ns,
@@ -1415,7 +1553,44 @@ mod tests {
         assert_eq!(replay.samples.len(), 1);
         assert_eq!(replay.samples[0].time_ns, received_at_ns);
         assert!((replay.samples[0].mid_price - 100.5).abs() < 1e-12);
-        assert!((replay.samples[0].ask_depth - 4.0).abs() < 1e-12);
+        assert!((replay.samples[0].ask_depth - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn samples_l1_and_weighted_top5_without_the_sixth_level() {
+        let state = BookState {
+            bids: BTreeMap::from([
+                (Decimal::from(95), Decimal::from(1_000)),
+                (Decimal::from(96), Decimal::from(2)),
+                (Decimal::from(97), Decimal::from(4)),
+                (Decimal::from(98), Decimal::from(6)),
+                (Decimal::from(99), Decimal::from(8)),
+                (Decimal::from(100), Decimal::from(10)),
+            ]),
+            asks: BTreeMap::from([
+                (Decimal::from(101), Decimal::from(2)),
+                (Decimal::from(102), Decimal::from(4)),
+                (Decimal::from(103), Decimal::from(6)),
+                (Decimal::from(104), Decimal::from(8)),
+                (Decimal::from(105), Decimal::from(10)),
+                (Decimal::from(106), Decimal::from(1_000)),
+            ]),
+        };
+
+        let sample = sample_book(&state, 1, event_ns(1_000), 5).unwrap();
+
+        assert_eq!(sample.bid_depth, 30.0);
+        assert_eq!(sample.ask_depth, 30.0);
+        assert_eq!(sample.top_depth_imbalance, 0.0);
+        assert!((sample.weighted_book_imbalance_top5.unwrap() - 2.0 / 9.0).abs() < f64::EPSILON);
+        assert!((sample.near_depth_concentration_skew_top5.unwrap() - 0.4).abs() < f64::EPSILON);
+        assert!((sample.vwap_center_deviation_top5_bps.unwrap() - 66.33499170812604).abs() < 1e-12);
+        assert!((sample.book_imbalance - 2.0 / 3.0).abs() < f64::EPSILON);
+
+        let mut incomplete = state;
+        incomplete.bids.remove(&Decimal::from(95));
+        incomplete.bids.remove(&Decimal::from(96));
+        assert!(sample_book(&incomplete, 1, event_ns(1_000), 5).is_err());
     }
 
     #[test]
@@ -1431,6 +1606,9 @@ mod tests {
             bid_depth: 10.0,
             ask_depth: 10.0,
             top_depth_imbalance: 0.0,
+            weighted_book_imbalance_top5: None,
+            near_depth_concentration_skew_top5: None,
+            vwap_center_deviation_top5_bps: None,
             book_imbalance: 0.0,
         };
         let samples = (1..=6).map(sample).collect::<Vec<_>>();
@@ -1510,6 +1688,109 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_only_batch_does_not_advance_sample_clock_and_snapshot_reseeds_series() {
+        let events = vec![
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns: event_ns(1_000),
+                bids: vec![
+                    level("100", "10"),
+                    level("99", "1"),
+                    level("98", "1"),
+                    level("97", "1"),
+                    level("96", "1"),
+                ],
+                asks: vec![
+                    level("101", "10"),
+                    level("102", "1"),
+                    level("103", "1"),
+                    level("104", "1"),
+                    level("105", "1"),
+                ],
+            }),
+            ReplayedBinanceBookEvent::Checkpoint {
+                received_at_ns: event_ns(1_500),
+            },
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns: event_ns(3_000),
+                bids: vec![
+                    level("200", "10"),
+                    level("199", "1"),
+                    level("198", "1"),
+                    level("197", "1"),
+                    level("196", "1"),
+                ],
+                asks: vec![
+                    level("201", "10"),
+                    level("202", "1"),
+                    level("203", "1"),
+                    level("204", "1"),
+                    level("205", "1"),
+                ],
+            }),
+        ];
+        let mut replay = Replay::new(1_000_000_000, 5);
+
+        replay.consume(&events).unwrap();
+
+        assert_eq!(
+            replay
+                .samples
+                .iter()
+                .map(|sample| sample.time_ns)
+                .collect::<Vec<_>>(),
+            vec![event_ns(1_000), event_ns(3_000)]
+        );
+        assert_eq!(replay.samples[0].series_id, 1);
+        assert_eq!(replay.samples[1].series_id, 2);
+        assert!((replay.samples[0].mid_price - 100.5).abs() < 1e-12);
+        assert!((replay.samples[1].mid_price - 200.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn verify_segments_splits_two_capture_sessions_into_two_verified_series() {
+        let first = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut second_rows = valid_rows("usdm");
+        shift_rows(&mut second_rows, event_ns(10_000));
+        retag_session(&mut second_rows, "session-2");
+        let second = Fixture::new(Market::Usdm, &second_rows);
+        let mut args = first.args();
+        args.segment.push(second.data.clone());
+        args.segment_content_sha256
+            .push(second.content_sha256.clone());
+        args.segment_manifest_sha256
+            .push(second.manifest_sha256.clone());
+
+        let (verified, _) = verify_segments(&args).unwrap();
+
+        assert_eq!(verified.len(), 2);
+        assert_eq!(verified[0].session_id(), "session-1");
+        assert_eq!(verified[1].session_id(), "session-2");
+    }
+
+    #[test]
+    fn non_top5_materialization_keeps_its_original_dynamic_features() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.top_depth = 1;
+
+        let published = materialize(&args).unwrap();
+        let row = BufReader::new(File::open(&published.report.artifact_path).unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let row: PointInTimeFeatureRow = serde_json::from_str(&row).unwrap();
+
+        assert!(row.features.contains_key("bid_depth_top1"));
+        assert!(row.features.contains_key("book_imbalance_top1"));
+        assert!(!row.features.contains_key("weighted_book_imbalance_top5"));
+        assert!(!row
+            .features
+            .contains_key("near_depth_concentration_skew_top5"));
+        assert!(!row.features.contains_key("vwap_center_deviation_top5_bps"));
+    }
+
+    #[test]
     fn preserves_report_evidence_and_point_in_time_rows() {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let published = materialize(&fixture.args()).unwrap();
@@ -1524,9 +1805,11 @@ mod tests {
 
         assert_eq!(
             published.report.schema_version,
-            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5
+            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6
         );
+        assert_eq!(published.report.series_count, 1);
         assert_eq!(published.report.rows, 3);
+        assert_eq!(rows[0].series_id, 1);
         snapshot.validate().unwrap();
         assert_eq!(output["report"]["snapshot_sha256"], snapshot.sha256());
         assert!(snapshot.derivatives_reference.is_some());
@@ -1568,6 +1851,16 @@ mod tests {
         assert_eq!(rows[0].features["aggregate_trade_base_volume"], 2.0);
         assert_eq!(rows[0].features["aggregate_trade_quote_volume"], 201.0);
         assert_eq!(rows[0].features["aggregate_trade_flow_imbalance"], 1.0);
+        assert!(rows[0]
+            .features
+            .contains_key("weighted_book_imbalance_top5"));
+        assert!(
+            (rows[0].features["near_depth_concentration_skew_top5"] - 0.17045454545454547).abs()
+                < 1e-12
+        );
+        assert!(
+            (rows[0].features["vwap_center_deviation_top5_bps"] - 28.12781278127806).abs() < 1e-9
+        );
         assert_eq!(rows[1].features["aggregate_trade_count"], 0.0);
         assert_eq!(rows[0].event_time.to_rfc3339(), "2026-07-14T00:00:02+00:00");
         assert_eq!(

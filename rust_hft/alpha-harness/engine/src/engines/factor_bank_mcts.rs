@@ -5,7 +5,7 @@ use crate::{
         verify_cex_baseline_artifact,
     },
     evaluation::{EngineContext, ResearchRow},
-    formula_evaluator::FormulaEvaluator,
+    formula_evaluator::{evaluate_ast, FormulaEvaluator},
     CandidateEvaluation,
 };
 use alpha_domain::{
@@ -16,9 +16,7 @@ use alpha_domain::{
     FormulaEvaluatorConfig, SearchBudget, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
     WALK_FORWARD_EVALUATOR_VERSION,
 };
-use hft_factor_dsl::{
-    evaluate_live_formula_series, validate_live_formula, FactorAst, FactorOperator, FactorTerminal,
-};
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 use hft_search_kernel::{
     backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
 };
@@ -990,10 +988,7 @@ impl CexCombinationResearchArtifactV1 {
         rows: &[ResearchRow],
     ) -> Result<Vec<f64>, String> {
         let formula = self.executable_formula(factor_bank)?;
-        let combined = evaluate_live_formula_series(&formula, rows.len(), |row, field| {
-            rows.get(row)?.features.get(field).copied()
-        })
-        .map_err(|error| error.to_string())?;
+        let combined = evaluate_ast(&formula, rows)?;
         if combined.iter().any(|value| !value.is_finite()) {
             return Err("CEX replay strategy produced a non-finite signal".to_string());
         }
@@ -2099,5 +2094,67 @@ mod tests {
         };
 
         assert!(serde_json::to_value(result).unwrap()["selected"].is_null());
+    }
+
+    #[test]
+    fn target_positions_reset_history_on_new_series() {
+        let rows = vec![
+            ResearchRow {
+                series_id: 1,
+                available_time: chrono::Utc::now(),
+                signal: 0.0,
+                features: BTreeMap::from([("book_imbalance".to_string(), 1.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 1,
+                available_time: chrono::Utc::now(),
+                signal: 0.0,
+                features: BTreeMap::from([("book_imbalance".to_string(), 3.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 2,
+                available_time: chrono::Utc::now(),
+                signal: 0.0,
+                features: BTreeMap::from([("book_imbalance".to_string(), 10.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 2,
+                available_time: chrono::Utc::now(),
+                signal: 0.0,
+                features: BTreeMap::from([("book_imbalance".to_string(), 13.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+        ];
+        let formula = FactorAst::call(
+            FactorOperator::Delta,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                FactorAst::Terminal(FactorTerminal::Constant("1".to_string())),
+            ],
+        )
+        .unwrap();
+
+        let signals = evaluate_ast(&formula, &rows).unwrap();
+
+        assert_eq!(signals, vec![0.0, 2.0, 0.0, 3.0]);
     }
 }

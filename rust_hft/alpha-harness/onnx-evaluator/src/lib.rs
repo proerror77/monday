@@ -164,6 +164,7 @@ mod tests {
     #[test]
     fn input_mapping_matches_runtime_channel_time_level_order() {
         let row = ResearchRow {
+            series_id: 1,
             available_time: Utc::now(),
             signal: 0.0,
             features: BTreeMap::from([
@@ -193,6 +194,7 @@ mod tests {
             .map(|index| {
                 let signal = if index % 2 == 0 { 1.0 } else { -1.0 };
                 ResearchRow {
+                    series_id: 1,
                     available_time: start + Duration::seconds(index),
                     signal: 0.0,
                     features: BTreeMap::from([

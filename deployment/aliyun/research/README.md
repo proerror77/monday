@@ -36,7 +36,10 @@ one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
 SHA-256 mismatch, sequence gaps, unseeded diffs, and closing checkpoints that
 do not match the replayed full book. Feature rows and the materialization report
 are published to SHA-256-named immutable paths. Forward-mid labels are only
-exposed at the future bucket's availability time.
+exposed at the future bucket's availability time. Reusing the same raw corpus
+with the same fields reuses the materialization; adding new atomic fields
+rematerializes from that same raw corpus. This does not add a new service, DB,
+or technology stack.
 
 No exchange credential belongs in this namespace. Research Pods receive public
 datasets, ClickHouse read credentials, and result-write authority only.
@@ -258,24 +261,27 @@ The image contains eight stable entrypoints:
 
 `k8s/alpha-mission-job.example.yaml` is only the generated Pod-shape reference.
 The production CEX path does not render a Mission or scan feature rows on the
-workstation. The workstation prepares one private, immutable Campaign request,
-signs exact OSS objects, and submits it. The ACK Pod then performs the complete
+workstation. The workstation only freezes, signs, and submits identities. The
+cloud ACK Pod downloads the shared inputs once, then performs the complete
 sequence:
 
 ```text
 input GET + SHA admission
-  -> Mission render
-  -> Mission create-once PUT + GET/SHA readback
-  -> GP + screening + Factor Bank + Ridge/CART + subset MCTS
-  -> event replay + final precommit + at-most-once sealed holdout
+  -> round render
+  -> create-once Mission PUT + GET/SHA readback
+  -> search-only execution per round
+  -> create-once result PUT + GET/SHA readback
+  -> deterministic pre-holdout winner
+  -> exactly one finalization + global holdout claim
   -> results.zip PUT + GET/SHA readback
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v1`. It binds the exact Git source
+The request schema is `cex-campaign-request-v2`. It binds the exact Git source
 revision, digest-pinned image, feature/materialization/replay objects and
-SHA-256 values, expected holdout ID, and one `round` containing one seed plus
-Mission/result PUT and readback URLs. It also carries the global
+SHA-256 values, expected holdout ID, campaign-wide `declared_total_trials`, and
+at least two `rounds`. Each round carries a unique `round_id`, a unique seed,
+and Mission/result PUT and readback URLs. It also carries the global
 `holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
 Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
 signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
@@ -305,16 +311,18 @@ The submitter creates the Job suspended, reads back its pinned execution
 template, then creates the immutable input Secret with the Job owner reference
 already attached. It reads the Secret back before releasing the Job and never
 prints the Secret or signed URLs. The Pod uses no ServiceAccount token,
-exchange account file, API key, or order/execution entrypoint.
+exchange account file, API key, or order/execution entrypoint. Each round
+records `results/mission-admission.json`, which binds the current request SHA
+and the round's Mission SHA alongside the campaign and round IDs.
 
-One Campaign maps to one Mission. The fixed Mission contract remains
-`200 + 3x256 + holdout256`, search budget `8 / 256`, GP policy
-`controlled_dynamic_v2`, and template family `signed_rolling_imbalance`.
-GP and subset MCTS already provide the bounded search iterations. A negative
-result terminates the Campaign; it must not trigger another seeded Mission
-without a separately designed Campaign-wide multiple-testing and holdout
-contract. A claim without a complete sealed receipt/result is terminal and
-inconclusive, not retry authority.
+One Campaign maps to multiple rounds. The fixed v4 factor plan uses 8 snapshot
+L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour protocol
+`7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the `$1000 / Top5 5%` capacity
+screen. GP and subset MCTS already provide the bounded search iterations. A
+negative Campaign produces no holdout claim. A selected round may finalize once
+against the global holdout claim, but there is no second holdout winner and no
+second finalization pass. A claim without a complete sealed receipt/result is
+terminal and inconclusive, not retry authority.
 
 Job completion alone is not research completion. Require the exact image ID,
 terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign

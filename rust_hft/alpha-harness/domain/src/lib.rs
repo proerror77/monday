@@ -29,6 +29,7 @@ pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
+pub const CEX_FACTOR_BANK_SCHEMA_V3: &str = "cex-factor-bank-v3";
 pub const CEX_FOUR_STAGE_STRATEGY_CANDIDATE_SCHEMA_V1: &str =
     "cex-four-stage-strategy-candidate-v1";
 pub const CEX_FINAL_PRECOMMIT_SCHEMA_V1: &str = "cex-final-precommit-v1";
@@ -625,15 +626,21 @@ pub struct CexResearchSearchPlanV1 {
     #[serde(deserialize_with = "deserialize_cex_search_budget")]
     pub budget: SearchBudget,
     pub max_new_iterations: usize,
+    pub multiple_testing_trials: usize,
 }
 
 impl CexResearchSearchPlanV1 {
     pub fn planned_gp_and_subset_trials(&self) -> Result<usize, DomainError> {
         self.budget.validate()?;
-        self.budget
+        let minimum = self
+            .budget
             .max_candidates
             .checked_mul(2)
-            .ok_or(DomainError::InvalidSearchBudget)
+            .ok_or(DomainError::InvalidSearchBudget)?;
+        if self.multiple_testing_trials < minimum {
+            return Err(DomainError::InvalidSearchBudget);
+        }
+        Ok(self.multiple_testing_trials)
     }
 }
 
@@ -787,6 +794,11 @@ impl CexResearchMissionSpecV1 {
         }
 
         let mut hypothesis_ids = BTreeSet::new();
+        let feature_fields = self
+            .feature_fields
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         for hypothesis in &self.hypotheses {
             let mut test_ids = BTreeSet::new();
             if hypothesis.hypothesis_id.trim().is_empty()
@@ -795,6 +807,10 @@ impl CexResearchMissionSpecV1 {
                 || hypothesis.target.horizon != self.instrument.horizon
                 || !hypothesis_ids.insert(hypothesis.hypothesis_id.as_str())
                 || !non_empty_unique(&hypothesis.required_feature_families)
+                || hypothesis
+                    .required_feature_families
+                    .iter()
+                    .any(|family| !feature_fields.contains(family.as_str()))
                 || !non_empty_unique(&hypothesis.required_template_families)
                 || hypothesis.falsification_tests.is_empty()
                 || hypothesis.falsification_tests.iter().any(|test| {
@@ -1251,7 +1267,10 @@ impl CandidateEvaluation {
                 .all(|value| value.is_finite())
                     && fold.fold_index > 0
                     && fold.row_count > 0
-                    && fold.trade_count <= fold.row_count
+                    && fold
+                        .row_count
+                        .checked_mul(2)
+                        .is_some_and(|max_trades| fold.trade_count <= max_trades)
                     && fold.total_turnover >= 0.0
                     && fold.max_drawdown >= 0.0
                     && fold
@@ -2035,17 +2054,7 @@ impl CexFactorEvaluationEvidenceV2 {
         let config = self.evidence.formula_config()?;
         let (protocol, _) = self.evidence.protocol_binding()?;
         let metrics = &self.evidence.metrics;
-        let mut codes = Vec::new();
-        if metrics
-            .folds
-            .iter()
-            .any(|fold| fold.row_count < config.min_validation_rows)
-        {
-            codes.push(CexFactorRejectionCodeV1::CoverageGateFailed);
-        }
-        if !metrics.predictive.passes(&config, true) {
-            codes.push(CexFactorRejectionCodeV1::PredictiveGateFailed);
-        }
+        let mut codes = self.screening_rejection_codes_for(&config);
         if metrics.folds.iter().any(|fold| {
             fold.trade_count < config.min_trades
                 || fold.mean_net_return <= config.min_fold_mean_return
@@ -2070,6 +2079,31 @@ impl CexFactorEvaluationEvidenceV2 {
             ));
         }
         Ok(codes)
+    }
+
+    pub fn screening_rejection_codes(&self) -> Result<Vec<CexFactorRejectionCodeV1>, DomainError> {
+        self.evidence.validate()?;
+        let config = self.evidence.formula_config()?;
+        Ok(self.screening_rejection_codes_for(&config))
+    }
+
+    fn screening_rejection_codes_for(
+        &self,
+        config: &FormulaEvaluatorConfig,
+    ) -> Vec<CexFactorRejectionCodeV1> {
+        let metrics = &self.evidence.metrics;
+        let mut codes = Vec::new();
+        if metrics
+            .folds
+            .iter()
+            .any(|fold| fold.row_count < config.min_validation_rows)
+        {
+            codes.push(CexFactorRejectionCodeV1::CoverageGateFailed);
+        }
+        if !metrics.predictive.passes(config, true) {
+            codes.push(CexFactorRejectionCodeV1::PredictiveGateFailed);
+        }
+        codes
     }
 
     fn orientation(&self) -> Result<CexFactorOrientationV1, DomainError> {
@@ -2151,7 +2185,7 @@ impl CexFactorBankRevisionV2 {
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
         let mut revision = Self {
-            schema_version: CEX_FACTOR_BANK_SCHEMA_V2.to_string(),
+            schema_version: CEX_FACTOR_BANK_SCHEMA_V3.to_string(),
             revision_id: String::new(),
             search_lineage_id,
             gp_policy,
@@ -2168,8 +2202,16 @@ impl CexFactorBankRevisionV2 {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.schema_version != CEX_FACTOR_BANK_SCHEMA_V2
-            || self.revision_id != self.expected_revision_id()?
+        let atomic_screening = match self.schema_version.as_str() {
+            CEX_FACTOR_BANK_SCHEMA_V2 => false,
+            CEX_FACTOR_BANK_SCHEMA_V3 => true,
+            _ => {
+                return Err(DomainError::InvalidCexFactorBank(
+                    "schema, semantic identity, or required lineage is invalid",
+                ));
+            }
+        };
+        if self.revision_id != self.expected_revision_id()?
             || self.search_lineage_id.trim().is_empty()
             || self.attempts.is_empty()
         {
@@ -2228,7 +2270,13 @@ impl CexFactorBankRevisionV2 {
             let derived_rejection_codes = attempt
                 .evaluation
                 .as_ref()
-                .map(CexFactorEvaluationEvidenceV2::rejection_codes)
+                .map(|evaluation| {
+                    if atomic_screening {
+                        evaluation.screening_rejection_codes()
+                    } else {
+                        evaluation.rejection_codes()
+                    }
+                })
                 .transpose()?;
             let accepted_codes_are_bound = derived_rejection_codes
                 .as_ref()
@@ -2250,7 +2298,7 @@ impl CexFactorBankRevisionV2 {
                     if attempt
                         .evaluation
                         .as_ref()
-                        .is_some_and(|value| value.evidence.passed)
+                        .is_some_and(|value| atomic_screening || value.evidence.passed)
                         && accepted_codes_are_bound
                         && attempt.rejection_details.is_empty()
                         && attempt.post_warmup_coverage_rows > 0 =>
@@ -5609,6 +5657,7 @@ mod tests {
                 max_seconds: 0,
             },
             max_new_iterations: 1,
+            multiple_testing_trials: 4,
         };
         let evaluation_protocol = evaluation_protocol();
         let screening_policy_sha256 = canonical_json_hash(
@@ -5774,6 +5823,15 @@ mod tests {
     }
 
     #[test]
+    fn cex_mission_rejects_hypothesis_features_outside_admission() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.hypotheses[0].required_feature_families =
+            vec!["book_imbalance_top5".to_string()];
+
+        assert!(mission.validate().is_err());
+    }
+
+    #[test]
     fn cex_mission_requires_a_deterministic_expansion_budget() {
         for (max_expansions, max_seconds) in [(0, 1), (2, 1)] {
             let mut mission = cex_mission_artifact(Utc::now());
@@ -5791,6 +5849,7 @@ mod tests {
         let mut mission = cex_mission_artifact(Utc::now());
         mission.spec.search.budget.max_candidates = 64;
         mission.spec.search.budget.max_expansions = 4_096;
+        mission.spec.search.multiple_testing_trials = 128;
         mission.spec.policies.screening.content_sha256 = canonical_json_hash(
             &FormulaEvaluatorConfig::for_trials(
                 mission.spec.search.planned_gp_and_subset_trials().unwrap(),
@@ -6285,6 +6344,99 @@ mod tests {
         revision.revision_id = revision.expected_revision_id().unwrap();
     }
 
+    fn fail_full_factor_gates(revision: &mut CexFactorBankRevisionV2) {
+        let evaluation = revision.attempts[0].evaluation.as_mut().unwrap();
+        let mut config = evaluation.evidence.formula_config().unwrap();
+        config.min_aggregate_score = 10.0;
+        evaluation.evidence.evaluator_config = serde_json::to_value(&config).unwrap();
+        evaluation.evidence.passed = false;
+        evaluation.evidence.failure_reasons = vec![
+            "trading gate rejected".to_string(),
+            "capacity gate rejected".to_string(),
+            "adjusted score rejected".to_string(),
+        ];
+        evaluation.evidence.metrics.folds[0].trade_count -= 1;
+        evaluation.evidence.metrics.trade_count -= 1;
+        let protocol = evaluation.evidence.evaluation_protocol.as_mut().unwrap();
+        protocol.costs.position_notional_usd = 10_000.0;
+        protocol.costs.capacity_depth_levels = 5;
+        protocol.costs.max_book_depth_fraction = 0.1;
+        for fold in &mut evaluation.evidence.metrics.folds {
+            fold.max_book_depth_fraction = Some(0.2);
+        }
+        let protocol_hash = protocol.content_hash().unwrap();
+        evaluation.evidence.evaluation_protocol_hash = Some(protocol_hash.clone());
+        revision.evaluation_policy.content_sha256 = protocol_hash;
+        revision.screening_policy.content_sha256 = canonical_json_hash(&config).unwrap();
+        rebind_factor_bank(revision);
+    }
+
+    #[test]
+    fn factor_bank_v3_accepts_predictive_factor_with_full_gate_failures() {
+        let mut revision = factor_bank();
+        fail_full_factor_gates(&mut revision);
+
+        revision.validate().unwrap();
+        assert_eq!(revision.schema_version, CEX_FACTOR_BANK_SCHEMA_V3);
+        assert_eq!(revision.entries.len(), 1);
+        let evidence = revision.attempts[0].evaluation.as_ref().unwrap();
+        assert!(!evidence.evidence.passed);
+        assert!(evidence.screening_rejection_codes().unwrap().is_empty());
+        assert_eq!(
+            evidence.rejection_codes().unwrap(),
+            vec![
+                CexFactorRejectionCodeV1::TradingGateFailed,
+                CexFactorRejectionCodeV1::CapacityGateFailed,
+                CexFactorRejectionCodeV1::MultipleTestingGateFailed,
+            ]
+        );
+        assert!(revision.attempts[0].rejection_details.is_empty());
+    }
+
+    #[test]
+    fn factor_bank_v3_rejects_a_forged_predictive_acceptance() {
+        let mut revision = factor_bank();
+        let evidence = revision.attempts[0].evaluation.as_mut().unwrap();
+        let folds = evidence
+            .evidence
+            .metrics
+            .predictive
+            .folds
+            .iter()
+            .map(|fold| FoldPredictiveMetrics {
+                fold_index: fold.fold_index,
+                row_count: fold.row_count,
+                time_series_ic: Some(0.0),
+                time_series_rank_ic: Some(0.0),
+            })
+            .collect();
+        evidence.evidence.metrics.predictive = PredictiveMetrics::from_folds(folds);
+        evidence.evidence.passed = false;
+        evidence.evidence.failure_reasons = vec!["predictive gate rejected".to_string()];
+        rebind_factor_bank(&mut revision);
+
+        assert!(revision.validate().is_err());
+    }
+
+    #[test]
+    fn factor_bank_v2_keeps_full_evaluation_acceptance_semantics() {
+        let mut revision = factor_bank();
+        fail_full_factor_gates(&mut revision);
+        revision.schema_version = CEX_FACTOR_BANK_SCHEMA_V2.to_string();
+        rebind_factor_bank(&mut revision);
+        assert!(revision.validate().is_err());
+
+        let attempt = &mut revision.attempts[0];
+        let evaluation = attempt.evaluation.as_ref().unwrap();
+        attempt.verdict = CexFactorScreeningVerdictV1::Rejected;
+        attempt.rejection_codes = evaluation.rejection_codes().unwrap();
+        attempt.rejection_details = evaluation.evidence.failure_reasons.clone();
+        revision.entries.clear();
+        rebind_factor_bank(&mut revision);
+
+        revision.validate().unwrap();
+    }
+
     #[test]
     fn legacy_factor_bank_v1_json_remains_readable() {
         let current = factor_bank();
@@ -6373,6 +6525,7 @@ mod tests {
         assert!(wrong_orientation.validate().is_err());
 
         let mut rejected = original.clone();
+        rejected.schema_version = CEX_FACTOR_BANK_SCHEMA_V2.to_string();
         let evaluation = rejected.attempts[0].evaluation.as_mut().unwrap();
         let mut config = evaluation.evidence.formula_config().unwrap();
         config.min_aggregate_score = 10.0;

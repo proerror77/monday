@@ -6,16 +6,16 @@ use crate::{
     data_mission, mission, prediction_dispatch,
 };
 use alpha_domain::{
-    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselinePolicyV1,
-    CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1, CexFactorBankRevisionV2,
-    CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2,
-    CexFactorScreeningVerdictV1, CexFinalPrecommitV1, CexFourStageStrategyCandidateV1,
-    CexGpPolicyV1, CexResearchContentRefV1, CexResearchHoldoutStateV1,
-    CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind, EvaluationCostsV1,
-    FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy, MissionStatus,
-    PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage, StrategyBundle,
-    ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1, MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
+    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
+    CexBaselineGateV1, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1,
+    CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2, CexFactorRejectionCodeV1,
+    CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1, CexFinalPrecommitV1,
+    CexFourStageStrategyCandidateV1, CexGpPolicyV1, CexResearchContentRefV1,
+    CexResearchHoldoutStateV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
+    EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
+    MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
+    StrategyBundle, ValidatorMode, CEX_FINAL_PRECOMMIT_SCHEMA_V1,
+    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     baselines::evaluate_cex_baselines,
@@ -45,6 +45,7 @@ use hft_research_manifest::{
     CexReplaySnapshotV3, CexReplaySnapshotV4, ManifestId,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
+    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
 };
 use reqwest::{
     blocking::Client,
@@ -75,7 +76,7 @@ pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_VERSION: &str = "cex-event-replay-receipt-v1";
@@ -116,11 +117,17 @@ pub(crate) struct Materialization {
     pub(crate) bucket_ms: u64,
     pub(crate) label_horizon_buckets: usize,
     pub(crate) top_depth: usize,
+    #[serde(default = "default_series_count")]
+    pub(crate) series_count: usize,
     pub(crate) rows: usize,
     first_event_time: chrono::DateTime<Utc>,
     last_event_time: chrono::DateTime<Utc>,
     pub(crate) snapshot: CexReplaySnapshotV4,
     snapshot_sha256: String,
+}
+
+const fn default_series_count() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,15 +183,21 @@ pub(crate) enum ExecutionBinding {
     },
 }
 
+impl ExecutionBinding {
+    fn is_search_only(&self) -> bool {
+        matches!(self, Self::Campaign { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CexFinalizationReportV1 {
-    schema_version: String,
-    precommit_id: String,
-    sealed_receipt_id: String,
-    sealed_passed: bool,
-    strategy_bundle_id: Option<String>,
-    promotion_id: Option<String>,
+pub(crate) struct CexFinalizationReportV1 {
+    pub(crate) schema_version: String,
+    pub(crate) precommit_id: String,
+    pub(crate) sealed_receipt_id: String,
+    pub(crate) sealed_passed: bool,
+    pub(crate) strategy_bundle_id: Option<String>,
+    pub(crate) promotion_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,7 +416,9 @@ pub(crate) fn execute_report(
         .timeout(Duration::from_secs(120))
         .redirect(Policy::none())
         .build()?;
-    ensure_holdout_claim_absent(&client, &args.holdout_claim_readback_url)?;
+    if !binding.is_search_only() {
+        ensure_holdout_claim_absent(&client, &args.holdout_claim_readback_url)?;
+    }
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
@@ -557,6 +572,7 @@ pub(crate) fn execute_report(
         || feature_manifest.artifact_sha256 != feature_sha256
         || feature_manifest.label_spec.horizon_buckets != materialization.label_horizon_buckets
         || feature_manifest.label_spec.observation_frequency_millis != materialization.bucket_ms
+        || feature_manifest.series_count != materialization.series_count
     {
         bail!("registered feature lineage or label facts do not match the materialization");
     }
@@ -654,7 +670,7 @@ pub(crate) fn execute_report(
             "multiple_testing_trials": control_mission
                 .spec
                 .search
-                .planned_gp_and_subset_trials()?
+                .multiple_testing_trials
         }),
         search_budget: control_mission.spec.search.budget.clone(),
         completion_policy: MissionCompletionPolicy {
@@ -729,8 +745,8 @@ pub(crate) fn execute_report(
     let baseline_dataset_manifest =
         data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
     let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
-    let feature_available_times = data_mission::feature_available_times(&feature_manifest)?;
-    if feature_available_times.len() != baseline_rows.len() {
+    let feature_decision_clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+    if feature_decision_clocks.len() != baseline_rows.len() {
         bail!("CEX feature availability clock does not match the admitted dataset");
     }
     let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
@@ -771,12 +787,13 @@ pub(crate) fn execute_report(
         .map(|(strategy, _, _)| {
             run_cex_event_replay(
                 &results_dir,
+                &mission_id,
                 &control_mission,
                 &materialization,
                 &materialization_sha256,
                 &factor_bank,
                 &baseline_context,
-                &feature_available_times[..baseline_context.rows().len()],
+                &feature_decision_clocks[..baseline_context.rows().len()],
                 strategy,
                 &replay_policy,
                 &replay_artifact_path,
@@ -798,7 +815,7 @@ pub(crate) fn execute_report(
     }
     let finalization = match (&subset_run, &replay_report) {
         (Some((strategy, subset_checkpoint, subset_result)), Some(replay))
-            if replay.gate.passed =>
+            if replay.gate.passed && !binding.is_search_only() =>
         {
             Some(finalize_cex_candidate(
                 &mut store,
@@ -806,6 +823,7 @@ pub(crate) fn execute_report(
                 &client,
                 &args.holdout_claim_put_url,
                 &args.holdout_claim_readback_url,
+                &mission_id,
                 &control_mission,
                 &lineage,
                 &factor_bank,
@@ -900,6 +918,7 @@ fn finalize_cex_candidate(
     client: &Client,
     holdout_claim_put_url: &str,
     holdout_claim_readback_url: &str,
+    mission_id: &str,
     control_mission: &CexResearchMissionArtifactV1,
     lineage: &MissionLineage,
     factor_bank: &CexFactorBankRevisionV2,
@@ -938,9 +957,8 @@ fn finalize_cex_candidate(
             subset_result,
         )
         .map_err(anyhow::Error::msg)?;
-    replay.validate()?;
+    validate_replay_strategy_binding(replay, strategy, control_mission, mission_id)?;
 
-    let mission_id = control_mission.semantic_id()?;
     let precommit_id = format!("cex-final-precommit:{mission_id}");
     let executable_formula = strategy
         .executable_formula(factor_bank)
@@ -948,7 +966,7 @@ fn finalize_cex_candidate(
     let strategy_json = serde_json::to_string(strategy)?;
     let candidate = CandidateArtifact::CexFourStage(CexFourStageStrategyCandidateV1::new(
         precommit_id,
-        mission_id.clone(),
+        mission_id.to_string(),
         strategy.artifact_id.clone(),
         strategy_json,
         executable_formula,
@@ -985,7 +1003,7 @@ fn finalize_cex_candidate(
     let now = Utc::now();
     let evaluation_record = EvaluationRecord {
         evaluation_id: evaluation_id.clone(),
-        mission_id: mission_id.clone(),
+        mission_id: mission_id.to_string(),
         candidate_id: candidate_id.clone(),
         dataset_manifest_id: lineage.mission.dataset_manifest_id.as_str().to_string(),
         evaluation_protocol_hash: control_mission
@@ -1017,7 +1035,7 @@ fn finalize_cex_candidate(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let iteration = ResearchIteration {
         iteration_id: format!("cex-final-iteration-{candidate_hash}"),
-        mission_id: mission_id.clone(),
+        mission_id: mission_id.to_string(),
         parent_candidate_ids,
         engine: EngineKind::Mcts,
         hypothesis: proposal.hypothesis.clone(),
@@ -1050,7 +1068,7 @@ fn finalize_cex_candidate(
         schema_version: CEX_FINAL_PRECOMMIT_SCHEMA_V1.to_string(),
         precommit_id: String::new(),
         mission: CexResearchContentRefV1 {
-            id: mission_id.clone(),
+            id: mission_id.to_string(),
             content_sha256: canonical_json_hash(&semantic_mission)?,
         },
         dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
@@ -1108,28 +1126,28 @@ fn finalize_cex_candidate(
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
     let claim_path = results_dir.join("sealed-holdout-claim.json");
     data_mission::write_json_atomic(&claim_path, &claim)?;
+    let claim_sha256 = sha256_file(&claim_path)?;
+    // This create-once write is the at-most-once boundary. If it succeeds but
+    // local claim or evaluation fails, the Mission is terminal and inconclusive.
+    publish_immutable_file(
+        client,
+        holdout_claim_put_url,
+        &claim_path,
+        "application/json",
+    )?;
+    let claim_readback_path = results_dir.join("sealed-holdout-claim-readback.json");
+    let (_, claim_readback_sha256) = fetch_to_file(
+        client,
+        holdout_claim_readback_url,
+        &claim_readback_path,
+        MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES,
+    )?;
+    if claim_readback_sha256 != claim_sha256 {
+        bail!("published CEX sealed holdout claim readback SHA256 mismatch");
+    }
     let sealed_revision = match store.claim_cex_sealed_holdout(&claim, Utc::now())? {
         Some(existing) => existing,
         None => {
-            let claim_sha256 = sha256_file(&claim_path)?;
-            // This create-once write is the at-most-once boundary. If it succeeds but
-            // readback or evaluation fails, the Mission is terminal and inconclusive.
-            publish_immutable_file(
-                client,
-                holdout_claim_put_url,
-                &claim_path,
-                "application/json",
-            )?;
-            let claim_readback_path = results_dir.join("sealed-holdout-claim-readback.json");
-            let (_, claim_readback_sha256) = fetch_to_file(
-                client,
-                holdout_claim_readback_url,
-                &claim_readback_path,
-                MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES,
-            )?;
-            if claim_readback_sha256 != claim_sha256 {
-                bail!("published CEX sealed holdout claim readback SHA256 mismatch");
-            }
             let sealed = evaluator
                 .evaluate_sealed(&proposal, dataset)
                 .map_err(anyhow::Error::msg)?;
@@ -1191,7 +1209,7 @@ fn finalize_cex_candidate(
         )?;
         let promotion = PromotionRecord {
             promotion_id: promotion_id.clone(),
-            mission_id: mission_id.clone(),
+            mission_id: mission_id.to_string(),
             candidate_id: candidate_id.clone(),
             candidate_content_hash: candidate_hash,
             dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
@@ -1245,6 +1263,91 @@ fn finalize_cex_candidate(
     Ok(report)
 }
 
+pub(crate) fn finalize_existing_search_round(
+    round_execute_dir: &Path,
+    finalization_dir: &Path,
+    holdout_claim_put_url: &str,
+    holdout_claim_readback_url: &str,
+    control_mission: &CexResearchMissionArtifactV1,
+) -> anyhow::Result<CexFinalizationReportV1> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(Policy::none())
+        .build()?;
+    ensure_holdout_claim_absent(&client, holdout_claim_readback_url)?;
+    let round_results = round_execute_dir.join("results");
+    std::fs::create_dir_all(finalization_dir)?;
+    let mut store = AlphaStore::open(round_results.join("alpha.duckdb"))?;
+    if store.has_cex_sealed_holdout_claim(&control_mission.spec.holdout.holdout_id)? {
+        bail!("sealed holdout is already claimed; finalize requires a fresh unopened holdout");
+    }
+    let mission_id = control_mission.semantic_id()?;
+    let lineage = store.mission_lineage(&mission_id)?;
+    let factor_bank: CexFactorBankRevisionV2 =
+        serde_json::from_slice(&std::fs::read(round_results.join("factor-bank.json"))?)?;
+    let ridge: CexBaselineArtifactV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("ridge-baseline.json"))?)?;
+    let cart: CexBaselineArtifactV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("cart-baseline.json"))?)?;
+    let gate: CexBaselineGateV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("baseline-gate.json"))?)?;
+    let subset_checkpoint: MctsCheckpointArtifactV1 = serde_json::from_slice(&std::fs::read(
+        round_results.join("factor-subset-mcts-checkpoint.json"),
+    )?)?;
+    let subset_result: CexFactorBankMctsResultV1 = serde_json::from_slice(&std::fs::read(
+        round_results.join("factor-subset-mcts-result.json"),
+    )?)?;
+    let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(&std::fs::read(
+        round_results.join("combination-walk-forward.json"),
+    )?)?;
+    let replay: CexEventReplayReceiptV1 = serde_json::from_slice(&std::fs::read(
+        round_results.join("cex-event-replay-receipt.json"),
+    )?)?;
+    let gp_policy: CexGpPolicyV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("gp-policy.json"))?)?;
+    let baseline_policy: CexBaselinePolicyV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("baseline-policy.json"))?)?;
+    let weight_policy: CexEqualAbsoluteWeightPolicyV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("weight-policy.json"))?)?;
+    let replay_policy: CexEventReplayPolicyV1 =
+        serde_json::from_slice(&std::fs::read(round_results.join("replay-policy.json"))?)?;
+    let materialization =
+        decode_materialization(&std::fs::read(round_results.join("materialization.json"))?)?;
+    let dataset_manifest = data_mission::read_registered_research_dataset(
+        &store,
+        &round_results.join("cex-replay-dataset-manifest.json"),
+    )?;
+    let rows = dataset_manifest.load_rows(&control_mission.spec.evaluation_protocol.costs)?;
+    let dataset = prepare_dataset(rows, &control_mission.spec.evaluation_protocol)?;
+    let baselines = alpha_engine::baselines::CexBaselineRun {
+        ridge: Some(ridge),
+        cart: Some(cart),
+        gate,
+    };
+    finalize_cex_candidate(
+        &mut store,
+        finalization_dir,
+        &client,
+        holdout_claim_put_url,
+        holdout_claim_readback_url,
+        &mission_id,
+        control_mission,
+        &lineage,
+        &factor_bank,
+        &baselines,
+        &strategy,
+        &subset_checkpoint.checkpoint,
+        &subset_result,
+        &replay,
+        &dataset,
+        &gp_policy,
+        &baseline_policy,
+        &weight_policy,
+        &replay_policy,
+        &materialization.snapshot.instrument_rules,
+    )
+}
+
 fn content_reference(
     id: &str,
     artifact: &impl Serialize,
@@ -1269,8 +1372,17 @@ pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materializa
         .get("schema_version")
         .and_then(serde_json::Value::as_str)
     {
+        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6) => {
+            serde_json::from_value(value).context("V6 materialization manifest is invalid")
+        }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5) => {
-            serde_json::from_value(value).context("V5 materialization manifest is invalid")
+            let materialization: Materialization = serde_json::from_value(value)
+                .context("historical V5 materialization is invalid")?;
+            materialization
+                .snapshot
+                .validate()
+                .map_err(anyhow::Error::new)?;
+            bail!("historical V5 materialization is read-only and cannot execute")
         }
         Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2) => {
             let snapshot: CexReplaySnapshotV1 = serde_json::from_value(
@@ -1465,12 +1577,13 @@ fn run_factor_bank_subset_search(
 #[allow(clippy::too_many_arguments)]
 fn run_cex_event_replay(
     results_dir: &Path,
+    mission_id: &str,
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
     materialization_sha256: &str,
     factor_bank: &CexFactorBankRevisionV2,
     context: &EngineContext<'_>,
-    feature_available_times: &[chrono::DateTime<Utc>],
+    feature_decision_clocks: &[data_mission::FeatureDecisionClock],
     strategy: &CexCombinationResearchArtifactV1,
     policy: &CexEventReplayPolicyV1,
     replay_artifact_path: &Path,
@@ -1485,17 +1598,21 @@ fn run_cex_event_replay(
     let positions = strategy
         .target_positions(factor_bank, context.rows())
         .map_err(anyhow::Error::msg)?;
-    if feature_available_times.len() != positions.len() {
+    if feature_decision_clocks.len() != positions.len() {
         bail!("CEX replay feature clock does not match the selected strategy rows");
     }
-    let decisions = feature_available_times
+    if feature_decision_clocks
         .iter()
-        .zip(positions)
-        .map(|(available_time, target_position)| TargetPositionDecision {
-            timestamp_us: available_time.timestamp_micros(),
-            target_position,
+        .zip(context.rows())
+        .any(|(clock, row)| {
+            clock.series_id != row.series_id
+                || clock.series_close_time < clock.feature_available_time
         })
-        .collect::<Vec<_>>();
+    {
+        bail!("CEX replay feature clock drifted across PIT series boundaries");
+    }
+    let (decisions, non_forced_decision_count) =
+        canonical_target_position_decisions(feature_decision_clocks, positions)?;
     let first_decision_time = decisions
         .first()
         .context("CEX event replay has no pre-holdout decisions")?
@@ -1566,7 +1683,10 @@ fn run_cex_event_replay(
     if metrics.l2_update_events < policy.min_l2_updates {
         failures.push("L2 update count is below the frozen replay minimum".to_string());
     }
-    if metrics.decision_count < policy.min_decisions {
+    if metrics.snapshot_events < materialization.series_count {
+        failures.push("snapshot count is below the PIT series boundary minimum".to_string());
+    }
+    if non_forced_decision_count < policy.min_decisions {
         failures.push("decision count is below the frozen replay minimum".to_string());
     }
     if metrics.min_bid_depth_levels < policy.required_depth_levels
@@ -1597,7 +1717,7 @@ fn run_cex_event_replay(
     let receipt = CexEventReplayReceiptV1 {
         schema_version: CEX_EVENT_REPLAY_RECEIPT_SCHEMA_VERSION.to_string(),
         receipt_id: String::new(),
-        mission_id: mission.semantic_id()?,
+        mission_id: mission_id.to_string(),
         strategy: CexResearchContentRefV1 {
             id: strategy.artifact_id.clone(),
             content_sha256: canonical_json_hash(strategy)?,
@@ -1632,6 +1752,53 @@ fn run_cex_event_replay(
     .finalize()?;
     data_mission::write_json_atomic(&results_dir.join("cex-event-replay-receipt.json"), &receipt)?;
     Ok(receipt)
+}
+
+fn canonical_target_position_decisions(
+    feature_decision_clocks: &[data_mission::FeatureDecisionClock],
+    positions: Vec<f64>,
+) -> anyhow::Result<(Vec<TargetPositionDecision>, usize)> {
+    let mut decisions = Vec::with_capacity(positions.len() + feature_decision_clocks.len());
+    let mut ordinary_decisions = 0;
+    for (index, (clock, target_position)) in
+        feature_decision_clocks.iter().zip(positions).enumerate()
+    {
+        let feature_time_us = clock.feature_available_time.timestamp_micros();
+        let close_time_us = clock.series_close_time.timestamp_micros();
+        if close_time_us < feature_time_us {
+            bail!("series close clock precedes feature availability");
+        }
+        if decisions
+            .last()
+            .is_some_and(|decision: &TargetPositionDecision| {
+                decision.timestamp_us >= feature_time_us
+            })
+        {
+            bail!("CEX replay decisions are not strictly ordered");
+        }
+        decisions.push(TargetPositionDecision {
+            timestamp_us: feature_time_us,
+            target_position,
+        });
+        ordinary_decisions += 1;
+        let series_end = index + 1 == feature_decision_clocks.len()
+            || feature_decision_clocks[index + 1].series_id != clock.series_id;
+        if series_end {
+            if decisions
+                .last()
+                .is_some_and(|decision: &TargetPositionDecision| {
+                    decision.timestamp_us >= close_time_us
+                })
+            {
+                bail!("CEX replay series close decisions are not strictly ordered");
+            }
+            decisions.push(TargetPositionDecision {
+                timestamp_us: close_time_us,
+                target_position: 0.0,
+            });
+        }
+    }
+    Ok((decisions, ordinary_decisions))
 }
 
 fn validate_replay_materialization_binding(
@@ -1739,34 +1906,40 @@ fn build_factor_bank(
                 })
             })
             .transpose()?;
-        let verdict = if iteration.verdict == IterationVerdict::Keep {
-            CexFactorScreeningVerdictV1::Accepted
-        } else {
-            CexFactorScreeningVerdictV1::Rejected
-        };
-        let rejection_codes = match iteration.verdict {
-            IterationVerdict::Keep => vec![],
-            IterationVerdict::Discard => evaluation
-                .as_ref()
-                .context("discarded candidate is missing screening evidence")?
-                .rejection_codes()?,
-            IterationVerdict::Crash => vec![match iteration.failure_class.as_deref() {
-                Some("duplicate_candidate") => CexFactorRejectionCodeV1::DuplicateCandidate,
-                Some("evaluation_error") => CexFactorRejectionCodeV1::EvaluationFailed,
-                _ => CexFactorRejectionCodeV1::EngineFailure,
-            }],
-        };
-        let rejection_details = evaluation
-            .as_ref()
-            .map(|evaluation| evaluation.evidence.failure_reasons.clone())
-            .filter(|reasons| !reasons.is_empty())
-            .or_else(|| {
+        let (verdict, rejection_codes, rejection_details) = match iteration.verdict {
+            IterationVerdict::Keep | IterationVerdict::Discard => {
+                let evidence = evaluation
+                    .as_ref()
+                    .context("evaluated candidate is missing screening evidence")?;
+                let rejection_codes = evidence.screening_rejection_codes()?;
+                if rejection_codes.is_empty() {
+                    (
+                        CexFactorScreeningVerdictV1::Accepted,
+                        rejection_codes,
+                        vec![],
+                    )
+                } else {
+                    (
+                        CexFactorScreeningVerdictV1::Rejected,
+                        rejection_codes,
+                        evidence.evidence.failure_reasons.clone(),
+                    )
+                }
+            }
+            IterationVerdict::Crash => (
+                CexFactorScreeningVerdictV1::Rejected,
+                vec![match iteration.failure_class.as_deref() {
+                    Some("duplicate_candidate") => CexFactorRejectionCodeV1::DuplicateCandidate,
+                    Some("evaluation_error") => CexFactorRejectionCodeV1::EvaluationFailed,
+                    _ => CexFactorRejectionCodeV1::EngineFailure,
+                }],
                 iteration
                     .failure_explanation
                     .clone()
                     .map(|reason| vec![reason])
-            })
-            .unwrap_or_default();
+                    .unwrap_or_default(),
+            ),
+        };
         let post_warmup_coverage_rows = evaluation
             .as_ref()
             .map(|evaluation| evaluation.evidence.metrics.row_count)
@@ -2062,7 +2235,7 @@ pub(crate) fn validate_materialization(
         bail!("CEX replay snapshot SHA256 mismatch");
     }
     if materialization.dataset_kind != MATERIALIZATION_KIND
-        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5
+        || materialization.schema_version != BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6
     {
         bail!("materialization kind or schema is unsupported");
     }
@@ -2074,6 +2247,7 @@ pub(crate) fn validate_materialization(
         || materialization.bucket_ms == 0
         || materialization.label_horizon_buckets == 0
         || materialization.top_depth == 0
+        || materialization.series_count == 0
     {
         bail!("materialization lineage is incomplete");
     }
@@ -2257,10 +2431,20 @@ pub(crate) fn recover_execution_report_from_published_result(
         512 * 1024,
     )?;
     if let Some(receipt) = &replay_receipt {
-        receipt.validate()?;
-        if receipt.mission_id != expected_mission_id {
-            bail!("published result bundle replay receipt does not match the Campaign Mission");
-        }
+        let strategy: CexCombinationResearchArtifactV1 = read_bundle_json(
+            &mut archive,
+            "results/combination-walk-forward.json",
+            4 * 1024 * 1024,
+        )?
+        .context(
+            "published result bundle replay receipt has no combination-walk-forward artifact",
+        )?;
+        validate_replay_strategy_binding(
+            receipt,
+            &strategy,
+            &control_mission,
+            expected_mission_id,
+        )?;
     }
 
     let finalization: Option<CexFinalizationReportV1> =
@@ -2278,6 +2462,7 @@ pub(crate) fn recover_execution_report_from_published_result(
         if replay_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.gate.passed)
+            && !binding.is_search_only()
         {
             bail!("published result bundle is missing finalization evidence for a passing replay");
         }
@@ -2382,7 +2567,31 @@ fn validate_recovered_binding(
                     "published result bundle is missing Campaign request SHA256 evidence",
                 )?,
             )?;
+            // Presigned query rotation changes request bytes without changing the
+            // canonical Campaign, round, or Mission identities checked above.
         }
+    }
+    Ok(())
+}
+
+fn validate_replay_strategy_binding(
+    replay: &CexEventReplayReceiptV1,
+    strategy: &CexCombinationResearchArtifactV1,
+    mission: &CexResearchMissionArtifactV1,
+    mission_id: &str,
+) -> anyhow::Result<()> {
+    replay.validate()?;
+    strategy.validate().map_err(anyhow::Error::msg)?;
+    if replay.mission_id != mission_id
+        || strategy.mission_id != mission_id
+        || replay.strategy != content_reference(&strategy.artifact_id, strategy)?
+        || replay.dataset != mission.spec.inputs.dataset
+        || replay.materialization != mission.spec.inputs.materialization
+        || replay.source != mission.spec.inputs.source
+        || replay.holdout_id != mission.spec.holdout.holdout_id
+        || replay.holdout_state != mission.spec.holdout.state
+    {
+        bail!("CEX replay receipt does not bind the exact selected strategy and Mission inputs");
     }
     Ok(())
 }
@@ -2698,7 +2907,7 @@ pub(crate) fn configured_sibling_binary(environment: &str, name: &str) -> anyhow
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         cli::{FeedbackLogArgs, FeedbackRecordArgs, SignDeploymentArgs, ValidationArgs},
@@ -2954,14 +3163,15 @@ mod tests {
     #[test]
     fn execute_rejects_features_that_have_no_live_formula_semantics() {
         let mut fixture = fixture("unsupported-live-fields");
-        fixture.mission.spec.feature_fields = vec!["book_imbalance_top5".to_string()];
+        fixture.mission.spec.feature_fields = vec!["ofi_top5".to_string()];
+        fixture.mission.spec.hypotheses[0].required_feature_families = vec!["ofi_top5".to_string()];
         resign_mission(&mut fixture);
 
         let error = execute(fixture.args.clone()).unwrap_err();
 
         assert_eq!(
             error.to_string(),
-            "feature field book_imbalance_top5 is not live executable: unsupported live field: book_imbalance_top5"
+            "feature field ofi_top5 is not live executable: unsupported live field: ofi_top5"
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
@@ -3434,7 +3644,7 @@ mod tests {
         let factor_bank: serde_json::Value =
             serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
                 .unwrap();
-        assert_eq!(factor_bank["schema_version"], "cex-factor-bank-v2");
+        assert_eq!(factor_bank["schema_version"], "cex-factor-bank-v3");
         assert_eq!(factor_bank["research_dataset"], run["research_dataset"]);
         let entries = factor_bank["entries"].as_array().unwrap();
         assert!(!entries.is_empty());
@@ -3482,6 +3692,58 @@ mod tests {
             );
         }
         assert!(!results.join("mcts-research-receipt.json").exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn discarded_full_evaluation_can_enter_the_atomic_factor_bank() {
+        let mut fixture = fixture("gp-atomic-factor-bank");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        fixture.mission.spec.evaluation_protocol.costs.fee_bps = 1_000.0;
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        resign_mission(&mut fixture);
+
+        execute(fixture.args.clone()).unwrap();
+
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_value(read_factor_bank(&fixture.args)).unwrap();
+        let accepted = factor_bank
+            .attempts
+            .iter()
+            .find(|attempt| {
+                attempt.verdict == CexFactorScreeningVerdictV1::Accepted
+                    && attempt
+                        .evaluation
+                        .as_ref()
+                        .is_some_and(|evaluation| !evaluation.evidence.passed)
+            })
+            .expect("predictive factor should survive a full trading rejection");
+        assert!(accepted.rejection_codes.is_empty());
+        assert!(accepted.rejection_details.is_empty());
+        assert!(!accepted
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .failure_reasons
+            .is_empty());
+        assert!(factor_bank
+            .entries
+            .iter()
+            .any(|entry| entry.candidate_id == accepted.candidate_id));
+
+        let lineage = AlphaStore::open(fixture.args.work_dir.join("results/alpha.duckdb"))
+            .unwrap()
+            .mission_lineage(fixture.mission.semantic_id().unwrap().as_str())
+            .unwrap();
+        assert!(lineage.iterations.iter().any(|iteration| {
+            iteration.candidate_artifact_id.as_deref() == Some(accepted.candidate_id.as_str())
+                && iteration.verdict == IterationVerdict::Discard
+        }));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -4461,6 +4723,7 @@ mod tests {
             .push("mid_price".to_string());
         fixture.mission.spec.search.budget.max_candidates = 3;
         fixture.mission.spec.search.budget.max_expansions = 3;
+        fixture.mission.spec.search.multiple_testing_trials = 6;
         rewrite_features(&mut fixture, |row| {
             let direction = row.label.signum();
             row.features.insert("book_imbalance".to_string(), direction);
@@ -4966,6 +5229,7 @@ mod tests {
         fixture.mission.spec.search.seed = 1;
         fixture.mission.spec.search.budget.max_candidates = 6;
         fixture.mission.spec.search.budget.max_expansions = 6;
+        fixture.mission.spec.search.multiple_testing_trials = 12;
         rewrite_features(&mut fixture, |row| row.label = 0.0);
         rebind_mission_inputs(&mut fixture);
 
@@ -5014,6 +5278,7 @@ mod tests {
         fixture.mission.spec.search.budget.max_candidates = 4;
         fixture.mission.spec.search.budget.max_expansions = 4;
         fixture.mission.spec.search.max_new_iterations = 1;
+        fixture.mission.spec.search.multiple_testing_trials = 8;
         resign_mission(&mut fixture);
         execute(fixture.args.clone()).unwrap();
         let first = read_factor_bank(&fixture.args);
@@ -5326,21 +5591,29 @@ mod tests {
         let foreign_binding = campaign_binding_fixture(&mut foreign);
         execute_report(foreign.args.clone(), foreign_binding).unwrap();
 
-        let foreign_results = foreign.args.work_dir.join("results");
+        let foreign_finalize = foreign.root.join("foreign-finalize");
+        finalize_existing_search_round(
+            &foreign.args.work_dir,
+            &foreign_finalize,
+            &foreign.args.holdout_claim_put_url,
+            &foreign.args.holdout_claim_readback_url,
+            &foreign.mission,
+        )
+        .unwrap();
         rewrite_bundle_entry_bytes(
             &primary.result_path,
             "results/finalization-report.json",
-            std::fs::read(foreign_results.join("finalization-report.json")).unwrap(),
+            std::fs::read(foreign_finalize.join("finalization-report.json")).unwrap(),
         );
         rewrite_bundle_entry_bytes(
             &primary.result_path,
             "results/final-precommit.json",
-            std::fs::read(foreign_results.join("final-precommit.json")).unwrap(),
+            std::fs::read(foreign_finalize.join("final-precommit.json")).unwrap(),
         );
         rewrite_bundle_entry_bytes(
             &primary.result_path,
             "results/sealed-holdout-receipt.json",
-            std::fs::read(foreign_results.join("sealed-holdout-receipt.json")).unwrap(),
+            std::fs::read(foreign_finalize.join("sealed-holdout-receipt.json")).unwrap(),
         );
 
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
@@ -5357,6 +5630,43 @@ mod tests {
         assert!(error.to_string().contains(
             "published result bundle precommit does not match the exact Campaign Mission"
         ));
+        std::fs::remove_dir_all(primary.root).unwrap();
+        std::fs::remove_dir_all(foreign.root).unwrap();
+    }
+
+    #[test]
+    fn recover_execution_report_rejects_a_foreign_strategy_for_the_replay_receipt() {
+        let mut primary = finalizing_fixture("recover-campaign-foreign-strategy");
+        let binding = campaign_binding_fixture(&mut primary);
+        execute_report(primary.args.clone(), binding.clone()).unwrap();
+
+        let mut foreign = finalizing_fixture("recover-campaign-foreign-strategy-source");
+        let foreign_binding = campaign_binding_fixture(&mut foreign);
+        execute_report(foreign.args.clone(), foreign_binding).unwrap();
+        rewrite_bundle_entry_bytes(
+            &primary.result_path,
+            "results/combination-walk-forward.json",
+            std::fs::read(
+                foreign
+                    .args
+                    .work_dir
+                    .join("results/combination-walk-forward.json"),
+            )
+            .unwrap(),
+        );
+
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let error = recover_execution_report_from_published_result(
+            &client,
+            primary.args.result_readback_url.as_str(),
+            &primary.root.join("recovered-foreign-strategy.zip"),
+            &primary.args.mission_id,
+            &primary.args.mission_sha256,
+            &binding,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exact selected strategy"));
         std::fs::remove_dir_all(primary.root).unwrap();
         std::fs::remove_dir_all(foreign.root).unwrap();
     }
@@ -5390,7 +5700,7 @@ mod tests {
         }
     }
 
-    fn finalizing_fixture(name: &str) -> Fixture {
+    pub(crate) fn finalizing_fixture(name: &str) -> Fixture {
         let mut fixture = fixture(name);
         fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
         rewrite_features(&mut fixture, |row| {
@@ -5403,11 +5713,11 @@ mod tests {
 
     fn rewrite_bundle_entry_bytes(bundle_path: &Path, entry_name: &str, replacement: Vec<u8>) {
         let mut entries = read_bundle_entries(bundle_path);
-        let entry_index = entries
-            .iter()
-            .position(|(name, _)| name == entry_name)
-            .expect("bundle entry must exist");
-        entries[entry_index].1 = replacement;
+        if let Some(entry_index) = entries.iter().position(|(name, _)| name == entry_name) {
+            entries[entry_index].1 = replacement;
+        } else {
+            entries.push((entry_name.to_string(), replacement));
+        }
         rewrite_bundle_entries(bundle_path, entries);
     }
 
@@ -5495,17 +5805,17 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    struct Fixture {
-        root: PathBuf,
-        feature_path: PathBuf,
-        mission_path: PathBuf,
-        materialization_path: PathBuf,
-        replay_artifact_path: PathBuf,
-        replay_manifest_path: PathBuf,
-        result_path: PathBuf,
-        mission: CexResearchMissionArtifactV1,
-        materialization: serde_json::Value,
-        args: ExecuteMissionArgs,
+    pub(crate) struct Fixture {
+        pub(crate) root: PathBuf,
+        pub(crate) feature_path: PathBuf,
+        pub(crate) mission_path: PathBuf,
+        pub(crate) materialization_path: PathBuf,
+        pub(crate) replay_artifact_path: PathBuf,
+        pub(crate) replay_manifest_path: PathBuf,
+        pub(crate) result_path: PathBuf,
+        pub(crate) mission: CexResearchMissionArtifactV1,
+        pub(crate) materialization: serde_json::Value,
+        pub(crate) args: ExecuteMissionArgs,
     }
 
     fn write_replay_fixture(
@@ -5654,6 +5964,7 @@ message binance_replay {
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);
                 PointInTimeFeatureRow {
+                    series_id: 1,
                     event_time,
                     feature_available_time: event_time,
                     label_available_time: event_time + ChronoDuration::seconds(5),
@@ -5754,7 +6065,7 @@ message binance_replay {
         let snapshot_sha256 = snapshot.sha256();
         let materialization = serde_json::json!({
             "dataset_kind": MATERIALIZATION_KIND,
-            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
+            "schema_version": BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
             "mission_id": "data-1",
             "symbol": "BTCUSDT",
             "market": "usdm",
@@ -5773,6 +6084,7 @@ message binance_replay {
                 "end_received_at_ns": source_end_ns,
                 "events": 160
             }],
+            "series_count": 1,
             "rows": 160,
             "first_event_time": first_event_time,
             "last_event_time": last_event_time,
@@ -5835,6 +6147,7 @@ message binance_replay {
                 max_seconds: 0,
             },
             max_new_iterations: 1,
+            multiple_testing_trials: 2,
         };
         let feature_fields = vec!["book_imbalance".to_string(), "spread_bps".to_string()];
         let gp_policy = CexGpPolicyV1::controlled_v1(
@@ -6130,6 +6443,160 @@ message binance_replay {
         assert!(error
             .to_string()
             .contains("historical V4 materialization is read-only"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn historical_v5_materialization_decodes_read_only() {
+        let fixture = fixture("historical-v5-read-only");
+        let mut value = fixture.materialization.clone();
+        value["schema_version"] = serde_json::json!(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5);
+
+        let error = decode_materialization(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("historical V5 materialization is read-only"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn canonical_target_position_decisions_insert_series_end_closes() {
+        let start = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let clocks = vec![
+            data_mission::FeatureDecisionClock {
+                series_id: 1,
+                feature_available_time: start,
+                series_close_time: start + ChronoDuration::seconds(5),
+            },
+            data_mission::FeatureDecisionClock {
+                series_id: 1,
+                feature_available_time: start + ChronoDuration::seconds(1),
+                series_close_time: start + ChronoDuration::seconds(6),
+            },
+            data_mission::FeatureDecisionClock {
+                series_id: 2,
+                feature_available_time: start + ChronoDuration::seconds(10),
+                series_close_time: start + ChronoDuration::seconds(15),
+            },
+        ];
+
+        let (decisions, ordinary) =
+            canonical_target_position_decisions(&clocks, vec![1.0, -1.0, 1.0]).unwrap();
+
+        assert_eq!(ordinary, 3);
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| (decision.timestamp_us, decision.target_position))
+                .collect::<Vec<_>>(),
+            vec![
+                (start.timestamp_micros(), 1.0),
+                (
+                    (start + ChronoDuration::seconds(1)).timestamp_micros(),
+                    -1.0
+                ),
+                ((start + ChronoDuration::seconds(6)).timestamp_micros(), 0.0),
+                (
+                    (start + ChronoDuration::seconds(10)).timestamp_micros(),
+                    1.0
+                ),
+                (
+                    (start + ChronoDuration::seconds(15)).timestamp_micros(),
+                    0.0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn campaign_override_mission_id_reaches_replay_receipt() {
+        let mut fixture = fixture("campaign-override-replay-receipt");
+        fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        execute(fixture.args.clone()).unwrap();
+
+        let results_dir = fixture.args.work_dir.join("results");
+        let mut override_mission = fixture.mission.clone();
+        let declared_total_trials = override_mission
+            .spec
+            .search
+            .planned_gp_and_subset_trials()
+            .unwrap()
+            + 1;
+        override_mission.spec.search.multiple_testing_trials = declared_total_trials;
+        override_mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&override_mission.spec.search).unwrap();
+        override_mission.spec.policies.screening.content_sha256 = canonical_json_hash(
+            &FormulaEvaluatorConfig::for_trials(declared_total_trials).unwrap(),
+        )
+        .unwrap();
+        override_mission.validate().unwrap();
+        let override_mission_id = override_mission.semantic_id().unwrap();
+        let store = AlphaStore::open(results_dir.join("alpha.duckdb")).unwrap();
+        let feature_manifest: hft_collector::FeatureDatasetManifest = serde_json::from_slice(
+            &std::fs::read(results_dir.join("feature-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let feature_decision_clocks =
+            data_mission::feature_decision_clocks(&feature_manifest).unwrap();
+        let dataset_manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results_dir.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let baseline_rows = dataset_manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let baseline_dataset =
+            prepare_dataset(baseline_rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let baseline_context = baseline_dataset.engine_context();
+        let factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results_dir.join("factor-bank.json")).unwrap())
+                .unwrap();
+        let strategy: CexCombinationResearchArtifactV1 = serde_json::from_slice(
+            &std::fs::read(results_dir.join("combination-walk-forward.json")).unwrap(),
+        )
+        .unwrap();
+        let replay_policy = CexEventReplayPolicyV1::controlled_v1(
+            fixture.mission.spec.policies.replay.id.clone(),
+            fixture.materialization["top_depth"].as_u64().unwrap() as usize,
+            fixture
+                .mission
+                .spec
+                .instrument
+                .horizon
+                .observation_frequency_millis,
+        )
+        .unwrap();
+        let materialization_sha256 = sha256_file(&fixture.materialization_path).unwrap();
+        let materialization =
+            decode_materialization(&std::fs::read(&fixture.materialization_path).unwrap()).unwrap();
+
+        let replay_receipt = run_cex_event_replay(
+            &results_dir,
+            &override_mission_id,
+            &override_mission,
+            &materialization,
+            &materialization_sha256,
+            &factor_bank,
+            &baseline_context,
+            &feature_decision_clocks[..baseline_context.rows().len()],
+            &strategy,
+            &replay_policy,
+            &fixture.replay_artifact_path,
+            &fixture.args.replay_artifact_sha256,
+            &fixture.replay_manifest_path,
+            &fixture.args.replay_manifest_sha256,
+        )
+        .unwrap();
+
+        assert_eq!(replay_receipt.mission_id, override_mission_id);
+
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

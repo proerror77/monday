@@ -17,7 +17,7 @@ const MICROS_IN_SECOND: f64 = 1_000_000.0;
 const BPS: f64 = 10_000.0;
 
 pub const TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION: &str =
-    "hft-backtest-target-position-replay-v1";
+    "hft-backtest-target-position-replay-v2";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +146,10 @@ impl<'a> TargetPositionReplay<'a> {
         self.last_event_time_us = Some(event.ts);
         match &event.payload {
             EventPayload::Snapshot { bids, asks } => {
+                if self.seeded {
+                    self.observe_series_boundary(event.ts)?;
+                    self.marked_mid = None;
+                }
                 self.book.apply_snapshot(event.ts, bids, asks);
                 self.seeded = true;
                 self.snapshot_events += 1;
@@ -235,9 +239,28 @@ impl<'a> TargetPositionReplay<'a> {
         Ok(())
     }
 
+    fn observe_series_boundary(&self, snapshot_ts: i64) -> Result<()> {
+        if self.position.abs() > f64::EPSILON {
+            anyhow::bail!("target-position replay received a new snapshot before flattening");
+        }
+        if self
+            .decisions
+            .get(self.decision_index)
+            .is_some_and(|decision| decision.timestamp_us < snapshot_ts)
+        {
+            anyhow::bail!(
+                "target-position replay has leftover pre-snapshot decisions from the prior series"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(self) -> Result<TargetPositionReplayMetrics> {
         if self.decision_index != self.decisions.len() {
             anyhow::bail!("target-position replay tape ended before all decisions");
+        }
+        if self.position.abs() > f64::EPSILON {
+            anyhow::bail!("target-position replay tape ended before flattening");
         }
         if self.config.trade_tape_declared && self.trade_events == 0 {
             anyhow::bail!("target-position replay manifest declares trades but none were replayed");
@@ -1700,6 +1723,10 @@ mod tests {
                 timestamp_us: 2_000_000,
                 target_position: -1.0,
             },
+            TargetPositionDecision {
+                timestamp_us: 3_000_000,
+                target_position: 0.0,
+            },
         ];
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
@@ -1722,7 +1749,7 @@ mod tests {
         assert_eq!(first.snapshot_events, 1);
         assert_eq!(first.l2_update_events, 2);
         assert_eq!(first.trade_events, 0);
-        assert_eq!(first.decision_count, 2);
+        assert_eq!(first.decision_count, 3);
         assert_eq!(first.max_bid_depth_levels, 1);
         assert_eq!(first.max_ask_depth_levels, 1);
         let unseeded = "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"l2_update\",\"bids\":[[100,1]],\"asks\":[[101,1]]}\n";
@@ -1741,11 +1768,20 @@ mod tests {
             "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
             "{\"timestamp\":3000000,\"sequence\":3,\"event\":\"l2_update\",\"bids\":[[109,0],[99,10]],\"asks\":[[111,0],[101,10]]}\n",
         );
-        let decisions =
-            [1_000_000, 2_000_000, 3_000_000].map(|timestamp_us| TargetPositionDecision {
-                timestamp_us,
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
                 target_position: 1.0,
-            });
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 3_000_000,
+                target_position: 0.0,
+            },
+        ];
         let config = TargetPositionReplayConfig {
             max_depth_levels: 1,
             max_decision_delay_us: 1,
@@ -1765,6 +1801,148 @@ mod tests {
         let expected_loss = 100.0 / 110.0 - 1.0 - 0.001;
         assert!((metrics.cumulative_net_return - (expected_gain + expected_loss)).abs() < 1e-12);
         assert!((metrics.max_drawdown - (-expected_loss / (1.0 + expected_gain))).abs() < 1e-12);
+    }
+
+    #[test]
+    fn target_position_replay_rejects_a_new_snapshot_with_an_open_position() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"snapshot\",\"bids\":[[89,10]],\"asks\":[[91,10]]}\n",
+        );
+        let decisions = [TargetPositionDecision {
+            timestamp_us: 1_000_000,
+            target_position: 1.0,
+        }];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let error = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap_err();
+        assert!(error.to_string().contains("before flattening"));
+    }
+
+    #[test]
+    fn target_position_replay_rejects_leftover_prior_series_decisions() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
+            "{\"timestamp\":10000000,\"sequence\":3,\"event\":\"snapshot\",\"bids\":[[89,10]],\"asks\":[[91,10]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 0.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 5_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 10_000_000,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let error = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("leftover pre-snapshot decisions"));
+    }
+
+    #[test]
+    fn target_position_replay_resets_marked_mid_across_snapshot_boundaries() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[99,0],[109,10]],\"asks\":[[101,0],[111,10]]}\n",
+            "{\"timestamp\":10000000,\"sequence\":3,\"event\":\"snapshot\",\"bids\":[[89,10]],\"asks\":[[91,10]]}\n",
+            "{\"timestamp\":11000000,\"sequence\":4,\"event\":\"l2_update\",\"bids\":[[89,0],[99,10]],\"asks\":[[91,0],[101,10]]}\n",
+        );
+        let decisions = [
+            TargetPositionDecision {
+                timestamp_us: 1_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 2_000_000,
+                target_position: 0.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 10_000_000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                timestamp_us: 11_000_000,
+                target_position: 0.0,
+            },
+        ];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let metrics = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap();
+
+        assert!((metrics.cumulative_net_return - (0.1 + (100.0 / 90.0 - 1.0))).abs() < 1e-12);
+    }
+
+    #[test]
+    fn target_position_replay_requires_a_flat_finish() {
+        let tape = concat!(
+            "{\"timestamp\":1000000,\"sequence\":1,\"event\":\"snapshot\",\"bids\":[[99,10]],\"asks\":[[101,10]]}\n",
+            "{\"timestamp\":2000000,\"sequence\":2,\"event\":\"l2_update\",\"bids\":[[109,10]],\"asks\":[[111,10]]}\n",
+        );
+        let decisions = [TargetPositionDecision {
+            timestamp_us: 1_000_000,
+            target_position: 1.0,
+        }];
+        let config = TargetPositionReplayConfig {
+            max_depth_levels: 1,
+            max_decision_delay_us: 1_000_000,
+            position_notional_usd: 0.0,
+            fee_bps: 0.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: false,
+            capacity_depth_levels: 0,
+            trade_tape_declared: false,
+        };
+
+        let error = replay_target_positions(tape.as_bytes(), &decisions, &config).unwrap_err();
+        assert!(error.to_string().contains("ended before flattening"));
     }
 
     #[test]
@@ -2060,10 +2238,7 @@ mod tests {
             .map(|trade| trade.pnl)
             .collect::<Vec<_>>();
         let average = pnls.iter().sum::<f64>() / pnls.len() as f64;
-        let deviation = (pnls
-            .iter()
-            .map(|pnl| (pnl - average).powi(2))
-            .sum::<f64>()
+        let deviation = (pnls.iter().map(|pnl| (pnl - average).powi(2)).sum::<f64>()
             / pnls.len() as f64)
             .sqrt();
         assert!(deviation > 0.0);

@@ -1,5 +1,8 @@
 use crate::{
-    evaluation::{evaluate_sealed_holdout, EngineContext, PreparedDataset, ResearchRow},
+    evaluation::{
+        contiguous_series_ranges, evaluate_sealed_holdout, EngineContext, PreparedDataset,
+        ResearchRow,
+    },
     CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
@@ -44,8 +47,13 @@ impl PredictiveGateResult {
             )
         });
         let mut max_book_depth_fraction = capacity_features.as_ref().map(|_| 0.0_f64);
-        let returns = range
+        let range_start = range.start;
+        let range_end = range.end;
+        let returns = (range_start..range_end)
             .map(|index| {
+                if index == range_start || rows[index - 1].series_id != rows[index].series_id {
+                    previous_position = 0.0;
+                }
                 let position = signal_position(signals[index]);
                 let position_change = position - previous_position;
                 let turnover = position_change.abs();
@@ -53,36 +61,34 @@ impl PredictiveGateResult {
                 if turnover > f64::EPSILON {
                     trade_count += 1;
                 }
-                previous_position = position;
                 let row = &rows[index];
-                let spread_crossing_bps = if costs.cross_spread {
-                    row.features.get("spread_bps").copied().unwrap_or(0.0) / 2.0
-                } else {
-                    0.0
-                };
-                if let (Some((bid_depth, ask_depth)), Some(max_fraction)) =
-                    (&capacity_features, &mut max_book_depth_fraction)
-                {
-                    let depth_feature = if position_change > 0.0 {
-                        ask_depth
-                    } else {
-                        bid_depth
-                    };
-                    let depth_notional = row.features.get(depth_feature).copied().unwrap_or(0.0)
-                        * row.features.get("mid_price").copied().unwrap_or(0.0);
-                    if turnover > f64::EPSILON {
-                        *max_fraction = (*max_fraction)
-                            .max(costs.position_notional_usd * turnover / depth_notional);
-                    }
+                let mut net = position * row.label
+                    - transaction_cost(
+                        row,
+                        turnover,
+                        position_change,
+                        costs,
+                        &capacity_features,
+                        &mut max_book_depth_fraction,
+                    )
+                    - row.funding_bps.max(0.0) * position.abs() / BPS;
+                let series_end =
+                    index + 1 == range_end || rows[index + 1].series_id != row.series_id;
+                previous_position = position;
+                if series_end && position.abs() > f64::EPSILON {
+                    total_turnover += position.abs();
+                    trade_count += 1;
+                    net -= transaction_cost(
+                        row,
+                        position.abs(),
+                        -position,
+                        costs,
+                        &capacity_features,
+                        &mut max_book_depth_fraction,
+                    );
+                    previous_position = 0.0;
                 }
-                let transaction_cost = (row.fee_bps.max(0.0) - costs.rebate_bps
-                    + row.latency_bps.max(0.0)
-                    + costs.slippage_bps
-                    + spread_crossing_bps)
-                    * turnover
-                    / BPS;
-                let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
-                position * row.label - transaction_cost - funding_cost
+                net
             })
             .collect();
         (
@@ -466,10 +472,17 @@ fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
 
 pub(crate) fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<f64>, String> {
     if validate_live_formula(ast).is_ok() {
-        return evaluate_live_formula_series(ast, rows.len(), |row, field| {
-            rows.get(row)?.features.get(field).copied()
-        })
-        .map_err(|error| error.to_string());
+        let mut output = Vec::with_capacity(rows.len());
+        for range in contiguous_series_ranges(rows) {
+            let series = &rows[range];
+            output.extend(
+                evaluate_live_formula_series(ast, series.len(), |row, field| {
+                    series.get(row)?.features.get(field).copied()
+                })
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        return Ok(output);
     }
     match ast {
         FactorAst::Terminal(FactorTerminal::Field(field)) if field == "signal" => {
@@ -504,7 +517,7 @@ pub(crate) fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<
                 FactorOperator::Log => {
                     unary(&args[0], rows, |value| value.signum() * value.abs().ln_1p())
                 }
-                FactorOperator::Rank => expanding_rank(&evaluate_ast(&args[0], rows)?),
+                FactorOperator::Rank => expanding_rank(&evaluate_ast(&args[0], rows)?, rows),
                 FactorOperator::Delta => {
                     rolling_binary(&args[0], &args[1], rows, RollingOperation::Delta)
                 }
@@ -590,25 +603,27 @@ fn rolling_binary(
 ) -> Result<Vec<f64>, String> {
     let values = evaluate_ast(values, rows)?;
     let window = parse_window(window)?;
-    let mut output = Vec::with_capacity(values.len());
-    for index in 0..values.len() {
-        let start = (index + 1).saturating_sub(window);
-        let history = &values[start..=index];
-        let value = match operation {
-            RollingOperation::Delta => values[index] - values[index.saturating_sub(window)],
-            RollingOperation::Mean => mean(history),
-            RollingOperation::Std => standard_deviation(history, mean(history)),
-            RollingOperation::ZScore => {
-                let average = mean(history);
-                let deviation = standard_deviation(history, average);
-                if deviation <= f64::EPSILON {
-                    0.0
-                } else {
-                    (values[index] - average) / deviation
+    let mut output = vec![0.0; values.len()];
+    for range in contiguous_series_ranges(rows) {
+        let series = &values[range.clone()];
+        for offset in 0..series.len() {
+            let start = (offset + 1).saturating_sub(window);
+            let history = &series[start..=offset];
+            output[range.start + offset] = match operation {
+                RollingOperation::Delta => series[offset] - series[offset.saturating_sub(window)],
+                RollingOperation::Mean => mean(history),
+                RollingOperation::Std => standard_deviation(history, mean(history)),
+                RollingOperation::ZScore => {
+                    let average = mean(history);
+                    let deviation = standard_deviation(history, average);
+                    if deviation <= f64::EPSILON {
+                        0.0
+                    } else {
+                        (series[offset] - average) / deviation
+                    }
                 }
-            }
-        };
-        output.push(value);
+            };
+        }
     }
     Ok(output)
 }
@@ -626,21 +641,59 @@ fn parse_window(ast: &FactorAst) -> Result<usize, String> {
         .ok_or_else(|| "rolling window is out of bounds".to_string())
 }
 
-fn expanding_rank(values: &[f64]) -> Result<Vec<f64>, String> {
+fn expanding_rank(values: &[f64], rows: &[ResearchRow]) -> Result<Vec<f64>, String> {
     if values.iter().any(|value| !value.is_finite()) {
         return Err("rank input is not finite".to_string());
     }
-    Ok(values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let less_or_equal = values[..=index]
+    let mut output = vec![0.0; values.len()];
+    for range in contiguous_series_ranges(rows) {
+        for offset in 0..range.len() {
+            let index = range.start + offset;
+            let value = values[index];
+            let less_or_equal = values[range.start..=index]
                 .iter()
-                .filter(|historical| *historical <= value)
+                .filter(|historical| **historical <= value)
                 .count();
-            less_or_equal as f64 / (index + 1) as f64
-        })
-        .collect())
+            output[index] = less_or_equal as f64 / (offset + 1) as f64;
+        }
+    }
+    Ok(output)
+}
+
+fn transaction_cost(
+    row: &ResearchRow,
+    turnover: f64,
+    position_change: f64,
+    costs: &EvaluationCostsV1,
+    capacity_features: &Option<(String, String)>,
+    max_book_depth_fraction: &mut Option<f64>,
+) -> f64 {
+    let spread_crossing_bps = if costs.cross_spread {
+        row.features.get("spread_bps").copied().unwrap_or(0.0) / 2.0
+    } else {
+        0.0
+    };
+    if let (Some((bid_depth, ask_depth)), Some(max_fraction)) =
+        (capacity_features.as_ref(), max_book_depth_fraction.as_mut())
+    {
+        let depth_feature = if position_change > 0.0 {
+            ask_depth.as_str()
+        } else {
+            bid_depth.as_str()
+        };
+        let depth_notional = row.features.get(depth_feature).copied().unwrap_or(0.0)
+            * row.features.get("mid_price").copied().unwrap_or(0.0);
+        if turnover > f64::EPSILON {
+            *max_fraction =
+                (*max_fraction).max(costs.position_notional_usd * turnover / depth_notional);
+        }
+    }
+    (row.fee_bps.max(0.0) - costs.rebate_bps
+        + row.latency_bps.max(0.0)
+        + costs.slippage_bps
+        + spread_crossing_bps)
+        * turnover
+        / BPS
 }
 
 fn predictive_metrics(
@@ -792,6 +845,7 @@ mod tests {
         let start = Utc::now();
         (0..500)
             .map(|index| ResearchRow {
+                series_id: 1,
                 available_time: start + Duration::minutes(index as i64),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
                 features: std::collections::BTreeMap::from([(
@@ -948,9 +1002,9 @@ mod tests {
         let (net_returns, trade_count, _, max_book_depth_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
-        assert_eq!(trade_count, 3);
+        assert_eq!(trade_count, 4);
         assert_eq!(max_book_depth_fraction, None);
-        assert!((net_returns.iter().sum::<f64>() - 0.028325).abs() < 1.0e-12);
+        assert!((net_returns.iter().sum::<f64>() - 0.02799).abs() < 1.0e-12);
     }
 
     #[test]
@@ -968,9 +1022,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(evaluation.metrics.total_turnover, 127.0);
-        assert_eq!(evaluation.metrics.folds[0].total_turnover, 127.0);
-        assert!((evaluation.metrics.cumulative_net_return - 0.6273).abs() < 1.0e-12);
+        assert_eq!(evaluation.metrics.total_turnover, 128.0);
+        assert_eq!(evaluation.metrics.folds[0].total_turnover, 128.0);
+        assert!((evaluation.metrics.cumulative_net_return - 0.6272).abs() < 1.0e-12);
     }
 
     #[test]
@@ -1033,10 +1087,156 @@ mod tests {
         let (net_returns, trade_count, _, _) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
-        assert_eq!(trade_count, 2);
+        assert_eq!(trade_count, 3);
         assert!((net_returns[0] + 0.00025).abs() < 1.0e-12);
         assert!((net_returns[1] + 0.0005).abs() < 1.0e-12);
-        assert_eq!(net_returns[2], 0.0);
+        assert!((net_returns[2] + 0.00025).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn rolling_state_resets_on_second_series() {
+        let start = Utc::now();
+        let rows = vec![
+            ResearchRow {
+                series_id: 1,
+                available_time: start,
+                signal: 0.0,
+                features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 1.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 1,
+                available_time: start + Duration::minutes(1),
+                signal: 0.0,
+                features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 3.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 2,
+                available_time: start + Duration::minutes(10),
+                signal: 0.0,
+                features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 10.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 2,
+                available_time: start + Duration::minutes(11),
+                signal: 0.0,
+                features: std::collections::BTreeMap::from([("book_imbalance".to_string(), 13.0)]),
+                label: 0.0,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+        ];
+        let delta = evaluate_ast(
+            &FactorAst::call(
+                FactorOperator::Delta,
+                vec![
+                    FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                    FactorAst::Terminal(FactorTerminal::Constant("1".to_string())),
+                ],
+            )
+            .unwrap(),
+            &rows,
+        )
+        .unwrap();
+        let zscore = evaluate_ast(
+            &FactorAst::call(
+                FactorOperator::ZScore,
+                vec![
+                    FactorAst::Terminal(FactorTerminal::Field("book_imbalance".to_string())),
+                    FactorAst::Terminal(FactorTerminal::Constant("2".to_string())),
+                ],
+            )
+            .unwrap(),
+            &rows,
+        )
+        .unwrap();
+
+        assert_eq!(delta, vec![0.0, 2.0, 0.0, 3.0]);
+        assert_eq!(zscore[2], 0.0);
+        assert!(zscore[3].is_finite());
+    }
+
+    #[test]
+    fn series_end_forces_close_and_range_end_flattens() {
+        let start = Utc::now();
+        let input = vec![
+            ResearchRow {
+                series_id: 1,
+                available_time: start,
+                signal: 1.0,
+                features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
+                label: 0.0,
+                fee_bps: 2.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 1,
+                available_time: start + Duration::minutes(1),
+                signal: 1.0,
+                features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
+                label: 0.0,
+                fee_bps: 2.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+            ResearchRow {
+                series_id: 2,
+                available_time: start + Duration::minutes(10),
+                signal: 1.0,
+                features: std::collections::BTreeMap::from([("spread_bps".to_string(), 0.0)]),
+                label: 0.0,
+                fee_bps: 2.0,
+                funding_bps: 0.0,
+                pit_funding: false,
+                latency_bps: 0.0,
+            },
+        ];
+        let signals = vec![1.0, 1.0, 1.0];
+        let costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
+
+        let (net_returns, trade_count, total_turnover, _) =
+            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+
+        assert_eq!(trade_count, 4);
+        assert_eq!(total_turnover, 4.0);
+        assert!((net_returns.iter().sum::<f64>() + 0.0008).abs() < 1.0e-12);
     }
 
     #[test]
@@ -1071,7 +1271,7 @@ mod tests {
         let (_, trade_count, _, max_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
-        assert_eq!(trade_count, 3);
+        assert_eq!(trade_count, 4);
         assert_eq!(max_fraction, Some(0.4));
     }
 

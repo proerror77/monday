@@ -12,7 +12,7 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 
 | Contract | Status | Current terminal evidence |
 | --- | --- | --- |
-| CEX Cloud Campaign | Implemented through cloud admission, GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once Mission/result objects plus independent readback with exact SHA-256 matches |
+| CEX Cloud Campaign | Implemented through cloud admission, immutable shared-input download, bounded multi-round Campaign execution, GP, immutable Factor Bank, deterministic Ridge/CART baselines, and bounded subset MCTS | Create-once per-round Mission/result objects, deterministic pre-holdout winner selection, one finalization/global holdout claim, and independent readback with exact SHA-256 matches |
 | Factor-Bank subset MCTS | Implemented | Content-bound checkpoint, add/remove/swap trace, and passing equal-absolute-weight selection or an explicit no-selection result; sealed holdout remains closed |
 | Four-stage combination walk-forward | Implemented | A passing subset emits a content-addressed, research-only Signal/Sizing/Risk/Execution artifact with same-protocol Ridge/CART evidence; no selection emits no strategy |
 | Event-level L2 replay receipt | Implemented | Canonical event replay emits a content-bound receipt and explicit queue/partial-fill/impact/capacity disclosures |
@@ -22,11 +22,14 @@ Rust CLI and libraries for the governed, bounded Loop Engineer research plane. I
 | Prediction Mission v4 | Implemented for `pipeline_smoke` and deterministic `research_trial` | Authenticated partition readmission plus task-isolated settlement, UP-execution, and DOWN-execution result receipts; no external proposal provider |
 
 `mission dispatch submit` is the CEX operator acceptance seam. It submits one
-immutable Campaign request and does not read feature rows, render a Mission, or
-run strategy search locally. One ACK Job/Pod performs input admission, Mission
-render and readback, research execution, and result readback. Low-level Mission
-and LoopRun commands remain diagnostics and implementation surfaces; they are
-not alternate evidence paths around this contract.
+immutable Campaign request and does not read feature rows or run search locally.
+The workstation only freezes, signs, and submits identities. One cloud ACK
+Job/Pod downloads the shared inputs once, admits the request, renders and
+executes each round search-only, performs create-once Mission/result readback
+per round, selects the deterministic pre-holdout winner, and finalizes exactly
+once against the global holdout claim. Low-level Mission and LoopRun commands
+remain diagnostics and implementation surfaces; they are not alternate evidence
+paths around this contract.
 
 ## Data Mission
 
@@ -81,10 +84,10 @@ it grants no promotion or runtime authority.
 
 The production CEX entrypoint consumes a private Campaign submission whose
 request binds the exact input objects and SHA-256 values, source revision,
-image digest, holdout identity, one search seed, output root, and create-once
-Mission/result objects plus one global sealed-holdout claim object. Signed URL
-query parameters are transport only; the query-free objects are part of the
-Campaign identity.
+image digest, holdout identity, campaign-wide `declared_total_trials`, and at
+least two rounds. Each round carries a unique `round_id`, unique seed, and
+create-once Mission/result URLs. Signed URL query parameters are transport
+only; the query-free objects are part of the Campaign identity.
 
 ```bash
 cargo run -p alpha-harness -- mission campaign-id \
@@ -99,14 +102,18 @@ cargo run -p alpha-harness -- mission dispatch submit \
 The submit command creates the Job suspended, verifies its pinned execution
 template, then creates the immutable Secret with that Job as its owner. It reads
 the Secret back before releasing the Job and prints identities only, never the
-signed URLs. The Pod rejects
-redirects, input/hash drift, an existing holdout claim, and any Mission or
-result readback mismatch before accepting terminal evidence.
+signed URLs. The Pod rejects redirects, input/hash drift, an existing holdout
+claim, and any Mission or result readback mismatch before accepting terminal
+evidence. Each round records `results/mission-admission.json`, which binds the
+current request SHA and the round's Mission SHA alongside the campaign and
+round IDs.
 
-One Campaign contains exactly one Mission. That Mission already performs the
-bounded GP and subset-MCTS iterations under one multiple-testing family. A
-negative result is terminal for the Campaign; it is not silently converted into
-another seeded Mission that keeps trying against the same holdout.
+One Campaign contains multiple rounds. Each round renders one Mission, executes
+search only, and can produce at most one passing pre-holdout result. The
+Campaign selects one deterministic pre-holdout winner from the passing rounds,
+then performs exactly one finalization against the global holdout claim. If no
+round passes, the Campaign ends negative and no claim is made. There is no
+second holdout winner.
 
 The direct `mission execute` and checkpoint-resume surfaces remain diagnostic.
 They are not the cloud Campaign production path.
@@ -129,28 +136,31 @@ as alternate execute flags. The latest credential-free replay writer currently
 admits USD-M only: public reference artifacts bind instrument rules, funding,
 and open interest, while fee and rebate values remain explicit, content-hashed
 Mission assumptions. Historical account-bound and Spot replay schemas remain
-read-only. Unknown fields, Prediction Market fields, action
-requests, hash drift, cross-instrument inputs, and same-search exposed-holdout
-feedback fail before Mission admission. `operational.submitted_at` is retained
-for audit but does not alter the semantic Mission identity. After both baselines
-pass, execution searches only canonical Factor Bank subsets through add, remove,
-and swap actions, scores mechanically oriented equal-absolute-weight signals on
-the research folds, and emits the typed weight policy plus deterministic
-checkpoint, trace, and terminal-result artifacts. GP screening and subset search
-share one multiplicity correction sized for both bounded candidate families;
-only passing subset evaluations are selectable; a terminal search with no
-passing subset publishes `selected: null` instead of dropping the negative
-result. A passing selection also emits `combination-walk-forward.json`: four
-content-addressed stages linked from the immutable Factor Bank through fixed
-equal-absolute Signal weights, sign-based bounded Sizing, evaluator-owned Risk
-limits, and the exact Binance bucketed-L2 cost/execution assumptions. The same
-artifact binds the selected walk-forward metrics and both mandatory baseline
-evaluations under one protocol while keeping the holdout unopened and carrying
-neither deployment nor order-submission authority. Its selected result is
-accepted only after exact checkpoint replay derives the same terminal metadata,
-subset, and evaluation. Sealed-holdout evaluation requires the separate governed
-precommit boundary. This schema binds prior-evidence identities; later holdout
-and Paper/Shadow gates own receipt and signature verification.
+read-only. Unknown fields, Prediction Market fields, action requests, hash
+drift, cross-instrument inputs, and same-search exposed-holdout feedback fail
+before Mission admission. `operational.submitted_at` is retained for audit but
+does not alter the semantic Mission identity. The fixed v4 factor plan uses 8
+snapshot L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour
+protocol `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the $1000 / Top5 5%
+capacity screen. After both baselines pass, execution searches only canonical
+Factor Bank subsets through add, remove, and swap actions, scores mechanically
+oriented equal-absolute-weight signals on the research folds, and emits the
+typed weight policy plus deterministic checkpoint, trace, and terminal-result
+artifacts. GP screening and subset search share one multiplicity correction
+sized for both bounded candidate families; only passing subset evaluations are
+selectable; a terminal search with no passing subset publishes `selected: null`
+instead of dropping the negative result. A passing selection also emits
+`combination-walk-forward.json`: four content-addressed stages linked from the
+immutable Factor Bank through fixed equal-absolute Signal weights, sign-based
+bounded Sizing, evaluator-owned Risk limits, and the exact Binance bucketed-L2
+cost/execution assumptions. The same artifact binds the selected walk-forward
+metrics and both mandatory baseline evaluations under one protocol while
+keeping the holdout unopened and carrying neither deployment nor
+order-submission authority. Its selected result is accepted only after exact
+checkpoint replay derives the same terminal metadata, subset, and evaluation.
+Sealed-holdout evaluation requires the separate governed precommit boundary.
+This schema binds prior-evidence identities; later holdout and Paper/Shadow
+gates own receipt and signature verification.
 
 For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The low-level CLI rejects `mcts`; Factor-Bank subset MCTS is owned only by the content-bound `mission execute` seam. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 

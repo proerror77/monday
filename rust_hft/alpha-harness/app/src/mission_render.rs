@@ -23,18 +23,18 @@ use hft_research_manifest::CexReplayDatasetManifestV4;
 use serde::Serialize;
 use std::path::Path;
 
-const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-dynamic-v2";
-const STABLE_HYPOTHESIS_ID: &str = "signed-rolling-imbalance-dynamic-v2";
-const MIN_ROWS: usize = 1232;
-const INITIAL_TRAIN_ROWS: usize = 200;
-const VALIDATION_ROWS: usize = 256;
+const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v4";
+const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v4";
+const INITIAL_TRAIN_ROWS: usize = 7_200;
+const VALIDATION_ROWS: usize = 3_600;
 const FOLD_COUNT: usize = 3;
 const PURGE_ROWS: usize = 5;
 const EMBARGO_ROWS: usize = 1;
-const HOLDOUT_ROWS: usize = 256;
-const MAX_CANDIDATES: usize = 8;
+const HOLDOUT_ROWS: usize = 3_600;
+const MIN_ROWS: usize =
+    INITIAL_TRAIN_ROWS + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS) + PURGE_ROWS + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
-const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-dynamic-v2-gp-policy";
+const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v4-gp-policy";
 const BASELINE_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-baseline-policy";
 const WEIGHT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-weight-policy";
 const REPLAY_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-replay-policy";
@@ -42,12 +42,26 @@ const SCREENING_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-screening-pol
 const SUBSET_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-subset-policy";
 const EVALUATION_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-evaluation-policy";
 const HOLDOUT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-holdout-policy";
-const FEATURE_FIELDS: [&str; 2] = ["book_imbalance", "spread_bps"];
+const FEATURE_FIELDS: [&str; 8] = [
+    "ask_depth_top5",
+    "bid_depth_top5",
+    "book_imbalance",
+    "book_imbalance_top5",
+    "near_depth_concentration_skew_top5",
+    "spread_bps",
+    "vwap_center_deviation_top5_bps",
+    "weighted_book_imbalance_top5",
+];
+const MAX_CANDIDATES: usize = FEATURE_FIELDS.len() * 2;
 
 #[derive(Debug)]
 pub(crate) struct RenderedCexMission {
     pub(crate) mission: CexResearchMissionArtifactV1,
     pub(crate) mission_id: String,
+}
+
+pub(crate) fn max_candidates_for_tests() -> usize {
+    MAX_CANDIDATES
 }
 
 #[derive(Debug, Serialize)]
@@ -59,10 +73,30 @@ struct RenderedHoldoutPolicyV1 {
     state: CexResearchHoldoutStateV1,
 }
 
+fn sealed_holdout_cohort_sha256(
+    materialization: &crate::mission_runner::Materialization,
+) -> anyhow::Result<String> {
+    Ok(canonical_json_hash(&serde_json::json!({
+        "venue": materialization.snapshot.venue,
+        "market": materialization.market,
+        "symbol": materialization.symbol,
+        "source_revision": materialization.source_revision,
+        "source_segments": materialization.snapshot.source_segments,
+        "bucket_ms": materialization.bucket_ms,
+        "label_horizon_buckets": materialization.label_horizon_buckets,
+        "rows": materialization.rows,
+        "first_event_time": materialization.snapshot.first_event_time,
+        "last_event_time": materialization.snapshot.last_event_time,
+        "sealed_holdout_rows": HOLDOUT_ROWS,
+    }))?)
+}
+
+#[allow(dead_code)]
 pub(crate) fn render_cex_bundle(
     feature: &Path,
     materialization_path: &Path,
     seed: u64,
+    multiple_testing_trials: usize,
 ) -> anyhow::Result<RenderedCexMission> {
     validate_input_sizes(feature, materialization_path)?;
     let feature_sha256 = sha256_file(feature)?;
@@ -97,12 +131,13 @@ pub(crate) fn render_cex_bundle(
         "snapshot_sha256": snapshot_sha256,
         "source_revision": materialization.source_revision,
     }))?;
+    let sealed_holdout_cohort_sha256 = sealed_holdout_cohort_sha256(&materialization)?;
     let search_lineage_id = format!(
         "{STABLE_VERSION}-lineage-seed-{seed}-{}",
         &frozen_input_sha256[..16]
     );
     let input_lineage_id = format!("{STABLE_VERSION}-input-{}", &materialization_sha256[..16]);
-    let holdout_id = format!("{STABLE_VERSION}-holdout-{}", &frozen_input_sha256[..16]);
+    let holdout_id = format!("cex-holdout-{}", &sealed_holdout_cohort_sha256[..48]);
     let evaluation_protocol = approved_evaluation_protocol(&materialization)?;
     let search = CexResearchSearchPlanV1 {
         seed,
@@ -113,6 +148,7 @@ pub(crate) fn render_cex_bundle(
             max_seconds: 0,
         },
         max_new_iterations: MAX_CANDIDATES,
+        multiple_testing_trials,
     };
     let gp_policy = CexGpPolicyV1::controlled_dynamic_v2(
         GP_POLICY_ID,
@@ -139,7 +175,7 @@ pub(crate) fn render_cex_bundle(
     let mission = CexResearchMissionArtifactV1 {
         schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
         spec: CexResearchMissionSpecV1 {
-            objective: "Test signed rolling imbalance on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v2 GP"
+            objective: "Screen atomic L2 microstructure factors, including top-five depth concentration and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v2 GP"
                 .to_string(),
             search_lineage_id,
             data_mission_id: materialization.mission_id.clone(),
@@ -154,7 +190,7 @@ pub(crate) fn render_cex_bundle(
             },
             hypotheses: vec![CexResearchHypothesisV1 {
                 hypothesis_id: STABLE_HYPOTHESIS_ID.to_string(),
-                statement: "Signed rolling imbalance predicts the next five one-second buckets on Binance USD-M BTCUSDT top5 depth".to_string(),
+                statement: "L1 pressure, top-five depth balance, near-touch depth concentration, linearly weighted top-five pressure, spread, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns".to_string(),
                 target: CexResearchHypothesisTargetV1 {
                     name: "forward_mid_return".to_string(),
                     horizon: EvaluationLabelSpecV1 {
@@ -163,7 +199,7 @@ pub(crate) fn render_cex_bundle(
                     },
                 },
                 required_feature_families: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
-                required_template_families: vec!["signed_rolling_imbalance".to_string()],
+                required_template_families: vec!["atomic_l2_microstructure".to_string()],
                 falsification_tests: vec![
                     CexResearchFalsificationTestV1 {
                         test_id: "purged-predictive-gate".to_string(),
@@ -301,10 +337,10 @@ fn approved_validation(
         funding_bps: data_mission::cex_snapshot_funding_bps(&materialization.snapshot)?,
         latency_bps: 0.5,
         slippage_bps: 0.0,
-        cross_spread: false,
-        position_notional_usd: 10_000.0,
+        cross_spread: true,
+        position_notional_usd: 1_000.0,
         capacity_depth_levels: 5,
-        max_book_depth_fraction: 0.1,
+        max_book_depth_fraction: 0.05,
         label_horizon_buckets: materialization.label_horizon_buckets,
         observation_frequency_millis: materialization.bucket_ms,
     })
@@ -328,10 +364,10 @@ fn approved_evaluation_protocol(
             funding_bps: data_mission::cex_snapshot_funding_bps(&materialization.snapshot)?,
             latency_bps: 0.5,
             slippage_bps: 0.0,
-            cross_spread: false,
-            position_notional_usd: 10_000.0,
+            cross_spread: true,
+            position_notional_usd: 1_000.0,
             capacity_depth_levels: 5,
-            max_book_depth_fraction: 0.1,
+            max_book_depth_fraction: 0.05,
         },
         EvaluationLabelSpecV1 {
             horizon_buckets: materialization.label_horizon_buckets,
@@ -360,6 +396,9 @@ fn ensure_materialization_scope(
     if materialization.rows != manifest.rows {
         bail!("materialization evidence row count does not match the feature artifact");
     }
+    if materialization.series_count != manifest.series_count {
+        bail!("materialization evidence series count does not match the feature artifact");
+    }
     if materialization.artifact_sha256 != feature_sha256
         || materialization.snapshot.feature_artifact_sha256 != feature_sha256
     {
@@ -370,10 +409,7 @@ fn ensure_materialization_scope(
     {
         bail!("feature manifest does not bind the supplied feature artifact");
     }
-    for field in FEATURE_FIELDS
-        .into_iter()
-        .chain(["mid_price", "bid_depth_top5", "ask_depth_top5"])
-    {
+    for field in FEATURE_FIELDS.into_iter().chain(["mid_price"]) {
         if !manifest.feature_names.iter().any(|name| name == field) {
             bail!("approved Mission render requires feature field {field}");
         }
@@ -382,7 +418,7 @@ fn ensure_materialization_scope(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, Utc};
     use hft_collector::{DataModality, PointInTimeFeatureRow};
@@ -392,34 +428,44 @@ mod tests {
         path::PathBuf,
     };
 
+    fn default_trials() -> usize {
+        max_candidates_for_tests() * 2
+    }
+
     #[test]
-    fn cloud_renderer_builds_a_dynamic_v2_mission() {
-        let fixture = Fixture::new(1232);
-        let rendered =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap();
+    fn cloud_renderer_builds_an_l2_factor_plan_v4_mission() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let rendered = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap();
         let mission = rendered.mission;
+        assert_eq!(MIN_ROWS, 21_608);
+        assert_eq!(MAX_CANDIDATES, 16);
         assert_eq!(mission.spec.search.budget.max_candidates, MAX_CANDIDATES);
+        assert_eq!(
+            mission.spec.search.planned_gp_and_subset_trials().unwrap(),
+            32
+        );
         assert_eq!(mission.spec.search.budget.max_expansions, MAX_EXPANSIONS);
         assert_eq!(
-            mission
-                .spec
-                .evaluation_protocol
-                .walk_forward
-                .validation_rows,
-            VALIDATION_ROWS
-        );
-        assert_eq!(
-            mission
-                .spec
-                .evaluation_protocol
-                .walk_forward
-                .sealed_holdout_rows,
-            HOLDOUT_ROWS
+            mission.spec.evaluation_protocol.walk_forward,
+            EvaluationWalkForwardV1 {
+                initial_train_rows: INITIAL_TRAIN_ROWS,
+                validation_rows: VALIDATION_ROWS,
+                fold_count: FOLD_COUNT,
+                purge_rows: PURGE_ROWS,
+                embargo_rows: EMBARGO_ROWS,
+                sealed_holdout_rows: HOLDOUT_ROWS,
+            }
         );
         assert_eq!(mission.spec.evaluation_protocol.costs.fee_bps, 2.0);
         assert_eq!(
             mission.spec.evaluation_protocol.costs.position_notional_usd,
-            10_000.0
+            1_000.0
         );
         assert_eq!(
             mission.spec.evaluation_protocol.costs.capacity_depth_levels,
@@ -431,28 +477,48 @@ mod tests {
                 .evaluation_protocol
                 .costs
                 .max_book_depth_fraction,
-            0.1
+            0.05
+        );
+        assert!(mission.spec.evaluation_protocol.costs.cross_spread);
+        assert_eq!(
+            mission.spec.feature_fields,
+            FEATURE_FIELDS.map(str::to_string)
+        );
+        assert_eq!(
+            mission.spec.hypotheses[0].hypothesis_id,
+            STABLE_HYPOTHESIS_ID
         );
         assert_eq!(
             mission.spec.hypotheses[0].required_template_families,
-            vec!["signed_rolling_imbalance".to_string()]
+            vec!["atomic_l2_microstructure".to_string()]
         );
         assert_eq!(mission.spec.policies.gp.id, GP_POLICY_ID);
+        assert!(mission.spec.search_lineage_id.starts_with(STABLE_VERSION));
     }
 
     #[test]
     fn render_cex_rejects_short_materializations() {
         let fixture = Fixture::new(MIN_ROWS - 1);
-        let error =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
-        assert!(format!("{error:#}").contains("at least 1232 point-in-time rows"));
+        let error = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("at least {MIN_ROWS} point-in-time rows")));
     }
 
     #[test]
     fn render_cex_rejects_feature_source_drift_without_leaving_output() {
         let fixture = Fixture::with_feature_source(MIN_ROWS, "d".repeat(64));
-        let error =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        let error = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("feature source revision"));
     }
 
@@ -465,8 +531,13 @@ mod tests {
             .unwrap()
             .set_len(MAX_FEATURE_BYTES + 1)
             .unwrap();
-        let error =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        let error = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("source exceeds the allowed size"));
 
         let fixture = Fixture::new(MIN_ROWS);
@@ -476,8 +547,13 @@ mod tests {
             .unwrap()
             .set_len(MAX_MATERIALIZATION_BYTES + 1)
             .unwrap();
-        let error =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        let error = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("source exceeds the allowed size"));
     }
 
@@ -493,18 +569,33 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap_err();
+        let error = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("source revision does not bind"));
     }
 
     #[test]
     fn render_cex_bundle_changes_search_lineage_per_seed_but_keeps_holdout() {
         let fixture = Fixture::new(MIN_ROWS);
-        let first =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 7).unwrap();
-        let second =
-            render_cex_bundle(&fixture.feature_path, &fixture.materialization_path, 11).unwrap();
+        let first = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+        let second = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            11,
+            default_trials(),
+        )
+        .unwrap();
 
         assert_ne!(first.mission_id, second.mission_id);
         assert_ne!(
@@ -515,16 +606,107 @@ mod tests {
             first.mission.spec.holdout.holdout_id,
             second.mission.spec.holdout.holdout_id
         );
+        assert_holdout_id_format(&first.mission.spec.holdout.holdout_id);
     }
 
-    struct Fixture {
-        _root: tempfile::TempDir,
-        feature_path: PathBuf,
-        materialization_path: PathBuf,
+    #[test]
+    fn render_cex_bundle_keeps_holdout_for_rematerialized_same_cohort() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let first = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+
+        let shifted_ingestion_time = read_feature_rows(&fixture.feature_path)[0].ingestion_time
+            + ChronoDuration::seconds(60);
+        let feature_bytes = std::fs::read_to_string(&fixture.feature_path)
+            .unwrap()
+            .lines()
+            .map(|line| format!("{line} "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&fixture.feature_path, feature_bytes).unwrap();
+        let feature_sha256 = hex::encode(Sha256::digest(
+            std::fs::read(&fixture.feature_path).unwrap(),
+        ));
+
+        let mut materialization: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.materialization_path).unwrap()).unwrap();
+        materialization["mission_id"] = serde_json::json!("data-mission-rematerialized");
+        materialization["artifact_sha256"] = serde_json::json!(feature_sha256);
+        materialization["snapshot"]["feature_artifact_sha256"] = serde_json::json!(feature_sha256);
+        let snapshot: hft_research_manifest::CexReplaySnapshotV4 =
+            serde_json::from_value(materialization["snapshot"].clone()).unwrap();
+        materialization["snapshot_sha256"] = serde_json::json!(snapshot.sha256());
+        materialization["created_at"] = serde_json::json!(shifted_ingestion_time);
+        std::fs::write(
+            &fixture.materialization_path,
+            serde_json::to_vec_pretty(&materialization).unwrap(),
+        )
+        .unwrap();
+
+        let second = render_cex_bundle(
+            &fixture.feature_path,
+            &fixture.materialization_path,
+            7,
+            default_trials(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.mission.spec.holdout.holdout_id,
+            second.mission.spec.holdout.holdout_id
+        );
+        assert_holdout_id_format(&first.mission.spec.holdout.holdout_id);
+    }
+
+    #[test]
+    fn sealed_holdout_cohort_hash_changes_with_window_source_or_label_slice() {
+        let fixture = Fixture::new(MIN_ROWS);
+        let base = load_materialization(&fixture.materialization_path);
+        let base_hash = sealed_holdout_cohort_sha256(&base).unwrap();
+
+        let shifted_window = mutate_materialization(&fixture.materialization_path, |value| {
+            let last_event_time = serde_json::from_value::<chrono::DateTime<Utc>>(
+                value["snapshot"]["last_event_time"].clone(),
+            )
+            .unwrap()
+                + ChronoDuration::seconds(1);
+            value["rows"] = serde_json::json!(MIN_ROWS + 1);
+            value["snapshot"]["last_event_time"] = serde_json::json!(last_event_time);
+            value["last_event_time"] = serde_json::json!(last_event_time);
+        });
+        let shifted_window_hash = sealed_holdout_cohort_sha256(&shifted_window).unwrap();
+        assert_ne!(base_hash, shifted_window_hash);
+
+        let shifted_source = mutate_materialization(&fixture.materialization_path, |value| {
+            value["source_revision"] = serde_json::json!("d".repeat(64));
+            value["snapshot"]["source_segments"][0]["content_sha256"] =
+                serde_json::json!("e".repeat(64));
+        });
+        let shifted_source_hash = sealed_holdout_cohort_sha256(&shifted_source).unwrap();
+        assert_ne!(base_hash, shifted_source_hash);
+
+        let shifted_label = mutate_materialization(&fixture.materialization_path, |value| {
+            value["label_horizon_buckets"] = serde_json::json!(6);
+            value["snapshot"]["label_horizon_buckets"] = serde_json::json!(6);
+        });
+        let shifted_label_hash = sealed_holdout_cohort_sha256(&shifted_label).unwrap();
+        assert_ne!(base_hash, shifted_label_hash);
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) _root: tempfile::TempDir,
+        pub(crate) feature_path: PathBuf,
+        pub(crate) materialization_path: PathBuf,
     }
 
     impl Fixture {
-        fn new(rows: usize) -> Self {
+        pub(crate) fn new(rows: usize) -> Self {
             Self::with_optional_feature_source(rows, None)
         }
 
@@ -561,10 +743,7 @@ mod tests {
             .unwrap();
             let source_end_ns =
                 u64::try_from(ingestion_time.timestamp_nanos_opt().unwrap()).unwrap();
-            let reference_evidence = "0123456789abcdef"
-                .chars()
-                .map(cex_triplet)
-                .collect::<Vec<_>>();
+            let reference_evidence = (0..256).map(indexed_cex_triplet).collect::<Vec<_>>();
             let snapshot = hft_research_manifest::CexReplaySnapshotV4 {
                 schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
                 venue: "binance".to_string(),
@@ -621,7 +800,7 @@ mod tests {
             let snapshot_sha256 = snapshot.sha256();
             let report = serde_json::json!({
                 "dataset_kind": "lob_point_in_time_materialization",
-                "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
+                "schema_version": hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
                 "mission_id": "data-mission-1",
                 "symbol": "BTCUSDT",
                 "market": "usdm",
@@ -638,6 +817,7 @@ mod tests {
                     "end_received_at_ns": source_end_ns,
                     "events": rows.len()
                 }],
+                "series_count": 1,
                 "rows": rows.len(),
                 "first_event_time": first_event_time,
                 "last_event_time": last_event_time,
@@ -665,6 +845,7 @@ mod tests {
         let start = ingestion_time - ChronoDuration::seconds(count as i64 + 10);
         (0..count)
             .map(|index| PointInTimeFeatureRow {
+                series_id: 1,
                 event_time: start + ChronoDuration::seconds(index as i64),
                 feature_available_time: start + ChronoDuration::seconds(index as i64),
                 label_available_time: start + ChronoDuration::seconds(index as i64 + 5),
@@ -684,10 +865,14 @@ mod tests {
                     ("ask_depth_top5".to_string(), 10.0),
                     ("bid_depth_top5".to_string(), 10.0),
                     ("book_imbalance".to_string(), 0.1),
+                    ("book_imbalance_top5".to_string(), 0.08),
                     ("mid_price".to_string(), 60_000.0),
+                    ("near_depth_concentration_skew_top5".to_string(), 0.04),
                     ("funding_rate".to_string(), 0.0001),
                     ("open_interest".to_string(), 12_345.0),
                     ("spread_bps".to_string(), 1.2),
+                    ("vwap_center_deviation_top5_bps".to_string(), 0.7),
+                    ("weighted_book_imbalance_top5".to_string(), 0.09),
                 ]),
                 label: 0.0001,
             })
@@ -702,6 +887,15 @@ mod tests {
         }
     }
 
+    fn indexed_cex_triplet(index: usize) -> hft_research_manifest::CexArtifactTripletV2 {
+        let data_sha256 = hex::encode(Sha256::digest(format!("reference-data-{index}")));
+        hft_research_manifest::CexArtifactTripletV2 {
+            manifest_sha256: hex::encode(Sha256::digest(format!("reference-manifest-{index}"))),
+            success_sha256: data_sha256.clone(),
+            data_sha256,
+        }
+    }
+
     fn write_feature_rows(path: &Path, rows: &[PointInTimeFeatureRow]) {
         let mut bytes = Vec::new();
         for row in rows {
@@ -709,5 +903,41 @@ mod tests {
             bytes.push(b'\n');
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    pub(crate) fn rewrite_feature_rows(path: &Path, rows: &[PointInTimeFeatureRow]) {
+        write_feature_rows(path, rows);
+    }
+
+    pub(crate) fn read_feature_rows(path: &Path) -> Vec<PointInTimeFeatureRow> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn load_materialization(path: &Path) -> crate::mission_runner::Materialization {
+        decode_materialization(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn mutate_materialization(
+        path: &Path,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> crate::mission_runner::Materialization {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        mutate(&mut value);
+        decode_materialization(&serde_json::to_vec_pretty(&value).unwrap()).unwrap()
+    }
+
+    fn assert_holdout_id_format(holdout_id: &str) {
+        assert!(holdout_id.starts_with("cex-holdout-"));
+        assert_eq!(holdout_id.len(), 60);
+        assert!(holdout_id
+            .strip_prefix("cex-holdout-")
+            .unwrap()
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
     }
 }

@@ -29,6 +29,7 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
     let start = Utc::now();
     let rows = (0..4)
         .map(|index| ResearchRow {
+            series_id: 1,
             available_time: start + Duration::seconds(index),
             signal: index as f64,
             features: std::collections::BTreeMap::new(),
