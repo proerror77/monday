@@ -12,19 +12,18 @@ use data::binance_market_tape_artifact::{
     VerifiedBinanceMarketTapeSeries,
 };
 use hft_collector::binance_usdm_reference_artifact::{
-    verify_reference_artifact, PublishedReferenceArtifact,
+    verify_reference_artifact_read_only_current_batch, PublishedReferenceArtifact,
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_core::{top5_book_features, TOP5_DEPTH};
 use hft_research_manifest::{
-    CexArtifactTripletV2, CexDerivativesReferenceV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2,
-    CexReplaySegmentIdentity, CexReplaySnapshotV4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6,
-    CEX_FEATURE_AVAILABILITY_POLICY, CEX_MODALITY_AGGREGATE_TRADE, CEX_MODALITY_FUNDING,
-    CEX_MODALITY_LOB, CEX_MODALITY_OPEN_INTEREST, CEX_REPLAY_CLOCK_RECEIVED_AT_NS,
-    CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
+    CexArtifactTripletV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2, CexReplaySegmentIdentity,
+    CexReplaySeriesV1, CexReplaySnapshotV5, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
+    CEX_DERIVATIVES_MAX_GAP_NS, CEX_FEATURE_AVAILABILITY_POLICY, CEX_MODALITY_AGGREGATE_TRADE,
+    CEX_MODALITY_LOB, CEX_REPLAY_CLOCK_RECEIVED_AT_NS, CEX_REPLAY_SNAPSHOT_SCHEMA_V5,
 };
 use rust_decimal::{prelude::ToPrimitive, Decimal};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -89,29 +88,6 @@ struct Args {
     reference_manifest_sha256: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ResearchContextV2 {
-    instrument_rules: Option<CexInstrumentRulesV2>,
-    derivatives_reference: Option<CexDerivativesReferenceV2>,
-    funding: Vec<FundingPointV2>,
-    open_interest: Vec<OpenInterestPointV2>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct FundingPointV2 {
-    available_at: DateTime<Utc>,
-    next_funding_at: DateTime<Utc>,
-    funding_rate: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct OpenInterestPointV2 {
-    available_at: DateTime<Utc>,
-    open_interest: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct SourceSegmentEvidence {
     path: PathBuf,
@@ -164,7 +140,7 @@ struct MaterializationReport {
     last_event_time: DateTime<Utc>,
     artifact_path: PathBuf,
     artifact_sha256: String,
-    snapshot: CexReplaySnapshotV4,
+    snapshot: CexReplaySnapshotV5,
     snapshot_sha256: String,
     created_at: DateTime<Utc>,
 }
@@ -174,6 +150,12 @@ struct PublishedMaterialization {
     report: MaterializationReport,
     report_path: PathBuf,
     report_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct RuleObservation {
+    available_at: DateTime<Utc>,
+    triplet: CexArtifactTripletV2,
 }
 
 struct Replay {
@@ -331,9 +313,6 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         bail!("verified market-tape does not match requested market");
     }
     let source_segments = source_segment_evidence(&verified_series, segment_paths)?;
-    let mut context = ResearchContextV2::default();
-    bind_usdm_reference(args, &symbol, &mut context)?;
-
     let bucket_ns = args
         .bucket_ms
         .checked_mul(1_000_000)
@@ -392,37 +371,45 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         &source_revisions,
         &symbol,
         ingestion_time,
-        &context,
     )?;
     let artifact_bytes = encode_rows(&rows)?;
     let artifact_sha256 = hex::encode(Sha256::digest(&artifact_bytes));
     let artifact_path = args.artifact_dir.join(format!("{artifact_sha256}.jsonl"));
     let first_event_time = rows.first().context("feature rows are empty")?.event_time;
     let last_event_time = rows.last().context("feature rows are empty")?.event_time;
-    let derivatives_reference = context.derivatives_reference.map(|mut reference| {
-        let funding_bound = rows
-            .iter()
-            .filter_map(|row| row.features.get("funding_cost_bps"))
-            .copied()
-            .fold(0.0_f64, f64::max);
-        reference.evaluation_funding_bps_per_bucket = funding_bound.to_string();
-        reference
-    });
-    let snapshot = CexReplaySnapshotV4 {
-        schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
+    let label_available_through = last_event_time
+        .checked_add_signed(
+            chrono::TimeDelta::try_milliseconds(
+                i64::try_from(
+                    args.bucket_ms
+                        .checked_mul(
+                            u64::try_from(args.label_horizon_buckets)
+                                .context("label horizon overflow")?,
+                        )
+                        .context("label horizon overflow")?,
+                )
+                .context("label horizon overflow")?,
+            )
+            .context("label horizon overflow")?,
+        )
+        .context("label availability time overflows")?;
+    let (instrument_rules, series) = bind_usdm_reference(
+        args,
+        &symbol,
+        &rows,
+        first_event_time,
+        label_available_through,
+    )?;
+    let snapshot = CexReplaySnapshotV5 {
+        schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
         venue: "binance".to_string(),
         instrument_type: args.market.as_str().to_string(),
         symbol: symbol.clone(),
         replay_clock: CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
-        required_modalities: BTreeSet::from_iter(
-            [
-                CEX_MODALITY_LOB.to_string(),
-                CEX_MODALITY_AGGREGATE_TRADE.to_string(),
-            ]
-            .into_iter()
-            .chain((args.market == Market::Usdm).then_some(CEX_MODALITY_FUNDING.to_string()))
-            .chain((args.market == Market::Usdm).then_some(CEX_MODALITY_OPEN_INTEREST.to_string())),
-        ),
+        required_modalities: BTreeSet::from([
+            CEX_MODALITY_LOB.to_string(),
+            CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+        ]),
         source_segments: source_segments
             .iter()
             .map(|segment| CexReplaySegmentIdentity {
@@ -440,10 +427,8 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         bucket_ms: args.bucket_ms,
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
-        instrument_rules: context
-            .instrument_rules
-            .context("verified instrument rules are missing")?,
-        derivatives_reference,
+        instrument_rules,
+        series,
     };
     snapshot.validate().map_err(anyhow::Error::new)?;
     publish_immutable(&artifact_path, &artifact_bytes)?;
@@ -451,7 +436,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
 
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
-        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6.to_string(),
+        schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7.to_string(),
         mission_id: mission_id.to_string(),
         symbol,
         market: args.market.as_str().to_string(),
@@ -566,17 +551,14 @@ fn republish_verified_file(source: &Path, target: &Path, expected_sha256: &str) 
     publish_immutable(target, &bytes)
 }
 
-fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV2) -> Result<()> {
+fn bind_usdm_reference(
+    args: &Args,
+    symbol: &str,
+    rows: &[PointInTimeFeatureRow],
+    first_event_time: DateTime<Utc>,
+    label_available_through: DateTime<Utc>,
+) -> Result<(CexInstrumentRulesV2, Vec<CexReplaySeriesV1>)> {
     let count = args.reference_data.len();
-    if args.market == Market::Spot {
-        if count != 0
-            || !args.reference_data_sha256.is_empty()
-            || !args.reference_manifest_sha256.is_empty()
-        {
-            bail!("Spot materialization does not accept USD-M reference artifacts");
-        }
-        return Ok(());
-    }
     if count == 0
         || args.reference_data_sha256.len() != count
         || args.reference_manifest_sha256.len() != count
@@ -585,9 +567,8 @@ fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV
     }
     let mut rules = None;
     let mut rule_times = Vec::with_capacity(count);
-    let mut funding = Vec::with_capacity(count);
-    let mut open_interest = Vec::with_capacity(count);
     let mut evidence = Vec::with_capacity(count);
+    let mut observations = Vec::with_capacity(count);
     for ((data_path, data_sha256), manifest_sha256) in args
         .reference_data
         .iter()
@@ -601,16 +582,12 @@ fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV
             data_sha256: data_sha256.clone(),
             manifest_sha256: manifest_sha256.clone(),
         };
-        let batch = verify_reference_artifact(&published, data_sha256, manifest_sha256)?;
-        republish_evidence_triplet(
-            &args.artifact_dir,
-            "reference",
-            &published.data_path,
-            &published.manifest_path,
-            &published.success_path,
-            &published.data_sha256,
-            &published.manifest_sha256,
+        let batch = verify_reference_artifact_read_only_current_batch(
+            &published,
+            data_sha256,
+            manifest_sha256,
         )?;
+        let triplet = reference_artifact_triplet(&published)?;
         let contract = batch
             .contracts()
             .iter()
@@ -624,44 +601,25 @@ fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV
         if rules.is_some_and(|existing| existing != candidate) {
             bail!("instrument rules changed inside the requested PIT window");
         }
+        republish_evidence_triplet(
+            &args.artifact_dir,
+            "reference",
+            &published.data_path,
+            &published.manifest_path,
+            &published.success_path,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )?;
         rules = Some(candidate);
-        let rule_available_at = datetime_ns(contract.received_at_ns)?;
-        rule_times.push(rule_available_at);
-        let mark = batch
-            .mark_index_funding()
-            .iter()
-            .find(|row| row.symbol == symbol)
-            .with_context(|| format!("reference artifact has no funding row {symbol}"))?;
-        funding.push(FundingPointV2 {
-            available_at: datetime_ns(mark.received_at_ns)?,
-            next_funding_at: datetime_ns(
-                mark.next_funding_time_ms
-                    .checked_mul(1_000_000)
-                    .context("next funding time overflow")?,
-            )?,
-            funding_rate: mark.last_funding_rate.to_string(),
-        });
-        let oi = batch
-            .open_interest()
-            .iter()
-            .find(|row| row.symbol == symbol)
-            .with_context(|| format!("reference artifact has no open-interest row {symbol}"))?;
-        open_interest.push(OpenInterestPointV2 {
-            available_at: datetime_ns(oi.received_at_ns)?,
-            open_interest: oi.open_interest.to_string(),
-        });
-        evidence.push((rule_available_at, reference_artifact_triplet(&published)?));
+        let available_at = datetime_ns(contract.received_at_ns)?;
+        rule_times.push(available_at);
+        push_unique_observation(&mut observations, available_at, &triplet);
+        push_unique_triplet(&mut evidence, &triplet);
     }
     rule_times.sort_unstable();
-    evidence.sort_by_key(|(available_at, _)| *available_at);
-    let evidence = evidence
-        .into_iter()
-        .map(|(_, triplet)| triplet)
-        .collect::<Vec<_>>();
-    funding.sort_by_key(|point| point.available_at);
-    open_interest.sort_by_key(|point| point.available_at);
+    observations.sort_by_key(|observation| observation.available_at);
     let (tick_size, step_size, min_notional) = rules.context("USD-M rules are missing")?;
-    context.instrument_rules = Some(CexInstrumentRulesV2 {
+    let instrument_rules = CexInstrumentRulesV2 {
         tick_size: tick_size.to_string(),
         step_size: step_size.to_string(),
         min_notional: min_notional.to_string(),
@@ -669,28 +627,20 @@ fn bind_usdm_reference(args: &Args, symbol: &str, context: &mut ResearchContextV
             .first()
             .context("USD-M rules evidence is empty")?,
         valid_through: *rule_times.last().unwrap(),
-        evidence: evidence.clone(),
-    });
-    context.derivatives_reference = Some(CexDerivativesReferenceV2 {
-        funding: CexPitSeriesEvidenceV2 {
-            evidence: evidence.clone(),
-            first_available_at: funding[0].available_at,
-            last_available_at: funding.last().unwrap().available_at,
-            observations: funding.len() as u64,
-            max_gap_ns: max_available_gap_ns(funding.iter().map(|point| point.available_at))?,
-        },
-        open_interest: CexPitSeriesEvidenceV2 {
-            evidence,
-            first_available_at: open_interest[0].available_at,
-            last_available_at: open_interest.last().unwrap().available_at,
-            observations: open_interest.len() as u64,
-            max_gap_ns: max_available_gap_ns(open_interest.iter().map(|point| point.available_at))?,
-        },
-        evaluation_funding_bps_per_bucket: "0".to_string(),
-    });
-    context.funding = funding;
-    context.open_interest = open_interest;
-    Ok(())
+        evidence,
+    };
+    if instrument_rules.available_at > first_event_time
+        || instrument_rules.valid_through < label_available_through
+    {
+        bail!("PIT instrument-rule coverage does not span the replay window");
+    }
+    let series = replay_series_coverages(
+        rows,
+        &observations,
+        args.label_horizon_buckets,
+        args.bucket_ms,
+    )?;
+    Ok((instrument_rules, series))
 }
 
 fn reference_artifact_triplet(
@@ -703,20 +653,122 @@ fn reference_artifact_triplet(
     })
 }
 
-fn max_available_gap_ns(times: impl IntoIterator<Item = DateTime<Utc>>) -> Result<u64> {
-    let mut previous = None;
-    let mut max_gap = 0;
-    for current in times {
-        if let Some(previous) = previous {
-            let gap = current
-                .signed_duration_since(previous)
-                .num_nanoseconds()
-                .context("PIT availability gap is outside i64 nanoseconds")?;
-            max_gap = max_gap.max(u64::try_from(gap).context("PIT availability is not ordered")?);
-        }
-        previous = Some(current);
+fn push_unique_triplet(evidence: &mut Vec<CexArtifactTripletV2>, triplet: &CexArtifactTripletV2) {
+    if !evidence.iter().any(|existing| existing == triplet) {
+        evidence.push(triplet.clone());
     }
-    Ok(max_gap)
+}
+
+fn push_unique_observation(
+    observations: &mut Vec<RuleObservation>,
+    available_at: DateTime<Utc>,
+    triplet: &CexArtifactTripletV2,
+) {
+    if observations
+        .iter()
+        .any(|existing| existing.available_at == available_at)
+    {
+        return;
+    }
+    observations.push(RuleObservation {
+        available_at,
+        triplet: triplet.clone(),
+    });
+}
+
+fn replay_series_coverages(
+    rows: &[PointInTimeFeatureRow],
+    observations: &[RuleObservation],
+    label_horizon_buckets: usize,
+    bucket_ms: u64,
+) -> Result<Vec<CexReplaySeriesV1>> {
+    let mut by_series = BTreeMap::<u64, (DateTime<Utc>, DateTime<Utc>)>::new();
+    for row in rows {
+        by_series
+            .entry(row.series_id)
+            .and_modify(|window| window.1 = row.event_time)
+            .or_insert((row.event_time, row.event_time));
+    }
+    let horizon = chrono::TimeDelta::try_milliseconds(
+        i64::try_from(
+            bucket_ms
+                .checked_mul(
+                    u64::try_from(label_horizon_buckets).context("label horizon overflow")?,
+                )
+                .context("label horizon overflow")?,
+        )
+        .context("label horizon overflow")?,
+    )
+    .context("label horizon overflow")?;
+    by_series
+        .into_iter()
+        .map(|(series_id, (first_event_time, last_event_time))| {
+            let required_through = last_event_time
+                .checked_add_signed(horizon)
+                .context("label availability time overflows")?;
+            let coverage =
+                select_series_rule_coverage(observations, first_event_time, required_through)?;
+            Ok(CexReplaySeriesV1 {
+                series_id: u32::try_from(series_id).context("series id overflow")?,
+                first_event_time,
+                last_event_time,
+                instrument_rules_coverage: coverage,
+            })
+        })
+        .collect()
+}
+
+fn select_series_rule_coverage(
+    observations: &[RuleObservation],
+    first_event_time: DateTime<Utc>,
+    required_through: DateTime<Utc>,
+) -> Result<CexPitSeriesEvidenceV2> {
+    let before = observations
+        .iter()
+        .rev()
+        .find(|observation| observation.available_at <= first_event_time);
+    let after = observations
+        .iter()
+        .find(|observation| observation.available_at >= required_through);
+    let (Some(before), Some(after)) = (before, after) else {
+        bail!("PIT instrument-rule coverage does not span the replay window");
+    };
+    let selected = observations
+        .iter()
+        .filter(|observation| {
+            observation.available_at >= before.available_at
+                && observation.available_at <= after.available_at
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let max_gap_ns = max_observation_gap_ns(&selected)?;
+    if max_gap_ns > CEX_DERIVATIVES_MAX_GAP_NS {
+        bail!("PIT instrument-rule coverage has a gap above 90s");
+    }
+    Ok(CexPitSeriesEvidenceV2 {
+        evidence: selected
+            .iter()
+            .map(|observation| observation.triplet.clone())
+            .collect(),
+        first_available_at: selected.first().expect("selected not empty").available_at,
+        last_available_at: selected.last().expect("selected not empty").available_at,
+        observations: u64::try_from(selected.len()).context("coverage observation overflow")?,
+        max_gap_ns,
+    })
+}
+
+fn max_observation_gap_ns(observations: &[RuleObservation]) -> Result<u64> {
+    let mut max_gap_ns = 0;
+    for pair in observations.windows(2) {
+        let gap_ns = pair[1]
+            .available_at
+            .signed_duration_since(pair[0].available_at)
+            .num_nanoseconds()
+            .context("PIT availability gap is outside i64 nanoseconds")?;
+        max_gap_ns =
+            max_gap_ns.max(u64::try_from(gap_ns).context("PIT availability is not ordered")?);
+    }
+    Ok(max_gap_ns)
 }
 
 fn source_segment_evidence(
@@ -871,7 +923,6 @@ fn materialize_rows(
     source_revisions: &BTreeMap<String, String>,
     symbol: &str,
     ingestion_time: DateTime<Utc>,
-    context: &ResearchContextV2,
 ) -> Result<Vec<PointInTimeFeatureRow>> {
     let mut rows = Vec::new();
     let aggregate_trades = aggregate_trades
@@ -972,54 +1023,7 @@ fn materialize_rows(
         if let Some(value) = current.vwap_center_deviation_top5_bps {
             features.insert("vwap_center_deviation_top5_bps".to_string(), value);
         }
-        let mut modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
-        if args.market == Market::Usdm {
-            let funding = context
-                .funding
-                .iter()
-                .rev()
-                .find(|point| point.available_at <= event_time)
-                .context("PIT funding coverage is missing")?;
-            let open_interest = context
-                .open_interest
-                .iter()
-                .rev()
-                .find(|point| point.available_at <= event_time)
-                .context("PIT open-interest coverage is missing")?;
-            features.insert("funding_rate".to_string(), funding.funding_rate.parse()?);
-            // The evaluator applies funding_cost_bps to the position held over
-            // this row's (current, future] label interval, so charge exactly
-            // the settlements inside that holding interval.
-            let crossed_funding = context
-                .funding
-                .iter()
-                .map(|point| point.next_funding_at)
-                .filter(|scheduled| *scheduled > event_time && *scheduled <= future_time)
-                .collect::<BTreeSet<_>>();
-            let funding_cost_bps = crossed_funding
-                .into_iter()
-                .filter_map(|scheduled| {
-                    context
-                        .funding
-                        .iter()
-                        .rev()
-                        .find(|point| point.available_at < scheduled)
-                        .filter(|point| point.next_funding_at == scheduled)
-                })
-                .map(|point| {
-                    point
-                        .funding_rate
-                        .parse::<f64>()
-                        .map(|rate| rate.abs() * 10_000.0)
-                })
-                .sum::<std::result::Result<f64, _>>()?;
-            features.insert("funding_cost_bps".to_string(), funding_cost_bps);
-            features.insert(
-                "open_interest".to_string(),
-                open_interest.open_interest.parse()?,
-            );
-            modalities.extend([DataModality::Funding, DataModality::OpenInterest]);
-        }
+        let modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
         if !label.is_finite() || features.values().any(|value| !value.is_finite()) {
             bail!("materialized feature or label is not finite");
         }
@@ -1310,6 +1314,116 @@ mod tests {
         }
     }
 
+    fn publish_reference_at_ns(
+        output_root: &Path,
+        observed_at_ns: u64,
+        next_funding_at_ns: u64,
+        funding: i64,
+        oi: i64,
+    ) -> PublishedReferenceArtifact {
+        let source_time_ms = observed_at_ns / 1_000_000;
+        publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: output_root.to_path_buf(),
+                observed_at_ns,
+                max_staleness_ms: 1_000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &CompleteReferenceBatch::new(
+                vec![ActivePerpetualContract {
+                    schema: REFERENCE_SCHEMA.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    pair: "BTCUSDT".to_string(),
+                    base_asset: "BTC".to_string(),
+                    quote_asset: "USDT".to_string(),
+                    margin_asset: "USDT".to_string(),
+                    tick_size: Decimal::new(1, 1),
+                    step_size: Decimal::new(1, 3),
+                    min_notional: Decimal::new(5, 0),
+                    contract_type: "PERPETUAL".to_string(),
+                    status: "TRADING".to_string(),
+                    onboard_date_ms: 1,
+                    delivery_date_ms: u64::MAX,
+                    source_time_ms,
+                    source_clock_received_at_ns: observed_at_ns,
+                    received_at_ns: observed_at_ns,
+                    source_endpoint: EXCHANGE_INFO_ENDPOINT.to_string(),
+                    source_clock_endpoint: SERVER_TIME_ENDPOINT.to_string(),
+                }],
+                vec![MarkIndexFundingObservation {
+                    schema: REFERENCE_SCHEMA.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    mark_price: Decimal::new(101, 0),
+                    index_price: Decimal::new(100, 0),
+                    basis: Decimal::ONE,
+                    basis_rate: Decimal::new(1, 2),
+                    last_funding_rate: Decimal::new(funding, 4),
+                    interest_rate: Decimal::new(1, 4),
+                    next_funding_time_ms: next_funding_at_ns / 1_000_000,
+                    source_time_ms,
+                    received_at_ns: observed_at_ns,
+                    source_endpoint: PREMIUM_INDEX_ENDPOINT.to_string(),
+                }],
+                vec![OpenInterestObservation {
+                    schema: REFERENCE_SCHEMA.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    open_interest: Decimal::new(oi, 1),
+                    source_time_ms,
+                    received_at_ns: observed_at_ns,
+                    source_endpoint: OPEN_INTEREST_ENDPOINT.to_string(),
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn rewrite_reference_manifest_v1(published: &mut PublishedReferenceArtifact) {
+        let data = std::fs::read(&published.data_path).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&published.manifest_path).unwrap()).unwrap();
+        manifest["schema"] = json!("binance.usdm_reference_manifest.v1");
+        let mut min_source_time_ms = u64::MAX;
+        let mut max_source_time_ms = 0_u64;
+        let mut min_received_at_ns = u64::MAX;
+        let mut max_received_at_ns = 0_u64;
+        for line in data.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            let observation = &row["observation"];
+            let source_time_ms = observation["source_time_ms"].as_u64().unwrap();
+            min_source_time_ms = min_source_time_ms.min(source_time_ms);
+            max_source_time_ms = max_source_time_ms.max(source_time_ms);
+            let received_at_ns = observation["received_at_ns"].as_u64().unwrap();
+            min_received_at_ns = min_received_at_ns.min(received_at_ns);
+            max_received_at_ns = max_received_at_ns.max(received_at_ns);
+            if row["kind"] == "metadata" {
+                let clock_received_at_ns =
+                    observation["source_clock_received_at_ns"].as_u64().unwrap();
+                min_received_at_ns = min_received_at_ns.min(clock_received_at_ns);
+                max_received_at_ns = max_received_at_ns.max(clock_received_at_ns);
+            }
+        }
+        let object = manifest.as_object_mut().unwrap();
+        object.remove("mark_index_funding");
+        object.remove("open_interest");
+        object.insert(
+            "time_bounds".to_string(),
+            json!({
+                "min_source_time_ms": min_source_time_ms,
+                "max_source_time_ms": max_source_time_ms,
+                "min_received_at_ns": min_received_at_ns,
+                "max_received_at_ns": max_received_at_ns,
+            }),
+        );
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        std::fs::write(&published.manifest_path, &manifest_bytes).unwrap();
+        published.manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+    }
+
     struct Fixture {
         directory: PathBuf,
         market: Market,
@@ -1594,65 +1708,6 @@ mod tests {
     }
 
     #[test]
-    fn charges_funding_over_the_holding_interval() {
-        let fixture = Fixture::new(Market::Spot, &valid_rows("spot"));
-        let mut args = fixture.args();
-        args.market = Market::Usdm;
-        let sample = |seconds: u64| BookSample {
-            series_id: 1,
-            time_ns: event_ns(seconds * 1_000),
-            mid_price: 100.0,
-            spread_bps: 1.0,
-            bid_depth: 10.0,
-            ask_depth: 10.0,
-            top_depth_imbalance: 0.0,
-            weighted_book_imbalance_top5: None,
-            near_depth_concentration_skew_top5: None,
-            vwap_center_deviation_top5_bps: None,
-            book_imbalance: 0.0,
-        };
-        let samples = (1..=6).map(sample).collect::<Vec<_>>();
-        let funding_point = |available_ms: u64, next_ms: u64, rate: &str| FundingPointV2 {
-            available_at: datetime_ns(event_ns(available_ms)).unwrap(),
-            next_funding_at: datetime_ns(event_ns(next_ms)).unwrap(),
-            funding_rate: rate.to_string(),
-        };
-        let context = ResearchContextV2 {
-            instrument_rules: None,
-            derivatives_reference: None,
-            funding: vec![
-                funding_point(500, 1_500, "0.0001"),
-                funding_point(1_600, 3_500, "0.0002"),
-                funding_point(3_700, 4_500, "0.0001"),
-                funding_point(4_600, 5_500, "0.0004"),
-            ],
-            open_interest: vec![OpenInterestPointV2 {
-                available_at: datetime_ns(event_ns(500)).unwrap(),
-                open_interest: "12345.5".to_string(),
-            }],
-        };
-
-        let rows = materialize_rows(
-            &samples,
-            &[],
-            &args,
-            &BTreeMap::new(),
-            "BTCUSDT",
-            datetime_ns(event_ns(6_500)).unwrap(),
-            &context,
-        )
-        .unwrap();
-
-        assert_eq!(rows.len(), 3);
-        // Holding intervals are (2s, 4s], (3s, 5s], (4s, 6s]; the 1.5s
-        // settlement precedes every holding interval and is never charged.
-        assert!((rows[0].features["funding_cost_bps"] - 2.0).abs() < 1e-9);
-        assert!((rows[1].features["funding_cost_bps"] - 3.0).abs() < 1e-9);
-        assert!((rows[2].features["funding_cost_bps"] - 5.0).abs() < 1e-9);
-        assert!((rows[0].features["funding_rate"] - 0.0002).abs() < 1e-12);
-    }
-
-    #[test]
     fn canonical_cli_has_no_account_fee_input() {
         let help = Args::command().render_long_help().to_string();
 
@@ -1675,9 +1730,8 @@ mod tests {
         let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
         let args = fixture.args();
 
-        let published = materialize(&args).unwrap();
+        materialize(&args).unwrap();
 
-        assert!(published.report.snapshot.derivatives_reference.is_some());
         assert!(args
             .artifact_dir
             .join(format!(
@@ -1685,6 +1739,141 @@ mod tests {
                 fixture.references[0].data_sha256
             ))
             .is_file());
+    }
+
+    #[test]
+    fn materializes_read_only_v1_reference_manifests() {
+        let mut fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        for reference in &mut fixture.references {
+            rewrite_reference_manifest_v1(reference);
+        }
+
+        let published = materialize(&fixture.args()).unwrap();
+
+        assert_eq!(
+            published.report.snapshot.required_modalities,
+            BTreeSet::from([
+                CEX_MODALITY_LOB.to_string(),
+                CEX_MODALITY_AGGREGATE_TRADE.to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_materialization_when_instrument_rules_do_not_cover_full_label_window() {
+        let first = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut second_rows = valid_rows("usdm");
+        shift_rows(&mut second_rows, event_ns(10_000));
+        retag_session(&mut second_rows, "session-2");
+        let second = Fixture::new(Market::Usdm, &second_rows);
+        let mut args = first.args();
+        args.segment.push(second.data.clone());
+        args.segment_content_sha256
+            .push(second.content_sha256.clone());
+        args.segment_manifest_sha256
+            .push(second.manifest_sha256.clone());
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("instrument-rule coverage does not span the replay window"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn materializes_two_series_when_instrument_rules_cover_full_label_window() {
+        let first = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut second_rows = valid_rows("usdm");
+        shift_rows(&mut second_rows, event_ns(10_000));
+        retag_session(&mut second_rows, "session-2");
+        let second = Fixture::new(Market::Usdm, &second_rows);
+        let mut args = first.args();
+        args.segment.push(second.data.clone());
+        args.segment_content_sha256
+            .push(second.content_sha256.clone());
+        args.segment_manifest_sha256
+            .push(second.manifest_sha256.clone());
+        let extra_root = first.directory.join("reference-extra");
+        let second_start_ns = second_rows[0]["received_at_ns"].as_u64().unwrap();
+        let extra = [
+            publish_reference_at_ns(
+                &extra_root,
+                second_start_ns + 500_000_000,
+                second_start_ns + 3_000_000_000,
+                4,
+                123_470,
+            ),
+            publish_reference_at_ns(
+                &extra_root,
+                second_start_ns + 3_000_000_000,
+                second_start_ns + 6_000_000_000,
+                5,
+                123_475,
+            ),
+            publish_reference_at_ns(
+                &extra_root,
+                second_start_ns + 6_000_000_000,
+                second_start_ns + 9_000_000_000,
+                6,
+                123_480,
+            ),
+        ];
+        for reference in &extra {
+            args.reference_data.push(reference.data_path.clone());
+            args.reference_data_sha256
+                .push(reference.data_sha256.clone());
+            args.reference_manifest_sha256
+                .push(reference.manifest_sha256.clone());
+        }
+
+        let published = materialize(&args).unwrap();
+
+        assert_eq!(published.report.series_count, 2);
+        assert_eq!(published.report.snapshot.series.len(), 2);
+        assert_eq!(published.report.snapshot.series[0].series_id, 1);
+        assert_eq!(published.report.snapshot.series[1].series_id, 2);
+        assert_eq!(
+            published.report.snapshot.series[1]
+                .instrument_rules_coverage
+                .observations,
+            3
+        );
+        assert_eq!(
+            published.report.snapshot.instrument_rules.valid_through,
+            datetime_ns(second_start_ns + 6_000_000_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_series_with_bracketed_endpoints_but_a_middle_gap_above_90_seconds() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        let gap_root = fixture.directory.join("reference-gap");
+        let custom = [
+            publish_reference_at_ns(&gap_root, event_ns(0), event_ns(3_000), 1, 123_455),
+            publish_reference_at_ns(&gap_root, event_ns(95_000), event_ns(96_000), 2, 123_460),
+            publish_reference_at_ns(&gap_root, event_ns(96_000), event_ns(97_000), 3, 123_465),
+        ];
+        args.reference_data = custom
+            .iter()
+            .map(|reference| reference.data_path.clone())
+            .collect();
+        args.reference_data_sha256 = custom
+            .iter()
+            .map(|reference| reference.data_sha256.clone())
+            .collect();
+        args.reference_manifest_sha256 = custom
+            .iter()
+            .map(|reference| reference.manifest_sha256.clone())
+            .collect();
+
+        let error = materialize(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("instrument-rule coverage has a gap above 90s"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1796,7 +1985,7 @@ mod tests {
         let published = materialize(&fixture.args()).unwrap();
         let output = serde_json::to_value(&published).unwrap();
         let source = &output["report"]["source_segments"][0];
-        let snapshot: hft_research_manifest::CexReplaySnapshotV4 =
+        let snapshot: hft_research_manifest::CexReplaySnapshotV5 =
             serde_json::from_value(output["report"]["snapshot"].clone()).unwrap();
         let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
             .lines()
@@ -1805,17 +1994,19 @@ mod tests {
 
         assert_eq!(
             published.report.schema_version,
-            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6
+            BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7
         );
         assert_eq!(published.report.series_count, 1);
         assert_eq!(published.report.rows, 3);
         assert_eq!(rows[0].series_id, 1);
-        snapshot.validate().unwrap();
         assert_eq!(output["report"]["snapshot_sha256"], snapshot.sha256());
-        assert!(snapshot.derivatives_reference.is_some());
+        assert_eq!(snapshot.schema_version, CEX_REPLAY_SNAPSHOT_SCHEMA_V5);
         assert_eq!(snapshot.instrument_rules.tick_size, "0.1");
         assert_eq!(snapshot.instrument_rules.step_size, "0.001");
         assert_eq!(snapshot.instrument_rules.min_notional, "5");
+        assert_eq!(snapshot.series.len(), 1);
+        assert_eq!(snapshot.series[0].series_id, 1);
+        assert_eq!(snapshot.series[0].instrument_rules_coverage.observations, 3);
         let encoded_snapshot = serde_json::to_string(&snapshot).unwrap();
         assert!(!encoded_snapshot.contains("fee_schedule"));
         assert!(!encoded_snapshot.contains("runtime_account_id"));
@@ -1837,12 +2028,7 @@ mod tests {
         assert_eq!(rows[0].symbol, "BTCUSDT");
         assert_eq!(
             rows[0].modalities,
-            BTreeSet::from([
-                DataModality::Lob,
-                DataModality::TradeTick,
-                DataModality::Funding,
-                DataModality::OpenInterest,
-            ])
+            BTreeSet::from([DataModality::Lob, DataModality::TradeTick])
         );
         // Aggregate-trade buckets are (previous_sample, current_sample]: the 1.7s
         // trade lands in the first row's (1s, 2s] bucket and the 0.7s trade is
@@ -1862,6 +2048,9 @@ mod tests {
             (rows[0].features["vwap_center_deviation_top5_bps"] - 28.12781278127806).abs() < 1e-9
         );
         assert_eq!(rows[1].features["aggregate_trade_count"], 0.0);
+        assert!(!rows[0].features.contains_key("funding_rate"));
+        assert!(!rows[0].features.contains_key("funding_cost_bps"));
+        assert!(!rows[0].features.contains_key("open_interest"));
         assert_eq!(rows[0].event_time.to_rfc3339(), "2026-07-14T00:00:02+00:00");
         assert_eq!(
             rows[0].label_available_time.to_rfc3339(),

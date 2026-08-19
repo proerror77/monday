@@ -1,0 +1,126 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: REPLACE_MATERIALIZATION_JOB_NAME
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-cex-materialization
+    app.kubernetes.io/part-of: monday
+    research.monday/contract: cex-materialization-v1
+  annotations:
+    research.monday/source-revision: REPLACE_WITH_40_HEX_SOURCE_SHA
+    research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+    research.monday/inventory-configmap: REPLACE_WITH_INVENTORY_CONFIGMAP
+    research.monday/raw-pvc: REPLACE_WITH_RAW_PVC_NAME
+    research.monday/reference-pvc: REPLACE_WITH_REFERENCE_PVC_NAME
+    research.monday/output-pvc: REPLACE_WITH_OUTPUT_PVC_NAME
+    research.monday/output-write: unique-prefix-plus-readback
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-cex-materialization
+        app.kubernetes.io/part-of: monday
+        research.monday/contract: cex-materialization-v1
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cex-materialization
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh"]
+          args:
+            - /contract/cex-materialization-entrypoint.sh
+            - --inventory
+            - /inventory/frozen.env
+            - --raw-root
+            - /lake/raw
+            - --reference-root
+            - /lake/reference
+            - --output-root
+            - /lake/output
+            - --work-dir
+            - /work
+            - --binary-dir
+            - /usr/local/bin
+          resources:
+            requests:
+              cpu: "3500m"
+              memory: 8Gi
+            limits:
+              cpu: "3500m"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: contract
+              mountPath: /contract
+              readOnly: true
+            - name: inventory
+              mountPath: /inventory
+              readOnly: true
+            - name: raw
+              mountPath: /lake/raw
+              readOnly: true
+            - name: reference
+              mountPath: /lake/reference
+              readOnly: true
+            - name: output
+              mountPath: /lake/output
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: contract
+          configMap:
+            name: REPLACE_WITH_CONTRACT_CONFIGMAP
+            defaultMode: 0444
+            items:
+              - key: cex-materialization-entrypoint.sh
+                path: cex-materialization-entrypoint.sh
+        - name: inventory
+          configMap:
+            name: REPLACE_WITH_INVENTORY_CONFIGMAP
+            defaultMode: 0444
+            items:
+              - key: frozen.env
+                path: frozen.env
+        - name: raw
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_RAW_PVC_NAME
+            readOnly: true
+        - name: reference
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_REFERENCE_PVC_NAME
+            readOnly: true
+        - name: output
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_OUTPUT_PVC_NAME
+        - name: work
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: tmp
+          emptyDir: {}

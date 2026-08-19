@@ -9,9 +9,10 @@ use hft_collector::{
 };
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
-    CexReplayDatasetManifestV4, CexReplaySnapshotV1, CexReplaySnapshotV2, CexReplaySnapshotV3,
-    CexReplaySnapshotV4, CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1,
-    CEX_REPLAY_DATASET_SCHEMA_V2, CEX_REPLAY_DATASET_SCHEMA_V3, CEX_REPLAY_DATASET_SCHEMA_V4,
+    CexReplayDatasetManifestV4, CexReplayDatasetManifestV5, CexReplaySeriesV1, CexReplaySnapshotV1,
+    CexReplaySnapshotV2, CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5,
+    CEX_REPLAY_DATASET_KIND, CEX_REPLAY_DATASET_SCHEMA_V1, CEX_REPLAY_DATASET_SCHEMA_V2,
+    CEX_REPLAY_DATASET_SCHEMA_V3, CEX_REPLAY_DATASET_SCHEMA_V4, CEX_REPLAY_DATASET_SCHEMA_V5,
     CEX_REPLAY_SNAPSHOT_SCHEMA_V3, CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
 };
 use sha2::{Digest, Sha256};
@@ -95,10 +96,10 @@ pub fn import_and_register_features(
 pub fn admit_cex_replay_dataset(
     store: &mut AlphaStore,
     features: &FeatureDatasetManifest,
-    snapshot: &CexReplaySnapshotV4,
-) -> anyhow::Result<CexReplayDatasetManifestV4> {
+    snapshot: &CexReplaySnapshotV5,
+) -> anyhow::Result<CexReplayDatasetManifestV5> {
     validate_cex_replay_features(snapshot, features)?;
-    let manifest = CexReplayDatasetManifestV4::new(features.manifest_id.clone(), snapshot.clone())?;
+    let manifest = CexReplayDatasetManifestV5::new(features.manifest_id.clone(), snapshot.clone())?;
     store.put_registry_revision(&RegistryRevision {
         revision_id: manifest.manifest_id.clone(),
         registry_kind: "dataset".to_string(),
@@ -110,8 +111,11 @@ pub fn admit_cex_replay_dataset(
     Ok(manifest)
 }
 
+const FORBIDDEN_CURRENT_CEX_FEATURES: [&str; 3] =
+    ["funding_cost_bps", "funding_rate", "open_interest"];
+
 pub(crate) fn validate_cex_replay_features(
-    snapshot: &CexReplaySnapshotV4,
+    snapshot: &CexReplaySnapshotV5,
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
     snapshot.validate()?;
@@ -127,16 +131,7 @@ pub(crate) fn validate_cex_replay_features(
     {
         bail!("feature time bounds do not match the CEX replay snapshot");
     }
-    let expected_modalities = if snapshot.instrument_type == "usdm" {
-        BTreeSet::from([
-            DataModality::Lob,
-            DataModality::TradeTick,
-            DataModality::Funding,
-            DataModality::OpenInterest,
-        ])
-    } else {
-        BTreeSet::from([DataModality::Lob, DataModality::TradeTick])
-    };
+    let expected_modalities = BTreeSet::from([DataModality::Lob, DataModality::TradeTick]);
     if features.modalities != expected_modalities {
         bail!("feature modalities do not match the CEX replay snapshot");
     }
@@ -168,6 +163,143 @@ pub(crate) fn validate_cex_replay_features(
         || features.source_revisions.get(&source_key) != Some(&expected_source_revision)
     {
         bail!("feature source revision does not match the CEX replay snapshot");
+    }
+    if features.series_count != snapshot.series.len() {
+        bail!("feature series count does not match the CEX replay snapshot");
+    }
+    let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
+    let label_horizon = u64::try_from(snapshot.label_horizon_buckets)
+        .ok()
+        .and_then(|horizon| snapshot.bucket_ms.checked_mul(horizon))
+        .and_then(|offset| i64::try_from(offset).ok())
+        .and_then(chrono::TimeDelta::try_milliseconds)
+        .context("feature label horizon is out of range")?;
+    let mut actual_series = std::collections::BTreeMap::<u64, ActualSeriesBounds>::new();
+    for row in rows {
+        if row.feature_available_time != row.event_time {
+            bail!("feature availability does not match the CEX replay decision clock");
+        }
+        if let Some(field) = FORBIDDEN_CURRENT_CEX_FEATURES
+            .into_iter()
+            .find(|field| row.features.contains_key(*field))
+        {
+            bail!("current L2-only CEX replay cannot include {field}");
+        }
+        actual_series
+            .entry(row.series_id)
+            .and_modify(|series| {
+                if row.event_time < series.first_event_time {
+                    series.first_event_time = row.event_time;
+                }
+                if row.event_time >= series.last_event_time {
+                    series.last_event_time = row.event_time;
+                    series.last_label_available_time = row.label_available_time;
+                }
+            })
+            .or_insert(ActualSeriesBounds {
+                first_event_time: row.event_time,
+                last_event_time: row.event_time,
+                last_label_available_time: row.label_available_time,
+            });
+    }
+    if actual_series.len() != snapshot.series.len() {
+        bail!("feature row series do not match the CEX replay snapshot");
+    }
+    for expected in &snapshot.series {
+        let actual = actual_series
+            .remove(&u64::from(expected.series_id))
+            .with_context(|| format!("feature row series {} is missing", expected.series_id))?;
+        validate_series_matches_rows(expected, &actual, label_horizon)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActualSeriesBounds {
+    first_event_time: DateTime<Utc>,
+    last_event_time: DateTime<Utc>,
+    last_label_available_time: DateTime<Utc>,
+}
+
+fn validate_series_matches_rows(
+    expected: &CexReplaySeriesV1,
+    actual: &ActualSeriesBounds,
+    label_horizon: chrono::TimeDelta,
+) -> anyhow::Result<()> {
+    if expected.first_event_time != actual.first_event_time
+        || expected.last_event_time != actual.last_event_time
+    {
+        bail!("feature row series bounds do not match the CEX replay snapshot");
+    }
+    let expected_last_label_available_time = expected
+        .last_event_time
+        .checked_add_signed(label_horizon)
+        .context("feature label horizon is out of range")?;
+    if actual.last_label_available_time != expected_last_label_available_time {
+        bail!(
+            "feature row series {} last label availability {} does not match snapshot close {}",
+            expected.series_id,
+            actual.last_label_available_time.to_rfc3339(),
+            expected_last_label_available_time.to_rfc3339(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_cex_replay_features_v4(
+    snapshot: &CexReplaySnapshotV4,
+    features: &FeatureDatasetManifest,
+) -> anyhow::Result<()> {
+    snapshot.validate()?;
+    if features.symbol != snapshot.symbol
+        || features.artifact_sha256 != snapshot.feature_artifact_sha256
+        || features.label_spec.horizon_buckets != snapshot.label_horizon_buckets
+        || features.label_spec.observation_frequency_millis != snapshot.bucket_ms
+    {
+        bail!("feature lineage or label facts do not match the historical CEX replay snapshot");
+    }
+    if features.time_bounds.first_event_time != snapshot.first_event_time
+        || features.time_bounds.last_event_time != snapshot.last_event_time
+    {
+        bail!("feature time bounds do not match the historical CEX replay snapshot");
+    }
+    let expected_modalities = BTreeSet::from([
+        DataModality::Lob,
+        DataModality::TradeTick,
+        DataModality::Funding,
+        DataModality::OpenInterest,
+    ]);
+    if features.modalities != expected_modalities {
+        bail!("feature modalities do not match the historical CEX replay snapshot");
+    }
+    let last_label_available_ns = u64::try_from(
+        features
+            .time_bounds
+            .last_label_available_time
+            .timestamp_nanos_opt()
+            .context("feature label availability is out of range")?,
+    )
+    .context("feature label availability is out of range")?;
+    if last_label_available_ns
+        > snapshot
+            .source_segments
+            .last()
+            .expect("validated snapshot has source segments")
+            .end_received_at_ns
+    {
+        bail!("feature label availability is outside the historical CEX replay snapshot");
+    }
+    let source_key = format!("binance-{}-lob", snapshot.instrument_type);
+    let expected_source_revision = source_revision(
+        snapshot
+            .source_segments
+            .iter()
+            .map(|segment| segment.content_sha256.as_str()),
+    );
+    if features.source_revisions.len() != 1
+        || features.source_revisions.get(&source_key) != Some(&expected_source_revision)
+    {
+        bail!("feature source revision does not match the historical CEX replay snapshot");
     }
     let rows = read_feature_rows(features).map_err(anyhow::Error::msg)?;
     if rows
@@ -213,7 +345,7 @@ fn validate_cex_replay_features_v3(
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
     snapshot.validate()?;
-    validate_cex_replay_features(
+    validate_cex_replay_features_v4(
         &CexReplaySnapshotV4 {
             schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
             venue: snapshot.venue.clone(),
@@ -303,6 +435,7 @@ pub enum CexReplayAdmission {
     V2(Box<CexReplayDatasetManifestV2>),
     V3(Box<CexReplayDatasetManifestV3>),
     V4(Box<CexReplayDatasetManifestV4>),
+    V5(Box<CexReplayDatasetManifestV5>),
 }
 
 impl CexReplayAdmission {
@@ -312,6 +445,7 @@ impl CexReplayAdmission {
             Self::V2(manifest) => &manifest.manifest_id,
             Self::V3(manifest) => &manifest.manifest_id,
             Self::V4(manifest) => &manifest.manifest_id,
+            Self::V5(manifest) => &manifest.manifest_id,
         }
     }
 
@@ -321,6 +455,7 @@ impl CexReplayAdmission {
             Self::V2(manifest) => &manifest.snapshot.symbol,
             Self::V3(manifest) => &manifest.snapshot.symbol,
             Self::V4(manifest) => &manifest.snapshot.symbol,
+            Self::V5(manifest) => &manifest.snapshot.symbol,
         }
     }
 }
@@ -351,11 +486,14 @@ impl RegisteredResearchDataset {
             ),
             Self::CexReplay {
                 admission:
-                    CexReplayAdmission::V1(_) | CexReplayAdmission::V2(_) | CexReplayAdmission::V3(_),
+                    CexReplayAdmission::V1(_)
+                    | CexReplayAdmission::V2(_)
+                    | CexReplayAdmission::V3(_)
+                    | CexReplayAdmission::V4(_),
                 ..
             } => bail!("historical CEX replay evidence is read-only and cannot execute"),
             Self::CexReplay {
-                admission: CexReplayAdmission::V4(manifest),
+                admission: CexReplayAdmission::V5(manifest),
                 features,
             } => {
                 let funding_bps = cex_snapshot_funding_bps(&manifest.snapshot)?;
@@ -369,7 +507,7 @@ impl RegisteredResearchDataset {
                     costs.fee_bps,
                     funding_bps,
                     costs.latency_bps,
-                    true,
+                    false,
                 )
             }
         }
@@ -401,21 +539,9 @@ impl RegisteredResearchDataset {
     }
 }
 
-pub fn cex_snapshot_funding_bps(snapshot: &CexReplaySnapshotV4) -> anyhow::Result<f64> {
+pub fn cex_snapshot_funding_bps(snapshot: &CexReplaySnapshotV5) -> anyhow::Result<f64> {
     snapshot.validate()?;
-    snapshot
-        .derivatives_reference
-        .as_ref()
-        .map(|reference| reference.evaluation_funding_bps_per_bucket.parse::<f64>())
-        .transpose()
-        .context("snapshot funding evidence is not numeric")?
-        .map_or(Ok(0.0), |value| {
-            if value.is_finite() && value >= 0.0 {
-                Ok(value)
-            } else {
-                bail!("snapshot funding evidence must be finite and non-negative")
-            }
-        })
+    Ok(0.0)
 }
 
 #[cfg(test)]
@@ -522,6 +648,21 @@ pub fn read_registered_research_dataset(
                     fields.2,
                 )
             }
+            CEX_REPLAY_DATASET_SCHEMA_V5 => {
+                let manifest: CexReplayDatasetManifestV5 = serde_json::from_value(value.clone())?;
+                manifest.validate()?;
+                let fields = (
+                    manifest.manifest_id.clone(),
+                    manifest.feature_manifest_id.clone(),
+                    manifest.snapshot.symbol.clone(),
+                );
+                (
+                    CexReplayAdmission::V5(Box::new(manifest)),
+                    fields.0,
+                    fields.1,
+                    fields.2,
+                )
+            }
             _ => bail!("CEX replay dataset schema is unsupported"),
         };
         let feature_revision = store
@@ -547,6 +688,9 @@ pub fn read_registered_research_dataset(
                 validate_cex_replay_features_v3(&manifest.snapshot, &features)?
             }
             CexReplayAdmission::V4(manifest) => {
+                validate_cex_replay_features_v4(&manifest.snapshot, &features)?
+            }
+            CexReplayAdmission::V5(manifest) => {
                 validate_cex_replay_features(&manifest.snapshot, &features)?
             }
         }
@@ -626,7 +770,7 @@ pub fn require_promotable_research_dataset(
             .payload
             .get("schema_version")
             .and_then(serde_json::Value::as_str)
-            != Some(CEX_REPLAY_DATASET_SCHEMA_V4)
+            != Some(CEX_REPLAY_DATASET_SCHEMA_V5)
     {
         bail!("historical CEX replay evidence is read-only and cannot be promoted");
     }
@@ -1154,6 +1298,274 @@ mod tests {
         assert_eq!(loaded[0].features["onchain_flow"], 0.0);
         assert_eq!(loaded[0].funding_bps, 2.0);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registered_current_cex_replay_v5_loads_as_l2_only_without_pit_funding() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let manifest_path = directory.path().join("cex-replay-dataset.json");
+        let artifacts = directory.path().join("artifacts");
+        let ingestion = Utc::now() - Duration::seconds(1);
+        let source_content_sha256 = "a".repeat(64);
+        let source_revision = source_revision([source_content_sha256.as_str()]);
+        let rows = (0..3)
+            .map(|index| {
+                let event_time = ingestion - Duration::seconds(3 - index as i64);
+                PointInTimeFeatureRow {
+                    series_id: 1,
+                    event_time,
+                    feature_available_time: event_time,
+                    label_available_time: event_time + Duration::seconds(1),
+                    ingestion_time: ingestion,
+                    symbol: "BTCUSDT".to_string(),
+                    source_revisions: BTreeMap::from([(
+                        "binance-usdm-lob".to_string(),
+                        source_revision.clone(),
+                    )]),
+                    modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                    features: BTreeMap::from([
+                        ("ask_depth_top5".to_string(), 10.0 + index as f64),
+                        ("bid_depth_top5".to_string(), 9.0 + index as f64),
+                        ("book_imbalance".to_string(), index as f64 / 10.0),
+                        ("book_imbalance_top5".to_string(), index as f64 / 20.0),
+                        ("mid_price".to_string(), 60_000.0 + index as f64),
+                        ("near_depth_concentration_skew_top5".to_string(), 0.1),
+                        ("spread_bps".to_string(), 1.0),
+                        ("vwap_center_deviation_top5_bps".to_string(), 0.5),
+                        ("weighted_book_imbalance_top5".to_string(), 0.2),
+                    ]),
+                    label: index as f64 * 0.001,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut bytes, row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&input, bytes).unwrap();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let features =
+            import_and_register_features(&mut store, "data-cex-v5", &input, &artifacts).unwrap();
+        let instrument_rules_evidence = (0..2)
+            .map(|index| hft_research_manifest::CexArtifactTripletV2 {
+                data_sha256: hex::encode(Sha256::digest(format!(
+                    "data-mission-v5-rules-data-{index}"
+                ))),
+                manifest_sha256: hex::encode(Sha256::digest(format!(
+                    "data-mission-v5-rules-manifest-{index}"
+                ))),
+                success_sha256: hex::encode(Sha256::digest(format!(
+                    "data-mission-v5-rules-data-{index}"
+                ))),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = CexReplaySnapshotV5 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V5.to_string(),
+            venue: "binance".to_string(),
+            instrument_type: "usdm".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
+            required_modalities: BTreeSet::from([
+                hft_research_manifest::CEX_MODALITY_LOB.to_string(),
+                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ]),
+            source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
+                content_sha256: source_content_sha256,
+                manifest_sha256: "b".repeat(64),
+                start_received_at_ns: u64::try_from(
+                    (rows.first().unwrap().event_time - Duration::seconds(1))
+                        .timestamp_nanos_opt()
+                        .unwrap(),
+                )
+                .unwrap(),
+                end_received_at_ns: u64::try_from(
+                    rows.last()
+                        .unwrap()
+                        .label_available_time
+                        .timestamp_nanos_opt()
+                        .unwrap(),
+                )
+                .unwrap(),
+                events: rows.len() as u64,
+            }],
+            first_event_time: rows.first().unwrap().event_time,
+            last_event_time: rows.last().unwrap().event_time,
+            feature_artifact_sha256: features.artifact_sha256.clone(),
+            feature_availability_policy: hft_research_manifest::CEX_FEATURE_AVAILABILITY_POLICY
+                .to_string(),
+            bucket_ms: 1_000,
+            label_horizon_buckets: 1,
+            top_depth: 5,
+            instrument_rules: hft_research_manifest::CexInstrumentRulesV2 {
+                tick_size: "0.1".to_string(),
+                step_size: "0.001".to_string(),
+                min_notional: "5".to_string(),
+                available_at: rows.first().unwrap().event_time - Duration::seconds(1),
+                valid_through: rows.last().unwrap().label_available_time,
+                evidence: instrument_rules_evidence.clone(),
+            },
+            series: vec![hft_research_manifest::CexReplaySeriesV1 {
+                series_id: 1,
+                first_event_time: rows.first().unwrap().event_time,
+                last_event_time: rows.last().unwrap().event_time,
+                instrument_rules_coverage: hft_research_manifest::CexPitSeriesEvidenceV2 {
+                    evidence: instrument_rules_evidence,
+                    first_available_at: rows.first().unwrap().event_time - Duration::seconds(1),
+                    last_available_at: rows.last().unwrap().label_available_time,
+                    observations: 2,
+                    max_gap_ns: 8_000_000_000,
+                },
+            }],
+        };
+        let manifest = admit_cex_replay_dataset(&mut store, &features, &snapshot).unwrap();
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let registered = read_registered_research_dataset(&store, &manifest_path).unwrap();
+        let loaded = registered
+            .load_rows(&EvaluationCostsV1 {
+                fee_bps: 1.0,
+                rebate_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
+            })
+            .unwrap();
+
+        assert_eq!(loaded.len(), rows.len());
+        assert_eq!(loaded[0].funding_bps, 0.0);
+        assert!(!loaded[0].pit_funding);
+        assert!(!loaded[0].features.contains_key("funding_cost_bps"));
+    }
+
+    #[test]
+    fn current_cex_replay_v5_rejects_series_label_availability_that_stretches_into_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let artifacts = directory.path().join("artifacts");
+        let ingestion = Utc::now() - Duration::seconds(1);
+        let source_content_sha256 = "1".repeat(64);
+        let source_revision = source_revision([source_content_sha256.as_str()]);
+        let series_one_start = ingestion - Duration::minutes(10);
+        let series_two_start = ingestion - Duration::minutes(4);
+        let rows = vec![
+            PointInTimeFeatureRow {
+                series_id: 1,
+                event_time: series_one_start,
+                feature_available_time: series_one_start,
+                label_available_time: series_one_start + Duration::minutes(1),
+                ingestion_time: ingestion,
+                symbol: "BTCUSDT".to_string(),
+                source_revisions: BTreeMap::from([(
+                    "binance-usdm-lob".to_string(),
+                    source_revision.clone(),
+                )]),
+                modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                features: BTreeMap::from([
+                    ("ask_depth_top5".to_string(), 10.0),
+                    ("bid_depth_top5".to_string(), 9.0),
+                    ("book_imbalance".to_string(), 0.1),
+                    ("book_imbalance_top5".to_string(), 0.05),
+                    ("mid_price".to_string(), 60_000.0),
+                    ("near_depth_concentration_skew_top5".to_string(), 0.1),
+                    ("spread_bps".to_string(), 1.0),
+                    ("vwap_center_deviation_top5_bps".to_string(), 0.5),
+                    ("weighted_book_imbalance_top5".to_string(), 0.2),
+                ]),
+                label: 0.001,
+            },
+            PointInTimeFeatureRow {
+                series_id: 1,
+                event_time: series_one_start + Duration::minutes(1),
+                feature_available_time: series_one_start + Duration::minutes(1),
+                label_available_time: series_one_start + Duration::minutes(3),
+                ingestion_time: ingestion,
+                symbol: "BTCUSDT".to_string(),
+                source_revisions: BTreeMap::from([(
+                    "binance-usdm-lob".to_string(),
+                    source_revision.clone(),
+                )]),
+                modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                features: BTreeMap::from([
+                    ("ask_depth_top5".to_string(), 11.0),
+                    ("bid_depth_top5".to_string(), 10.0),
+                    ("book_imbalance".to_string(), 0.2),
+                    ("book_imbalance_top5".to_string(), 0.1),
+                    ("mid_price".to_string(), 60_001.0),
+                    ("near_depth_concentration_skew_top5".to_string(), 0.1),
+                    ("spread_bps".to_string(), 1.0),
+                    ("vwap_center_deviation_top5_bps".to_string(), 0.5),
+                    ("weighted_book_imbalance_top5".to_string(), 0.2),
+                ]),
+                label: 0.002,
+            },
+            PointInTimeFeatureRow {
+                series_id: 2,
+                event_time: series_two_start,
+                feature_available_time: series_two_start,
+                label_available_time: series_two_start + Duration::minutes(1),
+                ingestion_time: ingestion,
+                symbol: "BTCUSDT".to_string(),
+                source_revisions: BTreeMap::from([(
+                    "binance-usdm-lob".to_string(),
+                    source_revision.clone(),
+                )]),
+                modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                features: BTreeMap::from([
+                    ("ask_depth_top5".to_string(), 12.0),
+                    ("bid_depth_top5".to_string(), 11.0),
+                    ("book_imbalance".to_string(), 0.3),
+                    ("book_imbalance_top5".to_string(), 0.15),
+                    ("mid_price".to_string(), 60_002.0),
+                    ("near_depth_concentration_skew_top5".to_string(), 0.1),
+                    ("spread_bps".to_string(), 1.0),
+                    ("vwap_center_deviation_top5_bps".to_string(), 0.5),
+                    ("weighted_book_imbalance_top5".to_string(), 0.2),
+                ]),
+                label: 0.003,
+            },
+            PointInTimeFeatureRow {
+                series_id: 2,
+                event_time: series_two_start + Duration::minutes(1),
+                feature_available_time: series_two_start + Duration::minutes(1),
+                label_available_time: series_two_start + Duration::minutes(2),
+                ingestion_time: ingestion,
+                symbol: "BTCUSDT".to_string(),
+                source_revisions: BTreeMap::from([(
+                    "binance-usdm-lob".to_string(),
+                    source_revision.clone(),
+                )]),
+                modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                features: BTreeMap::from([
+                    ("ask_depth_top5".to_string(), 13.0),
+                    ("bid_depth_top5".to_string(), 12.0),
+                    ("book_imbalance".to_string(), 0.4),
+                    ("book_imbalance_top5".to_string(), 0.2),
+                    ("mid_price".to_string(), 60_003.0),
+                    ("near_depth_concentration_skew_top5".to_string(), 0.1),
+                    ("spread_bps".to_string(), 1.0),
+                    ("vwap_center_deviation_top5_bps".to_string(), 0.5),
+                    ("weighted_book_imbalance_top5".to_string(), 0.2),
+                ]),
+                label: 0.004,
+            },
+        ];
+        let mut bytes = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut bytes, row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&input, bytes).unwrap();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let error = import_and_register_features(&mut store, "data-cex-v5-gap", &input, &artifacts)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("label horizon"));
     }
 
     fn trace_fixture() -> (std::path::PathBuf, DatasetManifest, Vec<OhlcvTraceRow>) {

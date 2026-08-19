@@ -441,11 +441,8 @@ pub fn verify_reference_artifact(
     expected_data_sha256: &str,
     expected_manifest_sha256: &str,
 ) -> Result<CompleteReferenceBatch> {
-    let (data, manifest_bytes) = read_artifact_trust_anchor(
-        published,
-        expected_data_sha256,
-        expected_manifest_sha256,
-    )?;
+    let (data, manifest_bytes) =
+        read_artifact_trust_anchor(published, expected_data_sha256, expected_manifest_sha256)?;
     match peek_manifest_schema(&manifest_bytes)?.as_str() {
         MANIFEST_SCHEMA_V2 => {
             verify_current_manifest_v2(published, &data, &manifest_bytes, expected_data_sha256)
@@ -453,6 +450,31 @@ pub fn verify_reference_artifact(
         MANIFEST_SCHEMA_V1 => bail!(
             "historical v1 reference manifests are read-only evidence and cannot pass the writable verifier"
         ),
+        _ => bail!("reference manifest schema is unsupported"),
+    }
+}
+
+pub fn verify_reference_artifact_read_only_current_batch(
+    published: &PublishedReferenceArtifact,
+    expected_data_sha256: &str,
+    expected_manifest_sha256: &str,
+) -> Result<CompleteReferenceBatch> {
+    let (data, manifest_bytes) =
+        read_artifact_trust_anchor(published, expected_data_sha256, expected_manifest_sha256)?;
+    match peek_manifest_schema(&manifest_bytes)?.as_str() {
+        MANIFEST_SCHEMA_V2 => {
+            verify_current_manifest_v2(published, &data, &manifest_bytes, expected_data_sha256)
+        }
+        MANIFEST_SCHEMA_V1 => {
+            let manifest: HistoricalManifestV1 = serde_json::from_slice(&manifest_bytes)
+                .context("parse historical v1 reference manifest")?;
+            if manifest.identity.data_schema != REFERENCE_SCHEMA {
+                bail!(
+                    "historical reference rows without current instrument rules are read-only evidence and cannot seed PIT materialization"
+                );
+            }
+            verify_current_manifest_v1(published, &data, &manifest_bytes, expected_data_sha256)
+        }
         _ => bail!("reference manifest schema is unsupported"),
     }
 }
@@ -519,12 +541,10 @@ fn verify_current_manifest_v2(
     )?;
     validate_partition_path(&published.data_path, manifest.identity.observed_at_ns)?;
     let batch = parse_current_batch(data)?;
-    let coverage = ArtifactCoverage::from(
-        batch.coverage(
-            manifest.identity.observed_at_ns,
-            manifest.identity.max_staleness_ms,
-        )?,
-    );
+    let coverage = ArtifactCoverage::from(batch.coverage(
+        manifest.identity.observed_at_ns,
+        manifest.identity.max_staleness_ms,
+    )?);
     let (mark_index_funding, open_interest) = batch_modality_clocks(&batch)?;
     if coverage != manifest.identity.coverage
         || !coverage.is_complete()
@@ -554,12 +574,10 @@ fn verify_current_manifest_v1(
     )?;
     validate_partition_path(&published.data_path, manifest.identity.observed_at_ns)?;
     let batch = parse_current_batch(data)?;
-    let coverage = ArtifactCoverage::from(
-        batch.coverage(
-            manifest.identity.observed_at_ns,
-            manifest.identity.max_staleness_ms,
-        )?,
-    );
+    let coverage = ArtifactCoverage::from(batch.coverage(
+        manifest.identity.observed_at_ns,
+        manifest.identity.max_staleness_ms,
+    )?);
     if coverage != manifest.identity.coverage
         || !coverage.is_complete()
         || time_bounds(&batch)? != manifest.time_bounds
@@ -575,11 +593,8 @@ pub fn verify_reference_artifact_read_only(
     expected_data_sha256: &str,
     expected_manifest_sha256: &str,
 ) -> Result<VerifiedReferenceCounts> {
-    let (data, manifest_bytes) = read_artifact_trust_anchor(
-        published,
-        expected_data_sha256,
-        expected_manifest_sha256,
-    )?;
+    let (data, manifest_bytes) =
+        read_artifact_trust_anchor(published, expected_data_sha256, expected_manifest_sha256)?;
     let schema = peek_manifest_schema(&manifest_bytes)?;
     if schema == MANIFEST_SCHEMA_V2 {
         let batch =
@@ -594,15 +609,11 @@ pub fn verify_reference_artifact_read_only(
     if schema != MANIFEST_SCHEMA_V1 {
         bail!("reference manifest schema is unsupported");
     }
-    let manifest: HistoricalManifestV1 =
-        serde_json::from_slice(&manifest_bytes).context("parse historical v1 reference manifest")?;
+    let manifest: HistoricalManifestV1 = serde_json::from_slice(&manifest_bytes)
+        .context("parse historical v1 reference manifest")?;
     if manifest.identity.data_schema == REFERENCE_SCHEMA {
-        let batch = verify_current_manifest_v1(
-            published,
-            &data,
-            &manifest_bytes,
-            expected_data_sha256,
-        )?;
+        let batch =
+            verify_current_manifest_v1(published, &data, &manifest_bytes, expected_data_sha256)?;
         return Ok(VerifiedReferenceCounts {
             metadata: batch.contracts().len(),
             mark_index_funding: batch.mark_index_funding().len(),
@@ -1216,10 +1227,22 @@ mod tests {
         assert_eq!(manifest.identity.source_endpoints, source_endpoints());
         assert_eq!(manifest.identity.coverage.api_error_count, 0);
         assert_eq!(manifest.identity.coverage.stale_metadata, 0);
-        assert_eq!(manifest.mark_index_funding.first_available_at_ns, RECEIVED_NS);
-        assert_eq!(manifest.mark_index_funding.last_available_at_ns, RECEIVED_NS);
-        assert_eq!(manifest.open_interest.first_available_at_ns, RECEIVED_NS + 50);
-        assert_eq!(manifest.open_interest.last_available_at_ns, RECEIVED_NS + 50);
+        assert_eq!(
+            manifest.mark_index_funding.first_available_at_ns,
+            RECEIVED_NS
+        );
+        assert_eq!(
+            manifest.mark_index_funding.last_available_at_ns,
+            RECEIVED_NS
+        );
+        assert_eq!(
+            manifest.open_interest.first_available_at_ns,
+            RECEIVED_NS + 50
+        );
+        assert_eq!(
+            manifest.open_interest.last_available_at_ns,
+            RECEIVED_NS + 50
+        );
     }
 
     #[test]
@@ -1499,20 +1522,15 @@ mod tests {
         let (_temp, _config, published) = publish_fixture();
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
-        manifest
-            .as_object_mut()
-            .unwrap()
-            .remove("open_interest");
+        manifest.as_object_mut().unwrap().remove("open_interest");
         let mut bytes = serde_json::to_vec(&manifest).unwrap();
         bytes.push(b'\n');
         fs::write(&published.manifest_path, &bytes).unwrap();
         let manifest_sha256 = digest(&bytes);
-        assert!(verify_reference_artifact(
-            &published,
-            &published.data_sha256,
-            &manifest_sha256,
-        )
-        .is_err());
+        assert!(
+            verify_reference_artifact(&published, &published.data_sha256, &manifest_sha256,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1605,5 +1623,127 @@ mod tests {
                 historical_read_only: false,
             }
         );
+    }
+
+    #[test]
+    fn historical_v1_current_rows_seed_the_read_only_current_batch_helper() {
+        let (_temp, config, published) = publish_fixture();
+        let data = fs::read(&published.data_path).unwrap();
+        let manifest = serde_json::json!({
+            "schema": MANIFEST_SCHEMA_V1,
+            "venue": VENUE,
+            "dataset": DATASET,
+            "data_schema": REFERENCE_SCHEMA,
+            "format": "ndjson",
+            "source_origin": OFFICIAL_USDM_SOURCE_ORIGIN,
+            "source_endpoints": source_endpoints(),
+            "file": DATA_NAME,
+            "bytes": data.len(),
+            "sha256": published.data_sha256,
+            "rows": 3,
+            "observed_at_ns": config.observed_at_ns,
+            "max_staleness_ms": config.max_staleness_ms,
+            "coverage": {
+                "active_contracts": 1,
+                "metadata_observations": 1,
+                "mark_index_funding_observations": 1,
+                "open_interest_observations": 1,
+                "stale_metadata": 0,
+                "stale_mark_index_funding": 0,
+                "stale_open_interest": 0,
+                "api_error_count": 0,
+            },
+            "time_bounds": {
+                "min_source_time_ms": SOURCE_MS,
+                "max_source_time_ms": SOURCE_MS,
+                "min_received_at_ns": RECEIVED_NS - 100,
+                "max_received_at_ns": RECEIVED_NS + 50,
+            },
+        });
+        let mut bytes = serde_json::to_vec(&manifest).unwrap();
+        bytes.push(b'\n');
+        fs::write(&published.manifest_path, &bytes).unwrap();
+        let manifest_sha256 = digest(&bytes);
+
+        let batch = verify_reference_artifact_read_only_current_batch(
+            &published,
+            &published.data_sha256,
+            &manifest_sha256,
+        )
+        .unwrap();
+
+        assert_eq!(batch.contracts().len(), 1);
+        assert_eq!(batch.mark_index_funding().len(), 1);
+        assert_eq!(batch.open_interest().len(), 1);
+    }
+
+    #[test]
+    fn historical_v2_rows_are_rejected_by_the_current_batch_helper() {
+        let (_temp, config, published) = publish_fixture();
+        let data = fs::read(&published.data_path).unwrap();
+        let mut historical = Vec::new();
+        for line in data.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            row["observation"]["schema"] = serde_json::json!(HISTORICAL_REFERENCE_SCHEMA_V2);
+            if row["kind"] == "metadata" {
+                let observation = row["observation"].as_object_mut().unwrap();
+                observation.remove("tick_size");
+                observation.remove("step_size");
+                observation.remove("min_notional");
+            }
+            serde_json::to_writer(&mut historical, &row).unwrap();
+            historical.push(b'\n');
+        }
+        fs::write(&published.data_path, &historical).unwrap();
+        let data_sha256 = digest(&historical);
+        let manifest = serde_json::json!({
+            "schema": MANIFEST_SCHEMA_V1,
+            "venue": VENUE,
+            "dataset": DATASET,
+            "data_schema": HISTORICAL_REFERENCE_SCHEMA_V2,
+            "format": "ndjson",
+            "source_origin": OFFICIAL_USDM_SOURCE_ORIGIN,
+            "source_endpoints": source_endpoints(),
+            "file": DATA_NAME,
+            "bytes": historical.len(),
+            "sha256": data_sha256,
+            "rows": 3,
+            "observed_at_ns": config.observed_at_ns,
+            "max_staleness_ms": config.max_staleness_ms,
+            "coverage": {
+                "active_contracts": 1,
+                "metadata_observations": 1,
+                "mark_index_funding_observations": 1,
+                "open_interest_observations": 1,
+                "stale_metadata": 0,
+                "stale_mark_index_funding": 0,
+                "stale_open_interest": 0,
+                "api_error_count": 0,
+            },
+            "time_bounds": {
+                "min_source_time_ms": SOURCE_MS,
+                "max_source_time_ms": SOURCE_MS,
+                "min_received_at_ns": RECEIVED_NS,
+                "max_received_at_ns": RECEIVED_NS + 50,
+            },
+        });
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        fs::write(&published.manifest_path, &manifest_bytes).unwrap();
+        let manifest_sha256 = digest(&manifest_bytes);
+        fs::write(&published.success_path, format!("{data_sha256}\n")).unwrap();
+
+        let error = verify_reference_artifact_read_only_current_batch(
+            &published,
+            &data_sha256,
+            &manifest_sha256,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("read-only evidence"), "{error}");
     }
 }

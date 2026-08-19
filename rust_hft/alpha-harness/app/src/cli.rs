@@ -78,6 +78,8 @@ enum MissionCommand {
     Create(CreateMissionArgs),
     Execute(Box<ExecuteMissionArgs>),
     CampaignExecute(CampaignExecuteArgs),
+    CampaignFreeze(CampaignFreezeArgs),
+    CampaignFinalize(CampaignFinalizeArgs),
     CampaignId(CampaignIdArgs),
     Dispatch {
         #[command(subcommand)]
@@ -147,6 +149,36 @@ pub struct CampaignExecuteArgs {
     pub request: PathBuf,
     #[arg(long)]
     pub request_sha256: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignFreezeArgs {
+    #[arg(long)]
+    pub campaign_inputs: PathBuf,
+    #[arg(long)]
+    pub input_root: PathBuf,
+    #[arg(long)]
+    pub campaign_root: String,
+    #[arg(long = "seed", required = true)]
+    pub seeds: Vec<u64>,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CampaignFinalizeArgs {
+    #[arg(long)]
+    pub freeze: PathBuf,
+    #[arg(long)]
+    pub signed_request: PathBuf,
+    #[arg(long)]
+    pub attempt_id: String,
+    #[arg(long)]
+    pub image: String,
+    #[arg(long)]
+    pub request_out: PathBuf,
+    #[arg(long)]
+    pub submission_out: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -709,6 +741,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("campaign execution worker failed")?
             }
+            MissionCommand::CampaignFreeze(args) => mission_campaign::freeze(args),
+            MissionCommand::CampaignFinalize(args) => mission_campaign::finalize(args),
             MissionCommand::CampaignId(args) => mission_campaign::print_expected_id(args),
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::Submit(args) => mission_dispatch::submit(args),
@@ -997,6 +1031,18 @@ mod tests {
     #[test]
     fn parses_mission_campaign_execute() {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_campaign_freeze() {
+        let args = "alpha-harness mission campaign-freeze --campaign-inputs campaign-inputs.json --input-root /mounted/run --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns --seed 7 --seed 11 --output freeze.json";
+        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
+    }
+
+    #[test]
+    fn parses_mission_campaign_finalize() {
+        let args = "alpha-harness mission campaign-finalize --freeze freeze.json --signed-request signed-request.json --attempt-id attempt-001 --image registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request-out request.json --submission-out submission.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 

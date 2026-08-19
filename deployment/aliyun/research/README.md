@@ -174,6 +174,92 @@ operator-created PVCs:
 Do not mount the complete OSS bucket as the hot replay path. Stage only the
 symbol/time partitions required by the current run.
 
+## ACK CEX materialization
+
+`k8s/cex-materialization-job.example.yaml` is the bounded cloud materialization
+entrypoint for one frozen CEX run identity. It does not enumerate OSS, mutate
+old YAML, or compile Rust in-cluster. The Job:
+
+- mounts a read-only raw OSS CSI PVC at `/lake/raw`;
+- mounts a read-only reference OSS CSI PVC at `/lake/reference`;
+- mounts one stable-lane output OSS CSI PVC at `/lake/output`;
+- loads one frozen inventory file and the repo-owned entrypoint script from
+  ConfigMaps;
+- verifies every declared data and manifest against their frozen SHA-256 values,
+  and checks that each `_SUCCESS` marker exists and its content equals the
+  frozen data SHA-256;
+- slices only the requested symbol with `binance-market-tape-slicer`;
+- runs `lob-pit-materializer` and `binance-replay-parquet-materializer`;
+- re-hashes the four produced Campaign inputs on the mounted output prefix; and
+- writes `receipts/campaign-inputs.json` plus a small receipt.
+
+The script is `scripts/cex-materialization-entrypoint.sh`, and the operator
+freezes inputs in `examples/cex-materialization.inventory.env.example`. Keep the
+inventory shell-safe: no spaces or shell metacharacters, and only canonical
+relative object keys under the mounted roots. The frozen inventory is the
+single source of truth for run-specific object identity:
+
+- `OUTPUT_PREFIX` selects the run-scoped subdirectory under the fixed mounted
+  lane root `research/cex-materialization`.
+
+The output volume template is
+`k8s/cex-materialization-output-volume.example.yaml`. Keep its PV `path` as a
+stable lane root placeholder and create one dedicated PV/PVC pair for that lane.
+The Job then writes only under the run-specific `OUTPUT_PREFIX` frozen in the
+inventory. The object URL base is fixed to
+`https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/cex-materialization`,
+and the script derives the four concrete object URLs by appending
+`/$OUTPUT_PREFIX/...`. `allow_other` stays enabled only so the CSI mount remains usable
+under non-root `uid=1000`/`gid=1000`; the mount itself is tightened to
+`umask/mp_umask=0077`, not world-writable. That keeps the Job bounded even
+though an OSSFS-backed PVC is not a strong global create-once proof. The
+current contract is therefore:
+
+- preflight unique prefix under the mounted output root;
+- content-addressed filenames from the Rust binaries inside that prefix; and
+- same-mount SHA readback after publication.
+
+This is honest transport evidence, not an independent remote OSS readback.
+Stage-7 immutable readback still needs a later controller or a separate
+read-only verification Job that opens the same object bytes through a different
+path.
+
+Example control-plane bootstrap:
+
+```bash
+kubectl -n monday-research create configmap monday-cex-materialization-contract \
+  --from-file=cex-materialization-entrypoint.sh=deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh
+
+kubectl -n monday-research create configmap monday-cex-materialization-inventory-a006 \
+  --from-file=frozen.env=deployment/aliyun/research/examples/cex-materialization.inventory.env.example
+
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-output-volume.example.yaml
+kubectl apply -f deployment/aliyun/research/k8s/cex-materialization-job.example.yaml
+kubectl -n monday-research patch job REPLACE_MATERIALIZATION_JOB_NAME \
+  --type merge -p '{"spec":{"suspend":false}}'
+```
+
+The Job template starts suspended. Read back the rendered inventory, output PV/PVC
+identities, and mounted lane root first, then unsuspend explicitly.
+
+Run `campaign-freeze` from any cloud Pod that mounts that completed run prefix;
+the receipt stores paths relative to the run root, so the mount point itself may
+differ from the materialization Pod. Pass that mount point with `--input-root`.
+
+The script accepts `--dry-run` for triplet and prefix validation without
+writing output. The repo-local contract check is:
+
+```bash
+deployment/aliyun/research/test-cex-materialization-entrypoint.sh
+```
+
+Current repository state caveat: the mounted inventory still needs explicit
+reference triplets whenever the pinned `research-runner` image's
+`lob-pit-materializer` still expects the read-only historical v1/current data v3
+reference lane for the current instrument-rules PIT binding. The deployment
+contract does not reinterpret the image's schema rules; it records and
+read-backs whatever the pinned binaries actually publish.
+
 ## Current deployment gates
 
 This bootstrap does not claim the complete research plane is live. Before
