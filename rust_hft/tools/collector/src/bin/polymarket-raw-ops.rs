@@ -9,8 +9,8 @@ use hft_collector::polymarket_parity::{
 };
 use hft_collector::polymarket_raw::{
     finalize_reference_tape, run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
-    DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE, DEFAULT_TAPE_MAX_BYTES,
-    DEFAULT_TRADE_REQUEST_SPACING_MS,
+    DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+    DEFAULT_SETTLED_STATE_RETENTION_SECS, DEFAULT_TAPE_MAX_BYTES, DEFAULT_TRADE_REQUEST_SPACING_MS,
 };
 use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
@@ -257,6 +257,7 @@ async fn run(cli: Cli) -> Result<()> {
                 trade_finalization_stable_polls,
                 per_market_delay: Duration::from_millis(per_market_delay_ms),
                 tape_max_bytes,
+                settled_state_retention_secs: DEFAULT_SETTLED_STATE_RETENTION_SECS,
                 low_disk_floor_bytes: Some(env_u64(
                     None,
                     "OSS_LOW_DISK_FLOOR_BYTES",
