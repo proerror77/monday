@@ -242,14 +242,19 @@ kubectl -n monday-research patch job REPLACE_MATERIALIZATION_JOB_NAME \
 The Job template starts suspended. Read back the rendered inventory, output PV/PVC
 identities, and mounted lane root first, then unsuspend explicitly.
 
-Run `campaign-freeze` from any cloud Pod that mounts that completed run prefix;
-the receipt stores paths relative to the run root, so the mount point itself may
+Run `campaign-freeze` from a cloud Pod using the exact digest-pinned executor
+image that will run the Campaign and mounting the completed run prefix. The
+receipt stores paths relative to the run root, so the mount point itself may
 differ from the materialization Pod. Pass that mount point with `--input-root`.
 `--source-revision` and `--image` are required and must name the exact executor
 git SHA and digest-pinned image that will run the Campaign. `campaign-freeze`
 rejects any source drift from the current Pod build. The mounted receipt's
 `source_revision` and `image_ref` remain immutable producer lineage and are
 bound into the canonical Campaign request separately from the executor identity.
+Before signing, read back that Pod's `imageID` and verify the published image's
+`org.opencontainers.image.revision` equals `--source-revision`; reject the
+freeze plan if either identity differs. The freeze plan is unsigned preparation,
+not execution authority.
 
 The script accepts `--dry-run` for triplet and prefix validation without
 writing output. The repo-local contract check is:

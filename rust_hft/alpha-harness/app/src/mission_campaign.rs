@@ -18,6 +18,7 @@ use crate::{
 use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
+use hft_backtest::config::verify_canonical_replay_artifact;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -624,6 +625,14 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         "campaign replay manifest",
         &replay_manifest_path,
         &receipt.replay_manifest.sha256,
+    )?;
+    verify_canonical_replay_artifact(
+        &replay_artifact_path,
+        &replay_manifest_path,
+        Some(&replay_artifact_sha256),
+        &replay_manifest_sha256,
+        None,
+        None,
     )?;
     let declared_total_trials = crate::mission_render::max_candidates_for_tests()
         .checked_mul(2)
@@ -1993,8 +2002,10 @@ mod tests {
         std::fs::create_dir_all(&input_root).unwrap();
         let feature_relative = PathBuf::from("features.jsonl");
         let materialization_relative = PathBuf::from("materialization.json");
-        let replay_artifact_relative = PathBuf::from("replay.parquet");
-        let replay_manifest_relative = PathBuf::from("replay-manifest.json");
+        let replay_artifact_relative: PathBuf =
+            fixture.replay_artifact_path.file_name().unwrap().into();
+        let replay_manifest_relative: PathBuf =
+            fixture.replay_manifest_path.file_name().unwrap().into();
         std::fs::copy(
             &fixture._render_fixture.feature_path,
             input_root.join(&feature_relative),
@@ -2043,7 +2054,10 @@ mod tests {
             },
             replay_artifact: CampaignInputReceiptItem {
                 relative_path: replay_artifact_relative.clone(),
-                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay.parquet"),
+                object_url: format!(
+                    "{TEST_ROOT}/runs/campaign-freeze/{}",
+                    replay_artifact_relative.display()
+                ),
                 sha256: crate::mission_runner::sha256_file(
                     &input_root.join(&replay_artifact_relative),
                 )
@@ -2051,7 +2065,10 @@ mod tests {
             },
             replay_manifest: CampaignInputReceiptItem {
                 relative_path: replay_manifest_relative.clone(),
-                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay-manifest.json"),
+                object_url: format!(
+                    "{TEST_ROOT}/runs/campaign-freeze/{}",
+                    replay_manifest_relative.display()
+                ),
                 sha256: crate::mission_runner::sha256_file(
                     &input_root.join(&replay_manifest_relative),
                 )
@@ -2122,6 +2139,29 @@ mod tests {
         assert!(invalid_executor
             .to_string()
             .contains("mission image must be pinned by @sha256 digest"));
+
+        let replay_manifest_path = input_root.join(&replay_manifest_relative);
+        let mut invalid_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&replay_manifest_path).unwrap()).unwrap();
+        invalid_manifest["artifact_path"] = serde_json::json!("wrong.parquet");
+        data_mission::write_json_atomic(&replay_manifest_path, &invalid_manifest).unwrap();
+        let mut invalid_replay_receipt = receipt.clone();
+        invalid_replay_receipt.replay_manifest.sha256 =
+            crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
+        data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
+        let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: executor_image_ref.clone(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: root.path().join("invalid-replay-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(invalid_replay
+            .chain()
+            .any(|cause| cause.to_string().contains("artifact")));
 
         let invalid_source = freeze_request(&CampaignFreezeArgs {
             campaign_inputs: receipt_path.clone(),
