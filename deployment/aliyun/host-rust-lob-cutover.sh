@@ -44,6 +44,7 @@ HEALTH_TIMEOUT_SECONDS=300
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EVIDENCE_DIR="/data/monday/evidence/cutovers/$(date -u +%Y%m%dT%H%M%SZ)-${CANDIDATE_SHA256:0:12}-$$"
+DRAIN_MAY_HAVE_MUTATED=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -78,6 +79,11 @@ DEPLOYMENT_ASSETS=(
   binance-lob-archiver-production-usdm.env
 )
 DRAIN_ENV_KEYS=(
+  MARKET
+  DATASET
+  SHARD_ID
+  SNAPSHOT_LIMIT
+  ZSTD_TIMEOUT_SECONDS
   SPOOL_DIR
   OSS_BUCKET
   OSS_ENDPOINT
@@ -300,7 +306,7 @@ require_empty_segment_spool() {
 }
 
 run_candidate_drain() {
-  local deployment=$1 market env_file key value
+  local deployment=$1 market env_file key value recovery_parent recovery_dir
   local -a env_args
   canonical_spool_paths_safe || return 1
   for market in spot usdm; do
@@ -312,6 +318,27 @@ run_candidate_drain() {
       [[ -n $value ]] || return 1
       env_args+=("$key=$value")
     done
+    if find "$CANONICAL_SPOOL/$market" -type f -name '*.jsonl.part' -print -quit \
+      | grep -q .; then
+      recovery_parent="$EVIDENCE_DIR/recovery-input/$market"
+      install -d -m 0750 -o root -g root -- "$recovery_parent" || return 1
+      recovery_dir="$recovery_parent/$(date -u +%Y%m%dT%H%M%S%NZ)-$$"
+      [[ ! -e $recovery_dir && ! -L $recovery_dir ]] || return 1
+      if ! env -i \
+        HOME=/root \
+        PATH="$SAFE_PATH" \
+        RUST_LOG=info \
+        "${env_args[@]}" \
+        RECOVERY_UID="$(id -u hftcollector)" \
+        RECOVERY_GID="$(id -g hftcollector)" \
+        RECOVERY_BACKUP_DIR="$recovery_dir" \
+        "$CANDIDATE_BINARY" --recover-parts-only; then
+        [[ -f $recovery_dir/receipt.json ]] && DRAIN_MAY_HAVE_MUTATED=1
+        return 1
+      fi
+      DRAIN_MAY_HAVE_MUTATED=1
+    fi
+    DRAIN_MAY_HAVE_MUTATED=1
     runuser --user hftcollector -- env -i \
       HOME=/var/lib/hft-collector \
       PATH="$SAFE_PATH" \
@@ -533,7 +560,8 @@ rollback_after_failure() {
     return
   fi
 
-  if [[ -d $CANONICAL_SPOOL ]]; then
+  if [[ -d $CANONICAL_SPOOL \
+    && ( $STEP != drain-old-production-with-candidate || $DRAIN_MAY_HAVE_MUTATED -eq 1 ) ]]; then
     if ! run_candidate_drain "$CANDIDATE_DEPLOYMENT"; then
       safe_to_restart=0
     fi
@@ -674,6 +702,7 @@ validate_deployment "$CANDIDATE_DEPLOYMENT" true
 id hftcollector >/dev/null 2>&1 || fail 'service account hftcollector is missing'
 runuser -u hftcollector -- "$CANDIDATE_BINARY" --self-test
 "$CANDIDATE_BINARY" --help | grep -Fq -- '--upload-only'
+"$CANDIDATE_BINARY" --help | grep -Fq -- '--recover-parts-only'
 [[ $(readlink -f "$SHADOW_LINK" 2>/dev/null || true) == "$CANDIDATE_BINARY" ]] \
   || fail 'shadow symlink does not point to the gated candidate binary'
 
@@ -769,6 +798,8 @@ else
 fi
 for unit in "${PRODUCTION_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "production unit did not stop: $unit"
+  [[ $(systemctl show --property MainPID --value "$unit") == 0 ]] \
+    || fail "production unit retained a MainPID after stop: $unit"
 done
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
@@ -782,7 +813,7 @@ systemctl daemon-reload
 
 if [[ $OLD_MODE == upgrade ]]; then
   STEP=drain-old-production-with-candidate
-  run_candidate_drain "$CANDIDATE_DEPLOYMENT"
+  run_candidate_drain "$OLD_DEPLOYMENT"
 else
   STEP=verify-new-host-spool
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'

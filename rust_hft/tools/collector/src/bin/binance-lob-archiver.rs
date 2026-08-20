@@ -16,14 +16,16 @@ use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
     recover_parts, segment_partition, send_or_shutdown, sha256_file, write_health,
     write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
-    QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, UploadStatus, RAW_SCHEMA,
+    QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, UploadStatus,
+    MAX_RECOVERY_ROW_BYTES, RAW_SCHEMA,
 };
 use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -51,7 +53,13 @@ struct Args {
 
     #[arg(
         long,
-        conflicts_with_all = ["self_test", "upload_only"],
+        conflicts_with_all = ["self_test", "upload_only", "verify_segment"]
+    )]
+    recover_parts_only: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["self_test", "upload_only", "recover_parts_only"],
         requires_all = ["segment_content_sha256", "segment_manifest_sha256"]
     )]
     verify_segment: Vec<PathBuf>,
@@ -323,6 +331,11 @@ impl SpoolLock {
         }
         Ok(Self { _file: file })
     }
+
+    fn owner(&self) -> anyhow::Result<(u32, u32)> {
+        let metadata = self._file.metadata()?;
+        Ok((metadata.uid(), metadata.gid()))
+    }
 }
 
 impl UploadConfig {
@@ -416,16 +429,7 @@ impl Config {
     /// and repeated by every session_start row. Liquidation orders are USD-M
     /// only, so spot tapes declare one fewer stream type.
     fn stream_types(&self) -> Vec<String> {
-        let mut stream_types = vec![
-            "depth@100ms".to_owned(),
-            "aggTrade".to_owned(),
-            "trade".to_owned(),
-            "bookTicker".to_owned(),
-        ];
-        if self.market == Market::Usdm {
-            stream_types.push("forceOrder".to_owned());
-        }
-        stream_types
+        stream_types_for_market(self.market)
     }
 
     fn segment_config(&self) -> SegmentConfig {
@@ -1067,6 +1071,9 @@ async fn main() -> anyhow::Result<()> {
     if args.upload_only {
         return upload_only(&UploadConfig::from_env()?).await;
     }
+    if args.recover_parts_only {
+        return recover_parts_only();
+    }
     if !args.verify_segment.is_empty() {
         return verify_segments(&args);
     }
@@ -1101,6 +1108,394 @@ async fn main() -> anyhow::Result<()> {
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
+    Ok(())
+}
+
+fn recover_parts_only() -> anyhow::Result<()> {
+    // SAFETY: this read-only libc call has no preconditions.
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "--recover-parts-only must start as root"
+    );
+    let spool_dir = PathBuf::from(required_env("SPOOL_DIR")?);
+    anyhow::ensure!(
+        spool_dir.is_absolute() && spool_dir.is_dir(),
+        "--recover-parts-only requires an existing absolute SPOOL_DIR"
+    );
+    let market: Market = required_env("MARKET")?
+        .parse()
+        .map_err(anyhow::Error::msg)?;
+    let dataset = required_env("DATASET")?;
+    let shard_id = required_env("SHARD_ID")?;
+    let backup_dir = PathBuf::from(required_env("RECOVERY_BACKUP_DIR")?);
+    anyhow::ensure!(
+        backup_dir.is_absolute() && !backup_dir.exists(),
+        "RECOVERY_BACKUP_DIR must be a new absolute path"
+    );
+    let lock_path = spool_dir.join(SPOOL_LOCK_FILE);
+    let lock_metadata = std::fs::symlink_metadata(&lock_path).with_context(|| {
+        format!(
+            "recovery requires the existing spool lock {}",
+            lock_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        lock_metadata.file_type().is_file(),
+        "recovery spool lock is not a regular file: {}",
+        lock_path.display()
+    );
+    let expected_uid: u32 = required_env_parse("RECOVERY_UID")?;
+    let expected_gid: u32 = required_env_parse("RECOVERY_GID")?;
+    anyhow::ensure!(
+        expected_uid != 0 && expected_gid != 0,
+        "recovery owner must be the non-root collector service"
+    );
+    let spool_lock = SpoolLock::acquire(&spool_dir)?;
+    let (recovery_uid, recovery_gid) = spool_lock.owner()?;
+    anyhow::ensure!(
+        (recovery_uid, recovery_gid) == (expected_uid, expected_gid),
+        "recovery spool lock does not belong to the expected collector service"
+    );
+    for suffix in [".zst.tmp", ".part.corrupt"] {
+        anyhow::ensure!(
+            files_with_suffix(&spool_dir, suffix)?.is_empty(),
+            "--recover-parts-only refuses residual {suffix} artifacts"
+        );
+    }
+    let parts = files_with_suffix(&spool_dir, ".jsonl.part")?;
+    if parts.is_empty() {
+        println!("recover-parts-only: recovered=0");
+        return Ok(());
+    }
+    let nonempty_parts =
+        validated_nonempty_recovery_parts(&parts, recovery_uid, recovery_gid)?;
+    backup_recovery_parts(&spool_dir, &backup_dir, &parts, market, &dataset, &shard_id)?;
+    drop_recovery_privileges(recovery_uid, recovery_gid)?;
+    let stream_types = stream_types_for_market(market);
+    let symbols = if nonempty_parts.is_empty() {
+        Vec::new()
+    } else {
+        discover_recovery_catalog(&nonempty_parts, market, &stream_types)?
+    };
+    let config = SegmentConfig {
+        spool_dir: spool_dir.clone(),
+        market,
+        dataset,
+        shard_id,
+        symbols,
+        security_token_symbols: Vec::new(),
+        excluded_symbols: Vec::new(),
+        snapshot_limit: required_env_parse("SNAPSHOT_LIMIT")?,
+        zstd_timeout: Duration::from_secs(required_env_parse("ZSTD_TIMEOUT_SECONDS")?),
+        stream_types,
+    };
+    let recovered = recover_parts(&config)?;
+    anyhow::ensure!(
+        recovered.len() == nonempty_parts.len()
+            && files_with_suffix(&spool_dir, ".jsonl.part")?.is_empty()
+            && files_with_suffix(&spool_dir, ".zst.tmp")?.is_empty()
+            && files_with_suffix(&spool_dir, ".part.corrupt")?.is_empty(),
+        "--recover-parts-only did not recover every non-empty input part"
+    );
+    println!("recover-parts-only: recovered={}", recovered.len());
+    Ok(())
+}
+
+fn validated_nonempty_recovery_parts(
+    parts: &[PathBuf],
+    recovery_uid: u32,
+    recovery_gid: u32,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut nonempty = Vec::new();
+    for part in parts {
+        let metadata = std::fs::symlink_metadata(part)?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.uid() == recovery_uid
+                && metadata.gid() == recovery_gid,
+            "recovery part owner does not match the collector spool lock: {}",
+            part.display()
+        );
+        if metadata.len() > 0 {
+            nonempty.push(part.clone());
+        }
+    }
+    Ok(nonempty)
+}
+
+fn drop_recovery_privileges(uid: u32, gid: u32) -> anyhow::Result<()> {
+    // SAFETY: the process is verified root, the target IDs are explicit and
+    // non-root, and a null group pointer is valid when the group count is zero.
+    let clear_groups = unsafe { libc::setgroups(0, std::ptr::null()) };
+    anyhow::ensure!(
+        clear_groups == 0,
+        "clear recovery supplementary groups: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: gid is the validated owner of the already-locked spool.
+    let set_gid = unsafe { libc::setgid(gid) };
+    anyhow::ensure!(
+        set_gid == 0,
+        "set recovery group: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: uid is the validated owner of the already-locked spool; this
+    // permanently removes root privileges before any recovery mutation.
+    let set_uid = unsafe { libc::setuid(uid) };
+    anyhow::ensure!(
+        set_uid == 0,
+        "set recovery user: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: these read-only libc calls have no preconditions.
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == gid,
+        "recovery privilege drop did not take effect"
+    );
+    Ok(())
+}
+
+fn stream_types_for_market(market: Market) -> Vec<String> {
+    let mut stream_types = vec![
+        "depth@100ms".to_owned(),
+        "aggTrade".to_owned(),
+        "trade".to_owned(),
+        "bookTicker".to_owned(),
+    ];
+    if market == Market::Usdm {
+        stream_types.push("forceOrder".to_owned());
+    }
+    stream_types
+}
+
+fn discover_recovery_catalog(
+    parts: &[PathBuf],
+    market: Market,
+    expected_stream_types: &[String],
+) -> anyhow::Result<Vec<String>> {
+    for path in parts.iter().rev() {
+        let mut reader = BufReader::new(std::fs::File::open(path)?);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = (&mut reader)
+                .take(MAX_RECOVERY_ROW_BYTES as u64 + 2)
+                .read_until(b'\n', &mut line)?;
+            if read == 0 {
+                break;
+            }
+            let complete = line.last() == Some(&b'\n');
+            anyhow::ensure!(
+                line.len() - usize::from(complete) <= MAX_RECOVERY_ROW_BYTES,
+                "recovery catalog row exceeds the bounded row size in {}",
+                path.display()
+            );
+            if !complete {
+                break;
+            }
+            let row: Value = serde_json::from_slice(&line)
+                .with_context(|| format!("parse recovery catalog row in {}", path.display()))?;
+            if row.get("type").and_then(Value::as_str) != Some("stream_coverage") {
+                continue;
+            }
+            anyhow::ensure!(
+                row.get("schema").and_then(Value::as_str) == Some(RAW_SCHEMA),
+                "recovery catalog is not {RAW_SCHEMA}"
+            );
+            let session_id = row
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .context("recovery stream coverage has no session_id")?;
+            let mut symbols = BTreeSet::new();
+            let mut shards = Vec::new();
+            for shard in row
+                .get("shards")
+                .and_then(Value::as_array)
+                .context("recovery stream coverage has no shards")?
+            {
+                let mut streams = Vec::new();
+                for stream in shard
+                    .as_array()
+                    .context("recovery stream coverage shard is not an array")?
+                {
+                    let stream = stream
+                        .as_str()
+                        .context("recovery stream coverage entry is not a string")?;
+                    let (symbol, stream_type) = stream
+                        .split_once('@')
+                        .context("recovery stream coverage entry has no channel")?;
+                    anyhow::ensure!(!symbol.is_empty() && !stream_type.is_empty());
+                    symbols.insert(symbol.to_ascii_uppercase());
+                    streams.push(stream.to_owned());
+                }
+                shards.push(streams);
+            }
+            let states = symbols
+                .iter()
+                .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, market)))
+                .collect::<HashMap<_, _>>();
+            validate_stream_coverage_shards(&shards, &states, expected_stream_types)
+                .context("recovery stream coverage does not prove the complete catalog")?;
+            for part in parts {
+                anyhow::ensure!(
+                    first_recovery_session(part)? == session_id,
+                    "recovery parts do not share the stream-coverage session"
+                );
+            }
+            return Ok(symbols.into_iter().collect());
+        }
+    }
+    bail!("recovery parts contain no complete stream-coverage catalog")
+}
+
+fn first_recovery_session(path: &Path) -> anyhow::Result<String> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = Vec::new();
+    let read = (&mut reader)
+        .take(MAX_RECOVERY_ROW_BYTES as u64 + 2)
+        .read_until(b'\n', &mut line)?;
+    anyhow::ensure!(read > 0 && line.last() == Some(&b'\n'));
+    anyhow::ensure!(line.len() - 1 <= MAX_RECOVERY_ROW_BYTES);
+    let row: Value = serde_json::from_slice(&line)
+        .with_context(|| format!("parse first recovery row in {}", path.display()))?;
+    anyhow::ensure!(
+        row.get("schema").and_then(Value::as_str) == Some(RAW_SCHEMA),
+        "recovery part is not {RAW_SCHEMA}: {}",
+        path.display()
+    );
+    row.get("session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .context("first recovery row has no session_id")
+}
+
+fn backup_recovery_parts(
+    spool_dir: &Path,
+    backup_dir: &Path,
+    parts: &[PathBuf],
+    market: Market,
+    dataset: &str,
+    shard_id: &str,
+) -> anyhow::Result<()> {
+    backup_recovery_parts_owned(spool_dir, backup_dir, parts, market, dataset, shard_id, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backup_recovery_parts_owned(
+    spool_dir: &Path,
+    backup_dir: &Path,
+    parts: &[PathBuf],
+    market: Market,
+    dataset: &str,
+    shard_id: &str,
+    required_uid: u32,
+) -> anyhow::Result<()> {
+    std::fs::create_dir(backup_dir)?;
+    std::fs::set_permissions(backup_dir, std::fs::Permissions::from_mode(0o750))?;
+    anyhow::ensure!(
+        std::fs::symlink_metadata(backup_dir)?.uid() == required_uid,
+        "recovery backup directory has the wrong owner"
+    );
+    let mut files = Vec::with_capacity(parts.len());
+    let mut backup_directories = vec![backup_dir.to_path_buf()];
+    for source in parts {
+        let relative = source
+            .strip_prefix(spool_dir)
+            .with_context(|| format!("recovery part escaped spool: {}", source.display()))?;
+        let relative = relative
+            .to_str()
+            .context("recovery part path is not UTF-8")?;
+        let destination = backup_dir.join(relative);
+        let destination_parent = destination.parent().context("backup part has no parent")?;
+        std::fs::create_dir_all(destination_parent)?;
+        let mut directory = Some(destination_parent);
+        while let Some(path) = directory {
+            anyhow::ensure!(path.starts_with(backup_dir));
+            backup_directories.push(path.to_path_buf());
+            if path == backup_dir {
+                break;
+            }
+            directory = path.parent();
+        }
+        let before = std::fs::metadata(source)?;
+        anyhow::ensure!(before.is_file(), "recovery input is not a regular file");
+        let copied = std::fs::copy(source, &destination)?;
+        anyhow::ensure!(copied == before.len(), "recovery backup copy was truncated");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o440))?;
+        std::fs::File::open(&destination)?.sync_all()?;
+        let after = std::fs::metadata(source)?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec(),
+            "recovery input changed while it was backed up: {}",
+            source.display()
+        );
+        let source_sha256 = sha256_file(source)?;
+        let backup_sha256 = sha256_file(&destination)?;
+        anyhow::ensure!(
+            source_sha256 == backup_sha256,
+            "recovery backup hash mismatch: {}",
+            source.display()
+        );
+        let backup_metadata = std::fs::metadata(&destination)?;
+        anyhow::ensure!(
+            backup_metadata.uid() == required_uid && backup_metadata.mode() & 0o777 == 0o440,
+            "recovery backup is not owned read-only evidence"
+        );
+        files.push(json!({
+            "path": relative,
+            "sha256": source_sha256,
+            "bytes": before.len(),
+            "source_dev": before.dev(),
+            "source_inode": before.ino(),
+            "source_uid": before.uid(),
+            "source_gid": before.gid(),
+            "source_mode": before.mode() & 0o777,
+            "source_mtime_seconds": before.mtime(),
+            "source_mtime_nanoseconds": before.mtime_nsec(),
+        }));
+    }
+    let receipt_path = backup_dir.join("receipt.json");
+    let mut receipt = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o640)
+        .open(&receipt_path)?;
+    serde_json::to_writer_pretty(
+        &mut receipt,
+        &json!({
+            "schema": "monday.binance-lob-recovery-input.v1",
+            "market": market.as_str(),
+            "dataset": dataset,
+            "shard_id": shard_id,
+            "files": files,
+        }),
+    )?;
+    receipt.write_all(b"\n")?;
+    receipt.sync_all()?;
+    std::fs::set_permissions(backup_dir, std::fs::Permissions::from_mode(0o550))?;
+    backup_directories.sort();
+    backup_directories.dedup();
+    backup_directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+    });
+    for directory in backup_directories {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    std::fs::File::open(
+        backup_dir
+            .parent()
+            .context("backup directory has no parent")?,
+    )?
+    .sync_all()?;
     Ok(())
 }
 
@@ -4370,6 +4765,25 @@ fn env_string(name: &str, default: &str) -> String {
         .to_owned()
 }
 
+fn required_env(name: &str) -> anyhow::Result<String> {
+    let value = env::var(name)
+        .with_context(|| format!("--recover-parts-only requires explicit {name}"))?
+        .trim()
+        .to_owned();
+    anyhow::ensure!(!value.is_empty(), "{name} must not be empty");
+    Ok(value)
+}
+
+fn required_env_parse<T>(name: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    required_env(name)?
+        .parse()
+        .with_context(|| format!("invalid {name}"))
+}
+
 fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
 where
     T: std::str::FromStr + std::fmt::Display,
@@ -4459,6 +4873,133 @@ mod tests {
             Args::try_parse_from(["binance-lob-archiver", "--upload-only", "--self-test",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn recover_parts_only_cli_is_explicit_and_exclusive() {
+        let args = Args::try_parse_from(["binance-lob-archiver", "--recover-parts-only"]).unwrap();
+        assert!(args.recover_parts_only);
+        for conflicting in ["--self-test", "--upload-only"] {
+            assert!(Args::try_parse_from([
+                "binance-lob-archiver",
+                "--recover-parts-only",
+                conflicting,
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_catalog_comes_from_matching_archived_stream_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty.jsonl.part");
+        let first = root.path().join("first.jsonl.part");
+        let second = root.path().join("second.jsonl.part");
+        std::fs::write(&empty, b"").unwrap();
+        let row = |event_type: &str, session_id: &str, extra: Value| {
+            let mut row = json!({
+                "schema": RAW_SCHEMA,
+                "received_at_ns": 1,
+                "type": event_type,
+                "session_id": session_id,
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            format!("{}\n", serde_json::to_string(&row).unwrap())
+        };
+        std::fs::write(
+            &first,
+            row(
+                "book_ticker",
+                "session-1",
+                json!({"frame":{"stream":"btcusdt@bookTicker"}}),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            row(
+                "stream_coverage",
+                "session-1",
+                json!({"shards":[[
+                    "btcusdt@depth@100ms",
+                    "btcusdt@aggTrade",
+                    "btcusdt@trade",
+                    "btcusdt@bookTicker"
+                ]]}),
+            ),
+        )
+        .unwrap();
+        let owner = std::fs::metadata(&first).unwrap();
+        assert_eq!(
+            validated_nonempty_recovery_parts(
+                &[empty, first.clone(), second.clone()],
+                owner.uid(),
+                owner.gid(),
+            )
+            .unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            discover_recovery_catalog(
+                &[first.clone(), second.clone()],
+                Market::Spot,
+                &stream_types_for_market(Market::Spot),
+            )
+            .unwrap(),
+            vec!["BTCUSDT"]
+        );
+
+        std::fs::write(
+            &first,
+            row(
+                "book_ticker",
+                "other-session",
+                json!({"frame":{"stream":"btcusdt@bookTicker"}}),
+            ),
+        )
+        .unwrap();
+        assert!(discover_recovery_catalog(
+            &[first, second],
+            Market::Spot,
+            &stream_types_for_market(Market::Spot),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_backup_is_read_only_and_receipted_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = root.path().join("spool");
+        let part = spool.join("date=2026-08-20/hour=01/part-1.jsonl.part");
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"original bytes\n").unwrap();
+        let backup = root.path().join("backup");
+        let owner = std::fs::metadata(root.path()).unwrap().uid();
+
+        backup_recovery_parts_owned(
+            &spool,
+            &backup,
+            std::slice::from_ref(&part),
+            Market::Spot,
+            "spot_all",
+            "all",
+            owner,
+        )
+        .unwrap();
+
+        let copy = backup.join(part.strip_prefix(&spool).unwrap());
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original bytes\n");
+        assert_eq!(std::fs::metadata(&copy).unwrap().mode() & 0o777, 0o440);
+        assert_eq!(std::fs::metadata(&backup).unwrap().mode() & 0o777, 0o550);
+        let receipt: Value =
+            serde_json::from_reader(std::fs::File::open(backup.join("receipt.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["market"], "spot");
+        assert_eq!(receipt["dataset"], "spot_all");
+        assert_eq!(receipt["files"][0]["bytes"], 15);
+        assert_eq!(std::fs::read(&part).unwrap(), b"original bytes\n");
     }
 
     #[test]
