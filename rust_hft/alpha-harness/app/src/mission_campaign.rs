@@ -1028,18 +1028,26 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign image identity must be a normalized SHA256");
     }
     normalized_source_revision("campaign source revision", &request.build_source_revision)?;
-    normalized_sha256(
-        "campaign inputs receipt SHA256",
-        &request.campaign_inputs_sha256,
-    )?;
+    if request.campaign_inputs_sha256
+        != normalized_sha256(
+            "campaign inputs receipt SHA256",
+            &request.campaign_inputs_sha256,
+        )?
+    {
+        bail!("campaign inputs receipt SHA256 must be normalized");
+    }
     normalized_source_revision(
         "campaign producer_source_revision",
         &request.producer_source_revision,
     )?;
-    normalized_sha256(
-        "campaign producer image identity",
-        &request.producer_image_identity,
-    )?;
+    if request.producer_image_identity
+        != normalized_sha256(
+            "campaign producer image identity",
+            &request.producer_image_identity,
+        )?
+    {
+        bail!("campaign producer image identity must be a normalized SHA256");
+    }
     validate_cex_holdout_id(&request.holdout_id)?;
     canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
     normalized_sha256("campaign feature", &request.feature_sha256)?;
@@ -1748,6 +1756,17 @@ mod tests {
         let mut request = valid_request();
         request.replay_manifest_url =
             "https://example.com/research/replay-manifest.json".to_string();
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_request_rejects_noncanonical_producer_digests() {
+        let mut request = valid_request();
+        request.campaign_inputs_sha256 = "A".repeat(64);
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.producer_image_identity = format!(" {} ", "a".repeat(64));
         assert!(validate_request(&request).is_err());
     }
 
