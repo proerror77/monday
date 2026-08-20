@@ -2492,13 +2492,19 @@ mod tests {
             .join(format!("mission/{}/execute", round.round_id));
         let results = execute_dir.join("results");
         let subset_path = results.join("factor-subset-mcts-result.json");
+        let mut report = recover_round_report(&fixture.work_dir, &request, &round);
+        report.replay_gate_passed = Some(false);
+        let failed_replay = collect_round_ledger(&execute_dir, &round, &report).unwrap();
+        assert_eq!(failed_replay.termination_reason, "replay_gate_failed");
+        assert!(failed_replay.selected_candidate_id.is_none());
+        assert!(failed_replay.selected_score.is_none());
+
         let mut subset: CexFactorBankMctsResultV1 =
             serde_json::from_slice(&std::fs::read(&subset_path).unwrap()).unwrap();
         subset.selected = None;
         data_mission::write_json_atomic(&subset_path, &subset).unwrap();
         std::fs::remove_file(results.join("combination-walk-forward.json")).unwrap();
 
-        let mut report = recover_round_report(&fixture.work_dir, &request, &round);
         report.replay_receipt_id = None;
         report.replay_gate_passed = None;
         let ledger = collect_round_ledger(&execute_dir, &round, &report).unwrap();
