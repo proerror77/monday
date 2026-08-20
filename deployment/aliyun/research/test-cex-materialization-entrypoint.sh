@@ -121,6 +121,7 @@ mkdir -p "$artifact_dir"
 feature=$artifact_dir/feature-test.jsonl
 report=$artifact_dir/materialization-test.materialization.json
 printf 'feature-row\n' >"$feature"
+printf 'verified-reference-evidence\n' >"$artifact_dir/decoy.reference.data"
 feature_sha=$(sha256sum "$feature" | awk '{print $1}')
 cat >"$report" <<JSON
 {
@@ -187,8 +188,19 @@ sh "$ENTRYPOINT" \
   --binary-dir "$BIN_DIR" >/dev/null
 
 RUN_ROOT=$OUT_ROOT/test-run-1
+[ -f "$WORK_ROOT/staged-output/artifacts/materialization/decoy.reference.data" ]
+[ ! -e "$RUN_ROOT/artifacts/materialization/decoy.reference.data" ]
 [ -f "$RUN_ROOT/receipts/campaign-inputs.json" ]
 [ -f "$RUN_ROOT/receipts/materialization-receipt.json" ]
+[ -f "$RUN_ROOT/receipts/frozen-inventory.env" ]
+[ -f "$RUN_ROOT/artifacts/materialization/feature-test.jsonl" ]
+[ -f "$RUN_ROOT/artifacts/materialization/materialization-test.materialization.json" ]
+[ -f "$RUN_ROOT/artifacts/replay/replay-test.parquet" ]
+[ -f "$RUN_ROOT/artifacts/replay/replay-test.canonical-manifest.json" ]
+if find "$RUN_ROOT" -type f -name '*.reference.*' | grep -q .; then
+  printf 'local reference evidence was unexpectedly published\n' >&2
+  exit 1
+fi
 grep -q '"schema_version": "monday.cex_campaign_inputs.v1"' "$RUN_ROOT/receipts/campaign-inputs.json"
 grep -q '"readback_scope": "same-mounted-ossfs-prefix"' "$RUN_ROOT/receipts/campaign-inputs.json"
 grep -q '"output_object_base_url": "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/cex-materialization"' "$RUN_ROOT/receipts/campaign-inputs.json"

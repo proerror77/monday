@@ -120,6 +120,41 @@ ensure_unique_prefix() {
   [ ! -e "$RUN_ROOT" ] || die "output prefix already exists: $RUN_ROOT"
 }
 
+published_path_for() {
+  publish_source=$1
+  publish_source_root=$2
+  publish_destination_root=$3
+  publish_label=$4
+  case "$publish_source" in
+    "$publish_source_root"/*)
+      publish_name=${publish_source#"$publish_source_root"/}
+      ;;
+    *)
+      die "$publish_label path escapes local artifact root: $publish_source"
+      ;;
+  esac
+  canonical_relpath "$publish_name" || die "$publish_label path is not canonical: $publish_name"
+  case "$publish_name" in
+    */*)
+      die "$publish_label must be a direct child of its artifact directory: $publish_source"
+      ;;
+  esac
+  printf '%s/%s\n' "$publish_destination_root" "$publish_name"
+}
+
+publish_verified_file() {
+  publish_label=$1
+  publish_source=$2
+  publish_destination=$3
+  publish_expected_sha=$4
+  [ -f "$publish_source" ] || die "$publish_label source is missing: $publish_source"
+  [ "$(sha256_file "$publish_source")" = "$publish_expected_sha" ] || die "$publish_label source SHA mismatch"
+  [ ! -e "$publish_destination" ] || die "$publish_label destination already exists: $publish_destination"
+  cp "$publish_source" "$publish_destination"
+  [ -f "$publish_destination" ] || die "$publish_label was not published: $publish_destination"
+  [ "$(sha256_file "$publish_destination")" = "$publish_expected_sha" ] || die "$publish_label published readback SHA mismatch"
+}
+
 triplet_paths() {
   root=$1
   rel=$2
@@ -306,6 +341,11 @@ ARTIFACT_ROOT=$RUN_ROOT/artifacts
 MATERIALIZATION_DIR=$ARTIFACT_ROOT/materialization
 REPLAY_DIR=$ARTIFACT_ROOT/replay
 RECEIPT_DIR=$RUN_ROOT/receipts
+LOCAL_RUN_ROOT=$WORK_DIR/staged-output
+LOCAL_ARTIFACT_ROOT=$LOCAL_RUN_ROOT/artifacts
+LOCAL_MATERIALIZATION_DIR=$LOCAL_ARTIFACT_ROOT/materialization
+LOCAL_REPLAY_DIR=$LOCAL_ARTIFACT_ROOT/replay
+LOCAL_RECEIPT_DIR=$LOCAL_RUN_ROOT/receipts
 SLICE_ROOT=$WORK_DIR/slices
 STATE_ROOT=$WORK_DIR/state
 
@@ -313,7 +353,7 @@ ensure_unique_prefix
 mkdir -p "$SLICE_ROOT" "$STATE_ROOT"
 
 if [ "$DRY_RUN" -ne 1 ]; then
-  mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
+  mkdir -p "$LOCAL_MATERIALIZATION_DIR" "$LOCAL_REPLAY_DIR" "$LOCAL_RECEIPT_DIR"
 fi
 
 [ "$DRY_RUN" -eq 1 ] || {
@@ -405,7 +445,7 @@ set -- "$PIT_BIN" \
   --bucket-ms "$bucket_ms" \
   --label-horizon-buckets "$label_horizon_buckets" \
   --top-depth "$top_depth" \
-  --artifact-dir "$MATERIALIZATION_DIR"
+  --artifact-dir "$LOCAL_MATERIALIZATION_DIR"
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
   set -- "$@" \
@@ -438,7 +478,7 @@ set -- "$REPLAY_BIN" \
   --mission-id "$mission_id" \
   --symbol "$symbol" \
   --market "$market" \
-  --artifact-dir "$REPLAY_DIR"
+  --artifact-dir "$LOCAL_REPLAY_DIR"
 i=1
 while [ "$i" -le "$raw_segment_count" ]; do
   set -- "$@" \
@@ -453,21 +493,26 @@ replay_manifest_path=$(json_string_field manifest_path "$replay_stdout")
 replay_manifest_sha=$(json_string_field manifest_sha256 "$replay_stdout")
 replay_artifact_rel=$(json_string_field artifact_path "$replay_stdout")
 replay_artifact_sha=$(json_string_field artifact_sha256 "$replay_stdout")
-replay_artifact_path=$REPLAY_DIR/$replay_artifact_rel
+replay_artifact_path=$LOCAL_REPLAY_DIR/$replay_artifact_rel
 [ -f "$replay_artifact_path" ] || die "replay artifact is missing: $replay_artifact_path"
 [ -f "$replay_manifest_path" ] || die "replay manifest is missing: $replay_manifest_path"
 [ "$(sha256_file "$replay_artifact_path")" = "$replay_artifact_sha" ] || die "replay artifact readback SHA mismatch"
 [ "$(sha256_file "$replay_manifest_path")" = "$replay_manifest_sha" ] || die "replay manifest readback SHA mismatch"
 
-cp "$INVENTORY" "$RECEIPT_DIR/frozen-inventory.env"
-inventory_copy_sha=$(sha256_file "$RECEIPT_DIR/frozen-inventory.env")
-[ "$inventory_copy_sha" = "$inventory_sha256" ] || die "inventory copy SHA mismatch"
-feature_url=$(object_url_for "$feature_path")
-materialization_url=$(object_url_for "$materialization_path")
-replay_artifact_url=$(object_url_for "$replay_artifact_path")
-replay_manifest_url=$(object_url_for "$replay_manifest_path")
+feature_publish_path=$(published_path_for "$feature_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "feature artifact")
+materialization_publish_path=$(published_path_for "$materialization_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "materialization report")
+replay_artifact_publish_path=$(published_path_for "$replay_artifact_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay artifact")
+replay_manifest_publish_path=$(published_path_for "$replay_manifest_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay manifest")
 
-cat >"$RECEIPT_DIR/campaign-inputs.json" <<EOF
+cp "$INVENTORY" "$LOCAL_RECEIPT_DIR/frozen-inventory.env"
+inventory_copy_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/frozen-inventory.env")
+[ "$inventory_copy_sha" = "$inventory_sha256" ] || die "inventory copy SHA mismatch"
+feature_url=$(object_url_for "$feature_publish_path")
+materialization_url=$(object_url_for "$materialization_publish_path")
+replay_artifact_url=$(object_url_for "$replay_artifact_publish_path")
+replay_manifest_url=$(object_url_for "$replay_manifest_publish_path")
+
+cat >"$LOCAL_RECEIPT_DIR/campaign-inputs.json" <<EOF
 {
   "schema_version": "monday.cex_campaign_inputs.v1",
   "run_id": "$run_id",
@@ -480,28 +525,28 @@ cat >"$RECEIPT_DIR/campaign-inputs.json" <<EOF
   "output_object_base_url": "$OUTPUT_OBJECT_BASE_URL",
   "readback_scope": "same-mounted-ossfs-prefix",
   "feature": {
-    "relative_path": "$(relative_run_path "$feature_path")",
+    "relative_path": "$(relative_run_path "$feature_publish_path")",
     "object_url": "$feature_url",
     "sha256": "$feature_sha"
   },
   "materialization": {
-    "relative_path": "$(relative_run_path "$materialization_path")",
+    "relative_path": "$(relative_run_path "$materialization_publish_path")",
     "object_url": "$materialization_url",
     "sha256": "$materialization_sha"
   },
   "replay_artifact": {
-    "relative_path": "$(relative_run_path "$replay_artifact_path")",
+    "relative_path": "$(relative_run_path "$replay_artifact_publish_path")",
     "object_url": "$replay_artifact_url",
     "sha256": "$replay_artifact_sha"
   },
   "replay_manifest": {
-    "relative_path": "$(relative_run_path "$replay_manifest_path")",
+    "relative_path": "$(relative_run_path "$replay_manifest_publish_path")",
     "object_url": "$replay_manifest_url",
     "sha256": "$replay_manifest_sha"
   }
 }
 EOF
-campaign_inputs_sha=$(sha256_file "$RECEIPT_DIR/campaign-inputs.json")
+campaign_inputs_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/campaign-inputs.json")
 
 {
   printf '{\n'
@@ -516,6 +561,16 @@ campaign_inputs_sha=$(sha256_file "$RECEIPT_DIR/campaign-inputs.json")
   printf '  "replay_artifact_sha256": "%s",\n' "$replay_artifact_sha"
   printf '  "replay_manifest_sha256": "%s"\n' "$replay_manifest_sha"
   printf '}\n'
-} >"$RECEIPT_DIR/materialization-receipt.json"
+} >"$LOCAL_RECEIPT_DIR/materialization-receipt.json"
+
+materialization_receipt_sha=$(sha256_file "$LOCAL_RECEIPT_DIR/materialization-receipt.json")
+mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
+publish_verified_file "feature artifact" "$feature_path" "$feature_publish_path" "$feature_sha"
+publish_verified_file "materialization report" "$materialization_path" "$materialization_publish_path" "$materialization_sha"
+publish_verified_file "replay artifact" "$replay_artifact_path" "$replay_artifact_publish_path" "$replay_artifact_sha"
+publish_verified_file "replay manifest" "$replay_manifest_path" "$replay_manifest_publish_path" "$replay_manifest_sha"
+publish_verified_file "frozen inventory" "$LOCAL_RECEIPT_DIR/frozen-inventory.env" "$RECEIPT_DIR/frozen-inventory.env" "$inventory_sha256"
+publish_verified_file "campaign inputs" "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RECEIPT_DIR/campaign-inputs.json" "$campaign_inputs_sha"
+publish_verified_file "materialization receipt" "$LOCAL_RECEIPT_DIR/materialization-receipt.json" "$RECEIPT_DIR/materialization-receipt.json" "$materialization_receipt_sha"
 
 log "run_id=$run_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha"
