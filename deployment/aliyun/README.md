@@ -1010,7 +1010,7 @@ not Code, CI, Merge, or immutable Release publication. It verifies the candidate
 Spot `SYMBOLS=ALL`, and the exact frozen 100-symbol USD-M production allowlist,
 then creates a fresh spool under
 `/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
-both units with `SEGMENT_SECONDS=120`, waits at most 180 seconds for initial
+both units with `SEGMENT_SECONDS=120`, waits at most 240 seconds for initial
 configured-catalog health, freezes both session IDs and catalog digests, and then uses
 monotonic time to observe at least 240 seconds. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to

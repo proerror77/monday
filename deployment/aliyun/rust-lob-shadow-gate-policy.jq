@@ -9,7 +9,7 @@ and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"
   + $candidate_sha256 + "/" + .run_id)
 and .required_duration_seconds == 240
 and .requested_duration_seconds >= .required_duration_seconds
-and .health_settle_seconds == 180
+and .health_settle_seconds == 240
 and .segment_seconds == 120
 and .test_only == false
 and .passed == true
