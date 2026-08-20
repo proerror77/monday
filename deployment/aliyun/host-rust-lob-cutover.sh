@@ -16,7 +16,7 @@ if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 
-for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sha256sum sleep stat systemctl tr wc; do
+for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sha256sum sleep sort stat systemctl tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
@@ -128,6 +128,7 @@ TRANSITION_STARTED=0
 SUCCESS=0
 OLD_SESSION_SPOT=
 OLD_SESSION_USDM=
+OLD_USDM_MINIMUM_SYMBOLS=400
 CANDIDATE_STARTED_NS=0
 
 fail() {
@@ -161,12 +162,29 @@ require_env_value() {
   [[ $actual == "$expected" ]] || fail "$file has unsafe $key=$actual (expected $expected)"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 validate_production_env() {
-  local file=$1 market=$2 dataset=$3 spool=$4
+  local file=$1 market=$2 dataset=$3 spool=$4 strict=$5 symbols
   require_env_value "$file" MARKET "$market"
   require_env_value "$file" DATASET "$dataset"
   require_env_value "$file" SHARD_ID all
-  require_env_value "$file" SYMBOLS ALL
+  symbols=$(env_value "$file" SYMBOLS) \
+    || fail "$file must contain exactly one SYMBOLS setting"
+  if [[ $market == spot ]]; then
+    [[ $symbols == ALL ]] || fail "$file must set SYMBOLS=ALL"
+  elif [[ $strict == true || $symbols != ALL ]]; then
+    is_usdm_top100 "$symbols" \
+      || fail "$file must set SYMBOLS=ALL or 100 unique explicit symbols"
+  fi
   require_env_value "$file" DEPTH_MODE diff
   require_env_value "$file" SEGMENT_SECONDS 3600
   require_env_value "$file" SPOOL_DIR "$spool"
@@ -185,10 +203,10 @@ validate_deployment() {
 
   validate_production_env \
     "$directory/binance-lob-archiver-production-spot.env" \
-    spot spot_all /data/monday/spool/binance-lob/spot
+    spot spot_all /data/monday/spool/binance-lob/spot "$strict"
   validate_production_env \
     "$directory/binance-lob-archiver-production-usdm.env" \
-    usdm usdm_perpetual_all /data/monday/spool/binance-lob/usdm
+    usdm usdm_perpetual_all /data/monday/spool/binance-lob/usdm "$strict"
 
   if [[ $strict == true ]]; then
     grep -Fxq 'AssertPathIsMountPoint=/data' \
@@ -307,7 +325,7 @@ run_candidate_drain() {
 }
 
 stage_existing_deployment_for_rollback() {
-  local existing=0 asset source installed_source mode source_kind
+  local existing=0 asset source installed_source mode source_kind old_usdm_symbols
   local release_deployment=$OLD_DEPLOYMENT
   local snapshot="$EVIDENCE_DIR/rollback-deployment"
   local manifest="$EVIDENCE_DIR/rollback-deployment.sha256"
@@ -346,6 +364,13 @@ stage_existing_deployment_for_rollback() {
     atomic_install "$mode" "$source" "$snapshot/$asset"
   done
   validate_deployment "$snapshot" false
+  old_usdm_symbols=$(awk -F= '$1 == "SYMBOLS" { print substr($0, 9) }' \
+    "$snapshot/binance-lob-archiver-production-usdm.env")
+  if [[ $old_usdm_symbols == ALL ]]; then
+    OLD_USDM_MINIMUM_SYMBOLS=400
+  else
+    OLD_USDM_MINIMUM_SYMBOLS=100
+  fi
   (
     cd "$snapshot"
     sha256sum "${DEPLOYMENT_ASSETS[@]}"
@@ -411,14 +436,14 @@ runtime_matches_release() {
 
 wait_for_release_health() {
   local binary=$1 old_spot_session=$2 old_usdm_session=$3
-  local minimum_updated_ns=${4:-0} deadline unit
+  local minimum_updated_ns=${4:-0} usdm_minimum_symbols=${5:-400} deadline unit
   deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
   while (( SECONDS < deadline )); do
     for unit in "${PRODUCTION_UNITS[@]}"; do
       systemctl is-active --quiet "$unit" || return 1
     done
     if health_ready_for_release spot 1000 "$old_spot_session" "$minimum_updated_ns" \
-      && health_ready_for_release usdm 400 "$old_usdm_session" "$minimum_updated_ns" \
+      && health_ready_for_release usdm "$usdm_minimum_symbols" "$old_usdm_session" "$minimum_updated_ns" \
       && runtime_matches_release "$binary" false; then
       return 0
     fi
@@ -555,10 +580,12 @@ rollback_after_failure() {
       if systemctl start "${PRODUCTION_UNITS[@]}" \
         && wait_for_release_health \
           "$OLD_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" "$rollback_started_ns" \
+          "$OLD_USDM_MINIMUM_SYMBOLS" \
         && systemctl enable "${PRODUCTION_UNITS[@]}" >/dev/null \
         && runtime_matches_release "$OLD_BINARY" true \
         && health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$rollback_started_ns" \
-        && health_ready_for_release usdm 400 "$OLD_SESSION_USDM" "$rollback_started_ns"; then
+        && health_ready_for_release usdm "$OLD_USDM_MINIMUM_SYMBOLS" \
+          "$OLD_SESSION_USDM" "$rollback_started_ns"; then
         ROLLBACK_RESULT=previous-release-health-verified
         systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null 2>&1 || true
       else
@@ -678,6 +705,11 @@ jq -e \
   --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
   -f "$GATE_POLICY" "$GATE_JSON" >/dev/null \
   || fail 'candidate shadow gate does not meet production thresholds'
+GATE_USDM_SYMBOLS=$(jq -er '.markets.usdm.symbols_config' "$GATE_JSON")
+CANDIDATE_USDM_SYMBOLS=$(env_value \
+  "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env" SYMBOLS)
+[[ $GATE_USDM_SYMBOLS == "$CANDIDATE_USDM_SYMBOLS" ]] \
+  || fail 'candidate shadow gate USD-M symbols differ from the deployment bundle'
 install -d -m 0750 "$EVIDENCE_DIR/shadow-gate"
 install -m 0640 "$GATE_JSON" "$EVIDENCE_DIR/shadow-gate/gate.json"
 install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
@@ -773,8 +805,8 @@ systemctl start "${PRODUCTION_UNITS[@]}"
 
 STEP=verify-candidate-production
 wait_for_release_health \
-  "$CANDIDATE_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
-  || fail 'candidate production did not reach verified full-catalog health'
+  "$CANDIDATE_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" 100 \
+  || fail 'candidate production did not reach verified catalog health'
 copy_health_evidence production
 
 STEP=enable-verified-candidate
@@ -783,7 +815,7 @@ runtime_matches_release "$CANDIDATE_BINARY" true \
   || fail 'candidate runtime identity changed while enabling production'
 health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$CANDIDATE_STARTED_NS" \
   || fail 'Spot health changed while enabling production'
-health_ready_for_release usdm 400 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
+health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
 

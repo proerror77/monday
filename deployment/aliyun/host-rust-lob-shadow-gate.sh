@@ -153,17 +153,26 @@ env_value() {
   printf '%s\n' "$value"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 readonly -a markets=(spot usdm)
 declare -A env_file base_spool_dir spool_dir override_file dataset shard_id
 declare -A oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
-declare -A min_symbols unit expected_stream_types
+declare -A configured_symbols min_symbols unit expected_stream_types
 for market in "${markets[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
   [[ $(env_value "${env_file[$market]}" MARKET) == "$market" ]] \
     || die "${env_file[$market]} has the wrong MARKET"
-  [[ $(env_value "${env_file[$market]}" SYMBOLS) == ALL ]] \
-    || die "${env_file[$market]} must set SYMBOLS=ALL"
+  configured_symbols[$market]=$(env_value "${env_file[$market]}" SYMBOLS)
   shard_id[$market]=$(env_value "${env_file[$market]}" SHARD_ID)
   [[ ${shard_id[$market]} == all ]] || die "${env_file[$market]} must set SHARD_ID=all"
   base_spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
@@ -185,6 +194,10 @@ for market in "${markets[@]}"; do
     || die "${env_file[$market]} must use the ECS RAM-role profile"
   unit[$market]="binance-lob-archiver-rust@${market}.service"
 done
+[[ ${configured_symbols[spot]} == ALL ]] \
+  || die "${env_file[spot]} must set SYMBOLS=ALL"
+is_usdm_top100 "${configured_symbols[usdm]}" \
+  || die "${env_file[usdm]} must set 100 unique explicit symbols"
 
 for asset in \
   binance-lob-archiver-rust@.service \
@@ -200,6 +213,11 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
+candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
+secure_regular_file "$candidate_production_usdm_env"
+[[ $(env_value "$candidate_production_usdm_env" SYMBOLS) \
+  == "${configured_symbols[usdm]}" ]] \
+  || die 'USD-M shadow and production symbol lists differ'
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
@@ -209,7 +227,7 @@ done
 [[ ${dataset[usdm]} == usdm_perpetual_all_rust_shadow ]] \
   || die 'USD-M shadow dataset is not isolated'
 min_symbols[spot]=1000
-min_symbols[usdm]=400
+min_symbols[usdm]=100
 # A v2 tape candidate declares this exact per-symbol stream-type list in its
 # manifest and every session_start row (sorted); forceOrder is USD-M only. A
 # v1 candidate keeps the legacy depth@100ms+aggTrade pair and must not carry
@@ -572,6 +590,7 @@ health_passes() {
   jq -e \
     --arg market "$market" \
     --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson gate_started_ns "$gate_started_ns" \
     '.market == $market
@@ -581,7 +600,11 @@ health_passes() {
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number"
       and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
@@ -621,7 +644,7 @@ while ! health_passes spot || ! health_passes usdm; do
   sleep 10
 done
 
-declare -A observed_session frozen_symbol_count frozen_catalog_sha256
+declare -A observed_session frozen_symbol_count frozen_catalog_sha256 configured_catalog_sha256
 declare -A initial_upload_failure_count last_health_updated_ns health_samples
 declare -A last_health_advance_mono max_health_silence_seconds
 for market in "${markets[@]}"; do
@@ -629,6 +652,13 @@ for market in "${markets[@]}"; do
   observed_session[$market]=$(jq -er '.session_id' "$health")
   frozen_symbol_count[$market]=$(jq -er '.symbol_count' "$health")
   frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market")
+  if [[ $market == usdm ]]; then
+    configured_catalog_sha256[$market]=$(jq -cn \
+      --arg symbols "${configured_symbols[$market]}" \
+      '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
+  else
+    configured_catalog_sha256[$market]=${frozen_catalog_sha256[$market]}
+  fi
   initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "$health")
   last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "$health")
   last_health_advance_mono[$market]=$(monotonic_seconds)
@@ -1190,7 +1220,9 @@ for market in "${markets[@]}"; do
     --arg dataset "${dataset[$market]}" \
     --arg session_id "${observed_session[$market]}" \
     --arg tape_schema "$tape_schema" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --arg catalog_sha256 "${frozen_catalog_sha256[$market]}" \
+    --arg configured_catalog_sha256 "${configured_catalog_sha256[$market]}" \
     --arg health_sha256 "${health_sha256[$market]}" \
     --argjson symbol_count "${symbol_count[$market]}" \
     --argjson snapshot_ready_count "${snapshot_ready_count[$market]}" \
@@ -1209,7 +1241,8 @@ for market in "${markets[@]}"; do
     --argjson oss_round_trips "$round_trips" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session_id,
       tape_schema:$tape_schema,
-      symbols_config:"ALL",catalog_sha256:$catalog_sha256,
+      symbols_config:$symbols_config,catalog_sha256:$catalog_sha256,
+      configured_catalog_sha256:$configured_catalog_sha256,
       symbol_count:$symbol_count,snapshot_ready_count:$snapshot_ready_count,
       stream_coverage_verified_count:$stream_coverage_verified_count,
       all_stream_coverage_verified:($stream_coverage_verified_count == $symbol_count),

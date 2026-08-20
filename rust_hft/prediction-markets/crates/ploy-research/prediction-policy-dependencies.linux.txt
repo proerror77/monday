@@ -1,7 +1,7 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:16f88b8dad22289cedddc3f2d177e9f36db20dbab4da9a8aebab0298ca718069
+input:Cargo.lock=sha256:b0cdff1d582f5810b61d9f6bdf996d43c19e0ea8b252ca482448ef7bf4c4d35c
 input:Cargo.toml=sha256:104f7b7a41e62d573b42da227e6fae379c2cfbe70bccf4b65b921a9c1281048f
 input:crates/ploy-research/Cargo.toml=sha256:cfc1572e1364f0e9712a81b2d7d5e6e786541b080862ee6729199ca4524b5541
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c

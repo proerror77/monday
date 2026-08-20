@@ -100,6 +100,7 @@ sync() {
 
 setup_fixture() {
   local fixture=$1 old_body=$2 candidate_body=$3 now_ns gate_dir
+  local usdm_symbols_config usdm_catalog
   configure_paths "$fixture"
   # Referenced by secure_regular_file in the sourced helper.
   # shellcheck disable=SC2034
@@ -121,12 +122,16 @@ setup_fixture() {
   chmod 0755 "$CANDIDATE_RELEASE/binance-lob-archiver"
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-upload@.service" \
     "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-upload@.service"
+  install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env" \
+    "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env"
   install -m 0644 "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" \
     "$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   install -m 0644 "$SCRIPT_DIR/binance-lob-archiver-production@.service" \
     "$PRODUCTION_SERVICE"
   install -m 0640 "$SCRIPT_DIR/binance-lob-archiver-production-spot.env" "$SPOT_ENV"
-  install -m 0640 "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env" "$USDM_ENV"
+  sed 's/^SYMBOLS=.*/SYMBOLS=ALL/' \
+    "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env" >"$USDM_ENV"
+  chmod 0640 "$USDM_ENV"
   DEPLOYMENT_BUNDLE_SHA256=$(printf 'b%.0s' {1..64})
   DEPLOYMENT_SOURCE_REVISION=$(printf 'c%.0s' {1..40})
   jq -n \
@@ -141,7 +146,9 @@ setup_fixture() {
     '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
       stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
       upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
+      symbols_config:"ALL",
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      configured_catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
       tape_schema:"binance.market_tape.v1",
       agg_trade_segments:2,agg_trade_count:2,
@@ -171,14 +178,23 @@ setup_fixture() {
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
          lob_min_bid_levels:1,lob_min_ask_levels:1}
       ]}')
-  usdm_market=$(jq -c '
-    .symbol_count = 500
-    | .snapshot_ready_count = 500
-    | .bridged_count = 500
-    | .stream_coverage_verified_count = 500
+  usdm_symbols_config=$(sed -n 's/^SYMBOLS=//p' \
+    "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env")
+  usdm_catalog=$(jq -cn --arg symbols "$usdm_symbols_config" \
+    '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
+  usdm_market=$(jq -c \
+    --arg symbols_config "$usdm_symbols_config" \
+    --arg catalog_sha256 "$usdm_catalog" '
+    .symbol_count = 100
+    | .snapshot_ready_count = 100
+    | .bridged_count = 100
+    | .stream_coverage_verified_count = 100
+    | .symbols_config = $symbols_config
+    | .catalog_sha256 = $catalog_sha256
+    | .configured_catalog_sha256 = $catalog_sha256
     | .oss_roundtrip_evidence |= map(
-        .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-        | .stream_coverage_verified_count = 500)' \
+        .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+        | .stream_coverage_verified_count = 100)' \
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \

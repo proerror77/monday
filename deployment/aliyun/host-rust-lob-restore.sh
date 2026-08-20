@@ -162,7 +162,8 @@ wait_for_release_health() {
       systemctl is-active --quiet "$unit" || return 1
     done
     if health_ready_for_release spot 1000 "$old_spot_session" "$minimum_updated_ns" \
-      && health_ready_for_release usdm 400 "$old_usdm_session" "$minimum_updated_ns" \
+      && health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
+        "$old_usdm_session" "$minimum_updated_ns" \
       && runtime_matches_release "$binary" false; then
       return 0
     fi
@@ -346,6 +347,7 @@ restore_release() (
   RESTART_STARTED_NS=0
   OLD_SESSION_SPOT=
   OLD_SESSION_USDM=
+  USDM_MINIMUM_SYMBOLS=400
   trap on_error ERR
   trap on_exit EXIT
 
@@ -417,6 +419,11 @@ restore_release() (
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     -f "$GATE_POLICY" "$GATE_JSON" >/dev/null \
     || fail 'candidate shadow gate does not meet production thresholds'
+  GATE_USDM_SYMBOLS=$(jq -er '.markets.usdm.symbols_config' "$GATE_JSON")
+  CANDIDATE_USDM_SYMBOLS=$(sed -n 's/^SYMBOLS=//p' \
+    "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env")
+  [[ $GATE_USDM_SYMBOLS == "$CANDIDATE_USDM_SYMBOLS" ]] \
+    || fail 'candidate shadow gate USD-M symbols differ from the deployment bundle'
   install -d -m 0750 "$EVIDENCE_DIR/shadow-gate"
   install -m 0640 "$GATE_JSON" "$EVIDENCE_DIR/shadow-gate/gate.json"
   install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
@@ -452,6 +459,10 @@ restore_release() (
     cmp -s -- "$CANDIDATE_DEPLOYMENT/$asset" "$installed_asset" \
       || fail "installed production asset drifted from the gated deployment bundle: $installed_asset"
   done
+  if [[ $(sed -n 's/^SYMBOLS=//p' \
+    "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env") != ALL ]]; then
+    USDM_MINIMUM_SYMBOLS=100
+  fi
   grep -Fxq 'RuntimeMaxSec=21600' "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
     || fail 'installed production unit no longer declares RuntimeMaxSec=21600'
 
@@ -476,7 +487,7 @@ restore_release() (
   STEP=verify-restored-production
   wait_for_release_health \
     "$CANDIDATE_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" \
-    || fail 'restored production did not reach verified full-catalog health'
+    || fail 'restored production did not reach verified catalog health'
   copy_health_evidence production
 
   STEP=enable-restored-production
@@ -485,7 +496,8 @@ restore_release() (
     || fail 'restored runtime identity changed while enabling production'
   health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$RESTART_STARTED_NS" \
     || fail 'Spot health changed while enabling production'
-  health_ready_for_release usdm 400 "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" \
+  health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
+    "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" \
     || fail 'USD-M health changed while enabling production'
 
   STEP=write-recovery-evidence

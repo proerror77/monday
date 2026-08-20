@@ -4,7 +4,10 @@ and .status == "synced"
 and .sequence_gaps == 0
 and (.symbol_count | type) == "number"
 and .symbol_count == (.symbol_count | floor)
-and .symbol_count >= $minimum_symbols
+and (if $expected_market == "usdm" and $minimum_symbols == 100
+  then .symbol_count == 100
+  else .symbol_count >= $minimum_symbols
+  end)
 and (.snapshot_ready_count | type) == "number"
 and .snapshot_ready_count == (.snapshot_ready_count | floor)
 and .snapshot_ready_count == .symbol_count

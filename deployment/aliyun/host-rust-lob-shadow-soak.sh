@@ -275,16 +275,25 @@ env_value() {
   printf '%s\n' "$value"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 evidence_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 declare -A env_file base_spool_dir spool_dir override_file dataset shard_id oss_bucket oss_endpoint oss_region
-declare -A aliyun_profile oss_copy_timeout unit min_symbols expected_stream_types
+declare -A aliyun_profile oss_copy_timeout configured_symbols unit min_symbols expected_stream_types
 for market in "${MARKETS[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
   [[ $(env_value "${env_file[$market]}" MARKET) == "$market" ]] \
     || die "${env_file[$market]} has the wrong MARKET"
-  [[ $(env_value "${env_file[$market]}" SYMBOLS) == ALL ]] \
-    || die "${env_file[$market]} must set SYMBOLS=ALL"
+  configured_symbols[$market]=$(env_value "${env_file[$market]}" SYMBOLS)
   shard_id[$market]=$(env_value "${env_file[$market]}" SHARD_ID)
   [[ ${shard_id[$market]} == all ]] || die "${env_file[$market]} must set SHARD_ID=all"
   base_spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
@@ -308,8 +317,12 @@ for market in "${MARKETS[@]}"; do
     || die "${env_file[$market]} must use the ECS RAM-role profile"
   unit[$market]="binance-lob-archiver-rust@${market}.service"
 done
+[[ ${configured_symbols[spot]} == ALL ]] \
+  || die "${env_file[spot]} must set SYMBOLS=ALL"
+is_usdm_top100 "${configured_symbols[usdm]}" \
+  || die "${env_file[usdm]} must set 100 unique explicit symbols"
 min_symbols[spot]=1000
-min_symbols[usdm]=400
+min_symbols[usdm]=100
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
 expected_stream_types[usdm]='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
 
@@ -534,13 +547,18 @@ health_passes() {
   [[ -f $health && ! -L $health ]] || return 1
   jq -e \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     '.market == $market and .dataset == $dataset
       and .updated_at_ns >= $started_ns and .status == "synced"
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number" and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
@@ -567,6 +585,7 @@ write_health_validation_failure() {
   fi
   jq -c \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     'def check($name; $ok; $actual; $expected):
@@ -582,8 +601,13 @@ write_health_validation_failure() {
        check("symbol_count_type"; (.symbol_count|type) == "number"; .symbol_count; "number"),
        check("symbol_count_integer"; (.symbol_count|type) == "number" and .symbol_count == (.symbol_count|floor);
          .symbol_count; "integer"),
-       check("minimum_symbols"; (.symbol_count|type) == "number" and .symbol_count >= $minimum_symbols;
-         .symbol_count; $minimum_symbols),
+       check("symbol_scope"; (.symbol_count|type) == "number"
+         and (if $market == "usdm" then .symbol_count == $minimum_symbols
+           else .symbol_count >= $minimum_symbols end);
+         .symbol_count; {market:$market,minimum:$minimum_symbols}),
+       check("symbol_membership"; $market != "usdm"
+         or ((.symbols | keys | sort) == ($symbols_config | split(",") | sort));
+         (.symbols | keys | sort); ($symbols_config | split(",") | sort)),
        check("snapshot_ready_count_type"; (.snapshot_ready_count|type) == "number";
          .snapshot_ready_count; "number"),
        check("snapshot_ready_count_integer"; (.snapshot_ready_count|type) == "number" and .snapshot_ready_count == (.snapshot_ready_count|floor);
@@ -702,6 +726,7 @@ health_recovery_safety_passes() {
   [[ -f $health && ! -L $health ]] || return 1
   jq -e \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     '.market == $market and .dataset == $dataset
@@ -709,7 +734,11 @@ health_recovery_safety_passes() {
       and (.status == "syncing" or .status == "reconnecting" or .status == "synced")
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number" and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count >= 0 and .snapshot_ready_count <= .symbol_count

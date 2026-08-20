@@ -36,7 +36,7 @@ jobs:
   image-smoke-selector:
     name: CI job selector
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}

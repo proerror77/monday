@@ -7,6 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
 RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
+SOAK="$SCRIPT_DIR/host-rust-lob-shadow-soak.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
 INVOKE="$SCRIPT_DIR/invoke-rust-lob-operation.sh"
@@ -17,6 +18,8 @@ LOB_ARCHIVER="$SCRIPT_DIR/../../rust_hft/tools/collector/src/lob_archiver.rs"
 ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
+SHADOW_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"
+PRODUCTION_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-production-usdm.env"
 LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$LIB"
@@ -103,6 +106,32 @@ grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
 grep -Fq 'readonly HEALTH_SETTLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
 grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
+shadow_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
+production_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$PRODUCTION_USDM_ENV")
+[[ $shadow_usdm_symbols == "$production_usdm_symbols" ]] || {
+  printf 'shadow and production USD-M symbol lists differ\n' >&2
+  exit 1
+}
+IFS=, read -r -a usdm_symbols <<<"$shadow_usdm_symbols"
+[[ ${#usdm_symbols[@]} -eq 100 ]] || {
+  printf 'USD-M catalog is not exactly 100 symbols\n' >&2
+  exit 1
+}
+[[ $(printf '%s\n' "${usdm_symbols[@]}" | sort -u | wc -l) -eq 100 ]] || {
+  printf 'USD-M catalog contains duplicate symbols\n' >&2
+  exit 1
+}
+cutover_symbol_validator=$(sed -n '/^is_usdm_top100()/,/^}/p' "$CUTOVER")
+eval "$cutover_symbol_validator"
+is_usdm_top100 "$shadow_usdm_symbols"
+if is_usdm_top100 ALL; then
+  printf 'cutover accepted SYMBOLS=ALL as the candidate USD-M scope\n' >&2
+  exit 1
+fi
+grep -Fq 'min_symbols[usdm]=100' "$GATE"
+grep -Fq 'and .markets.usdm.symbol_count == 100' "$POLICY"
+grep -Fq '"$CANDIDATE_STARTED_NS" 100' "$CUTOVER"
+grep -Fq '"$OLD_USDM_MINIMUM_SYMBOLS"' "$CUTOVER"
 grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
 grep -Fq 'install -d -m 0755 -o root -g root' "$GATE"
 grep -Fq '"$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"' "$GATE"
@@ -139,6 +168,11 @@ grep -Fq 'and .bridged_count == .symbol_count' "$GATE"
 grep -Fq 'and .snapshot_only_symbols == []' "$GATE"
 grep -Fq 'and .stream_coverage_verified_count == .symbol_count' "$GATE"
 grep -Fq 'and .all_stream_coverage_verified == true' "$GATE"
+grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$GATE"
+grep -Fq 'then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)' "$SOAK"
+grep -Fq 'configured_catalog_sha256:$configured_catalog_sha256' "$GATE"
+grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$CUTOVER"
+grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle' "$RESTORE"
 grep -Fq 'or (.diff_count == 0' "$GATE"
 grep -Fq 'and .first_update_id == null' "$GATE"
 grep -Fq 'and .last_update_id == null' "$GATE"
@@ -418,13 +452,16 @@ source_revision=$(printf 'c%.0s' {1..40})
 catalog=$(printf 'd%.0s' {1..64})
 gate_run_id=20260820T000000Z-1
 run_spool="/data/monday/spool/binance-lob-rust-shadow/runs/$artifact/$gate_run_id"
+usdm_symbols_config=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
+usdm_catalog=$(jq -cn --arg symbols "$usdm_symbols_config" \
+  '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
 
 market_json=$(jq -cn \
   --arg catalog "$catalog" \
   '{symbol_count:1200,snapshot_ready_count:1200,bridged_count:1200,
     stream_coverage_verified_count:1200,all_stream_coverage_verified:true,sequence_gaps:0,
     upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
-    catalog_sha256:$catalog,
+    symbols_config:"ALL",catalog_sha256:$catalog,configured_catalog_sha256:$catalog,
     session_id:"session-1",oss_roundtrips:2,
     tape_schema:"binance.market_tape.v2",
     stream_types:["aggTrade","bookTicker","depth@100ms","trade"],
@@ -456,16 +493,20 @@ market_json=$(jq -cn \
        lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
        lob_min_bid_levels:1,lob_min_ask_levels:1}
     ]}')
-usdm_market=$(jq -c '
-  .symbol_count = 500
-  | .snapshot_ready_count = 500
-  | .bridged_count = 500
-  | .stream_coverage_verified_count = 500
+usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
+  --arg catalog_sha256 "$usdm_catalog" '
+  .symbol_count = 100
+  | .snapshot_ready_count = 100
+  | .bridged_count = 100
+  | .stream_coverage_verified_count = 100
+  | .symbols_config = $symbols_config
+  | .catalog_sha256 = $catalog_sha256
+  | .configured_catalog_sha256 = $catalog_sha256
   | .stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]
   | .force_order_count = 2
   | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-      | .stream_coverage_verified_count = 500
+      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+      | .stream_coverage_verified_count = 100
       | .force_order_count = 1)' \
   <<<"$market_json")
 jq -n \
@@ -491,6 +532,43 @@ jq -e \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
 
+jq '.markets.usdm.symbol_count = 101
+    | .markets.usdm.snapshot_ready_count = 101
+    | .markets.usdm.bridged_count = 101
+    | .markets.usdm.stream_coverage_verified_count = 101' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-101-symbols.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/usdm-101-symbols.json" >/dev/null; then
+  printf 'gate policy accepted 101 USD-M symbols\n' >&2
+  exit 1
+fi
+
+jq '.markets.usdm.symbols_config = "ALL"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-all-symbols.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/usdm-all-symbols.json" >/dev/null; then
+  printf 'gate policy accepted SYMBOLS=ALL for USD-M\n' >&2
+  exit 1
+fi
+
+jq '.markets.usdm.configured_catalog_sha256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-catalog-mismatch.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/usdm-catalog-mismatch.json" >/dev/null; then
+  printf 'gate policy accepted a USD-M configured/runtime catalog mismatch\n' >&2
+  exit 1
+fi
+
 jq '.run_spool = "/data/monday/spool/binance-lob-rust-shadow/spot"' \
   "$tmp_dir/gate.json" >"$tmp_dir/fixed-spool-gate.json"
 if jq -e \
@@ -510,14 +588,15 @@ v1_market=$(jq -c '
   | .oss_roundtrip_evidence |= map(
       del(.raw_trade_count, .book_ticker_count, .force_order_count))' \
   <<<"$market_json")
-v1_usdm_market=$(jq -c '
-  .symbol_count = 500
-  | .snapshot_ready_count = 500
-  | .bridged_count = 500
-  | .stream_coverage_verified_count = 500
+v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
+  .symbol_count = 100
+  | .snapshot_ready_count = 100
+  | .bridged_count = 100
+  | .stream_coverage_verified_count = 100
+  | .symbols_config = $symbols_config
   | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-      | .stream_coverage_verified_count = 500)' \
+      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+      | .stream_coverage_verified_count = 100)' \
   <<<"$v1_market")
 jq -n \
   --arg artifact "$artifact" \
@@ -856,11 +935,12 @@ jq -n '{market:"spot",dataset:"spot_all",status:"synced",sequence_gaps:0,symbol_
 runtime_policy_accepts() {
   local health=$1 old_session=$2 minimum_updated_ns=$3
   local expected_market=${4:-spot} expected_dataset=${5:-spot_all}
+  local minimum_symbols=${6:-1000}
   jq -e \
     --arg expected_market "$expected_market" \
     --arg expected_dataset "$expected_dataset" \
     --arg old_session "$old_session" \
-    --argjson minimum_symbols 1000 \
+    --argjson minimum_symbols "$minimum_symbols" \
     --argjson minimum_updated_ns "$minimum_updated_ns" \
     -f "$RUNTIME_POLICY" "$health" >/dev/null
 }
@@ -897,6 +977,25 @@ runtime_policy_accepts "$tmp_dir/v1-runtime-coverage.json" old-session 100 || {
   printf 'runtime policy rejected a v1 collector without the full coverage field\n' >&2
   exit 1
 }
+jq '.market = "usdm"
+    | .dataset = "usdm_perpetual_all"
+    | .symbol_count = 100
+    | .snapshot_ready_count = 100
+    | .bridged_count = 100
+    | .stream_coverage_verified_count = 100' \
+  "$tmp_dir/runtime-health.json" >"$tmp_dir/usdm-runtime-health.json"
+runtime_policy_accepts "$tmp_dir/usdm-runtime-health.json" old-session 100 \
+  usdm usdm_perpetual_all 100
+jq '.symbol_count = 101
+    | .snapshot_ready_count = 101
+    | .bridged_count = 101
+    | .stream_coverage_verified_count = 101' \
+  "$tmp_dir/usdm-runtime-health.json" >"$tmp_dir/usdm-101-runtime-health.json"
+if runtime_policy_accepts "$tmp_dir/usdm-101-runtime-health.json" old-session 100 \
+  usdm usdm_perpetual_all 100; then
+  printf 'runtime policy accepted 101 USD-M symbols\n' >&2
+  exit 1
+fi
 for field in symbol_count snapshot_ready_count bridged_count stream_coverage_verified_count; do
   jq --arg field "$field" '.[$field] = "1200"' \
     "$tmp_dir/runtime-health.json" >"$tmp_dir/quoted-count.json"

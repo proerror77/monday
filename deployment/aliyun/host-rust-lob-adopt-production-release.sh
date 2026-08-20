@@ -84,8 +84,18 @@ require_env_value() {
     || die "$file has unsafe $key=$actual (expected $expected)"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 validate_production_assets() {
-  local file market dataset spool
+  local file market dataset spool symbols
   require_secure_file "$PRODUCTION_SERVICE"
   require_line "$PRODUCTION_SERVICE" 'AssertPathIsMountPoint=/data'
   require_line "$PRODUCTION_SERVICE" \
@@ -105,7 +115,14 @@ validate_production_assets() {
     require_env_value "$file" MARKET "$market"
     require_env_value "$file" DATASET "$dataset"
     require_env_value "$file" SHARD_ID all
-    require_env_value "$file" SYMBOLS ALL
+    symbols=$(env_value "$file" SYMBOLS) \
+      || die "$file must contain exactly one SYMBOLS setting"
+    if [[ $market == spot ]]; then
+      [[ $symbols == ALL ]] || die "$file must set SYMBOLS=ALL"
+    elif [[ $symbols != ALL ]]; then
+      is_usdm_top100 "$symbols" \
+        || die "$file must set SYMBOLS=ALL or 100 unique explicit symbols"
+    fi
     require_env_value "$file" DEPTH_MODE diff
     require_env_value "$file" SEGMENT_SECONDS 3600
     require_env_value "$file" SPOOL_DIR "$spool"
@@ -170,7 +187,14 @@ capture_health_state() {
   local market=$1 expected_dataset minimum_symbols file state updated_at_ns now_ns
   case "$market" in
     spot) expected_dataset=spot_all; minimum_symbols=1000 ;;
-    usdm) expected_dataset=usdm_perpetual_all; minimum_symbols=400 ;;
+    usdm)
+      expected_dataset=usdm_perpetual_all
+      if [[ $(env_value "$USDM_ENV" SYMBOLS) == ALL ]]; then
+        minimum_symbols=400
+      else
+        minimum_symbols=100
+      fi
+      ;;
     *) return 1 ;;
   esac
   file="$DATA_ROOT/monday/spool/binance-lob/$market/health.json"
@@ -183,7 +207,9 @@ capture_health_state() {
       | select(.status == "synced")
       | select(.updated_at_ns | type == "number" and floor == . and . > 0)
       | select(.session_id | type == "string" and length > 0)
-      | select(.symbol_count | type == "number" and floor == . and . >= $minimum_symbols)
+      | select(.symbol_count | type == "number" and floor == .
+          and (if $market == "usdm" and $minimum_symbols == 100
+            then . == 100 else . >= $minimum_symbols end))
       | select(.snapshot_ready_count == .symbol_count)
       | select(.sequence_gaps | type == "number" and floor == . and . >= 0)
       | select(.pending_upload_segments == 0)
@@ -234,12 +260,13 @@ atomic_install() {
 }
 
 verify_candidate_release() {
-  local markers marker marker_entry gate_dir gate_json gate_policy
+  local markers marker marker_entry gate_dir gate_json gate_policy candidate_usdm_env
   CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
   CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
   CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
   CANDIDATE_METADATA="$CANDIDATE_RELEASE/release.json"
   CANDIDATE_UPLOAD="$CANDIDATE_DEPLOYMENT/binance-lob-archiver-upload@.service"
+  candidate_usdm_env="$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env"
   gate_policy="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   for path in "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
     secure_direct_directory "$path" \
@@ -252,6 +279,7 @@ verify_candidate_release() {
     || die 'candidate binary digest does not match its release path'
   require_secure_file "$CANDIDATE_METADATA"
   require_secure_file "$CANDIDATE_UPLOAD"
+  require_secure_file "$candidate_usdm_env"
   require_secure_file "$gate_policy"
   require_line "$CANDIDATE_UPLOAD" 'AssertPathIsMountPoint=/data'
   require_line "$CANDIDATE_UPLOAD" \
@@ -303,6 +331,9 @@ verify_candidate_release() {
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     -f "$gate_policy" "$gate_json" >/dev/null \
     || die 'candidate gate is not production eligible'
+  [[ $(jq -er '.markets.usdm.symbols_config' "$gate_json") \
+    == "$(env_value "$candidate_usdm_env" SYMBOLS)" ]] \
+    || die 'candidate gate USD-M symbols differ from the candidate production scope'
 }
 
 validate_existing_adoption() {
@@ -672,7 +703,7 @@ main() {
     exit 2
   fi
   for command in awk chmod cmp date find flock grep id install jq ln mkdir mktemp mountpoint \
-    mv readlink rm sha256sum stat sync systemctl tr wc; do
+    mv readlink rm sha256sum sort stat sync systemctl tr wc; do
     command -v "$command" >/dev/null 2>&1 \
       || { printf 'missing required command: %s\n' "$command" >&2; exit 2; }
   done
