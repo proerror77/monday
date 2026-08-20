@@ -588,7 +588,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         &receipt.replay_manifest.object_url,
     )?;
     let campaign_root = canonical_tokyo_oss_internal_object("campaign root", &args.campaign_root)?;
-    let image_identity = image_identity_from_ref(&receipt.image_ref)?;
+    let image_identity = image_identity_from_ref(&args.image)?;
     let feature_path = args.input_root.join(&receipt.feature.relative_path);
     let materialization_path = args.input_root.join(&receipt.materialization.relative_path);
     let replay_artifact_path = args.input_root.join(&receipt.replay_artifact.relative_path);
@@ -661,9 +661,6 @@ fn validate_campaign_inputs_receipt(receipt: &CampaignInputsReceipt) -> anyhow::
         bail!("campaign inputs receipt schema_version must be {CAMPAIGN_INPUTS_SCHEMA_V1}");
     }
     validate_receipt_identifier("campaign inputs run_id", &receipt.run_id)?;
-    if receipt.source_revision != BUILD_SOURCE_REVISION {
-        bail!("campaign inputs receipt source_revision does not match this build");
-    }
     if !valid_git_revision(&receipt.source_revision) {
         bail!("campaign inputs receipt source_revision must be an exact git revision");
     }
@@ -1871,6 +1868,9 @@ mod tests {
     fn freeze_from_receipt_derives_identity_and_plan() {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
+        let producer_revision = "b".repeat(40);
+        let producer_image_ref = format!("registry/research-runner@sha256:{}", "1".repeat(64));
+        let executor_image_ref = format!("registry/research-runner@sha256:{}", "2".repeat(64));
         let fixture = campaign_e2e_fixture("campaign-freeze", false, false);
         let root = tempfile::tempdir().unwrap();
         let input_root = root.path().join("remounted-run");
@@ -1903,8 +1903,8 @@ mod tests {
         let receipt = CampaignInputsReceipt {
             schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.to_string(),
             run_id: "20260819t000000z-1".to_string(),
-            source_revision: BUILD_SOURCE_REVISION.to_string(),
-            image_ref: format!("registry/research-runner@sha256:{}", "1".repeat(64)),
+            source_revision: producer_revision.clone(),
+            image_ref: producer_image_ref.clone(),
             mission_id: "campaign-inputs-test".to_string(),
             market: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -1947,7 +1947,8 @@ mod tests {
 
         freeze(CampaignFreezeArgs {
             campaign_inputs: receipt_path.clone(),
-            input_root,
+            input_root: input_root.clone(),
+            image: executor_image_ref.clone(),
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             output: output.clone(),
@@ -1955,17 +1956,42 @@ mod tests {
         .unwrap();
 
         let (receipt_again, receipt_sha256) = load_campaign_inputs_receipt(&receipt_path).unwrap();
-        assert_eq!(receipt_again.source_revision, BUILD_SOURCE_REVISION);
+        assert_eq!(receipt_again.source_revision, producer_revision);
+        assert_eq!(receipt_again.image_ref, producer_image_ref);
         let frozen = load_freeze_plan(&output).unwrap();
         assert_eq!(frozen.campaign_inputs_sha256, receipt_sha256);
         assert_eq!(
+            frozen.canonical_request.build_source_revision,
+            BUILD_SOURCE_REVISION
+        );
+        assert_eq!(
             frozen.canonical_request.image_identity,
-            image_identity_from_ref(&receipt.image_ref).unwrap()
+            image_identity_from_ref(&executor_image_ref).unwrap()
         );
         assert_eq!(
             frozen.signing_plan,
             signing_plan(&frozen.canonical_request).unwrap()
         );
+
+        let mut invalid_producer = receipt.clone();
+        invalid_producer.source_revision = "not-a-git-sha".to_string();
+        assert!(validate_campaign_inputs_receipt(&invalid_producer)
+            .unwrap_err()
+            .to_string()
+            .contains("source_revision must be an exact git revision"));
+
+        let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root,
+            image: "registry/research-runner:latest".to_string(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: root.path().join("invalid-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(invalid_executor
+            .to_string()
+            .contains("campaign image_ref must be pinned by @sha256 digest"));
 
         let mut sibling = receipt.clone();
         sibling.feature.object_url =
