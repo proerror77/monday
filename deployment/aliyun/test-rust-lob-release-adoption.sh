@@ -172,13 +172,13 @@ setup_fixture() {
          lob_min_bid_levels:1,lob_min_ask_levels:1}
       ]}')
   usdm_market=$(jq -c '
-    .symbol_count = 500
-    | .snapshot_ready_count = 500
-    | .bridged_count = 500
-    | .stream_coverage_verified_count = 500
+    .symbol_count = 100
+    | .snapshot_ready_count = 100
+    | .bridged_count = 100
+    | .stream_coverage_verified_count = 100
     | .oss_roundtrip_evidence |= map(
-        .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-        | .stream_coverage_verified_count = 500)' \
+        .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+        | .stream_coverage_verified_count = 100)' \
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \

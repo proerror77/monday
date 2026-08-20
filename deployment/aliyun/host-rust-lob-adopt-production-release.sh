@@ -84,8 +84,18 @@ require_env_value() {
     || die "$file has unsafe $key=$actual (expected $expected)"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 validate_production_assets() {
-  local file market dataset spool
+  local file market dataset spool symbols
   require_secure_file "$PRODUCTION_SERVICE"
   require_line "$PRODUCTION_SERVICE" 'AssertPathIsMountPoint=/data'
   require_line "$PRODUCTION_SERVICE" \
@@ -105,7 +115,14 @@ validate_production_assets() {
     require_env_value "$file" MARKET "$market"
     require_env_value "$file" DATASET "$dataset"
     require_env_value "$file" SHARD_ID all
-    require_env_value "$file" SYMBOLS ALL
+    symbols=$(env_value "$file" SYMBOLS) \
+      || die "$file must contain exactly one SYMBOLS setting"
+    if [[ $market == spot ]]; then
+      [[ $symbols == ALL ]] || die "$file must set SYMBOLS=ALL"
+    elif [[ $symbols != ALL ]]; then
+      is_usdm_top100 "$symbols" \
+        || die "$file must set SYMBOLS=ALL or 100 unique explicit symbols"
+    fi
     require_env_value "$file" DEPTH_MODE diff
     require_env_value "$file" SEGMENT_SECONDS 3600
     require_env_value "$file" SPOOL_DIR "$spool"
@@ -170,7 +187,14 @@ capture_health_state() {
   local market=$1 expected_dataset minimum_symbols file state updated_at_ns now_ns
   case "$market" in
     spot) expected_dataset=spot_all; minimum_symbols=1000 ;;
-    usdm) expected_dataset=usdm_perpetual_all; minimum_symbols=400 ;;
+    usdm)
+      expected_dataset=usdm_perpetual_all
+      if [[ $(env_value "$USDM_ENV" SYMBOLS) == ALL ]]; then
+        minimum_symbols=400
+      else
+        minimum_symbols=100
+      fi
+      ;;
     *) return 1 ;;
   esac
   file="$DATA_ROOT/monday/spool/binance-lob/$market/health.json"
@@ -672,7 +696,7 @@ main() {
     exit 2
   fi
   for command in awk chmod cmp date find flock grep id install jq ln mkdir mktemp mountpoint \
-    mv readlink rm sha256sum stat sync systemctl tr wc; do
+    mv readlink rm sha256sum sort stat sync systemctl tr wc; do
     command -v "$command" >/dev/null 2>&1 \
       || { printf 'missing required command: %s\n' "$command" >&2; exit 2; }
   done
