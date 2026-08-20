@@ -817,7 +817,7 @@ pub fn write_success_marker(data: &Path, digest: &str) -> anyhow::Result<PathBuf
 /// Upper bound for one recovered tape row. Rows are venue JSON frames
 /// (kilobytes at most); anything larger is corruption, and an unterminated
 /// multi-GB tail must not be buffered whole by `read_until`.
-const MAX_RECOVERY_ROW_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RECOVERY_ROW_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifacts>> {
     let mut artifacts = Vec::new();
@@ -907,6 +907,15 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                 }
             };
             if !event_type_allowed(&row_schema.1, event_type) {
+                quarantine = true;
+                break;
+            }
+            if row_schema.0
+                && event
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
                 quarantine = true;
                 break;
             }
@@ -2104,6 +2113,12 @@ mod tests {
                 "unknown",
                 vec![
                     json!({"schema":"binance.market_tape.v999","received_at_ns":start_ns,"type":"diff"}),
+                ],
+            ),
+            (
+                "missing_session",
+                vec![
+                    json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"book_ticker","frame":{}}),
                 ],
             ),
             (

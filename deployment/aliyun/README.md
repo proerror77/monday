@@ -1089,9 +1089,21 @@ Python instance units must be inactive and disabled before the transition; they
 are included in the transition mask so they cannot become a second canonical
 writer.
 
-The drain is bootstrap-safe: it runs the digest-pinned target binary directly
-against the canonical production env, so the first upgrade does not depend on
-the old production binary supporting `--upload-only`. A new host is accepted
+The drain is bootstrap-safe: it runs the digest-pinned target binary against
+the previous production env. If that spool contains `.jsonl.part` files, the
+candidate takes the per-spool writer lock and preserves root-owned, read-only,
+hash-verified copies plus a source-metadata receipt under the cutover evidence
+directory before changing any part. It derives the exact catalog from archived
+stream-coverage evidence; the previous production env supplies market, dataset,
+and shard identity. After the backup is durable, it drops to the collector owner
+recorded on the spool lock before changing or finalizing any segment. It then
+performs streaming `--recover-parts-only` and runs
+`--upload-only` with bounded OSS readback. Recovery never performs live symbol
+discovery and does not depend on the old production binary supporting either
+command. A recovered manifest deliberately preserves its fail-closed replay and
+readiness evidence; successful OSS triplet upload is not a data-quality verdict,
+so cutover readback reports the recovered manifest's gaps and readiness as-is.
+A new host is accepted
 only when the canonical spool contains no segment artifact. The script then
 atomically changes the production symlink and starts both services without
 enabling them. It verifies fresh configured-catalog health, no warnings, zero restarts,
