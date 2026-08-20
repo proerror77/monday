@@ -593,12 +593,27 @@ still fresh and fail-closed clean, and the journal since the last verified
 identity shows the failed main process plus systemd's automatic
 `Scheduled restart job` record for the new restart counter with no operator
 `Stopping` record — an operator `systemctl restart` never schedules a restart
-job, so manual intervention still fails closed. At most three such supervised
+job, so manual intervention still fails closed. Conditions that observe the
+crash→restart transition are resampled within bounded budgets instead of being
+trusted from one sample: the ActiveState/MainPID pair is repolled until the
+unit settles to active with a main PID (30 seconds, well past `RestartSec=5`),
+so a transient `failed`/`inactive` sample between the exit and the
+auto-restart is not mistaken for a terminal state, and the journal evidence is
+reread after each `journalctl --sync` for up to 30 seconds so crash and
+`Scheduled restart job` records that are not yet visible are awaited rather
+than rejected. A condition that is still unmet when its budget expires fails
+closed, and every rejection names the exact failed condition with its observed
+and expected values in the Gate log. At most three such supervised
 crash restarts may be adjudicated per Gate; beyond that bound, or on any other
 identity change, the Gate fails closed. Every adjudicated transition is recorded
 in the gate evidence under `baseline_crash_restarts`. After the baseline
 writer is stopped, cutover explicitly resets the inherited counter and requires the
 new Rust process to remain at zero for post-start verification.
+During the observation window a baseline health sample whose only violation is
+a non-empty `api_errors` (for example a per-market HTTP 429 that clears next
+cycle) is tolerated for one health-freshness budget (240 seconds) for any
+baseline mode; a baseline that keeps erroring past the budget, or violates any
+other health field even within it, still fails closed.
 PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
 also freezes each unit's systemd `InvocationID`. Immediately before stopping the
 shadow or baseline writer, the control captures a synced journal cursor; after the

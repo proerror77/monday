@@ -2027,6 +2027,7 @@ exercise_rust_bootstrap_identity
 # restart thrash — still fails closed.
 crash_restart_contract="$tmp_dir/baseline-crash-restart.sh"
 sed -n \
+  -e '/^crash_restart_reject() {$/,/^}$/p' \
   -e '/^baseline_crash_restart_journal_evidence() {$/,/^}$/p' \
   -e '/^adjudicate_baseline_crash_restart() {$/,/^}$/p' \
   "$GATE" >"$crash_restart_contract"
@@ -2056,7 +2057,17 @@ crash_restart_mocks() {
     if [[ $* == --sync ]]; then
       return 0
     fi
-    case "$mock_journal" in
+    local journal_case=$mock_journal
+    if [[ $journal_case == delayed ]]; then
+      # SECONDS is advanced by the sleep mock in the parent shell, so a
+      # visibility threshold survives the pipeline subshell journalctl runs in.
+      if ((SECONDS < mock_journal_visible_at)); then
+        journal_case=silent
+      else
+        journal_case=crash
+      fi
+    fi
+    case "$journal_case" in
       crash)
         printf '%s\n' \
           '{"MESSAGE":"polymarket-reference-collector.service: Main process exited, code=exited, status=1/FAILURE"}' \
@@ -2088,7 +2099,9 @@ crash_restart_mocks() {
   verify_fresh_baseline_health() { [[ $mock_health == true ]]; }
   sleep() {
     SECONDS=$((SECONDS + $1))
-    if [[ $mock_settle == true ]]; then
+    # Only a unit sampled inside the restart gap (MainPID 0) comes up during a
+    # sleep; an already-running process is not replaced by waiting.
+    if [[ $mock_settle == true && $mock_main_pid == 0 ]]; then
       mock_state=active
       mock_main_pid=4343
     fi
@@ -2102,7 +2115,8 @@ exercise_baseline_crash_restart_adjudication() (
   LEGACY_SPOOL="$tmp_dir/crash-restart-spool"
   RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
   MAX_BASELINE_CRASH_RESTARTS=3
-  BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
+  BASELINE_CRASH_RESTART_SETTLE_SECONDS=30
+  BASELINE_CRASH_RESTART_JOURNAL_SECONDS=30
   mkdir -p "$LEGACY_SPOOL"
   new_invocation_one=$(printf 'b%.0s' {1..32})
   new_invocation_two=$(printf 'c%.0s' {1..32})
@@ -2117,7 +2131,7 @@ exercise_baseline_crash_restart_adjudication() (
     mock_invocation=$new_invocation_one
     mock_fragment=$LEGACY_FRAGMENT mock_drop_ins=
     mock_exec=$RUST_PRODUCTION_EXEC mock_cmdline="$RUST_PRODUCTION_EXEC "
-    mock_journal=crash mock_health=true mock_settle=true
+    mock_journal=crash mock_journal_visible_at=0 mock_health=true mock_settle=true
     SECONDS=100
   }
   crash_restart_mocks
@@ -2170,6 +2184,81 @@ exercise_baseline_crash_restart_adjudication() (
     printf 'accepted a baseline stuck inside the restart gap\n' >&2
     exit 1
   fi
+  # A transient failed/inactive sample between the exit and the auto-restart
+  # is resampled, not rejected: the unit settles and adjudication proceeds.
+  for transient_state in failed inactive deactivating; do
+    reset_crash_scenario
+    mock_state=$transient_state mock_main_pid=0
+    adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+      printf 'rejected a crash restart sampled in transient state %s\n' \
+        "$transient_state" >&2
+      exit 1
+    }
+  done
+  # A unit that never leaves the failed state fails closed once the settle
+  # budget expires, and the rejection names the unmet condition.
+  reset_crash_scenario
+  mock_state=failed mock_main_pid=0 mock_settle=false
+  if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" \
+    2>"$tmp_dir/settle-reject.log"; then
+    printf 'accepted a baseline stuck in the failed state\n' >&2
+    exit 1
+  fi
+  grep -Fq 'did not settle to active with a main PID' \
+    "$tmp_dir/settle-reject.log" || {
+    printf 'settle rejection did not name the unmet condition\n' >&2
+    exit 1
+  }
+  grep -Fq 'observed ActiveState=failed MainPID=0' \
+    "$tmp_dir/settle-reject.log" || {
+    printf 'settle rejection did not report the observed state\n' >&2
+    exit 1
+  }
+  # Journal records that become visible only after the first read are
+  # resampled within the bounded journal budget instead of rejected.
+  reset_crash_scenario
+  mock_journal=delayed mock_journal_visible_at=$((SECONDS + 4))
+  adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" || {
+    printf 'rejected a crash restart whose journal records lagged\n' >&2
+    exit 1
+  }
+  # A permanently missing journal record fails closed after the budget and
+  # the diagnosis reports exactly which condition was unmet.
+  reset_crash_scenario
+  mock_journal=silent
+  if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" \
+    2>"$tmp_dir/journal-reject.log"; then
+    printf 'accepted a crash restart without journal evidence\n' >&2
+    exit 1
+  fi
+  grep -Fq 'main_process_exit_record=false' "$tmp_dir/journal-reject.log" || {
+    printf 'journal rejection did not name the missing exit record\n' >&2
+    exit 1
+  }
+  reset_crash_scenario
+  mock_journal=manual
+  if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" \
+    2>"$tmp_dir/manual-reject.log"; then
+    printf 'accepted an operator-restarted baseline\n' >&2
+    exit 1
+  fi
+  grep -Fq 'operator_stopping_record=true' "$tmp_dir/manual-reject.log" || {
+    printf 'operator-restart rejection did not name the Stopping record\n' >&2
+    exit 1
+  }
+  # An identity rejection names the changed condition and both values.
+  reset_crash_scenario
+  mock_exec="$RUST_PRODUCTION_EXEC --once"
+  if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC" \
+    2>"$tmp_dir/exec-reject.log"; then
+    printf 'accepted a changed effective ExecStart\n' >&2
+    exit 1
+  fi
+  grep -Fq "effective ExecStart changed (observed '$RUST_PRODUCTION_EXEC --once', expected '$RUST_PRODUCTION_EXEC')" \
+    "$tmp_dir/exec-reject.log" || {
+    printf 'ExecStart rejection did not report observed and expected values\n' >&2
+    exit 1
+  }
   # A signal-killed main process is a supervised crash as well.
   reset_crash_scenario
   mock_journal=signal
@@ -2195,7 +2284,7 @@ exercise_baseline_crash_restart_adjudication() (
       journal_manual) mock_journal=manual ;;
       journal_silent) mock_journal=silent ;;
       health_stale) mock_health=false ;;
-      unit_failed) mock_state=failed ;;
+      unit_failed) mock_state=failed mock_main_pid=0 mock_settle=false ;;
     esac
     if adjudicate_baseline_crash_restart "$RUST_PRODUCTION_EXEC"; then
       printf 'crash-restart adjudication accepted %s\n' "$failure" >&2
@@ -2228,7 +2317,8 @@ exercise_crash_restart_baseline_identity() (
   RUST_ACTIVE_BINARY="$tmp_dir/crash-active"
   RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference --max-trade-polls-per-cycle 200'
   MAX_BASELINE_CRASH_RESTARTS=3
-  BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
+  BASELINE_CRASH_RESTART_SETTLE_SECONDS=30
+  BASELINE_CRASH_RESTART_JOURNAL_SECONDS=30
   baseline_crash_restarts=0
   baseline_crash_restart_evidence='[]'
   legacy_journal_cursor=cursor-0
@@ -5945,12 +6035,18 @@ grep -Fq \
   "$tmp_dir/legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) == clean ]]
 jq '.api_errors = ["trades condition-1: The read operation timed out"]' \
   "$tmp_dir/legacy-health.json" >"$tmp_dir/transient-legacy-health.json"
+# A transient api_errors cycle (e.g. a bounded HTTP 429) is budget-tolerated
+# for every baseline mode; the recovery budget bounds it, and any non
+# api_errors policy violation stays fatal even inside the budget.
 [[ $(legacy_health_sample_state \
   "$tmp_dir/transient-legacy-health.json" "$LEGACY_HEALTH_POLICY" legacy_python) \
   == transient_api_error ]]
 [[ $(legacy_health_sample_state \
   "$tmp_dir/transient-legacy-health.json" "$LEGACY_HEALTH_POLICY" rust_release) \
-  == fatal ]]
+  == transient_api_error ]]
+[[ $(legacy_health_sample_state \
+  "$tmp_dir/transient-legacy-health.json" "$LEGACY_HEALTH_POLICY" rust_bootstrap) \
+  == transient_api_error ]]
 jq '.malformed_trade_rows = 1' "$tmp_dir/transient-legacy-health.json" \
   >"$tmp_dir/fatal-legacy-health.json"
 [[ $(legacy_health_sample_state \
