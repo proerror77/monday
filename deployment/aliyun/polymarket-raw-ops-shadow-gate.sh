@@ -45,10 +45,15 @@ readonly PARITY_CUTOFF_LAG_SECONDS=60
 # adjudicate_baseline_crash_restart. At most this many baseline restarts may
 # be re-admitted per Gate; beyond the bound the Gate fails closed against
 # restart thrash. The settle window outlasts the baseline unit's RestartSec=5
-# so an observation sample that lands inside the supervised restart gap sees
-# the restarted process, never a transient empty MainPID.
+# with generous slack, so an observation sample that lands inside the
+# supervised restart gap — or on a transient failed/inactive state between
+# the exit and the auto-restart — is resampled instead of rejected, and only
+# a state that persists past the budget fails closed. The journal window
+# similarly bounds how long the adjudication waits for the crash and
+# "Scheduled restart job" records to become visible after `journalctl --sync`.
 readonly MAX_BASELINE_CRASH_RESTARTS=3
-readonly BASELINE_CRASH_RESTART_SETTLE_SECONDS=15
+readonly BASELINE_CRASH_RESTART_SETTLE_SECONDS=30
+readonly BASELINE_CRASH_RESTART_JOURNAL_SECONDS=30
 # Mirrors TAPE_WINDOW_LOOKBACK_SECONDS in the parity verifier
 # (rust_hft/tools/collector/src/polymarket_parity.rs): the verifier reads
 # baseline tapes rotated within one hour before the parity window.
@@ -492,61 +497,130 @@ legacy_runtime_budget_observation() {
 #      restart job, so manual intervention still fails closed.
 # A swapped binary, a changed command line, or a replaced unit never
 # satisfies the hard conditions, so real tampering keeps failing closed.
-baseline_crash_restart_journal_evidence() {
-  local cursor=$1 restarts=$2
-  journalctl --sync || return 1
-  journalctl --unit "$LEGACY_UNIT" --after-cursor "$cursor" --output=json \
-    --no-pager \
-    | jq -s -e --argjson restarts "$restarts" '
-      def msg: .MESSAGE // "";
-      all(.[]; (msg | test("^Stopping ")) | not)
-      and any(.[]; msg
-        | (test("Main process exited, code=exited, status=[1-9][0-9]*/FAILURE")
-          or test("Main process exited, code=killed, signal=")))
-      and any(.[]; msg
-        | test("Scheduled restart job, restart counter is at "
-            + ($restarts | tostring) + "\\."))
-    ' >/dev/null
+# Every rejection inside crash-restart adjudication names the failed condition
+# with the observed and expected values: the conditions share one fail-closed
+# exit, so without per-condition diagnostics a false rejection is
+# indistinguishable from a real one in the Gate log (fourth production Gate,
+# invocation 88847f74).
+crash_restart_reject() {
+  printf 'baseline crash-restart adjudication rejected: %s\n' "$1" >&2
+  return 1
 }
 
+# The crash exit record and systemd's "Scheduled restart job" record are
+# written during the transition window the adjudication samples, so a single
+# --after-cursor read can run ahead of their visibility even after
+# `journalctl --sync`. Resample within a bounded budget; records that never
+# appear — or an operator Stopping record that does — still fail closed, with
+# the exact unmet condition in the Gate log.
+baseline_crash_restart_journal_evidence() {
+  local cursor=$1 restarts=$2 deadline diagnosis
+  deadline=$((SECONDS + BASELINE_CRASH_RESTART_JOURNAL_SECONDS))
+  while :; do
+    journalctl --sync || return 1
+    if journalctl --unit "$LEGACY_UNIT" --after-cursor "$cursor" --output=json \
+      --no-pager \
+      | jq -s -e --argjson restarts "$restarts" '
+        def msg: .MESSAGE // "";
+        all(.[]; (msg | test("^Stopping ")) | not)
+        and any(.[]; msg
+          | (test("Main process exited, code=exited, status=[1-9][0-9]*/FAILURE")
+            or test("Main process exited, code=killed, signal=")))
+        and any(.[]; msg
+          | test("Scheduled restart job, restart counter is at "
+              + ($restarts | tostring) + "\\."))
+      ' >/dev/null; then
+      return 0
+    fi
+    if ((SECONDS >= deadline)); then
+      diagnosis=$(journalctl --unit "$LEGACY_UNIT" --after-cursor "$cursor" \
+        --output=json --no-pager \
+        | jq -s -r --argjson restarts "$restarts" '
+          def msg: .MESSAGE // "";
+          "operator_stopping_record="
+          + (any(.[]; msg | test("^Stopping ")) | tostring)
+          + " main_process_exit_record="
+          + (any(.[]; msg
+            | test("Main process exited, code=exited, status=[1-9][0-9]*/FAILURE")
+              or test("Main process exited, code=killed, signal=")) | tostring)
+          + " scheduled_restart_record_counter_" + ($restarts | tostring) + "="
+          + (any(.[]; msg
+            | test("Scheduled restart job, restart counter is at "
+                + ($restarts | tostring) + "\\.")) | tostring)
+        ' 2>/dev/null) || diagnosis='journal unreadable during diagnosis'
+      crash_restart_reject "journal evidence within ${BASELINE_CRASH_RESTART_JOURNAL_SECONDS}s showed no supervised crash restart ($diagnosis)"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# A swapped binary, a changed command line, or a replaced unit never
+# satisfies the hard conditions, so real tampering keeps failing closed.
+# Conditions that observe the crash→restart transition (ActiveState/MainPID
+# sampling, journal record visibility) are resampled within bounded budgets —
+# a transient sample is not evidence — while every rejection names the exact
+# failed condition with its observed and expected values.
 adjudicate_baseline_crash_restart() {
   local expected_exec=$1 state pid restarts invocation_id deadline
-  # Outlast the unit's RestartSec so a sample inside the supervised restart
-  # gap sees the settled process instead of a transient empty MainPID.
+  local fragment drop_ins exec_argv cmdline
+  # Outlast the unit's RestartSec plus sampling slack: a sample inside the
+  # supervised restart gap can catch a transient ActiveState (failed,
+  # inactive, or deactivating between the exit and the auto-restart) or an
+  # empty MainPID, none of which is evidence against adjudication. Only a
+  # unit that still has not settled to active with a main PID when the budget
+  # expires fails closed.
   deadline=$((SECONDS + BASELINE_CRASH_RESTART_SETTLE_SECONDS))
   while :; do
-    state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT") \
-      || return 1
-    [[ $state == active || $state == activating ]] || return 1
-    pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT") || return 1
+    state=$(systemctl show --property=ActiveState --value "$LEGACY_UNIT" \
+      2>/dev/null)
+    pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT" 2>/dev/null)
     if [[ $state == active && $pid =~ ^[1-9][0-9]*$ ]]; then
       break
     fi
-    ((SECONDS < deadline)) || return 1
-    sleep 1
+    if ((SECONDS >= deadline)); then
+      crash_restart_reject "unit did not settle to active with a main PID within ${BASELINE_CRASH_RESTART_SETTLE_SECONDS}s (observed ActiveState=${state:-unavailable} MainPID=${pid:-unavailable}, expected active with MainPID > 0)"
+      return 1
+    fi
+    sleep 2
   done
   # Hard software identity: fragment, drop-ins, effective ExecStart, and the
   # live command line must match the pinned baseline exactly.
-  [[ $(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") \
-    == "$LEGACY_FRAGMENT" ]] || return 1
-  [[ -z $(systemctl show --property=DropInPaths --value "$LEGACY_UNIT") ]] \
-    || return 1
-  [[ $(effective_exec_argv "$LEGACY_UNIT") == "$expected_exec" ]] || return 1
-  [[ $(proc_cmdline "$pid") == "$expected_exec " ]] || return 1
+  fragment=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") \
+    || { crash_restart_reject 'could not read the unit FragmentPath'; return 1; }
+  [[ $fragment == "$LEGACY_FRAGMENT" ]] \
+    || { crash_restart_reject "unit fragment changed (observed '$fragment', expected '$LEGACY_FRAGMENT')"; return 1; }
+  drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT") \
+    || { crash_restart_reject 'could not read the unit DropInPaths'; return 1; }
+  [[ -z $drop_ins ]] \
+    || { crash_restart_reject "unit drop-ins appeared (observed '$drop_ins', expected none)"; return 1; }
+  exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
+    || { crash_restart_reject 'could not read the effective ExecStart argv'; return 1; }
+  [[ $exec_argv == "$expected_exec" ]] \
+    || { crash_restart_reject "effective ExecStart changed (observed '$exec_argv', expected '$expected_exec')"; return 1; }
+  cmdline=$(proc_cmdline "$pid") \
+    || { crash_restart_reject "could not read /proc/$pid/cmdline of the restarted process"; return 1; }
+  [[ $cmdline == "$expected_exec " ]] \
+    || { crash_restart_reject "restarted process command line changed (observed '$cmdline', expected '$expected_exec ')"; return 1; }
   restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT") \
-    || return 1
-  [[ $restarts =~ ^[0-9]+$ ]] || return 1
+    || { crash_restart_reject 'could not read the unit NRestarts counter'; return 1; }
+  [[ $restarts =~ ^[0-9]+$ ]] \
+    || { crash_restart_reject "unit NRestarts counter is invalid (observed '$restarts')"; return 1; }
   invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT") \
-    || return 1
-  [[ $invocation_id =~ ^[a-f0-9]{32}$ ]] || return 1
+    || { crash_restart_reject 'could not read the unit InvocationID'; return 1; }
+  [[ $invocation_id =~ ^[a-f0-9]{32}$ ]] \
+    || { crash_restart_reject "unit InvocationID is invalid (observed '$invocation_id')"; return 1; }
   # Process identity may only move forward under supervision: a strictly
   # increasing restart counter and a fresh invocation within the thrash bound.
-  ((restarts > legacy_restarts)) || return 1
+  ((restarts > legacy_restarts)) \
+    || { crash_restart_reject "restart counter did not advance (observed $restarts, pinned $legacy_restarts)"; return 1; }
   ((baseline_crash_restarts + restarts - legacy_restarts \
-    <= MAX_BASELINE_CRASH_RESTARTS)) || return 1
+    <= MAX_BASELINE_CRASH_RESTARTS)) \
+    || { crash_restart_reject "restart thrash exceeds the Gate bound (already adjudicated $baseline_crash_restarts, this transition $((restarts - legacy_restarts)), bound $MAX_BASELINE_CRASH_RESTARTS)"; return 1; }
   baseline_crash_restart_journal_evidence "$legacy_journal_cursor" "$restarts" \
     || return 1
-  verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" || return 1
+  verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
+    || { crash_restart_reject "baseline health is not fresh and fail-closed clean after the restart ($LEGACY_SPOOL/health.json)"; return 1; }
   baseline_crash_restart_evidence=$(jq -c \
     --argjson from_pid "$legacy_pid" --argjson to_pid "$pid" \
     --arg from_invocation "$legacy_invocation_id" \
@@ -557,7 +631,8 @@ adjudicate_baseline_crash_restart() {
     '. + [{adjudicated_at:$at,from_main_pid:$from_pid,to_main_pid:$to_pid,
       from_invocation_id:$from_invocation,to_invocation_id:$to_invocation,
       from_restarts:$from_restarts,to_restarts:$to_restarts}]' \
-    <<<"$baseline_crash_restart_evidence") || return 1
+    <<<"$baseline_crash_restart_evidence") \
+    || { crash_restart_reject 'could not record the adjudication evidence'; return 1; }
   baseline_crash_restarts=$((baseline_crash_restarts \
     + restarts - legacy_restarts))
   printf 'adjudicated supervised baseline crash restart: pid %s -> %s, restarts %s -> %s\n' \
@@ -565,7 +640,8 @@ adjudicate_baseline_crash_restart() {
   legacy_pid=$pid
   legacy_restarts=$restarts
   legacy_invocation_id=$invocation_id
-  legacy_journal_cursor=$(journal_cursor "$LEGACY_UNIT") || return 1
+  legacy_journal_cursor=$(journal_cursor "$LEGACY_UNIT") \
+    || { crash_restart_reject 'could not capture the post-adjudication journal cursor'; return 1; }
 }
 
 verify_baseline_identity() {
@@ -814,12 +890,16 @@ baseline_health_requires_continuous_freshness() {
 }
 
 legacy_health_sample_state() {
-  local health=$1 policy=$2 baseline_mode=$3
+  local health=$1 policy=$2
   if jq -e -f "$policy" "$health" >/dev/null; then
     printf '%s\n' clean
-  elif [[ $baseline_mode == legacy_python ]] \
-    && jq -e '.api_errors | type == "array" and length > 0' "$health" >/dev/null \
+  elif jq -e '.api_errors | type == "array" and length > 0' "$health" >/dev/null \
     && jq '.api_errors = []' "$health" | jq -e -f "$policy" >/dev/null; then
+    # Any baseline can record a transient per-market API error (e.g. an HTTP
+    # 429 rate limit that clears next cycle); legacy_health_transition bounds
+    # the tolerance to one health budget, so a baseline that keeps erroring
+    # still fails closed. Only api_errors is transient — every other field
+    # must satisfy the policy even within the budget.
     printf '%s\n' transient_api_error
   else
     printf '%s\n' fatal
