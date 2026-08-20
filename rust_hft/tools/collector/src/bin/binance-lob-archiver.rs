@@ -2646,9 +2646,13 @@ async fn wait_for_rotation_or_shutdown<T>(
 fn snapshot_rate_limiter(
     requests_per_second: f64,
 ) -> Arc<tokio::sync::Mutex<tokio::time::Interval>> {
-    Arc::new(tokio::sync::Mutex::new(tokio::time::interval(
-        Duration::from_secs_f64(1.0 / requests_per_second.max(0.1)),
-    )))
+    let mut interval = tokio::time::interval(Duration::from_secs_f64(
+        1.0 / requests_per_second.max(0.1),
+    ));
+    // A shared interval must not burst missed ticks after a slow response;
+    // otherwise concurrent producers can exceed the venue's request limit.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Arc::new(tokio::sync::Mutex::new(interval))
 }
 
 async fn wait_for_snapshot_rate_slot(
@@ -9669,6 +9673,16 @@ mod tests {
         assert_eq!(snapshot_retry_delay(None, 99), Duration::from_secs(32));
         assert_eq!(snapshot_retry_delay(Some("NaN"), 0), Duration::from_secs(1));
         assert_eq!(snapshot_retry_delay(Some("-1"), 1), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn snapshot_rate_limiter_delays_missed_ticks_instead_of_bursting() {
+        let limiter = snapshot_rate_limiter(5.0);
+        let limiter = limiter.try_lock().unwrap();
+        assert_eq!(
+            limiter.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
     }
 
     #[tokio::test]
