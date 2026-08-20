@@ -18,7 +18,7 @@ use crate::{
 use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
-use hft_backtest::config::verify_canonical_replay_artifact;
+use hft_backtest::config::verify_canonical_replay_artifact_streaming;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -626,7 +626,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         &replay_manifest_path,
         &receipt.replay_manifest.sha256,
     )?;
-    verify_canonical_replay_artifact(
+    verify_canonical_replay_artifact_streaming(
         &replay_artifact_path,
         &replay_manifest_path,
         Some(&replay_artifact_sha256),
