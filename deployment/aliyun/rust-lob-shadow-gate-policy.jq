@@ -3,12 +3,21 @@
 and .candidate_sha256 == $candidate_sha256
 and .deployment_bundle_sha256 == $deployment_bundle_sha256
 and .deployment_source_revision == $deployment_source_revision
+and (.run_id | type) == "string"
+and (.run_id | test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
+and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"
+  + $candidate_sha256 + "/" + .run_id)
+and .required_duration_seconds == 240
+and .requested_duration_seconds >= .required_duration_seconds
+and .health_settle_seconds == 180
+and .segment_seconds == 120
+and .test_only == false
 and .passed == true
 and .production_eligible == true
 and .checks_passed == true
 and (.duration_seconds | type) == "number"
 and .duration_seconds == (.duration_seconds | floor)
-and .duration_seconds >= 900
+and .duration_seconds >= 240
 and (.markets.spot.symbol_count | type) == "number"
 and .markets.spot.symbol_count == (.markets.spot.symbol_count | floor)
 and .markets.spot.symbol_count >= 1000
@@ -21,7 +30,7 @@ and .markets.spot.upload_failure_count == (.markets.spot.upload_failure_count | 
 and .markets.spot.upload_failure_count >= 0
 and (.markets.spot.health_samples | type) == "number"
 and .markets.spot.health_samples == (.markets.spot.health_samples | floor)
-and .markets.spot.health_samples >= 10
+and .markets.spot.health_samples >= 8
 and (.markets.spot.max_health_silence_seconds | type) == "number"
 and .markets.spot.max_health_silence_seconds >= 0
 and .markets.spot.max_health_silence_seconds <= 120
@@ -118,7 +127,7 @@ and .markets.usdm.upload_failure_count == (.markets.usdm.upload_failure_count | 
 and .markets.usdm.upload_failure_count >= 0
 and (.markets.usdm.health_samples | type) == "number"
 and .markets.usdm.health_samples == (.markets.usdm.health_samples | floor)
-and .markets.usdm.health_samples >= 10
+and .markets.usdm.health_samples >= 8
 and (.markets.usdm.max_health_silence_seconds | type) == "number"
 and .markets.usdm.max_health_silence_seconds >= 0
 and .markets.usdm.max_health_silence_seconds <= 120

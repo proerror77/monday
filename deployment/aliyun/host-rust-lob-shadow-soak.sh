@@ -452,8 +452,9 @@ assert_no_symlink_ancestors "$run_spool_path"
 run_resources_started=true
 install -d -m 0750 "$EVIDENCE_ROOT" "$EVIDENCE_ROOT/$CANDIDATE_SHA256" "$evidence_dir"
 direct_directory "$evidence_dir" || die 'soak evidence path is indirect'
+install -d -m 0755 -o root -g root \
+  "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256"
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-  "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256" \
   "$RUN_SPOOL_ROOT/$CANDIDATE_SHA256/$evidence_run_id" \
   "${spool_dir[spot]}" "${spool_dir[usdm]}"
 for market in "${MARKETS[@]}"; do

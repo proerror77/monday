@@ -184,11 +184,16 @@ setup_fixture() {
     --arg artifact "$CANDIDATE_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg source "$DEPLOYMENT_SOURCE_REVISION" \
+    --arg run_id 20260820T000000Z-1 \
+    --arg run_spool "/data/monday/spool/binance-lob-rust-shadow/runs/$CANDIDATE_SHA256/20260820T000000Z-1" \
     --argjson market "$market" \
     --argjson usdm_market "$usdm_market" \
     '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
-      passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
+      run_id:$run_id,run_spool:$run_spool,
+      required_duration_seconds:240,requested_duration_seconds:240,
+      health_settle_seconds:180,segment_seconds:120,test_only:false,
+      passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
       markets:{spot:$market,usdm:$usdm_market}}' \
     >"$gate_dir/gate.json"
   (cd "$gate_dir" && sha256sum gate.json >PASSED.sha256)
