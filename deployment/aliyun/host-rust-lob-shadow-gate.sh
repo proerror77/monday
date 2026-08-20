@@ -265,9 +265,10 @@ for path in "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path"
 done
 [[ ! -e $run_spool_path && ! -L $run_spool_path ]] \
   || die 'run-scoped spool already exists'
+install -d -m 0755 -o root -g root \
+  "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-  "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path" \
-  "${spool_dir[spot]}" "${spool_dir[usdm]}"
+  "$run_spool_path" "${spool_dir[spot]}" "${spool_dir[usdm]}"
 for path in "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path" \
   "${spool_dir[spot]}" "${spool_dir[usdm]}"; do
   direct_directory "$path" || die "run-scoped spool path is indirect: $path"

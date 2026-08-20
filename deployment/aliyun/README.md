@@ -1007,9 +1007,10 @@ and `SYMBOLS=ALL`, creates a fresh spool under
 both units with `SEGMENT_SECONDS=120`, waits at most 180 seconds for initial
 full-catalog health, freezes both session IDs and catalog digests, and then uses
 monotonic time to observe at least 240 seconds. It never drains or recovers an
-older Shadow run. Failed run files remain evidence under that run's spool and
-cannot block the next Gate. The Gate fails unless all of these are true for the
-entire candidate run:
+older Shadow run. Any incomplete files left by a failed run remain confined to
+that run's spool and cannot block the next Gate; files already uploaded and
+cleaned retain their OSS triplet evidence instead of a duplicate local copy.
+The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
 - Spot has at least 1,000 symbols and USD-M at least 400;

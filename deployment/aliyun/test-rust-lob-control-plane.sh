@@ -104,6 +104,9 @@ grep -Fq 'readonly HEALTH_SETTLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
 grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
 grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
+grep -Fq 'install -d -m 0755 -o root -g root' "$GATE"
+grep -Fq '"$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"' "$GATE"
+grep -Fq '"$run_spool_path" "${spool_dir[spot]}" "${spool_dir[usdm]}"' "$GATE"
 grep -Fq 'printf '\''SEGMENT_SECONDS=%s\n'\'' "$GATE_SEGMENT_SECONDS"' "$GATE"
 [[ $(grep -Fc 'run_candidate_drain "$market"' "$GATE") -eq 1 ]] || {
   printf 'shadow gate drains a fixed or pre-existing spool before the run\n' >&2
