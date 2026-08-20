@@ -242,9 +242,19 @@ kubectl -n monday-research patch job REPLACE_MATERIALIZATION_JOB_NAME \
 The Job template starts suspended. Read back the rendered inventory, output PV/PVC
 identities, and mounted lane root first, then unsuspend explicitly.
 
-Run `campaign-freeze` from any cloud Pod that mounts that completed run prefix;
-the receipt stores paths relative to the run root, so the mount point itself may
+Run `campaign-freeze` from a cloud Pod using the exact digest-pinned executor
+image that will run the Campaign and mounting the completed run prefix. The
+receipt stores paths relative to the run root, so the mount point itself may
 differ from the materialization Pod. Pass that mount point with `--input-root`.
+`--source-revision` and `--image` are required and must name the exact executor
+git SHA and digest-pinned image that will run the Campaign. `campaign-freeze`
+rejects any source drift from the current Pod build. The mounted receipt's
+`source_revision` and `image_ref` remain immutable producer lineage and are
+bound into the canonical Campaign request separately from the executor identity.
+Before signing, read back that Pod's `imageID` and verify the published image's
+`org.opencontainers.image.revision` equals `--source-revision`; reject the
+freeze plan if either identity differs. The freeze plan is unsigned preparation,
+not execution authority.
 
 The script accepts `--dry-run` for triplet and prefix validation without
 writing output. The repo-local contract check is:
@@ -363,11 +373,13 @@ input GET + SHA admission
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v2`. It binds the exact Git source
-revision, digest-pinned image, feature/materialization/replay objects and
-SHA-256 values, expected holdout ID, campaign-wide `declared_total_trials`, and
-at least two `rounds`. Each round carries a unique `round_id`, a unique seed,
-and Mission/result PUT and readback URLs. It also carries the global
+The request schema is `cex-campaign-request-v3`. It separately binds the exact
+executor Git revision and image digest plus the input receipt SHA-256, producer
+Git revision, and producer image digest. It also binds the
+feature/materialization/replay objects and SHA-256 values, expected holdout ID,
+campaign-wide `declared_total_trials`, and at least two `rounds`. Each round
+carries a unique `round_id`, a unique seed, and Mission/result PUT and readback
+URLs. It also carries the global
 `holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
 Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
 signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.

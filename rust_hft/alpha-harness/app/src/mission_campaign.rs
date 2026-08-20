@@ -18,6 +18,7 @@ use crate::{
 use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
+use hft_backtest::config::verify_canonical_replay_artifact_streaming;
 use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,9 +32,9 @@ use zip::ZipArchive;
 
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
-const CAMPAIGN_REQUEST_SCHEMA_V2: &str = "cex-campaign-request-v2";
-const CAMPAIGN_RESULT_SCHEMA_V2: &str = "cex-campaign-result-v2";
-const CAMPAIGN_IDENTITY_SCHEMA_V2: &str = "cex-campaign-identity-v2";
+const CAMPAIGN_REQUEST_SCHEMA_V3: &str = "cex-campaign-request-v3";
+const CAMPAIGN_RESULT_SCHEMA_V3: &str = "cex-campaign-result-v3";
+const CAMPAIGN_IDENTITY_SCHEMA_V3: &str = "cex-campaign-identity-v3";
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
@@ -46,6 +47,9 @@ pub(crate) struct CampaignRequest {
     pub(crate) campaign_id: String,
     pub(crate) build_source_revision: String,
     pub(crate) image_identity: String,
+    pub(crate) campaign_inputs_sha256: String,
+    pub(crate) producer_source_revision: String,
+    pub(crate) producer_image_identity: String,
     pub(crate) feature_url: String,
     pub(crate) feature_sha256: String,
     pub(crate) materialization_url: String,
@@ -202,6 +206,9 @@ struct CampaignResultV1 {
     request_sha256: String,
     build_source_revision: String,
     image_identity: String,
+    campaign_inputs_sha256: String,
+    producer_source_revision: String,
+    producer_image_identity: String,
     holdout_id: String,
     declared_total_trials: usize,
     consumed_trials: usize,
@@ -519,11 +526,14 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V2,
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V3,
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
         image_identity: loaded.request.image_identity.clone(),
+        campaign_inputs_sha256: loaded.request.campaign_inputs_sha256.clone(),
+        producer_source_revision: loaded.request.producer_source_revision.clone(),
+        producer_image_identity: loaded.request.producer_image_identity.clone(),
         holdout_id: loaded.request.holdout_id.clone(),
         declared_total_trials: loaded.request.declared_total_trials,
         consumed_trials,
@@ -573,6 +583,11 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest, String)> {
     let (receipt, campaign_inputs_sha256) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
+    let build_source_revision =
+        normalized_source_revision("campaign source revision", &args.source_revision)?;
+    if build_source_revision != BUILD_SOURCE_REVISION {
+        bail!("campaign source revision does not match this build");
+    }
     let feature_url =
         canonical_tokyo_oss_internal_object("campaign feature", &receipt.feature.object_url)?;
     let materialization_url = canonical_tokyo_oss_internal_object(
@@ -588,7 +603,8 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         &receipt.replay_manifest.object_url,
     )?;
     let campaign_root = canonical_tokyo_oss_internal_object("campaign root", &args.campaign_root)?;
-    let image_identity = image_identity_from_ref(&receipt.image_ref)?;
+    let image_identity = mission_dispatch::image_digest(&args.image)?;
+    let producer_image_identity = mission_dispatch::image_digest(&receipt.image_ref)?;
     let feature_path = args.input_root.join(&receipt.feature.relative_path);
     let materialization_path = args.input_root.join(&receipt.materialization.relative_path);
     let replay_artifact_path = args.input_root.join(&receipt.replay_artifact.relative_path);
@@ -609,6 +625,14 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         "campaign replay manifest",
         &replay_manifest_path,
         &receipt.replay_manifest.sha256,
+    )?;
+    verify_canonical_replay_artifact_streaming(
+        &replay_artifact_path,
+        &replay_manifest_path,
+        Some(&replay_artifact_sha256),
+        &replay_manifest_sha256,
+        None,
+        None,
     )?;
     let declared_total_trials = crate::mission_render::max_candidates_for_tests()
         .checked_mul(2)
@@ -634,6 +658,10 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
             &replay_artifact_sha256,
             &replay_manifest_url,
             &replay_manifest_sha256,
+            &campaign_inputs_sha256,
+            &receipt.source_revision,
+            &producer_image_identity,
+            &build_source_revision,
             &image_identity,
             &campaign_root,
             &rendered.mission.spec.holdout.holdout_id,
@@ -661,12 +689,10 @@ fn validate_campaign_inputs_receipt(receipt: &CampaignInputsReceipt) -> anyhow::
         bail!("campaign inputs receipt schema_version must be {CAMPAIGN_INPUTS_SCHEMA_V1}");
     }
     validate_receipt_identifier("campaign inputs run_id", &receipt.run_id)?;
-    if receipt.source_revision != BUILD_SOURCE_REVISION {
-        bail!("campaign inputs receipt source_revision does not match this build");
-    }
-    if !valid_git_revision(&receipt.source_revision) {
-        bail!("campaign inputs receipt source_revision must be an exact git revision");
-    }
+    normalized_source_revision(
+        "campaign inputs receipt source_revision",
+        &receipt.source_revision,
+    )?;
     validate_receipt_identifier("campaign inputs mission_id", &receipt.mission_id)?;
     if receipt.market != "usdm" {
         bail!("campaign inputs receipt market must be usdm");
@@ -678,7 +704,7 @@ fn validate_campaign_inputs_receipt(receipt: &CampaignInputsReceipt) -> anyhow::
         bail!("campaign inputs receipt readback_scope must be same-mounted-ossfs-prefix");
     }
     let output_root = campaign_inputs_output_root(receipt)?;
-    image_identity_from_ref(&receipt.image_ref)?;
+    mission_dispatch::image_digest(&receipt.image_ref)?;
     validate_campaign_input_receipt_item("campaign feature", &receipt.feature, &output_root)?;
     validate_campaign_input_receipt_item(
         "campaign materialization",
@@ -802,14 +828,14 @@ fn verify_local_receipt_item(
     Ok(actual)
 }
 
-fn image_identity_from_ref(image_ref: &str) -> anyhow::Result<String> {
-    if image_ref != image_ref.trim() || image_ref.chars().any(char::is_control) {
-        bail!("campaign image_ref must not contain surrounding whitespace or control characters");
+fn normalized_source_revision(label: &str, source_revision: &str) -> anyhow::Result<String> {
+    if source_revision != source_revision.trim() || source_revision.chars().any(char::is_control) {
+        bail!("{label} must not contain surrounding whitespace or control characters");
     }
-    let (_, digest) = image_ref
-        .rsplit_once("@sha256:")
-        .context("campaign image_ref must be pinned by @sha256 digest")?;
-    normalized_sha256("campaign image identity", digest)
+    if !valid_git_revision(source_revision) {
+        bail!("{label} must be an exact git revision");
+    }
+    Ok(source_revision.to_string())
 }
 
 fn extract_bundle(bundle: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -1001,8 +1027,8 @@ pub(crate) fn valid_request_for_tests() -> CampaignRequest {
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V2 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V2}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V3 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V3}");
     }
     validate_campaign_id(&request.campaign_id)?;
     if request.image_identity
@@ -1010,11 +1036,26 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     {
         bail!("campaign image identity must be a normalized SHA256");
     }
-    if request.build_source_revision != request.build_source_revision.trim() {
-        bail!("campaign source revision must not contain surrounding whitespace");
+    normalized_source_revision("campaign source revision", &request.build_source_revision)?;
+    if request.campaign_inputs_sha256
+        != normalized_sha256(
+            "campaign inputs receipt SHA256",
+            &request.campaign_inputs_sha256,
+        )?
+    {
+        bail!("campaign inputs receipt SHA256 must be normalized");
     }
-    if !valid_git_revision(&request.build_source_revision) {
-        bail!("campaign source revision must be an exact git revision");
+    normalized_source_revision(
+        "campaign producer_source_revision",
+        &request.producer_source_revision,
+    )?;
+    if request.producer_image_identity
+        != normalized_sha256(
+            "campaign producer image identity",
+            &request.producer_image_identity,
+        )?
+    {
+        bail!("campaign producer image identity must be a normalized SHA256");
     }
     validate_cex_holdout_id(&request.holdout_id)?;
     canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
@@ -1132,16 +1173,23 @@ fn build_request_from_parts(
     replay_artifact_sha256: &str,
     replay_manifest_url: &str,
     replay_manifest_sha256: &str,
+    campaign_inputs_sha256: &str,
+    producer_source_revision: &str,
+    producer_image_identity: &str,
+    build_source_revision: &str,
     image_identity: &str,
     campaign_root: &str,
     holdout_id: &str,
     seeds: &[u64],
 ) -> anyhow::Result<CampaignRequest> {
     let mut request = CampaignRequest {
-        schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
+        schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
         campaign_id: "placeholder".to_string(),
-        build_source_revision: BUILD_SOURCE_REVISION.to_string(),
+        build_source_revision: build_source_revision.to_string(),
         image_identity: image_identity.to_string(),
+        campaign_inputs_sha256: campaign_inputs_sha256.to_string(),
+        producer_source_revision: producer_source_revision.to_string(),
+        producer_image_identity: producer_image_identity.to_string(),
         feature_url: feature_url.to_string(),
         feature_sha256: feature_sha256.to_string(),
         materialization_url: materialization_url.to_string(),
@@ -1212,8 +1260,22 @@ fn build_request_from_parts(
 
 fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<CampaignRequest> {
     let mut canonical = request.clone();
+    canonical.build_source_revision =
+        normalized_source_revision("campaign source revision", &canonical.build_source_revision)?;
     canonical.image_identity =
         normalized_sha256("campaign image identity", &canonical.image_identity)?;
+    canonical.campaign_inputs_sha256 = normalized_sha256(
+        "campaign inputs receipt SHA256",
+        &canonical.campaign_inputs_sha256,
+    )?;
+    canonical.producer_source_revision = normalized_source_revision(
+        "campaign producer_source_revision",
+        &canonical.producer_source_revision,
+    )?;
+    canonical.producer_image_identity = normalized_sha256(
+        "campaign producer image identity",
+        &canonical.producer_image_identity,
+    )?;
     canonical.feature_url =
         canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
     canonical.materialization_url = canonical_tokyo_oss_internal_object(
@@ -1387,10 +1449,25 @@ fn signing_action_put(name: &str, object: String, content_type: &str) -> Campaig
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
     let identity = serde_json::json!({
-        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V2,
+        "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V3,
         "request_schema_version": request.schema_version,
-        "build_source_revision": request.build_source_revision,
+        "build_source_revision": normalized_source_revision(
+            "campaign source revision",
+            &request.build_source_revision,
+        )?,
         "image_identity": normalized_sha256("campaign image identity", &request.image_identity)?,
+        "campaign_inputs_sha256": normalized_sha256(
+            "campaign inputs receipt SHA256",
+            &request.campaign_inputs_sha256,
+        )?,
+        "producer_source_revision": normalized_source_revision(
+            "campaign producer_source_revision",
+            &request.producer_source_revision,
+        )?,
+        "producer_image_identity": normalized_sha256(
+            "campaign producer image identity",
+            &request.producer_image_identity,
+        )?,
         "feature": {
             "object": canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?,
             "sha256": normalized_sha256("campaign feature", &request.feature_sha256)?,
@@ -1519,11 +1596,23 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V2 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V2}");
+    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V3 {
+        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V3}");
     }
     validate_campaign_id(&request.campaign_id)?;
     normalized_sha256("campaign image identity", &request.image_identity)?;
+    normalized_sha256(
+        "campaign inputs receipt SHA256",
+        &request.campaign_inputs_sha256,
+    )?;
+    normalized_source_revision(
+        "campaign producer_source_revision",
+        &request.producer_source_revision,
+    )?;
+    normalized_sha256(
+        "campaign producer image identity",
+        &request.producer_image_identity,
+    )?;
     if request.build_source_revision != BUILD_SOURCE_REVISION
         || !valid_git_revision(&request.build_source_revision)
     {
@@ -1633,6 +1722,24 @@ mod tests {
     }
 
     #[test]
+    fn expected_campaign_id_binds_producer_lineage() {
+        let mut request = valid_request();
+        let original = expected_campaign_id(&request).unwrap();
+        request.campaign_inputs_sha256 = "9".repeat(64);
+        assert_ne!(expected_campaign_id(&request).unwrap(), original);
+
+        let mut request = valid_request();
+        let original = expected_campaign_id(&request).unwrap();
+        request.producer_source_revision = "c".repeat(40);
+        assert_ne!(expected_campaign_id(&request).unwrap(), original);
+
+        let mut request = valid_request();
+        let original = expected_campaign_id(&request).unwrap();
+        request.producer_image_identity = "8".repeat(64);
+        assert_ne!(expected_campaign_id(&request).unwrap(), original);
+    }
+
+    #[test]
     fn validate_request_rejects_http_transport() {
         let mut request = valid_request();
         request.feature_url = request.feature_url.replacen("https://", "http://", 1);
@@ -1658,6 +1765,17 @@ mod tests {
         let mut request = valid_request();
         request.replay_manifest_url =
             "https://example.com/research/replay-manifest.json".to_string();
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn validate_request_rejects_noncanonical_producer_digests() {
+        let mut request = valid_request();
+        request.campaign_inputs_sha256 = "A".repeat(64);
+        assert!(validate_request(&request).is_err());
+
+        let mut request = valid_request();
+        request.producer_image_identity = format!(" {} ", "a".repeat(64));
         assert!(validate_request(&request).is_err());
     }
 
@@ -1852,6 +1970,10 @@ mod tests {
             &"3".repeat(64),
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/replay-manifest.json",
             &"4".repeat(64),
+            &"5".repeat(64),
+            &"a".repeat(40),
+            &"6".repeat(64),
+            BUILD_SOURCE_REVISION,
             &"1".repeat(64),
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns",
             "cex-holdout-test",
@@ -1871,14 +1993,19 @@ mod tests {
     fn freeze_from_receipt_derives_identity_and_plan() {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
+        let producer_revision = "b".repeat(40);
+        let producer_image_ref = format!("registry/research-runner@sha256:{}", "1".repeat(64));
+        let executor_image_ref = format!("registry/research-runner@sha256:{}", "2".repeat(64));
         let fixture = campaign_e2e_fixture("campaign-freeze", false, false);
         let root = tempfile::tempdir().unwrap();
         let input_root = root.path().join("remounted-run");
         std::fs::create_dir_all(&input_root).unwrap();
         let feature_relative = PathBuf::from("features.jsonl");
         let materialization_relative = PathBuf::from("materialization.json");
-        let replay_artifact_relative = PathBuf::from("replay.parquet");
-        let replay_manifest_relative = PathBuf::from("replay-manifest.json");
+        let replay_artifact_relative: PathBuf =
+            fixture.replay_artifact_path.file_name().unwrap().into();
+        let replay_manifest_relative: PathBuf =
+            fixture.replay_manifest_path.file_name().unwrap().into();
         std::fs::copy(
             &fixture._render_fixture.feature_path,
             input_root.join(&feature_relative),
@@ -1903,8 +2030,8 @@ mod tests {
         let receipt = CampaignInputsReceipt {
             schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.to_string(),
             run_id: "20260819t000000z-1".to_string(),
-            source_revision: BUILD_SOURCE_REVISION.to_string(),
-            image_ref: format!("registry/research-runner@sha256:{}", "1".repeat(64)),
+            source_revision: producer_revision.clone(),
+            image_ref: producer_image_ref.clone(),
             mission_id: "campaign-inputs-test".to_string(),
             market: "usdm".to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -1927,7 +2054,10 @@ mod tests {
             },
             replay_artifact: CampaignInputReceiptItem {
                 relative_path: replay_artifact_relative.clone(),
-                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay.parquet"),
+                object_url: format!(
+                    "{TEST_ROOT}/runs/campaign-freeze/{}",
+                    replay_artifact_relative.display()
+                ),
                 sha256: crate::mission_runner::sha256_file(
                     &input_root.join(&replay_artifact_relative),
                 )
@@ -1935,7 +2065,10 @@ mod tests {
             },
             replay_manifest: CampaignInputReceiptItem {
                 relative_path: replay_manifest_relative.clone(),
-                object_url: format!("{TEST_ROOT}/runs/campaign-freeze/replay-manifest.json"),
+                object_url: format!(
+                    "{TEST_ROOT}/runs/campaign-freeze/{}",
+                    replay_manifest_relative.display()
+                ),
                 sha256: crate::mission_runner::sha256_file(
                     &input_root.join(&replay_manifest_relative),
                 )
@@ -1947,7 +2080,9 @@ mod tests {
 
         freeze(CampaignFreezeArgs {
             campaign_inputs: receipt_path.clone(),
-            input_root,
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: executor_image_ref.clone(),
             campaign_root: format!("{TEST_ROOT}/campaigns"),
             seeds: vec![7, 11],
             output: output.clone(),
@@ -1955,17 +2090,92 @@ mod tests {
         .unwrap();
 
         let (receipt_again, receipt_sha256) = load_campaign_inputs_receipt(&receipt_path).unwrap();
-        assert_eq!(receipt_again.source_revision, BUILD_SOURCE_REVISION);
+        assert_eq!(receipt_again.source_revision, producer_revision);
+        assert_eq!(receipt_again.image_ref, producer_image_ref);
         let frozen = load_freeze_plan(&output).unwrap();
         assert_eq!(frozen.campaign_inputs_sha256, receipt_sha256);
         assert_eq!(
+            frozen.canonical_request.campaign_inputs_sha256,
+            receipt_sha256
+        );
+        assert_eq!(
+            frozen.canonical_request.producer_source_revision,
+            producer_revision
+        );
+        assert_eq!(
+            frozen.canonical_request.producer_image_identity,
+            mission_dispatch::image_digest(&producer_image_ref).unwrap()
+        );
+        assert_eq!(
+            frozen.canonical_request.build_source_revision,
+            BUILD_SOURCE_REVISION
+        );
+        assert_eq!(
             frozen.canonical_request.image_identity,
-            image_identity_from_ref(&receipt.image_ref).unwrap()
+            mission_dispatch::image_digest(&executor_image_ref).unwrap()
         );
         assert_eq!(
             frozen.signing_plan,
             signing_plan(&frozen.canonical_request).unwrap()
         );
+
+        let mut invalid_producer = receipt.clone();
+        invalid_producer.source_revision = "not-a-git-sha".to_string();
+        assert!(validate_campaign_inputs_receipt(&invalid_producer)
+            .unwrap_err()
+            .to_string()
+            .contains("source_revision must be an exact git revision"));
+
+        let invalid_executor = freeze_request(&CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: "registry/research-runner:latest".to_string(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: root.path().join("invalid-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(invalid_executor
+            .to_string()
+            .contains("mission image must be pinned by @sha256 digest"));
+
+        let replay_manifest_path = input_root.join(&replay_manifest_relative);
+        let mut invalid_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&replay_manifest_path).unwrap()).unwrap();
+        invalid_manifest["artifact_path"] = serde_json::json!("wrong.parquet");
+        data_mission::write_json_atomic(&replay_manifest_path, &invalid_manifest).unwrap();
+        let mut invalid_replay_receipt = receipt.clone();
+        invalid_replay_receipt.replay_manifest.sha256 =
+            crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
+        data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
+        let invalid_replay = freeze_request(&CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: BUILD_SOURCE_REVISION.to_string(),
+            image: executor_image_ref.clone(),
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: root.path().join("invalid-replay-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(invalid_replay
+            .chain()
+            .any(|cause| cause.to_string().contains("artifact")));
+
+        let invalid_source = freeze_request(&CampaignFreezeArgs {
+            campaign_inputs: receipt_path.clone(),
+            input_root: input_root.clone(),
+            source_revision: "c".repeat(40),
+            image: executor_image_ref,
+            campaign_root: format!("{TEST_ROOT}/campaigns"),
+            seeds: vec![7, 11],
+            output: root.path().join("invalid-source-freeze.json"),
+        })
+        .unwrap_err();
+        assert!(invalid_source
+            .to_string()
+            .contains("campaign source revision does not match this build"));
 
         let mut sibling = receipt.clone();
         sibling.feature.object_url =
@@ -2153,6 +2363,7 @@ mod tests {
     #[test]
     fn execute_runs_two_rounds_and_finalizes_exactly_once() {
         let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false);
+        let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args).unwrap();
 
         let work_dir = fixture.work_dir;
@@ -2173,7 +2384,19 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V2);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V3);
+        assert_eq!(
+            result["campaign_inputs_sha256"],
+            serde_json::json!(request.campaign_inputs_sha256)
+        );
+        assert_eq!(
+            result["producer_source_revision"],
+            serde_json::json!(request.producer_source_revision)
+        );
+        assert_eq!(
+            result["producer_image_identity"],
+            serde_json::json!(request.producer_image_identity)
+        );
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
         assert_eq!(result["declared_total_trials"], 64);
         assert_eq!(result["consumed_trials"], 64);
@@ -2325,10 +2548,13 @@ mod tests {
         const TEST_ROOT: &str =
             "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
         let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
             campaign_id: String::new(),
             build_source_revision: "a".repeat(40),
             image_identity: "1".repeat(64),
+            campaign_inputs_sha256: "f".repeat(64),
+            producer_source_revision: "b".repeat(40),
+            producer_image_identity: "e".repeat(64),
             feature_url: format!("{TEST_ROOT}/features.jsonl"),
             feature_sha256: "1".repeat(64),
             materialization_url: format!("{TEST_ROOT}/materialization.json"),
@@ -2552,10 +2778,13 @@ mod tests {
         );
         let published = root.join("published");
         CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V2.to_string(),
+            schema_version: CAMPAIGN_REQUEST_SCHEMA_V3.to_string(),
             campaign_id: campaign_id.clone(),
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
             image_identity: "1".repeat(64),
+            campaign_inputs_sha256: "f".repeat(64),
+            producer_source_revision: BUILD_SOURCE_REVISION.to_string(),
+            producer_image_identity: "e".repeat(64),
             feature_url: feature_path.to_string_lossy().into_owned(),
             feature_sha256: crate::mission_runner::sha256_file(feature_path).unwrap(),
             materialization_url: materialization_path.to_string_lossy().into_owned(),

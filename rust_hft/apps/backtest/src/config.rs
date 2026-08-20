@@ -854,6 +854,30 @@ pub fn verify_canonical_replay_artifact(
     })
 }
 
+pub fn verify_canonical_replay_artifact_streaming(
+    artifact_path: &Path,
+    manifest_path: &Path,
+    expected_artifact_sha256: Option<&str>,
+    expected_manifest_sha256: &str,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+) -> anyhow::Result<CanonicalReplayEvidence> {
+    let (manifest, manifest_sha256, artifact_sha256) = verify_canonical_manifest_and_artifact(
+        artifact_path,
+        manifest_path,
+        expected_artifact_sha256,
+        expected_manifest_sha256,
+    )?;
+    let replay_rows =
+        visit_canonical_parquet(artifact_path, &manifest, start_ts, end_ts, |_| Ok(()))?;
+    Ok(canonical_replay_evidence(
+        manifest,
+        manifest_sha256,
+        artifact_sha256,
+        replay_rows,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_replay_canonical_target_positions(
     artifact_path: &Path,
