@@ -89,6 +89,7 @@ struct Config {
     security_token_symbols: Vec<String>,
     excluded_symbols: Arc<RwLock<BTreeSet<String>>>,
     ws_shard_size: usize,
+    usdm_book_ticker_shard_size: usize,
     snapshot_limit: u64,
     snapshot_requests_per_second: f64,
     snapshot_producers: usize,
@@ -388,6 +389,11 @@ impl Config {
             security_token_symbols: catalog.security_token_symbols,
             excluded_symbols: Arc::new(RwLock::new(catalog.excluded_symbols.into_iter().collect())),
             ws_shard_size: env_parse("WS_SHARD_SIZE", 100_usize)?.max(1),
+            usdm_book_ticker_shard_size: env_parse(
+                "USDM_BOOK_TICKER_SHARD_SIZE",
+                20_usize,
+            )?
+            .max(1),
             snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
             snapshot_requests_per_second: env_parse("SNAPSHOT_REQUESTS_PER_SECOND", 15_f64)?,
             snapshot_producers: env_parse("SNAPSHOT_PRODUCERS", 8_usize)?.max(1),
@@ -444,7 +450,8 @@ impl Config {
     }
 
     fn stream_shards(&self) -> Vec<StreamShard> {
-        self.active_symbols()
+        let symbols = self.active_symbols();
+        let mut shards = symbols
             .chunks(self.ws_shard_size)
             .flat_map(|symbols| {
                 let depth_streams = symbols
@@ -527,12 +534,6 @@ impl Config {
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/public/stream?streams={book_tickers}"
-                                ),
-                                streams: book_ticker_streams,
-                            },
-                            StreamShard {
-                                url: format!(
                                     "wss://fstream.binance.com/market/stream?streams={force_orders}"
                                 ),
                                 streams: force_order_streams,
@@ -541,7 +542,29 @@ impl Config {
                     }
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if self.market == Market::Usdm {
+            shards.extend(
+                symbols
+                    .chunks(self.usdm_book_ticker_shard_size)
+                    .map(|symbols| {
+                        let streams = symbols
+                            .iter()
+                            .map(|symbol| {
+                                format!("{}@bookTicker", symbol.to_ascii_lowercase())
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let names = streams.iter().cloned().collect::<Vec<_>>().join("/");
+                        StreamShard {
+                            url: format!(
+                                "wss://fstream.binance.com/public/stream?streams={names}"
+                            ),
+                            streams,
+                        }
+                    }),
+            );
+        }
+        shards
     }
 
     fn active_symbols(&self) -> Vec<String> {
@@ -5384,6 +5407,7 @@ mod tests {
             security_token_symbols: vec![],
             excluded_symbols: Arc::new(RwLock::new(BTreeSet::new())),
             ws_shard_size: 100,
+            usdm_book_ticker_shard_size: 20,
             snapshot_limit: 100,
             snapshot_requests_per_second: 15.0,
             snapshot_producers: 8,
@@ -5645,6 +5669,19 @@ mod tests {
                     && shard.streams.len() == 1
             }), "usdm shard for {stream}");
         }
+        usdm_config.symbols = (0..21).map(|index| format!("S{index:02}USDT")).collect();
+        let usdm = usdm_config.stream_shards();
+        let book_ticker_shard_sizes = usdm
+            .iter()
+            .filter(|shard| {
+                shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@bookTicker"))
+            })
+            .map(|shard| shard.streams.len())
+            .collect::<Vec<_>>();
+        assert_eq!(book_ticker_shard_sizes, [20, 1]);
         // Liquidation orders are USD-M only: spot never subscribes forceOrder.
         assert!(spot
             .iter()
