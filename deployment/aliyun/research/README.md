@@ -368,11 +368,13 @@ input GET + SHA admission
   -> campaign-result.json PUT + GET/SHA readback
 ```
 
-The request schema is `cex-campaign-request-v2`. It binds the exact Git source
-revision, digest-pinned image, feature/materialization/replay objects and
-SHA-256 values, expected holdout ID, campaign-wide `declared_total_trials`, and
-at least two `rounds`. Each round carries a unique `round_id`, a unique seed,
-and Mission/result PUT and readback URLs. It also carries the global
+The request schema is `cex-campaign-request-v3`. It separately binds the exact
+executor Git revision and image digest plus the input receipt SHA-256, producer
+Git revision, and producer image digest. It also binds the
+feature/materialization/replay objects and SHA-256 values, expected holdout ID,
+campaign-wide `declared_total_trials`, and at least two `rounds`. Each round
+carries a unique `round_id`, a unique seed, and Mission/result PUT and readback
+URLs. It also carries the global
 `holdout-id-sha256=<SHA256(HOLDOUT_ID)>/sealed-holdout-claim.json` URLs and one
 Campaign-result object. All URLs are HTTPS signed URLs for exact objects; PUT
 signatures must cover `Content-Type` and `x-oss-forbid-overwrite:true`.
