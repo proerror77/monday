@@ -32,7 +32,7 @@ use zip::ZipArchive;
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V3: &str = "cex-campaign-request-v3";
-const CAMPAIGN_RESULT_SCHEMA_V2: &str = "cex-campaign-result-v2";
+const CAMPAIGN_RESULT_SCHEMA_V3: &str = "cex-campaign-result-v3";
 const CAMPAIGN_IDENTITY_SCHEMA_V3: &str = "cex-campaign-identity-v3";
 const STOP_RULE_V2: &str = "bounded_multi_round_single_finalize_v2";
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -205,6 +205,9 @@ struct CampaignResultV1 {
     request_sha256: String,
     build_source_revision: String,
     image_identity: String,
+    campaign_inputs_sha256: String,
+    producer_source_revision: String,
+    producer_image_identity: String,
     holdout_id: String,
     declared_total_trials: usize,
     consumed_trials: usize,
@@ -522,11 +525,14 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         };
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V2,
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V3,
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
         image_identity: loaded.request.image_identity.clone(),
+        campaign_inputs_sha256: loaded.request.campaign_inputs_sha256.clone(),
+        producer_source_revision: loaded.request.producer_source_revision.clone(),
+        producer_image_identity: loaded.request.producer_image_identity.clone(),
         holdout_id: loaded.request.holdout_id.clone(),
         declared_total_trials: loaded.request.declared_total_trials,
         consumed_trials,
@@ -1237,8 +1243,22 @@ fn build_request_from_parts(
 
 fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<CampaignRequest> {
     let mut canonical = request.clone();
+    canonical.build_source_revision =
+        normalized_source_revision("campaign source revision", &canonical.build_source_revision)?;
     canonical.image_identity =
         normalized_sha256("campaign image identity", &canonical.image_identity)?;
+    canonical.campaign_inputs_sha256 = normalized_sha256(
+        "campaign inputs receipt SHA256",
+        &canonical.campaign_inputs_sha256,
+    )?;
+    canonical.producer_source_revision = normalized_source_revision(
+        "campaign producer_source_revision",
+        &canonical.producer_source_revision,
+    )?;
+    canonical.producer_image_identity = normalized_sha256(
+        "campaign producer image identity",
+        &canonical.producer_image_identity,
+    )?;
     canonical.feature_url =
         canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
     canonical.materialization_url = canonical_tokyo_oss_internal_object(
@@ -2284,6 +2304,7 @@ mod tests {
     #[test]
     fn execute_runs_two_rounds_and_finalizes_exactly_once() {
         let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false);
+        let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args).unwrap();
 
         let work_dir = fixture.work_dir;
@@ -2304,7 +2325,19 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V2);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V3);
+        assert_eq!(
+            result["campaign_inputs_sha256"],
+            serde_json::json!(request.campaign_inputs_sha256)
+        );
+        assert_eq!(
+            result["producer_source_revision"],
+            serde_json::json!(request.producer_source_revision)
+        );
+        assert_eq!(
+            result["producer_image_identity"],
+            serde_json::json!(request.producer_image_identity)
+        );
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
         assert_eq!(result["declared_total_trials"], 64);
         assert_eq!(result["consumed_trials"], 64);
