@@ -117,7 +117,7 @@ and (.markets.spot.oss_roundtrip_evidence as $round_trips
         == ($round_trips[.].start_received_at_ns - $round_trips[. - 1].end_received_at_ns)))
 and (.markets.usdm.symbol_count | type) == "number"
 and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
-and .markets.usdm.symbol_count >= 400
+and .markets.usdm.symbol_count == 100
 and .markets.usdm.snapshot_ready_count == .markets.usdm.symbol_count
 and .markets.usdm.stream_coverage_verified_count == .markets.usdm.symbol_count
 and .markets.usdm.all_stream_coverage_verified == true

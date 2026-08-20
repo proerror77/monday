@@ -941,13 +941,18 @@ installed binary SHA, archives the prior `release.json` as
 `deployment_bundle_*` fields and `deployment_source_revision` of `release.json`.
 The binary is never replaced in this mode.
 
-The committed shadow environments use `SYMBOLS=ALL`, five-minute segments, the
-isolated spools below, and isolated OSS datasets:
+The committed shadow environments use `SYMBOLS=ALL` for Spot and the same
+frozen 100-symbol USD-M production allowlist for Futures. Both keep five-minute
+segments, isolated spools, and isolated OSS datasets:
 
 | Market | Shadow spool | Shadow dataset |
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
 | USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+
+The dataset and shard identifiers remain the canonical lane names; every
+manifest's explicit symbol list and catalog digest are the authority for its
+actual membership.
 
 The sealed-triplet preflight binds candidate source/bundle/build identity and
 independently verifies one or more latest Spot and USD-M data/manifest/`_SUCCESS`
@@ -988,7 +993,7 @@ trade for a static symbol. Every segment must still contain at least one real
 `agg_trade` for its market dataset, and a v2 segment must additionally carry
 `raw_trade` and `book_ticker` events for the same scope.
 
-### 2. Run the short full-catalog gate
+### 2. Run the short production-catalog gate
 
 Start the gate through the same CLI wrapper:
 
@@ -1001,11 +1006,12 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 ```
 
 The host gate owns only the runtime transition. A failed Gate blocks cutover,
-not Code, CI, Merge, or immutable Release publication. It verifies the candidate
-and `SYMBOLS=ALL`, creates a fresh spool under
+not Code, CI, Merge, or immutable Release publication. It verifies the candidate,
+Spot `SYMBOLS=ALL`, and the exact frozen 100-symbol USD-M production allowlist,
+then creates a fresh spool under
 `/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
 both units with `SEGMENT_SECONDS=120`, waits at most 180 seconds for initial
-full-catalog health, freezes both session IDs and catalog digests, and then uses
+configured-catalog health, freezes both session IDs and catalog digests, and then uses
 monotonic time to observe at least 240 seconds. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
 that run's spool and cannot block the next Gate; files already uploaded and
@@ -1013,7 +1019,7 @@ cleaned retain their OSS triplet evidence instead of a duplicate local copy.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;
-- Spot has at least 1,000 symbols and USD-M at least 400;
+- Spot has at least 1,000 symbols and USD-M has exactly the configured 100 symbols;
 - every discovered symbol has a ready two-sided snapshot, exact WebSocket stream
   coverage is verified, and sequence gaps remain zero;
 - neither session nor catalog membership changes, health never stops advancing
@@ -1051,7 +1057,7 @@ binary is still a regular file instead of a digest-addressed symlink, use
 `host-rust-lob-adopt-production-release.sh` through Cloud Assistant before the
 cutover. Pin both the running binary digest and the already gated candidate
 digest. The helper never starts, stops, restarts, enables, or disables a unit.
-It verifies fresh full-catalog production health and stable PIDs/restart counts,
+It verifies fresh configured-catalog production health and stable PIDs/restart counts,
 copies the byte-identical running binary and current rollback assets into an
 adopted release, installs an inactive/non-installable rollback-compatibility
 upload unit, atomically replaces the regular path with the identical release
@@ -1076,7 +1082,7 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 ```
 
 The host cutover revalidates the binary, release metadata, staged deployment
-files, gate JSON, marker hash, duration, full-catalog counts, and OSS round trips.
+files, gate JSON, marker hash, duration, configured-catalog counts, and OSS round trips.
 Only then does it disable and stop the current production units. After production
 is stopped, it installs the target production unit/env files. Deleted legacy
 Python instance units must be inactive and disabled before the transition; they
@@ -1088,7 +1094,7 @@ against the canonical production env, so the first upgrade does not depend on
 the old production binary supporting `--upload-only`. A new host is accepted
 only when the canonical spool contains no segment artifact. The script then
 atomically changes the production symlink and starts both services without
-enabling them. It verifies fresh full-catalog health, no warnings, zero restarts,
+enabling them. It verifies fresh configured-catalog health, no warnings, zero restarts,
 and each process's `/proc/<pid>/exe` resolving to the requested release; only a
 verified candidate is enabled for reboot.
 
@@ -1145,7 +1151,7 @@ Before starting anything the host restore requires all of the following:
    `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
 
 The restore then clears stale health, starts the production units while disabled,
-waits for fresh full-catalog health written after the restart with a new session
+waits for fresh configured-catalog health written after the restart with a new session
 and zero restarts, verifies each `/proc/<pid>/exe` still resolves to the
 candidate release, enables production for reboot, and re-verifies health. A
 unique recovery evidence directory is created under

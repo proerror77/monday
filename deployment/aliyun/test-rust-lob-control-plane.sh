@@ -17,6 +17,8 @@ LOB_ARCHIVER="$SCRIPT_DIR/../../rust_hft/tools/collector/src/lob_archiver.rs"
 ACR_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 POLICY="$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq"
 RUNTIME_POLICY="$SCRIPT_DIR/rust-lob-runtime-health-policy.jq"
+SHADOW_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-rust-usdm.env"
+PRODUCTION_USDM_ENV="$SCRIPT_DIR/binance-lob-archiver-production-usdm.env"
 LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1090,SC1091
 . "$LIB"
@@ -103,6 +105,32 @@ grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
 grep -Fq 'readonly HEALTH_SETTLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
 grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
+shadow_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
+production_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$PRODUCTION_USDM_ENV")
+[[ $shadow_usdm_symbols == "$production_usdm_symbols" ]] || {
+  printf 'shadow and production USD-M symbol lists differ\n' >&2
+  exit 1
+}
+IFS=, read -r -a usdm_symbols <<<"$shadow_usdm_symbols"
+[[ ${#usdm_symbols[@]} -eq 100 ]] || {
+  printf 'USD-M catalog is not exactly 100 symbols\n' >&2
+  exit 1
+}
+[[ $(printf '%s\n' "${usdm_symbols[@]}" | sort -u | wc -l) -eq 100 ]] || {
+  printf 'USD-M catalog contains duplicate symbols\n' >&2
+  exit 1
+}
+cutover_symbol_validator=$(sed -n '/^is_usdm_top100()/,/^}/p' "$CUTOVER")
+eval "$cutover_symbol_validator"
+is_usdm_top100 "$shadow_usdm_symbols"
+if is_usdm_top100 ALL; then
+  printf 'cutover accepted SYMBOLS=ALL as the candidate USD-M scope\n' >&2
+  exit 1
+fi
+grep -Fq 'min_symbols[usdm]=100' "$GATE"
+grep -Fq 'and .markets.usdm.symbol_count == 100' "$POLICY"
+grep -Fq '"$CANDIDATE_STARTED_NS" 100' "$CUTOVER"
+grep -Fq '"$OLD_USDM_MINIMUM_SYMBOLS"' "$CUTOVER"
 grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
 grep -Fq 'install -d -m 0755 -o root -g root' "$GATE"
 grep -Fq '"$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"' "$GATE"
@@ -457,15 +485,15 @@ market_json=$(jq -cn \
        lob_min_bid_levels:1,lob_min_ask_levels:1}
     ]}')
 usdm_market=$(jq -c '
-  .symbol_count = 500
-  | .snapshot_ready_count = 500
-  | .bridged_count = 500
-  | .stream_coverage_verified_count = 500
+  .symbol_count = 100
+  | .snapshot_ready_count = 100
+  | .bridged_count = 100
+  | .stream_coverage_verified_count = 100
   | .stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]
   | .force_order_count = 2
   | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-      | .stream_coverage_verified_count = 500
+      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+      | .stream_coverage_verified_count = 100
       | .force_order_count = 1)' \
   <<<"$market_json")
 jq -n \
@@ -511,13 +539,13 @@ v1_market=$(jq -c '
       del(.raw_trade_count, .book_ticker_count, .force_order_count))' \
   <<<"$market_json")
 v1_usdm_market=$(jq -c '
-  .symbol_count = 500
-  | .snapshot_ready_count = 500
-  | .bridged_count = 500
-  | .stream_coverage_verified_count = 500
+  .symbol_count = 100
+  | .snapshot_ready_count = 100
+  | .bridged_count = 100
+  | .stream_coverage_verified_count = 100
   | .oss_roundtrip_evidence |= map(
-      .lob_declared_symbol_count = 500 | .lob_covered_symbol_count = 500
-      | .stream_coverage_verified_count = 500)' \
+      .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
+      | .stream_coverage_verified_count = 100)' \
   <<<"$v1_market")
 jq -n \
   --arg artifact "$artifact" \

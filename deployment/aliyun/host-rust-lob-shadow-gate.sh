@@ -153,17 +153,26 @@ env_value() {
   printf '%s\n' "$value"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 readonly -a markets=(spot usdm)
 declare -A env_file base_spool_dir spool_dir override_file dataset shard_id
 declare -A oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
-declare -A min_symbols unit expected_stream_types
+declare -A configured_symbols min_symbols unit expected_stream_types
 for market in "${markets[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
   [[ $(env_value "${env_file[$market]}" MARKET) == "$market" ]] \
     || die "${env_file[$market]} has the wrong MARKET"
-  [[ $(env_value "${env_file[$market]}" SYMBOLS) == ALL ]] \
-    || die "${env_file[$market]} must set SYMBOLS=ALL"
+  configured_symbols[$market]=$(env_value "${env_file[$market]}" SYMBOLS)
   shard_id[$market]=$(env_value "${env_file[$market]}" SHARD_ID)
   [[ ${shard_id[$market]} == all ]] || die "${env_file[$market]} must set SHARD_ID=all"
   base_spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
@@ -185,6 +194,10 @@ for market in "${markets[@]}"; do
     || die "${env_file[$market]} must use the ECS RAM-role profile"
   unit[$market]="binance-lob-archiver-rust@${market}.service"
 done
+[[ ${configured_symbols[spot]} == ALL ]] \
+  || die "${env_file[spot]} must set SYMBOLS=ALL"
+is_usdm_top100 "${configured_symbols[usdm]}" \
+  || die "${env_file[usdm]} must set 100 unique explicit symbols"
 
 for asset in \
   binance-lob-archiver-rust@.service \
@@ -200,6 +213,11 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
+candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
+secure_regular_file "$candidate_production_usdm_env"
+[[ $(env_value "$candidate_production_usdm_env" SYMBOLS) \
+  == "${configured_symbols[usdm]}" ]] \
+  || die 'USD-M shadow and production symbol lists differ'
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
@@ -209,7 +227,7 @@ done
 [[ ${dataset[usdm]} == usdm_perpetual_all_rust_shadow ]] \
   || die 'USD-M shadow dataset is not isolated'
 min_symbols[spot]=1000
-min_symbols[usdm]=400
+min_symbols[usdm]=100
 # A v2 tape candidate declares this exact per-symbol stream-type list in its
 # manifest and every session_start row (sorted); forceOrder is USD-M only. A
 # v1 candidate keeps the legacy depth@100ms+aggTrade pair and must not carry

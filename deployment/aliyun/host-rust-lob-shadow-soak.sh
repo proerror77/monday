@@ -275,16 +275,25 @@ env_value() {
   printf '%s\n' "$value"
 }
 
+is_usdm_top100() {
+  local value=$1 unique
+  local -a symbols
+  [[ $value =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || return 1
+  IFS=, read -r -a symbols <<<"$value"
+  (( ${#symbols[@]} == 100 )) || return 1
+  unique=$(printf '%s\n' "${symbols[@]}" | sort -u | wc -l)
+  (( unique == 100 ))
+}
+
 evidence_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 declare -A env_file base_spool_dir spool_dir override_file dataset shard_id oss_bucket oss_endpoint oss_region
-declare -A aliyun_profile oss_copy_timeout unit min_symbols expected_stream_types
+declare -A aliyun_profile oss_copy_timeout configured_symbols unit min_symbols expected_stream_types
 for market in "${MARKETS[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
   [[ $(env_value "${env_file[$market]}" MARKET) == "$market" ]] \
     || die "${env_file[$market]} has the wrong MARKET"
-  [[ $(env_value "${env_file[$market]}" SYMBOLS) == ALL ]] \
-    || die "${env_file[$market]} must set SYMBOLS=ALL"
+  configured_symbols[$market]=$(env_value "${env_file[$market]}" SYMBOLS)
   shard_id[$market]=$(env_value "${env_file[$market]}" SHARD_ID)
   [[ ${shard_id[$market]} == all ]] || die "${env_file[$market]} must set SHARD_ID=all"
   base_spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
@@ -308,8 +317,12 @@ for market in "${MARKETS[@]}"; do
     || die "${env_file[$market]} must use the ECS RAM-role profile"
   unit[$market]="binance-lob-archiver-rust@${market}.service"
 done
+[[ ${configured_symbols[spot]} == ALL ]] \
+  || die "${env_file[spot]} must set SYMBOLS=ALL"
+is_usdm_top100 "${configured_symbols[usdm]}" \
+  || die "${env_file[usdm]} must set 100 unique explicit symbols"
 min_symbols[spot]=1000
-min_symbols[usdm]=400
+min_symbols[usdm]=100
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
 expected_stream_types[usdm]='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
 
