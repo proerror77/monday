@@ -590,6 +590,7 @@ health_passes() {
   jq -e \
     --arg market "$market" \
     --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson gate_started_ns "$gate_started_ns" \
     '.market == $market
@@ -599,7 +600,11 @@ health_passes() {
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number"
       and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
@@ -639,7 +644,7 @@ while ! health_passes spot || ! health_passes usdm; do
   sleep 10
 done
 
-declare -A observed_session frozen_symbol_count frozen_catalog_sha256
+declare -A observed_session frozen_symbol_count frozen_catalog_sha256 configured_catalog_sha256
 declare -A initial_upload_failure_count last_health_updated_ns health_samples
 declare -A last_health_advance_mono max_health_silence_seconds
 for market in "${markets[@]}"; do
@@ -647,6 +652,13 @@ for market in "${markets[@]}"; do
   observed_session[$market]=$(jq -er '.session_id' "$health")
   frozen_symbol_count[$market]=$(jq -er '.symbol_count' "$health")
   frozen_catalog_sha256[$market]=$(health_catalog_sha256 "$market")
+  if [[ $market == usdm ]]; then
+    configured_catalog_sha256[$market]=$(jq -cn \
+      --arg symbols "${configured_symbols[$market]}" \
+      '$symbols | split(",") | sort' | sha256sum | awk '{print $1}')
+  else
+    configured_catalog_sha256[$market]=${frozen_catalog_sha256[$market]}
+  fi
   initial_upload_failure_count[$market]=$(jq -er '.upload_failure_count' "$health")
   last_health_updated_ns[$market]=$(jq -er '.updated_at_ns' "$health")
   last_health_advance_mono[$market]=$(monotonic_seconds)
@@ -1208,7 +1220,9 @@ for market in "${markets[@]}"; do
     --arg dataset "${dataset[$market]}" \
     --arg session_id "${observed_session[$market]}" \
     --arg tape_schema "$tape_schema" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --arg catalog_sha256 "${frozen_catalog_sha256[$market]}" \
+    --arg configured_catalog_sha256 "${configured_catalog_sha256[$market]}" \
     --arg health_sha256 "${health_sha256[$market]}" \
     --argjson symbol_count "${symbol_count[$market]}" \
     --argjson snapshot_ready_count "${snapshot_ready_count[$market]}" \
@@ -1227,7 +1241,8 @@ for market in "${markets[@]}"; do
     --argjson oss_round_trips "$round_trips" \
     '{market:$market,unit:$unit,dataset:$dataset,session_id:$session_id,
       tape_schema:$tape_schema,
-      symbols_config:"ALL",catalog_sha256:$catalog_sha256,
+      symbols_config:$symbols_config,catalog_sha256:$catalog_sha256,
+      configured_catalog_sha256:$configured_catalog_sha256,
       symbol_count:$symbol_count,snapshot_ready_count:$snapshot_ready_count,
       stream_coverage_verified_count:$stream_coverage_verified_count,
       all_stream_coverage_verified:($stream_coverage_verified_count == $symbol_count),

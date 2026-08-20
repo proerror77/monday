@@ -547,13 +547,18 @@ health_passes() {
   [[ -f $health && ! -L $health ]] || return 1
   jq -e \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     '.market == $market and .dataset == $dataset
       and .updated_at_ns >= $started_ns and .status == "synced"
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number" and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
@@ -580,6 +585,7 @@ write_health_validation_failure() {
   fi
   jq -c \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     'def check($name; $ok; $actual; $expected):
@@ -595,8 +601,13 @@ write_health_validation_failure() {
        check("symbol_count_type"; (.symbol_count|type) == "number"; .symbol_count; "number"),
        check("symbol_count_integer"; (.symbol_count|type) == "number" and .symbol_count == (.symbol_count|floor);
          .symbol_count; "integer"),
-       check("minimum_symbols"; (.symbol_count|type) == "number" and .symbol_count >= $minimum_symbols;
-         .symbol_count; $minimum_symbols),
+       check("symbol_scope"; (.symbol_count|type) == "number"
+         and (if $market == "usdm" then .symbol_count == $minimum_symbols
+           else .symbol_count >= $minimum_symbols end);
+         .symbol_count; {market:$market,minimum:$minimum_symbols}),
+       check("symbol_membership"; $market != "usdm"
+         or ((.symbols | keys | sort) == ($symbols_config | split(",") | sort));
+         (.symbols | keys | sort); ($symbols_config | split(",") | sort)),
        check("snapshot_ready_count_type"; (.snapshot_ready_count|type) == "number";
          .snapshot_ready_count; "number"),
        check("snapshot_ready_count_integer"; (.snapshot_ready_count|type) == "number" and .snapshot_ready_count == (.snapshot_ready_count|floor);
@@ -715,6 +726,7 @@ health_recovery_safety_passes() {
   [[ -f $health && ! -L $health ]] || return 1
   jq -e \
     --arg market "$market" --arg dataset "${dataset[$market]}" \
+    --arg symbols_config "${configured_symbols[$market]}" \
     --argjson minimum_symbols "${min_symbols[$market]}" \
     --argjson started_ns "$start_ns" \
     '.market == $market and .dataset == $dataset
@@ -722,7 +734,11 @@ health_recovery_safety_passes() {
       and (.status == "syncing" or .status == "reconnecting" or .status == "synced")
       and .sequence_gaps == 0
       and (.symbol_count | type) == "number" and .symbol_count == (.symbol_count | floor)
-      and .symbol_count >= $minimum_symbols
+      and (if $market == "usdm" then .symbol_count == $minimum_symbols
+        else .symbol_count >= $minimum_symbols end)
+      and (if $market == "usdm"
+        then (.symbols | keys | sort) == ($symbols_config | split(",") | sort)
+        else true end)
       and (.snapshot_ready_count | type) == "number"
       and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count >= 0 and .snapshot_ready_count <= .symbol_count

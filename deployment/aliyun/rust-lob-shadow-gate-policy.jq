@@ -21,6 +21,7 @@ and .duration_seconds >= 240
 and (.markets.spot.symbol_count | type) == "number"
 and .markets.spot.symbol_count == (.markets.spot.symbol_count | floor)
 and .markets.spot.symbol_count >= 1000
+and .markets.spot.symbols_config == "ALL"
 and .markets.spot.snapshot_ready_count == .markets.spot.symbol_count
 and .markets.spot.stream_coverage_verified_count == .markets.spot.symbol_count
 and .markets.spot.all_stream_coverage_verified == true
@@ -36,6 +37,7 @@ and .markets.spot.max_health_silence_seconds >= 0
 and .markets.spot.max_health_silence_seconds <= 120
 and (.markets.spot.catalog_sha256 | type) == "string"
 and (.markets.spot.catalog_sha256 | test("^[a-f0-9]{64}$"))
+and .markets.spot.configured_catalog_sha256 == .markets.spot.catalog_sha256
 and (.markets.spot.session_id | type) == "string"
 and (.markets.spot.session_id | length) > 0
 and (.markets.spot.oss_roundtrips | type) == "number"
@@ -118,6 +120,10 @@ and (.markets.spot.oss_roundtrip_evidence as $round_trips
 and (.markets.usdm.symbol_count | type) == "number"
 and .markets.usdm.symbol_count == (.markets.usdm.symbol_count | floor)
 and .markets.usdm.symbol_count == 100
+and (.markets.usdm.symbols_config | type) == "string"
+and (.markets.usdm.symbols_config | test("^[A-Z0-9]+(,[A-Z0-9]+)*$"))
+and (.markets.usdm.symbols_config | split(",") | length) == 100
+and (.markets.usdm.symbols_config | split(",") | unique | length) == 100
 and .markets.usdm.snapshot_ready_count == .markets.usdm.symbol_count
 and .markets.usdm.stream_coverage_verified_count == .markets.usdm.symbol_count
 and .markets.usdm.all_stream_coverage_verified == true
@@ -133,6 +139,7 @@ and .markets.usdm.max_health_silence_seconds >= 0
 and .markets.usdm.max_health_silence_seconds <= 120
 and (.markets.usdm.catalog_sha256 | type) == "string"
 and (.markets.usdm.catalog_sha256 | test("^[a-f0-9]{64}$"))
+and .markets.usdm.configured_catalog_sha256 == .markets.usdm.catalog_sha256
 and (.markets.usdm.session_id | type) == "string"
 and (.markets.usdm.session_id | length) > 0
 and (.markets.usdm.oss_roundtrips | type) == "number"

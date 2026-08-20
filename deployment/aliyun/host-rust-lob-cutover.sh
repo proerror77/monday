@@ -705,6 +705,11 @@ jq -e \
   --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
   -f "$GATE_POLICY" "$GATE_JSON" >/dev/null \
   || fail 'candidate shadow gate does not meet production thresholds'
+GATE_USDM_SYMBOLS=$(jq -er '.markets.usdm.symbols_config' "$GATE_JSON")
+CANDIDATE_USDM_SYMBOLS=$(env_value \
+  "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env" SYMBOLS)
+[[ $GATE_USDM_SYMBOLS == "$CANDIDATE_USDM_SYMBOLS" ]] \
+  || fail 'candidate shadow gate USD-M symbols differ from the deployment bundle'
 install -d -m 0750 "$EVIDENCE_DIR/shadow-gate"
 install -m 0640 "$GATE_JSON" "$EVIDENCE_DIR/shadow-gate/gate.json"
 install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"

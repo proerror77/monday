@@ -207,7 +207,9 @@ capture_health_state() {
       | select(.status == "synced")
       | select(.updated_at_ns | type == "number" and floor == . and . > 0)
       | select(.session_id | type == "string" and length > 0)
-      | select(.symbol_count | type == "number" and floor == . and . >= $minimum_symbols)
+      | select(.symbol_count | type == "number" and floor == .
+          and (if $market == "usdm" and $minimum_symbols == 100
+            then . == 100 else . >= $minimum_symbols end))
       | select(.snapshot_ready_count == .symbol_count)
       | select(.sequence_gaps | type == "number" and floor == . and . >= 0)
       | select(.pending_upload_segments == 0)
@@ -258,12 +260,13 @@ atomic_install() {
 }
 
 verify_candidate_release() {
-  local markers marker marker_entry gate_dir gate_json gate_policy
+  local markers marker marker_entry gate_dir gate_json gate_policy candidate_usdm_env
   CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
   CANDIDATE_BINARY="$CANDIDATE_RELEASE/binance-lob-archiver"
   CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
   CANDIDATE_METADATA="$CANDIDATE_RELEASE/release.json"
   CANDIDATE_UPLOAD="$CANDIDATE_DEPLOYMENT/binance-lob-archiver-upload@.service"
+  candidate_usdm_env="$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env"
   gate_policy="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
   for path in "$CANDIDATE_RELEASE" "$CANDIDATE_DEPLOYMENT"; do
     secure_direct_directory "$path" \
@@ -276,6 +279,7 @@ verify_candidate_release() {
     || die 'candidate binary digest does not match its release path'
   require_secure_file "$CANDIDATE_METADATA"
   require_secure_file "$CANDIDATE_UPLOAD"
+  require_secure_file "$candidate_usdm_env"
   require_secure_file "$gate_policy"
   require_line "$CANDIDATE_UPLOAD" 'AssertPathIsMountPoint=/data'
   require_line "$CANDIDATE_UPLOAD" \
@@ -327,6 +331,9 @@ verify_candidate_release() {
     --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     -f "$gate_policy" "$gate_json" >/dev/null \
     || die 'candidate gate is not production eligible'
+  [[ $(jq -er '.markets.usdm.symbols_config' "$gate_json") \
+    == "$(env_value "$candidate_usdm_env" SYMBOLS)" ]] \
+    || die 'candidate gate USD-M symbols differ from the candidate production scope'
 }
 
 validate_existing_adoption() {
