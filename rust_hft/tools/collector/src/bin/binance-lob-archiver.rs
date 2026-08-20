@@ -2042,7 +2042,14 @@ fn process_event(
             info!(reason, "websocket shard reconnecting");
         }
         Event::StreamReconnected { streams } => {
-            info!(streams = ?streams, "websocket shard connection restored; awaiting market data");
+            let reconnecting_before = !process_state.streams_healthy();
+            for stream in &streams {
+                process_state.mark_stream_observed(stream);
+            }
+            info!(streams = ?streams, "websocket shard subscription proof restored");
+            if reconnecting_before && process_state.streams_healthy() {
+                return Ok(ProcessAction::RestartSession);
+            }
         }
         Event::RotationBarrier { .. } => {
             anyhow::bail!("rotation barrier reached normal event processing");
@@ -8441,7 +8448,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_trade_reconnect_requires_a_new_capture_session() {
+    fn subscription_proven_reconnect_requires_a_new_capture_session() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
         config.spool_dir = root.path().to_path_buf();
@@ -8452,6 +8459,7 @@ mod tests {
         )]);
         let mut budget = PendingBudget::new(1);
         let mut process_state = trusted_process_state(&config.symbols);
+        let streams = vec!["btcusdt@bookTicker".into(), "ethusdt@bookTicker".into()];
         assert_eq!(
             process_event(
                 &config,
@@ -8460,7 +8468,7 @@ mod tests {
                 &mut budget,
                 "session-1",
                 Event::StreamDisconnected {
-                    streams: vec!["btcusdt@aggTrade".into()],
+                    streams: streams.clone(),
                     reason: "test".into(),
                 },
                 &mut process_state,
@@ -8471,15 +8479,19 @@ mod tests {
         assert!(!segment.is_replay_safe());
 
         assert_eq!(
-            archive_first_btc_aggregate_trade(
+            process_event(
                 &config,
                 &mut segment,
                 &mut states,
                 &mut budget,
+                "session-1",
+                Event::StreamReconnected { streams },
                 &mut process_state,
-            ),
+            )
+            .unwrap(),
             ProcessAction::RestartSession
         );
+        assert!(process_state.streams_healthy());
     }
 
     #[tokio::test]
