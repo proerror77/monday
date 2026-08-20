@@ -521,13 +521,13 @@ impl Config {
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/stream?streams={trades}"
+                                    "wss://fstream.binance.com/public/stream?streams={trades}"
                                 ),
                                 streams: trade_streams,
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/stream?streams={book_tickers}"
+                                    "wss://fstream.binance.com/public/stream?streams={book_tickers}"
                                 ),
                                 streams: book_ticker_streams,
                             },
@@ -5625,8 +5625,8 @@ mod tests {
                 "wss://fstream.binance.com/public/stream",
             ),
             ("btcusdt@aggTrade", "wss://fstream.binance.com/market/stream"),
-            ("btcusdt@trade", "wss://fstream.binance.com/stream"),
-            ("btcusdt@bookTicker", "wss://fstream.binance.com/stream"),
+            ("btcusdt@trade", "wss://fstream.binance.com/public/stream"),
+            ("btcusdt@bookTicker", "wss://fstream.binance.com/public/stream"),
             (
                 "btcusdt@forceOrder",
                 "wss://fstream.binance.com/market/stream",
