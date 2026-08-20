@@ -147,12 +147,44 @@ publish_verified_file() {
   publish_source=$2
   publish_destination=$3
   publish_expected_sha=$4
+  publish_temporary=$publish_destination.$$.tmp
   [ -f "$publish_source" ] || die "$publish_label source is missing: $publish_source"
   [ "$(sha256_file "$publish_source")" = "$publish_expected_sha" ] || die "$publish_label source SHA mismatch"
   [ ! -e "$publish_destination" ] || die "$publish_label destination already exists: $publish_destination"
-  cp "$publish_source" "$publish_destination"
+  [ ! -e "$publish_temporary" ] || die "$publish_label temporary destination already exists: $publish_temporary"
+  if ! cp "$publish_source" "$publish_temporary"; then
+    rm -f "$publish_temporary"
+    die "$publish_label temporary publish failed"
+  fi
+  if [ "$(sha256_file "$publish_temporary")" != "$publish_expected_sha" ]; then
+    rm -f "$publish_temporary"
+    die "$publish_label temporary readback SHA mismatch"
+  fi
+  if ! mv "$publish_temporary" "$publish_destination"; then
+    rm -f "$publish_temporary"
+    die "$publish_label promotion failed"
+  fi
   [ -f "$publish_destination" ] || die "$publish_label was not published: $publish_destination"
   [ "$(sha256_file "$publish_destination")" = "$publish_expected_sha" ] || die "$publish_label published readback SHA mismatch"
+}
+
+rewrite_materialization_artifact_path() {
+  rewrite_source=$1
+  rewrite_expected_path=$2
+  rewrite_published_path=$3
+  rewrite_output=$4
+  observed_path=$(json_string_field artifact_path "$rewrite_source")
+  [ "$observed_path" = "$rewrite_expected_path" ] || die "materialization report does not bind its local feature artifact"
+  awk -v published="$rewrite_published_path" '
+    /^[[:space:]]*"artifact_path":/ {
+      count += 1
+      printf "  \"artifact_path\": \"%s\",\n", published
+      next
+    }
+    { print }
+    END { if (count != 1) exit 1 }
+  ' "$rewrite_source" >"$rewrite_output" || die "materialization report artifact path rewrite failed"
+  [ "$(json_string_field artifact_path "$rewrite_output")" = "$rewrite_published_path" ] || die "materialization report published artifact path mismatch"
 }
 
 triplet_paths() {
@@ -472,6 +504,15 @@ materialization_sha=$(json_string_field report_sha256 "$pit_stdout")
 [ -f "$materialization_path" ] || die "materialization report is missing: $materialization_path"
 [ "$(sha256_file "$feature_path")" = "$feature_sha" ] || die "feature artifact readback SHA mismatch"
 [ "$(sha256_file "$materialization_path")" = "$materialization_sha" ] || die "materialization report readback SHA mismatch"
+feature_publish_path=$(published_path_for "$feature_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "feature artifact")
+rewritten_materialization=$STATE_ROOT/materialization-published-path.json
+rewrite_materialization_artifact_path "$materialization_path" "$feature_path" "$feature_publish_path" "$rewritten_materialization"
+materialization_sha=$(sha256_file "$rewritten_materialization")
+materialization_rewritten_path=$LOCAL_MATERIALIZATION_DIR/$materialization_sha.materialization.json
+[ ! -e "$materialization_rewritten_path" ] || die "rewritten materialization report already exists: $materialization_rewritten_path"
+mv "$rewritten_materialization" "$materialization_rewritten_path"
+rm -f "$materialization_path"
+materialization_path=$materialization_rewritten_path
 
 replay_stdout=$STATE_ROOT/replay-materializer.json
 set -- "$REPLAY_BIN" \
@@ -499,7 +540,6 @@ replay_artifact_path=$LOCAL_REPLAY_DIR/$replay_artifact_rel
 [ "$(sha256_file "$replay_artifact_path")" = "$replay_artifact_sha" ] || die "replay artifact readback SHA mismatch"
 [ "$(sha256_file "$replay_manifest_path")" = "$replay_manifest_sha" ] || die "replay manifest readback SHA mismatch"
 
-feature_publish_path=$(published_path_for "$feature_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "feature artifact")
 materialization_publish_path=$(published_path_for "$materialization_path" "$LOCAL_MATERIALIZATION_DIR" "$MATERIALIZATION_DIR" "materialization report")
 replay_artifact_publish_path=$(published_path_for "$replay_artifact_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay artifact")
 replay_manifest_publish_path=$(published_path_for "$replay_manifest_path" "$LOCAL_REPLAY_DIR" "$REPLAY_DIR" "replay manifest")

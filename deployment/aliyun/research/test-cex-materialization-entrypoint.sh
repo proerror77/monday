@@ -194,9 +194,13 @@ RUN_ROOT=$OUT_ROOT/test-run-1
 [ -f "$RUN_ROOT/receipts/materialization-receipt.json" ]
 [ -f "$RUN_ROOT/receipts/frozen-inventory.env" ]
 [ -f "$RUN_ROOT/artifacts/materialization/feature-test.jsonl" ]
-[ -f "$RUN_ROOT/artifacts/materialization/materialization-test.materialization.json" ]
 [ -f "$RUN_ROOT/artifacts/replay/replay-test.parquet" ]
 [ -f "$RUN_ROOT/artifacts/replay/replay-test.canonical-manifest.json" ]
+published_report=$(find "$RUN_ROOT/artifacts/materialization" -maxdepth 1 -type f -name '*.materialization.json')
+[ -n "$published_report" ]
+published_report_sha=$(sha256sum "$published_report" | awk '{print $1}')
+[ "$(basename "$published_report")" = "$published_report_sha.materialization.json" ]
+grep -q "\"artifact_path\": \"$RUN_ROOT/artifacts/materialization/feature-test.jsonl\"" "$published_report"
 if find "$RUN_ROOT" -type f -name '*.reference.*' | grep -q .; then
   printf 'local reference evidence was unexpectedly published\n' >&2
   exit 1
