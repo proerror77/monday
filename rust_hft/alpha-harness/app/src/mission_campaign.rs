@@ -40,6 +40,13 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_CAMPAIGN_RESULT_BYTES: u64 = 1024 * 1024;
 const MAX_RESULT_BUNDLE_FILES: usize = 256;
 
+fn declared_total_trials_for_rounds(round_count: usize) -> anyhow::Result<usize> {
+    crate::mission_render::max_candidates_for_tests()
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(round_count))
+        .context("campaign declared_total_trials overflowed")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CampaignRequest {
@@ -634,10 +641,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
         None,
         None,
     )?;
-    let declared_total_trials = crate::mission_render::max_candidates_for_tests()
-        .checked_mul(2)
-        .and_then(|count| count.checked_mul(args.seeds.len()))
-        .context("campaign declared_total_trials overflowed")?;
+    let declared_total_trials = declared_total_trials_for_rounds(args.seeds.len())?;
     let probe_seed = *args
         .seeds
         .first()
@@ -1135,10 +1139,7 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if request.rounds.len() < 2 {
         bail!("campaign request must declare at least two rounds");
     }
-    let per_round_trials = crate::mission_render::max_candidates_for_tests() * 2;
-    let minimum_total_trials = per_round_trials
-        .checked_mul(request.rounds.len())
-        .context("campaign total trials overflowed")?;
+    let minimum_total_trials = declared_total_trials_for_rounds(request.rounds.len())?;
     if request.declared_total_trials < minimum_total_trials {
         bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
@@ -1231,10 +1232,7 @@ fn build_request_from_parts(
         replay_manifest_url: replay_manifest_url.to_string(),
         replay_manifest_sha256: replay_manifest_sha256.to_string(),
         holdout_id: holdout_id.to_string(),
-        declared_total_trials: crate::mission_render::max_candidates_for_tests()
-            .checked_mul(2)
-            .and_then(|count| count.checked_mul(seeds.len()))
-            .context("campaign declared_total_trials overflowed")?,
+        declared_total_trials: declared_total_trials_for_rounds(seeds.len())?,
         rounds: seeds
             .iter()
             .enumerate()
@@ -1654,10 +1652,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
     if request.rounds.len() < 2 {
         bail!("campaign request must declare at least two rounds");
     }
-    let per_round_trials = crate::mission_render::max_candidates_for_tests() * 2;
-    let minimum_total_trials = per_round_trials
-        .checked_mul(request.rounds.len())
-        .context("campaign total trials overflowed")?;
+    let minimum_total_trials = declared_total_trials_for_rounds(request.rounds.len())?;
     if request.declared_total_trials < minimum_total_trials {
         bail!("campaign declared_total_trials is below the minimum multi-round trial family");
     }
@@ -1854,7 +1849,7 @@ mod tests {
     #[test]
     fn validate_request_rejects_underdeclared_total_trials() {
         let mut request = valid_request();
-        request.declared_total_trials = crate::mission_render::max_candidates_for_tests() * 2;
+        request.declared_total_trials = declared_total_trials_for_rounds(1).unwrap();
         request.campaign_id = expected_campaign_id(&request).unwrap();
         assert!(validate_request(&request).is_err());
     }
@@ -2430,9 +2425,10 @@ mod tests {
             result["producer_image_identity"],
             serde_json::json!(request.producer_image_identity)
         );
+        let declared_total_trials = declared_total_trials_for_rounds(2).unwrap();
         assert_eq!(result["rounds"].as_array().unwrap().len(), 2);
-        assert_eq!(result["declared_total_trials"], 64);
-        assert_eq!(result["consumed_trials"], 64);
+        assert_eq!(result["declared_total_trials"], declared_total_trials);
+        assert_eq!(result["consumed_trials"], declared_total_trials);
         for round in ["r1", "r2"] {
             let mission: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(
@@ -2441,7 +2437,10 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            assert_eq!(mission["spec"]["search"]["multiple_testing_trials"], 64);
+            assert_eq!(
+                mission["spec"]["search"]["multiple_testing_trials"],
+                declared_total_trials
+            );
             let subset: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(work_dir.join(format!(
                     "mission/{round}/execute/results/factor-subset-mcts-result.json"
@@ -2451,7 +2450,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 subset["selected"]["evaluation"]["evaluator_config"]["multiple_testing_trials"],
-                64
+                declared_total_trials
             );
         }
         assert!(result["selected_round_id"].is_string());
@@ -2693,7 +2692,7 @@ mod tests {
             replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
             replay_manifest_sha256: "4".repeat(64),
             holdout_id: "cex-holdout-test".to_string(),
-            declared_total_trials: crate::mission_render::max_candidates_for_tests() * 4,
+            declared_total_trials: declared_total_trials_for_rounds(2).unwrap(),
             rounds: vec![
                 CampaignRoundRequest {
                     round_id: "r1".to_string(),
@@ -2832,7 +2831,7 @@ mod tests {
             &render_fixture.feature_path,
             &render_fixture.materialization_path,
             7,
-            crate::mission_render::max_candidates_for_tests() * 4,
+            declared_total_trials_for_rounds(2).unwrap(),
         )
         .unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -2926,9 +2925,7 @@ mod tests {
             replay_manifest_sha256: crate::mission_runner::sha256_file(replay_manifest_path)
                 .unwrap(),
             holdout_id: holdout_id.to_string(),
-            declared_total_trials: crate::mission_render::max_candidates_for_tests()
-                * 2
-                * seeds.len(),
+            declared_total_trials: declared_total_trials_for_rounds(seeds.len()).unwrap(),
             rounds: seeds
                 .iter()
                 .enumerate()

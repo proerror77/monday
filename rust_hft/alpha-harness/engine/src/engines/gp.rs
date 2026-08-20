@@ -3,7 +3,9 @@ use crate::{
     evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, RemainingBudget,
 };
-use alpha_domain::{CandidateArtifact, CexGpPolicyV1, EngineKind, CEX_GP_POLICY_SCHEMA_V2};
+use alpha_domain::{
+    CandidateArtifact, CexGpPolicyV1, EngineKind, CEX_GP_POLICY_SCHEMA_V2, CEX_GP_POLICY_SCHEMA_V3,
+};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use std::collections::BTreeSet;
 
@@ -159,32 +161,22 @@ impl GeneticProgrammingEngine {
         let Some(policy) = &self.governed_policy else {
             return Ok(None);
         };
-        if policy.schema_version != CEX_GP_POLICY_SCHEMA_V2 || iteration_index == 0 {
+        if iteration_index == 0 {
             return Ok(None);
         }
         let template_index = iteration_index - 1;
-        let Some(field) = self.fields.get(template_index / 2) else {
-            return Ok(None);
+        let candidate = match policy.schema_version.as_str() {
+            CEX_GP_POLICY_SCHEMA_V2 => self.atomic_dynamic_template(template_index)?,
+            CEX_GP_POLICY_SCHEMA_V3 => self.dynamic_v3_template(template_index)?,
+            _ => None,
         };
-        let field = FactorAst::Terminal(FactorTerminal::Field(field.clone()));
-        let value = if template_index.is_multiple_of(2) {
-            FactorAst::call(FactorOperator::ZScore, vec![field, constant("20")])
-        } else {
-            FactorAst::call(
-                FactorOperator::ZScore,
-                vec![
-                    FactorAst::call(FactorOperator::Delta, vec![field, constant("5")])
-                        .map_err(|error| error.to_string())?,
-                    constant("20"),
-                ],
-            )
+        if let Some(candidate) = candidate {
+            policy
+                .validate_candidate(&candidate)
+                .map_err(|error| error.to_string())?;
+            return Ok(Some(candidate));
         }
-        .map_err(|error| error.to_string())?;
-        let candidate = thresholded_standard_signal(value)?;
-        policy
-            .validate_candidate(&candidate)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(candidate))
+        Ok(None)
     }
 
     fn remember(&mut self, ast: FactorAst, score: f64) {
@@ -298,8 +290,81 @@ impl ProposalEngine for GeneticProgrammingEngine {
     }
 }
 
+impl GeneticProgrammingEngine {
+    fn atomic_dynamic_template(&self, template_index: usize) -> Result<Option<FactorAst>, String> {
+        let Some(field) = self.fields.get(template_index / 2) else {
+            return Ok(None);
+        };
+        let value = if template_index.is_multiple_of(2) {
+            standardized_field(field)?
+        } else {
+            standardized_delta(field)?
+        };
+        Ok(Some(thresholded_standard_signal(value)?))
+    }
+
+    fn dynamic_v3_template(&self, template_index: usize) -> Result<Option<FactorAst>, String> {
+        let atomic_templates = self.fields.len() * 2;
+        if template_index < atomic_templates {
+            return self.atomic_dynamic_template(template_index);
+        }
+        let named_index = template_index - atomic_templates;
+        let candidate = match named_index {
+            0 => thresholded_standard_signal(negate(standardized_field("spread_bps")?)?)?,
+            1 => thresholded_standard_signal(negate(standardized_delta("spread_bps")?)?)?,
+            2 => directional_consensus_signal(
+                standardized_field("book_imbalance")?,
+                standardized_field("weighted_book_imbalance_top5")?,
+            )?,
+            3 => thresholded_signal(
+                standardized_field("weighted_book_imbalance_top5")?,
+                add_one_plus_one()?,
+            )?,
+            _ => return Ok(None),
+        };
+        Ok(Some(candidate))
+    }
+}
+
 fn constant(value: &str) -> FactorAst {
     FactorAst::Terminal(FactorTerminal::Constant(value.to_string()))
+}
+
+fn field_terminal(field: &str) -> FactorAst {
+    FactorAst::Terminal(FactorTerminal::Field(field.to_string()))
+}
+
+fn standardized_field(field: &str) -> Result<FactorAst, String> {
+    FactorAst::call(
+        FactorOperator::ZScore,
+        vec![field_terminal(field), constant("20")],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn standardized_delta(field: &str) -> Result<FactorAst, String> {
+    FactorAst::call(
+        FactorOperator::ZScore,
+        vec![
+            FactorAst::call(
+                FactorOperator::Delta,
+                vec![field_terminal(field), constant("5")],
+            )
+            .map_err(|error| error.to_string())?,
+            constant("20"),
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn negate(value: FactorAst) -> Result<FactorAst, String> {
+    FactorAst::call(FactorOperator::Mul, vec![constant("-1"), value])
+        .map_err(|error| error.to_string())
+}
+
+fn add_one_plus_one() -> Result<FactorAst, String> {
+    FactorAst::call(FactorOperator::Add, vec![constant("1"), constant("1")])
+        .map_err(|error| error.to_string())
 }
 
 fn thresholded_standard_signal(value: FactorAst) -> Result<FactorAst, String> {
@@ -327,9 +392,115 @@ fn thresholded_standard_signal(value: FactorAst) -> Result<FactorAst, String> {
     .map_err(|error| error.to_string())
 }
 
+fn thresholded_signal(value: FactorAst, threshold: FactorAst) -> Result<FactorAst, String> {
+    let negative_threshold =
+        FactorAst::call(FactorOperator::Sub, vec![constant("0"), threshold.clone()])
+            .map_err(|error| error.to_string())?;
+    FactorAst::call(
+        FactorOperator::IfElse,
+        vec![
+            FactorAst::call(FactorOperator::GreaterThan, vec![value.clone(), threshold])
+                .map_err(|error| error.to_string())?,
+            constant("1"),
+            FactorAst::call(
+                FactorOperator::IfElse,
+                vec![
+                    FactorAst::call(FactorOperator::LessThan, vec![value, negative_threshold])
+                        .map_err(|error| error.to_string())?,
+                    constant("-1"),
+                    constant("0"),
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn directional_consensus_signal(left: FactorAst, right: FactorAst) -> Result<FactorAst, String> {
+    let right_positive = right.clone();
+    FactorAst::call(
+        FactorOperator::IfElse,
+        vec![
+            FactorAst::call(
+                FactorOperator::GreaterThan,
+                vec![left.clone(), constant("1")],
+            )
+            .map_err(|error| error.to_string())?,
+            FactorAst::call(
+                FactorOperator::IfElse,
+                vec![
+                    FactorAst::call(
+                        FactorOperator::GreaterThan,
+                        vec![right_positive, constant("1")],
+                    )
+                    .map_err(|error| error.to_string())?,
+                    constant("1"),
+                    constant("0"),
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+            FactorAst::call(
+                FactorOperator::IfElse,
+                vec![
+                    FactorAst::call(FactorOperator::LessThan, vec![left, constant("-1")])
+                        .map_err(|error| error.to_string())?,
+                    FactorAst::call(
+                        FactorOperator::IfElse,
+                        vec![
+                            FactorAst::call(FactorOperator::LessThan, vec![right, constant("-1")])
+                                .map_err(|error| error.to_string())?,
+                            constant("-1"),
+                            constant("0"),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?,
+                    constant("0"),
+                ],
+            )
+            .map_err(|error| error.to_string())?,
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn governed_budget(max_candidates: usize) -> alpha_domain::SearchBudget {
+        alpha_domain::SearchBudget {
+            max_candidates,
+            max_expansions: 256,
+            max_tokens: 0,
+            max_seconds: 0,
+        }
+    }
+
+    fn governed_remaining(candidates: usize) -> RemainingBudget {
+        RemainingBudget {
+            candidates,
+            expansions: 256,
+            tokens: 0,
+            milliseconds: 0,
+        }
+    }
+
+    fn named_template_fields() -> Vec<String> {
+        [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
 
     fn evaluation(score: f64) -> CandidateEvaluation {
         CandidateEvaluation {
@@ -356,17 +527,31 @@ mod tests {
         }
     }
 
+    fn governed_templates(policy: CexGpPolicyV1, count: usize) -> Vec<CandidateArtifact> {
+        let mut engine = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+        let dataset = super::super::test_dataset();
+        let remaining = governed_remaining(count);
+        (1..=count)
+            .map(|iteration| {
+                engine
+                    .propose(
+                        "mission",
+                        iteration,
+                        &dataset.proposal_context(),
+                        &remaining,
+                    )
+                    .unwrap()
+                    .artifact
+            })
+            .collect()
+    }
+
     fn scores_change_candidates(
         mut left: GeneticProgrammingEngine,
         mut right: GeneticProgrammingEngine,
     ) -> bool {
         let dataset = super::super::test_dataset();
-        let remaining = RemainingBudget {
-            candidates: 8,
-            expansions: 256,
-            tokens: 0,
-            milliseconds: 0,
-        };
+        let remaining = governed_remaining(8);
         for iteration in 1..=8 {
             let context = dataset.proposal_context();
             let left_proposal = left
@@ -418,12 +603,7 @@ mod tests {
     #[test]
     fn governed_gp_does_not_observe_evaluation_scores() {
         let fields = vec!["book_imbalance".to_string(), "spread_bps".to_string()];
-        let budget = alpha_domain::SearchBudget {
-            max_candidates: 8,
-            max_expansions: 256,
-            max_tokens: 0,
-            max_seconds: 0,
-        };
+        let budget = governed_budget(8);
         let policy = CexGpPolicyV1::controlled_v1("policy", fields, 7, &budget).unwrap();
         let left = GeneticProgrammingEngine::new_governed(policy.clone(), "mission").unwrap();
         let right = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
@@ -432,12 +612,7 @@ mod tests {
 
     #[test]
     fn governed_gp_resume_matches_the_uninterrupted_sequence() {
-        let budget = alpha_domain::SearchBudget {
-            max_candidates: 8,
-            max_expansions: 256,
-            max_tokens: 0,
-            max_seconds: 0,
-        };
+        let budget = governed_budget(8);
         let policy = CexGpPolicyV1::controlled_v1(
             "policy",
             vec!["book_imbalance".to_string(), "spread_bps".to_string()],
@@ -446,12 +621,7 @@ mod tests {
         )
         .unwrap();
         let dataset = super::super::test_dataset();
-        let remaining = RemainingBudget {
-            candidates: 8,
-            expansions: 256,
-            tokens: 0,
-            milliseconds: 0,
-        };
+        let remaining = governed_remaining(8);
         let mut uninterrupted =
             GeneticProgrammingEngine::new_governed(policy.clone(), "mission").unwrap();
         let mut history = Vec::new();
@@ -499,12 +669,7 @@ mod tests {
 
     #[test]
     fn governed_gp_emits_atomic_dynamic_templates_before_composition() {
-        let budget = alpha_domain::SearchBudget {
-            max_candidates: 8,
-            max_expansions: 256,
-            max_tokens: 0,
-            max_seconds: 0,
-        };
+        let budget = governed_budget(8);
         let policy = CexGpPolicyV1::controlled_dynamic_v2(
             "policy",
             vec!["spread_bps".to_string(), "book_imbalance".to_string()],
@@ -514,12 +679,7 @@ mod tests {
         .unwrap();
         let mut engine = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
         let dataset = super::super::test_dataset();
-        let remaining = RemainingBudget {
-            candidates: 8,
-            expansions: 256,
-            tokens: 0,
-            milliseconds: 0,
-        };
+        let remaining = governed_remaining(8);
         let templates = (1..=4)
             .map(|iteration| {
                 engine
@@ -548,5 +708,91 @@ mod tests {
         assert!(rendered.iter().all(|formula| {
             formula.contains(" > 1") && formula.contains(" < -1") && formula.contains("if_else")
         }));
+    }
+
+    #[test]
+    fn governed_gp_v2_keeps_the_preexisting_seventeenth_candidate() {
+        let budget = governed_budget(20);
+        let policy =
+            CexGpPolicyV1::controlled_dynamic_v2("policy", named_template_fields(), 7, &budget)
+                .unwrap();
+        let mut engine = GeneticProgrammingEngine::new_governed(policy, "mission").unwrap();
+        let dataset = super::super::test_dataset();
+        let remaining = governed_remaining(20);
+        for iteration in 1..=16 {
+            let proposal = engine
+                .propose(
+                    "mission",
+                    iteration,
+                    &dataset.proposal_context(),
+                    &remaining,
+                )
+                .unwrap();
+            engine.observe(&proposal, &evaluation(1.0));
+        }
+        let seventeenth = engine
+            .propose("mission", 17, &dataset.proposal_context(), &remaining)
+            .unwrap();
+        let expected = FactorAst::call(
+            FactorOperator::Mul,
+            vec![
+                thresholded_standard_signal(standardized_delta("book_imbalance_top5").unwrap())
+                    .unwrap(),
+                field_terminal("bid_depth_top5"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(seventeenth.artifact, CandidateArtifact::Formula(expected));
+    }
+
+    #[test]
+    fn governed_gp_v3_emits_sixteen_atomic_then_four_named_templates() {
+        let budget = governed_budget(20);
+        let fields = named_template_fields();
+        let v2_templates = governed_templates(
+            CexGpPolicyV1::controlled_dynamic_v2("policy-v2", fields.clone(), 7, &budget).unwrap(),
+            16,
+        );
+        assert_eq!(
+            alpha_domain::canonical_json_hash(&v2_templates).unwrap(),
+            "3fb55524158416564acd9c01dd780b2b3b9934c990fb764ae93afef38a1504d4"
+        );
+        let templates = governed_templates(
+            CexGpPolicyV1::controlled_dynamic_v3("policy", fields, 7, &budget).unwrap(),
+            20,
+        );
+        assert_eq!(&templates[..16], v2_templates.as_slice());
+
+        let expected_named = vec![
+            CandidateArtifact::Formula(
+                thresholded_standard_signal(
+                    negate(standardized_field("spread_bps").unwrap()).unwrap(),
+                )
+                .unwrap(),
+            ),
+            CandidateArtifact::Formula(
+                thresholded_standard_signal(
+                    negate(standardized_delta("spread_bps").unwrap()).unwrap(),
+                )
+                .unwrap(),
+            ),
+            CandidateArtifact::Formula(
+                directional_consensus_signal(
+                    standardized_field("book_imbalance").unwrap(),
+                    standardized_field("weighted_book_imbalance_top5").unwrap(),
+                )
+                .unwrap(),
+            ),
+            CandidateArtifact::Formula(
+                thresholded_signal(
+                    standardized_field("weighted_book_imbalance_top5").unwrap(),
+                    add_one_plus_one().unwrap(),
+                )
+                .unwrap(),
+            ),
+        ];
+
+        assert_eq!(&templates[16..], expected_named.as_slice());
     }
 }

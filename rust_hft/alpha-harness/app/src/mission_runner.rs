@@ -100,8 +100,25 @@ fn bound_gp_policy(mission: &CexResearchMissionArtifactV1) -> anyhow::Result<Cex
         mission.spec.search.seed,
         &mission.spec.search.budget,
     )?;
-    dynamic.validate_binding(binding)?;
-    Ok(dynamic)
+    let dynamic_binding = dynamic.validate_binding(binding);
+    if dynamic_binding.is_ok() {
+        return Ok(dynamic);
+    }
+    let Ok(named_templates) = CexGpPolicyV1::controlled_dynamic_v3(
+        binding.id.clone(),
+        mission.spec.feature_fields.clone(),
+        mission.spec.search.seed,
+        &mission.spec.search.budget,
+    ) else {
+        return Err(dynamic_binding.unwrap_err().into());
+    };
+    if named_templates.validate_binding(binding).is_err() {
+        return Err(dynamic_binding.unwrap_err().into());
+    }
+    if mission.spec.search.max_new_iterations != mission.spec.search.budget.max_candidates {
+        bail!("named-template GP requires max_new_iterations to equal max_candidates");
+    }
+    Ok(named_templates)
 }
 
 #[derive(Debug, Deserialize)]
@@ -6809,6 +6826,71 @@ message binance_replay {
         fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
 
         assert_eq!(bound_gp_policy(&fixture.mission).unwrap(), expected);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn bound_gp_policy_uses_the_signed_named_template_policy_version() {
+        let mut fixture = fixture("named-template-gp-policy-binding");
+        fixture.mission.spec.feature_fields = [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        fixture.mission.spec.search.budget.max_candidates = 20;
+        fixture.mission.spec.search.max_new_iterations = 20;
+        let expected = CexGpPolicyV1::controlled_dynamic_v3(
+            fixture.mission.spec.policies.gp.id.clone(),
+            fixture.mission.spec.feature_fields.clone(),
+            fixture.mission.spec.search.seed,
+            &fixture.mission.spec.search.budget,
+        )
+        .unwrap();
+        fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
+
+        assert_eq!(bound_gp_policy(&fixture.mission).unwrap(), expected);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn bound_gp_policy_rejects_named_template_iteration_budget_drift() {
+        let mut fixture = fixture("named-template-gp-policy-iterations");
+        fixture.mission.spec.feature_fields = [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        fixture.mission.spec.search.budget.max_candidates = 20;
+        fixture.mission.spec.search.max_new_iterations = 19;
+        let expected = CexGpPolicyV1::controlled_dynamic_v3(
+            fixture.mission.spec.policies.gp.id.clone(),
+            fixture.mission.spec.feature_fields.clone(),
+            fixture.mission.spec.search.seed,
+            &fixture.mission.spec.search.budget,
+        )
+        .unwrap();
+        fixture.mission.spec.policies.gp.content_sha256 = expected.content_hash().unwrap();
+
+        assert!(
+            format!("{:#}", bound_gp_policy(&fixture.mission).unwrap_err())
+                .contains("named-template GP requires max_new_iterations to equal max_candidates")
+        );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

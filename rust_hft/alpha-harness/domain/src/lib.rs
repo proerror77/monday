@@ -27,6 +27,7 @@ pub const CEX_MCTS_RESEARCH_RECEIPT_VERSION_V1: &str = "cex-mcts-research-receip
 pub const CEX_RESEARCH_MISSION_SCHEMA_V1: &str = "cex-research-mission-v1";
 pub const CEX_GP_POLICY_SCHEMA_V1: &str = "cex-gp-policy-v1";
 pub const CEX_GP_POLICY_SCHEMA_V2: &str = "cex-gp-policy-v2";
+pub const CEX_GP_POLICY_SCHEMA_V3: &str = "cex-gp-policy-v3";
 pub const CEX_FACTOR_BANK_SCHEMA_V1: &str = "cex-factor-bank-v1";
 pub const CEX_FACTOR_BANK_SCHEMA_V2: &str = "cex-factor-bank-v2";
 pub const CEX_FACTOR_BANK_SCHEMA_V3: &str = "cex-factor-bank-v3";
@@ -746,6 +747,19 @@ impl CexResearchMissionSpecV1 {
         CexEqualAbsoluteWeightPolicyV1::controlled_v1(self.policies.weight.id.clone())?
             .validate_binding(&self.policies.weight)?;
         self.search.budget.validate()?;
+        if CexGpPolicyV1::controlled_dynamic_v3(
+            self.policies.gp.id.clone(),
+            self.feature_fields.clone(),
+            self.search.seed,
+            &self.search.budget,
+        )
+        .is_ok_and(|policy| policy.validate_binding(&self.policies.gp).is_ok())
+            && self.search.max_new_iterations != self.search.budget.max_candidates
+        {
+            return Err(DomainError::InvalidCexResearchMission(
+                "named-template GP requires max_new_iterations to equal max_candidates",
+            ));
+        }
         self.evaluation_protocol.validate()?;
         if self
             .subset_checkpoint_upper_bound_bytes()
@@ -1619,45 +1633,21 @@ pub struct CexGpPolicyV1 {
 }
 
 impl CexGpPolicyV1 {
-    pub fn controlled_v1(
-        policy_id: impl Into<String>,
-        mut admitted_fields: Vec<String>,
-        seed: u64,
-        budget: &SearchBudget,
-    ) -> Result<Self, DomainError> {
+    fn normalize_admitted_fields(admitted_fields: &mut Vec<String>) {
         admitted_fields.sort();
         admitted_fields.dedup();
-        let policy = Self {
-            schema_version: CEX_GP_POLICY_SCHEMA_V1.to_string(),
-            policy_id: policy_id.into(),
-            admitted_fields,
-            operators: vec![
-                FactorOperator::Add,
-                FactorOperator::Sub,
-                FactorOperator::Mul,
-            ],
-            windows: vec![],
-            constants: vec![],
-            max_ast_depth: 5,
-            max_ast_nodes: 31,
-            population_limit: 32,
-            seed,
-            budget: budget.clone(),
-        };
-        policy.validate()?;
-        Ok(policy)
     }
 
-    pub fn controlled_dynamic_v2(
+    fn controlled_dynamic(
+        schema_version: &str,
         policy_id: impl Into<String>,
         mut admitted_fields: Vec<String>,
         seed: u64,
         budget: &SearchBudget,
     ) -> Result<Self, DomainError> {
-        admitted_fields.sort();
-        admitted_fields.dedup();
+        Self::normalize_admitted_fields(&mut admitted_fields);
         let policy = Self {
-            schema_version: CEX_GP_POLICY_SCHEMA_V2.to_string(),
+            schema_version: schema_version.to_string(),
             policy_id: policy_id.into(),
             admitted_fields,
             operators: vec![
@@ -1685,6 +1675,64 @@ impl CexGpPolicyV1 {
         Ok(policy)
     }
 
+    pub fn controlled_v1(
+        policy_id: impl Into<String>,
+        mut admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::normalize_admitted_fields(&mut admitted_fields);
+        let policy = Self {
+            schema_version: CEX_GP_POLICY_SCHEMA_V1.to_string(),
+            policy_id: policy_id.into(),
+            admitted_fields,
+            operators: vec![
+                FactorOperator::Add,
+                FactorOperator::Sub,
+                FactorOperator::Mul,
+            ],
+            windows: vec![],
+            constants: vec![],
+            max_ast_depth: 5,
+            max_ast_nodes: 31,
+            population_limit: 32,
+            seed,
+            budget: budget.clone(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn controlled_dynamic_v2(
+        policy_id: impl Into<String>,
+        admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::controlled_dynamic(
+            CEX_GP_POLICY_SCHEMA_V2,
+            policy_id,
+            admitted_fields,
+            seed,
+            budget,
+        )
+    }
+
+    pub fn controlled_dynamic_v3(
+        policy_id: impl Into<String>,
+        admitted_fields: Vec<String>,
+        seed: u64,
+        budget: &SearchBudget,
+    ) -> Result<Self, DomainError> {
+        Self::controlled_dynamic(
+            CEX_GP_POLICY_SCHEMA_V3,
+            policy_id,
+            admitted_fields,
+            seed,
+            budget,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         let governed_v1 = self.schema_version == CEX_GP_POLICY_SCHEMA_V1
             && self.operators
@@ -1696,22 +1744,24 @@ impl CexGpPolicyV1 {
             && self.windows.is_empty()
             && self.constants.is_empty()
             && self.max_ast_depth == 5;
-        let dynamic_v2 = self.schema_version == CEX_GP_POLICY_SCHEMA_V2
-            && self.operators
-                == [
-                    FactorOperator::ZScore,
-                    FactorOperator::Delta,
-                    FactorOperator::Add,
-                    FactorOperator::Sub,
-                    FactorOperator::Mul,
-                    FactorOperator::GreaterThan,
-                    FactorOperator::LessThan,
-                    FactorOperator::IfElse,
-                ]
+        let governed_dynamic = matches!(
+            self.schema_version.as_str(),
+            CEX_GP_POLICY_SCHEMA_V2 | CEX_GP_POLICY_SCHEMA_V3
+        ) && self.operators
+            == [
+                FactorOperator::ZScore,
+                FactorOperator::Delta,
+                FactorOperator::Add,
+                FactorOperator::Sub,
+                FactorOperator::Mul,
+                FactorOperator::GreaterThan,
+                FactorOperator::LessThan,
+                FactorOperator::IfElse,
+            ]
             && self.windows == [5, 20]
             && self.constants == ["-1", "0", "1", "5", "20"]
             && self.max_ast_depth == 7;
-        if !(governed_v1 || dynamic_v2)
+        if !(governed_v1 || governed_dynamic)
             || self.policy_id.trim().is_empty()
             || self.admitted_fields.is_empty()
             || self
@@ -1738,6 +1788,29 @@ impl CexGpPolicyV1 {
         if self.budget.max_seconds != 0 {
             return Err(DomainError::InvalidCexGpPolicy(
                 "governed GP cannot depend on a wall-clock budget",
+            ));
+        }
+        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3
+            && self.budget.max_candidates != self.admitted_fields.len() * 2 + 4
+        {
+            return Err(DomainError::InvalidCexGpPolicy(
+                "governed GP v3 requires exactly two atomic slots per field plus four named templates",
+            ));
+        }
+        let has_named_template_fields = [
+            "book_imbalance",
+            "spread_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .all(|field| {
+            self.admitted_fields
+                .iter()
+                .any(|admitted| admitted == field)
+        });
+        if self.schema_version == CEX_GP_POLICY_SCHEMA_V3 && !has_named_template_fields {
+            return Err(DomainError::InvalidCexGpPolicy(
+                "governed GP v3 requires the named-template fields",
             ));
         }
         let mut event_domain = None;
@@ -5823,6 +5896,51 @@ mod tests {
     }
 
     #[test]
+    fn cex_mission_rejects_named_template_iteration_budget_drift() {
+        let mut mission = cex_mission_artifact(Utc::now());
+        mission.spec.feature_fields = [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        mission.spec.search.budget.max_candidates = 20;
+        mission.spec.search.budget.max_expansions = 20;
+        mission.spec.search.max_new_iterations = 20;
+        mission.spec.search.multiple_testing_trials = 40;
+        let gp = CexGpPolicyV1::controlled_dynamic_v3(
+            mission.spec.policies.gp.id.clone(),
+            mission.spec.feature_fields.clone(),
+            mission.spec.search.seed,
+            &mission.spec.search.budget,
+        )
+        .unwrap();
+        mission.spec.policies.gp.content_sha256 = gp.content_hash().unwrap();
+        mission.spec.policies.screening.content_sha256 =
+            canonical_json_hash(&FormulaEvaluatorConfig::for_trials(40).unwrap()).unwrap();
+        mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&mission.spec.search).unwrap();
+        mission.validate().unwrap();
+
+        mission.spec.search.max_new_iterations = 19;
+        mission.spec.policies.subset_search.content_sha256 =
+            canonical_json_hash(&mission.spec.search).unwrap();
+        assert_eq!(
+            mission.validate(),
+            Err(DomainError::InvalidCexResearchMission(
+                "named-template GP requires max_new_iterations to equal max_candidates"
+            ))
+        );
+    }
+
+    #[test]
     fn cex_mission_rejects_hypothesis_features_outside_admission() {
         let mut mission = cex_mission_artifact(Utc::now());
         mission.spec.hypotheses[0].required_feature_families =
@@ -6747,6 +6865,90 @@ mod tests {
             policy.validate_candidate(&candidate),
             Err(DomainError::InvalidCexGpCandidate(
                 "formula references an unadmitted rolling window"
+            ))
+        );
+    }
+
+    #[test]
+    fn dynamic_gp_policy_v3_rejects_drift_and_missing_named_fields() {
+        let budget = SearchBudget {
+            max_candidates: 20,
+            max_expansions: 64,
+            max_tokens: 0,
+            max_seconds: 0,
+        };
+        let fields = [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut drifted =
+            CexGpPolicyV1::controlled_dynamic_v3("gp-policy-3", fields.clone(), 7, &budget)
+                .unwrap();
+        drifted.constants.push("2".to_string());
+        assert_eq!(
+            drifted.validate(),
+            Err(DomainError::InvalidCexGpPolicy(
+                "governed GP fields, grammar, limits, or budget drifted"
+            ))
+        );
+
+        assert_eq!(
+            CexGpPolicyV1::controlled_dynamic_v3(
+                "gp-policy-3-missing",
+                fields
+                    .into_iter()
+                    .filter(|field| field != "weighted_book_imbalance_top5")
+                    .collect(),
+                7,
+                &SearchBudget {
+                    max_candidates: 18,
+                    ..budget
+                },
+            ),
+            Err(DomainError::InvalidCexGpPolicy(
+                "governed GP v3 requires the named-template fields"
+            ))
+        );
+    }
+
+    #[test]
+    fn dynamic_gp_policy_v3_rejects_candidate_budget_drift() {
+        let fields = [
+            "ask_depth_top5",
+            "bid_depth_top5",
+            "book_imbalance",
+            "book_imbalance_top5",
+            "near_depth_concentration_skew_top5",
+            "spread_bps",
+            "vwap_center_deviation_top5_bps",
+            "weighted_book_imbalance_top5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            CexGpPolicyV1::controlled_dynamic_v3(
+                "gp-policy-3-underdeclared",
+                fields,
+                7,
+                &SearchBudget {
+                    max_candidates: 16,
+                    max_expansions: 64,
+                    max_tokens: 0,
+                    max_seconds: 0,
+                },
+            ),
+            Err(DomainError::InvalidCexGpPolicy(
+                "governed GP v3 requires exactly two atomic slots per field plus four named templates"
             ))
         );
     }
