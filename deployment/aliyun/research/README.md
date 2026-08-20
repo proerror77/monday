@@ -245,10 +245,11 @@ identities, and mounted lane root first, then unsuspend explicitly.
 Run `campaign-freeze` from any cloud Pod that mounts that completed run prefix;
 the receipt stores paths relative to the run root, so the mount point itself may
 differ from the materialization Pod. Pass that mount point with `--input-root`.
-`--image` is required and must be the digest-pinned executor image that will run
-the Campaign. The mounted receipt's `source_revision` and `image_ref` remain the
-immutable producer lineage and are still validated as exact git SHA plus pinned
-digest, but they no longer need to match the current `campaign-freeze` Pod build.
+`--source-revision` and `--image` are required and must name the exact executor
+git SHA and digest-pinned image that will run the Campaign. `campaign-freeze`
+rejects any source drift from the current Pod build. The mounted receipt's
+`source_revision` and `image_ref` remain immutable producer lineage and are
+bound into the canonical Campaign request separately from the executor identity.
 
 The script accepts `--dry-run` for triplet and prefix validation without
 writing output. The repo-local contract check is:

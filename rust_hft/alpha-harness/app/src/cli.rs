@@ -158,6 +158,8 @@ pub struct CampaignFreezeArgs {
     #[arg(long)]
     pub input_root: PathBuf,
     #[arg(long)]
+    pub source_revision: String,
+    #[arg(long)]
     pub image: String,
     #[arg(long)]
     pub campaign_root: String,
@@ -1038,7 +1040,7 @@ mod tests {
 
     #[test]
     fn parses_mission_campaign_freeze() {
-        let args = "alpha-harness mission campaign-freeze --campaign-inputs campaign-inputs.json --input-root /mounted/run --image registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns --seed 7 --seed 11 --output freeze.json";
+        let args = "alpha-harness mission campaign-freeze --campaign-inputs campaign-inputs.json --input-root /mounted/run --source-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --image registry/research-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --campaign-root https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns --seed 7 --seed 11 --output freeze.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 

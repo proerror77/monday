@@ -746,7 +746,7 @@ fn render_manifest(validated: ValidatedSubmission, namespace: &str) -> anyhow::R
     }))
 }
 
-fn image_digest(image: &str) -> anyhow::Result<String> {
+pub(crate) fn image_digest(image: &str) -> anyhow::Result<String> {
     if image != image.trim() || image.chars().any(char::is_control) {
         bail!("mission image must not contain surrounding whitespace or control characters");
     }
