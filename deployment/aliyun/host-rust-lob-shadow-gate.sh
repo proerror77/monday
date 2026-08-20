@@ -5,7 +5,7 @@ umask 027
 export LC_ALL=C
 
 readonly REQUIRED_DURATION_SECONDS=240
-readonly HEALTH_SETTLE_SECONDS=180
+readonly HEALTH_SETTLE_SECONDS=240
 readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
@@ -28,11 +28,11 @@ usage() {
   printf '%s\n' \
     'Usage: host-rust-lob-shadow-gate.sh <candidate-sha256>' \
     '' \
-    'Production gates wait up to 180 seconds for health, then observe at least 240 seconds.' \
+    'Production gates wait up to 240 seconds for health, then observe at least 240 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
     'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.' \
     'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS only' \
-    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 180 seconds;' \
+    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 240 seconds;' \
     'otherwise the policy check fails.'
 }
 
@@ -218,6 +218,12 @@ secure_regular_file "$candidate_production_usdm_env"
 [[ $(env_value "$candidate_production_usdm_env" SYMBOLS) \
   == "${configured_symbols[usdm]}" ]] \
   || die 'USD-M shadow and production symbol lists differ'
+configured_usdm_ws_shard_size=$(env_value "${env_file[usdm]}" WS_SHARD_SIZE)
+[[ $configured_usdm_ws_shard_size == 25 ]] \
+  || die 'USD-M shadow WS_SHARD_SIZE must be 25'
+[[ $(env_value "$candidate_production_usdm_env" WS_SHARD_SIZE) \
+  == "$configured_usdm_ws_shard_size" ]] \
+  || die 'USD-M shadow and production WS_SHARD_SIZE differ'
 
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'

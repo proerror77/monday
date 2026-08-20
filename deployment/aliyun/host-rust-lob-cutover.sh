@@ -191,6 +191,9 @@ validate_production_env() {
     is_usdm_top100 "$symbols" \
       || fail "$file must set SYMBOLS=ALL or 100 unique explicit symbols"
   fi
+  if [[ $market == usdm && $strict == true ]]; then
+    require_env_value "$file" WS_SHARD_SIZE 25
+  fi
   require_env_value "$file" DEPTH_MODE diff
   require_env_value "$file" SEGMENT_SECONDS 3600
   require_env_value "$file" SPOOL_DIR "$spool"

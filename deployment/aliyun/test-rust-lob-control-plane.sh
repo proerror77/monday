@@ -103,7 +103,10 @@ grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
-grep -Fq 'readonly HEALTH_SETTLE_SECONDS=180' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=240' "$GATE"
+grep -Fq 'Production gates wait up to 240 seconds for health' "$GATE"
+grep -Fq 'USD-M shadow and production WS_SHARD_SIZE differ' "$GATE"
+grep -Fq 'require_env_value "$file" WS_SHARD_SIZE 25' "$CUTOVER"
 grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
 grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
 shadow_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
@@ -119,6 +122,11 @@ IFS=, read -r -a usdm_symbols <<<"$shadow_usdm_symbols"
 }
 [[ $(printf '%s\n' "${usdm_symbols[@]}" | sort -u | wc -l) -eq 100 ]] || {
   printf 'USD-M catalog contains duplicate symbols\n' >&2
+  exit 1
+}
+[[ $(sed -n 's/^WS_SHARD_SIZE=//p' "$SHADOW_USDM_ENV") == 25
+  && $(sed -n 's/^WS_SHARD_SIZE=//p' "$PRODUCTION_USDM_ENV") == 25 ]] || {
+  printf 'USD-M websocket shards must contain exactly 25 symbols\n' >&2
   exit 1
 }
 cutover_symbol_validator=$(sed -n '/^is_usdm_top100()/,/^}/p' "$CUTOVER")
@@ -374,7 +382,7 @@ run_strict_verifier_failure_fixture
 health_settle_body="$tmp_dir/resolve-health-settle.sh"
 sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
 resolve_health_settle() (
-  HEALTH_SETTLE_SECONDS=180
+  HEALTH_SETTLE_SECONDS=240
   gate_seconds=$1
   test_only=$2
   MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=$3
@@ -389,7 +397,7 @@ resolve_health_settle() (
   printf 'authorized short health settle was not applied\n' >&2
   exit 1
 }
-[[ $(resolve_health_settle 120 true 1 '') == 180 ]] || {
+[[ $(resolve_health_settle 120 true 1 '') == 240 ]] || {
   printf 'test-only gate without an override did not keep the formal settle\n' >&2
   exit 1
 }
@@ -397,8 +405,8 @@ for fixture in \
   '240 false 1 60' \
   '120 true 0 60' \
   '120 true 1 invalid' \
-  '120 true 1 180' \
-  '120 true 1 181' \
+  '120 true 1 240' \
+  '120 true 1 241' \
   "120 true 1 $(printf '9%.0s' {1..100})"; do
   read -r fixture_gate fixture_test fixture_auth fixture_value <<<"$fixture"
   if resolve_health_settle "$fixture_gate" "$fixture_test" "$fixture_auth" \
@@ -546,7 +554,7 @@ jq -n \
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
-    health_settle_seconds:180,segment_seconds:120,test_only:false,
+    health_settle_seconds:240,segment_seconds:120,test_only:false,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate.json"
@@ -635,7 +643,7 @@ jq -n \
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
-    health_settle_seconds:180,segment_seconds:120,test_only:false,
+    health_settle_seconds:240,segment_seconds:120,test_only:false,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate-v1.json"
