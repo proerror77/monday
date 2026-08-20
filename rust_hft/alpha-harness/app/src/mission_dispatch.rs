@@ -490,7 +490,7 @@ fn decode_base64(value: &str) -> anyhow::Result<Vec<u8>> {
         bail!("CEX Campaign input Secret campaign.json is not valid base64");
     }
     let mut decoded = Vec::with_capacity(value.len() / 4 * 3);
-    for chunk in value.as_bytes().chunks_exact(4) {
+    for chunk in value.as_bytes().as_chunks::<4>().0 {
         let mut quartet = [0u8; 4];
         let mut padding = 0usize;
         for (index, byte) in chunk.iter().copied().enumerate() {
