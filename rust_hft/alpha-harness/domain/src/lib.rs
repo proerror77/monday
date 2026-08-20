@@ -4150,11 +4150,11 @@ impl CexFourStageWalkForwardV1 {
             || self.ridge.evaluation.evaluator_version
                 != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
             || self.cart.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || !self.selected.evaluation.passed
             || evaluations.iter().any(|evaluation| {
-                !evaluation.passed
-                    || evaluation.protocol_binding().map_or(true, |(_, hash)| {
-                        hash != self.evaluation_protocol.content_sha256
-                    })
+                evaluation.protocol_binding().map_or(true, |(_, hash)| {
+                    hash != self.evaluation_protocol.content_sha256
+                })
             })
         {
             return Err(DomainError::InvalidStrategyBundle);
@@ -7064,6 +7064,222 @@ mod tests {
         assert_eq!(
             evaluation.validate(),
             Err(DomainError::InvalidEvaluationEvidence)
+        );
+    }
+
+    fn failed_baseline_evaluation(protocol: &EvaluationProtocolV1) -> CandidateEvaluation {
+        let mut config = FormulaEvaluatorConfig::for_trials(2).unwrap();
+        let adjusted_score = config.adjusted_score(5.0).unwrap();
+        config.min_aggregate_score = adjusted_score + 1.0;
+        let evaluation = CandidateEvaluation {
+            passed: false,
+            score: adjusted_score,
+            failure_reasons: vec!["insufficient evidence".to_string()],
+            evaluator_version: CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION.to_string(),
+            evaluator_config: serde_json::to_value(&config).unwrap(),
+            evaluation_protocol: Some(protocol.clone()),
+            evaluation_protocol_hash: Some(protocol.content_hash().unwrap()),
+            metrics: EvaluationMetrics {
+                predictive: PredictiveMetrics::from_folds(vec![
+                    FoldPredictiveMetrics {
+                        fold_index: 1,
+                        row_count: 30,
+                        time_series_ic: Some(0.1),
+                        time_series_rank_ic: Some(0.1),
+                    },
+                    FoldPredictiveMetrics {
+                        fold_index: 2,
+                        row_count: 30,
+                        time_series_ic: Some(0.1),
+                        time_series_rank_ic: Some(0.1),
+                    },
+                    FoldPredictiveMetrics {
+                        fold_index: 3,
+                        row_count: 30,
+                        time_series_ic: Some(0.1),
+                        time_series_rank_ic: Some(0.1),
+                    },
+                ]),
+                row_count: 90,
+                trade_count: 90,
+                total_turnover: 90.0,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.09,
+                max_drawdown: 0.01,
+                net_sharpe: 1.0,
+                raw_score: 5.0,
+                adjusted_score,
+                folds: vec![
+                    FoldEvaluationMetrics {
+                        fold_index: 1,
+                        row_count: 30,
+                        trade_count: 30,
+                        total_turnover: 30.0,
+                        mean_net_return: 0.001,
+                        cumulative_net_return: 0.03,
+                        max_drawdown: 0.01,
+                        net_sharpe: 1.0,
+                        raw_score: 5.0,
+                        max_book_depth_fraction: None,
+                    },
+                    FoldEvaluationMetrics {
+                        fold_index: 2,
+                        row_count: 30,
+                        trade_count: 30,
+                        total_turnover: 30.0,
+                        mean_net_return: 0.001,
+                        cumulative_net_return: 0.03,
+                        max_drawdown: 0.01,
+                        net_sharpe: 1.0,
+                        raw_score: 5.0,
+                        max_book_depth_fraction: None,
+                    },
+                    FoldEvaluationMetrics {
+                        fold_index: 3,
+                        row_count: 30,
+                        trade_count: 30,
+                        total_turnover: 30.0,
+                        mean_net_return: 0.001,
+                        cumulative_net_return: 0.03,
+                        max_drawdown: 0.01,
+                        net_sharpe: 1.0,
+                        raw_score: 5.0,
+                        max_book_depth_fraction: None,
+                    },
+                ],
+            },
+        };
+        evaluation.validate().unwrap();
+        evaluation
+    }
+
+    fn four_stage_evaluation(
+        kind: CexFourStageEvaluationKindV1,
+        source_artifact: CexResearchContentRefV1,
+        evaluation: CandidateEvaluation,
+    ) -> CexFourStageEvaluationV1 {
+        CexFourStageEvaluationV1 {
+            kind,
+            evaluation_sha256: canonical_json_hash(&evaluation).unwrap(),
+            source_artifact,
+            evaluation,
+        }
+    }
+
+    fn four_stage_walk_forward_fixture(
+        selected: CandidateEvaluation,
+        ridge: CandidateEvaluation,
+        cart: CandidateEvaluation,
+    ) -> CexFourStageWalkForwardV1 {
+        let factor_bank = factor_bank();
+        let mission = cex_mission_artifact(Utc::now());
+        let mut walk_forward = CexFourStageWalkForwardV1 {
+            schema_version: CEX_COMBINATION_WALK_FORWARD_SCHEMA_V1.to_string(),
+            content_sha256: String::new(),
+            research_dataset: factor_bank.research_dataset.clone(),
+            walk_forward_partition: factor_bank.walk_forward_partition.clone(),
+            evaluation_protocol: mission.spec.policies.evaluation.clone(),
+            holdout_id: mission.spec.holdout.holdout_id.clone(),
+            holdout_state: mission.spec.holdout.state,
+            selected: four_stage_evaluation(
+                CexFourStageEvaluationKindV1::SelectedSubset,
+                CexResearchContentRefV1 {
+                    id: "selected-subset".to_string(),
+                    content_sha256: "1".repeat(64),
+                },
+                selected,
+            ),
+            ridge: four_stage_evaluation(
+                CexFourStageEvaluationKindV1::RidgeBaseline,
+                CexResearchContentRefV1 {
+                    id: "ridge-baseline".to_string(),
+                    content_sha256: "2".repeat(64),
+                },
+                ridge,
+            ),
+            cart: four_stage_evaluation(
+                CexFourStageEvaluationKindV1::CartBaseline,
+                CexResearchContentRefV1 {
+                    id: "cart-baseline".to_string(),
+                    content_sha256: "3".repeat(64),
+                },
+                cart,
+            ),
+        };
+        let mut semantic = walk_forward.clone();
+        semantic.content_sha256.clear();
+        walk_forward.content_sha256 = canonical_json_hash(&semantic).unwrap();
+        walk_forward
+    }
+
+    #[test]
+    fn four_stage_walk_forward_accepts_failed_baselines_when_selected_passes() {
+        let factor_bank = factor_bank();
+        let protocol = evaluation_protocol();
+        let selected = factor_bank.attempts[0]
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        let walk_forward = four_stage_walk_forward_fixture(
+            selected,
+            failed_baseline_evaluation(&protocol),
+            failed_baseline_evaluation(&protocol),
+        );
+
+        assert!(walk_forward.validate().is_ok());
+    }
+
+    #[test]
+    fn four_stage_walk_forward_rejects_a_failed_selected_subset() {
+        let factor_bank = factor_bank();
+        let protocol = evaluation_protocol();
+        let mut selected = factor_bank.attempts[0]
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        let mut selected_config = selected.formula_config().unwrap();
+        selected_config.min_aggregate_score = selected.score + 1.0;
+        selected.passed = false;
+        selected.failure_reasons = vec!["selected subset failed".to_string()];
+        selected.evaluator_config = serde_json::to_value(&selected_config).unwrap();
+        selected.validate().unwrap();
+
+        let walk_forward = four_stage_walk_forward_fixture(
+            selected,
+            failed_baseline_evaluation(&protocol),
+            failed_baseline_evaluation(&protocol),
+        );
+
+        assert_eq!(
+            walk_forward.validate(),
+            Err(DomainError::InvalidStrategyBundle)
+        );
+    }
+
+    #[test]
+    fn four_stage_walk_forward_rejects_protocol_identity_drift() {
+        let factor_bank = factor_bank();
+        let protocol = evaluation_protocol();
+        let selected = factor_bank.attempts[0]
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        let mut walk_forward = four_stage_walk_forward_fixture(
+            selected,
+            failed_baseline_evaluation(&protocol),
+            failed_baseline_evaluation(&protocol),
+        );
+        walk_forward.evaluation_protocol.content_sha256 = "0".repeat(64);
+
+        assert_eq!(
+            walk_forward.validate(),
+            Err(DomainError::InvalidStrategyBundle)
         );
     }
 

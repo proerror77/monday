@@ -743,11 +743,11 @@ impl CexCombinationWalkForwardEvidenceV1 {
             || self.ridge.evaluation.evaluator_version
                 != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
             || self.cart.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+            || !self.selected.evaluation.passed
             || evaluations.iter().any(|evaluation| {
-                !evaluation.passed
-                    || evaluation.protocol_binding().map_or(true, |(_, hash)| {
-                        hash != self.evaluation_protocol.content_sha256
-                    })
+                evaluation.protocol_binding().map_or(true, |(_, hash)| {
+                    hash != self.evaluation_protocol.content_sha256
+                })
             })
         {
             return Err("CEX combination walk-forward evidence is invalid".to_string());
@@ -1777,9 +1777,6 @@ fn validate_source_bindings(
         Some(cart),
     )
     .map_err(|error| error.to_string())?;
-    if !gate.passed || !ridge.evaluation.passed || !cart.evaluation.passed {
-        return Err("Factor-Bank MCTS requires both passing baseline artifacts".to_string());
-    }
     Ok(())
 }
 

@@ -142,9 +142,10 @@ before Mission admission. `operational.submitted_at` is retained for audit but
 does not alter the semantic Mission identity. The fixed v4 factor plan uses 8
 snapshot L2 terminals, 16 atomic candidates, 32 trials per round, the six-hour
 protocol `7200 + 3*(3600+1) + 5 + 3600 = 21608`, and the $1000 / Top5 5%
-capacity screen. After both baselines pass, execution searches only canonical
-Factor Bank subsets through add, remove, and swap actions, scores mechanically
-oriented equal-absolute-weight signals on the research folds, and emits the
+capacity screen. After both baseline artifacts are sealed, a non-empty Factor
+Bank enters canonical subset search through add, remove, and swap actions,
+scores mechanically oriented equal-absolute-weight signals on the research
+folds, and emits the
 typed weight policy plus deterministic checkpoint, trace, and terminal-result
 artifacts. GP screening and subset search share one multiplicity correction
 sized for both bounded candidate families; only passing subset evaluations are
@@ -154,8 +155,8 @@ instead of dropping the negative result. A passing selection also emits
 immutable Factor Bank through fixed equal-absolute Signal weights, sign-based
 bounded Sizing, evaluator-owned Risk limits, and the exact Binance bucketed-L2
 cost/execution assumptions. The same artifact binds the selected walk-forward
-metrics and both mandatory baseline evaluations under one protocol while
-keeping the holdout unopened and carrying neither deployment nor
+metrics and both mandatory baseline benchmark evaluations under one protocol
+while keeping the holdout unopened and carrying neither deployment nor
 order-submission authority. Its selected result is accepted only after exact
 checkpoint replay derives the same terminal metadata, subset, and evaluation.
 Sealed-holdout evaluation requires the separate governed precommit boundary.

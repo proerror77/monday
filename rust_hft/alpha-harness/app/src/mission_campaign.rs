@@ -883,20 +883,59 @@ fn collect_round_ledger(
     let results = execute_dir.join("results");
     let factor_bank: CexFactorBankRevisionV2 =
         serde_json::from_slice(&std::fs::read(results.join("factor-bank.json"))?)?;
-    let consumed_trials = factor_bank.attempts.len() + round_subset_candidates(&results)?;
     let strategy_path = results.join("combination-walk-forward.json");
-    let (selected_candidate_id, selected_candidate_content_hash, selected_score) =
-        if strategy_path.try_exists()? && report.replay_gate_passed == Some(true) {
-            let strategy: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&strategy_path)?)?;
-            (
-                strategy["artifact_id"].as_str().map(str::to_string),
-                Some(canonical_json_hash(&strategy)?),
-                strategy["walk_forward_evidence"]["selected"]["evaluation"]["score"].as_f64(),
-            )
+    let subset_result = load_round_subset_result(&results)?;
+    let consumed_trials = factor_bank.attempts.len()
+        + subset_result
+            .as_ref()
+            .map(|result| result.candidates_evaluated)
+            .unwrap_or(0);
+    let strategy_exists = strategy_path.try_exists()?;
+    let (
+        termination_reason,
+        selected_candidate_id,
+        selected_candidate_content_hash,
+        selected_score,
+    ) = if factor_bank.entries.is_empty() {
+        if subset_result.is_some() || strategy_exists || report.replay_receipt_id.is_some() {
+            bail!("empty Factor Bank cannot produce subset search artifacts");
+        }
+        ("no_accepted_factors".to_string(), None, None, None)
+    } else {
+        let subset_result =
+            subset_result.context("non-empty Factor Bank is missing factor subset MCTS result")?;
+        if subset_result.selected.is_none() {
+            if strategy_exists {
+                bail!("subset search produced no passing selection but strategy artifact exists");
+            }
+            if report.replay_receipt_id.is_some() {
+                bail!("subset search produced no passing selection but replay receipt exists");
+            }
+            ("no_passing_subset".to_string(), None, None, None)
         } else {
-            (None, None, None)
-        };
+            if !strategy_exists {
+                bail!("passing subset selection is missing combination strategy artifact");
+            }
+            if report.replay_receipt_id.is_none() {
+                bail!("passing subset selection is missing event replay receipt");
+            }
+            let replay_gate_passed = report
+                .replay_gate_passed
+                .context("replay receipt is missing its gate verdict")?;
+            if replay_gate_passed {
+                let strategy: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&strategy_path)?)?;
+                (
+                    "pre_holdout_candidate_kept".to_string(),
+                    strategy["artifact_id"].as_str().map(str::to_string),
+                    Some(canonical_json_hash(&strategy)?),
+                    strategy["walk_forward_evidence"]["selected"]["evaluation"]["score"].as_f64(),
+                )
+            } else {
+                ("replay_gate_failed".to_string(), None, None, None)
+            }
+        }
+    };
     Ok(CampaignMissionLedgerV1 {
         round_id: round.round_id.clone(),
         seed: round.seed,
@@ -916,13 +955,7 @@ fn collect_round_ledger(
         selected_candidate_content_hash,
         selected_score,
         consumed_trials,
-        termination_reason: if report.replay_gate_passed == Some(true) {
-            "pre_holdout_candidate_kept".to_string()
-        } else if report.replay_receipt_id.is_some() {
-            "replay_gate_failed".to_string()
-        } else {
-            "no_passing_subset".to_string()
-        },
+        termination_reason,
     })
 }
 
@@ -948,13 +981,12 @@ fn campaign_round_claim_urls(
     }
 }
 
-fn round_subset_candidates(results: &Path) -> anyhow::Result<usize> {
+fn load_round_subset_result(results: &Path) -> anyhow::Result<Option<CexFactorBankMctsResultV1>> {
     let subset_path = results.join("factor-subset-mcts-result.json");
     if !subset_path.try_exists()? {
-        return Ok(0);
+        return Ok(None);
     }
-    let subset: CexFactorBankMctsResultV1 = serde_json::from_slice(&std::fs::read(subset_path)?)?;
-    Ok(subset.candidates_evaluated)
+    Ok(Some(serde_json::from_slice(&std::fs::read(subset_path)?)?))
 }
 
 fn compare_round_selection(
@@ -1668,6 +1700,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use crate::mission_render;
+    use alpha_domain::CexResearchMissionArtifactV1;
     use parquet::{
         data_type::{ByteArray, ByteArrayType, Int64Type},
         file::{
@@ -2440,8 +2473,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["termination_reason"], "campaign_no_candidate");
+        assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
+            round["termination_reason"] == serde_json::json!("no_accepted_factors")
+        }));
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
+    }
+
+    #[test]
+    fn collect_round_ledger_marks_missing_selection_as_no_passing_subset() {
+        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false);
+        execute(fixture.args.clone()).unwrap();
+
+        let request = load_request(&fixture.args.request).unwrap().request;
+        let round = request.rounds[0].clone();
+        let execute_dir = fixture
+            .work_dir
+            .join(format!("mission/{}/execute", round.round_id));
+        let results = execute_dir.join("results");
+        let subset_path = results.join("factor-subset-mcts-result.json");
+        let mut report = recover_round_report(&fixture.work_dir, &request, &round);
+        report.replay_gate_passed = Some(false);
+        let failed_replay = collect_round_ledger(&execute_dir, &round, &report).unwrap();
+        assert_eq!(failed_replay.termination_reason, "replay_gate_failed");
+        assert!(failed_replay.selected_candidate_id.is_none());
+        assert!(failed_replay.selected_score.is_none());
+
+        let mut subset: CexFactorBankMctsResultV1 =
+            serde_json::from_slice(&std::fs::read(&subset_path).unwrap()).unwrap();
+        subset.selected = None;
+        data_mission::write_json_atomic(&subset_path, &subset).unwrap();
+        std::fs::remove_file(results.join("combination-walk-forward.json")).unwrap();
+
+        report.replay_receipt_id = None;
+        report.replay_gate_passed = None;
+        let ledger = collect_round_ledger(&execute_dir, &round, &report).unwrap();
+
+        assert_eq!(ledger.termination_reason, "no_passing_subset");
+        assert!(ledger.selected_candidate_id.is_none());
+        assert!(ledger.selected_candidate_content_hash.is_none());
+        assert!(ledger.selected_score.is_none());
+    }
+
+    #[test]
+    fn collect_round_ledger_rejects_missing_subset_result_for_nonempty_factor_bank() {
+        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false);
+        execute(fixture.args.clone()).unwrap();
+
+        let request = load_request(&fixture.args.request).unwrap().request;
+        let round = request.rounds[0].clone();
+        let execute_dir = fixture
+            .work_dir
+            .join(format!("mission/{}/execute", round.round_id));
+        let results = execute_dir.join("results");
+        std::fs::remove_file(results.join("factor-subset-mcts-result.json")).unwrap();
+
+        let error = collect_round_ledger(
+            &execute_dir,
+            &round,
+            &recover_round_report(&fixture.work_dir, &request, &round),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("non-empty Factor Bank is missing factor subset MCTS result"));
     }
 
     #[test]
@@ -2505,13 +2601,46 @@ mod tests {
     }
 
     #[test]
-    fn round_subset_candidates_rejects_invalid_json() {
+    fn load_round_subset_result_rejects_invalid_json() {
         let root = tempfile::tempdir().unwrap();
         let results = root.path().join("results");
         std::fs::create_dir_all(&results).unwrap();
         std::fs::write(results.join("factor-subset-mcts-result.json"), b"{").unwrap();
 
-        assert!(round_subset_candidates(&results).is_err());
+        assert!(load_round_subset_result(&results).is_err());
+    }
+
+    fn recover_round_report(
+        work_dir: &Path,
+        request: &CampaignRequest,
+        round: &CampaignRoundRequest,
+    ) -> crate::mission_runner::ExecutionReport {
+        let mission_readback = work_dir.join(format!(
+            "mission/{}/admission/mission-readback.json",
+            round.round_id
+        ));
+        let mission: CexResearchMissionArtifactV1 =
+            serde_json::from_slice(&std::fs::read(&mission_readback).unwrap()).unwrap();
+        let mission_id = mission.semantic_id().unwrap();
+        let mission_sha256 = crate::mission_runner::sha256_file(&mission_readback).unwrap();
+        let request_sha256 =
+            crate::mission_runner::sha256_file(&work_dir.join("campaign-request.json")).unwrap();
+        let binding = ExecutionBinding::Campaign {
+            campaign_id: request.campaign_id.clone(),
+            round_id: round.round_id.clone(),
+            request_sha256,
+        };
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        recover_execution_report_from_published_result(
+            &client,
+            &round.result_readback_url,
+            &work_dir.join(format!("recover-{}.zip", round.round_id)),
+            &mission_id,
+            &mission_sha256,
+            &binding,
+        )
+        .unwrap()
+        .unwrap()
     }
 
     #[test]

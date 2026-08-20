@@ -768,7 +768,12 @@ pub(crate) fn execute_report(
         &factor_bank,
         &baseline_run,
     )?;
-    let subset_run = if baseline_run.gate.passed {
+    let subset_run = if factor_bank.entries.is_empty() {
+        if resume_checkpoint.is_some() {
+            bail!("MCTS resume checkpoint requires a non-empty Factor Bank");
+        }
+        None
+    } else {
         run_factor_bank_subset_search(
             &results_dir,
             &control_mission,
@@ -777,10 +782,6 @@ pub(crate) fn execute_report(
             &baseline_context,
             resume_checkpoint,
         )?
-    } else if resume_checkpoint.is_some() {
-        bail!("MCTS resume checkpoint requires a passing baseline gate");
-    } else {
-        None
     };
     let replay_report = subset_run
         .as_ref()
@@ -942,8 +943,8 @@ fn finalize_cex_candidate(
         .cart
         .as_ref()
         .context("final precommit is missing CART baseline evidence")?;
-    if !baselines.gate.passed || !replay.gate.passed {
-        bail!("final precommit requires passing baseline and replay gates");
+    if !replay.gate.passed {
+        bail!("final precommit requires a passing replay gate");
     }
     strategy
         .validate_binding(
@@ -5308,6 +5309,121 @@ pub(crate) mod tests {
             .all(|attempt| entries
                 .iter()
                 .all(|entry| entry["candidate_id"] != attempt["candidate_id"])));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn subset_mcts_runs_with_failed_baselines_when_factor_bank_is_nonempty() {
+        let mut fixture = fixture("failed-baseline-still-runs-subset");
+        fixture.mission.spec.search.seed = 1;
+        fixture.mission.spec.search.budget.max_candidates = 6;
+        fixture.mission.spec.search.budget.max_expansions = 6;
+        fixture.mission.spec.search.multiple_testing_trials = 12;
+        rewrite_features(&mut fixture, |row| {
+            let direction = row.label.signum();
+            row.features.insert("book_imbalance".to_string(), direction);
+            row.label = direction * 0.001;
+        });
+        rebind_mission_inputs(&mut fixture);
+
+        execute(fixture.args.clone()).unwrap();
+
+        let results = fixture.args.work_dir.join("results");
+        let original_factor_bank: CexFactorBankRevisionV2 =
+            serde_json::from_slice(&std::fs::read(results.join("factor-bank.json")).unwrap())
+                .unwrap();
+        let accepted_attempt = original_factor_bank
+            .attempts
+            .iter()
+            .find(|attempt| attempt.verdict == CexFactorScreeningVerdictV1::Accepted)
+            .cloned()
+            .expect("fixture must produce an accepted GP attempt");
+        let rejected_attempt = original_factor_bank
+            .attempts
+            .iter()
+            .find(|attempt| {
+                attempt.verdict == CexFactorScreeningVerdictV1::Rejected
+                    && attempt.evaluation.is_some()
+            })
+            .cloned()
+            .expect("fixture must produce an evaluated rejected GP attempt");
+        let mut synthetic_attempt = rejected_attempt;
+        synthetic_attempt.verdict = CexFactorScreeningVerdictV1::Accepted;
+        let mut borrowed_evaluation = accepted_attempt.evaluation.clone().unwrap();
+        borrowed_evaluation.candidate_id = synthetic_attempt.candidate_id.clone();
+        borrowed_evaluation.candidate_ast_sha256 = synthetic_attempt.ast_sha256.clone();
+        synthetic_attempt.evaluation = Some(borrowed_evaluation);
+        synthetic_attempt.rejection_codes.clear();
+        synthetic_attempt.rejection_details.clear();
+        synthetic_attempt.post_warmup_coverage_rows = accepted_attempt.post_warmup_coverage_rows;
+        let factor_bank = CexFactorBankRevisionV2::new(
+            original_factor_bank.search_lineage_id.clone(),
+            original_factor_bank.gp_policy.clone(),
+            original_factor_bank.screening_policy.clone(),
+            original_factor_bank.evaluation_policy.clone(),
+            original_factor_bank.research_dataset.clone(),
+            original_factor_bank.walk_forward_partition.clone(),
+            vec![synthetic_attempt],
+        )
+        .unwrap();
+        assert!(!factor_bank.entries.is_empty());
+
+        let baseline_policy: CexBaselinePolicyV1 =
+            serde_json::from_slice(&std::fs::read(results.join("baseline-policy.json")).unwrap())
+                .unwrap();
+        let store = AlphaStore::open(results.join("alpha.duckdb")).unwrap();
+        let manifest = data_mission::read_registered_research_dataset(
+            &store,
+            &results.join("cex-replay-dataset-manifest.json"),
+        )
+        .unwrap();
+        let rows = manifest
+            .load_rows(&fixture.mission.spec.evaluation_protocol.costs)
+            .unwrap();
+        let dataset = prepare_dataset(rows, &fixture.mission.spec.evaluation_protocol).unwrap();
+        let failed_baselines = evaluate_cex_baselines(
+            &dataset.engine_context(),
+            &factor_bank,
+            &baseline_policy,
+            &fixture.mission.semantic_id().unwrap(),
+            fixture.mission.spec.hypotheses[0].target.clone(),
+            &fixture.mission.spec.policies.evaluation,
+        )
+        .unwrap();
+        assert!(!failed_baselines.gate.passed);
+        assert!(failed_baselines.ridge.is_some());
+        assert!(failed_baselines.cart.is_some());
+
+        let subset_results = fixture.root.join("failed-baseline-subset-results");
+        std::fs::create_dir_all(&subset_results).unwrap();
+        let selection = run_factor_bank_subset_search(
+            &subset_results,
+            &fixture.mission,
+            &factor_bank,
+            &failed_baselines,
+            &dataset.engine_context(),
+            None,
+        )
+        .unwrap();
+
+        assert!(selection.is_none());
+        assert!(subset_results
+            .join("factor-subset-mcts-checkpoint.json")
+            .exists());
+        assert!(subset_results
+            .join("factor-subset-mcts-trace.json")
+            .exists());
+        assert!(subset_results
+            .join("factor-subset-mcts-result.json")
+            .exists());
+        assert!(!subset_results
+            .join("combination-walk-forward.json")
+            .exists());
+        assert!(!subset_results
+            .join("cex-event-replay-receipt.json")
+            .exists());
+        assert!(!subset_results.join("final-precommit.json").exists());
+        assert!(!subset_results.join("sealed-holdout-claim.json").exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
