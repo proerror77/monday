@@ -1039,6 +1039,38 @@ cutover requires exactly one immutable passing run. A short test override is
 available only for script testing; it writes `passed=false` and never creates
 `PASSED.sha256`, so it cannot authorize cutover.
 
+### Isolated shadow recovery (explicit exception path)
+
+If a stopped Shadow spool contains one interrupted `.jsonl.part` together with
+its same-stem truncated `.jsonl.zst.tmp`, use the release that created those
+files through the recovery action:
+
+```bash
+set -euo pipefail
+ACTION=recover \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+EXPECTED_PRODUCTION_SHA256=REPLACE_WITH_CURRENT_PRODUCTION_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+The host helper is restricted to the isolated Spot Shadow spool, requires both
+Shadow units and upload oneshots to be inactive, verifies the candidate,
+production rollback identity, and the unchanged canonical production spool, and
+requires exactly one matching `.part`/`.zst.tmp` pair. The candidate's
+`--recover-only` mode takes the per-spool lock, does not connect to WebSocket or
+start a collector, streams `.jsonl.part` recovery, proves the temporary is a
+truncated zstd prefix of that part, and moves the temporary into a run-scoped
+quarantine with its digest recorded in immutable evidence. Unknown, complete,
+corrupt, or mismatched temporary artifacts fail closed. It then runs the
+existing upload-only path, which verifies the Tokyo internal OSS data/manifest/
+`_SUCCESS` triplet by readback and requires zero local incomplete artifacts.
+
+This path never touches the production symlink or canonical production spool,
+does not create Gate evidence, and does not authorize cutover. A fresh formal
+Gate remains mandatory after recovery; stop on any identity, lock, artifact,
+readback, or production-orphan drift.
+
 For a one-time upgrade from the pre-release layout, where the running Rust
 binary is still a regular file instead of a digest-addressed symlink, use
 `host-rust-lob-adopt-production-release.sh` through Cloud Assistant before the

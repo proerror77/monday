@@ -23,9 +23,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -48,6 +49,12 @@ struct Args {
 
     #[arg(long, conflicts_with_all = ["self_test", "verify_segment"])]
     upload_only: bool,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["self_test", "upload_only", "verify_segment"]
+    )]
+    recover_only: bool,
 
     #[arg(
         long,
@@ -117,6 +124,17 @@ struct UploadConfig {
     oss_region: String,
     aliyun_profile: String,
     oss_copy_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct RecoveryConfig {
+    segment: SegmentConfig,
+    upload: UploadConfig,
+    artifact_sha256: String,
+    source_revision: String,
+    bundle_sha256: String,
+    catalog_manifest: PathBuf,
+    evidence_dir: PathBuf,
 }
 
 const UPLOADED_CLEANUP_SCHEMA: &str = "monday.binance_lob.uploaded_cleanup.v1";
@@ -351,6 +369,498 @@ impl From<&Config> for UploadConfig {
     }
 }
 
+fn required_recovery_env(name: &str) -> anyhow::Result<String> {
+    let value = env::var(name)
+        .with_context(|| format!("{name} is required for --recover-only"))?
+        .trim()
+        .to_owned();
+    anyhow::ensure!(!value.is_empty(), "{name} must not be empty");
+    Ok(value)
+}
+
+fn required_recovery_hex(name: &str, length: usize) -> anyhow::Result<String> {
+    let value = required_recovery_env(name)?;
+    anyhow::ensure!(
+        value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{name} must contain exactly {length} hexadecimal characters"
+    );
+    Ok(value.to_ascii_lowercase())
+}
+
+fn direct_existing_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_absolute(), "{label} must be an absolute path");
+    let mut current = PathBuf::from("/");
+    for component in path.components().skip(1) {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("failed to inspect {label}: {}", current.display()))?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "{label} contains a symlink: {}",
+            current.display()
+        );
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label}: {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "{label} is not a directory: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn direct_existing_file(path: &Path, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_absolute(), "{label} must be an absolute path");
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} has no parent: {}", path.display()))?;
+    direct_existing_directory(parent, label)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label}: {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{label} is not a direct regular file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn stream_types_for_market(market: Market) -> Vec<String> {
+    let mut stream_types = vec![
+        "depth@100ms".to_owned(),
+        "aggTrade".to_owned(),
+        "trade".to_owned(),
+        "bookTicker".to_owned(),
+    ];
+    if market == Market::Usdm {
+        stream_types.push("forceOrder".to_owned());
+    }
+    stream_types
+}
+
+fn manifest_string_list(value: &Value, field: &str) -> anyhow::Result<Vec<String>> {
+    let values = value[field]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("catalog manifest field {field} must be an array"))?;
+    let mut strings = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("catalog manifest field {field} has a non-string"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !strings.is_empty(),
+        "catalog manifest field {field} is empty"
+    );
+    let mut sorted = strings.clone();
+    sorted.sort();
+    sorted.dedup();
+    anyhow::ensure!(
+        sorted.len() == strings.len() && sorted == strings,
+        "catalog manifest field {field} must be sorted and unique"
+    );
+    Ok(std::mem::take(&mut strings))
+}
+
+fn manifest_optional_string_list(value: &Value, field: &str) -> anyhow::Result<Vec<String>> {
+    let Some(values) = value.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("catalog manifest field {field} must be an array"))?;
+    let strings = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("catalog manifest field {field} has a non-string"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut sorted = strings.clone();
+    sorted.sort();
+    sorted.dedup();
+    anyhow::ensure!(
+        sorted.len() == strings.len() && sorted == strings,
+        "catalog manifest field {field} must be sorted and unique"
+    );
+    Ok(strings)
+}
+
+fn recovery_catalog(
+    path: &Path,
+    spool_dir: &Path,
+    market: Market,
+    dataset: &str,
+    shard_id: &str,
+) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    direct_existing_file(path, "RECOVERY_CATALOG_MANIFEST")?;
+    let spool_root = std::fs::canonicalize(spool_dir)?;
+    let manifest_path = std::fs::canonicalize(path)?;
+    anyhow::ensure!(
+        manifest_path.starts_with(&spool_root),
+        "RECOVERY_CATALOG_MANIFEST must be inside SPOOL_DIR"
+    );
+    let manifest: Value = serde_json::from_reader(std::fs::File::open(path)?)
+        .context("failed to parse RECOVERY_CATALOG_MANIFEST")?;
+    anyhow::ensure!(
+        manifest["schema"] == RAW_SCHEMA,
+        "RECOVERY_CATALOG_MANIFEST must use {RAW_SCHEMA}"
+    );
+    anyhow::ensure!(
+        manifest["market"].as_str() == Some(market.as_str()),
+        "catalog manifest market does not match recovery market"
+    );
+    anyhow::ensure!(
+        manifest["dataset"].as_str() == Some(dataset),
+        "catalog manifest dataset does not match recovery dataset"
+    );
+    anyhow::ensure!(
+        manifest["shard_id"].as_str() == Some(shard_id),
+        "catalog manifest shard_id does not match recovery shard"
+    );
+    let expected_stream_types = serde_json::to_value(stream_types_for_market(market))?;
+    anyhow::ensure!(
+        manifest.get("stream_types") == Some(&expected_stream_types),
+        "catalog manifest stream_types do not match the recovery market"
+    );
+    let symbols = manifest_string_list(&manifest, "symbols")?;
+    let security_token_symbols =
+        manifest_optional_string_list(&manifest, "security_token_symbols")?;
+    let excluded_symbols = manifest_optional_string_list(&manifest, "excluded_symbols")?;
+    Ok((symbols, security_token_symbols, excluded_symbols))
+}
+
+impl RecoveryConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        let spool_dir = PathBuf::from(required_recovery_env("SPOOL_DIR")?);
+        direct_existing_directory(&spool_dir, "SPOOL_DIR")?;
+        let market: Market = required_recovery_env("MARKET")?
+            .parse()
+            .map_err(anyhow::Error::msg)?;
+        let dataset = required_recovery_env("DATASET")?;
+        let shard_id = required_recovery_env("SHARD_ID")?;
+        let catalog_manifest = PathBuf::from(required_recovery_env("RECOVERY_CATALOG_MANIFEST")?);
+        let (symbols, security_token_symbols, excluded_symbols) =
+            recovery_catalog(&catalog_manifest, &spool_dir, market, &dataset, &shard_id)?;
+        let upload = UploadConfig::from_env()?;
+        anyhow::ensure!(
+            upload.oss_endpoint == "oss-ap-northeast-1-internal.aliyuncs.com"
+                && upload.oss_region == "ap-northeast-1",
+            "--recover-only requires the Tokyo internal OSS endpoint and region"
+        );
+        let artifact_sha256 = required_recovery_hex("RECOVERY_ARTIFACT_SHA256", 64)?;
+        let executable = env::current_exe().context("failed to resolve recovery executable")?;
+        anyhow::ensure!(
+            sha256_file(&executable)? == artifact_sha256,
+            "RECOVERY_ARTIFACT_SHA256 does not match the running executable"
+        );
+        let source_revision = required_recovery_env("RECOVERY_SOURCE_REVISION")?;
+        anyhow::ensure!(
+            source_revision == BUILD_SOURCE_REVISION
+                && source_revision.len() >= 40
+                && source_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "RECOVERY_SOURCE_REVISION does not match the bound binary source revision"
+        );
+        let bundle_sha256 = required_recovery_hex("RECOVERY_BUNDLE_SHA256", 64)?;
+        let evidence_dir = PathBuf::from(required_recovery_env("RECOVERY_EVIDENCE_DIR")?);
+        direct_existing_directory(&evidence_dir, "RECOVERY_EVIDENCE_DIR")?;
+        let segment = SegmentConfig {
+            spool_dir,
+            market,
+            dataset,
+            shard_id,
+            symbols,
+            security_token_symbols,
+            excluded_symbols,
+            snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
+            zstd_timeout: Duration::from_secs(env_parse("ZSTD_TIMEOUT_SECONDS", 300_u64)?),
+            stream_types: stream_types_for_market(market),
+        };
+        Ok(Self {
+            segment,
+            upload,
+            artifact_sha256,
+            source_revision,
+            bundle_sha256,
+            catalog_manifest,
+            evidence_dir,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryTempValidation {
+    decompressed_bytes: u64,
+    zstd_error: String,
+}
+
+fn replace_suffix(path: &Path, suffix: &str, replacement: &str) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no UTF-8 file name: {}", path.display()))?;
+    let stem = name
+        .strip_suffix(suffix)
+        .ok_or_else(|| anyhow::anyhow!("path has no {suffix} suffix: {}", path.display()))?;
+    Ok(path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?
+        .join(format!("{stem}{replacement}")))
+}
+
+fn recovery_inventory(config: &SegmentConfig) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let parts = files_with_suffix(&config.spool_dir, ".jsonl.part")?;
+    let temps = files_with_suffix(&config.spool_dir, ".jsonl.zst.tmp")?;
+    let corrupt = files_with_suffix(&config.spool_dir, ".part.corrupt")?;
+    if !corrupt.is_empty() {
+        anyhow::bail!(
+            "recovery refuses pre-existing corrupt artifacts: {}",
+            corrupt
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for temp in &temps {
+        let part = replace_suffix(temp, ".jsonl.zst.tmp", ".jsonl.part")?;
+        anyhow::ensure!(
+            parts.binary_search(&part).is_ok(),
+            "recovery refuses unknown temporary artifact without a same-stem part: {}",
+            temp.display()
+        );
+    }
+    Ok((parts, temps))
+}
+
+fn validate_recovery_temp(temp: &Path, part: &Path) -> anyhow::Result<RecoveryTempValidation> {
+    direct_existing_file(temp, "stale recovery temporary")?;
+    direct_existing_file(part, "recovery part")?;
+    let part_len = std::fs::metadata(part)?.len();
+    anyhow::ensure!(part_len > 0, "recovery part is empty: {}", part.display());
+    let mut child = Command::new("zstd")
+        .args(["-dc", "--quiet"])
+        .arg(temp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to inspect stale temporary {}", temp.display()))?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("zstd stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("zstd stderr was not piped"))?;
+    let mut part_file = std::fs::File::open(part)?;
+    let mut decompressed_chunk = vec![0_u8; 1024 * 1024];
+    let mut part_chunk = vec![0_u8; 1024 * 1024];
+    let mut decompressed_bytes = 0_u64;
+    loop {
+        let read = output.read(&mut decompressed_chunk)?;
+        if read == 0 {
+            break;
+        }
+        let mut offset = 0;
+        while offset < read {
+            let expected = part_file.read(&mut part_chunk[..read - offset])?;
+            anyhow::ensure!(
+                expected > 0
+                    && part_chunk[..expected] == decompressed_chunk[offset..offset + expected],
+                "stale temporary does not match the prefix of its same-stem part: {}",
+                temp.display()
+            );
+            offset += expected;
+            decompressed_bytes = decompressed_bytes
+                .checked_add(expected as u64)
+                .ok_or_else(|| anyhow::anyhow!("stale temporary byte count overflow"))?;
+        }
+    }
+    let mut stderr_bytes = Vec::new();
+    stderr.read_to_end(&mut stderr_bytes)?;
+    let status = child.wait()?;
+    let zstd_error = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+    anyhow::ensure!(
+        !status.success()
+            && decompressed_bytes > 0
+            && decompressed_bytes < part_len
+            && zstd_error.to_ascii_lowercase().contains("premature end"),
+        "stale temporary is not a proven truncated zstd prefix: {} ({zstd_error})",
+        temp.display()
+    );
+    Ok(RecoveryTempValidation {
+        decompressed_bytes,
+        zstd_error,
+    })
+}
+
+fn recovery_snapshot(path: &Path) -> anyhow::Result<Value> {
+    direct_existing_file(path, "recovery artifact")?;
+    let metadata = std::fs::metadata(path)?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("artifact mtime predates epoch: {error}"))?
+        .as_nanos();
+    Ok(json!({
+        "path": path,
+        "inode": metadata.ino(),
+        "device": metadata.dev(),
+        "bytes": metadata.len(),
+        "mtime_ns": modified_ns,
+        "sha256": sha256_file(path)?,
+    }))
+}
+
+fn write_recovery_json(evidence_dir: &Path, name: &str, value: &Value) -> anyhow::Result<()> {
+    let destination = evidence_dir.join(name);
+    anyhow::ensure!(
+        !destination.exists() && !destination.is_symlink(),
+        "recovery evidence already exists: {}",
+        destination.display()
+    );
+    let temporary = evidence_dir.join(format!(".{name}.tmp"));
+    anyhow::ensure!(
+        !temporary.exists() && !temporary.is_symlink(),
+        "recovery evidence temporary already exists: {}",
+        temporary.display()
+    );
+    let bytes = serde_json::to_vec_pretty(value)?;
+    std::fs::write(&temporary, bytes)?;
+    std::fs::File::open(&temporary)?.sync_all()?;
+    std::fs::rename(&temporary, &destination)?;
+    sync_parent_directory(&destination)?;
+    Ok(())
+}
+
+fn quarantine_recovery_temp(
+    temp: &Path,
+    evidence_dir: &Path,
+    sha256: &str,
+) -> anyhow::Result<PathBuf> {
+    let quarantine_dir = evidence_dir.join("quarantine");
+    if !quarantine_dir.exists() {
+        std::fs::create_dir(&quarantine_dir)?;
+    }
+    direct_existing_directory(&quarantine_dir, "recovery quarantine")?;
+    let name = temp
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("temporary has no UTF-8 file name: {}", temp.display()))?;
+    let destination = quarantine_dir.join(format!("{name}.quarantined.{sha256}"));
+    anyhow::ensure!(
+        !destination.exists() && !destination.is_symlink(),
+        "recovery quarantine destination already exists: {}",
+        destination.display()
+    );
+    std::fs::rename(temp, &destination)
+        .with_context(|| format!("failed to quarantine stale temporary {}", temp.display()))?;
+    sync_parent_directory(&destination)?;
+    Ok(destination)
+}
+
+async fn recover_only() -> anyhow::Result<()> {
+    let config = RecoveryConfig::from_env()?;
+    let _spool_lock = SpoolLock::acquire(&config.segment.spool_dir)?;
+    let (parts, temps) = recovery_inventory(&config.segment)?;
+    let catalog_sha256 = sha256_file(&config.catalog_manifest)?;
+    let part_snapshots = parts
+        .iter()
+        .map(|path| recovery_snapshot(path))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut temp_evidence = Vec::new();
+    for temp in &temps {
+        let part = replace_suffix(temp, ".jsonl.zst.tmp", ".jsonl.part")?;
+        let validation = validate_recovery_temp(temp, &part)?;
+        let snapshot = recovery_snapshot(temp)?;
+        temp_evidence.push(json!({
+            "temporary": snapshot,
+            "same_stem_part": part,
+            "decompressed_prefix_bytes": validation.decompressed_bytes,
+            "zstd_error": validation.zstd_error,
+        }));
+    }
+    write_recovery_json(
+        &config.evidence_dir,
+        "recovery-input.json",
+        &json!({
+            "schema": "monday.binance_lob_recovery.v1",
+            "phase": "input",
+            "candidate_artifact_sha256": config.artifact_sha256,
+            "source_revision": config.source_revision,
+            "deployment_bundle_sha256": config.bundle_sha256,
+            "spool_dir": config.segment.spool_dir,
+            "market": config.segment.market.as_str(),
+            "dataset": config.segment.dataset,
+            "shard_id": config.segment.shard_id,
+            "catalog_manifest": config.catalog_manifest,
+            "catalog_manifest_sha256": catalog_sha256,
+            "parts": part_snapshots,
+            "stale_temporaries": temp_evidence,
+        }),
+    )?;
+    let mut quarantined = Vec::new();
+    for temp in temps {
+        let sha256 = sha256_file(&temp)?;
+        let destination = quarantine_recovery_temp(&temp, &config.evidence_dir, &sha256)?;
+        quarantined.push(json!({
+            "original": temp,
+            "quarantined": destination,
+            "sha256": sha256,
+        }));
+    }
+    let recovered = recover_parts(&config.segment)?;
+    let corrupt = files_with_suffix(&config.segment.spool_dir, ".part.corrupt")?;
+    anyhow::ensure!(
+        corrupt.is_empty(),
+        "recovery produced corrupt artifacts: {}",
+        corrupt
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let uploaded = upload_only_locked(&config.upload).await?;
+    let (remaining_parts, remaining_temps) = recovery_inventory(&config.segment)?;
+    anyhow::ensure!(
+        remaining_parts.is_empty() && remaining_temps.is_empty(),
+        "recovery left incomplete artifacts in the spool"
+    );
+    write_recovery_json(
+        &config.evidence_dir,
+        "recovery-result.json",
+        &json!({
+            "schema": "monday.binance_lob_recovery.v1",
+            "phase": "complete",
+            "candidate_artifact_sha256": config.artifact_sha256,
+            "source_revision": config.source_revision,
+            "deployment_bundle_sha256": config.bundle_sha256,
+            "recovered_segments": recovered.len(),
+            "uploaded_segments": uploaded,
+            "remaining_parts": remaining_parts,
+            "remaining_stale_temporaries": remaining_temps,
+            "quarantined_temporaries": quarantined,
+            "oss_endpoint": config.upload.oss_endpoint,
+            "oss_region": config.upload.oss_region,
+        }),
+    )?;
+    println!(
+        "recover-only: recovered={} uploaded={} incomplete=0",
+        recovered.len(),
+        uploaded
+    );
+    Ok(())
+}
+
 impl Config {
     async fn from_env() -> anyhow::Result<Self> {
         if env_string("DEPTH_MODE", "diff") != "diff" {
@@ -416,16 +926,7 @@ impl Config {
     /// and repeated by every session_start row. Liquidation orders are USD-M
     /// only, so spot tapes declare one fewer stream type.
     fn stream_types(&self) -> Vec<String> {
-        let mut stream_types = vec![
-            "depth@100ms".to_owned(),
-            "aggTrade".to_owned(),
-            "trade".to_owned(),
-            "bookTicker".to_owned(),
-        ];
-        if self.market == Market::Usdm {
-            stream_types.push("forceOrder".to_owned());
-        }
-        stream_types
+        stream_types_for_market(self.market)
     }
 
     fn segment_config(&self) -> SegmentConfig {
@@ -1066,6 +1567,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.upload_only {
         return upload_only(&UploadConfig::from_env()?).await;
+    }
+    if args.recover_only {
+        return recover_only().await;
     }
     if !args.verify_segment.is_empty() {
         return verify_segments(&args);
@@ -3757,6 +4261,12 @@ async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
         );
     }
     let _spool_lock = SpoolLock::acquire(&config.spool_dir)?;
+    let uploaded = upload_only_locked(config).await?;
+    println!("upload-only: uploaded={uploaded} pending=0");
+    Ok(())
+}
+
+async fn upload_only_locked(config: &UploadConfig) -> anyhow::Result<usize> {
     let mut incomplete = Vec::new();
     for suffix in [".jsonl.part", ".zst.tmp", ".part.corrupt"] {
         incomplete.extend(files_with_suffix(&config.spool_dir, suffix)?);
@@ -3790,8 +4300,7 @@ async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
             residual.len()
         );
     }
-    println!("upload-only: uploaded={uploaded} pending=0");
-    Ok(())
+    Ok(uploaded)
 }
 
 async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usize> {
@@ -4455,6 +4964,31 @@ mod tests {
     }
 
     #[test]
+    fn recover_only_cli_is_explicit_and_exclusive() {
+        let args = Args::try_parse_from(["binance-lob-archiver", "--recover-only"]).unwrap();
+        assert!(args.recover_only);
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--recover-only", "--upload-only",])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--recover-only", "--self-test",])
+                .is_err()
+        );
+        assert!(Args::try_parse_from([
+            "binance-lob-archiver",
+            "--recover-only",
+            "--verify-segment",
+            "/tmp/part.jsonl.zst",
+            "--segment-content-sha256",
+            &"a".repeat(64),
+            "--segment-manifest-sha256",
+            &"b".repeat(64),
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn verify_segments_cli_requires_equal_explicit_trust_anchors() {
         let args = Args::try_parse_from([
             "binance-lob-archiver",
@@ -4665,6 +5199,64 @@ mod tests {
         upload_only(&config).await.unwrap();
         assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
         std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_validates_a_same_stem_truncated_zstd_prefix() {
+        let temp_dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let part = temp_dir.path().join("part-1700000000000000000.jsonl.part");
+        let temporary = temp_dir
+            .path()
+            .join("part-1700000000000000000.jsonl.zst.tmp");
+        let bytes = (0..20_000)
+            .map(|index| format!("{}\n", json!({"received_at_ns": index})))
+            .collect::<String>()
+            .into_bytes();
+        std::fs::write(&part, &bytes).unwrap();
+        let compressed = temp_dir.path().join("full.zst");
+        let status = Command::new("zstd")
+            .args(["-q", "-f"])
+            .arg(&part)
+            .arg("-o")
+            .arg(&compressed)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut compressed_bytes = std::fs::read(&compressed).unwrap();
+        compressed_bytes.truncate(compressed_bytes.len() / 2);
+        std::fs::write(&temporary, compressed_bytes).unwrap();
+
+        let validation = validate_recovery_temp(&temporary, &part).unwrap();
+        assert!(validation.decompressed_bytes > 0);
+        assert!(validation.decompressed_bytes < bytes.len() as u64);
+        assert!(validation
+            .zstd_error
+            .to_ascii_lowercase()
+            .contains("premature end"));
+    }
+
+    #[test]
+    fn recovery_refuses_a_held_second_writer_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let first = SpoolLock::acquire(temp_dir.path()).unwrap();
+        let error = SpoolLock::acquire(temp_dir.path()).unwrap_err();
+        assert!(error.to_string().contains("spool is already locked"));
+        drop(first);
+    }
+
+    #[test]
+    fn recovery_refuses_unknown_stale_temporary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let unknown = temp_dir
+            .path()
+            .join("part-1700000000000000000.jsonl.zst.tmp");
+        std::fs::write(&unknown, b"unfinished").unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = temp_dir.path().to_path_buf();
+        let error = recovery_inventory(&config.segment_config()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown temporary artifact without a same-stem part"));
     }
 
     #[tokio::test]

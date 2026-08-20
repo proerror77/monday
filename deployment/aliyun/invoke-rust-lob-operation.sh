@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: ACTION=gate|cutover|restore INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
+    'Usage: ACTION=gate|cutover|restore|recover INSTANCE_ID=i-... ARTIFACT_SHA256=<64 hex> invoke-rust-lob-operation.sh' \
     '' \
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
@@ -15,7 +15,7 @@ for command in aliyun base64 jq seq sleep tr; do
   fi
 done
 
-: "${ACTION:?set ACTION to gate, cutover, or restore}"
+: "${ACTION:?set ACTION to gate, cutover, restore, or recover}"
 : "${INSTANCE_ID:?set INSTANCE_ID}"
 : "${ARTIFACT_SHA256:?set ARTIFACT_SHA256}"
 
@@ -51,6 +51,17 @@ case "$ACTION" in
     timeout_seconds=3600
     command_name=monday-rust-lob-restore
     ;;
+  recover)
+    host_script=host-rust-lob-shadow-recover.sh
+    timeout_seconds=3600
+    command_name=monday-rust-lob-shadow-recover
+    : "${EXPECTED_PRODUCTION_SHA256:?set EXPECTED_PRODUCTION_SHA256 for recover}"
+    if [[ ! "$EXPECTED_PRODUCTION_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+      printf 'EXPECTED_PRODUCTION_SHA256 must contain exactly 64 hexadecimal characters\n' >&2
+      exit 2
+    fi
+    EXPECTED_PRODUCTION_SHA256=$(printf '%s' "$EXPECTED_PRODUCTION_SHA256" | tr '[:upper:]' '[:lower:]')
+    ;;
   *)
     usage >&2
     exit 2
@@ -78,8 +89,13 @@ if [[ -n "$ALIYUN_LOCAL_PROFILE" ]]; then
 fi
 
 host_path="/opt/monday/releases/binance-lob-archiver/$ARTIFACT_SHA256/deployment/$host_script"
-printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
-  "$host_path" "$ARTIFACT_SHA256"
+if [[ "$ACTION" == recover ]]; then
+  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q %q\n' \
+    "$host_path" "$ARTIFACT_SHA256" "$EXPECTED_PRODUCTION_SHA256"
+else
+  printf -v remote_script '#!/usr/bin/env bash\nset -euo pipefail\nexec %q %q\n' \
+    "$host_path" "$ARTIFACT_SHA256"
+fi
 command_content=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
 
 run_json=$(aliyun ecs RunCommand \

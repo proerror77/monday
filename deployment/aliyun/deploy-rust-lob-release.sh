@@ -89,6 +89,7 @@ assets=(
   host-rust-lob-shadow-preflight.sh
   host-rust-lob-shadow-soak.sh
   host-rust-lob-shadow-gate.sh
+  host-rust-lob-shadow-recover.sh
   host-rust-lob-cutover.sh
   host-rust-lob-restore.sh
   rust-lob-control-plane-lib.sh
@@ -357,6 +358,9 @@ install -m 0755 "$release_deployment/host-rust-lob-shadow-soak.sh" \
   /opt/monday/bin/monday-rust-lob-shadow-soak
 install -m 0755 "$release_deployment/host-rust-lob-shadow-preflight.sh" \
   /opt/monday/bin/monday-rust-lob-shadow-preflight
+
+install -m 0755 "$release_deployment/host-rust-lob-shadow-recover.sh" \
+  /opt/monday/bin/monday-rust-lob-shadow-recover
 
 ln -sfn "$release_binary" /opt/monday/bin/binance-lob-archiver-shadow
 printf '%s  %s\n' "$artifact_sha256" /opt/monday/bin/binance-lob-archiver-shadow \
