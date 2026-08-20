@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/host-rust-lob-cutover.sh"
+RESTORE="$SCRIPT_DIR/host-rust-lob-restore.sh"
 GATE="$SCRIPT_DIR/host-rust-lob-shadow-gate.sh"
 INSTALL_RELEASE="$SCRIPT_DIR/deploy-rust-lob-release.sh"
 SHADOW_UNIT="$SCRIPT_DIR/binance-lob-archiver-rust@.service"
@@ -98,7 +99,22 @@ grep -Fq 'fewer than two replay-safe complete OSS manifests' "$GATE"
 grep -Fq 'replay-unsafe manifest before a later replay-safe manifest' "$LIB"
 grep -Fq 'install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$segment_dir"' "$GATE"
 grep -Fq 'manifest_sha256:$manifest_sha256' "$GATE"
-grep -Fq 'readonly HEALTH_SETTLE_SECONDS=600' "$GATE"
+grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=180' "$GATE"
+grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
+grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
+grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
+grep -Fq 'printf '\''SEGMENT_SECONDS=%s\n'\'' "$GATE_SEGMENT_SECONDS"' "$GATE"
+[[ $(grep -Fc 'run_candidate_drain "$market"' "$GATE") -eq 1 ]] || {
+  printf 'shadow gate drains a fixed or pre-existing spool before the run\n' >&2
+  exit 1
+}
+if grep -Fq 'monday-rust-lob-shadow-gate.lock' "$CUTOVER" "$RESTORE"; then
+  printf 'cutover or restore still acquires the duplicate shadow-gate lock\n' >&2
+  exit 1
+fi
+grep -Fq 'monday-rust-lob-release.lock' "$CUTOVER"
+grep -Fq 'monday-rust-lob-release.lock' "$RESTORE"
 grep -Fq 'readonly MAX_HEALTH_SILENCE_SECONDS=120' "$GATE"
 grep -Fq 'MONDAY_TEST_HEALTH_SETTLE_SECONDS' "$GATE"
 grep -Fq 'short health settles require a test-only gate' "$GATE"
@@ -123,8 +139,8 @@ grep -Fq 'and .all_stream_coverage_verified == true' "$GATE"
 grep -Fq 'or (.diff_count == 0' "$GATE"
 grep -Fq 'and .first_update_id == null' "$GATE"
 grep -Fq 'and .last_update_id == null' "$GATE"
-grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
-grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
+grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"
+grep -Fq 'gate_started_ns=$(date +%s%N)' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
 grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
@@ -140,17 +156,27 @@ if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GA
   exit 1
 fi
 
-observation_started_ns=1000000900
-same_second_warmup_start_ns=1000000100
-same_second_observation_start_ns=1000000950
-((same_second_warmup_start_ns < observation_started_ns)) || {
-  printf 'nanosecond cutoff admitted a same-second warmup segment\n' >&2
+gate_started_ns=1000000900
+pre_gate_start_ns=1000000100
+same_second_gate_start_ns=1000000950
+((pre_gate_start_ns < gate_started_ns)) || {
+  printf 'nanosecond cutoff admitted a pre-gate segment\n' >&2
   exit 1
 }
 
 required_duration_seconds=$(sed -n 's/^readonly REQUIRED_DURATION_SECONDS=//p' "$GATE")
 [[ $required_duration_seconds =~ ^[1-9][0-9]*$ ]] || {
   printf 'gate has no positive REQUIRED_DURATION_SECONDS\n' >&2
+  exit 1
+}
+gate_segment_seconds=$(sed -n 's/^readonly GATE_SEGMENT_SECONDS=//p' "$GATE")
+[[ $gate_segment_seconds =~ ^[1-9][0-9]*$ ]] || {
+  printf 'gate has no positive GATE_SEGMENT_SECONDS\n' >&2
+  exit 1
+}
+(( required_duration_seconds >= 2 * gate_segment_seconds )) || {
+  printf 'formal Gate cannot produce two run-scoped segments (obs %ss, segment %ss)\n' \
+    "$required_duration_seconds" "$gate_segment_seconds" >&2
   exit 1
 }
 for shadow_env in \
@@ -161,18 +187,14 @@ for shadow_env in \
     printf 'shadow env has no positive SEGMENT_SECONDS: %s\n' "$shadow_env" >&2
     exit 1
   }
-  # A rotation can land almost a full segment after observation start, so the
-  # observation must hold at least two complete post-start segments even in
-  # that worst case: required >= 2 * segment_seconds. The second segment is
-  # finalized by the drain when its rotation falls after observation end.
-  (( required_duration_seconds >= 2 * segment_seconds )) || {
-    printf 'shadow cadence cannot guarantee two post-start manifests: %s (obs %ss, segment %ss)\n' \
-      "$shadow_env" "$required_duration_seconds" "$segment_seconds" >&2
+  ((segment_seconds == 300)) || {
+    printf 'committed stability cadence changed unexpectedly: %s (%ss)\n' \
+      "$shadow_env" "$segment_seconds" >&2
     exit 1
   }
 done
-((same_second_observation_start_ns >= observation_started_ns)) || {
-  printf 'nanosecond cutoff rejected a same-second observation segment\n' >&2
+((same_second_gate_start_ns >= gate_started_ns)) || {
+  printf 'nanosecond cutoff rejected a same-second gate segment\n' >&2
   exit 1
 }
 
@@ -290,7 +312,7 @@ run_strict_verifier_failure_fixture
 health_settle_body="$tmp_dir/resolve-health-settle.sh"
 sed -n '/^resolve_health_settle_seconds()/,/^}/p' "$GATE" >"$health_settle_body"
 resolve_health_settle() (
-  HEALTH_SETTLE_SECONDS=2400
+  HEALTH_SETTLE_SECONDS=180
   gate_seconds=$1
   test_only=$2
   MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=$3
@@ -301,21 +323,21 @@ resolve_health_settle() (
   resolve_health_settle_seconds
   printf '%s\n' "$health_settle_seconds"
 )
-[[ $(resolve_health_settle 1800 true 1 60) == 60 ]] || {
+[[ $(resolve_health_settle 120 true 1 60) == 60 ]] || {
   printf 'authorized short health settle was not applied\n' >&2
   exit 1
 }
-[[ $(resolve_health_settle 1800 true 1 '') == 2400 ]] || {
+[[ $(resolve_health_settle 120 true 1 '') == 180 ]] || {
   printf 'test-only gate without an override did not keep the formal settle\n' >&2
   exit 1
 }
 for fixture in \
-  '3600 false 1 60' \
-  '1800 true 0 60' \
-  '1800 true 1 invalid' \
-  '1800 true 1 2400' \
-  '1800 true 1 2401' \
-  "1800 true 1 $(printf '9%.0s' {1..100})"; do
+  '240 false 1 60' \
+  '120 true 0 60' \
+  '120 true 1 invalid' \
+  '120 true 1 180' \
+  '120 true 1 181' \
+  "120 true 1 $(printf '9%.0s' {1..100})"; do
   read -r fixture_gate fixture_test fixture_auth fixture_value <<<"$fixture"
   if resolve_health_settle "$fixture_gate" "$fixture_test" "$fixture_auth" \
     "$fixture_value" >/dev/null 2>&1; then
@@ -391,6 +413,8 @@ artifact=$(printf 'a%.0s' {1..64})
 bundle=$(printf 'b%.0s' {1..64})
 source_revision=$(printf 'c%.0s' {1..40})
 catalog=$(printf 'd%.0s' {1..64})
+gate_run_id=20260820T000000Z-1
+run_spool="/data/monday/spool/binance-lob-rust-shadow/runs/$artifact/$gate_run_id"
 
 market_json=$(jq -cn \
   --arg catalog "$catalog" \
@@ -445,11 +469,16 @@ jq -n \
   --arg artifact "$artifact" \
   --arg bundle "$bundle" \
   --arg source "$source_revision" \
+  --arg run_id "$gate_run_id" \
+  --arg run_spool "$run_spool" \
   --argjson market "$market_json" \
   --argjson usdm_market "$usdm_market" \
   '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
-    passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
+    run_id:$run_id,run_spool:$run_spool,
+    required_duration_seconds:240,requested_duration_seconds:240,
+    health_settle_seconds:180,segment_seconds:120,test_only:false,
+    passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate.json"
 
@@ -458,6 +487,17 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq '.run_spool = "/data/monday/spool/binance-lob-rust-shadow/spot"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/fixed-spool-gate.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/fixed-spool-gate.json" >/dev/null; then
+  printf 'gate policy accepted a fixed shared shadow spool\n' >&2
+  exit 1
+fi
 
 v1_market=$(jq -c '
   del(.stream_types, .raw_trade_segments, .raw_trade_count, .book_ticker_count,
@@ -480,11 +520,16 @@ jq -n \
   --arg artifact "$artifact" \
   --arg bundle "$bundle" \
   --arg source "$source_revision" \
+  --arg run_id "$gate_run_id" \
+  --arg run_spool "$run_spool" \
   --argjson market "$v1_market" \
   --argjson usdm_market "$v1_usdm_market" \
   '{schema:"monday.rust_lob_shadow_gate.v3",candidate_sha256:$artifact,
     deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
-    passed:true,production_eligible:true,checks_passed:true,duration_seconds:3600,
+    run_id:$run_id,run_spool:$run_spool,
+    required_duration_seconds:240,requested_duration_seconds:240,
+    health_settle_seconds:180,segment_seconds:120,test_only:false,
+    passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate-v1.json"
 jq -e \

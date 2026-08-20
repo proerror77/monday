@@ -27,6 +27,8 @@ Produce a read-only status report. Never infer a later state from an earlier one
 
 Do not collapse runner outages, code failures, mergeability, approval, deployment, or runtime health into one "CI failed" or "done" result.
 
+A production Gate failure blocks cutover only. It never blocks or downgrades Code, CI, Merge, or Release when those states have their own passing evidence.
+
 ## Stop conditions
 
 - Stop mutation entirely; this Skill never reruns CI, merges, deploys, restarts, or changes configuration.

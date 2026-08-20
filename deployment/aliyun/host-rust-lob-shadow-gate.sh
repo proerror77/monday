@@ -4,13 +4,16 @@ set -euo pipefail
 umask 027
 export LC_ALL=C
 
-readonly REQUIRED_DURATION_SECONDS=900
-readonly HEALTH_SETTLE_SECONDS=600
+readonly REQUIRED_DURATION_SECONDS=240
+readonly HEALTH_SETTLE_SECONDS=180
+readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
+readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs
+readonly OVERRIDE_ROOT=/run/monday
 readonly LOCK_FILE=/run/lock/monday-rust-lob-release.lock
 readonly SERVICE_USER=hftcollector
 readonly SERVICE_HOME=/var/lib/hft-collector
@@ -25,12 +28,19 @@ usage() {
   printf '%s\n' \
     'Usage: host-rust-lob-shadow-gate.sh <candidate-sha256>' \
     '' \
-    'Production gates always observe at least 900 seconds.' \
+    'Production gates wait up to 180 seconds for health, then observe at least 240 seconds.' \
     'Tests may set MONDAY_GATE_TEST_SECONDS only with' \
     'MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1; test evidence cannot pass cutover.' \
     'Test-only health settling may use MONDAY_TEST_HEALTH_SETTLE_SECONDS only' \
-    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 600 seconds;' \
+    'with MONDAY_ALLOW_SHORT_GATE_FOR_TESTS=1 and a value below 180 seconds;' \
     'otherwise the policy check fails.'
+}
+
+run_spool_dir() {
+  local candidate=$1 run_id=$2 market=$3
+  [[ $candidate =~ ^[a-f0-9]{64}$ && $run_id =~ ^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]]
+  [[ $market == spot || $market == usdm ]]
+  printf '%s/%s/%s/%s\n' "$RUN_SPOOL_ROOT" "$candidate" "$run_id" "$market"
 }
 
 resolve_health_settle_seconds() {
@@ -144,8 +154,9 @@ env_value() {
 }
 
 readonly -a markets=(spot usdm)
-declare -A env_file spool_dir dataset shard_id oss_bucket oss_endpoint oss_region
-declare -A aliyun_profile oss_copy_timeout min_symbols unit expected_stream_types
+declare -A env_file base_spool_dir spool_dir override_file dataset shard_id
+declare -A oss_bucket oss_endpoint oss_region aliyun_profile oss_copy_timeout
+declare -A min_symbols unit expected_stream_types
 for market in "${markets[@]}"; do
   env_file[$market]="/etc/monday/binance-lob-archiver-rust-${market}.env"
   [[ -f ${env_file[$market]} ]] || die "missing ${env_file[$market]}"
@@ -155,7 +166,7 @@ for market in "${markets[@]}"; do
     || die "${env_file[$market]} must set SYMBOLS=ALL"
   shard_id[$market]=$(env_value "${env_file[$market]}" SHARD_ID)
   [[ ${shard_id[$market]} == all ]] || die "${env_file[$market]} must set SHARD_ID=all"
-  spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
+  base_spool_dir[$market]=$(env_value "${env_file[$market]}" SPOOL_DIR)
   dataset[$market]=$(env_value "${env_file[$market]}" DATASET)
   oss_bucket[$market]=$(env_value "${env_file[$market]}" OSS_BUCKET)
   oss_endpoint[$market]=$(env_value "${env_file[$market]}" OSS_ENDPOINT)
@@ -190,18 +201,10 @@ for asset in \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
 
-[[ ${spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
+[[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
-[[ ${spool_dir[usdm]} == /data/monday/spool/binance-lob-rust-shadow/usdm ]] \
+[[ ${base_spool_dir[usdm]} == /data/monday/spool/binance-lob-rust-shadow/usdm ]] \
   || die 'USD-M shadow spool path is not isolated'
-for path in \
-  /data/monday/spool/binance-lob-rust-shadow \
-  "${spool_dir[spot]}" \
-  "${spool_dir[usdm]}"; do
-  [[ -d $path && ! -L $path ]] || die "shadow spool is missing or a symlink: $path"
-  [[ $(readlink -f "$path") == "$path" ]] \
-    || die "shadow spool resolved outside its canonical path: $path"
-done
 [[ ${dataset[spot]} == spot_all_rust_shadow ]] || die 'Spot shadow dataset is not isolated'
 [[ ${dataset[usdm]} == usdm_perpetual_all_rust_shadow ]] \
   || die 'USD-M shadow dataset is not isolated'
@@ -219,6 +222,11 @@ binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
 runs_dir="$bundle_evidence_dir/runs"
 gate_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+run_spool_path="$RUN_SPOOL_ROOT/$candidate_sha/$gate_run_id"
+for market in "${markets[@]}"; do
+  spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")
+  override_file[$market]="$OVERRIDE_ROOT/binance-lob-archiver-rust-${market}-soak.env"
+done
 evidence_dir="$runs_dir/$gate_run_id"
 gate_json="$evidence_dir/gate.json"
 passed_marker="$evidence_dir/PASSED.sha256"
@@ -249,6 +257,21 @@ fi
 mkdir -m 0750 -- "$evidence_dir" \
   || die 'gate run evidence directory already exists or could not be created atomically'
 direct_directory "$evidence_dir" || die 'gate run evidence directory is indirect or a symlink'
+for path in /data/monday /data/monday/spool /data/monday/spool/binance-lob-rust-shadow; do
+  direct_directory "$path" || die "shadow spool parent is indirect or a symlink: $path"
+done
+for path in "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path"; do
+  direct_directory_or_absent "$path" || die "run-scoped spool path is indirect: $path"
+done
+[[ ! -e $run_spool_path && ! -L $run_spool_path ]] \
+  || die 'run-scoped spool already exists'
+install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+  "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path" \
+  "${spool_dir[spot]}" "${spool_dir[usdm]}"
+for path in "$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha" "$run_spool_path" \
+  "${spool_dir[spot]}" "${spool_dir[usdm]}"; do
+  direct_directory "$path" || die "run-scoped spool path is indirect: $path"
+done
 run_created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -n \
   --arg schema monday.rust_lob_shadow_gate_run.v1 \
@@ -257,6 +280,8 @@ jq -n \
   --arg candidate_sha256 "$candidate_sha" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
   --arg deployment_source_revision "$deployment_source_revision" \
+  --arg run_spool "$run_spool_path" \
+  --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
   --argjson test_only "$test_only" \
@@ -264,6 +289,7 @@ jq -n \
     candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
+    run_spool:$run_spool,segment_seconds:$segment_seconds,
     requested_duration_seconds:$requested_duration_seconds,
     health_settle_seconds:$health_settle_seconds,test_only:$test_only}' \
   >"$evidence_dir/run.json"
@@ -284,11 +310,14 @@ stop_strict_verifier() {
 cleanup() {
   local status=$?
   stop_strict_verifier
-  rm -rf "$tmp_dir"
-  rm -f "$gate_tmp" "$marker_tmp"
   if [[ $gate_finished != true ]]; then
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
   fi
+  for market in "${markets[@]}"; do
+    rm -f -- "${override_file[$market]}"
+  done
+  rm -rf "$tmp_dir"
+  rm -f "$gate_tmp" "$marker_tmp"
   exit "$status"
 }
 trap 'exit 143' HUP INT TERM
@@ -426,9 +455,18 @@ verify_raw_trade_continuity() {
 }
 
 systemctl stop "${unit[spot]}" "${unit[usdm]}"
+direct_directory_or_absent "$OVERRIDE_ROOT" || die 'runtime override directory is indirect'
+install -d -m 0755 "$OVERRIDE_ROOT"
+direct_directory "$OVERRIDE_ROOT" || die 'runtime override directory is indirect'
 for market in "${markets[@]}"; do
-  run_candidate_drain "$market"
-  rm -f "${spool_dir[$market]}/health.json"
+  assert_spool_drained "$market"
+  rm -f -- "${override_file[$market]}"
+  {
+    printf 'SPOOL_DIR=%s\n' "${spool_dir[$market]}"
+    printf 'SEGMENT_SECONDS=%s\n' "$GATE_SEGMENT_SECONDS"
+  } >"$tmp_dir/$market-gate.env"
+  install -m 0640 "$tmp_dir/$market-gate.env" "${override_file[$market]}"
+  secure_regular_file "${override_file[$market]}"
 done
 candidate_units=(
   "${unit[spot]}"
@@ -445,8 +483,7 @@ done
 assert_candidate
 
 gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-gate_started_epoch=$(date +%s)
-gate_started_ns="${gate_started_epoch}000000000"
+gate_started_ns=$(date +%s%N)
 systemctl start "${unit[spot]}" "${unit[usdm]}"
 
 systemctl_value() {
@@ -632,7 +669,6 @@ validate_observation_sample() {
   health_samples[$market]=$((health_samples[$market] + sample_increment))
 }
 
-observation_started_ns=$(date +%s%N)
 observation_started_mono=$(monotonic_seconds)
 observation_deadline=$((observation_started_mono + gate_seconds))
 while (( $(monotonic_seconds) < observation_deadline )); do
@@ -656,7 +692,7 @@ while (( $(monotonic_seconds) < observation_deadline )); do
 done
 
 if [[ $test_only != true ]]; then
-  minimum_health_samples=$((REQUIRED_DURATION_SECONDS / 90))
+  minimum_health_samples=$((REQUIRED_DURATION_SECONDS / 30))
   for market in "${markets[@]}"; do
     ((health_samples[$market] >= minimum_health_samples)) \
       || die "$market health did not advance often enough during observation"
@@ -797,7 +833,7 @@ verify_oss_round_trips() {
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
-    ((start_ns < observation_started_ns)) && continue
+    ((start_ns < gate_started_ns)) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
       --arg market "$market" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
@@ -1234,11 +1270,14 @@ jq -n \
   --arg candidate_binary "$candidate_binary" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
   --arg deployment_source_revision "$deployment_source_revision" \
+  --arg run_id "$gate_run_id" \
+  --arg run_spool "$run_spool_path" \
   --arg started_at "$gate_started_at" \
   --arg finished_at "$gate_finished_at" \
   --argjson required_duration_seconds "$REQUIRED_DURATION_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
+  --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
   --argjson checks_passed true \
@@ -1248,10 +1287,12 @@ jq -n \
   '{schema:$schema,candidate_sha256:$candidate_sha256,candidate_binary:$candidate_binary,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
+    run_id:$run_id,run_spool:$run_spool,
     started_at:$started_at,finished_at:$finished_at,
     required_duration_seconds:$required_duration_seconds,
     requested_duration_seconds:$requested_duration_seconds,
     health_settle_seconds:$health_settle_seconds,
+    segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,
     production_eligible:$production_eligible,passed:$passed,markets:$markets}' \

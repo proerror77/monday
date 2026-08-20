@@ -92,11 +92,6 @@ if ! flock -n 9; then
   printf 'another Rust collector release operation holds the host lock\n' >&2
   exit 1
 fi
-exec 8>/run/lock/monday-rust-lob-shadow-gate.lock
-if ! flock -n 8; then
-  printf 'a Rust collector shadow gate is still running\n' >&2
-  exit 1
-fi
 if [[ ! -d /data || -L /data ]] || ! mountpoint -q /data; then
   printf '/data must be a mounted filesystem\n' >&2
   exit 1

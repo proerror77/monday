@@ -961,7 +961,8 @@ preflight's third argument; the preflight never generates that trust anchor
 from the corpus it is about to verify. Correctness mode uses only its run-scoped
 `SEGMENT_SECONDS=90` override (two complete 90-second post-bootstrap segments
 fit inside the fixed 300-second observation); committed environments remain at
-600 seconds and stability/Gate behavior is unchanged.
+300 seconds. Stability remains the responsibility of the long soak; the formal
+Gate uses a run-scoped 120-second segment override.
 
 Each session proves the exact expected subscription set on every WebSocket
 shard with `LIST_SUBSCRIPTIONS` before it requests snapshots. A
@@ -987,7 +988,7 @@ trade for a static symbol. Every segment must still contain at least one real
 `agg_trade` for its market dataset, and a v2 segment must additionally carry
 `raw_trade` and `book_ticker` events for the same scope.
 
-### 2. Run the 15-minute full-catalog gate
+### 2. Run the short full-catalog gate
 
 Start the gate through the same CLI wrapper:
 
@@ -999,11 +1000,16 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 ./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
-The host gate owns the complete transition. It verifies the candidate and
-`SYMBOLS=ALL`, drains any previous isolated shadow data, restarts both units,
-waits for initial full-catalog health, freezes both session IDs and catalog
-digests, and then uses monotonic time to observe at least 900 seconds. It fails unless all of
-these are true for the entire candidate run:
+The host gate owns only the runtime transition. A failed Gate blocks cutover,
+not Code, CI, Merge, or immutable Release publication. It verifies the candidate
+and `SYMBOLS=ALL`, creates a fresh spool under
+`/data/monday/spool/binance-lob-rust-shadow/runs/<artifact>/<run-id>/`, starts
+both units with `SEGMENT_SECONDS=120`, waits at most 180 seconds for initial
+full-catalog health, freezes both session IDs and catalog digests, and then uses
+monotonic time to observe at least 240 seconds. It never drains or recovers an
+older Shadow run. Failed run files remain evidence under that run's spool and
+cannot block the next Gate. The Gate fails unless all of these are true for the
+entire candidate run:
 
 - both units stay active with `NRestarts=0`;
 - Spot has at least 1,000 symbols and USD-M at least 400;
@@ -1016,8 +1022,8 @@ these are true for the entire candidate run:
 - CPU accounting and peak memory stay inside the systemd limits;
 - after stop, the candidate's `--upload-only` drain leaves no partial,
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
-- for each market, at least two manifests opened after health settles and the
-  observation starts are downloaded from OSS with their data object and
+- for each market, at least two manifests opened after this isolated candidate
+  run starts are downloaded from OSS with their data object and
   reproduce the manifest SHA-256; each manifest contains real aggregate trades,
   complete checkpoint coverage, and either sequence-checked diffs or explicit
   static-symbol evidence derived from the verified subscription set.
