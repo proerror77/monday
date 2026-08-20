@@ -23,8 +23,8 @@ use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::Serialize;
 use std::path::Path;
 
-const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v4";
-const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v4";
+const STABLE_VERSION: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5";
+const STABLE_HYPOTHESIS_ID: &str = "l2-microstructure-factor-plan-v5";
 const INITIAL_TRAIN_ROWS: usize = 7_200;
 const VALIDATION_ROWS: usize = 3_600;
 const FOLD_COUNT: usize = 3;
@@ -34,7 +34,7 @@ const HOLDOUT_ROWS: usize = 3_600;
 const MIN_ROWS: usize =
     INITIAL_TRAIN_ROWS + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS) + PURGE_ROWS + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
-const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v4-gp-policy";
+const GP_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-factor-plan-v5-gp-policy";
 const BASELINE_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-baseline-policy";
 const WEIGHT_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-weight-policy";
 const REPLAY_POLICY_ID: &str = "binance-btcusdt-usdm-1s-h5-top5-replay-policy";
@@ -52,7 +52,7 @@ const FEATURE_FIELDS: [&str; 8] = [
     "vwap_center_deviation_top5_bps",
     "weighted_book_imbalance_top5",
 ];
-const MAX_CANDIDATES: usize = FEATURE_FIELDS.len() * 2;
+const MAX_CANDIDATES: usize = FEATURE_FIELDS.len() * 2 + 4;
 
 #[derive(Debug)]
 pub(crate) struct RenderedCexMission {
@@ -150,7 +150,7 @@ pub(crate) fn render_cex_bundle(
         max_new_iterations: MAX_CANDIDATES,
         multiple_testing_trials,
     };
-    let gp_policy = CexGpPolicyV1::controlled_dynamic_v2(
+    let gp_policy = CexGpPolicyV1::controlled_dynamic_v3(
         GP_POLICY_ID,
         FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
         search.seed,
@@ -175,7 +175,7 @@ pub(crate) fn render_cex_bundle(
     let mission = CexResearchMissionArtifactV1 {
         schema_version: CEX_RESEARCH_MISSION_SCHEMA_V1.to_string(),
         spec: CexResearchMissionSpecV1 {
-            objective: "Screen atomic L2 microstructure factors, including top-five depth concentration and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v2 GP"
+            objective: "Screen atomic and named composite L2 microstructure factors, including inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, on Binance USD-M BTCUSDT 1s/h5/top5 under governed dynamic-v3 GP"
                 .to_string(),
             search_lineage_id,
             data_mission_id: materialization.mission_id.clone(),
@@ -190,7 +190,7 @@ pub(crate) fn render_cex_bundle(
             },
             hypotheses: vec![CexResearchHypothesisV1 {
                 hypothesis_id: STABLE_HYPOTHESIS_ID.to_string(),
-                statement: "L1 pressure, top-five depth balance, near-touch depth concentration, linearly weighted top-five pressure, spread, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns".to_string(),
+                statement: "L1 pressure, top-five depth balance, inverse spread, cross-depth pressure consensus, near-touch depth concentration, linearly weighted top-five pressure, and top-five VWAP-center displacement predict the next five one-second BTCUSDT mid-price returns".to_string(),
                 target: CexResearchHypothesisTargetV1 {
                     name: "forward_mid_return".to_string(),
                     horizon: EvaluationLabelSpecV1 {
@@ -199,7 +199,10 @@ pub(crate) fn render_cex_bundle(
                     },
                 },
                 required_feature_families: FEATURE_FIELDS.into_iter().map(str::to_string).collect(),
-                required_template_families: vec!["atomic_l2_microstructure".to_string()],
+                required_template_families: vec![
+                    "atomic_l2_microstructure".to_string(),
+                    "named_composite_l2_microstructure".to_string(),
+                ],
                 falsification_tests: vec![
                     CexResearchFalsificationTestV1 {
                         test_id: "purged-predictive-gate".to_string(),
@@ -433,7 +436,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cloud_renderer_builds_an_l2_factor_plan_v4_mission() {
+    fn cloud_renderer_builds_an_l2_factor_plan_v5_mission() {
         let fixture = Fixture::new(MIN_ROWS);
         let rendered = render_cex_bundle(
             &fixture.feature_path,
@@ -444,11 +447,11 @@ pub(crate) mod tests {
         .unwrap();
         let mission = rendered.mission;
         assert_eq!(MIN_ROWS, 21_608);
-        assert_eq!(MAX_CANDIDATES, 16);
+        assert_eq!(MAX_CANDIDATES, 20);
         assert_eq!(mission.spec.search.budget.max_candidates, MAX_CANDIDATES);
         assert_eq!(
             mission.spec.search.planned_gp_and_subset_trials().unwrap(),
-            32
+            40
         );
         assert_eq!(mission.spec.search.budget.max_expansions, MAX_EXPANSIONS);
         assert_eq!(
@@ -491,9 +494,22 @@ pub(crate) mod tests {
         );
         assert_eq!(
             mission.spec.hypotheses[0].required_template_families,
-            vec!["atomic_l2_microstructure".to_string()]
+            vec![
+                "atomic_l2_microstructure".to_string(),
+                "named_composite_l2_microstructure".to_string(),
+            ]
         );
         assert_eq!(mission.spec.policies.gp.id, GP_POLICY_ID);
+        let expected_gp = CexGpPolicyV1::controlled_dynamic_v3(
+            mission.spec.policies.gp.id.clone(),
+            mission.spec.feature_fields.clone(),
+            mission.spec.search.seed,
+            &mission.spec.search.budget,
+        )
+        .unwrap();
+        expected_gp
+            .validate_binding(&mission.spec.policies.gp)
+            .unwrap();
         assert!(mission.spec.search_lineage_id.starts_with(STABLE_VERSION));
     }
 
