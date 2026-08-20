@@ -106,7 +106,7 @@ grep -Fq 'readonly REQUIRED_DURATION_SECONDS=240' "$GATE"
 grep -Fq 'readonly HEALTH_SETTLE_SECONDS=240' "$GATE"
 grep -Fq 'Production gates wait up to 240 seconds for health' "$GATE"
 grep -Fq 'USD-M shadow and production WS_SHARD_SIZE differ' "$GATE"
-grep -Fq 'require_env_value "$file" WS_SHARD_SIZE 25' "$CUTOVER"
+grep -Fq 'require_env_value "$file" WS_SHARD_SIZE 100' "$CUTOVER"
 grep -Fq 'readonly GATE_SEGMENT_SECONDS=120' "$GATE"
 grep -Fq 'readonly RUN_SPOOL_ROOT=/data/monday/spool/binance-lob-rust-shadow/runs' "$GATE"
 shadow_usdm_symbols=$(sed -n 's/^SYMBOLS=//p' "$SHADOW_USDM_ENV")
@@ -124,9 +124,9 @@ IFS=, read -r -a usdm_symbols <<<"$shadow_usdm_symbols"
   printf 'USD-M catalog contains duplicate symbols\n' >&2
   exit 1
 }
-[[ $(sed -n 's/^WS_SHARD_SIZE=//p' "$SHADOW_USDM_ENV") == 25
-  && $(sed -n 's/^WS_SHARD_SIZE=//p' "$PRODUCTION_USDM_ENV") == 25 ]] || {
-  printf 'USD-M websocket shards must contain exactly 25 symbols\n' >&2
+[[ $(sed -n 's/^WS_SHARD_SIZE=//p' "$SHADOW_USDM_ENV") == 100
+  && $(sed -n 's/^WS_SHARD_SIZE=//p' "$PRODUCTION_USDM_ENV") == 100 ]] || {
+  printf 'USD-M websocket shards must contain exactly 100 symbols\n' >&2
   exit 1
 }
 cutover_symbol_validator=$(sed -n '/^is_usdm_top100()/,/^}/p' "$CUTOVER")
