@@ -21,7 +21,7 @@ use hft_collector::lob_archiver::{
 };
 use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,7 +29,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -664,6 +664,72 @@ struct ValidatedDepth {
 struct SnapshotRequest {
     symbol: String,
     generation: u64,
+}
+
+#[derive(Clone)]
+struct SnapshotResyncSender {
+    notify: mpsc::Sender<()>,
+    pending: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+struct SnapshotResyncReceiver {
+    notify: mpsc::Receiver<()>,
+    pending: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+fn snapshot_resync_channel() -> (SnapshotResyncSender, SnapshotResyncReceiver) {
+    let (notify, notified) = mpsc::channel(1);
+    let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    (
+        SnapshotResyncSender {
+            notify,
+            pending: pending.clone(),
+        },
+        SnapshotResyncReceiver {
+            notify: notified,
+            pending,
+        },
+    )
+}
+
+impl SnapshotResyncSender {
+    fn enqueue(&self, request: SnapshotRequest) -> anyhow::Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot resync queue lock poisoned"))?;
+        pending
+            .entry(request.symbol)
+            .and_modify(|generation| *generation = (*generation).max(request.generation))
+            .or_insert(request.generation);
+        drop(pending);
+        match self.notify.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                anyhow::bail!("snapshot resync queue closed")
+            }
+        }
+    }
+}
+
+impl SnapshotResyncReceiver {
+    async fn recv(&mut self) -> anyhow::Result<Vec<SnapshotRequest>> {
+        self.notify
+            .recv()
+            .await
+            .context("snapshot resync queue closed unexpectedly")?;
+        let pending = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("snapshot resync queue lock poisoned"))?;
+            std::mem::take(&mut *pending)
+        };
+        Ok(pending
+            .into_iter()
+            .map(|(symbol, generation)| SnapshotRequest { symbol, generation })
+            .collect())
+    }
 }
 
 #[derive(Debug)]
@@ -1833,7 +1899,7 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
 
 fn queue_snapshot_resyncs(
     config: &Config,
-    queues: &HashMap<String, mpsc::Sender<SnapshotRequest>>,
+    queues: &HashMap<String, SnapshotResyncSender>,
     requests: Vec<SnapshotRequest>,
 ) -> anyhow::Result<()> {
     for request in requests {
@@ -1843,13 +1909,7 @@ fn queue_snapshot_resyncs(
         let queue = queues
             .get(&request.symbol)
             .ok_or_else(|| anyhow::anyhow!("snapshot producer missing {}", request.symbol))?;
-        queue.try_send(request.clone()).map_err(|error| {
-            anyhow::anyhow!(
-                "snapshot resync queue failed for {} generation {}: {error}",
-                request.symbol,
-                request.generation
-            )
-        })?;
+        queue.enqueue(request)?;
     }
     Ok(())
 }
@@ -1925,7 +1985,7 @@ async fn run_session(
         .zip(snapshot_subscriptions)
         .enumerate()
     {
-        let (resync_tx, resync_rx) = mpsc::channel(symbols.len().max(1));
+        let (resync_tx, resync_rx) = snapshot_resync_channel();
         for symbol in &symbols {
             anyhow::ensure!(
                 snapshot_resync_queues
@@ -2790,7 +2850,7 @@ async fn await_rotation_barriers(
     budget: &mut PendingBudget,
     session_id: &str,
     process_state: &mut ProcessState,
-    snapshot_resync_queues: &HashMap<String, mpsc::Sender<SnapshotRequest>>,
+    snapshot_resync_queues: &HashMap<String, SnapshotResyncSender>,
     expected_producers: usize,
     epoch: u64,
     watchdog: Option<&ProcessWatchdog>,
@@ -3870,7 +3930,7 @@ async fn produce_snapshots_after_streams_connect(
     mut rotation_pause: watch::Receiver<u64>,
     mut rotation_resume: watch::Receiver<u64>,
     symbols: Vec<String>,
-    resync_requests: mpsc::Receiver<SnapshotRequest>,
+    resync_requests: SnapshotResyncReceiver,
     announce_coverage: bool,
     rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
@@ -4270,7 +4330,7 @@ async fn produce_snapshots(
     mut rotation_resume: watch::Receiver<u64>,
     mut last_pause_epoch: u64,
     symbols: Vec<String>,
-    mut resync_requests: mpsc::Receiver<SnapshotRequest>,
+    mut resync_requests: SnapshotResyncReceiver,
     rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
     let client = reqwest::Client::builder()
@@ -4323,23 +4383,24 @@ async fn produce_snapshots(
             changed = rotation_pause.changed() => {
                 changed.context("segment rotation controller stopped before snapshot producer pause")?;
             }
-            request = resync_requests.recv() => {
-                let request = request.context("snapshot resync queue closed unexpectedly")?;
-                if let Some(exit) = send_snapshot_request(
-                    &client,
-                    &config,
-                    &sender,
-                    &mut shutdown,
-                    producer_id,
-                    &mut rotation_pause,
-                    &mut rotation_resume,
-                    &mut last_pause_epoch,
-                    &request,
-                    &rate_limiter,
-                )
-                .await?
-                {
-                    return Ok(exit);
+            requests = resync_requests.recv() => {
+                for request in requests? {
+                    if let Some(exit) = send_snapshot_request(
+                        &client,
+                        &config,
+                        &sender,
+                        &mut shutdown,
+                        producer_id,
+                        &mut rotation_pause,
+                        &mut rotation_resume,
+                        &mut last_pause_epoch,
+                        &request,
+                        &rate_limiter,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
                 }
             }
         }
@@ -8970,7 +9031,7 @@ mod tests {
         let (connected_tx, _) = broadcast::channel(2);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let producer = tokio::spawn(produce_snapshots_after_streams_connect(
             config,
             sender,
@@ -9049,7 +9110,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9112,7 +9173,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
 
@@ -9194,7 +9255,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9273,7 +9334,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9347,7 +9408,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
-        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9400,6 +9461,31 @@ mod tests {
         assert!(!ProcessAction::None.restarts_capture_session());
         assert!(!ProcessAction::InitialSnapshotsComplete.restarts_capture_session());
         assert!(!ProcessAction::ResyncSnapshots(Vec::new()).restarts_capture_session());
+    }
+
+    #[tokio::test]
+    async fn snapshot_resync_queue_keeps_only_the_latest_generation() {
+        let (sender, mut receiver) = snapshot_resync_channel();
+        sender
+            .enqueue(SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            })
+            .unwrap();
+        sender
+            .enqueue(SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 2,
+            })
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 2,
+            }]
+        );
     }
 
     #[test]
@@ -9694,7 +9780,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
-        let (resync_tx, resync_rx) = mpsc::channel(1);
+        let (resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9733,11 +9819,10 @@ mod tests {
         resume_tx.send(1).unwrap();
 
         resync_tx
-            .send(SnapshotRequest {
+            .enqueue(SnapshotRequest {
                 symbol: "BTCUSDT".into(),
                 generation: 1,
             })
-            .await
             .unwrap();
         assert!(matches!(
             receiver.recv().await,
@@ -10984,6 +11069,74 @@ mod tests {
             }
         }
         assert!(rotated, "post-select maintenance must rotate a hot queue");
+    }
+
+    #[tokio::test]
+    async fn rotation_barrier_queues_local_snapshot_resync() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", config.market),
+        )]);
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (sender, mut receiver) = mpsc::channel(3);
+        let mut tasks = JoinSet::new();
+        let (resync_tx, mut resync_rx) = snapshot_resync_channel();
+        let resync_queues = HashMap::from([("BTCUSDT".to_owned(), resync_tx)]);
+        let streams = vec!["btcusdt@depth@100ms".into()];
+
+        sender
+            .send(Event::StreamDisconnected {
+                streams: streams.clone(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        sender
+            .send(Event::StreamReconnected { streams })
+            .await
+            .unwrap();
+        sender
+            .send(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut tasks,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                &mut process_state,
+                &resync_queues,
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+            RotationBarrierResult::Ready {
+                initial_snapshots_complete: 0,
+                resync_requested: true,
+            }
+        );
+        assert_eq!(
+            resync_rx.recv().await.unwrap(),
+            vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            }]
+        );
     }
 
     #[tokio::test]
