@@ -9,6 +9,8 @@ readonly HEALTH_SETTLE_SECONDS=240
 readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
+readonly HOST_MEMORY_RESERVE_BYTES=1073741824
+readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=6710886400
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -236,6 +238,71 @@ configured_usdm_ws_shard_size=$(env_value "${env_file[usdm]}" WS_SHARD_SIZE)
   == "$configured_usdm_ws_shard_size" ]] \
   || die 'USD-M shadow and production WS_SHARD_SIZE differ'
 
+declare -A host_meminfo_bytes
+for field in MemTotal MemAvailable SwapTotal; do
+  value=$(awk -v key="$field:" '
+      $1 == key { count += 1; value = $2 }
+      END { if (count != 1 || value !~ /^[0-9]+$/) exit 1; print value }
+    ' /proc/meminfo) || die "$field is unavailable in /proc/meminfo"
+  ((value <= 9007199254740991)) || die "$field is too large to convert safely"
+  host_meminfo_bytes[$field]=$((value * 1024))
+done
+host_memory_total_bytes=${host_meminfo_bytes[MemTotal]}
+host_memory_available_bytes=${host_meminfo_bytes[MemAvailable]}
+host_swap_total_bytes=${host_meminfo_bytes[SwapTotal]}
+shadow_memory_max_bytes=()
+for market in "${markets[@]}"; do
+  shadow_unit=${unit[$market]}
+  [[ -z $(systemctl show "$shadow_unit" --property=DropInPaths --value) ]] \
+    || die "$market shadow service has an unexpected systemd drop-in"
+  [[ $(systemctl show "$shadow_unit" --property=MemoryHigh --value) == 4613734400 ]] \
+    || die "$market shadow service MemoryHigh differs from the gated template"
+  [[ $(systemctl show "$shadow_unit" --property=OOMScoreAdjust --value) == 500 ]] \
+    || die "$market shadow service OOMScoreAdjust differs from the gated template"
+  memory_max=$(systemctl show "$shadow_unit" --property=MemoryMax --value)
+  [[ $memory_max == 5242880000 ]] \
+    || die "$market shadow service MemoryMax differs from the gated template"
+  shadow_memory_max_bytes+=("$memory_max")
+done
+shadow_phase_memory_bytes=$((shadow_memory_max_bytes[0] + shadow_memory_max_bytes[1]))
+if ((STRICT_VERIFIER_MEMORY_MAX_BYTES > shadow_phase_memory_bytes)); then
+  shadow_phase_memory_bytes=$STRICT_VERIFIER_MEMORY_MAX_BYTES
+fi
+production_memory_headroom_bytes=0
+for market in "${markets[@]}"; do
+  production_unit="binance-lob-archiver-production@${market}.service"
+  production_active=$(systemctl show "$production_unit" --property=ActiveState --value)
+  case "$production_active" in
+    active)
+      [[ $(systemctl show "$production_unit" --property=SubState --value) == running ]] \
+        || die "$market production service is active but not running"
+      production_memory_max=$(systemctl show "$production_unit" --property=MemoryMax --value)
+      production_memory_current=$(systemctl show "$production_unit" \
+        --property=MemoryCurrent --value)
+      [[ $production_memory_max =~ ^[0-9]+$ \
+        && $production_memory_current =~ ^[0-9]+$ \
+        && $production_memory_current -le $production_memory_max ]] \
+        || die "$market production memory accounting is invalid"
+      production_memory_headroom_bytes=$((production_memory_headroom_bytes \
+        + production_memory_max - production_memory_current))
+      ;;
+    inactive) ;;
+    *) die "$market production service has ambiguous ActiveState=$production_active" ;;
+  esac
+done
+host_memory_headroom_ok=false
+host_memory_shortfall_bytes=0
+if host_memory_required_bytes=$(monday_shadow_memory_admission \
+  "$host_memory_available_bytes" "$HOST_MEMORY_RESERVE_BYTES" \
+  "$shadow_phase_memory_bytes" "$production_memory_headroom_bytes"); then
+  host_memory_headroom_ok=true
+else
+  admission_status=$?
+  [[ $admission_status -eq 1 ]] \
+    || die 'shadow memory admission inputs are invalid or overflowed'
+  host_memory_shortfall_bytes=$((host_memory_required_bytes - host_memory_available_bytes))
+fi
+
 [[ ${base_spool_dir[spot]} == /data/monday/spool/binance-lob-rust-shadow/spot ]] \
   || die 'Spot shadow spool path is not isolated'
 [[ ${base_spool_dir[usdm]} == /data/monday/spool/binance-lob-rust-shadow/usdm ]] \
@@ -320,6 +387,15 @@ jq -n \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
+  --argjson host_memory_total_bytes "$host_memory_total_bytes" \
+  --argjson host_memory_available_bytes_at_preflight "$host_memory_available_bytes" \
+  --argjson host_swap_total_bytes "$host_swap_total_bytes" \
+  --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
+  --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
+  --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
+  --argjson host_memory_required_bytes "$host_memory_required_bytes" \
+  --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
+  --argjson host_memory_headroom_ok "$host_memory_headroom_ok" \
   --argjson test_only "$test_only" \
   '{schema:$schema,run_id:$run_id,created_at:$created_at,
     candidate_sha256:$candidate_sha256,
@@ -327,7 +403,16 @@ jq -n \
     deployment_source_revision:$deployment_source_revision,
     run_spool:$run_spool,segment_seconds:$segment_seconds,
     requested_duration_seconds:$requested_duration_seconds,
-    health_settle_seconds:$health_settle_seconds,test_only:$test_only}' \
+    health_settle_seconds:$health_settle_seconds,
+    host_memory_total_bytes:$host_memory_total_bytes,
+    host_memory_available_bytes_at_preflight:$host_memory_available_bytes_at_preflight,
+    host_swap_total_bytes:$host_swap_total_bytes,
+    shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
+    production_memory_headroom_bytes:$production_memory_headroom_bytes,
+    host_memory_reserve_bytes:$host_memory_reserve_bytes,
+    host_memory_required_bytes:$host_memory_required_bytes,
+    host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
+    host_memory_headroom_ok:$host_memory_headroom_ok,test_only:$test_only}' \
   >"$evidence_dir/run.json"
 chmod 0640 "$evidence_dir/run.json"
 
@@ -358,6 +443,9 @@ cleanup() {
 }
 trap 'exit 143' HUP INT TERM
 trap cleanup EXIT
+
+[[ $host_memory_headroom_ok == true ]] || die \
+  "insufficient host memory headroom for concurrent shadow gate: total=$host_memory_total_bytes available=$host_memory_available_bytes swap=$host_swap_total_bytes phase=$shadow_phase_memory_bytes production_headroom=$production_memory_headroom_bytes reserve=$HOST_MEMORY_RESERVE_BYTES required=$host_memory_required_bytes shortfall=$host_memory_shortfall_bytes"
 
 assert_candidate() {
   [[ -L $SHADOW_BINARY ]] || die 'shadow candidate symlink disappeared'
@@ -577,6 +665,8 @@ for market in "${markets[@]}"; do
     || die "$market shadow service did not enter ActiveState=active"
   [[ $(systemctl_value "$market" SubState) == running ]] \
     || die "$market shadow service did not enter SubState=running"
+  [[ $(systemctl_value "$market" OOMScoreAdjust) == 500 ]] \
+    || die "$market shadow service OOMScoreAdjust differs from the gated template"
   [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
     || die "$market shadow service restarted during startup"
   active_enter_us[$market]=$(require_uint \
@@ -1387,6 +1477,14 @@ jq -n \
   --argjson required_duration_seconds "$REQUIRED_DURATION_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
+  --argjson host_memory_total_bytes "$host_memory_total_bytes" \
+  --argjson host_memory_available_bytes_at_preflight "$host_memory_available_bytes" \
+  --argjson host_swap_total_bytes "$host_swap_total_bytes" \
+  --argjson shadow_phase_memory_bytes "$shadow_phase_memory_bytes" \
+  --argjson production_memory_headroom_bytes "$production_memory_headroom_bytes" \
+  --argjson host_memory_reserve_bytes "$HOST_MEMORY_RESERVE_BYTES" \
+  --argjson host_memory_required_bytes "$host_memory_required_bytes" \
+  --argjson host_memory_shortfall_bytes "$host_memory_shortfall_bytes" \
   --argjson segment_seconds "$GATE_SEGMENT_SECONDS" \
   --argjson duration_seconds "$duration_seconds" \
   --argjson test_only "$test_only" \
@@ -1403,6 +1501,14 @@ jq -n \
     required_duration_seconds:$required_duration_seconds,
     requested_duration_seconds:$requested_duration_seconds,
     health_settle_seconds:$health_settle_seconds,
+    host_memory_total_bytes:$host_memory_total_bytes,
+    host_memory_available_bytes_at_preflight:$host_memory_available_bytes_at_preflight,
+    host_swap_total_bytes:$host_swap_total_bytes,
+    shadow_phase_memory_bytes:$shadow_phase_memory_bytes,
+    production_memory_headroom_bytes:$production_memory_headroom_bytes,
+    host_memory_reserve_bytes:$host_memory_reserve_bytes,
+    host_memory_required_bytes:$host_memory_required_bytes,
+    host_memory_shortfall_bytes:$host_memory_shortfall_bytes,
     segment_seconds:$segment_seconds,
     duration_seconds:$duration_seconds,
     test_only:$test_only,checks_passed:$checks_passed,

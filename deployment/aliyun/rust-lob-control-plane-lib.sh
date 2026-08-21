@@ -34,6 +34,28 @@ monday_observe_health_freshness() {
     "$last_updated_ns" "$last_advance_mono" "$max_gap_seconds" "$sample_increment"
 }
 
+# Print the required bytes and accept only when the host has that headroom.
+monday_shadow_memory_admission() {
+  (($# >= 3)) || return 2
+  local input available=$1 total=0 value
+
+  for input in "$@"; do
+    [[ $input =~ ^(0|[1-9][0-9]{0,18})$ ]] || return 2
+    # Intentional lexical comparison: arithmetic would overflow on invalid input.
+    # shellcheck disable=SC2071
+    (( ${#input} < 19 )) || [[ $input < 9223372036854775808 ]] || return 2
+  done
+  shift
+
+  for value in "$@"; do
+    ((value <= 9223372036854775807 - total)) || return 2
+    total=$((total + value))
+  done
+  ((total > 0)) || return 2
+  printf '%s\n' "$total"
+  ((available >= total))
+}
+
 # Validate that replay-unsafe manifests are limited to the trailing incomplete
 # portion of a gate observation. Safe segments remain the only input to strict
 # readback; an unsafe segment followed by safe data is a fail-closed boundary.
