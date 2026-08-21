@@ -21,7 +21,7 @@ use hft_collector::lob_archiver::{
 };
 use hft_collector::polymarket_upload::ExclusiveTempDir;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,7 +29,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -660,6 +660,78 @@ struct ValidatedDepth {
     source_clock: DepthSourceClock,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotRequest {
+    symbol: String,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct SnapshotResyncSender {
+    notify: mpsc::Sender<()>,
+    pending: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+struct SnapshotResyncReceiver {
+    notify: mpsc::Receiver<()>,
+    pending: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+fn snapshot_resync_channel() -> (SnapshotResyncSender, SnapshotResyncReceiver) {
+    let (notify, notified) = mpsc::channel(1);
+    let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    (
+        SnapshotResyncSender {
+            notify,
+            pending: pending.clone(),
+        },
+        SnapshotResyncReceiver {
+            notify: notified,
+            pending,
+        },
+    )
+}
+
+impl SnapshotResyncSender {
+    fn enqueue(&self, request: SnapshotRequest) -> anyhow::Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot resync queue lock poisoned"))?;
+        pending
+            .entry(request.symbol)
+            .and_modify(|generation| *generation = (*generation).max(request.generation))
+            .or_insert(request.generation);
+        drop(pending);
+        match self.notify.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                anyhow::bail!("snapshot resync queue closed")
+            }
+        }
+    }
+}
+
+impl SnapshotResyncReceiver {
+    async fn recv(&mut self) -> anyhow::Result<Vec<SnapshotRequest>> {
+        self.notify
+            .recv()
+            .await
+            .context("snapshot resync queue closed unexpectedly")?;
+        let pending = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("snapshot resync queue lock poisoned"))?;
+            std::mem::take(&mut *pending)
+        };
+        Ok(pending
+            .into_iter()
+            .map(|(symbol, generation)| SnapshotRequest { symbol, generation })
+            .collect())
+    }
+}
+
 #[derive(Debug)]
 enum Event {
     Diff {
@@ -700,6 +772,7 @@ enum Event {
     Snapshot {
         received_at_ns: u64,
         symbol: String,
+        generation: u64,
         request_started_at_ns: u64,
         snapshot: Value,
     },
@@ -734,19 +807,21 @@ enum ProcessAction {
     None,
     Excluded,
     InitialSnapshotsComplete,
-    RestartSession,
+    ResyncSnapshots(Vec<SnapshotRequest>),
 }
 
 impl ProcessAction {
     fn restarts_capture_session(&self) -> bool {
-        matches!(self, Self::Excluded | Self::RestartSession)
+        matches!(self, Self::Excluded)
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum RotationBarrierResult {
-    Ready { initial_snapshots_complete: usize },
-    RestartSession,
+    Ready {
+        initial_snapshots_complete: usize,
+        resync_requested: bool,
+    },
 }
 
 enum ProducerWait<T> {
@@ -762,6 +837,7 @@ struct ProcessState {
     aggregate_trades: AggregateTradeSequenceValidator,
     raw_trades: RawTradeSequenceValidator,
     raw_trade_stale_ranges: HashMap<String, (u64, u64)>,
+    snapshot_generations: HashMap<String, u64>,
     stream_coverage_trusted: bool,
     stream_coverage_shards: Vec<Vec<String>>,
     reconnecting_shards: Vec<BTreeSet<String>>,
@@ -782,6 +858,16 @@ impl ProcessState {
 
     fn depth_streams_healthy(&self) -> bool {
         self.reconnecting_depth_shards.is_empty()
+    }
+
+    fn bump_snapshot_generation(&mut self, symbol: &str) -> u64 {
+        let generation = self.snapshot_generations.entry(symbol.to_owned()).or_insert(0);
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+
+    fn snapshot_generation(&self, symbol: &str) -> u64 {
+        self.snapshot_generations.get(symbol).copied().unwrap_or(0)
     }
 
     fn mark_shard_disconnected(&mut self, streams: Vec<String>) {
@@ -1811,6 +1897,23 @@ fn verify_segments(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn queue_snapshot_resyncs(
+    config: &Config,
+    queues: &HashMap<String, SnapshotResyncSender>,
+    requests: Vec<SnapshotRequest>,
+) -> anyhow::Result<()> {
+    for request in requests {
+        if config.is_excluded(&request.symbol) {
+            continue;
+        }
+        let queue = queues
+            .get(&request.symbol)
+            .ok_or_else(|| anyhow::anyhow!("snapshot producer missing {}", request.symbol))?;
+        queue.enqueue(request)?;
+    }
+    Ok(())
+}
+
 async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
@@ -1858,6 +1961,7 @@ async fn run_session(
     let snapshot_subscriptions = (0..snapshot_producers)
         .map(|_| stream_connected_tx.subscribe())
         .collect::<Vec<_>>();
+    let mut snapshot_resync_queues = HashMap::new();
     // One process-wide REST rate limiter shared by every snapshot producer, so
     // N shards cannot multiply SNAPSHOT_REQUESTS_PER_SECOND by N.
     let snapshot_rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
@@ -1881,6 +1985,15 @@ async fn run_session(
         .zip(snapshot_subscriptions)
         .enumerate()
     {
+        let (resync_tx, resync_rx) = snapshot_resync_channel();
+        for symbol in &symbols {
+            anyhow::ensure!(
+                snapshot_resync_queues
+                    .insert(symbol.clone(), resync_tx.clone())
+                    .is_none(),
+                "snapshot producer catalog contains duplicate symbol {symbol}"
+            );
+        }
         tasks.spawn(produce_snapshots_after_streams_connect(
             config.clone(),
             sender.clone(),
@@ -1891,6 +2004,7 @@ async fn run_session(
             rotation_pause_rx.clone(),
             rotation_resume_rx.clone(),
             symbols,
+            resync_rx,
             index == 0,
             snapshot_rate_limiter.clone(),
         ));
@@ -1993,14 +2107,20 @@ async fn run_session(
             action if action.restarts_capture_session() => break,
             ProcessAction::None => {}
             ProcessAction::Excluded => unreachable!("excluded action must restart the session"),
-            ProcessAction::RestartSession => {
-                unreachable!("recovered reconnect must restart the session")
-            }
             ProcessAction::InitialSnapshotsComplete => {
                 snapshot_completions += 1;
                 if snapshot_completions >= snapshot_producers {
                     sync_deadline = Some(Instant::now() + config.sync_timeout);
                 }
+            }
+            ProcessAction::ResyncSnapshots(requests) => {
+                if let Err(error) =
+                    queue_snapshot_resyncs(&config, &snapshot_resync_queues, requests)
+                {
+                    failure = Some(error);
+                    break;
+                }
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
             }
         }
 
@@ -2053,6 +2173,7 @@ async fn run_session(
                 &mut budget,
                 &session_id,
                 &mut process_state,
+                &snapshot_resync_queues,
                 expected_rotation_producers,
                 rotation_epoch,
                 Some(&watchdog),
@@ -2069,10 +2190,12 @@ async fn run_session(
             let completed_during_barrier = match barriers {
                 RotationBarrierResult::Ready {
                     initial_snapshots_complete,
-                } => initial_snapshots_complete,
-                RotationBarrierResult::RestartSession => {
-                    let _ = rotation_resume_tx.send(rotation_epoch);
-                    break;
+                    resync_requested,
+                } => {
+                    if resync_requested {
+                        sync_deadline = Some(Instant::now() + config.sync_timeout);
+                    }
+                    initial_snapshots_complete
                 }
             };
             snapshot_completions += completed_during_barrier;
@@ -2116,14 +2239,13 @@ async fn run_session(
 
         if last_health.elapsed() >= Duration::from_secs(30) {
             watchdog.record_queue_health(QueueHealth::from_sender(&sender));
-            let status =
-                if !process_state.streams_healthy() || !process_state.depth_streams_healthy() {
-                    "reconnecting"
-                } else if states.values().all(|state| state.synced) {
-                    "synced"
-                } else {
-                    "syncing"
-                };
+            let status = if !process_state.depth_streams_healthy() {
+                "reconnecting"
+            } else if states.values().all(|state| state.synced) {
+                "synced"
+            } else {
+                "syncing"
+            };
             let manifest_count = match files_with_suffix(&config.spool_dir, ".manifest.json") {
                 Ok(manifests) => manifests.len(),
                 Err(error) => {
@@ -2206,6 +2328,41 @@ fn sync_timed_out(
     now: Instant,
 ) -> bool {
     deadline.is_some_and(|deadline| now > deadline && states.values().any(|state| !state.synced))
+}
+
+fn depth_symbols_for_streams(streams: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut symbols = BTreeSet::new();
+    for stream in streams {
+        if !stream.ends_with("@depth@100ms") {
+            continue;
+        }
+        let (symbol, channel) = stream
+            .split_once('@')
+            .context("stream disconnect evidence is missing a channel")?;
+        anyhow::ensure!(
+            channel == "depth@100ms",
+            "depth reconnect evidence has the wrong channel {channel}"
+        );
+        symbols.insert(symbol.to_ascii_uppercase());
+    }
+    Ok(symbols.into_iter().collect())
+}
+
+fn invalidate_depth_resync_targets(
+    states: &mut HashMap<String, OrderBookState>,
+    budget: &mut PendingBudget,
+    process_state: &mut ProcessState,
+    streams: &[String],
+) -> anyhow::Result<()> {
+    for symbol in depth_symbols_for_streams(streams)? {
+        let state = states
+            .get_mut(&symbol)
+            .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
+        state.invalidate_for_resync(budget);
+        process_state.depth_source_clocks.reset_symbol(&symbol);
+        process_state.bump_snapshot_generation(&symbol);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2358,11 +2515,7 @@ fn process_event(
                 )?;
                 return Err(error);
             }
-            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
-            }
         }
         Event::AggregateTrade { trade, frame } => {
             if config.is_excluded(&trade.symbol) {
@@ -2392,11 +2545,7 @@ fn process_event(
                 trade.received_at_ns,
             )?;
             let stream_name = format!("{}@aggTrade", trade.symbol.to_ascii_lowercase());
-            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
-            }
         }
         Event::RawTrade { trade, frame } => {
             if config.is_excluded(&trade.symbol) {
@@ -2448,11 +2597,7 @@ fn process_event(
                 )?;
             }
             let stream_name = format!("{}@trade", trade.symbol.to_ascii_lowercase());
-            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
-            }
         }
         Event::BookTicker { ticker, frame } => {
             if config.is_excluded(&ticker.symbol) {
@@ -2467,11 +2612,7 @@ fn process_event(
                 ticker.received_at_ns,
             )?;
             let stream_name = format!("{}@bookTicker", ticker.symbol.to_ascii_lowercase());
-            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
-            }
         }
         Event::StaleBookTicker {
             ticker,
@@ -2580,19 +2721,19 @@ fn process_event(
                 order.received_at_ns,
             )?;
             let stream_name = format!("{}@forceOrder", order.symbol.to_ascii_lowercase());
-            let reconnecting_before = !process_state.streams_healthy();
             process_state.mark_stream_observed(&stream_name);
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
-            }
         }
         Event::Snapshot {
             received_at_ns,
             symbol,
+            generation,
             request_started_at_ns,
             snapshot,
         } => {
             if config.is_excluded(&symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if generation != process_state.snapshot_generation(&symbol) {
                 return Ok(ProcessAction::None);
             }
             segment.write(
@@ -2654,18 +2795,42 @@ fn process_event(
             }
         }
         Event::StreamDisconnected { streams, reason } => {
-            process_state.mark_shard_disconnected(streams);
+            process_state.mark_shard_disconnected(streams.clone());
+            invalidate_depth_resync_targets(states, budget, process_state, &streams)?;
             segment.mark_replay_unsafe();
+            segment.write(
+                "sequence_gap",
+                json!({
+                    "session_id":session_id,
+                    "kind":"stream_disconnect",
+                    "streams":streams,
+                    "reason":reason,
+                }),
+                now_ns()?,
+            )?;
             info!(reason, "websocket shard reconnecting");
         }
         Event::StreamReconnected { streams } => {
-            let reconnecting_before = !process_state.streams_healthy();
             for stream in &streams {
                 process_state.mark_stream_observed(stream);
             }
+            let resyncs = depth_symbols_for_streams(&streams)?
+                .into_iter()
+                .map(|symbol| {
+                    let state = states
+                        .get_mut(&symbol)
+                        .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
+                    state.verify_stream_coverage();
+                    let generation = process_state.snapshot_generation(&symbol);
+                    Ok(SnapshotRequest {
+                        symbol,
+                        generation,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             info!(streams = ?streams, "websocket shard subscription proof restored");
-            if reconnecting_before && process_state.streams_healthy() {
-                return Ok(ProcessAction::RestartSession);
+            if !resyncs.is_empty() {
+                return Ok(ProcessAction::ResyncSnapshots(resyncs));
             }
         }
         Event::RotationBarrier { .. } => {
@@ -2685,6 +2850,7 @@ async fn await_rotation_barriers(
     budget: &mut PendingBudget,
     session_id: &str,
     process_state: &mut ProcessState,
+    snapshot_resync_queues: &HashMap<String, SnapshotResyncSender>,
     expected_producers: usize,
     epoch: u64,
     watchdog: Option<&ProcessWatchdog>,
@@ -2695,6 +2861,7 @@ async fn await_rotation_barriers(
     let deadline = tokio::time::Instant::now() + acknowledgement_timeout;
     let mut acknowledged = BTreeSet::new();
     let mut initial_snapshots_complete = 0_usize;
+    let mut resync_requested = false;
     while acknowledged.len() < expected_producers {
         let event = tokio::select! {
             event = receiver.recv() => {
@@ -2773,16 +2940,22 @@ async fn await_rotation_barriers(
                     watchdog.mark_processed();
                 }
                 if action.restarts_capture_session() {
-                    return Ok(RotationBarrierResult::RestartSession);
+                    return Err(anyhow::anyhow!(
+                        "runtime exclusion reached segment rotation barrier"
+                    ));
                 }
                 if matches!(action, ProcessAction::InitialSnapshotsComplete) {
                     initial_snapshots_complete += 1;
+                } else if let ProcessAction::ResyncSnapshots(requests) = action {
+                    queue_snapshot_resyncs(config, snapshot_resync_queues, requests)?;
+                    resync_requested = true;
                 }
             }
         }
     }
     Ok(RotationBarrierResult::Ready {
         initial_snapshots_complete,
+        resync_requested,
     })
 }
 
@@ -2902,6 +3075,7 @@ fn archive_only(
         Event::Snapshot {
             received_at_ns,
             symbol,
+            generation: _,
             request_started_at_ns,
             snapshot,
         } => segment.write(
@@ -3756,6 +3930,7 @@ async fn produce_snapshots_after_streams_connect(
     mut rotation_pause: watch::Receiver<u64>,
     mut rotation_resume: watch::Receiver<u64>,
     symbols: Vec<String>,
+    resync_requests: SnapshotResyncReceiver,
     announce_coverage: bool,
     rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
@@ -3812,6 +3987,7 @@ async fn produce_snapshots_after_streams_connect(
         rotation_resume,
         last_pause_epoch,
         symbols,
+        resync_requests,
         rate_limiter,
     )
     .await
@@ -4034,6 +4210,117 @@ fn event_from_frame_for_shard(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn send_snapshot_request(
+    client: &reqwest::Client,
+    config: &Config,
+    sender: &mpsc::Sender<Event>,
+    shutdown: &mut watch::Receiver<bool>,
+    producer_id: usize,
+    rotation_pause: &mut watch::Receiver<u64>,
+    rotation_resume: &mut watch::Receiver<u64>,
+    last_pause_epoch: &mut u64,
+    request: &SnapshotRequest,
+    rate_limiter: &Arc<tokio::sync::Mutex<tokio::time::Interval>>,
+) -> anyhow::Result<Option<TaskExit>> {
+    if config.is_excluded(&request.symbol) {
+        return Ok(None);
+    }
+    let started = now_ns()?;
+    let mut attempt = 0_usize;
+    let mut retry_deadline = None;
+    let snapshot = loop {
+        if let Some(exit) = acknowledge_rotation_pause(
+            producer_id,
+            sender,
+            rotation_pause,
+            rotation_resume,
+            last_pause_epoch,
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(Some(exit));
+        }
+        if *shutdown.borrow() {
+            return Ok(Some(TaskExit::Stopped(None)));
+        }
+        if let Some(deadline) = retry_deadline {
+            match wait_for_rotation_or_shutdown(
+                tokio::time::sleep_until(deadline),
+                shutdown,
+                rotation_pause,
+            )
+            .await?
+            {
+                ProducerWait::Ready(()) => retry_deadline = None,
+                ProducerWait::Stopped => return Ok(Some(TaskExit::Stopped(None))),
+                ProducerWait::PauseRequested => continue,
+            }
+        }
+        match wait_for_snapshot_rate_slot(rate_limiter, shutdown, rotation_pause).await? {
+            ProducerWait::Ready(()) => {}
+            ProducerWait::Stopped => return Ok(Some(TaskExit::Stopped(None))),
+            ProducerWait::PauseRequested => continue,
+        }
+        match wait_for_rotation_or_shutdown(
+            fetch_snapshot_attempt(client, config, &request.symbol, attempt),
+            shutdown,
+            rotation_pause,
+        )
+        .await?
+        {
+            ProducerWait::Ready(Ok(SnapshotFetchAttempt::Snapshot(snapshot))) => break snapshot,
+            ProducerWait::Ready(Ok(SnapshotFetchAttempt::Retry(delay))) => {
+                attempt += 1;
+                retry_deadline = Some(tokio::time::Instant::now() + delay);
+            }
+            ProducerWait::Stopped => return Ok(Some(TaskExit::Stopped(None))),
+            ProducerWait::PauseRequested => continue,
+            ProducerWait::Ready(Err(error)) => {
+                if error.downcast_ref::<SnapshotUnavailable>().is_some() {
+                    let event = Event::ExcludeSymbol {
+                        symbol: request.symbol.clone(),
+                        reason: error.to_string(),
+                    };
+                    return match send_or_shutdown(sender, event, shutdown).await? {
+                        SendOutcome::Sent => Ok(None),
+                        SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
+                    };
+                }
+                return Err(error);
+            }
+        }
+    };
+    if snapshot
+        .get("bids")
+        .and_then(Value::as_array)
+        .zip(snapshot.get("asks").and_then(Value::as_array))
+        .is_some_and(|(bids, asks)| bids.is_empty() || asks.is_empty())
+    {
+        let event = Event::ExcludeSymbol {
+            symbol: request.symbol.clone(),
+            reason: "one-sided initial snapshot is not replay-complete".to_owned(),
+        };
+        return match send_or_shutdown(sender, event, shutdown).await? {
+            SendOutcome::Sent => Ok(None),
+            SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
+        };
+    }
+    let received_at_ns = now_ns()?;
+    let event = Event::Snapshot {
+        received_at_ns,
+        symbol: request.symbol.clone(),
+        generation: request.generation,
+        request_started_at_ns: started,
+        snapshot,
+    };
+    match send_or_shutdown(sender, event, shutdown).await? {
+        SendOutcome::Sent => Ok(None),
+        SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn produce_snapshots(
     config: Arc<Config>,
     sender: mpsc::Sender<Event>,
@@ -4043,160 +4330,37 @@ async fn produce_snapshots(
     mut rotation_resume: watch::Receiver<u64>,
     mut last_pause_epoch: u64,
     symbols: Vec<String>,
+    mut resync_requests: SnapshotResyncReceiver,
     rate_limiter: Arc<tokio::sync::Mutex<tokio::time::Interval>>,
 ) -> anyhow::Result<TaskExit> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
-    'symbols: for symbol in symbols {
-        let started = now_ns()?;
-        let mut attempt = 0_usize;
-        let mut retry_deadline = None;
-        let snapshot = loop {
-            if let Some(exit) = acknowledge_rotation_pause(
-                producer_id,
-                &sender,
-                &mut rotation_pause,
-                &mut rotation_resume,
-                &mut last_pause_epoch,
-                &mut shutdown,
-            )
-            .await?
-            {
-                return Ok(exit);
-            }
-            if *shutdown.borrow() {
-                return Ok(TaskExit::Stopped(None));
-            }
-            if let Some(deadline) = retry_deadline {
-                match wait_for_rotation_or_shutdown(
-                    tokio::time::sleep_until(deadline),
-                    &mut shutdown,
-                    &mut rotation_pause,
-                )
-                .await?
-                {
-                    ProducerWait::Ready(()) => retry_deadline = None,
-                    ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
-                    ProducerWait::PauseRequested => {
-                        if let Some(exit) = acknowledge_rotation_pause(
-                            producer_id,
-                            &sender,
-                            &mut rotation_pause,
-                            &mut rotation_resume,
-                            &mut last_pause_epoch,
-                            &mut shutdown,
-                        )
-                        .await?
-                        {
-                            return Ok(exit);
-                        }
-                        continue;
-                    }
-                }
-            }
-            match wait_for_snapshot_rate_slot(&rate_limiter, &mut shutdown, &mut rotation_pause)
-                .await?
-            {
-                ProducerWait::Ready(()) => {}
-                ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
-                ProducerWait::PauseRequested => {
-                    if let Some(exit) = acknowledge_rotation_pause(
-                        producer_id,
-                        &sender,
-                        &mut rotation_pause,
-                        &mut rotation_resume,
-                        &mut last_pause_epoch,
-                        &mut shutdown,
-                    )
-                    .await?
-                    {
-                        return Ok(exit);
-                    }
-                    continue;
-                }
-            }
-            match wait_for_rotation_or_shutdown(
-                fetch_snapshot_attempt(&client, &config, &symbol, attempt),
-                &mut shutdown,
-                &mut rotation_pause,
-            )
-            .await?
-            {
-                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Snapshot(snapshot))) => {
-                    break snapshot;
-                }
-                ProducerWait::Ready(Ok(SnapshotFetchAttempt::Retry(delay))) => {
-                    attempt += 1;
-                    retry_deadline = Some(tokio::time::Instant::now() + delay);
-                }
-                ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
-                ProducerWait::PauseRequested => {
-                    if let Some(exit) = acknowledge_rotation_pause(
-                        producer_id,
-                        &sender,
-                        &mut rotation_pause,
-                        &mut rotation_resume,
-                        &mut last_pause_epoch,
-                        &mut shutdown,
-                    )
-                    .await?
-                    {
-                        return Ok(exit);
-                    }
-                }
-                ProducerWait::Ready(Err(error)) => {
-                    if error.downcast_ref::<SnapshotUnavailable>().is_some() {
-                        let event = Event::ExcludeSymbol {
-                            symbol: symbol.clone(),
-                            reason: error.to_string(),
-                        };
-                        match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                            SendOutcome::Sent => continue 'symbols,
-                            SendOutcome::Shutdown(event) => {
-                                return Ok(TaskExit::Stopped(Some(event)));
-                            }
-                        }
-                    }
-                    return Err(error);
-                }
-            }
-        };
-        if snapshot
-            .get("bids")
-            .and_then(Value::as_array)
-            .zip(snapshot.get("asks").and_then(Value::as_array))
-            .is_some_and(|(bids, asks)| bids.is_empty() || asks.is_empty())
+    for symbol in symbols {
+        if let Some(exit) = send_snapshot_request(
+            &client,
+            &config,
+            &sender,
+            &mut shutdown,
+            producer_id,
+            &mut rotation_pause,
+            &mut rotation_resume,
+            &mut last_pause_epoch,
+            &SnapshotRequest {
+                symbol,
+                generation: 0,
+            },
+            &rate_limiter,
+        )
+        .await?
         {
-            let event = Event::ExcludeSymbol {
-                symbol: symbol.clone(),
-                reason: "one-sided initial snapshot is not replay-complete".to_owned(),
-            };
-            match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                SendOutcome::Sent => continue 'symbols,
-                SendOutcome::Shutdown(event) => {
-                    return Ok(TaskExit::Stopped(Some(event)));
-                }
-            }
-        }
-        // REST snapshot completion is a separate boundary and is excluded from WS latency cohorts.
-        let received_at_ns = now_ns()?;
-        let event = Event::Snapshot {
-            received_at_ns,
-            symbol: symbol.clone(),
-            request_started_at_ns: started,
-            snapshot,
-        };
-        match send_or_shutdown(&sender, event, &mut shutdown).await? {
-            SendOutcome::Sent => {}
-            SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
+            return Ok(exit);
         }
     }
     match send_or_shutdown(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
         SendOutcome::Sent => {}
         SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
     }
-    // Keep the producer alive so a normal completion is not mistaken for a session failure.
     loop {
         if let Some(exit) = acknowledge_rotation_pause(
             producer_id,
@@ -4218,6 +4382,26 @@ async fn produce_snapshots(
             }
             changed = rotation_pause.changed() => {
                 changed.context("segment rotation controller stopped before snapshot producer pause")?;
+            }
+            requests = resync_requests.recv() => {
+                for request in requests? {
+                    if let Some(exit) = send_snapshot_request(
+                        &client,
+                        &config,
+                        &sender,
+                        &mut shutdown,
+                        producer_id,
+                        &mut rotation_pause,
+                        &mut rotation_resume,
+                        &mut last_pause_epoch,
+                        &request,
+                        &rate_limiter,
+                    )
+                    .await?
+                    {
+                        return Ok(exit);
+                    }
+                }
             }
         }
     }
@@ -8153,6 +8337,7 @@ mod tests {
             Event::Snapshot {
                 received_at_ns: snapshot_received_at_ns,
                 symbol: "CYSUSDT".into(),
+                generation: 0,
                 request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
                 snapshot: json!({
                     "lastUpdateId": 100,
@@ -8333,6 +8518,7 @@ mod tests {
             Event::Snapshot {
                 received_at_ns: snapshot_received_at_ns,
                 symbol: "CHIPUSD1".into(),
+                generation: 0,
                 request_started_at_ns: snapshot_received_at_ns.saturating_sub(1),
                 snapshot: json!({
                     "lastUpdateId": 100,
@@ -8845,6 +9031,7 @@ mod tests {
         let (connected_tx, _) = broadcast::channel(2);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let producer = tokio::spawn(produce_snapshots_after_streams_connect(
             config,
             sender,
@@ -8855,6 +9042,7 @@ mod tests {
             pause_rx,
             resume_rx,
             symbols,
+            resync_rx,
             true,
             rate_limiter,
         ));
@@ -8922,6 +9110,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -8933,6 +9122,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            resync_rx,
             rate_limiter,
         ));
 
@@ -8983,6 +9173,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_pause_tx, pause_rx) = watch::channel(0_u64);
         let (_resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
 
@@ -8995,6 +9186,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            resync_rx,
             rate_limiter,
         ));
 
@@ -9063,6 +9255,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9074,6 +9267,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            resync_rx,
             rate_limiter,
         ));
 
@@ -9140,6 +9334,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9151,6 +9346,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            resync_rx,
             rate_limiter,
         ));
 
@@ -9212,6 +9408,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let (_resync_tx, resync_rx) = snapshot_resync_channel();
         let symbols = config.active_symbols();
         let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
         let producer = tokio::spawn(produce_snapshots(
@@ -9223,6 +9420,7 @@ mod tests {
             resume_rx,
             0,
             symbols,
+            resync_rx,
             rate_limiter,
         ));
 
@@ -9260,9 +9458,34 @@ mod tests {
     #[test]
     fn runtime_exclusion_requires_a_new_capture_session() {
         assert!(ProcessAction::Excluded.restarts_capture_session());
-        assert!(ProcessAction::RestartSession.restarts_capture_session());
         assert!(!ProcessAction::None.restarts_capture_session());
         assert!(!ProcessAction::InitialSnapshotsComplete.restarts_capture_session());
+        assert!(!ProcessAction::ResyncSnapshots(Vec::new()).restarts_capture_session());
+    }
+
+    #[tokio::test]
+    async fn snapshot_resync_queue_keeps_only_the_latest_generation() {
+        let (sender, mut receiver) = snapshot_resync_channel();
+        sender
+            .enqueue(SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            })
+            .unwrap();
+        sender
+            .enqueue(SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 2,
+            })
+            .unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 2,
+            }]
+        );
     }
 
     #[test]
@@ -9294,16 +9517,26 @@ mod tests {
     }
 
     #[test]
-    fn subscription_proven_reconnect_requires_a_new_capture_session() {
+    fn book_ticker_reconnect_does_not_restart_or_reset_lob_state() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
         config.spool_dir = root.path().to_path_buf();
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let mut states = HashMap::from([(
-            "BTCUSDT".to_owned(),
-            OrderBookState::new("BTCUSDT", Market::Spot),
-        )]);
         let mut budget = PendingBudget::new(1);
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["101", "1"]],
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        let last_update_id = state.last_update_id();
+        let bridged = state.bridged;
+        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
         let mut process_state = trusted_process_state(&config.symbols);
         let streams = vec!["btcusdt@bookTicker".into(), "ethusdt@bookTicker".into()];
         assert_eq!(
@@ -9323,6 +9556,10 @@ mod tests {
             ProcessAction::None
         );
         assert!(!segment.is_replay_safe());
+        let state = states.get("BTCUSDT").unwrap();
+        assert!(state.synced);
+        assert_eq!(state.bridged, bridged);
+        assert_eq!(state.last_update_id(), last_update_id);
 
         assert_eq!(
             process_event(
@@ -9335,9 +9572,274 @@ mod tests {
                 &mut process_state,
             )
             .unwrap(),
-            ProcessAction::RestartSession
+            ProcessAction::None
         );
         assert!(process_state.streams_healthy());
+        let state = states.get("BTCUSDT").unwrap();
+        assert!(state.synced);
+        assert_eq!(state.bridged, bridged);
+        assert_eq!(state.last_update_id(), last_update_id);
+    }
+
+    #[test]
+    fn depth_reconnect_invalidates_only_affected_symbols_and_requests_local_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut budget = PendingBudget::new(4);
+        let mut btc = OrderBookState::new("BTCUSDT", Market::Spot);
+        btc.install_snapshot(
+            &json!({
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]],
+            }),
+            &mut budget,
+        )
+        .unwrap();
+        let mut eth = OrderBookState::new("ETHUSDT", Market::Spot);
+        eth.install_snapshot(
+            &json!({
+                "lastUpdateId": 200,
+                "bids": [["200", "1"]],
+                "asks": [["201", "1"]],
+            }),
+            &mut budget,
+        )
+        .unwrap();
+        let eth_last_update_id = eth.last_update_id();
+        let mut states = HashMap::from([
+            ("BTCUSDT".to_owned(), btc),
+            ("ETHUSDT".to_owned(), eth),
+        ]);
+        let mut process_state = trusted_process_state(&config.symbols);
+        let streams = vec!["btcusdt@depth@100ms".into()];
+
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::StreamDisconnected {
+                    streams: streams.clone(),
+                    reason: "test".into(),
+                },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert!(!states["BTCUSDT"].synced);
+        assert_eq!(states["BTCUSDT"].last_update_id(), None);
+        assert!(states["ETHUSDT"].synced);
+        assert_eq!(states["ETHUSDT"].last_update_id(), eth_last_update_id);
+
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::StreamReconnected { streams },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::ResyncSnapshots(vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            }])
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_generation_is_ignored_until_matching_resync_arrives() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut budget = PendingBudget::new(2);
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["101", "1"]],
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
+        let mut process_state = trusted_process_state(&config.symbols);
+        let streams = vec!["btcusdt@depth@100ms".into()];
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::StreamDisconnected {
+                streams: streams.clone(),
+                reason: "test".into(),
+            },
+            &mut process_state,
+        )
+        .unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::StreamReconnected { streams },
+            &mut process_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::Snapshot {
+                    received_at_ns: now_ns().unwrap(),
+                    symbol: "BTCUSDT".into(),
+                    generation: 0,
+                    request_started_at_ns: now_ns().unwrap(),
+                    snapshot: json!({
+                        "lastUpdateId": 150,
+                        "bids": [["100", "3"]],
+                        "asks": [["101", "2"]],
+                    }),
+                },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert!(!states["BTCUSDT"].synced);
+        assert_eq!(states["BTCUSDT"].last_update_id(), None);
+
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::Snapshot {
+                received_at_ns: now_ns().unwrap(),
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+                request_started_at_ns: now_ns().unwrap(),
+                snapshot: json!({
+                    "lastUpdateId": 151,
+                    "bids": [["100", "4"]],
+                    "asks": [["101", "5"]],
+                }),
+            },
+            &mut process_state,
+        )
+        .unwrap();
+        assert!(states["BTCUSDT"].synced);
+        assert_eq!(states["BTCUSDT"].last_update_id(), Some(151));
+    }
+
+    #[tokio::test]
+    async fn idle_snapshot_producer_acknowledges_rotation_and_handles_local_resync() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let body = r#"{"lastUpdateId":1,"bids":[["100","1"]],"asks":[["101","1"]]}"#;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let read = stream.read(&mut request).unwrap();
+                let request_text = String::from_utf8_lossy(&request[..read]).into_owned();
+                server_requests.lock().unwrap().push(request_text);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.symbols = vec!["ETHUSDT".into()];
+        config.snapshot_requests_per_second = 1_000.0;
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(0_u64);
+        let (resume_tx, resume_rx) = watch::channel(0_u64);
+        let (resync_tx, resync_rx) = snapshot_resync_channel();
+        let symbols = config.active_symbols();
+        let rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
+        let producer = tokio::spawn(produce_snapshots(
+            Arc::new(config),
+            sender,
+            shutdown_rx,
+            0,
+            pause_rx,
+            resume_rx,
+            0,
+            symbols,
+            resync_rx,
+            rate_limiter,
+        ));
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, generation, .. })
+                if symbol == "ETHUSDT" && generation == 0
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+
+        pause_tx.send(1).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap(),
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        resume_tx.send(1).unwrap();
+
+        resync_tx
+            .enqueue(SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { symbol, generation, .. })
+                if symbol == "BTCUSDT" && generation == 1
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("symbol=ETHUSDT"));
+        assert!(requests[1].contains("symbol=BTCUSDT"));
     }
 
     #[tokio::test]
@@ -10570,6 +11072,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotation_barrier_queues_local_snapshot_resync() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", config.market),
+        )]);
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let (sender, mut receiver) = mpsc::channel(3);
+        let mut tasks = JoinSet::new();
+        let (resync_tx, mut resync_rx) = snapshot_resync_channel();
+        let resync_queues = HashMap::from([("BTCUSDT".to_owned(), resync_tx)]);
+        let streams = vec!["btcusdt@depth@100ms".into()];
+
+        sender
+            .send(Event::StreamDisconnected {
+                streams: streams.clone(),
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        sender
+            .send(Event::StreamReconnected { streams })
+            .await
+            .unwrap();
+        sender
+            .send(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut tasks,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                &mut process_state,
+                &resync_queues,
+                1,
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+            RotationBarrierResult::Ready {
+                initial_snapshots_complete: 0,
+                resync_requested: true,
+            }
+        );
+        assert_eq!(
+            resync_rx.recv().await.unwrap(),
+            vec![SnapshotRequest {
+                symbol: "BTCUSDT".into(),
+                generation: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn rotation_barriers_drain_captured_events_before_segment_boundary() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
@@ -10605,6 +11175,7 @@ mod tests {
                 Event::Snapshot {
                     received_at_ns,
                     symbol: "BTCUSDT".into(),
+                    generation: 1,
                     request_started_at_ns: received_at_ns,
                     snapshot: json!({
                         "lastUpdateId": 1,
@@ -10640,6 +11211,7 @@ mod tests {
                 &mut budget,
                 "session-1",
                 &mut process_state,
+                &HashMap::new(),
                 1,
                 1,
                 None,
@@ -10652,7 +11224,8 @@ mod tests {
         assert_eq!(
             barriers,
             RotationBarrierResult::Ready {
-                initial_snapshots_complete: 0
+                initial_snapshots_complete: 0,
+                resync_requested: false,
             }
         );
         assert!(captured_at_ns < now_ns().unwrap());
@@ -10706,6 +11279,7 @@ mod tests {
                 &mut budget,
                 "session-1",
                 &mut process_state,
+                &HashMap::new(),
                 1,
                 1,
                 None,

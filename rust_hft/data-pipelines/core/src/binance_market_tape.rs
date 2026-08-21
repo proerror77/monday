@@ -466,6 +466,10 @@ impl DepthSourceClockSequenceValidator {
         );
         Ok(())
     }
+
+    pub fn reset_symbol(&mut self, symbol: &str) {
+        self.last.remove(symbol);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
