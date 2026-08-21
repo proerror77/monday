@@ -2,7 +2,8 @@
 
 **Status:** Phase 1 runtime-admission extraction complete; attribution and bundle extraction pending
 
-**Revision:** `codex/monday-flow-fix-snapshot@5ec72cc8`
+**Baseline:** integrated against `main` on 2026-08-21; Git history records the
+exact source revision.
 
 **Scope:** identify the smallest contract families that can leave
 `alpha-harness/domain` without changing wire format, hashes, signatures, or
@@ -101,8 +102,8 @@ cargo metadata --locked --no-deps
 
 No extraction may be declared complete from a compile-only result.
 
-Baseline on this checkout: `alpha-domain` passed `67/67` unit tests and `0`
-doc-tests with the existing `5ec72cc8` contract implementation.
+Integration baseline: `alpha-domain` passed `73/73` unit tests and `0` doc-tests;
+the governance crate and runtime consumer checks also passed.
 
 ## 4. Migration order
 

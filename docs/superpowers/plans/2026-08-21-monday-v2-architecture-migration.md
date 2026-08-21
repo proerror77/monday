@@ -1,10 +1,9 @@
 # Monday V2 architecture migration plan
 
 **Status:** Phase 1 runtime-admission extraction complete; attribution and bundle
-extraction pending on
-`codex/monday-flow-fix-snapshot@5ec72cc8`
+extraction pending
 
-**Owner:** current checkout only; no production controller is assigned
+**Owner:** repository architecture lane; no production controller is assigned
 
 **Scope:** repository architecture and migration seams; no runtime cutover
 
@@ -17,12 +16,11 @@ existing Collector recovery work or the user's dirty files.
 
 | Area | Current evidence | Interpretation |
 | --- | --- | --- |
-| Checkout | `codex/monday-flow-fix-snapshot`, `5ec72cc8` | Not `main`; recheck before every publish/merge action |
-| Worktree | 25 modified tracked files; untracked `DEV_STATE.md`, ADR/inventory/plan documents, `rust_hft/.cargo_home/git/`, and `rust_hft/governance-contracts/` | Includes pre-existing user changes; preserve, no reset, cleanup, or broad formatting |
+| Source baseline | Integrated against the current `main` at implementation time | Recheck exact revision before every publish, release, or runtime action |
 | Workspace graph | 78 packages in `rust_hft`; 23 in `rust_hft/prediction-markets` | The new governance package is a contract seam, not a new product authority |
 | Data | `hft-collector` has 50 Rust files and recorder/reference/uploader/materializer/cache binaries | Collection and heavy processing share a package/release boundary |
 | Research | `alpha-harness` splits CLI files but links collector and backtest directly; multiple mission/loop seams remain | Operator acceptance and implementation paths are not yet one Golden Path |
-| Contracts | `alpha-domain` is 7,445 lines; `hft-governance-contracts` is 511 lines and `hft-live` now consumes it directly | Runtime admission is separated; attribution and bundle identity remain shared |
+| Contracts | `hft-governance-contracts` owns runtime admission and `hft-live` consumes it directly | Attribution and bundle identity remain shared |
 | Prediction | `ploy-research` can opt into `ploy-strategy-bundles` and `ploy-trading` | Transitional runtime coupling must shrink, not gain authority |
 | Safety | `cargo metadata --locked --no-deps` succeeds; no direct alpha/research -> risk/execution edge observed | Safe to start with docs and contract-boundary work |
 

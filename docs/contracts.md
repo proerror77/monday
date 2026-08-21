@@ -4,7 +4,8 @@ This file is an index, not an independent protocol definition. Rust types and va
 
 ## Research Contracts
 
-- `rust_hft/alpha-harness/domain`: `ResearchMission`, `LoopRun`, `CandidateArtifact`, evaluation evidence, approvals, promotion records, strategy bundles, deployment envelopes, and runtime attribution.
+- `rust_hft/alpha-harness/domain`: `ResearchMission`, `LoopRun`, `CandidateArtifact`, evaluation evidence, approvals, promotion records, strategy bundles, and runtime attribution.
+- `rust_hft/governance-contracts`: deployment envelopes, runtime approval evidence, policy binding, signature verification, and deployment scope hashing.
 - `rust_hft/alpha-harness/store`: immutable revisions, append-only iterations, authenticated checkpoints, approvals, policy memory, and deployment evidence.
 - `rust_hft/tools/collector`: governed dataset manifests, source capabilities, time bounds, and quality reports.
 

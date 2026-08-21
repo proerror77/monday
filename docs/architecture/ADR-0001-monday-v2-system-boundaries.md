@@ -15,12 +15,11 @@ does not expose the full lifecycle as one set of module boundaries.
 
 The current checkout provides the following evidence:
 
-- The pre-migration Rust workspace had 77 packages. `alpha-domain` was a
-  7,894-line crate containing mission/evaluation types alongside strategy
-  bundles, deployment envelopes, approvals, and runtime-attribution contracts.
-  The first migration slice now adds the 511-line `hft-governance-contracts`
-  package, leaving `alpha-domain` at 7,445 lines and moving runtime admission
-  consumers to the new package.
+- The pre-migration Rust workspace had 77 packages. `alpha-domain` contained
+  mission/evaluation types alongside strategy bundles, deployment envelopes,
+  approvals, and runtime-attribution contracts. The first migration slice adds
+  `hft-governance-contracts` and moves runtime-admission consumers to that
+  package without changing the wire contract.
 - `tools/collector` has 50 Rust source files and many recorder, reference,
   uploader, verifier, replay-materializer, cache-warmer, and analytics binaries in
   one package. Its LOB archiver also imports the runtime-oriented
