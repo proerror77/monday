@@ -1,11 +1,13 @@
 use alpha_domain::{
-    sign_runtime_attribution_event, verify_envelope, AllowedIntentType, ApprovalClass, DomainError,
-    EvaluationCostsV1, RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
-    SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact, VerifiedDeploymentEnvelope,
-    MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
+    sign_runtime_attribution_event, DomainError, EvaluationCostsV1, RuntimeAttributionEvent,
+    StrategyBundle, StrategyBundleArtifact, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use governance::{
+    verify_envelope, AllowedIntentType, ApprovalClass, GovernanceError, RuntimeApprovalEvidence,
+    RuntimeEnvelopePolicy, SignedDeploymentEnvelope, VerifiedDeploymentEnvelope,
+};
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +22,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum IntakeError {
     #[error("deployment envelope rejected: {0}")]
-    Domain(#[from] DomainError),
+    Domain(#[from] GovernanceError),
+    #[error("runtime attribution rejected: {0}")]
+    Attribution(#[from] DomainError),
     #[error("runtime is paused and cannot be resumed by a deployment envelope")]
     RuntimePaused,
     #[error("deployment must request exactly one paper, shadow, or live-small activation")]
@@ -993,8 +997,8 @@ fn durable_error(error: std::io::Error) -> IntakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::DeploymentEnvelope;
     use chrono::Duration;
+    use governance::DeploymentEnvelope;
 
     #[test]
     fn same_class_auto_live_small_is_not_runtime_authority() {
