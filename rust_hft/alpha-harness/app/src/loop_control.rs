@@ -547,11 +547,14 @@ mod tests {
         },
         data_mission, governance,
     };
+    use ::governance::{
+        deployment_scope_hash, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
+        LiveSmallEligibilityEvidence,
+    };
     use alpha_domain::{
-        deployment_scope_hash, sign_runtime_attribution_event, AllowedIntentType, ApprovalClass,
-        AttributionKind, AttributionOutcome, CandidateArtifact, DeploymentEnvelope, EngineKind,
-        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
-        IterationVerdict, LiveSmallEligibilityEvidence, MissionTerminalReason, ResearchIteration,
+        sign_runtime_attribution_event, AttributionKind, AttributionOutcome, CandidateArtifact,
+        EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
+        EvaluationWalkForwardV1, IterationVerdict, MissionTerminalReason, ResearchIteration,
         ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
         SEALED_HOLDOUT_EVALUATOR_VERSION,
     };

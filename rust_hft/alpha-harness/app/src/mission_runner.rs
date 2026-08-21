@@ -2942,17 +2942,20 @@ pub(crate) mod tests {
         cli::{FeedbackLogArgs, FeedbackRecordArgs, SignDeploymentArgs, ValidationArgs},
         governance,
     };
+    use ::governance::{
+        deployment_scope_hash, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
+    };
     use alpha_domain::{
-        deployment_scope_hash, runtime_stage_is_healthy, sign_runtime_attribution_event,
-        AllowedIntentType, ApprovalClass, AttributionKind, AttributionMode, AttributionOutcome,
-        CexBaselineArtifactV1, CexBaselineGateV1, CexEventReplayPolicyV1, CexResearchContentRefV1,
-        CexResearchEvidenceKindV1, CexResearchEvidenceRefV1, CexResearchEvidenceSignatureV1,
-        CexResearchFalsificationTestV1, CexResearchHoldoutStateV1, CexResearchHoldoutV1,
-        CexResearchHypothesisTargetV1, CexResearchHypothesisV1, CexResearchInputBindingsV1,
-        CexResearchInstrumentV1, CexResearchMarketV1, CexResearchMissionSpecV1,
-        CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1, CexResearchSearchPlanV1,
-        CexResearchVenueV1, DeploymentEnvelope, EvaluationLabelSpecV1, RuntimeAttributionEvent,
-        SearchBudget, SignedRuntimeAttributionEvent, CEX_RESEARCH_MISSION_SCHEMA_V1,
+        runtime_stage_is_healthy, sign_runtime_attribution_event, AttributionKind, AttributionMode,
+        AttributionOutcome, CexBaselineArtifactV1, CexBaselineGateV1, CexEventReplayPolicyV1,
+        CexResearchContentRefV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
+        CexResearchEvidenceSignatureV1, CexResearchFalsificationTestV1, CexResearchHoldoutStateV1,
+        CexResearchHoldoutV1, CexResearchHypothesisTargetV1, CexResearchHypothesisV1,
+        CexResearchInputBindingsV1, CexResearchInstrumentV1, CexResearchMarketV1,
+        CexResearchMissionSpecV1, CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1,
+        CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationLabelSpecV1,
+        RuntimeAttributionEvent, SearchBudget, SignedRuntimeAttributionEvent,
+        CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
     use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
     use alpha_store::ApprovalRecord;
