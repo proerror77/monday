@@ -213,8 +213,16 @@ for asset in \
   cmp -s "$candidate_deployment/$asset" "$installed_asset" \
     || die "installed shadow asset differs from the gated deployment bundle: $asset"
 done
+candidate_production_spot_env="$candidate_deployment/binance-lob-archiver-production-spot.env"
 candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
+secure_regular_file "$candidate_production_spot_env"
 secure_regular_file "$candidate_production_usdm_env"
+configured_spot_snapshot_producers=$(env_value "${env_file[spot]}" SNAPSHOT_PRODUCERS)
+[[ $configured_spot_snapshot_producers == 16 ]] \
+  || die 'Spot shadow SNAPSHOT_PRODUCERS must be 16'
+[[ $(env_value "$candidate_production_spot_env" SNAPSHOT_PRODUCERS) \
+  == "$configured_spot_snapshot_producers" ]] \
+  || die 'Spot shadow and production SNAPSHOT_PRODUCERS differ'
 [[ $(env_value "$candidate_production_usdm_env" DATASET) \
   == usdm_perpetual_top100_lob ]] \
   || die 'candidate USD-M production dataset is not the LOB-first identity'

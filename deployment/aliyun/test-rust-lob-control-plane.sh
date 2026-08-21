@@ -279,6 +279,17 @@ for shadow_env in \
     exit 1
   }
 done
+shadow_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-rust-spot.env")
+production_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
+  "$SCRIPT_DIR/binance-lob-archiver-production-spot.env")
+[[ $shadow_spot_snapshot_producers == 16 \
+  && $production_spot_snapshot_producers == "$shadow_spot_snapshot_producers" ]] || {
+  printf 'Spot shadow and production must pin SNAPSHOT_PRODUCERS=16\n' >&2
+  exit 1
+}
+grep -Fq 'Spot shadow SNAPSHOT_PRODUCERS must be 16' "$GATE"
+grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
 ((same_second_gate_start_ns >= gate_started_ns)) || {
   printf 'nanosecond cutoff rejected a same-second gate segment\n' >&2
   exit 1
