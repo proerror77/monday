@@ -40,7 +40,8 @@ export TMPDIR="$task_root/tmp"
 export CARGO_HOME="$task_root/cargo"
 export RUSTUP_HOME="$task_root/rustup"
 export CARGO_TARGET_DIR="$task_root/target"
-mkdir -p "$TMPDIR" "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR"
+export SCCACHE_DIR="$task_root/sccache"
+mkdir -p "$TMPDIR" "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR" "$SCCACHE_DIR"
 ```
 
 Upload or read back every required result before the command exits. A task root
