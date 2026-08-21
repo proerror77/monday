@@ -785,12 +785,7 @@ pub(crate) fn execute_report(
         &factor_bank,
         &baseline_run,
     )?;
-    let subset_run = if factor_bank.entries.is_empty() {
-        if resume_checkpoint.is_some() {
-            bail!("MCTS resume checkpoint requires a non-empty Factor Bank");
-        }
-        None
-    } else {
+    let subset_run = if baseline_run.gate.passed {
         run_factor_bank_subset_search(
             &results_dir,
             &control_mission,
@@ -799,6 +794,10 @@ pub(crate) fn execute_report(
             &baseline_context,
             resume_checkpoint,
         )?
+    } else if resume_checkpoint.is_some() {
+        bail!("MCTS resume checkpoint requires a passing baseline gate");
+    } else {
+        None
     };
     let replay_report = subset_run
         .as_ref()
@@ -960,8 +959,8 @@ fn finalize_cex_candidate(
         .cart
         .as_ref()
         .context("final precommit is missing CART baseline evidence")?;
-    if !replay.gate.passed {
-        bail!("final precommit requires a passing replay gate");
+    if !baselines.gate.passed || !replay.gate.passed {
+        bail!("final precommit requires passing baseline and replay gates");
     }
     strategy
         .validate_binding(
@@ -5330,7 +5329,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn subset_mcts_runs_with_failed_baselines_when_factor_bank_is_nonempty() {
+    fn subset_mcts_rejects_failed_baselines_when_factor_bank_is_nonempty() {
         let mut fixture = fixture("failed-baseline-still-runs-subset");
         fixture.mission.spec.search.seed = 1;
         fixture.mission.spec.search.budget.max_candidates = 6;
@@ -5413,7 +5412,7 @@ pub(crate) mod tests {
 
         let subset_results = fixture.root.join("failed-baseline-subset-results");
         std::fs::create_dir_all(&subset_results).unwrap();
-        let selection = run_factor_bank_subset_search(
+        let error = run_factor_bank_subset_search(
             &subset_results,
             &fixture.mission,
             &factor_bank,
@@ -5421,16 +5420,19 @@ pub(crate) mod tests {
             &dataset.engine_context(),
             None,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(selection.is_none());
-        assert!(subset_results
+        assert_eq!(
+            error.to_string(),
+            "Factor-Bank MCTS requires both passing baseline artifacts"
+        );
+        assert!(!subset_results
             .join("factor-subset-mcts-checkpoint.json")
             .exists());
-        assert!(subset_results
+        assert!(!subset_results
             .join("factor-subset-mcts-trace.json")
             .exists());
-        assert!(subset_results
+        assert!(!subset_results
             .join("factor-subset-mcts-result.json")
             .exists());
         assert!(!subset_results

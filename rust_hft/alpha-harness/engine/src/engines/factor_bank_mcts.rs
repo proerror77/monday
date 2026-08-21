@@ -1777,6 +1777,9 @@ fn validate_source_bindings(
         Some(cart),
     )
     .map_err(|error| error.to_string())?;
+    if !gate.passed || !ridge.evaluation.passed || !cart.evaluation.passed {
+        return Err("Factor-Bank MCTS requires both passing baseline artifacts".to_string());
+    }
     Ok(())
 }
 

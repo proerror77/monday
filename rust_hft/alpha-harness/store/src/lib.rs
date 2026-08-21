@@ -1506,26 +1506,18 @@ impl AlphaStore {
     }
 
     pub fn has_cex_sealed_holdout_claim(&self, holdout_id: &str) -> Result<bool, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT payload_json FROM registry_revisions WHERE registry_kind = ?")
-            .map_err(database_error)?;
-        let mut rows = statement
-            .query(params![CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND])
-            .map_err(database_error)?;
-        while let Some(row) = rows.next().map_err(database_error)? {
-            let payload: serde_json::Value =
-                serde_json::from_str(&row.get::<_, String>(0).map_err(database_error)?)
-                    .map_err(serialization_error)?;
-            if payload
+        let revisions: Vec<RegistryRevision> = read_json_rows(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM registry_revisions WHERE registry_kind = ?",
+            CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND,
+        )?;
+        Ok(revisions.iter().any(|revision| {
+            revision
+                .payload
                 .get("holdout_id")
                 .and_then(serde_json::Value::as_str)
                 == Some(holdout_id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        }))
     }
 
     pub fn put_cex_sealed_evaluation(
@@ -3637,6 +3629,9 @@ mod tests {
             1
         );
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(readback
+            .has_cex_sealed_holdout_claim(&claim.holdout_id)
+            .unwrap());
         assert_eq!(
             readback
                 .get_registry_revision(&claim.claim_id)

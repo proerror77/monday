@@ -1,6 +1,6 @@
 ---
 name: monday-delivery-status
-description: Report Monday delivery truth as separate Code, CI, merge, release, runtime, and readback states with exact live identities. Use for status questions such as "现在卡在哪里", "是否完成", "能否上线", PR/CI triage, release checks, deployment checks, or any claim that work has shipped.
+description: Report Monday source-delivery truth as separate Code, CI, merge, release, runtime, and readback states with exact live identities. Use for "现在卡在哪里", "是否完成", "能否上线", PR/CI, release, deployment, or shipped claims. For evidence inside a research run, use monday-research-evidence-audit instead.
 ---
 
 # Monday Delivery Status

@@ -15,7 +15,7 @@ use crate::{
         cex_global_holdout_claim_object, validate_dns_label,
     },
 };
-use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
+use alpha_domain::{canonical_json_hash, CexBaselineGateV1, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
@@ -887,6 +887,40 @@ fn collect_round_ledger(
     let results = execute_dir.join("results");
     let factor_bank: CexFactorBankRevisionV2 =
         serde_json::from_slice(&std::fs::read(results.join("factor-bank.json"))?)?;
+    let baseline_gate: CexBaselineGateV1 =
+        serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json"))?)?;
+    let control_mission: alpha_domain::CexResearchMissionArtifactV1 =
+        serde_json::from_slice(&std::fs::read(results.join("control-plane-mission.json"))?)?;
+    let baseline_policy: alpha_domain::CexBaselinePolicyV1 =
+        serde_json::from_slice(&std::fs::read(results.join("baseline-policy.json"))?)?;
+    let (ridge, cart) = if factor_bank.entries.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(
+                serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
+                    results.join("ridge-baseline.json"),
+                )?)?,
+            ),
+            Some(
+                serde_json::from_slice::<alpha_domain::CexBaselineArtifactV1>(&std::fs::read(
+                    results.join("cart-baseline.json"),
+                )?)?,
+            ),
+        )
+    };
+    if report.mission_id != control_mission.semantic_id()? {
+        bail!("round execution report mission identity drifted");
+    }
+    baseline_gate
+        .validate_binding(
+            &control_mission,
+            &baseline_policy,
+            &factor_bank,
+            ridge.as_ref(),
+            cart.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
     let consumed_trials = factor_bank.attempts.len()
@@ -905,6 +939,11 @@ fn collect_round_ledger(
             bail!("empty Factor Bank cannot produce subset search artifacts");
         }
         ("no_accepted_factors".to_string(), None, None, None)
+    } else if !baseline_gate.passed {
+        if subset_result.is_some() || strategy_exists || report.replay_receipt_id.is_some() {
+            bail!("failed baseline gate cannot produce subset search artifacts");
+        }
+        ("baseline_gate_failed".to_string(), None, None, None)
     } else {
         let subset_result =
             subset_result.context("non-empty Factor Bank is missing factor subset MCTS result")?;
@@ -2512,6 +2551,61 @@ mod tests {
         assert!(ledger.selected_candidate_id.is_none());
         assert!(ledger.selected_candidate_content_hash.is_none());
         assert!(ledger.selected_score.is_none());
+
+        let ridge_path = results.join("ridge-baseline.json");
+        let ridge: alpha_domain::CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(&ridge_path).unwrap()).unwrap();
+        let cart: alpha_domain::CexBaselineArtifactV1 =
+            serde_json::from_slice(&std::fs::read(results.join("cart-baseline.json")).unwrap())
+                .unwrap();
+        let mut evaluation = ridge.evaluation.clone();
+        evaluation.metrics.folds[0].trade_count = 0;
+        evaluation.metrics.trade_count = evaluation
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.trade_count)
+            .sum();
+        evaluation.passed = false;
+        evaluation.failure_reasons = vec!["forced baseline failure".to_string()];
+        let ridge = alpha_domain::CexBaselineArtifactV1::new(
+            ridge.mission_id.clone(),
+            ridge.factor_bank_revision_id.clone(),
+            ridge.factor_ids.clone(),
+            ridge.target.clone(),
+            ridge.research_dataset.clone(),
+            ridge.walk_forward_partition.clone(),
+            ridge.evaluation_policy.clone(),
+            ridge.baseline_policy.clone(),
+            ridge.model_kind,
+            ridge.folds.clone(),
+            evaluation,
+        )
+        .unwrap();
+        let gate = CexBaselineGateV1::new(&ridge, &cart).unwrap();
+        let gate_path = results.join("baseline-gate.json");
+        data_mission::write_json_atomic(&ridge_path, &ridge).unwrap();
+        data_mission::write_json_atomic(&gate_path, &gate).unwrap();
+        std::fs::remove_file(&subset_path).unwrap();
+
+        let baseline_failed = collect_round_ledger(&execute_dir, &round, &report).unwrap();
+        assert_eq!(baseline_failed.termination_reason, "baseline_gate_failed");
+        assert!(baseline_failed.selected_candidate_id.is_none());
+
+        let mut mismatched_gate = gate;
+        mismatched_gate.mission_id = "cex-research-mission-other".to_string();
+        mismatched_gate.gate_id.clear();
+        mismatched_gate.gate_id = format!(
+            "cex-baseline-gate-{}",
+            canonical_json_hash(&mismatched_gate).unwrap()
+        );
+        mismatched_gate.validate().unwrap();
+        data_mission::write_json_atomic(&gate_path, &mismatched_gate).unwrap();
+
+        let error = collect_round_ledger(&execute_dir, &round, &report).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("baseline gate producer binding drifted"));
     }
 
     #[test]

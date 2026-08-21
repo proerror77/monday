@@ -1,6 +1,6 @@
 ---
 name: monday-worktree-audit
-description: Classify Monday Git worktrees as active, dirty, or Git-prunable without deleting or cleaning them. Use for worktree inventory, branch cleanup planning, disk-usage review, stale-worktree questions, ownership conflicts, or before any request to remove a worktree or branch.
+description: Classify Monday Git worktrees as registered-clean, dirty, or Git-prunable without deleting or cleaning them. Use for worktree inventory, branch cleanup planning, disk-usage review, stale-worktree questions, ownership conflicts, or before any request to remove a worktree or branch.
 ---
 
 # Monday Worktree Audit
@@ -16,7 +16,7 @@ Produce a read-only inventory. Classification is not deletion authorization.
 5. For any cleanup candidate, additionally read its ownership record, exact `HEAD`, upstream/push state, open or closed PR state, merge state, and active-session use.
    Lock-file existence is not lock ownership; record a lock as active only with `flock` or holder evidence.
 6. Classify worktrees exactly once, using the preflight report as authoritative:
-   - `active`: registered, clean, and not Git-prunable;
+   - `registered-clean`: registered, clean, and not Git-prunable; this does not prove an active owner or session;
    - `dirty`: tracked or untracked changes exist;
    - `prunable`: Git itself marks the administrative worktree record prunable.
    Record ownership or session use only in `Owner/use`; it never changes `State`.
@@ -30,7 +30,7 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 ## Output
 
-Return totals for `active`, `dirty`, and `prunable`, followed by:
+Return totals for `registered-clean`, `dirty`, and `prunable`, followed by:
 `Path | Branch/HEAD | State | Dirty/unpushed | PR | Owner/use | Cleanup safety | Reason`.
 Then list unattached branches as `Branch | HEAD | Upstream/unpushed | PR | Owner/use | Cleanup safety | Reason`.
 List only evidence-backed cleanup candidates in a separate final section; do not recommend deletion without an exact authorized path list.

@@ -13,7 +13,7 @@ value() {
 check() {
   local root primary branch record recorded_root recorded_branch base
   root=$(git rev-parse --show-toplevel) || fail not_a_git_worktree
-  primary=$(git worktree list --porcelain | awk '$1 == "worktree" { print substr($0, 10); exit }')
+  primary=$(git worktree list --porcelain | awk '$1 == "worktree" && !found { print substr($0, 10); found=1 }')
   [[ "$root" != "$primary" ]] || fail primary_checkout
   [[ "$root" == "$primary/.worktrees/codex/"* ]] || fail unmanaged_worktree
   branch=$(git branch --show-current)
@@ -39,7 +39,7 @@ report() {
       [[ -n "$path" ]] || continue
       if [[ "$prunable" == true ]]; then state=prunable
       elif [[ -n $(git -C "$path" status --porcelain) ]]; then state=dirty
-      else state=active; fi
+      else state=registered-clean; fi
       printf 'worktree=%s\tbranch=%s\tstate=%s\n' "$path" "$branch" "$state"
       path= branch= prunable=
     elif [[ "$line" == worktree\ * ]]; then path=${line#worktree }
@@ -50,7 +50,7 @@ report() {
   if [[ -n "$path" ]]; then
     if [[ "$prunable" == true ]]; then state=prunable
     elif [[ -n $(git -C "$path" status --porcelain) ]]; then state=dirty
-    else state=active; fi
+    else state=registered-clean; fi
     printf 'worktree=%s\tbranch=%s\tstate=%s\n' "$path" "$branch" "$state"
   fi
 }
