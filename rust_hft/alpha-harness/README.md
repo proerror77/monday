@@ -1,5 +1,5 @@
 # Alpha Harness
-Rust CLI and libraries for the governed, bounded Loop Engineer research plane. It has no order or trade command and does not depend on execution adapters.
+Rust CLI and libraries for the governed CEX Campaign and prediction research plane. It has no order or trade command and does not depend on execution adapters.
 
 ## Packages
 
@@ -31,7 +31,7 @@ once against the global holdout claim. Low-level Mission and LoopRun commands
 remain diagnostics and implementation surfaces; they are not alternate evidence
 paths around this contract.
 
-## Data Mission
+## Local Data Diagnostics
 
 ```bash
 cargo run -p alpha-harness -- data sources
@@ -45,59 +45,52 @@ cargo run -p alpha-harness -- data acquire \
   --artifact-dir var/datasets
 ```
 
-The command calls the registered public connector, writes a content-addressed JSONL trace and manifest, persists the full manifest as an immutable DuckDB registry revision, and writes a failure artifact on acquisition failure. Research commands reject a disk manifest that does not exactly match that revision. The acquisition path never substitutes fixtures.
+This diagnostic command calls the registered public connector, writes a content-addressed JSONL trace and manifest, persists the full manifest as an immutable DuckDB registry revision, and writes a failure artifact on acquisition failure. It is not the production CEX admission path. Research commands reject a disk manifest that does not exactly match that revision. The acquisition path never substitutes fixtures.
 
-## Research Mission
+## CEX Campaign
 
-Create a JSON `ResearchMission`, then run one explicitly selected engine:
+The supported CEX operator path freezes one shared input set in the cloud,
+finalizes its reviewed signatures into one immutable Campaign submission, and
+submits that object to the generated ACK Job:
 
 ```bash
-cargo run -p alpha-harness -- mission create \
-  --db var/alpha.duckdb --mission mission.json
+alpha-harness mission campaign-freeze \
+  --campaign-inputs /private/campaign-inputs.json \
+  --input-root /mounted/materialization-run \
+  --source-revision REPLACE_GIT_SHA \
+  --image REPLACE_REGISTRY/research-runner@sha256:REPLACE_DIGEST \
+  --campaign-root https://REPLACE_INTERNAL_OSS/research/campaigns \
+  --seed 7 --seed 11 \
+  --output freeze.json
 
-cargo run -p alpha-harness -- mission run \
-  --db var/alpha.duckdb \
-  --mission-id mission-1 \
-  --engine gp \
-  --feature-fields book_imbalance \
-  --dataset-manifest var/datasets/dataset-....manifest.json \
-  --label-horizon-buckets 1 \
-  --observation-frequency-millis 60000
+# Produce signed-request.json in the separately reviewed signing step.
+alpha-harness mission campaign-finalize \
+  --freeze freeze.json \
+  --signed-request signed-request.json \
+  --attempt-id attempt-001 \
+  --image REPLACE_REGISTRY/research-runner@sha256:REPLACE_DIGEST \
+  --request-out campaign-request.json \
+  --submission-out campaign-submission.json
 
-cargo run -p alpha-harness -- mission status \
-  --db var/alpha.duckdb --mission-id mission-1
+alpha-harness mission campaign-id --request campaign-request.json
 
-cargo run -p alpha-harness -- candidate list \
-  --db var/alpha.duckdb --mission-id mission-1
-
-cargo run -p alpha-harness -- candidate show \
-  --db var/alpha.duckdb --mission-id mission-1 \
-  --candidate-id mission-1-gp-1
+alpha-harness mission dispatch submit \
+  --submission campaign-submission.json \
+  --context monday-research-apne1 \
+  --namespace monday-research
 ```
 
-`candidate show` prints the candidate artifact plus every stored evaluation as
-structured JSON: pass/fail, score, failure reasons, the bound evaluation
-protocol, and the full metrics (IC/RankIC/ICIR/RankICIR, positive-IC ratio,
-per-fold and aggregate net return, drawdown, turnover, trade count, and the
-unannualized per-observation net Sharpe). It is read-only evidence readback;
-it grants no promotion or runtime authority.
+`campaign-execute` is the generated Job's internal entrypoint, not a manual
+operator step. The older Mission and LoopRun mutation commands remain hidden,
+diagnostic implementation surfaces; they cannot complete this Campaign
+contract.
 
-The production CEX entrypoint consumes a private Campaign submission whose
+The Campaign commands above consume a private submission whose
 request binds the exact input objects and SHA-256 values, source revision,
 image digest, holdout identity, campaign-wide `declared_total_trials`, and at
 least two rounds. Each round carries a unique `round_id`, unique seed, and
 create-once Mission/result URLs. Signed URL query parameters are transport
 only; the query-free objects are part of the Campaign identity.
-
-```bash
-cargo run -p alpha-harness -- mission campaign-id \
-  --request var/submissions/campaign-request.json
-
-cargo run -p alpha-harness -- mission dispatch submit \
-  --submission var/submissions/campaign-submission.json \
-  --context monday-research-apne1 \
-  --namespace monday-research
-```
 
 The submit command creates the Job suspended, verifies its pinned execution
 template, then creates the immutable Secret with that Job as its owner. It reads
@@ -117,16 +110,6 @@ second holdout winner.
 
 The direct `mission execute` and checkpoint-resume surfaces remain diagnostic.
 They are not the cloud Campaign production path.
-
-Resume a persisted subset-search checkpoint into a fresh work directory by
-adding `--resume-url <checkpoint.json>` and
-`--resume-sha256 <checkpoint-content-sha256>` using the checkpoint artifact's
-embedded `checkpoint_sha256` field. Restore deterministically replays the
-complete trace against the newly reproduced Mission, Factor Bank, baselines,
-policies, and research context before accepting any persisted RNG, tree
-statistics, evaluation, or selection.
-Mission admission rejects search plans whose conservative checkpoint-size bound
-cannot fit the same 64 MiB resume transport limit.
 
 The artifact binds one Binance Spot or USD-M instrument and horizon, typed
 hypotheses and falsifiers, immutable data/policy identities, the search and
@@ -163,7 +146,14 @@ Sealed-holdout evaluation requires the separate governed precommit boundary.
 This schema binds prior-evidence identities; later holdout and Paper/Shadow
 gates own receipt and signature verification.
 
-For `mission run`, `--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. GP and LLM produce validated Formula candidates. The low-level CLI rejects `mcts`; Factor-Bank subset MCTS is owned only by the content-bound `mission execute` seam. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
+The hidden diagnostic `mission run` surface requires `--feature-fields`.
+Supply comma-delimited fields that are present in the prepared dataset,
+live-executable, and all belong to the same live event domain. GP and LLM
+produce validated Formula candidates. The low-level CLI rejects `mcts`;
+Factor-Bank subset MCTS is owned only by the Campaign execution seam.
+`bayesian` and `offline-rl` remain research engines but are rejected before
+opening mission state because their proposal grammars cannot produce
+live-executable formulas. LLM diagnostics require:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -176,34 +166,15 @@ Credentials are process inputs and are never persisted.
 
 For an LLM mission, `objective` and `hypothesis_scope` are the governed research brief; put the curated, source-grounded material synthesis in those fields. `prompt_snapshot_id` records the content-addressed source snapshot but is not an implicit retrieval mechanism. The proposer receives that brief, the registered feature names, the mutable scope, and at most eight prior candidate `keep`/`discard` outcomes. It receives no row labels, raw evaluation metrics, or validator thresholds, and code rejects Formula output unless `mutable_scope` explicitly includes `factor_ast` or `factor_formula`.
 
-## Bounded LoopRun
+## Legacy Diagnostic Surfaces
 
-The durable state contract has the following command shape:
-
-```bash
-cargo run -p alpha-harness -- loop run \
-  --db var/alpha.duckdb \
-  --loop-run-id loop-btc-1 \
-  --mission-id mission-1 \
-  --engine mcts \
-  --dataset-manifest var/datasets/dataset-....manifest.json \
-  --label-horizon-buckets 1 \
-  --observation-frequency-millis 60000 \
-  --target-stage shadow-healthy \
-  --max-research-missions 2
-
-cargo run -p alpha-harness -- loop status \
-  --db var/alpha.duckdb \
-  --loop-run-id loop-btc-1
-```
-
-The durable LoopRun still targets the retired Formula-MCTS proposal interface,
-so it is not a runnable CEX golden path. The content-bound `mission execute` path
-owns Factor-Bank subset MCTS and exact checkpoint resume. GP and LLM remain
-available through standalone `mission run` commands but cannot claim that
-acceptance path. Bayesian and offline RL are rejected during preflight. Missing
-evaluation, holdout, Paper, Shadow, or human evidence pauses LoopRun instead of
-fabricating progress; invocation does not bypass stage evidence.
+`mission create`, `mission execute`, `mission run`, `mission resume`, and
+`loop run` remain parseable only for focused diagnostics and legacy checkpoint
+inspection. They are hidden from CLI help and are not runnable CEX completion
+paths. The Campaign seam owns Factor-Bank subset MCTS, exact checkpoint resume,
+round accounting, winner selection, and the one sealed-holdout finalization.
+Missing evaluation, holdout, Paper, Shadow, or human evidence still fails or
+pauses closed; invoking a diagnostic command never supplies that evidence.
 
 ## Prediction-Market Research
 

@@ -30,7 +30,7 @@ const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
 const CEX_FACTOR_BANK_MCTS_OPERATOR_ERROR: &str =
-    "CEX Factor-Bank subset MCTS is available only through content-bound mission execute";
+    "CEX Factor-Bank subset MCTS is available only through the Campaign execution seam";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

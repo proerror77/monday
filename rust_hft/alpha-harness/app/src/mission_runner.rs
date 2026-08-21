@@ -4944,7 +4944,7 @@ pub(crate) mod tests {
 
         assert!(error
             .to_string()
-            .contains("available only through content-bound mission execute"));
+            .contains("available only through the Campaign execution seam"));
         let store = AlphaStore::open(&args.db).unwrap();
         assert_eq!(
             store.get_mission(&args.mission_id).unwrap().status,
