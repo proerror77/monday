@@ -332,7 +332,7 @@ check_dataset binance-spot \
   'lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/' \
   triplet "$GRACE_SPOT"
 check_dataset binance-usdm \
-  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all/' \
+  'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/' \
   triplet "$GRACE_USDM"
 check_dataset bybit-options \
   'lake/raw/venue=bybit/market=option/dataset=options_quotes/' \

@@ -260,7 +260,7 @@ Governed datasets and their completeness rules:
 | Dataset | Lake prefix | Rule |
 | --- | --- | --- |
 | `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
-| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all/` | same triplet |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/` | same triplet |
 | `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
 | `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
 | `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
@@ -948,7 +948,7 @@ segments, isolated spools, and isolated OSS datasets:
 | Market | Shadow spool | Shadow dataset |
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_rust_shadow` |
 
 The dataset and shard identifiers remain the canonical lane names; every
 manifest's explicit symbol list and catalog digest are the authority for its

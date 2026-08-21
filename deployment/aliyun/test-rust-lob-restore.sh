@@ -187,7 +187,10 @@ setup_fixture() {
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       configured_catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       session_id:"shadow-session",oss_roundtrips:2,
-      tape_schema:"binance.market_tape.v1",
+      tape_schema:"binance.market_tape.v2",
+      stream_types:["aggTrade","bookTicker","depth@100ms","trade"],
+      raw_trade_segments:2,raw_trade_count:2,book_ticker_count:2,
+      strict_raw_trade_continuity_readback:true,full_stream_coverage_verified:true,
       agg_trade_segments:2,agg_trade_count:2,
       strict_trade_summary_readback:true,strict_lob_continuity_readback:true,
       lob_reconnect_boundaries:0,
@@ -203,7 +206,8 @@ setup_fixture() {
          lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
          stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
-         lob_min_bid_levels:1,lob_min_ask_levels:1},
+         lob_min_bid_levels:1,lob_min_ask_levels:1,raw_trade_count:1,
+         book_ticker_count:1},
         {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",
          sha256:"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
          manifest_sha256:"9999999999999999999999999999999999999999999999999999999999999999",
@@ -213,7 +217,8 @@ setup_fixture() {
          lob_declared_symbol_count:1200,lob_covered_symbol_count:1200,
          stream_coverage_verified_count:1200,all_stream_coverage_verified:true,
          lob_min_source_latency_ms:0,lob_max_source_latency_ms:0,
-         lob_min_bid_levels:1,lob_min_ask_levels:1}
+         lob_min_bid_levels:1,lob_min_ask_levels:1,raw_trade_count:1,
+         book_ticker_count:1}
       ]}')
   usdm_symbols_config=$(sed -n 's/^SYMBOLS=//p' \
     "$SCRIPT_DIR/binance-lob-archiver-production-usdm.env")
@@ -229,9 +234,21 @@ setup_fixture() {
     | .symbols_config = $symbols_config
     | .catalog_sha256 = $catalog_sha256
     | .configured_catalog_sha256 = $catalog_sha256
+    | .stream_types = ["bookTicker","depth@100ms"]
+    | .agg_trade_segments = 0
+    | .agg_trade_count = 0
+    | .raw_trade_segments = 0
+    | .raw_trade_count = 0
+    | .book_ticker_count = 2
+    | .strict_trade_summary_readback = false
+    | .strict_raw_trade_continuity_readback = false
+    | .full_stream_coverage_verified = true
+    | .force_order_count = 0
     | .oss_roundtrip_evidence |= map(
         .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
-        | .stream_coverage_verified_count = 100)' \
+        | .stream_coverage_verified_count = 100
+        | .agg_trade_count = 0 | .raw_trade_count = 0
+        | .book_ticker_count = 1 | .force_order_count = 0)' \
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \

@@ -215,6 +215,9 @@ for asset in \
 done
 candidate_production_usdm_env="$candidate_deployment/binance-lob-archiver-production-usdm.env"
 secure_regular_file "$candidate_production_usdm_env"
+[[ $(env_value "$candidate_production_usdm_env" DATASET) \
+  == usdm_perpetual_top100_lob ]] \
+  || die 'candidate USD-M production dataset is not the LOB-first identity'
 [[ $(env_value "$candidate_production_usdm_env" SYMBOLS) \
   == "${configured_symbols[usdm]}" ]] \
   || die 'USD-M shadow and production symbol lists differ'
@@ -230,7 +233,7 @@ configured_usdm_ws_shard_size=$(env_value "${env_file[usdm]}" WS_SHARD_SIZE)
 [[ ${base_spool_dir[usdm]} == /data/monday/spool/binance-lob-rust-shadow/usdm ]] \
   || die 'USD-M shadow spool path is not isolated'
 [[ ${dataset[spot]} == spot_all_rust_shadow ]] || die 'Spot shadow dataset is not isolated'
-[[ ${dataset[usdm]} == usdm_perpetual_all_rust_shadow ]] \
+[[ ${dataset[usdm]} == usdm_perpetual_top100_lob_rust_shadow ]] \
   || die 'USD-M shadow dataset is not isolated'
 min_symbols[spot]=1000
 min_symbols[usdm]=100
@@ -240,7 +243,7 @@ min_symbols[usdm]=100
 # the new families, so both schema generations remain gateable during the
 # transition.
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
-expected_stream_types[usdm]='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
+expected_stream_types[usdm]='["bookTicker","depth@100ms"]'
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
@@ -875,7 +878,17 @@ verify_oss_round_trips() {
       --arg market "$market" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
       '(.schema == "binance.market_tape.v1" or .schema == "binance.market_tape.v2")
-        and (if .schema == "binance.market_tape.v1" then
+        and (if $market == "usdm" then
+          .schema == "binance.market_tape.v2"
+          and (.stream_types | sort) == $expected_stream_types
+          and (.event_types.book_ticker | type) == "number"
+          and .event_types.book_ticker > 0
+          and ((.event_types.agg_trade // 0) == 0)
+          and ((.event_types.raw_trade // 0) == 0)
+          and ((.event_types.force_order // 0) == 0)
+          and (has("trade_summary_contract") | not)
+          and (has("trade_summaries") | not)
+        elif .schema == "binance.market_tape.v1" then
           (has("stream_types") | not)
           and (.event_types | has("raw_trade") | not)
           and (.event_types | has("book_ticker") | not)
@@ -897,9 +910,11 @@ verify_oss_round_trips() {
             (.event_types | has("force_order") | not)
           end)
         end)
-        and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
-        and (.trade_summaries | type) == "object"
-        and (.trade_summaries | length) > 0
+        and (if $market == "usdm" then true
+          else .trade_summary_contract == "binance.aggregate_trade_summary.v1"
+            and (.trade_summaries | type) == "object"
+            and (.trade_summaries | length) > 0
+        end)
         and .lob_continuity.contract == "binance.lob_continuity.v1"
         and .lob_continuity.capture_session_id == $session_id
         and (.lob_continuity.reconnect_boundary | type) == "boolean"
@@ -946,9 +961,11 @@ verify_oss_round_trips() {
           and (.max_ask_levels | type) == "number"
           and .min_ask_levels > 0
           and .max_ask_levels >= .min_ask_levels)
-        and (.event_types.agg_trade | type) == "number"
-        and .event_types.agg_trade == (.event_types.agg_trade | floor)
-        and .event_types.agg_trade > 0' \
+        and (if $market == "usdm" then true
+          else (.event_types.agg_trade | type) == "number"
+            and .event_types.agg_trade == (.event_types.agg_trade | floor)
+            and .event_types.agg_trade > 0
+        end)' \
       "$manifest" >/dev/null \
       || die "$market has an incomplete market-tape manifest after gate start: $uri"
     candidate_schema=$(jq -er '.schema' "$manifest")
@@ -968,7 +985,7 @@ verify_oss_round_trips() {
     file=$(jq -er '.file' "$manifest")
     digest=$(jq -er '.sha256' "$manifest")
     manifest_digest=$(sha256sum "$manifest" | awk '{print $1}')
-    manifest_agg_trade_count=$(jq -er '.event_types.agg_trade' "$manifest")
+    manifest_agg_trade_count=$(jq -er '.event_types.agg_trade // 0' "$manifest")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$start_ns" "$end_ns" "$uri" "$file" "$digest" "$manifest_digest" "$manifest" \
       "$manifest_agg_trade_count" \
@@ -1124,10 +1141,14 @@ verify_oss_round_trips() {
             .invalid = (.invalid or (($row | valid_session_start) | not))
           else . end)
       | if .invalid then error("malformed market-tape row")
-        elif .agg_trade == 0 then error("missing agg_trade")
-        elif $schema == "binance.market_tape.v2" and (.raw_trade == 0 or .book_ticker == 0)
+        elif $market == "usdm"
+          and (.book_ticker == 0 or .agg_trade > 0 or .raw_trade > 0 or .force_order > 0)
+          then error("USD-M LOB stream family contract")
+        elif $market == "spot" and .agg_trade == 0 then error("missing agg_trade")
+        elif $market == "spot" and $schema == "binance.market_tape.v2"
+          and (.raw_trade == 0 or .book_ticker == 0)
           then error("missing v2 stream family")
-        elif $schema == "binance.market_tape.v1"
+        elif $market == "spot" and $schema == "binance.market_tape.v1"
           and (.raw_trade > 0 or .book_ticker > 0 or .force_order > 0)
           then error("v1 tape carries v2 stream families")
         else {agg_trade,raw_trade,book_ticker,force_order} end') \
@@ -1194,9 +1215,11 @@ verify_oss_round_trips() {
   done < <(sort -n -k1,1 "$candidates")
 
   verify_adjacent_segments "${strict_verifier_segments[@]}"
-  verify_aggregate_trade_continuity "${strict_verifier_segments[@]}"
-  if [[ $tape_schema == binance.market_tape.v2 ]]; then
-    verify_raw_trade_continuity "${strict_verifier_segments[@]}"
+  if [[ $market == spot ]]; then
+    verify_aggregate_trade_continuity "${strict_verifier_segments[@]}"
+    if [[ $tape_schema == binance.market_tape.v2 ]]; then
+      verify_raw_trade_continuity "${strict_verifier_segments[@]}"
+    fi
   fi
 
   jq -e --arg session_id "${observed_session[$market]}" '
@@ -1261,7 +1284,7 @@ for market in "${markets[@]}"; do
       cpu_usage_ns:$cpu_usage_ns,cpu_quota_per_sec_us:$cpu_quota_per_sec_us,
       memory_peak_bytes:$memory_peak_bytes,memory_max_bytes:$memory_max_bytes,
       health_sha256:$health_sha256,
-      strict_trade_summary_readback:true,
+      strict_trade_summary_readback:($market == "spot"),
       strict_lob_continuity_readback:true,
       lob_reconnect_boundaries:([$oss_round_trips[].lob_reconnect_boundary] | map(select(.)) | length),
       min_lob_source_latency_ms:([$oss_round_trips[].lob_min_source_latency_ms] | min),
@@ -1270,7 +1293,7 @@ for market in "${markets[@]}"; do
       min_lob_ask_levels:([$oss_round_trips[].lob_min_ask_levels] | min),
       max_segment_gap_ns:([$oss_round_trips[].gap_from_previous_ns] | max),
       oss_roundtrips:($oss_round_trips | length),
-      agg_trade_segments:($oss_round_trips | length),
+      agg_trade_segments:(if $market == "spot" then ($oss_round_trips | length) else 0 end),
       agg_trade_count:([$oss_round_trips[].agg_trade_count] | add),
       oss_roundtrip_evidence:$oss_round_trips}')
   if [[ $tape_schema == binance.market_tape.v2 ]]; then
@@ -1284,7 +1307,7 @@ for market in "${markets[@]}"; do
           | select(. > 0)] | length),
         raw_trade_count:([$value.oss_roundtrip_evidence[].raw_trade_count] | add),
         book_ticker_count:([$value.oss_roundtrip_evidence[].book_ticker_count] | add),
-        strict_raw_trade_continuity_readback:true}
+        strict_raw_trade_continuity_readback:($market == "spot")}
         + (if $market == "usdm" then
           {force_order_count:([$value.oss_roundtrip_evidence[].force_order_count] | add)}
         else {} end)')

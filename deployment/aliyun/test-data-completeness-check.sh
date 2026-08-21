@@ -42,7 +42,7 @@ BUCKET=monday-lob-apne1-1045353359
 FAKE_SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 P_SPOT='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
-P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all'
+P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all'
 P_BYBIT='lake/raw/venue=bybit/market=option/dataset=options_quotes'
 P_POLY='lake/raw/venue=polymarket/dataset=crypto_expiry'
 P_REF='lake/raw/venue=binance_usdm/dataset=reference'
