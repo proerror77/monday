@@ -744,6 +744,7 @@ set_supervisor_state baseline-active inactive
 # A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
 {
+  sed -n '/^utc_epoch() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$GATE"
@@ -5874,6 +5875,7 @@ grep -Fq 'oss_download_with_retry() {' "$GATE" || {
 )
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
+  -e '/^utc_epoch() {$/,/^}$/p' \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
   -e '/^readonly LEGACY_START_HEALTH_MAX_AGE_SECONDS=/p' \
   -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \

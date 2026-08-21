@@ -103,6 +103,18 @@ secure_control_file() {
 valid_candidate() { [[ $1 =~ ^[a-f0-9]{64}$ ]]; }
 valid_source() { [[ $1 =~ ^[a-f0-9]{40,64}$ ]]; }
 valid_invocation() { [[ $1 =~ ^[a-f0-9]{32}$ ]]; }
+utc_epoch() {
+  local timestamp=$1
+  date -u -d "$timestamp" +%s 2>/dev/null && return 0
+  jq -ner --arg timestamp "$timestamp" '
+    $timestamp
+    | sub("\\.[0-9]+Z$"; "Z")
+    | sub("\\.[0-9]+[+]00:00$"; "+00:00")
+    | sub("\\.[0-9]+-00:00$"; "-00:00")
+    | sub("[+-]00:00$"; "Z")
+    | fromdateiso8601
+  '
+}
 unit_for() { printf '%s@%s.service\n' "$UNIT_PREFIX" "$1"; }
 runtime_request_for() { printf '%s/%s.request.json\n' "$RUN_ROOT" "$1"; }
 invocation_dir_for() { printf '%s/%s/%s\n' "$RECEIPT_ROOT" "$1" "$2"; }
@@ -675,7 +687,7 @@ recovery_probe() {
     and .candidate_once.health_updated_at == .observed_at
   ' <<<"$probe_json" >/dev/null || die 'recovery probe does not prove the bounded Gamma health probe'
   observed=$(jq -er .observed_at <<<"$probe_json")
-  observed=$(date -u -d "$observed" +%s) || die 'recovery probe timestamp is invalid'
+  observed=$(utc_epoch "$observed") || die 'recovery probe timestamp is invalid'
   now=$(date -u +%s)
   age=$((now - observed))
   ((age >= 0 && age <= RECOVERY_PROBE_MAX_AGE_SECONDS)) \
