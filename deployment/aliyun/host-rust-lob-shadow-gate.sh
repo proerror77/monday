@@ -717,7 +717,55 @@ validate_observation_sample() {
   health_samples[$market]=$((health_samples[$market] + sample_increment))
 }
 
+validate_running_sample() {
+  local market memory_now
+  assert_candidate
+  for market in "${markets[@]}"; do
+    systemctl is-active --quiet "${unit[$market]}" \
+      || die "$market shadow service stopped before observation completed"
+    [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
+      || die "$market shadow service restarted before observation completed"
+    memory_now=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
+      "$market MemoryCurrent")
+    ((memory_now > max_memory_bytes[$market])) && max_memory_bytes[$market]=$memory_now
+    ((memory_now <= memory_max_bytes[$market])) \
+      || die "$market memory usage exceeded MemoryMax"
+    validate_observation_sample "$market"
+  done
+}
+
+active_segment_start_ns() {
+  local directory=$1
+  find "$directory" -type f -name 'part-*.jsonl.part' -print \
+    | sed -n 's#^.*/part-\([1-9][0-9]*\)\.jsonl\.part$#\1#p' \
+    | sort -n \
+    | sed -n '$p'
+}
+
+declare -A pre_observation_segment current_segment
+for market in "${markets[@]}"; do
+  pre_observation_segment[$market]=$(active_segment_start_ns "${spool_dir[$market]}")
+  [[ ${pre_observation_segment[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
+    || die "$market has no valid active segment before observation"
+done
+alignment_deadline=$(( $(monotonic_seconds) + GATE_SEGMENT_SECONDS + MAX_HEALTH_SILENCE_SECONDS ))
+while :; do
+  validate_running_sample
+  segments_rotated=true
+  for market in "${markets[@]}"; do
+    current_segment[$market]=$(active_segment_start_ns "${spool_dir[$market]}")
+    [[ ${current_segment[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
+      || die "$market lost its active segment before observation"
+    ((current_segment[$market] > pre_observation_segment[$market])) \
+      || segments_rotated=false
+  done
+  [[ $segments_rotated == true ]] && break
+  (( $(monotonic_seconds) < alignment_deadline )) \
+    || die 'shadow segments did not rotate after health settled'
+  sleep 10
+done
 observation_started_ns=$(date +%s%N)
+
 observation_started_mono=$(monotonic_seconds)
 observation_deadline=$((observation_started_mono + gate_seconds))
 while (( $(monotonic_seconds) < observation_deadline )); do
@@ -726,18 +774,7 @@ while (( $(monotonic_seconds) < observation_deadline )); do
   interval=30
   ((remaining < interval)) && interval=$remaining
   ((interval > 0)) && sleep "$interval"
-  assert_candidate
-  for market in "${markets[@]}"; do
-    systemctl is-active --quiet "${unit[$market]}" || die "$market shadow service stopped during observation"
-    [[ $(systemctl_value "$market" NRestarts) == 0 ]] \
-      || die "$market shadow service restarted during observation"
-    memory_now=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
-      "$market MemoryCurrent")
-    ((memory_now > max_memory_bytes[$market])) && max_memory_bytes[$market]=$memory_now
-    ((memory_now <= memory_max_bytes[$market])) \
-      || die "$market memory usage exceeded MemoryMax"
-    validate_observation_sample "$market"
-  done
+  validate_running_sample
 done
 
 if [[ $test_only != true ]]; then
@@ -882,7 +919,7 @@ verify_oss_round_trips() {
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
-    ((start_ns < observation_started_ns)) && continue
+    ((end_ns <= observation_started_ns)) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
       --arg market "$market" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
@@ -1346,6 +1383,7 @@ jq -n \
   --arg run_spool "$run_spool_path" \
   --arg started_at "$gate_started_at" \
   --arg finished_at "$gate_finished_at" \
+  --argjson observation_started_ns "$observation_started_ns" \
   --argjson required_duration_seconds "$REQUIRED_DURATION_SECONDS" \
   --argjson requested_duration_seconds "$gate_seconds" \
   --argjson health_settle_seconds "$health_settle_seconds" \
@@ -1361,6 +1399,7 @@ jq -n \
     deployment_source_revision:$deployment_source_revision,
     run_id:$run_id,run_spool:$run_spool,
     started_at:$started_at,finished_at:$finished_at,
+    observation_started_ns:$observation_started_ns,
     required_duration_seconds:$required_duration_seconds,
     requested_duration_seconds:$requested_duration_seconds,
     health_settle_seconds:$health_settle_seconds,

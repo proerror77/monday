@@ -226,9 +226,18 @@ grep -Fq 'or (.diff_count == 0' "$GATE"
 grep -Fq 'and .first_update_id == null' "$GATE"
 grep -Fq 'and .last_update_id == null' "$GATE"
 grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
-grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
+grep -Fq '((end_ns <= observation_started_ns)) && continue' "$GATE"
+grep -Fq 'shadow segments did not rotate after health settled' "$GATE"
+[[ $(grep -Fc 'end_received_at_ns > $gate.observation_started_ns' "$POLICY") -eq 2 ]] || {
+  printf 'gate policy does not bind both market tapes across observation start\n' >&2
+  exit 1
+}
 if grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"; then
   printf 'manifest discovery still admits health-settle warmup segments\n' >&2
+  exit 1
+fi
+if grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"; then
+  printf 'manifest discovery still drops the segment overlapping observation start\n' >&2
   exit 1
 fi
 grep -Fq 'gate_started_ns=$(date +%s%N)' "$GATE"
@@ -246,16 +255,6 @@ if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GA
   printf 'shadow memory contract still depends on a persistent USD-M drop-in\n' >&2
   exit 1
 fi
-
-gate_started_ns=1000000900
-observation_started_ns=1000001000
-warmup_segment_start_ns=1000000950
-observed_segment_start_ns=1000001050
-((warmup_segment_start_ns >= gate_started_ns \
-  && warmup_segment_start_ns < observation_started_ns)) || {
-  printf 'observation cutoff fixture does not model a health-settle warmup segment\n' >&2
-  exit 1
-}
 
 required_duration_seconds=$(sed -n 's/^readonly REQUIRED_DURATION_SECONDS=//p' "$GATE")
 [[ $required_duration_seconds =~ ^[1-9][0-9]*$ ]] || {
@@ -297,13 +296,21 @@ production_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
 }
 grep -Fq 'Spot shadow SNAPSHOT_PRODUCERS must be 16' "$GATE"
 grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
-((observed_segment_start_ns >= observation_started_ns)) || {
-  printf 'nanosecond observation cutoff rejected an observed segment\n' >&2
-  exit 1
-}
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+active_segment_body=$(sed -n '/^active_segment_start_ns()/,/^}/p' "$GATE")
+eval "$active_segment_body"
+active_segment_fixture="$tmp_dir/active-segment"
+mkdir -p "$active_segment_fixture"
+touch "$active_segment_fixture/part-100.jsonl.part" \
+  "$active_segment_fixture/part-200.jsonl.part"
+ln -s part-200.jsonl.part "$active_segment_fixture/part-300.jsonl.part"
+[[ $(active_segment_start_ns "$active_segment_fixture") == 200 ]] || {
+  printf 'active segment discovery did not select the newest direct part\n' >&2
+  exit 1
+}
 
 strict_verifier_body="$tmp_dir/strict-verifier.sh"
 sed -n '/^stop_strict_verifier()/,/^}/p;/^run_strict_verifier()/,/^}/p;/^run_strict_verifier_pair()/,/^}/p;/^verify_adjacent_segments()/,/^}/p;/^verify_aggregate_trade_continuity()/,/^}/p;/^verify_raw_trade_continuity()/,/^}/p' \
@@ -596,6 +603,7 @@ jq -n \
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
     health_settle_seconds:240,segment_seconds:120,test_only:false,
+    observation_started_ns:150,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate.json"
@@ -605,6 +613,37 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq 'del(.observation_started_ns)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-observation-boundary.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/missing-observation-boundary.json" >/dev/null; then
+  printf 'gate policy accepted evidence without an observation boundary\n' >&2
+  exit 1
+fi
+jq '.observation_started_ns = 99' \
+  "$tmp_dir/gate.json" >"$tmp_dir/late-evidence-start.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/late-evidence-start.json" >/dev/null; then
+  printf 'gate policy accepted evidence that starts after observation\n' >&2
+  exit 1
+fi
+jq '.observation_started_ns = 200' \
+  "$tmp_dir/gate.json" >"$tmp_dir/early-evidence-end.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/early-evidence-end.json" >/dev/null; then
+  printf 'gate policy accepted evidence ending before observation\n' >&2
+  exit 1
+fi
 
 jq '.markets.usdm.stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]' \
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-legacy-stream-contract.json"
@@ -716,6 +755,7 @@ jq -n \
     run_id:$run_id,run_spool:$run_spool,
     required_duration_seconds:240,requested_duration_seconds:240,
     health_settle_seconds:240,segment_seconds:120,test_only:false,
+    observation_started_ns:150,
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate-v1.json"
