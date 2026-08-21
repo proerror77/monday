@@ -6,18 +6,6 @@ export LC_ALL=C
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 readonly SCRIPT_DIR
-utc_epoch() {
-  local timestamp=$1
-  date -u -d "$timestamp" +%s 2>/dev/null && return 0
-  jq -ner --arg timestamp "$timestamp" '
-    $timestamp
-    | sub("\\.[0-9]+Z$"; "Z")
-    | sub("\\.[0-9]+[+]00:00$"; "+00:00")
-    | sub("\\.[0-9]+-00:00$"; "-00:00")
-    | sub("[+-]00:00$"; "Z")
-    | fromdateiso8601
-  '
-}
 readonly POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
@@ -884,8 +872,8 @@ verify_legacy_health() {
   jq -e -f "$health_policy" "$HEALTH" >/dev/null || return 1
   updated_at=$(jq -er '.updated_at' "$HEALTH") || return 1
   last_success_at=$(jq -er '.last_success_at' "$HEALTH") || return 1
-  updated_epoch=$(utc_epoch "$updated_at") || return 1
-  success_epoch=$(utc_epoch "$last_success_at") || return 1
+  updated_epoch=$(date -u -d "$updated_at" +%s) || return 1
+  success_epoch=$(date -u -d "$last_success_at" +%s) || return 1
   now_epoch=$(date -u +%s)
   ((updated_epoch >= started_epoch && updated_epoch <= now_epoch)) || return 1
   ((success_epoch >= started_epoch && success_epoch <= now_epoch)) || return 1
@@ -950,8 +938,8 @@ verify_rust_health_file() {
   jq -e -f "$health_policy" "$health_file" >/dev/null || return 1
   updated_at=$(jq -er '.updated_at' "$health_file") || return 1
   last_success_at=$(jq -er '.last_success_at' "$health_file") || return 1
-  updated_epoch=$(utc_epoch "$updated_at") || return 1
-  success_epoch=$(utc_epoch "$last_success_at") || return 1
+  updated_epoch=$(date -u -d "$updated_at" +%s) || return 1
+  success_epoch=$(date -u -d "$last_success_at" +%s) || return 1
   now_epoch=$(date -u +%s)
   ((updated_epoch >= started_epoch && updated_epoch <= now_epoch)) || return 1
   ((success_epoch >= started_epoch && success_epoch <= now_epoch)) || return 1
@@ -1698,7 +1686,7 @@ gate_oss_config_sha=$(jq -er '.oss_config_sha256 | select(type == "string")' "$g
   || die 'OSS configuration changed after the shadow gate'
 gate_completed_at=$(jq -er '.completed_at | select(type == "string")' "$gate_json") \
   || die 'shadow gate completion timestamp is missing'
-gate_completed_epoch=$(utc_epoch "$gate_completed_at") \
+gate_completed_epoch=$(date -u -d "$gate_completed_at" +%s) \
   || die 'shadow gate completion timestamp is invalid'
 now_epoch=$(date -u +%s)
 gate_age=$((now_epoch - gate_completed_epoch))

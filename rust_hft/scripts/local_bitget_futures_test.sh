@@ -33,11 +33,11 @@ DURATION="${DURATION:-90}"   # seconds
 
 echo "[info] Building collector (release, host target)..." | tee -a "$LOG_FILE"
 HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
-cargo build --release --locked --target "$HOST_TRIPLE" \
-  -p hft-collector --bin hft-collector | tee -a "$LOG_FILE"
+(cd apps/collector && cargo clean && cargo build --release --target "$HOST_TRIPLE") | tee -a "$LOG_FILE"
 
 BIN=""
 for cand in \
+  "apps/collector/target/$HOST_TRIPLE/release/hft-collector" \
   "target/$HOST_TRIPLE/release/hft-collector" \
   "target/release/hft-collector"; do
   if [[ -x "$cand" ]]; then BIN="$cand"; break; fi

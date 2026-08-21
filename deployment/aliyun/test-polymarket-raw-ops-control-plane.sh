@@ -744,7 +744,6 @@ set_supervisor_state baseline-active inactive
 # A fresh probe admits once; its binding remains valid through the 3600-second Gate.
 recovery_binding_contract="$supervisor_tmp/recovery-binding-contract.sh"
 {
-  sed -n '/^utc_epoch() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_recovery_binding() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_recovery_admission() {$/,/^}$/p' "$GATE"
   sed -n '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$GATE"
@@ -4092,12 +4091,10 @@ done
 # production uploader's post-upload deletion cannot truncate the verifier's
 # baseline view, re-sweeps union tapes rotated after the first sweep without
 # ever pinning an inode twice, and fails closed on malformed rotated names.
-(
+if date -u -d @0 +%s >/dev/null 2>&1; then
+  (
     snapshot_fn_contract="$tmp_dir/snapshot-legacy-tapes.sh"
-    {
-      sed -n '/^utc_epoch() {$/,/^}$/p' "$GATE"
-      sed -n '/^snapshot_legacy_tapes()/,/^}/p' "$GATE"
-    } >"$snapshot_fn_contract"
+    sed -n '/^snapshot_legacy_tapes()/,/^}/p' "$GATE" >"$snapshot_fn_contract"
     snapshot_legacy_spool="$tmp_dir/snapshot-legacy-spool"
     tape_snapshot_dir="$tmp_dir/legacy-tape-snapshot"
     mkdir "$snapshot_legacy_spool" "$tape_snapshot_dir"
@@ -4197,7 +4194,8 @@ done
       printf 'snapshot_legacy_tapes ignored a source deleted mid-link\n' >&2
       exit 1
     }
-)
+  )
+fi
 
 trade_mode_contract="$tmp_dir/trade-mode-contract.sh"
 sed -n '/^trade_parity_reason=/,/^fi$/p' "$GATE" >"$trade_mode_contract"
@@ -5876,7 +5874,6 @@ grep -Fq 'oss_download_with_retry() {' "$GATE" || {
 )
 legacy_health_observer="$tmp_dir/legacy-health-observer.sh"
 sed -n \
-  -e '/^utc_epoch() {$/,/^}$/p' \
   -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' \
   -e '/^readonly LEGACY_START_HEALTH_MAX_AGE_SECONDS=/p' \
   -e '/^legacy_health_publication_after_gate() {$/,/^}$/p' \

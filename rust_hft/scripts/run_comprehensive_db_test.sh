@@ -95,6 +95,9 @@ check_system_resources() {
 build_release() {
     log_step "编译 Release 优化版本..."
     
+    # 清理之前的构建
+    cargo clean
+    
     # 编译 Release 版本
     log_info "正在编译高性能版本（启用所有优化）..."
     RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2,+fma" \

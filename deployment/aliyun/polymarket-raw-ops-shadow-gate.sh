@@ -78,18 +78,6 @@ readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 readonly SCRIPT_DIR
 readonly RELEASE_MANIFEST="$SCRIPT_DIR/polymarket-raw-ops-release.json"
-utc_epoch() {
-  local timestamp=$1
-  date -u -d "$timestamp" +%s 2>/dev/null && return 0
-  jq -ner --arg timestamp "$timestamp" '
-    $timestamp
-    | sub("\\.[0-9]+Z$"; "Z")
-    | sub("\\.[0-9]+[+]00:00$"; "+00:00")
-    | sub("\\.[0-9]+-00:00$"; "-00:00")
-    | sub("[+-]00:00$"; "Z")
-    | fromdateiso8601
-  '
-}
 readonly SERVICE_TEMPLATE="$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
 readonly GATE_POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
@@ -730,7 +718,7 @@ verify_recovery_admission() {
   local recovery=$1 candidate=$2 source=$3 observed now age
   verify_recovery_binding "$recovery" "$candidate" "$source" || return 1
   observed=$(jq -er '.candidate_probe.observed_at' <<<"$recovery") || return 1
-  observed=$(utc_epoch "$observed") || return 1
+  observed=$(date -u -d "$observed" +%s) || return 1
   now=$(date -u +%s) || return 1
   age=$((now - observed))
   ((age >= 0 && age <= 900))
@@ -810,7 +798,7 @@ fresh_baseline_health_snapshot() {
   for field in updated_at last_success_at; do
     timestamp=$(jq -er --arg field "$field" \
       '.[$field] | select(type == "string" and length > 0)' <<<"$snapshot") || return 1
-    epoch=$(utc_epoch "$timestamp") || return 1
+    epoch=$(date -u -d "$timestamp" +%s) || return 1
     ((epoch <= now && now - epoch <= MAX_HEALTH_SILENCE_SECONDS)) || return 1
   done
   printf '%s\n' "$snapshot"
@@ -883,7 +871,7 @@ fresh_legacy_health_observation() {
     timestamp=$(jq -er --arg field "$field" \
       '.[$field] | select(type == "string" and length > 0)' <<<"$snapshot") \
       || return 1
-    epoch=$(utc_epoch "$timestamp") || return 1
+    epoch=$(date -u -d "$timestamp" +%s) || return 1
     ((epoch <= now)) || return 1
   done
   jq -cn --argjson health "$snapshot" \
@@ -1584,9 +1572,9 @@ snapshot_legacy_tapes() {
         || die "invalid rotated baseline tape name: $name"
       [[ -z $suffix || $suffix =~ ^\.[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
         || die "invalid rotated baseline tape name: $name"
-      rotated_at=$(utc_epoch \
-        "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z") \
-        || die "could not parse baseline tape rotation time: $name"
+      rotated_at=$(date -u -d \
+        "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" \
+        +%s) || die "could not parse baseline tape rotation time: $name"
       ((rotated_at >= window_start_unix - LEGACY_TAPE_WINDOW_LOOKBACK_SECONDS)) \
         || continue
     fi
@@ -2043,8 +2031,8 @@ if [[ $baseline_mode == legacy_python \
   baseline_health_start_success_at=$(jq -er '.last_success_at' \
     <<<"$baseline_health_snapshot") \
     || die 'admitted legacy collector health has no last_success_at'
-  baseline_health_start_success_unix=$(utc_epoch \
-    "$baseline_health_start_success_at") \
+  baseline_health_start_success_unix=$(date -u -d \
+    "$baseline_health_start_success_at" +%s) \
     || die 'admitted legacy collector last_success_at is invalid'
   ((baseline_health_start_success_unix <= baseline_health_start_written_at_unix)) \
     || die 'admitted legacy collector success is after its completed write'
@@ -2180,7 +2168,7 @@ while :; do
       legacy_success_at=$(jq -er '.last_success_at' \
         <<<"$baseline_health_completion_snapshot") \
         || die 'post-start legacy collector health has no last_success_at'
-      baseline_health_cutoff_unix=$(utc_epoch "$legacy_success_at") \
+      baseline_health_cutoff_unix=$(date -u -d "$legacy_success_at" +%s) \
         || die 'post-start legacy collector last_success_at is invalid'
       ((baseline_health_cutoff_unix > baseline_health_start_success_unix)) \
         || die 'post-start legacy collector last_success_at did not advance'
@@ -2240,7 +2228,7 @@ while :; do
 
     rust_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
       "$health") || die 'Rust health has no last_success_at'
-    rust_success_epoch=$(utc_epoch "$rust_success_at") \
+    rust_success_epoch=$(date -u -d "$rust_success_at" +%s) \
       || die 'Rust last_success_at is invalid'
     now_epoch=$(date -u +%s)
     ((rust_success_epoch <= now_epoch && now_epoch - rust_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
@@ -2251,7 +2239,7 @@ while :; do
         legacy_success_at=$(jq -er \
           '.last_success_at | select(type == "string" and length > 0)' \
           "$legacy_health") || die "$baseline_label health has no last_success_at"
-        legacy_success_epoch=$(utc_epoch "$legacy_success_at") \
+        legacy_success_epoch=$(date -u -d "$legacy_success_at" +%s) \
           || die "$baseline_label last_success_at is invalid"
         ((legacy_success_epoch <= now_epoch \
           && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
