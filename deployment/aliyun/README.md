@@ -1020,6 +1020,14 @@ monotonic time to observe at least 240 seconds. It never drains or recovers an
 older Shadow run. Any incomplete files left by a failed run remain confined to
 that run's spool and cannot block the next Gate; files already uploaded and
 cleaned retain their OSS triplet evidence instead of a duplicate local copy.
+The Shadow unit uses a 1792MiB high watermark and 2048MiB hard limit per market.
+Five immutable passed Tokyo gates measured Spot at no more than 664,735,744 bytes
+and the former 570-symbol USD-M scope at no more than 1,789,218,816 bytes; the
+current USD-M Gate covers only the frozen Top 100. Strict readback is separately
+capped at 2560MiB/3072MiB and carries the same non-production OOM preference as
+the Shadow collectors. The largest Gate phase is therefore 4GiB, plus the
+existing 1GiB host reserve. An over-limit candidate fails the Gate instead of
+increasing the host size or weakening the reserve.
 The Gate fails unless all of these are true for the entire candidate run:
 
 - both units stay active with `NRestarts=0`;

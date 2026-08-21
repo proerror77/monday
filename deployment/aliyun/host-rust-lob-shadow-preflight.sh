@@ -195,7 +195,8 @@ run_strict_verifier() {
     --uid="$SERVICE_USER" --gid="$SERVICE_USER" \
     --property=KillMode=control-group \
     --property=TimeoutStartSec=300 --property=TimeoutStopSec=30 \
-    --property=MemoryHigh=5000M --property=MemoryMax=6400M \
+    --property=OOMScoreAdjust=500 \
+    --property=MemoryHigh=2560M --property=MemoryMax=3072M \
     -- "$candidate_binary" "$@"; then
     status=0
   else
