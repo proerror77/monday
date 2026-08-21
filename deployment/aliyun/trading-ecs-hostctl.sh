@@ -14,6 +14,7 @@ readonly ACR_AUTH_ROOT_DEFAULT=/run/monday/acr-auth
 readonly RELEASE_ROOT_DEFAULT=/opt/monday/releases/hft-trading
 readonly CONTROL_ROOT_DEFAULT=/opt/monday/control/hft-trading
 readonly EVIDENCE_ROOT_DEFAULT=/var/lib/monday/evidence/hft-trading
+readonly STATE_ROOT_DEFAULT=/var/lib/monday/hft-trading
 readonly CURRENT_FILE_DEFAULT=/etc/monday/hft-trading-current.env
 readonly RUNTIME_PROGRAM_DEFAULT=/usr/local/libexec/monday-hft-trading-runtime
 readonly HOSTCTL_PROGRAM_DEFAULT=/usr/local/sbin/monday-hft-trading-hostctl
@@ -34,6 +35,10 @@ require_root() {
 
 stat_uid() {
   if [[ $(uname -s) == Darwin ]]; then stat -f %u -- "$1"; else stat -c %u -- "$1"; fi
+}
+
+stat_gid() {
+  if [[ $(uname -s) == Darwin ]]; then stat -f %g -- "$1"; else stat -c %g -- "$1"; fi
 }
 
 stat_mode() {
@@ -893,6 +898,182 @@ verify_rollback_lineage() {
   ROLLBACK_EXPECTED_IDENTITY=$invocation'|'$main_pid'|'$nrestarts'|'$container_id'|'$health_endpoint'|'$grpc_endpoint
 }
 
+readback_cutover() {
+  local evidence_dir=$1 current_file=${CURRENT_FILE:-$CURRENT_FILE_DEFAULT}
+  local runtime_program=${RUNTIME_PROGRAM:-$RUNTIME_PROGRAM_DEFAULT}
+  local state_root=${STATE_ROOT:-$STATE_ROOT_DEFAULT}
+  local cutover_file=$evidence_dir/cutover.json activation_dir state_dir
+  local envelope_file nonce_file audit_file feedback_file feedback_line
+  local runtime_uid runtime_gid activation_sha source_revision release_manifest_sha
+  local deployment_id asset_revision_id promotion_id bundle_id bundle_hash
+  local risk_policy_hash nonce account_id venue mode feedback_content_hash
+  local cutover_sha envelope_sha policy_sha nonce_sha readback_at
+  require_root
+  [[ $evidence_dir == /* && -d $evidence_dir && ! -L $evidence_dir ]] \
+    || die 'cutover evidence directory must be absolute'
+  [[ $(canonical_directory "$evidence_dir") == "$evidence_dir" ]] \
+    || die 'cutover evidence directory must be canonical'
+  secure_directory "$evidence_dir" || die 'cutover evidence directory is unsafe'
+  verify_single_checksum_marker "$evidence_dir" PASSED.sha256 cutover.json \
+    || die 'canonical cutover success marker is invalid'
+  [[ ! -e $evidence_dir/PASSED.rollback-pending.sha256 \
+    && ! -e $evidence_dir/PASSED.rolled-back.sha256 ]] \
+    || die 'cutover success has been revoked by rollback'
+  verify_rollback_lineage "$evidence_dir" "$current_file" \
+    || die 'cutover evidence is stale, legacy, or has invalid pointer lineage'
+  runtime_identity_matches "$ROLLBACK_IMAGE" "$ROLLBACK_EXPECTED_IDENTITY" \
+    || die 'active runtime does not match this cutover evidence'
+  HFT_CURRENT_FILE="$current_file" "$runtime_program" preflight \
+    || die 'current runtime no longer passes the reviewed production preflight'
+
+  secure_regular_file "$current_file" 0600 || die 'current pointer is unsafe'
+  unset HFT_TRADING_IMAGE HFT_RELEASE_MANIFEST_SHA256 HFT_ACTIVATION_DIR \
+    HFT_ACTIVATION_SHA256 HFT_SOURCE_REVISION
+  # The file is root-owned, content-addressed by cutover evidence, and generated
+  # by write_current_file with identifier-only assignments.
+  # shellcheck disable=SC1090
+  source "$current_file"
+  : "${HFT_TRADING_IMAGE:?missing HFT_TRADING_IMAGE}"
+  : "${HFT_RELEASE_MANIFEST_SHA256:?missing HFT_RELEASE_MANIFEST_SHA256}"
+  : "${HFT_ACTIVATION_DIR:?missing HFT_ACTIVATION_DIR}"
+  : "${HFT_ACTIVATION_SHA256:?missing HFT_ACTIVATION_SHA256}"
+  : "${HFT_SOURCE_REVISION:?missing HFT_SOURCE_REVISION}"
+  activation_sha=$(jq -er '.activation_manifest_sha256' "$cutover_file") \
+    || die 'cutover has no activation identity'
+  source_revision=$(jq -er '.source_revision' "$cutover_file") \
+    || die 'cutover has no source identity'
+  release_manifest_sha=$(jq -er '.release_manifest_sha256' "$cutover_file") \
+    || die 'cutover has no release identity'
+  [[ $HFT_TRADING_IMAGE == "$ROLLBACK_IMAGE" \
+    && $HFT_ACTIVATION_SHA256 == "$activation_sha" \
+    && $HFT_SOURCE_REVISION == "$source_revision" \
+    && $HFT_RELEASE_MANIFEST_SHA256 == "$release_manifest_sha" ]] \
+    || die 'current pointer does not match cutover identities'
+
+  activation_dir=$HFT_ACTIVATION_DIR
+  [[ $(canonical_directory "$activation_dir") == "$activation_dir" ]] \
+    || die 'activation directory is not canonical'
+  envelope_file=$activation_dir/deployment/envelope.json
+  jq -e -s '
+    length == 1 and (.[0] |
+      (.envelope | type == "object") and
+      (.envelope.deployment_id | type == "string" and length > 0) and
+      (.envelope.asset_revision_id | type == "string" and length > 0) and
+      (.envelope.promotion_id | type == "string" and length > 0) and
+      (.envelope.bundle_id | type == "string" and length > 0) and
+      (.envelope.bundle_hash | test("^[0-9a-f]{64}$")) and
+      (.envelope.risk_policy_hash | test("^[0-9a-f]{64}$")) and
+      (.envelope.nonce | type == "string" and length > 0) and
+      (.envelope.account_id | type == "string" and length > 0) and
+      (.envelope.venue | type == "string" and length > 0) and
+      (.envelope.allowed_intent_types | type == "array") and
+      (([.envelope.allowed_intent_types[] |
+        select(. == "StartPaper" or . == "StartShadow")] | length) == 1) and
+      (.key_id | type == "string" and length > 0) and
+      (.signature_hex | test("^[0-9a-f]{128}$"))
+    )
+  ' "$envelope_file" >/dev/null || die 'deployment envelope identity is invalid'
+  deployment_id=$(jq -er '.envelope.deployment_id' "$envelope_file")
+  asset_revision_id=$(jq -er '.envelope.asset_revision_id' "$envelope_file")
+  promotion_id=$(jq -er '.envelope.promotion_id' "$envelope_file")
+  bundle_id=$(jq -er '.envelope.bundle_id' "$envelope_file")
+  bundle_hash=$(jq -er '.envelope.bundle_hash' "$envelope_file")
+  risk_policy_hash=$(jq -er '.envelope.risk_policy_hash' "$envelope_file")
+  nonce=$(jq -er '.envelope.nonce' "$envelope_file")
+  account_id=$(jq -er '.envelope.account_id' "$envelope_file")
+  venue=$(jq -er '.envelope.venue' "$envelope_file")
+  mode=$(jq -er 'if (.envelope.allowed_intent_types | index("StartPaper"))
+    then "Paper" else "Shadow" end' "$envelope_file")
+
+  runtime_uid=${EXPECTED_RUNTIME_UID:-$(id -u "$HFT_RUNTIME_USER_DEFAULT")}
+  runtime_gid=${EXPECTED_RUNTIME_GID:-$(id -g "$HFT_RUNTIME_USER_DEFAULT")}
+  [[ $runtime_uid =~ ^[0-9]+$ && $runtime_gid =~ ^[0-9]+$ ]] \
+    || die 'runtime account identity is invalid'
+  [[ $(canonical_directory "$state_root") == "$state_root" ]] \
+    || die 'runtime state root is not canonical'
+  secure_directory "$state_root" || die 'runtime state root is unsafe'
+  state_dir=$state_root/$activation_sha
+  [[ -d $state_dir && ! -L $state_dir \
+    && $(stat_uid "$state_dir") == "$runtime_uid" \
+    && $(stat_gid "$state_dir") == "$runtime_gid" \
+    && $(stat_mode "$state_dir") == 700 ]] \
+    || die 'runtime activation state directory is unsafe'
+  nonce_file=$state_dir/nonces.jsonl
+  audit_file=$state_dir/audit.jsonl
+  feedback_file=$state_dir/feedback.jsonl
+  for state_file in "$nonce_file" "$audit_file" "$feedback_file"; do
+    [[ -f $state_file && ! -L $state_file \
+      && $(stat_uid "$state_file") == "$runtime_uid" \
+      && $(stat_gid "$state_file") == "$runtime_gid" ]] \
+      || die 'runtime governance state file is unsafe'
+  done
+  jq -e -s --arg nonce "$nonce" --arg deployment "$deployment_id" '
+    length == 1 and .[0].nonce == $nonce and
+    .[0].deployment_id == $deployment and
+    (.[0].accepted_at | type == "string" and length > 0)
+  ' "$nonce_file" >/dev/null || die 'runtime nonce consumption does not match the envelope'
+  jq -e -s --arg deployment "$deployment_id" '
+    length >= 3 and all(.[]; .deployment_id == $deployment and
+      (.recorded_at | type == "string" and length > 0)) and
+    .[-3].phase == "pre_activation" and .[-3].result == "verified" and
+      .[-3].reason == null and
+    .[-2].phase == "configuration" and .[-2].result == "prepared" and
+      .[-2].reason == null and
+    .[-1].phase == "runtime" and .[-1].result == "activated" and
+      .[-1].reason == null
+  ' "$audit_file" >/dev/null || die 'runtime activation audit is incomplete or mismatched'
+  feedback_line=$(sed -n '1p' "$feedback_file")
+  [[ -n $feedback_line ]] || die 'runtime activation feedback is absent'
+  jq -e --arg deployment "$deployment_id" --arg asset "$asset_revision_id" \
+    --arg account "$account_id" --arg venue "$venue" --arg mode "$mode" '
+    .key_id == "runtime-feedback-1" and
+    (.content_hash | test("^[0-9a-f]{64}$")) and
+    (.signature_hex | test("^[0-9a-f]{128}$")) and
+    .event.event_id == ("activation:" + $deployment) and
+    .event.deployment_id == $deployment and
+    .event.asset_revision_id == $asset and
+    .event.mode == $mode and .event.outcome == "Activated" and
+    .event.kind == "Activation" and .event.account_id == $account and
+    .event.venue == $venue and .event.reason == null
+  ' <<<"$feedback_line" >/dev/null \
+    || die 'signed runtime activation feedback is incomplete or mismatched'
+
+  cutover_sha=$(sha256sum "$cutover_file" | awk '{print $1}')
+  envelope_sha=$(sha256sum "$envelope_file" | awk '{print $1}')
+  policy_sha=$(sha256sum "$activation_dir/deployment/policy.json" | awk '{print $1}')
+  nonce_sha=$(printf '%s' "$nonce" | sha256sum | awk '{print $1}')
+  feedback_content_hash=$(jq -er '.content_hash' <<<"$feedback_line")
+  readback_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if ! verify_single_checksum_marker "$evidence_dir" PASSED.sha256 cutover.json \
+    || [[ -e $evidence_dir/PASSED.rollback-pending.sha256 \
+      || -e $evidence_dir/PASSED.rolled-back.sha256 ]] \
+    || ! current_pointer_matches_sha "$current_file" "$ROLLBACK_CANDIDATE_SHA" \
+    || ! runtime_identity_matches "$ROLLBACK_IMAGE" "$ROLLBACK_EXPECTED_IDENTITY"; then
+    die 'runtime identity changed during readback'
+  fi
+  jq -S -n --arg cutover "$cutover_sha" --arg image "$ROLLBACK_IMAGE" \
+    --arg source "$source_revision" --arg release "$release_manifest_sha" \
+    --arg activation "$activation_sha" --arg envelope "$envelope_sha" \
+    --arg policy "$policy_sha" --arg deployment "$deployment_id" \
+    --arg asset "$asset_revision_id" --arg promotion "$promotion_id" \
+    --arg bundle "$bundle_id" --arg bundle_hash "$bundle_hash" \
+    --arg risk "$risk_policy_hash" --arg nonce "$nonce_sha" \
+    --arg feedback "$feedback_content_hash" --arg mode "$mode" \
+    --arg at "$readback_at" '
+    {schema:"monday.hft_trading_ecs_readback.v1",result:"active_governed",
+      cutover_sha256:$cutover,image_reference:$image,source_revision:$source,
+      release_manifest_sha256:$release,
+      activation_manifest_sha256:$activation,envelope_sha256:$envelope,
+      policy_sha256:$policy,deployment_id:$deployment,
+      asset_revision_id:$asset,promotion_id:$promotion,bundle_id:$bundle,
+      bundle_hash:$bundle_hash,risk_policy_hash:$risk,nonce_sha256:$nonce,
+      activation_feedback_content_hash:$feedback,mode:$mode,
+      nonce_consumed:true,audit_activated:true,
+      activation_feedback_signature_present:true,service_enabled:false,
+      automatic_restart_enabled:false,live_small_enabled:false,readback_at:$at}
+  '
+}
+
 rollback_cutover() {
   local evidence_dir=$1 current_file=${CURRENT_FILE:-$CURRENT_FILE_DEFAULT}
   local runtime_program=${RUNTIME_PROGRAM:-$RUNTIME_PROGRAM_DEFAULT}
@@ -965,10 +1146,12 @@ usage() {
 Usage:
   trading-ecs-hostctl.sh stage ARTIFACT_DIR ACR_USERNAME ACR_PASSWORD_FILE
   trading-ecs-hostctl.sh cutover IMAGE_REFERENCE RELEASE_MANIFEST_SHA256 ACTIVATION_DIR
+  trading-ecs-hostctl.sh readback CUTOVER_EVIDENCE_DIR
   trading-ecs-hostctl.sh rollback CUTOVER_EVIDENCE_DIR
 
 The host must be a Tokyo Ubuntu 26.04 amd64 ECS with MondayTradingEcsRole.
 stage never starts or enables the service. cutover accepts Paper/Shadow only.
+readback never starts, stops, restarts, or enables the service.
 USAGE
 }
 
@@ -992,6 +1175,10 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     cutover)
       [[ $# -eq 4 ]] || { usage; exit 2; }
       with_host_lock cutover_release "$2" "$3" "$4"
+      ;;
+    readback)
+      [[ $# -eq 2 ]] || { usage; exit 2; }
+      with_host_lock readback_cutover "$2"
       ;;
     rollback)
       [[ $# -eq 2 ]] || { usage; exit 2; }
