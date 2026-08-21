@@ -3921,28 +3921,35 @@ fn event_from_frame_for_shard(
     let is_raw_trade = channel.is_some_and(|channel| channel.eq_ignore_ascii_case("trade"));
     if !channel.is_some_and(|channel| channel.eq_ignore_ascii_case("bookTicker")) {
         if is_depth {
-            let strict_error = match event_from_frame(frame.clone(), received_at_ns) {
-                Ok(event) => return Ok(event),
-                Err(error) => error,
+            let source_clock = match DepthSourceClock::from_frame(&frame, received_at_ns) {
+                Ok(source_clock) => source_clock,
+                Err(strict_error) => {
+                    let data = frame.get("data").unwrap_or(&frame);
+                    let event_time_ms = data.get("E").and_then(Value::as_u64);
+                    let value_or_missing = |value: Option<u64>| {
+                        value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
+                    };
+                    anyhow::bail!(
+                        "{strict_error:#}; stream={} symbol={} E={} T={} U={} u={} pu={} received_at_ns={received_at_ns} recv_minus_event_ms={} governed_limit_ms={MAX_SOURCE_DELAY_MS} producer_id={producer_id}",
+                        frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
+                        data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
+                        value_or_missing(event_time_ms),
+                        value_or_missing(data.get("T").and_then(Value::as_u64)),
+                        value_or_missing(data.get("U").and_then(Value::as_u64)),
+                        value_or_missing(data.get("u").and_then(Value::as_u64)),
+                        value_or_missing(data.get("pu").and_then(Value::as_u64)),
+                        value_or_missing(event_time_ms.map(|event_time_ms| {
+                            (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
+                        })),
+                    );
+                }
             };
-            let data = frame.get("data").unwrap_or(&frame);
-            let event_time_ms = data.get("E").and_then(Value::as_u64);
-            let value_or_missing = |value: Option<u64>| {
-                value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
-            };
-            anyhow::bail!(
-                "{strict_error:#}; stream={} symbol={} E={} T={} U={} u={} pu={} received_at_ns={received_at_ns} recv_minus_event_ms={} governed_limit_ms={MAX_SOURCE_DELAY_MS} producer_id={producer_id}",
-                frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
-                data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
-                value_or_missing(event_time_ms),
-                value_or_missing(data.get("T").and_then(Value::as_u64)),
-                value_or_missing(data.get("U").and_then(Value::as_u64)),
-                value_or_missing(data.get("u").and_then(Value::as_u64)),
-                value_or_missing(data.get("pu").and_then(Value::as_u64)),
-                value_or_missing(event_time_ms.map(|event_time_ms| {
-                    (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
-                })),
-            );
+            let diff = DepthDiff::from_frame(&frame)?;
+            return Ok(Event::Diff {
+                received_at_ns,
+                frame,
+                depth: Box::new(ValidatedDepth { diff, source_clock }),
+            });
         }
         if !is_raw_trade {
             return event_from_frame(frame, received_at_ns);
