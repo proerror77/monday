@@ -24,7 +24,7 @@ pub(crate) const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_
 #[command(
     name = "alpha-harness",
     version = BUILD_SOURCE_REVISION,
-    about = "Bounded Loop Engineer alpha research control plane"
+    about = "Governed CEX Campaign and prediction research control plane"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -37,6 +37,7 @@ enum Command {
         #[command(subcommand)]
         command: MissionCommand,
     },
+    #[command(hide = true)]
     Loop {
         #[command(subcommand)]
         command: LoopCommand,
@@ -75,7 +76,9 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum MissionCommand {
+    #[command(hide = true)]
     Create(CreateMissionArgs),
+    #[command(hide = true)]
     Execute(Box<ExecuteMissionArgs>),
     CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
@@ -85,10 +88,14 @@ enum MissionCommand {
         #[command(subcommand)]
         command: MissionDispatchCommand,
     },
+    #[command(hide = true)]
     Run(RunMissionArgs),
+    #[command(hide = true)]
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
+    #[command(hide = true)]
     Learn(LearnMissionArgs),
+    #[command(hide = true)]
     RecoverLegacyCheckpoint(RecoverLegacyCheckpointArgs),
 }
 
@@ -857,9 +864,49 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::ffi::{OsStr, OsString};
 
     static PREDICTION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn help_defaults_to_the_campaign_surface() {
+        let mut root = Cli::command();
+        let root_help = root.render_help().to_string();
+        assert!(!root_help
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("loop")));
+
+        let mission_help = root
+            .find_subcommand_mut("mission")
+            .unwrap()
+            .render_help()
+            .to_string();
+        let listed = |name| {
+            mission_help
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(name))
+        };
+        for command in [
+            "create",
+            "execute",
+            "run",
+            "resume",
+            "learn",
+            "recover-legacy-checkpoint",
+        ] {
+            assert!(!listed(command), "{command} must stay diagnostic-only");
+        }
+        for command in [
+            "campaign-freeze",
+            "campaign-finalize",
+            "campaign-id",
+            "campaign-execute",
+            "dispatch",
+        ] {
+            assert!(listed(command), "{command} must stay on the Campaign path");
+        }
+    }
 
     struct EnvVarGuard {
         key: &'static str,

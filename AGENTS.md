@@ -9,6 +9,10 @@
 - Research may emit typed candidates and signed deployment envelopes. It may not
   submit orders, change risk limits, or resume a paused runtime. Live stays
   disabled until a separately reviewed runtime contract proves every gate.
+- The production CEX research seam is `mission campaign-freeze` -> `mission
+  campaign-finalize` -> `mission dispatch submit` -> generated `mission
+  campaign-execute`. Direct `mission execute`, `mission run`, and `loop run`
+  are diagnostic implementation surfaces, never alternate completion paths.
 - Follow the nearest nested `AGENTS.md`.
 
 ## Working rules
