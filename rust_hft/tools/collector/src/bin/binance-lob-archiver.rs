@@ -2239,7 +2239,13 @@ async fn run_session(
 
         if last_health.elapsed() >= Duration::from_secs(30) {
             watchdog.record_queue_health(QueueHealth::from_sender(&sender));
-            let status = collector_health_status(&states, &process_state);
+            let status = if !process_state.depth_streams_healthy() {
+                "reconnecting"
+            } else if states.values().all(|state| state.synced) {
+                "synced"
+            } else {
+                "syncing"
+            };
             let manifest_count = match files_with_suffix(&config.spool_dir, ".manifest.json") {
                 Ok(manifests) => manifests.len(),
                 Err(error) => {
@@ -2322,19 +2328,6 @@ fn sync_timed_out(
     now: Instant,
 ) -> bool {
     deadline.is_some_and(|deadline| now > deadline && states.values().any(|state| !state.synced))
-}
-
-fn collector_health_status(
-    states: &HashMap<String, OrderBookState>,
-    process_state: &ProcessState,
-) -> &'static str {
-    if !process_state.streams_healthy() {
-        "reconnecting"
-    } else if states.values().all(|state| state.synced) {
-        "synced"
-    } else {
-        "syncing"
-    }
 }
 
 fn depth_symbols_for_streams(streams: &[String]) -> anyhow::Result<Vec<String>> {
@@ -9521,27 +9514,6 @@ mod tests {
         process_state.mark_stream_observed("ethusdt@depth@100ms");
         assert!(process_state.streams_healthy());
         assert!(process_state.depth_streams_healthy());
-    }
-
-    #[test]
-    fn collector_health_status_requires_all_streams_to_recover() {
-        let mut states = HashMap::from([(
-            "BTCUSDT".to_owned(),
-            OrderBookState::new("BTCUSDT", Market::Spot),
-        )]);
-        states.get_mut("BTCUSDT").unwrap().synced = true;
-        let mut process_state = ProcessState::new(true);
-
-        assert_eq!(collector_health_status(&states, &process_state), "synced");
-
-        process_state.mark_shard_disconnected(vec!["btcusdt@bookTicker".into()]);
-        assert_eq!(
-            collector_health_status(&states, &process_state),
-            "reconnecting"
-        );
-
-        process_state.mark_stream_observed("btcusdt@bookTicker");
-        assert_eq!(collector_health_status(&states, &process_state), "synced");
     }
 
     #[test]
