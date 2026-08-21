@@ -139,6 +139,11 @@ OLD_SESSION_SPOT=
 OLD_SESSION_USDM=
 OLD_USDM_MINIMUM_SYMBOLS=400
 CANDIDATE_STARTED_NS=0
+PRODUCTION_USDM_MEMORY_DROPIN=/etc/systemd/system/binance-lob-archiver-production@usdm.service.d/10-memory.conf
+PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
+PRODUCTION_USDM_MEMORY_DROPIN_BACKUP=
+PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST=
+PRODUCTION_USDM_MEMORY_DROPIN_SHA256=
 
 fail() {
   FAILURE_REASON=$*
@@ -153,6 +158,19 @@ secure_regular_file() {
   mode=$(stat -c %a -- "$path")
   [[ $owner == 0 ]] || fail "required file is not root-owned: $path"
   (( (8#$mode & 022) == 0 )) || fail "required file is group/world writable: $path"
+}
+
+secure_directory() {
+  local path=$1 mode owner
+  [[ -d $path && ! -L $path ]] || fail "required directory is missing or a symlink: $path"
+  owner=$(stat -c %u -- "$path")
+  mode=$(stat -c %a -- "$path")
+  [[ $owner == 0 ]] || fail "required directory is not root-owned: $path"
+  (( (8#$mode & 022) == 0 )) || fail "required directory is group/world writable: $path"
+}
+
+systemctl_value() {
+  systemctl show "$1" --property="$2" --value
 }
 
 env_value() {
@@ -252,6 +270,31 @@ validate_deployment() {
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit has the wrong environment file'
   fi
+}
+
+validate_memory_only_dropin() {
+  local path=$1
+  awk '
+    BEGIN {
+      section = ""
+      service_count = 0
+      memory_high = 0
+      memory_max = 0
+    }
+    /^[[:space:]]*($|#|;)/ { next }
+    /^\[Service\][[:space:]]*$/ {
+      service_count += 1
+      section = "Service"
+      next
+    }
+    /^\[/ { exit 1 }
+    section != "Service" { exit 1 }
+    /^[[:space:]]*MemoryHigh=[^[:space:]].*$/ { memory_high += 1; next }
+    /^[[:space:]]*MemoryMax=[^[:space:]].*$/ { memory_max += 1; next }
+    { exit 1 }
+    END { exit !(service_count == 1 && memory_high == 1 && memory_max == 1) }
+  ' "$path" >/dev/null \
+    || fail "production USD-M drop-in must contain only [Service], MemoryHigh, and MemoryMax: $path"
 }
 
 atomic_install() {
@@ -423,6 +466,79 @@ stage_existing_deployment_for_rollback() {
   chmod 0640 "$manifest"
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
   OLD_DEPLOYMENT=$snapshot
+}
+
+capture_existing_production_identity() {
+  OLD_MODE=$1
+  [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
+  OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
+  [[ $OLD_BINARY =~ ^$RELEASE_ROOT/([a-f0-9]{64})/binance-lob-archiver$ ]] \
+    || fail "running production symlink is not digest-addressed: $OLD_BINARY"
+  OLD_SHA256=${BASH_REMATCH[1]}
+  [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
+  printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
+  OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
+  stage_existing_deployment_for_rollback
+  SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
+}
+
+capture_allowlisted_production_usdm_dropin() {
+  local dropin_dir
+  secure_regular_file "$PRODUCTION_USDM_MEMORY_DROPIN"
+  validate_memory_only_dropin "$PRODUCTION_USDM_MEMORY_DROPIN"
+  dropin_dir=${PRODUCTION_USDM_MEMORY_DROPIN%/*}
+  secure_directory "$dropin_dir"
+  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=1
+  PRODUCTION_USDM_MEMORY_DROPIN_BACKUP="$EVIDENCE_DIR/binance-lob-archiver-production-usdm-10-memory.conf"
+  PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST="$EVIDENCE_DIR/binance-lob-archiver-production-usdm-10-memory.conf.sha256"
+  atomic_install 0640 \
+    "$PRODUCTION_USDM_MEMORY_DROPIN" "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP"
+  cmp -s -- "$PRODUCTION_USDM_MEMORY_DROPIN" "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" \
+    || fail 'production USD-M memory drop-in backup does not match the installed bytes'
+  PRODUCTION_USDM_MEMORY_DROPIN_SHA256=$(
+    sha256sum "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" | awk '{print $1}'
+  )
+  printf '%s  %s\n' \
+    "$PRODUCTION_USDM_MEMORY_DROPIN_SHA256" \
+    "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" >"$PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST"
+  chmod 0640 "$PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST"
+}
+
+validate_existing_production_dropins() {
+  local dropins
+  dropins=$(systemctl_value "${PRODUCTION_UNITS[0]}" DropInPaths) \
+    || fail "could not read production drop-ins for ${PRODUCTION_UNITS[0]}"
+  [[ -z $dropins ]] \
+    || fail "spot production service has an unexpected systemd drop-in: $dropins"
+
+  dropins=$(systemctl_value "${PRODUCTION_UNITS[1]}" DropInPaths) \
+    || fail "could not read production drop-ins for ${PRODUCTION_UNITS[1]}"
+  if [[ -z $dropins ]]; then
+    return 0
+  fi
+  [[ $dropins == "$PRODUCTION_USDM_MEMORY_DROPIN" ]] \
+    || fail "USD-M production service has an unexpected systemd drop-in: $dropins"
+  capture_allowlisted_production_usdm_dropin
+}
+
+remove_allowlisted_production_dropins_for_candidate() {
+  [[ $PRODUCTION_USDM_MEMORY_DROPIN_PRESENT -eq 1 ]] || return 0
+  sha256sum --check --strict "$PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST" >/dev/null \
+    || fail 'production USD-M memory drop-in backup digest changed before candidate cutover'
+  rm -f -- "$PRODUCTION_USDM_MEMORY_DROPIN" \
+    || fail 'could not remove the allowlisted production USD-M memory drop-in'
+  [[ ! -e $PRODUCTION_USDM_MEMORY_DROPIN && ! -L $PRODUCTION_USDM_MEMORY_DROPIN ]] \
+    || fail 'production USD-M memory drop-in remained present after removal'
+}
+
+restore_allowlisted_production_dropins() {
+  [[ $PRODUCTION_USDM_MEMORY_DROPIN_PRESENT -eq 1 ]] || return 0
+  sha256sum --check --strict "$PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST" >/dev/null \
+    || return 1
+  atomic_install 0644 \
+    "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" "$PRODUCTION_USDM_MEMORY_DROPIN" \
+    || return 1
+  cmp -s -- "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" "$PRODUCTION_USDM_MEMORY_DROPIN"
 }
 
 unit_active_json() {
@@ -601,7 +717,7 @@ rollback_after_failure() {
     fi
   fi
 
-  if [[ $OLD_MODE == upgrade ]]; then
+  if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then
     if [[ -n $ROLLBACK_DEPLOYMENT_MANIFEST_SHA256 ]]; then
       printf '%s  %s\n' "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
         "$EVIDENCE_DIR/rollback-deployment.sha256" | sha256sum --check --strict \
@@ -621,13 +737,20 @@ rollback_after_failure() {
     elif ! atomic_symlink "$OLD_BINARY" "$PRODUCTION_LINK"; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-symlink-failed-disabled
+    elif ! restore_allowlisted_production_dropins; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=restore-dropin-failed-disabled
+    elif ! systemctl daemon-reload; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=daemon-reload-failed-disabled
+    elif [[ $OLD_MODE == contained-upgrade ]]; then
+      ROLLBACK_RESULT=previous-release-restored-contained
     else
-      systemctl daemon-reload || safe_to_restart=0
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0
     fi
 
-    if (( safe_to_restart )); then
+    if [[ $OLD_MODE == upgrade ]] && (( safe_to_restart )); then
       copy_health_evidence failed-candidate
       if ! clear_health_before_restart; then
         safe_to_restart=0
@@ -637,7 +760,7 @@ rollback_after_failure() {
       fi
     fi
 
-    if (( safe_to_restart )); then
+    if [[ $OLD_MODE == upgrade ]] && (( safe_to_restart )); then
       systemctl reset-failed "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
       if systemctl start "${PRODUCTION_UNITS[@]}" \
         && wait_for_release_health \
@@ -659,7 +782,7 @@ rollback_after_failure() {
           ROLLBACK_RESULT=previous-release-health-unverified-containment-failed
         fi
       fi
-    else
+    elif (( safe_to_restart == 0 )); then
       systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
       systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
       if ! production_is_fail_closed; then
@@ -779,6 +902,7 @@ install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
 
 STEP=validate-host-state
 canonical_spool_paths_safe || fail 'canonical spool path contains a symlink or escapes /data'
+validate_existing_production_dropins
 for unit in "${QUIESCENT_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "unit must be inactive before cutover: $unit"
 done
@@ -801,18 +925,10 @@ for unit in "${PRODUCTION_UNITS[@]}"; do
 done
 
 if (( active_count == 2 && enabled_count == 2 )); then
-  OLD_MODE=upgrade
-  [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
-  OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
-  [[ $OLD_BINARY =~ ^$RELEASE_ROOT/([a-f0-9]{64})/binance-lob-archiver$ ]] \
-    || fail "running production symlink is not digest-addressed: $OLD_BINARY"
-  OLD_SHA256=${BASH_REMATCH[1]}
-  [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
-  printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
-  OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
-  stage_existing_deployment_for_rollback
-  SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
+  capture_existing_production_identity upgrade
   DRAIN_REQUIRED=1
+elif (( active_count == 0 && enabled_count == 2 )) && [[ -L $PRODUCTION_LINK ]]; then
+  capture_existing_production_identity contained-upgrade
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
@@ -836,6 +952,8 @@ for unit in "${PRODUCTION_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "production unit did not stop: $unit"
   [[ $(systemctl show --property MainPID --value "$unit") == 0 ]] \
     || fail "production unit retained a MainPID after stop: $unit"
+  systemctl is-enabled --quiet "$unit" \
+    && fail "production unit remained enabled after disable: $unit"
 done
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
@@ -843,9 +961,16 @@ canonical_spool_paths_safe || fail 'canonical spool path changed during producti
 STEP=install-candidate-production-assets
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
 install_deployment "$CANDIDATE_DEPLOYMENT"
+remove_allowlisted_production_dropins_for_candidate
 install -d -m 0750 -o hftcollector -g hftcollector \
   "$CANONICAL_SPOOL/spot" "$CANONICAL_SPOOL/usdm"
 systemctl daemon-reload
+for unit in "${PRODUCTION_UNITS[@]}"; do
+  unit_dropins=$(systemctl_value "$unit" DropInPaths) \
+    || fail "could not read production drop-ins for $unit after daemon-reload"
+  [[ -z $unit_dropins ]] \
+    || fail "candidate production service retained an unexpected systemd drop-in: $unit_dropins"
+done
 
 if [[ $OLD_MODE == upgrade ]]; then
   STEP=drain-old-production-with-candidate

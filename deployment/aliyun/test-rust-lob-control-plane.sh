@@ -1247,11 +1247,20 @@ enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' "$rollback_b
 grep -Fq 'runtime_matches_release "$OLD_BINARY" true' "$rollback_body"
 grep -Fq '"$rollback_started_ns"' "$rollback_body"
 grep -Fq 'previous-release-health-unverified-disabled' "$rollback_body"
+grep -Fq 'previous-release-restored-contained' "$rollback_body"
 grep -Fq 'systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}"' "$rollback_body"
 grep -Fq 'ROLLBACK_RESULT=new-host-containment-failed' "$rollback_body"
+grep -Fq 'restore_allowlisted_production_dropins' "$rollback_body"
 grep -Fq 'binance-lob-archiver@spot.service' "$CUTOVER"
 grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
+grep -Fq 'contained-upgrade' "$CUTOVER"
+grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
+grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
 grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
+grep -Fq 'production unit remained enabled after disable' "$CUTOVER"
+grep -Fq 'candidate production service retained an unexpected systemd drop-in' "$CUTOVER"
+grep -Fq 'validate_existing_production_dropins' "$CUTOVER"
+grep -Fq 'remove_allowlisted_production_dropins_for_candidate' "$CUTOVER"
 grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXXXXX")' \
   "$INSTALL_RELEASE"
 grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
@@ -1305,6 +1314,84 @@ candidate_enable_line=$(grep -n 'systemctl enable "${PRODUCTION_UNITS\[@\]}"' \
   exit 1
 }
 grep -Fq '"$CANDIDATE_STARTED_NS"' "$candidate_start_body"
+
+dropin_body="$tmp_dir/production-dropins.sh"
+{
+  sed -n '/^systemctl_value()/,/^}/p' "$CUTOVER"
+  sed -n '/^validate_memory_only_dropin()/,/^}/p' "$CUTOVER"
+  sed -n '/^capture_allowlisted_production_usdm_dropin()/,/^}/p' "$CUTOVER"
+  sed -n '/^validate_existing_production_dropins()/,/^}/p' "$CUTOVER"
+  sed -n '/^remove_allowlisted_production_dropins_for_candidate()/,/^}/p' "$CUTOVER"
+  sed -n '/^restore_allowlisted_production_dropins()/,/^}/p' "$CUTOVER"
+} >"$dropin_body"
+
+dropin_root="$tmp_dir/dropin-fixture"
+dropin_path="$dropin_root/etc/systemd/system/binance-lob-archiver-production@usdm.service.d/10-memory.conf"
+install -d -m 0755 "$dropin_root/etc/systemd/system/binance-lob-archiver-production@usdm.service.d"
+cat >"$dropin_path" <<'EOF'
+[Service]
+MemoryHigh=4096M
+MemoryMax=5120M
+EOF
+
+run_dropin_roundtrip_fixture() (
+  local spot_dropins=${1:-}
+  local usdm_dropins=${2:-$dropin_path}
+  EVIDENCE_DIR="$dropin_root/evidence"
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  PRODUCTION_USDM_MEMORY_DROPIN="$dropin_path"
+  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=0
+  PRODUCTION_USDM_MEMORY_DROPIN_BACKUP=
+  PRODUCTION_USDM_MEMORY_DROPIN_MANIFEST=
+  PRODUCTION_USDM_MEMORY_DROPIN_SHA256=
+  rm -rf "$EVIDENCE_DIR"
+  install -d -m 0755 "$EVIDENCE_DIR"
+  fail() { printf '%s\n' "$*" >&2; exit 1; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  secure_directory() { [[ -d $1 && ! -L $1 ]]; }
+  atomic_install() { install -m "$1" "$2" "$3"; }
+  systemctl() {
+    if [[ $1 == show && $3 == --property=DropInPaths && $4 == --value ]]; then
+      case "$2" in
+        production-spot) printf '%s\n' "$spot_dropins" ;;
+        production-usdm) printf '%s\n' "$usdm_dropins" ;;
+      esac
+      return 0
+    fi
+    return 1
+  }
+  # shellcheck disable=SC1090
+  . "$dropin_body"
+  validate_existing_production_dropins
+  remove_allowlisted_production_dropins_for_candidate
+  [[ ! -e $PRODUCTION_USDM_MEMORY_DROPIN && ! -L $PRODUCTION_USDM_MEMORY_DROPIN ]]
+  restore_allowlisted_production_dropins
+  cmp -s "$PRODUCTION_USDM_MEMORY_DROPIN_BACKUP" "$PRODUCTION_USDM_MEMORY_DROPIN"
+)
+
+run_dropin_roundtrip_fixture
+cat >"$dropin_path" <<'EOF'
+[Service]
+MemoryHigh=4096M
+ExecStart=/bin/false
+EOF
+if run_dropin_roundtrip_fixture >"$tmp_dir/dropin-invalid.out" 2>&1; then
+  printf 'production drop-in fixture accepted a non-memory directive\n' >&2
+  exit 1
+fi
+grep -Fq 'must contain only [Service], MemoryHigh, and MemoryMax' \
+  "$tmp_dir/dropin-invalid.out"
+cat >"$dropin_path" <<'EOF'
+[Service]
+MemoryHigh=4096M
+MemoryMax=5120M
+EOF
+if run_dropin_roundtrip_fixture /tmp/spot-memory.conf >"$tmp_dir/dropin-spot.out" 2>&1; then
+  printf 'production drop-in fixture accepted a spot drop-in\n' >&2
+  exit 1
+fi
+grep -Fq 'spot production service has an unexpected systemd drop-in' \
+  "$tmp_dir/dropin-spot.out"
 
 # Execute the rollback snapshot logic against isolated fixture roots. This catches
 # content drift and manifest-tamper regressions that static contract greps miss.
@@ -1372,6 +1459,64 @@ if run_stage_fixture "$drift_evidence" >"$tmp_dir/drift.out" 2>&1; then
 fi
 grep -Fq 'installed production asset drifted from the active immutable release' \
   "$tmp_dir/drift.out"
+
+run_contained_upgrade_rollback_fixture() (
+  local calls="$tmp_dir/contained-rollback.calls"
+  PRODUCTION_UNITS=(production-spot production-usdm)
+  UPLOAD_UNITS=(upload-spot upload-usdm)
+  LEGACY_UNITS=(legacy-spot legacy-usdm)
+  TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
+  CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
+  CANDIDATE_BINARY="$tmp_dir/candidate-binary"
+  PRODUCTION_LINK="$tmp_dir/contained-production-link"
+  OLD_MODE=contained-upgrade
+  OLD_DEPLOYMENT="$tmp_dir/contained-old-deployment"
+  OLD_BINARY="$tmp_dir/contained-old-binary"
+  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=fixture
+  ROLLBACK_RESULT=
+  EVIDENCE_DIR="$tmp_dir/contained-evidence"
+  DRAIN_REQUIRED=0
+  DRAIN_ATTEMPTED=0
+  DRAIN_MAY_HAVE_MUTATED=0
+  SPOOL_ENV_DEPLOYMENT=
+  mkdir -p "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" "$(dirname "$PRODUCTION_LINK")"
+  : >"$calls"
+  systemctl() {
+    printf '%s %s\n' "$1" "${*:2}" >>"$calls"
+    case "$1" in
+      is-active) return 1 ;;
+      is-enabled)
+        if [[ ${2:-} == --quiet ]]; then
+          return 1
+        fi
+        printf 'masked-runtime\n'
+        return 1
+        ;;
+      *) return 0 ;;
+    esac
+  }
+  sha256sum() { return 0; }
+  copy_health_evidence() { return 0; }
+  run_candidate_drain() { return 0; }
+  install_deployment() { printf 'install %s\n' "$1" >>"$calls"; return 0; }
+  atomic_symlink() { printf 'symlink %s %s\n' "$1" "$2" >>"$calls"; return 0; }
+  restore_allowlisted_production_dropins() { printf 'restore-dropin\n' >>"$calls"; return 0; }
+  # shellcheck disable=SC1090
+  . "$production_predicate_body"
+  # shellcheck disable=SC1090
+  . "$rollback_body"
+  rollback_after_failure
+  [[ $ROLLBACK_RESULT == previous-release-restored-contained ]]
+  grep -Fq 'restore-dropin' "$calls"
+  grep -Eq '^daemon-reload( |$)' "$calls"
+  if grep -Eq '^(start|enable|unmask) ' "$calls"; then
+    printf 'contained rollback tried to restart or unmask the previous release\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "$ROLLBACK_RESULT"
+)
+
+[[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
 
 run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit
