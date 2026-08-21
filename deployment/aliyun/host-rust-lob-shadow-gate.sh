@@ -230,8 +230,8 @@ configured_spot_snapshot_producers=$(env_value "${env_file[spot]}" SNAPSHOT_PROD
   == "${configured_symbols[usdm]}" ]] \
   || die 'USD-M shadow and production symbol lists differ'
 configured_usdm_ws_shard_size=$(env_value "${env_file[usdm]}" WS_SHARD_SIZE)
-[[ $configured_usdm_ws_shard_size == 100 ]] \
-  || die 'USD-M shadow WS_SHARD_SIZE must be 100'
+[[ $configured_usdm_ws_shard_size == 25 ]] \
+  || die 'USD-M shadow WS_SHARD_SIZE must be 25'
 [[ $(env_value "$candidate_production_usdm_env" WS_SHARD_SIZE) \
   == "$configured_usdm_ws_shard_size" ]] \
   || die 'USD-M shadow and production WS_SHARD_SIZE differ'
