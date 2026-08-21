@@ -928,6 +928,13 @@ pub(crate) fn execute_report(
     })
 }
 
+fn ensure_promotable_cex_costs(costs: &EvaluationCostsV1) -> anyhow::Result<()> {
+    if !costs.fee_bps.is_finite() || costs.fee_bps < 2.0 || costs.rebate_bps != 0.0 {
+        bail!("promotable CEX candidates require fee_bps >= 2 and rebate_bps == 0");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_cex_candidate(
     store: &mut AlphaStore,
@@ -951,6 +958,8 @@ fn finalize_cex_candidate(
     replay_policy: &CexEventReplayPolicyV1,
     instrument_rules: &CexInstrumentRulesV2,
 ) -> anyhow::Result<CexFinalizationReportV1> {
+    let costs = &control_mission.spec.evaluation_protocol.costs;
+    ensure_promotable_cex_costs(costs)?;
     let ridge = baselines
         .ridge
         .as_ref()
@@ -2632,6 +2641,7 @@ fn validate_recovered_finalization(
     replay_receipt: Option<&CexEventReplayReceiptV1>,
     expected_mission_id: &str,
 ) -> anyhow::Result<()> {
+    ensure_promotable_cex_costs(&control_mission.spec.evaluation_protocol.costs)?;
     if !replay_receipt.is_some_and(|receipt| receipt.gate.passed) {
         bail!("published result bundle finalization lacks a passing replay receipt");
     }
@@ -3669,6 +3679,64 @@ pub(crate) mod tests {
             0.0
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn finalization_rejects_optimistic_costs_before_holdout_claim() {
+        for (name, fee_bps, rebate_bps) in [("fee-floor", 1.0, 0.0), ("rebate", 2.0, 0.25)] {
+            let mut fixture = fixture(name);
+            fixture.mission.spec.feature_fields = vec!["book_imbalance".to_string()];
+            fixture.mission.spec.evaluation_protocol.costs.fee_bps = fee_bps;
+            fixture.mission.spec.evaluation_protocol.costs.rebate_bps = rebate_bps;
+            rewrite_features(&mut fixture, |row| {
+                let direction = row.label.signum();
+                row.features.insert("book_imbalance".to_string(), direction);
+                row.label = direction * 0.001;
+            });
+
+            let error = execute(fixture.args.clone()).unwrap_err();
+
+            assert!(format!("{error:#}")
+                .contains("promotable CEX candidates require fee_bps >= 2 and rebate_bps == 0"));
+            let results = fixture.args.work_dir.join("results");
+            assert!(results.join("factor-bank.json").exists());
+            assert!(!results.join("final-precommit.json").exists());
+            assert!(!results.join("promotion-record.json").exists());
+            assert!(!Path::new(&fixture.args.holdout_claim_put_url).exists());
+            std::fs::remove_dir_all(fixture.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn promotable_cex_costs_reject_non_finite_and_nonzero_rebates() {
+        let mut costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        assert!(ensure_promotable_cex_costs(&costs).is_ok());
+
+        for (fee_bps, rebate_bps) in [
+            (1.999, 0.0),
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+            (f64::NEG_INFINITY, 0.0),
+            (2.0, 0.25),
+            (2.0, -0.25),
+            (2.0, f64::NAN),
+            (2.0, f64::INFINITY),
+            (2.0, f64::NEG_INFINITY),
+        ] {
+            costs.fee_bps = fee_bps;
+            costs.rebate_bps = rebate_bps;
+            assert!(ensure_promotable_cex_costs(&costs).is_err());
+        }
     }
 
     #[test]
@@ -5728,6 +5796,41 @@ pub(crate) mod tests {
         assert_eq!(recovered.campaign_id, original.campaign_id);
         assert_eq!(recovered.round_id, original.round_id);
         assert_eq!(recovered.request_sha256, original.request_sha256);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn recovered_finalization_rejects_optimistic_costs() {
+        let mut fixture = finalizing_fixture("recover-finalization-cost-gate");
+        execute_report(fixture.args.clone(), ExecutionBinding::Direct).unwrap();
+        let mut archive = ZipArchive::new(File::open(&fixture.result_path).unwrap()).unwrap();
+        let report: CexFinalizationReportV1 =
+            read_bundle_json(&mut archive, "results/finalization-report.json", 128 * 1024)
+                .unwrap()
+                .unwrap();
+        let replay: CexEventReplayReceiptV1 = read_bundle_json(
+            &mut archive,
+            "results/cex-event-replay-receipt.json",
+            512 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+        fixture.mission.spec.evaluation_protocol.costs.fee_bps = 1.0;
+        resign_mission(&mut fixture);
+        fixture.mission.validate().unwrap();
+
+        let error = validate_recovered_finalization(
+            &mut archive,
+            &report,
+            &fixture.mission,
+            Some(&replay),
+            &fixture.mission.semantic_id().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("promotable CEX candidates require fee_bps >= 2 and rebate_bps == 0"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
