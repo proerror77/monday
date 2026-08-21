@@ -44,7 +44,10 @@ HEALTH_TIMEOUT_SECONDS=300
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EVIDENCE_DIR="/data/monday/evidence/cutovers/$(date -u +%Y%m%dT%H%M%SZ)-${CANDIDATE_SHA256:0:12}-$$"
+DRAIN_REQUIRED=0
+DRAIN_ATTEMPTED=0
 DRAIN_MAY_HAVE_MUTATED=0
+SPOOL_ENV_DEPLOYMENT=
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -341,6 +344,9 @@ run_candidate_drain() {
         PATH="$SAFE_PATH" \
         RUST_LOG=info \
         "${env_args[@]}" \
+        RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256" \
+        RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION" \
+        RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256" \
         RECOVERY_UID="$(id -u hftcollector)" \
         RECOVERY_GID="$(id -g hftcollector)" \
         RECOVERY_BACKUP_DIR="$recovery_dir" \
@@ -531,6 +537,7 @@ write_evidence() {
     --arg rollback_result "$ROLLBACK_RESULT" \
     --arg rollback_deployment_manifest_sha256 "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
+    --arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg previous_sha256 "$OLD_SHA256" \
     --arg mode "$OLD_MODE" \
@@ -548,6 +555,8 @@ write_evidence() {
         (if $rollback_deployment_manifest_sha256 == "" then null
          else $rollback_deployment_manifest_sha256 end),
       candidate_sha256: $candidate_sha256,
+      deployment_source_revision:
+        (if $deployment_source_revision == "" then null else $deployment_source_revision end),
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       previous_sha256: (if $previous_sha256 == "" then null else $previous_sha256 end),
       host_mode: $mode,
@@ -578,10 +587,17 @@ rollback_after_failure() {
     return
   fi
 
-  if [[ -d $CANONICAL_SPOOL \
-    && ( $STEP != drain-old-production-with-candidate || $DRAIN_MAY_HAVE_MUTATED -eq 1 ) ]]; then
-    if ! run_candidate_drain "$CANDIDATE_DEPLOYMENT"; then
+  if [[ -d $CANONICAL_SPOOL && $DRAIN_REQUIRED -eq 1 ]]; then
+    if [[ -z $SPOOL_ENV_DEPLOYMENT \
+      || ( $DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0 ) ]]; then
       safe_to_restart=0
+    else
+      DRAIN_ATTEMPTED=1
+      if run_candidate_drain "$SPOOL_ENV_DEPLOYMENT"; then
+        DRAIN_REQUIRED=0
+      else
+        safe_to_restart=0
+      fi
     fi
   fi
 
@@ -795,6 +811,8 @@ if (( active_count == 2 && enabled_count == 2 )); then
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
   stage_existing_deployment_for_rollback
+  SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"
+  DRAIN_REQUIRED=1
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
@@ -831,7 +849,11 @@ systemctl daemon-reload
 
 if [[ $OLD_MODE == upgrade ]]; then
   STEP=drain-old-production-with-candidate
+  DRAIN_ATTEMPTED=1
   run_candidate_drain "$OLD_DEPLOYMENT"
+  DRAIN_REQUIRED=0
+  DRAIN_ATTEMPTED=0
+  DRAIN_MAY_HAVE_MUTATED=0
 else
   STEP=verify-new-host-spool
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
@@ -846,6 +868,10 @@ copy_health_evidence previous-production
 clear_health_before_restart \
   || fail 'could not clear stale production health before starting the candidate'
 CANDIDATE_STARTED_NS=$(date +%s%N)
+SPOOL_ENV_DEPLOYMENT="$CANDIDATE_DEPLOYMENT"
+DRAIN_REQUIRED=1
+DRAIN_ATTEMPTED=0
+DRAIN_MAY_HAVE_MUTATED=0
 
 STEP=start-candidate-production
 systemctl reset-failed "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true

@@ -155,19 +155,32 @@ upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)
 recover_body=$(sed -n '/^fn recover_parts_only()/,/^fn stream_types_for_market/p' "$COLLECTOR")
 grep -Fq 'RECOVERY_UID="$(id -u hftcollector)"' "$CUTOVER"
 grep -Fq 'RECOVERY_GID="$(id -g hftcollector)"' "$CUTOVER"
+grep -Fq 'RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256"' "$CUTOVER"
+grep -Fq 'RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
+grep -Fq 'RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256"' "$CUTOVER"
+grep -Fq -- '--arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
+grep -Fq 'deployment_source_revision:' "$CUTOVER"
 grep -Fq 'spool_lock.owner()' <<<"$recover_body"
 grep -Fq 'validated_nonempty_recovery_parts' <<<"$recover_body"
-backup_line=$(grep -n 'backup_recovery_parts' <<<"$recover_body" | head -1 | cut -d: -f1)
+grep -Fq 'validated_recovery_temporaries' <<<"$recover_body"
+backup_line=$(grep -n 'backup_recovery_inputs' <<<"$recover_body" | head -1 | cut -d: -f1)
 drop_line=$(grep -n 'drop_recovery_privileges' <<<"$recover_body" | head -1 | cut -d: -f1)
+catalog_line=$(grep -n 'discover_recovery_catalog' <<<"$recover_body" | head -1 | cut -d: -f1)
+remove_temporary_line=$(grep -n 'remove_recovery_temporaries' <<<"$recover_body" | head -1 | cut -d: -f1)
 recover_line=$(grep -n 'recover_parts(&config)' <<<"$recover_body" | head -1 | cut -d: -f1)
-[[ -n $backup_line && -n $drop_line && -n $recover_line \
-  && $backup_line -lt $drop_line && $drop_line -lt $recover_line ]] || {
-  printf 'recovery does not preserve root-only evidence before dropping to the spool owner\n' >&2
+[[ -n $backup_line && -n $drop_line && -n $catalog_line \
+  && -n $remove_temporary_line && -n $recover_line \
+  && $backup_line -lt $drop_line && $drop_line -lt $catalog_line \
+  && $catalog_line -lt $remove_temporary_line && $remove_temporary_line -lt $recover_line ]] || {
+  printf 'recovery evidence, catalog validation, temporary removal, and recompression are out of order\n' >&2
   exit 1
 }
 grep -Fq 'production unit retained a MainPID after stop' "$CUTOVER"
 grep -Fq 'run_candidate_drain "$OLD_DEPLOYMENT"' "$CUTOVER"
-grep -Fq '$STEP != drain-old-production-with-candidate || $DRAIN_MAY_HAVE_MUTATED -eq 1' "$CUTOVER"
+grep -Fq 'SPOOL_ENV_DEPLOYMENT="$OLD_DEPLOYMENT"' "$CUTOVER"
+grep -Fq 'SPOOL_ENV_DEPLOYMENT="$CANDIDATE_DEPLOYMENT"' "$CUTOVER"
+grep -Fq 'run_candidate_drain "$SPOOL_ENV_DEPLOYMENT"' "$CUTOVER"
+grep -Fq '$DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0' "$CUTOVER"
 grep -Fq 'spool_dir[$market]=$(run_spool_dir "$candidate_sha" "$gate_run_id" "$market")' "$GATE"
 grep -Fq 'install -d -m 0755 -o root -g root' "$GATE"
 grep -Fq '"$RUN_SPOOL_ROOT" "$RUN_SPOOL_ROOT/$candidate_sha"' "$GATE"
@@ -1250,6 +1263,10 @@ run_new_host_rollback_fixture() (
   PRODUCTION_LINK="$tmp_dir/nonexistent-production-link"
   OLD_MODE=new-host
   ROLLBACK_RESULT=
+  DRAIN_REQUIRED=0
+  DRAIN_ATTEMPTED=0
+  DRAIN_MAY_HAVE_MUTATED=0
+  SPOOL_ENV_DEPLOYMENT=
   systemctl() {
     case "$1" in
       is-active)

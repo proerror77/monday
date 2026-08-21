@@ -1097,14 +1097,22 @@ The drain is bootstrap-safe: it runs the digest-pinned target binary against
 the previous production env. If that spool contains `.jsonl.part` files, the
 candidate takes the per-spool writer lock and preserves root-owned, read-only,
 hash-verified copies plus a source-metadata receipt under the cutover evidence
-directory before changing any part. It derives the exact catalog from archived
+directory before changing any part. The receipt binds the candidate digest,
+deployment source revision, and deployment-bundle digest already verified by
+the host. It derives the exact catalog from archived
 stream-coverage evidence; the previous production env supplies market, dataset,
-and shard identity. After the backup is durable, it drops to the collector owner
-recorded on the spool lock before changing or finalizing any segment. It then
+and shard identity. A same-stem interrupted `.jsonl.zst.tmp` is disposable
+derived output: it is included in the root-owned receipt and backup, then
+removed after the backup is durable. The candidate drops to the collector owner
+recorded on the spool lock before removing that temporary or changing and
+finalizing any segment. It then
 performs streaming `--recover-parts-only` and runs
 `--upload-only` with bounded OSS readback. Recovery never performs live symbol
 discovery and does not depend on the old production binary supporting either
-command. A recovered manifest deliberately preserves its fail-closed replay and
+command. Rollback resumes a partial drain with the deployment environment that
+owns the interrupted spool; an unproven recovery keeps production masked instead
+of restarting a writer that could bypass the recovery checks. A recovered
+manifest deliberately preserves its fail-closed replay and
 readiness evidence; successful OSS triplet upload is not a data-quality verdict,
 so cutover readback reports the recovered manifest's gaps and readiness as-is.
 A new host is accepted

@@ -1031,6 +1031,11 @@ pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBu
                 visit(&path, suffix, files)?;
             } else if file_type.is_file() && path.to_string_lossy().ends_with(suffix) {
                 files.push(path);
+            } else if !file_type.is_file() {
+                anyhow::bail!(
+                    "refusing non-regular entry while scanning spool: {}",
+                    path.display()
+                );
             }
         }
         Ok(())
@@ -1698,6 +1703,7 @@ mod tests {
     #[test]
     fn spool_scan_rejects_root_directory_and_file_symlinks() {
         use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
 
         let root = std::env::temp_dir().join(format!("monday-scan-root-{}", now_ns().unwrap()));
         let outside =
@@ -1723,6 +1729,12 @@ mod tests {
         let error = files_with_suffix(&root, ".manifest.json").unwrap_err();
         assert!(error.to_string().contains("refusing symlink"));
         assert_eq!(fs::read(&outside_file).unwrap(), b"do-not-delete\n");
+        fs::remove_file(root.join("linked.manifest.json")).unwrap();
+
+        let socket = root.join("rogue.zst.tmp");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let error = files_with_suffix(&root, ".zst.tmp").unwrap_err();
+        assert!(error.to_string().contains("refusing non-regular entry"));
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
