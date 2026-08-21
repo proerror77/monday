@@ -263,6 +263,7 @@ setup_fixture() {
       run_id:$run_id,run_spool:$run_spool,
       required_duration_seconds:240,requested_duration_seconds:240,
       health_settle_seconds:240,segment_seconds:120,test_only:false,
+      observation_started_ns:150,
       passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
       markets:{spot:$market,usdm:$usdm_market}}' \
     >"$gate_dir/gate.json"

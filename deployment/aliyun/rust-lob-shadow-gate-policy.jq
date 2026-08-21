@@ -7,6 +7,9 @@ and (.run_id | type) == "string"
 and (.run_id | test("^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$"))
 and .run_spool == ("/data/monday/spool/binance-lob-rust-shadow/runs/"
   + $candidate_sha256 + "/" + .run_id)
+and (.observation_started_ns | type) == "number"
+and .observation_started_ns == (.observation_started_ns | floor)
+and .observation_started_ns > 0
 and .required_duration_seconds == 240
 and .requested_duration_seconds >= .required_duration_seconds
 and .health_settle_seconds == 240
@@ -104,7 +107,9 @@ and all(.markets.spot.oss_roundtrip_evidence[];
   and (.lob_min_ask_levels | type) == "number"
   and .lob_min_ask_levels > 0)
 and (.markets.spot.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].gap_from_previous_ns == 0
+  | $round_trips[0].start_received_at_ns <= $gate.observation_started_ns
+  and $round_trips[0].end_received_at_ns > $gate.observation_started_ns
+  and $round_trips[0].gap_from_previous_ns == 0
   and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.spot.lob_reconnect_boundaries
     == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
@@ -205,7 +210,9 @@ and all(.markets.usdm.oss_roundtrip_evidence[];
   and (.lob_min_ask_levels | type) == "number"
   and .lob_min_ask_levels > 0)
 and (.markets.usdm.oss_roundtrip_evidence as $round_trips
-  | $round_trips[0].gap_from_previous_ns == 0
+  | $round_trips[0].start_received_at_ns <= $gate.observation_started_ns
+  and $round_trips[0].end_received_at_ns > $gate.observation_started_ns
+  and $round_trips[0].gap_from_previous_ns == 0
   and all($round_trips[].lob_reconnect_boundary; . == false)
   and .markets.usdm.lob_reconnect_boundaries
     == ([$round_trips[].lob_reconnect_boundary] | map(select(.)) | length)
