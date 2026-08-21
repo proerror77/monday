@@ -1,14 +1,13 @@
 //! Transactional DuckDB source of truth for the bounded Loop Engineer control plane.
 
 use alpha_domain::{
-    canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    CandidateEvaluation, CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
+    canonical_json_hash, AttributionKind, AttributionMode, CandidateArtifact, CandidateEvaluation,
+    CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
     CexFourStageStrategyCandidateV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
-    CexSealedHoldoutClaimV1, DeploymentEnvelope, EngineKind, EvaluationProtocolV1,
-    FormulaEvaluatorConfig, IterationVerdict, LearningDirective, LiveSmallEligibilityEvidence,
-    LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration,
-    ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision,
-    SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
+    CexSealedHoldoutClaimV1, EngineKind, EvaluationProtocolV1, FormulaEvaluatorConfig,
+    IterationVerdict, LearningDirective, LoopRun, MissionStatus, MissionTerminalReason,
+    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    SearchBudgetUsage, SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact,
     VerifiedRuntimeAttributionEvent, CEX_FINAL_PRECOMMIT_REGISTRY_KIND,
     CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
     ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
@@ -16,6 +15,9 @@ use alpha_domain::{
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
+use governance::{
+    AllowedIntentType, DeploymentEnvelope, LiveSmallEligibilityEvidence, SignedDeploymentEnvelope,
+};
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3409,15 +3411,15 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 mod tests {
     use super::*;
     use alpha_domain::{
-        canonical_json_hash, sign_envelope, sign_runtime_attribution_event,
-        verify_runtime_attribution_event, AllowedIntentType, ApprovalClass, AttributionKind,
-        AttributionMode, AttributionOutcome, DeploymentEnvelope, EngineKind, EvaluationCostsV1,
+        canonical_json_hash, sign_runtime_attribution_event, verify_runtime_attribution_event,
+        AttributionKind, AttributionMode, AttributionOutcome, EngineKind, EvaluationCostsV1,
         EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict,
         LoopCompletionPolicy, LoopRunStatus, LoopTargetStage, MissionCompletionPolicy,
         MissionStatus, PromotionRecord, RuntimeAttributionEvent, SearchBudget,
         SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
     };
     use ed25519_dalek::SigningKey;
+    use governance::{sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope};
     use hft_factor_dsl::{FactorAst, FactorTerminal};
     use hft_research_manifest::ManifestId;
     use std::time::{SystemTime, UNIX_EPOCH};
