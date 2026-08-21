@@ -37,7 +37,6 @@ enum Command {
         #[command(subcommand)]
         command: MissionCommand,
     },
-    #[command(hide = true)]
     Loop {
         #[command(subcommand)]
         command: LoopCommand,
@@ -101,6 +100,7 @@ enum MissionCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoopCommand {
+    #[command(hide = true)]
     Run(Box<LoopRunArgs>),
     Status(LoopStatusArgs),
 }
@@ -873,9 +873,21 @@ mod tests {
     fn help_defaults_to_the_campaign_surface() {
         let mut root = Cli::command();
         let root_help = root.render_help().to_string();
-        assert!(!root_help
+        assert!(root_help
             .lines()
             .any(|line| line.split_whitespace().next() == Some("loop")));
+
+        let loop_help = root
+            .find_subcommand_mut("loop")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(!loop_help
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("run")));
+        assert!(loop_help
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("status")));
 
         let mission_help = root
             .find_subcommand_mut("mission")
