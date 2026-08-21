@@ -97,6 +97,7 @@ struct Config {
     security_token_symbols: Vec<String>,
     excluded_symbols: Arc<RwLock<BTreeSet<String>>>,
     ws_shard_size: usize,
+    usdm_book_ticker_shard_size: usize,
     snapshot_limit: u64,
     snapshot_requests_per_second: f64,
     snapshot_producers: usize,
@@ -401,6 +402,11 @@ impl Config {
             security_token_symbols: catalog.security_token_symbols,
             excluded_symbols: Arc::new(RwLock::new(catalog.excluded_symbols.into_iter().collect())),
             ws_shard_size: env_parse("WS_SHARD_SIZE", 100_usize)?.max(1),
+            usdm_book_ticker_shard_size: env_parse(
+                "USDM_BOOK_TICKER_SHARD_SIZE",
+                20_usize,
+            )?
+            .max(1),
             snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
             snapshot_requests_per_second: env_parse("SNAPSHOT_REQUESTS_PER_SECOND", 15_f64)?,
             snapshot_producers: env_parse("SNAPSHOT_PRODUCERS", 8_usize)?.max(1),
@@ -449,7 +455,8 @@ impl Config {
     }
 
     fn stream_shards(&self) -> Vec<StreamShard> {
-        self.active_symbols()
+        let symbols = self.active_symbols();
+        let mut shards = symbols
             .chunks(self.ws_shard_size)
             .flat_map(|symbols| {
                 let depth_streams = symbols
@@ -550,35 +557,43 @@ impl Config {
                             },
                             StreamShard {
                                 url: format!(
-                                    "wss://fstream.binance.com/public/stream?streams={book_tickers}"
-                                ),
-                                streams: book_ticker_streams,
-                            },
-                            StreamShard {
-                                url: format!(
                                     "wss://fstream.binance.com/market/stream?streams={force_orders}"
                                 ),
                                 streams: force_order_streams,
                             },
                         ]
                     }
-                    Market::Usdm => vec![
-                        StreamShard {
-                            url: format!(
-                                "wss://fstream.binance.com/public/stream?streams={depth}"
-                            ),
-                            streams: depth_streams,
-                        },
-                        StreamShard {
-                            url: format!(
-                                "wss://fstream.binance.com/public/stream?streams={book_tickers}"
-                            ),
-                            streams: book_ticker_streams,
-                        },
-                    ],
+                    Market::Usdm => vec![StreamShard {
+                        url: format!(
+                            "wss://fstream.binance.com/public/stream?streams={depth}"
+                        ),
+                        streams: depth_streams,
+                    }],
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if self.market == Market::Usdm {
+            shards.extend(
+                symbols
+                    .chunks(self.usdm_book_ticker_shard_size)
+                    .map(|symbols| {
+                        let streams = symbols
+                            .iter()
+                            .map(|symbol| {
+                                format!("{}@bookTicker", symbol.to_ascii_lowercase())
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let names = streams.iter().cloned().collect::<Vec<_>>().join("/");
+                        StreamShard {
+                            url: format!(
+                                "wss://fstream.binance.com/public/stream?streams={names}"
+                            ),
+                            streams,
+                        }
+                    }),
+            );
+        }
+        shards
     }
 
     fn active_symbols(&self) -> Vec<String> {
@@ -6274,6 +6289,7 @@ mod tests {
             security_token_symbols: vec![],
             excluded_symbols: Arc::new(RwLock::new(BTreeSet::new())),
             ws_shard_size: 100,
+            usdm_book_ticker_shard_size: 20,
             snapshot_limit: 100,
             snapshot_requests_per_second: 15.0,
             snapshot_producers: 8,
@@ -6515,12 +6531,23 @@ mod tests {
         usdm_config.market = Market::Usdm;
         usdm_config.dataset = "usdm_perpetual_top100_lob".into();
         usdm_config.symbols = (0..100).map(|index| format!("S{index:03}USDT")).collect();
+        usdm_config.ws_shard_size = 25;
         let usdm = usdm_config.stream_shards();
-        assert_eq!(usdm.len(), 2);
+        assert_eq!(usdm.len(), 9);
         assert!(usdm
             .iter()
             .all(|shard| shard.url.starts_with("wss://fstream.binance.com/public/stream")));
         assert_eq!(usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(), 200);
+        assert_eq!(
+            usdm.iter()
+                .filter(|shard| shard
+                    .streams
+                    .iter()
+                    .all(|stream| stream.ends_with("@bookTicker")))
+                .map(|shard| shard.streams.len())
+                .collect::<Vec<_>>(),
+            [20, 20, 20, 20, 20]
+        );
         assert!(usdm.iter().all(|shard| {
             shard
                 .streams
