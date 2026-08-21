@@ -7,6 +7,7 @@ description = "Deterministic Rust trading runtime with signed Paper and Shadow a
 [dependencies]
 # 核心依賴
 alpha-domain = { path = "../../alpha-harness/domain" }
+governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 hft_core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 runtime = { package = "hft-runtime", path = "../../market-core/runtime" }

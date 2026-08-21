@@ -7,10 +7,10 @@
 mod helpers;
 
 use alpha_domain::{
-    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
-    SignedDeploymentEnvelope, StrategyBundle,
+    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent, StrategyBundle,
 };
 use clap::Parser;
+use governance::SignedDeploymentEnvelope;
 use hft_live::deployment_envelope::{
     decode_trusted_keys, ActivationRequest, DeploymentIntake, DeploymentReservation,
     RuntimeAuditLog, RuntimeFeedbackLog, RuntimeNonceLedger, RuntimePolicyDocument,

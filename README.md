@@ -1,6 +1,6 @@
-# Rust Loop Engineer Trading System
+# Monday — Governed Quant Research & Trading System
 
-Rust-first, multi-venue alpha discovery and paper/shadow execution platform. The research plane may acquire governed data, propose and evaluate candidates, learn from failures, and prepare signed deployments. Deterministic Rust runtime code alone owns market connectivity, risk, OMS, reconciliation, cancellation, and execution.
+Rust-first, multi-venue system for governed market-data acquisition, immutable replay, quantitative research, strategy governance, and deterministic Paper/Shadow execution. The research plane may acquire governed data, propose and evaluate candidates, learn from failures, and prepare signed deployments. Deterministic Rust runtime code alone owns market connectivity, risk, OMS, reconciliation, cancellation, and execution.
 
 ## Production Boundary
 
@@ -91,6 +91,8 @@ Ordinary changes should use package-scoped checks. Run a release graph, containe
 ## Entry Points
 
 - [Canonical architecture](rust_hft/ARCHITECTURE.md)
+- [Monday V2 system-boundary ADR](docs/architecture/ADR-0001-monday-v2-system-boundaries.md)
+- [Monday V2 architecture migration plan](docs/superpowers/plans/2026-08-21-monday-v2-architecture-migration.md)
 - [Alpha Harness CLI](rust_hft/alpha-harness/README.md)
 - [Production deployment](rust_hft/deployment/PRODUCTION_DEPLOYMENT.md)
 - [Current approved design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)

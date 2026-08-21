@@ -1,10 +1,10 @@
-use alpha_domain::{
-    deployment_scope_hash, sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
-    RuntimeApprovalEvidence, RuntimeEnvelopePolicy, StrategyBundle,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
-};
+use alpha_domain::{StrategyBundle, SEALED_HOLDOUT_EVALUATOR_VERSION};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use governance::{
+    deployment_scope_hash, sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
+    RuntimeApprovalEvidence, RuntimeEnvelopePolicy, SignedDeploymentEnvelope,
+};
 use hft_live::deployment_envelope::ActivationMode;
 #[cfg(feature = "formula-strategy")]
 use hft_live::deployment_envelope::RuntimeFeedbackLog;
@@ -194,7 +194,7 @@ fn trusted(key: &SigningKey) -> BTreeMap<String, VerifyingKey> {
 }
 
 fn intake<A: RuntimeActivationAdapter>(
-    signed: &alpha_domain::SignedDeploymentEnvelope,
+    signed: &SignedDeploymentEnvelope,
     keys: &BTreeMap<String, VerifyingKey>,
     policy: &RuntimeEnvelopePolicy,
     now: chrono::DateTime<Utc>,
@@ -207,7 +207,7 @@ fn intake<A: RuntimeActivationAdapter>(
 }
 
 fn prepare_intake<A: RuntimeActivationAdapter>(
-    signed: &alpha_domain::SignedDeploymentEnvelope,
+    signed: &SignedDeploymentEnvelope,
     keys: &BTreeMap<String, VerifyingKey>,
     policy: &RuntimeEnvelopePolicy,
     now: chrono::DateTime<Utc>,

@@ -7,12 +7,12 @@ use crate::{
     data_mission,
 };
 use alpha_domain::{
-    canonical_json_hash, deployment_scope_hash, sign_envelope, verify_runtime_attribution_event,
-    ApprovalClass, CandidateArtifact, DeploymentEnvelope, EngineKind, IterationVerdict,
-    MissionStatus, MissionTerminalReason, OnnxModelCandidate, PromotionRecord, ResearchIteration,
-    SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision, SignedRuntimeAttributionEvent,
-    StrategyBundle, VerifiedRuntimeAttributionEvent, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    canonical_json_hash, verify_runtime_attribution_event, CandidateArtifact, EngineKind,
+    IterationVerdict, MissionStatus, MissionTerminalReason, OnnxModelCandidate, PromotionRecord,
+    ResearchIteration, SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision,
+    SignedRuntimeAttributionEvent, StrategyBundle, VerifiedRuntimeAttributionEvent,
+    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     evaluation::prepare_dataset,
@@ -27,6 +27,7 @@ use alpha_store::{
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use governance::{deployment_scope_hash, sign_envelope, ApprovalClass, DeploymentEnvelope};
 use hft_factor_dsl::validate_live_formula;
 use sha2::{Digest, Sha256};
 use std::{
@@ -1230,14 +1231,15 @@ fn read_trusted_attribution_keys(
 mod tests {
     use super::*;
     use alpha_domain::{
-        sign_runtime_attribution_event, AllowedIntentType, EvaluationCostsV1,
-        EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
-        MissionCompletionPolicy, ResearchMission, RuntimeAttributionEvent, SearchBudget,
-        TensorElementType, TensorSpec, ValidatorMode, LOB_ONNX_PREPROCESSING_VERSION,
+        sign_runtime_attribution_event, EvaluationCostsV1, EvaluationLabelSpecV1,
+        EvaluationProtocolV1, EvaluationWalkForwardV1, MissionCompletionPolicy, ResearchMission,
+        RuntimeAttributionEvent, SearchBudget, TensorElementType, TensorSpec, ValidatorMode,
+        LOB_ONNX_PREPROCESSING_VERSION,
     };
     use alpha_engine::evaluation::ResearchRow;
     use alpha_store::{StoredCandidate, StoredEvaluation};
     use chrono::Duration;
+    use governance::AllowedIntentType;
     use std::sync::{Arc, Barrier};
 
     fn evaluation_protocol() -> EvaluationProtocolV1 {

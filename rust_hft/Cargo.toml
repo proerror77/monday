@@ -83,6 +83,9 @@ members = [
     "research-core/ml",
     "research-core/search-kernel",
 
+    # Governance contracts shared by research producers and the runtime
+    "governance-contracts",
+
     # Bounded Loop Engineer research plane
     "alpha-harness/domain",
     "alpha-harness/store",

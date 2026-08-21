@@ -614,6 +614,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hft-factor-dsl",
+ "hft-governance-contracts",
  "hft-research-manifest",
  "serde",
  "serde_json",
@@ -659,6 +660,7 @@ dependencies = [
  "hft-backtest",
  "hft-collector",
  "hft-factor-dsl",
+ "hft-governance-contracts",
  "hft-research-manifest",
  "parquet",
  "reqwest 0.12.28",
@@ -692,6 +694,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hft-factor-dsl",
+ "hft-governance-contracts",
  "hft-research-manifest",
  "hmac",
  "serde",
@@ -5319,27 +5322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-examples"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "clap",
- "core_affinity",
- "futures",
- "hft-core",
- "hft-data-adapter-binance",
- "hft-engine",
- "hft-ports",
- "hft-runtime",
- "rust_decimal",
- "serde_yaml",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hft-execution"
 version = "0.1.0"
 dependencies = [
@@ -5619,6 +5601,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-governance-contracts"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hft-grpc-server"
 version = "0.1.0"
 dependencies = [
@@ -5779,6 +5774,7 @@ dependencies = [
  "hft-core",
  "hft-data",
  "hft-engine",
+ "hft-governance-contracts",
  "hft-grpc-server",
  "hft-infra-metrics",
  "hft-ports",
@@ -8027,17 +8023,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
-name = "polymarket-tape-contract"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8073,6 +8058,17 @@ checksum = "ec242d7eccbb2fd8b3b5b6e3cf89f94a91a800f469005b44d154359609f8af72"
 dependencies = [
  "higher-kinded-types",
  "never-say-never",
+]
+
+[[package]]
+name = "polymarket-tape-contract"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
