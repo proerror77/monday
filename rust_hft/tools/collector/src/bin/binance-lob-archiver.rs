@@ -3914,8 +3914,43 @@ fn event_from_frame_for_shard(
         .get("stream")
         .and_then(Value::as_str)
         .and_then(|stream| stream.rsplit_once('@').map(|(_, channel)| channel));
+    let is_depth = frame
+        .get("stream")
+        .and_then(Value::as_str)
+        .is_some_and(|stream| stream.contains("@depth"));
     let is_raw_trade = channel.is_some_and(|channel| channel.eq_ignore_ascii_case("trade"));
     if !channel.is_some_and(|channel| channel.eq_ignore_ascii_case("bookTicker")) {
+        if is_depth {
+            let source_clock = match DepthSourceClock::from_frame(&frame, received_at_ns) {
+                Ok(source_clock) => source_clock,
+                Err(strict_error) => {
+                    let data = frame.get("data").unwrap_or(&frame);
+                    let event_time_ms = data.get("E").and_then(Value::as_u64);
+                    let value_or_missing = |value: Option<u64>| {
+                        value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
+                    };
+                    anyhow::bail!(
+                        "{strict_error:#}; stream={} symbol={} E={} T={} U={} u={} pu={} received_at_ns={received_at_ns} recv_minus_event_ms={} governed_limit_ms={MAX_SOURCE_DELAY_MS} producer_id={producer_id}",
+                        frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
+                        data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
+                        value_or_missing(event_time_ms),
+                        value_or_missing(data.get("T").and_then(Value::as_u64)),
+                        value_or_missing(data.get("U").and_then(Value::as_u64)),
+                        value_or_missing(data.get("u").and_then(Value::as_u64)),
+                        value_or_missing(data.get("pu").and_then(Value::as_u64)),
+                        value_or_missing(event_time_ms.map(|event_time_ms| {
+                            (received_at_ns / 1_000_000).saturating_sub(event_time_ms)
+                        })),
+                    );
+                }
+            };
+            let diff = DepthDiff::from_frame(&frame)?;
+            return Ok(Event::Diff {
+                received_at_ns,
+                frame,
+                depth: Box::new(ValidatedDepth { diff, source_clock }),
+            });
+        }
         if !is_raw_trade {
             return event_from_frame(frame, received_at_ns);
         }
@@ -7454,6 +7489,34 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported Binance research stream"));
+    }
+
+    #[test]
+    fn stale_depth_error_identifies_symbol_shard_and_delay() {
+        let received_at_ns = 1_700_000_031_000_000_000;
+        let frame = json!({
+            "stream": "btcusdt@depth@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "E": 1_700_000_000_000_u64,
+                "s": "BTCUSDT",
+                "U": 10,
+                "u": 11,
+                "b": [],
+                "a": [],
+            },
+        });
+
+        let error = event_from_frame_for_shard(frame, received_at_ns, 7)
+            .expect_err("stale depth must remain fail closed")
+            .to_string();
+        assert!(error.contains("depth E source-to-receive delay"));
+        assert!(error.contains("stream=btcusdt@depth@100ms"));
+        assert!(error.contains("symbol=BTCUSDT"));
+        assert!(error.contains("U=10 u=11 pu=<missing>"));
+        assert!(error.contains("recv_minus_event_ms=31000"));
+        assert!(error.contains("governed_limit_ms=30000"));
+        assert!(error.contains("producer_id=7"));
     }
 
     #[test]
