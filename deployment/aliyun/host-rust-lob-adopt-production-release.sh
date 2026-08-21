@@ -108,7 +108,10 @@ validate_production_assets() {
       dataset=spot_all
     else
       file=$USDM_ENV
-      dataset=usdm_perpetual_all
+      dataset=$(env_value "$file" DATASET) \
+        || die "$file has no DATASET"
+      [[ $dataset == usdm_perpetual_all || $dataset == usdm_perpetual_top100_lob ]] \
+        || die "$file has an unsupported USD-M DATASET=$dataset"
     fi
     spool="/data/monday/spool/binance-lob/$market"
     require_secure_file "$file"
@@ -188,7 +191,9 @@ capture_health_state() {
   case "$market" in
     spot) expected_dataset=spot_all; minimum_symbols=1000 ;;
     usdm)
-      expected_dataset=usdm_perpetual_all
+      expected_dataset=$(env_value "$USDM_ENV" DATASET) || return 1
+      [[ $expected_dataset == usdm_perpetual_all \
+        || $expected_dataset == usdm_perpetual_top100_lob ]] || return 1
       if [[ $(env_value "$USDM_ENV" SYMBOLS) == ALL ]]; then
         minimum_symbols=400
       else
@@ -281,6 +286,7 @@ verify_candidate_release() {
   require_secure_file "$CANDIDATE_UPLOAD"
   require_secure_file "$candidate_usdm_env"
   require_secure_file "$gate_policy"
+  require_env_value "$candidate_usdm_env" DATASET usdm_perpetual_top100_lob
   require_line "$CANDIDATE_UPLOAD" 'AssertPathIsMountPoint=/data'
   require_line "$CANDIDATE_UPLOAD" \
     'ExecStart=/opt/monday/bin/binance-lob-archiver --upload-only'

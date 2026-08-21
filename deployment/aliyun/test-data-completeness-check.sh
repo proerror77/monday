@@ -42,7 +42,7 @@ BUCKET=monday-lob-apne1-1045353359
 FAKE_SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 P_SPOT='lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all'
-P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all'
+P_USDM='lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all'
 P_BYBIT='lake/raw/venue=bybit/market=option/dataset=options_quotes'
 P_POLY='lake/raw/venue=polymarket/dataset=crypto_expiry'
 P_REF='lake/raw/venue=binance_usdm/dataset=reference'
@@ -123,6 +123,7 @@ run_check() {
 reset_env() {
   STUB_ALIYUN_FAIL_MATCH=""
   unset COMPLETENESS_WINDOW_DAYS
+  unset COMPLETENESS_START_EPOCH_USDM
   : >"$call_log"
 }
 
@@ -280,6 +281,15 @@ remove_partition "$P_SPOT" 2026-08-15 08
 run_check --json
 expect 'grace: absent post-grace hour breaches' \
   "$(rc_is 1 && json_query '.datasets["binance-spot"].missing_partitions == ["date=2026-08-15/hour=08"]' && echo 0 || echo 1)"
+
+# --- USD-M activation boundary ---------------------------------------------
+reset_env
+reset_lake
+make_complete_lake
+rm -rf "$fake_oss/$P_USDM/date=2026-08-13" "$fake_oss/$P_USDM/date=2026-08-14"
+run_check --json
+expect 'usdm pre-launch hours are excluded from the inferred activation boundary' \
+  "$(rc_is 0 && json_query '.datasets["binance-usdm"].expected_hours == 9 and .datasets["binance-usdm"].present_hours == 9 and .datasets["binance-usdm"].activation_start_source == "inferred_first_landed_hour"' && echo 0 || echo 1)"
 
 # --- scenario: reference hour presence --------------------------------------
 reset_env

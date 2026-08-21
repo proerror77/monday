@@ -37,6 +37,8 @@ const MAX_SLICE_ROWS: u64 = 10_000_000;
 const MAX_SOURCE_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const SESSION_ROW_SLACK_BYTES: u64 = 4 * 1024;
 const COMPRESSION_LEVEL: i32 = 3;
+const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const USDM_LOB_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -328,12 +330,26 @@ fn validate_source_manifest(manifest: &Map<String, Value>) -> Result<()> {
             bail!("v2 source manifest stream types are malformed");
         }
     }
-    if manifest
-        .get("trade_summary_contract")
-        .and_then(Value::as_str)
-        != Some(AGGREGATE_TRADE_SUMMARY_CONTRACT)
+    let requires_trade_contract = !manifest_is_usdm_lob_only(manifest);
+    if requires_trade_contract
+        && manifest
+            .get("trade_summary_contract")
+            .and_then(Value::as_str)
+            != Some(AGGREGATE_TRADE_SUMMARY_CONTRACT)
     {
         bail!("source segment is missing the aggregate-trade summary contract");
+    }
+    if !requires_trade_contract
+        && [
+            "trade_representation",
+            "price_surface_derivation",
+            "trade_summary_contract",
+            "trade_summaries",
+        ]
+        .iter()
+        .any(|field| manifest.contains_key(*field))
+    {
+        bail!("USD-M LOB-only source carries trade-summary metadata");
     }
     let flags_ok = manifest
         .get("has_replay_safe_checkpoint")
@@ -365,6 +381,25 @@ fn validate_source_manifest(manifest: &Map<String, Value>) -> Result<()> {
         bail!("source manifest snapshot limit must be nonzero");
     }
     Ok(())
+}
+
+fn manifest_is_usdm_lob_only(manifest: &Map<String, Value>) -> bool {
+    manifest.get("market").and_then(Value::as_str) == Some("usdm")
+        && manifest.get("dataset").and_then(Value::as_str) == Some(USDM_LOB_DATASET)
+        && manifest
+            .get("schema")
+            .and_then(Value::as_str)
+            == Some(MARKET_TAPE_SCHEMA_V2)
+        && manifest
+            .get("stream_types")
+            .and_then(Value::as_array)
+            .is_some_and(|stream_types| {
+                stream_types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == USDM_LOB_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
+            })
 }
 
 fn selected_symbols(raw: Option<&str>, declared: &BTreeSet<String>) -> Result<Vec<String>> {
@@ -759,7 +794,9 @@ fn publish_slice(
             bail!("slice would not carry a replay-safe checkpoint for {symbol}");
         }
     }
-    if event_types.get("agg_trade").copied().unwrap_or(0) == 0 {
+    if !manifest_is_usdm_lob_only(source_manifest)
+        && event_types.get("agg_trade").copied().unwrap_or(0) == 0
+    {
         let _ = fs::remove_file(&temporary);
         bail!("slice carries no aggregate trades and cannot pass the LOB continuity gate");
     }
@@ -924,10 +961,21 @@ fn slice_manifest(
     manifest.insert("file".to_string(), Value::from(data_name));
     manifest.insert("bytes".to_string(), Value::from(compressed_bytes));
     manifest.insert("sha256".to_string(), Value::from(content_sha256));
-    manifest.insert(
-        "trade_summaries".to_string(),
-        serde_json::to_value(&trade_summaries)?,
-    );
+    if manifest_is_usdm_lob_only(source) {
+        for field in [
+            "trade_representation",
+            "price_surface_derivation",
+            "trade_summary_contract",
+            "trade_summaries",
+        ] {
+            manifest.remove(field);
+        }
+    } else {
+        manifest.insert(
+            "trade_summaries".to_string(),
+            serde_json::to_value(&trade_summaries)?,
+        );
+    }
     manifest.insert(
         "lob_continuity".to_string(),
         serde_json::to_value(&lob_continuity)?,

@@ -426,10 +426,11 @@ impl Config {
     }
 
     /// Declared per-symbol stream-type list carried by the v2 tape manifest
-    /// and repeated by every session_start row. Liquidation orders are USD-M
-    /// only, so spot tapes declare one fewer stream type.
+    /// and repeated by every session_start row. Spot keeps the full tape;
+    /// USD-M uses the dedicated depth/bookTicker LOB-first contract, while
+    /// the legacy full-tape dataset keeps its recorded five stream families.
     fn stream_types(&self) -> Vec<String> {
-        stream_types_for_market(self.market)
+        stream_types_for_dataset(self.market, &self.dataset)
     }
 
     fn segment_config(&self) -> SegmentConfig {
@@ -455,58 +456,74 @@ impl Config {
                     .iter()
                     .map(|symbol| format!("{}@depth@100ms", symbol.to_ascii_lowercase()))
                     .collect::<BTreeSet<_>>();
-                let aggregate_trade_streams = symbols
-                    .iter()
-                    .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
-                    .collect::<BTreeSet<_>>();
-                let trade_streams = symbols
-                    .iter()
-                    .map(|symbol| format!("{}@trade", symbol.to_ascii_lowercase()))
-                    .collect::<BTreeSet<_>>();
                 let book_ticker_streams = symbols
                     .iter()
                     .map(|symbol| format!("{}@bookTicker", symbol.to_ascii_lowercase()))
                     .collect::<BTreeSet<_>>();
                 let depth = depth_streams.iter().cloned().collect::<Vec<_>>().join("/");
-                let aggregate_trades = aggregate_trade_streams
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let trades = trade_streams.iter().cloned().collect::<Vec<_>>().join("/");
                 let book_tickers = book_ticker_streams
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("/");
                 match self.market {
-                    Market::Spot => vec![
-                        StreamShard {
-                            url: format!("wss://data-stream.binance.vision/stream?streams={depth}"),
-                            streams: depth_streams,
-                        },
-                        StreamShard {
-                            url: format!(
-                                "wss://data-stream.binance.vision/stream?streams={aggregate_trades}"
-                            ),
-                            streams: aggregate_trade_streams,
-                        },
-                        StreamShard {
-                            url: format!("wss://data-stream.binance.vision/stream?streams={trades}"),
-                            streams: trade_streams,
-                        },
-                        StreamShard {
-                            url: format!(
-                                "wss://data-stream.binance.vision/stream?streams={book_tickers}"
-                            ),
-                            streams: book_ticker_streams,
-                        },
-                    ],
-                    Market::Usdm => {
+                    Market::Spot => {
+                        let aggregate_trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@trade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let aggregate_trades = aggregate_trade_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        let trades = trade_streams.iter().cloned().collect::<Vec<_>>().join("/");
+                        vec![
+                            StreamShard {
+                                url: format!("wss://data-stream.binance.vision/stream?streams={depth}"),
+                                streams: depth_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://data-stream.binance.vision/stream?streams={aggregate_trades}"
+                                ),
+                                streams: aggregate_trade_streams,
+                            },
+                            StreamShard {
+                                url: format!("wss://data-stream.binance.vision/stream?streams={trades}"),
+                                streams: trade_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://data-stream.binance.vision/stream?streams={book_tickers}"
+                                ),
+                                streams: book_ticker_streams,
+                            },
+                        ]
+                    }
+                    Market::Usdm if is_legacy_usdm_dataset(&self.dataset) => {
+                        let aggregate_trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@trade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
                         let force_order_streams = symbols
                             .iter()
                             .map(|symbol| format!("{}@forceOrder", symbol.to_ascii_lowercase()))
                             .collect::<BTreeSet<_>>();
+                        let aggregate_trades = aggregate_trade_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        let trades = trade_streams.iter().cloned().collect::<Vec<_>>().join("/");
                         let force_orders = force_order_streams
                             .iter()
                             .cloned()
@@ -514,7 +531,9 @@ impl Config {
                             .join("/");
                         vec![
                             StreamShard {
-                                url: format!("wss://fstream.binance.com/public/stream?streams={depth}"),
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={depth}"
+                                ),
                                 streams: depth_streams,
                             },
                             StreamShard {
@@ -543,6 +562,20 @@ impl Config {
                             },
                         ]
                     }
+                    Market::Usdm => vec![
+                        StreamShard {
+                            url: format!(
+                                "wss://fstream.binance.com/public/stream?streams={depth}"
+                            ),
+                            streams: depth_streams,
+                        },
+                        StreamShard {
+                            url: format!(
+                                "wss://fstream.binance.com/public/stream?streams={book_tickers}"
+                            ),
+                            streams: book_ticker_streams,
+                        },
+                    ],
                 }
             })
             .collect()
@@ -1170,8 +1203,8 @@ fn recover_parts_only() -> anyhow::Result<()> {
     let nonempty_parts =
         validated_nonempty_recovery_parts(&parts, recovery_uid, recovery_gid)?;
     backup_recovery_parts(&spool_dir, &backup_dir, &parts, market, &dataset, &shard_id)?;
+    let stream_types = stream_types_for_recovery(market, &dataset)?;
     drop_recovery_privileges(recovery_uid, recovery_gid)?;
-    let stream_types = stream_types_for_market(market);
     let symbols = if nonempty_parts.is_empty() {
         Vec::new()
     } else {
@@ -1256,16 +1289,49 @@ fn drop_recovery_privileges(uid: u32, gid: u32) -> anyhow::Result<()> {
 }
 
 fn stream_types_for_market(market: Market) -> Vec<String> {
-    let mut stream_types = vec![
-        "depth@100ms".to_owned(),
-        "aggTrade".to_owned(),
-        "trade".to_owned(),
-        "bookTicker".to_owned(),
-    ];
-    if market == Market::Usdm {
-        stream_types.push("forceOrder".to_owned());
+    match market {
+        Market::Spot => vec![
+            "depth@100ms".to_owned(),
+            "aggTrade".to_owned(),
+            "trade".to_owned(),
+            "bookTicker".to_owned(),
+        ],
+        // USD-M is intentionally LOB-first: only the depth and book-ticker
+        // public routes are part of this dataset identity.
+        Market::Usdm => vec!["depth@100ms".to_owned(), "bookTicker".to_owned()],
     }
-    stream_types
+}
+
+fn is_legacy_usdm_dataset(dataset: &str) -> bool {
+    matches!(dataset, "usdm_all" | "usdm_perpetual_all")
+}
+
+fn stream_types_for_dataset(market: Market, dataset: &str) -> Vec<String> {
+    if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
+        vec![
+            "depth@100ms".to_owned(),
+            "aggTrade".to_owned(),
+            "trade".to_owned(),
+            "bookTicker".to_owned(),
+            "forceOrder".to_owned(),
+        ]
+    } else {
+        stream_types_for_market(market)
+    }
+}
+
+fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Vec<String>> {
+    match (market, dataset) {
+        (Market::Spot, "spot_all") => Ok(stream_types_for_market(Market::Spot)),
+        // A canonical drain starts with the old deployment environment when
+        // it must consume a residual full-tape USD-M part.  Keep that
+        // recorded five-family contract distinct from the new LOB identity.
+        (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
+            Ok(stream_types_for_dataset(Market::Usdm, dataset))
+        }
+        (Market::Usdm, "usdm_perpetual_top100_lob") => Ok(stream_types_for_market(Market::Usdm)),
+        _ => anyhow::bail!("unsupported recovery market/dataset identity: {market:?}/{dataset}"),
+    }
 }
 
 fn discover_recovery_catalog(
@@ -2868,7 +2934,7 @@ fn replay_seed_ready(
         && process_state.depth_streams_healthy()
         && process_state.sequence_gaps == 0
         && process_state.stream_coverage_trusted
-        && segment.event_count("agg_trade") > 0
+        && (!segment.requires_aggregate_trades() || segment.event_count("agg_trade") > 0)
         && !states.is_empty()
         && states.values().all(OrderBookState::continuity_complete)
 }
@@ -4969,6 +5035,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_stream_contract_follows_recorded_dataset_identity() {
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, "usdm_perpetual_all").unwrap(),
+            vec![
+                "depth@100ms".to_owned(),
+                "aggTrade".to_owned(),
+                "trade".to_owned(),
+                "bookTicker".to_owned(),
+                "forceOrder".to_owned()
+            ]
+        );
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, "usdm_perpetual_top100_lob").unwrap(),
+            vec!["depth@100ms".to_owned(), "bookTicker".to_owned()]
+        );
+        assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());
+    }
+
+    #[test]
     fn recovery_backup_is_read_only_and_receipted_before_mutation() {
         let root = tempfile::tempdir().unwrap();
         let spool = root.path().join("spool");
@@ -6164,29 +6249,38 @@ mod tests {
 
         let mut usdm_config = test_config("http://unused".into());
         usdm_config.market = Market::Usdm;
-        usdm_config.dataset = "usdm_all".into();
+        usdm_config.dataset = "usdm_perpetual_top100_lob".into();
+        usdm_config.symbols = (0..100).map(|index| format!("S{index:03}USDT")).collect();
         let usdm = usdm_config.stream_shards();
-        assert_eq!(usdm.len(), 5);
-        for (stream, url_prefix) in [
-            (
-                "btcusdt@depth@100ms",
-                "wss://fstream.binance.com/public/stream",
-            ),
-            ("btcusdt@aggTrade", "wss://fstream.binance.com/market/stream"),
-            ("btcusdt@trade", "wss://fstream.binance.com/public/stream"),
-            ("btcusdt@bookTicker", "wss://fstream.binance.com/public/stream"),
-            (
-                "btcusdt@forceOrder",
-                "wss://fstream.binance.com/market/stream",
-            ),
-        ] {
-            assert!(usdm.iter().any(|shard| {
-                shard.url.starts_with(url_prefix)
-                    && shard.streams.contains(stream)
-                    && shard.streams.len() == 1
-            }), "usdm shard for {stream}");
-        }
-        // Liquidation orders are USD-M only: spot never subscribes forceOrder.
+        assert_eq!(usdm.len(), 2);
+        assert!(usdm
+            .iter()
+            .all(|shard| shard.url.starts_with("wss://fstream.binance.com/public/stream")));
+        assert_eq!(usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(), 200);
+        assert!(usdm.iter().all(|shard| {
+            shard
+                .streams
+                .iter()
+                .all(|stream| stream.ends_with("@depth@100ms") || stream.ends_with("@bookTicker"))
+        }));
+        assert!(!usdm.iter().any(|shard| {
+            shard.streams.iter().any(|stream| {
+                stream.ends_with("@aggTrade")
+                    || stream.ends_with("@trade")
+                    || stream.ends_with("@forceOrder")
+            })
+        }));
+        let mut legacy_config = test_config("http://unused".into());
+        legacy_config.market = Market::Usdm;
+        legacy_config.dataset = "usdm_perpetual_all".into();
+        let legacy = legacy_config.stream_shards();
+        assert_eq!(legacy.len(), 5);
+        assert_eq!(
+            legacy_config.stream_types(),
+            ["depth@100ms", "aggTrade", "trade", "bookTicker", "forceOrder"]
+        );
+        // Liquidation orders are USD-M only in the legacy/full-tape contract;
+        // the LOB-first USD-M dataset deliberately does not subscribe them.
         assert!(spot
             .iter()
             .all(|shard| !shard.streams.contains("btcusdt@forceOrder")));
@@ -6196,8 +6290,50 @@ mod tests {
         );
         assert_eq!(
             usdm_config.stream_types(),
-            ["depth@100ms", "aggTrade", "trade", "bookTicker", "forceOrder"]
+            ["depth@100ms", "bookTicker"]
         );
+    }
+
+    #[test]
+    fn usdm_lob_segment_can_seed_without_aggregate_trades() {
+        let root = tempfile::Builder::new()
+            .prefix("monday-usdm-lob-seed-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.dataset = "usdm_perpetual_top100_lob".into();
+        config.spool_dir = root.path().to_path_buf();
+        let mut state = OrderBookState::new("BTCUSDT", Market::Usdm);
+        let mut budget = PendingBudget::new(1);
+        state.verify_stream_coverage();
+        state
+            .install_snapshot(&json!({
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]]
+            }), &mut budget)
+            .unwrap();
+        state
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: Some(100),
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        let states = HashMap::from([(String::from("BTCUSDT"), state)]);
+        let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        assert!(replay_seed_ready(
+            &segment,
+            &states,
+            &ProcessState::new(true)
+        ));
     }
 
     #[test]
@@ -7044,32 +7180,6 @@ mod tests {
         })
     }
 
-    fn observed_usdm_cys_raw_trade_frame(
-        id: u64,
-        event_time_ms: u64,
-        trade_time_ms: u64,
-        price: &str,
-        quantity: &str,
-        execution_type: &str,
-        is_buyer_maker: bool,
-    ) -> Value {
-        json!({
-            "stream": "cysusdt@trade",
-            "data": {
-                "e": "trade",
-                "E": event_time_ms,
-                "s": "CYSUSDT",
-                "t": id,
-                "p": price,
-                "q": quantity,
-                "T": trade_time_ms,
-                "X": execution_type,
-                "m": is_buyer_maker,
-                "st": 1
-            }
-        })
-    }
-
     #[rustfmt::skip]
     fn book_ticker_frame(received_at_ns: u64) -> Value {
         let event_time_ms = received_at_ns / 1_000_000 - 1;
@@ -7659,7 +7769,7 @@ mod tests {
     }
 
     #[test]
-    fn binance_frame_to_upload_only_contract_covers_every_usdm_stream() {
+    fn binance_frame_to_upload_only_contract_covers_usdm_lob_streams() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -7669,14 +7779,12 @@ mod tests {
         let dirs = UploadTestDir::new();
         let mut config = test_config("http://unused".into());
         config.market = Market::Usdm;
-        config.dataset = "usdm_all".into();
+        config.dataset = "usdm_perpetual_top100_lob".into();
         config.symbols = vec!["CYSUSDT".into()];
         config.spool_dir = dirs.spool.clone();
         let session_id = "session-usdm-upload-only";
-        let first_trade_received_at_ns = 1_786_437_637_142_000_000;
-        let last_trade_received_at_ns = 1_786_437_637_153_000_000;
         let pre_trade_received_at_ns = 1_786_437_637_137_000_000;
-        let segment_start = first_trade_received_at_ns - 20_000_000;
+        let segment_start = pre_trade_received_at_ns - 20_000_000;
         let mut segment = Segment::create(config.segment_config(), segment_start).unwrap();
         let stream_types = config.stream_types();
         segment
@@ -7758,134 +7866,11 @@ mod tests {
                         pre_trade_received_at_ns,
                     ),
                 ],
-                "aggTrade" => vec![
-                    (
-                        json!({
-                            "stream": "cysusdt@aggTrade",
-                            "data": {
-                                "e": "aggTrade",
-                                "E": 1_786_437_637_136_u64,
-                                "s": "CYSUSDT",
-                                "a": 1,
-                                "f": 1,
-                                "l": 1,
-                                "p": "101",
-                                "q": "0.2",
-                                "T": 1_786_437_637_136_u64,
-                                "m": true,
-                            },
-                        }),
-                        pre_trade_received_at_ns + 1_000_000,
-                    ),
-                ],
-                // Receive times are deterministic test delivery clocks, not captured payload fields.
-                "trade" => vec![
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193461,
-                            1_786_437_637_137,
-                            1_786_437_637_137,
-                            "1.3910000",
-                            "4",
-                            "MARKET",
-                            false,
-                        ),
-                        first_trade_received_at_ns,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193462,
-                            1_786_437_637_138,
-                            1_786_437_637_138,
-                            "1.3907000",
-                            "16",
-                            "MARKET",
-                            false,
-                        ),
-                        first_trade_received_at_ns + 2_000_000,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193463,
-                            1_786_437_637_139,
-                            1_786_437_637_139,
-                            "1.3906000",
-                            "29",
-                            "MARKET",
-                            false,
-                        ),
-                        first_trade_received_at_ns + 4_000_000,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193464,
-                            1_786_437_637_139,
-                            1_786_437_637_139,
-                            "0",
-                            "0",
-                            "INSURANCE_FUND",
-                            false,
-                        ),
-                        first_trade_received_at_ns + 5_000_000,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193465,
-                            1_786_437_637_140,
-                            1_786_437_637_139,
-                            "1.3906000",
-                            "54",
-                            "MARKET",
-                            false,
-                        ),
-                        first_trade_received_at_ns + 7_000_000,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193466,
-                            1_786_437_637_140,
-                            1_786_437_637_139,
-                            "1.3907000",
-                            "67",
-                            "MARKET",
-                            false,
-                        ),
-                        first_trade_received_at_ns + 8_000_000,
-                    ),
-                    (
-                        observed_usdm_cys_raw_trade_frame(
-                            110193467,
-                            1_786_437_637_142,
-                            1_786_437_637_142,
-                            "1.3905000",
-                            "6",
-                            "MARKET",
-                            true,
-                        ),
-                        last_trade_received_at_ns,
-                    ),
-                ],
                 "bookTicker" => {
-                    let stale_received_at_ns = last_trade_received_at_ns + 1_000_000;
-                    let stale_event_time_ms = stale_received_at_ns / 1_000_000 - 31_000;
-                    let mut stale = book_ticker_frame(stale_received_at_ns);
-                    stale["stream"] = json!("cysusdt@bookTicker");
-                    stale["data"]["s"] = json!("CYSUSDT");
-                    stale["data"]["E"] = json!(stale_event_time_ms);
-                    stale["data"].as_object_mut().unwrap().remove("T");
-                    let mut current = book_ticker_frame(last_trade_received_at_ns + 2_000_000);
+                    let mut current = book_ticker_frame(pre_trade_received_at_ns + 1_000_000);
                     current["stream"] = json!("cysusdt@bookTicker");
                     current["data"]["s"] = json!("CYSUSDT");
-                    vec![
-                        (stale, stale_received_at_ns),
-                        (current, last_trade_received_at_ns + 2_000_000),
-                    ]
-                }
-                "forceOrder" => {
-                    let mut frame = force_order_frame(last_trade_received_at_ns + 2_000_000);
-                    frame["stream"] = json!("cysusdt@forceOrder");
-                    frame["data"]["o"]["s"] = json!("CYSUSDT");
-                    vec![(frame, last_trade_received_at_ns + 2_000_000)]
+                    vec![(current, pre_trade_received_at_ns + 1_000_000)]
                 }
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
             };
@@ -7916,10 +7901,11 @@ mod tests {
         .expect("USD-M contract segment must be non-empty");
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["event_types"]["raw_trade"], 6);
-        assert_eq!(manifest["event_types"]["raw_trade_zero_price"], 1);
-        assert_eq!(manifest["event_types"]["stale_book_ticker"], 1);
+        assert_eq!(manifest["event_types"].get("raw_trade").and_then(Value::as_u64), None);
+        assert_eq!(manifest["event_types"].get("agg_trade").and_then(Value::as_u64), None);
+        assert_eq!(manifest["event_types"].get("force_order").and_then(Value::as_u64), None);
         assert_eq!(manifest["event_types"]["book_ticker"], 1);
+        assert_eq!(manifest["stream_types"], json!(["depth@100ms", "bookTicker"]));
         assert_eq!(manifest["lob_continuity"]["sequence_gaps"], 0);
         assert_eq!(process_state.sequence_gaps, 0);
 

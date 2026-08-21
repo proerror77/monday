@@ -324,7 +324,7 @@ is_usdm_top100 "${configured_symbols[usdm]}" \
 min_symbols[spot]=1000
 min_symbols[usdm]=100
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
-expected_stream_types[usdm]='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
+expected_stream_types[usdm]='["bookTicker","depth@100ms"]'
 
 for asset in \
   binance-lob-archiver-rust@.service \
@@ -362,7 +362,7 @@ for path in /data/monday/spool/binance-lob-rust-shadow \
   direct_directory "$path" || die "shadow spool is missing or indirect: $path"
 done
 [[ ${dataset[spot]} == spot_all_rust_shadow ]] || die 'Spot dataset is not isolated'
-[[ ${dataset[usdm]} == usdm_perpetual_all_rust_shadow ]] \
+[[ ${dataset[usdm]} == usdm_perpetual_top100_lob_rust_shadow ]] \
   || die 'USD-M dataset is not isolated'
 
 assert_spool_empty() {
@@ -1005,8 +1005,18 @@ verify_market_readback() {
        and (.file|type) == "string" and (.file|test("^[A-Za-z0-9._-]+\\.jsonl\\.zst$"))
        and (.sha256|type) == "string" and (.sha256|test("^[a-f0-9]{64}$"))
        and .has_replay_safe_checkpoint == true
-       and .trade_summary_contract == "binance.aggregate_trade_summary.v1"
-       and (.trade_summaries|type) == "object" and (.trade_summaries|length) > 0
+       and (if $market == "usdm" then
+         (has("trade_summary_contract") | not)
+         and (has("trade_summaries") | not)
+         and ((.event_types.agg_trade // 0) == 0)
+         and ((.event_types.raw_trade // 0) == 0)
+         and ((.event_types.force_order // 0) == 0)
+         and (.event_types.book_ticker | type) == "number"
+         and .event_types.book_ticker > 0
+       else
+         .trade_summary_contract == "binance.aggregate_trade_summary.v1"
+         and (.trade_summaries|type) == "object" and (.trade_summaries|length) > 0
+       end)
        and .lob_continuity.contract == "binance.lob_continuity.v1"
        and .lob_continuity.capture_session_id == $session
        and .lob_continuity.sequence_gaps == 0
@@ -1017,8 +1027,10 @@ verify_market_readback() {
        and .stream_coverage_verified_count == (.symbols|length)
        and .all_stream_coverage_verified == true
        and (.stream_types|sort) == $expected_streams
-       and (.event_types.agg_trade|type) == "number" and .event_types.agg_trade > 0
-       and (.event_types.raw_trade|type) == "number" and .event_types.raw_trade > 0
+       and (if $market == "usdm" then true
+         else (.event_types.agg_trade|type) == "number" and .event_types.agg_trade > 0
+           and (.event_types.raw_trade|type) == "number" and .event_types.raw_trade > 0
+       end)
        and (.event_types.book_ticker|type) == "number" and .event_types.book_ticker > 0' \
       "$manifest" >/dev/null \
       || die "$market manifest failed soak readback validation: $uri"
@@ -1081,14 +1093,16 @@ verify_market_readback() {
   run_strict_verifier --require-lob-continuity "${continuity_args[@]}" \
     >"$evidence_dir/${market}-lob-continuity.txt" 2>&1 \
     || die "$market strict LOB continuity verifier failed"
-  local -a aggregate_args=(--verify-aggregate-trade-continuity "${continuity_args[@]}")
-  run_strict_verifier "${aggregate_args[@]}" \
-    >"$evidence_dir/${market}-aggregate-continuity.txt" 2>&1 \
-    || die "$market aggregate continuity verifier failed"
-  local -a raw_args=(--verify-raw-trade-continuity "${continuity_args[@]}")
-  run_strict_verifier "${raw_args[@]}" \
-    >"$evidence_dir/${market}-raw-trade-continuity.txt" 2>&1 \
-    || die "$market raw-trade continuity verifier failed"
+  if [[ $market == spot ]]; then
+    local -a aggregate_args=(--verify-aggregate-trade-continuity "${continuity_args[@]}")
+    run_strict_verifier "${aggregate_args[@]}" \
+      >"$evidence_dir/${market}-aggregate-continuity.txt" 2>&1 \
+      || die "$market aggregate continuity verifier failed"
+    local -a raw_args=(--verify-raw-trade-continuity "${continuity_args[@]}")
+    run_strict_verifier "${raw_args[@]}" \
+      >"$evidence_dir/${market}-raw-trade-continuity.txt" 2>&1 \
+      || die "$market raw-trade continuity verifier failed"
+  fi
 }
 
 soak_completed=false

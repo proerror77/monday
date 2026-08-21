@@ -204,7 +204,7 @@ validate_production_env() {
 }
 
 validate_deployment() {
-  local directory=$1 strict=${2:-false} asset
+  local directory=$1 strict=${2:-false} asset usdm_dataset
   [[ -d $directory && ! -L $directory ]] || fail "staged deployment is missing: $directory"
   for asset in "${DEPLOYMENT_ASSETS[@]}"; do
     secure_regular_file "$directory/$asset"
@@ -213,9 +213,18 @@ validate_deployment() {
   validate_production_env \
     "$directory/binance-lob-archiver-production-spot.env" \
     spot spot_all /data/monday/spool/binance-lob/spot "$strict"
+  if [[ $strict == true ]]; then
+    usdm_dataset=usdm_perpetual_top100_lob
+  else
+    usdm_dataset=$(env_value \
+      "$directory/binance-lob-archiver-production-usdm.env" DATASET) \
+      || fail 'rollback USD-M deployment has no DATASET'
+    [[ $usdm_dataset == usdm_perpetual_all || $usdm_dataset == usdm_perpetual_top100_lob ]] \
+      || fail "rollback USD-M deployment has an unsupported DATASET=$usdm_dataset"
+  fi
   validate_production_env \
     "$directory/binance-lob-archiver-production-usdm.env" \
-    usdm usdm_perpetual_all /data/monday/spool/binance-lob/usdm "$strict"
+    usdm "$usdm_dataset" /data/monday/spool/binance-lob/usdm "$strict"
 
   if [[ $strict == true ]]; then
     grep -Fxq 'AssertPathIsMountPoint=/data' \
@@ -436,7 +445,13 @@ health_ready_for_release() {
   [[ -f $health && ! -L $health ]] || return 1
   case "$market" in
     spot) expected_dataset=spot_all ;;
-    usdm) expected_dataset=usdm_perpetual_all ;;
+    usdm)
+      expected_dataset=$(env_value \
+        /etc/monday/binance-lob-archiver-production-usdm.env DATASET) \
+        || return 1
+      [[ $expected_dataset == usdm_perpetual_all \
+        || $expected_dataset == usdm_perpetual_top100_lob ]] || return 1
+      ;;
     *) return 1 ;;
   esac
   jq -e \

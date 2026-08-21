@@ -51,6 +51,9 @@ grep -Fq 'raw_trade_segments' "$GATE"
 grep -Fq 'book_ticker_count' "$GATE"
 grep -Fq 'force_order_count' "$GATE"
 grep -Fq 'tape_schema' "$GATE"
+grep -Fq 'USD-M LOB stream family contract' "$GATE"
+grep -Fq 'usdm_perpetual_top100_lob' "$CUTOVER"
+grep -Fq 'usdm_perpetual_top100_lob_rust_shadow' "$GATE"
 book_ticker_validator=$(sed -n \
   '/^[[:space:]]*def valid_book_ticker:/,/;[[:space:]]*$/p' "$GATE")
 spot_book_ticker='{"received_at_ns":1,"frame":{"data":{"u":1,"s":"CATIUSDT","b":"0.1","B":"2","a":"0.2","A":"3"}}}'
@@ -535,12 +538,19 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
   | .symbols_config = $symbols_config
   | .catalog_sha256 = $catalog_sha256
   | .configured_catalog_sha256 = $catalog_sha256
-  | .stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]
-  | .force_order_count = 2
-  | .oss_roundtrip_evidence |= map(
+    | .stream_types = ["bookTicker","depth@100ms"]
+    | .agg_trade_segments = 0
+    | .agg_trade_count = 0
+    | .raw_trade_segments = 0
+    | .raw_trade_count = 0
+    | .strict_trade_summary_readback = false
+    | .strict_raw_trade_continuity_readback = false
+    | .force_order_count = 0
+    | .oss_roundtrip_evidence |= map(
       .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
       | .stream_coverage_verified_count = 100
-      | .force_order_count = 1)' \
+      | .agg_trade_count = 0 | .raw_trade_count = 0
+      | .book_ticker_count = 1 | .force_order_count = 0)' \
   <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
@@ -564,6 +574,27 @@ jq -e \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+
+jq '.markets.usdm.stream_types = ["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-legacy-stream-contract.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/usdm-legacy-stream-contract.json" >/dev/null; then
+  printf 'gate policy accepted the legacy USD-M full-tape stream contract\n' >&2
+  exit 1
+fi
+jq '.markets.usdm.book_ticker_count = 0' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-missing-book-ticker.json"
+if jq -e \
+  --arg candidate_sha256 "$artifact" \
+  --arg deployment_bundle_sha256 "$bundle" \
+  --arg deployment_source_revision "$source_revision" \
+  -f "$POLICY" "$tmp_dir/usdm-missing-book-ticker.json" >/dev/null; then
+  printf 'gate policy accepted USD-M evidence without bookTicker rows\n' >&2
+  exit 1
+fi
 
 jq '.markets.usdm.symbol_count = 101
     | .markets.usdm.snapshot_ready_count = 101
@@ -627,9 +658,19 @@ v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
   | .bridged_count = 100
   | .stream_coverage_verified_count = 100
   | .symbols_config = $symbols_config
+  | .stream_types = ["bookTicker","depth@100ms"]
+  | .agg_trade_segments = 0
+  | .agg_trade_count = 0
+  | .raw_trade_segments = 0
+  | .raw_trade_count = 0
+  | .strict_trade_summary_readback = false
+  | .strict_raw_trade_continuity_readback = false
+  | .force_order_count = 0
   | .oss_roundtrip_evidence |= map(
       .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
-      | .stream_coverage_verified_count = 100)' \
+      | .stream_coverage_verified_count = 100
+      | .agg_trade_count = 0 | .raw_trade_count = 0
+      | .book_ticker_count = 1 | .force_order_count = 0)' \
   <<<"$v1_market")
 jq -n \
   --arg artifact "$artifact" \
@@ -647,14 +688,14 @@ jq -n \
     passed:true,production_eligible:true,checks_passed:true,duration_seconds:240,
     markets:{spot:$market,usdm:$usdm_market}}' \
   >"$tmp_dir/gate-v1.json"
-jq -e \
+if jq -e \
   --arg candidate_sha256 "$artifact" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/gate-v1.json" >/dev/null || {
-  printf 'gate policy rejected a v1 tape candidate during the transition\n' >&2
+  -f "$POLICY" "$tmp_dir/gate-v1.json" >/dev/null; then
+  printf 'gate policy accepted a v1 USD-M candidate outside the LOB-first contract\n' >&2
   exit 1
-}
+fi
 
 jq '.markets.spot.raw_trade_count = 1' \
   "$tmp_dir/gate-v1.json" >"$tmp_dir/v1-with-raw-trades.json"

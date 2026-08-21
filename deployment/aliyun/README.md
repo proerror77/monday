@@ -260,7 +260,7 @@ Governed datasets and their completeness rules:
 | Dataset | Lake prefix | Rule |
 | --- | --- | --- |
 | `binance-spot` | `venue=binance/market=spot/dataset=spot_all/shard=all/` | hour present; each `*.jsonl.zst` carries `.manifest.json` + `._SUCCESS` |
-| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_all/shard=all/` | same triplet |
+| `binance-usdm` | `venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/` | same triplet |
 | `bybit-options` | `venue=bybit/market=option/dataset=options_quotes/` | hour present; each `*.ndjson.zst` carries its `.zst`-stripped `.manifest.json` (no `_SUCCESS` by design) |
 | `polymarket-crypto-expiry` | `venue=polymarket/dataset=crypto_expiry/` | hour present; triplet |
 | `binance-usdm-reference` | `venue=binance_usdm/dataset=reference/` | hour presence only (batch-partitioned, listed with `-d`) |
@@ -270,10 +270,14 @@ An hour is expected once it has ended and the per-dataset grace lag has passed
 still be in flight). Configuration: `COMPLETENESS_WINDOW_DAYS` (default 2),
 `COMPLETENESS_GRACE_HOURS` plus per-dataset
 `COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}`, and the
-usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. The JSON
-report (`--json`, or `--output FILE`) carries per-dataset `expected_hours`,
-`present_hours`, `missing_partitions`, `triplet_violations`,
-`latest_landed_hour`, and `lag_seconds`.
+usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. For the
+new USD-M Top-100 LOB prefix, `COMPLETENESS_START_EPOCH_USDM` may pin the
+UTC activation epoch; when omitted, the checker infers the earliest landed
+hour in the reconciliation window and fails closed if no hour has landed, so
+pre-launch hours are not reported as missing. The JSON report (`--json`, or
+`--output FILE`) carries per-dataset `expected_hours`, `present_hours`,
+`missing_partitions`, `triplet_violations`, `latest_landed_hour`,
+`lag_seconds`, and the activation boundary/source.
 `test-data-completeness-check.sh` is the self-contained offline contract test
 (stubbed `aliyun ossutil ls` over a fixture lake).
 
@@ -948,7 +952,7 @@ segments, isolated spools, and isolated OSS datasets:
 | Market | Shadow spool | Shadow dataset |
 | --- | --- | --- |
 | Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_top100_lob_rust_shadow` |
 
 The dataset and shard identifiers remain the canonical lane names; every
 manifest's explicit symbol list and catalog digest are the authority for its

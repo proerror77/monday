@@ -612,6 +612,15 @@ impl Segment {
         self.counts.get(event_type).copied().unwrap_or(0)
     }
 
+    /// Aggregate-trade summaries are part of the Spot/full-tape contract but
+    /// deliberately absent from the USD-M LOB-only dataset.
+    pub fn requires_aggregate_trades(&self) -> bool {
+        self.config
+            .stream_types
+            .iter()
+            .any(|stream_type| stream_type == "aggTrade")
+    }
+
     pub fn close(mut self) -> anyhow::Result<Option<SegmentArtifacts>> {
         let has_replay_safe_checkpoint = self.replay_safe && self.event_count("checkpoint") > 0;
         let readiness = readiness_summary(
@@ -664,11 +673,16 @@ fn finalize_segment(
     raw_trade_incomplete_symbols: BTreeSet<String>,
     readiness: ReadinessSummary,
 ) -> anyhow::Result<SegmentArtifacts> {
+    let require_aggregate_trades = config
+        .stream_types
+        .iter()
+        .any(|stream_type| stream_type == "aggTrade");
     let replay_scope = match schema {
         LEGACY_LOB_TAPE_SCHEMA => "captured_snapshot_seed_plus_sequence_checked_diffs",
-        schema if market_tape_schema(schema) => {
+        schema if market_tape_schema(schema) && require_aggregate_trades => {
             "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs"
         }
+        schema if market_tape_schema(schema) => "captured_snapshot_seed_plus_sequence_checked_diffs",
         _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
     };
     let lob_continuity = if market_tape_schema(schema) {
@@ -728,22 +742,24 @@ fn finalize_segment(
     });
     if market_tape_schema(schema) {
         let metadata = metadata.as_object_mut().expect("manifest is an object");
-        metadata.insert(
-            "trade_representation".to_owned(),
-            "aggregate_trade_only".into(),
-        );
-        metadata.insert(
-            "price_surface_derivation".to_owned(),
-            "latest aggregate trade price".into(),
-        );
-        metadata.insert(
-            "trade_summaries".to_owned(),
-            serde_json::to_value(trade_summaries)?,
-        );
-        metadata.insert(
-            "trade_summary_contract".to_owned(),
-            AGGREGATE_TRADE_SUMMARY_CONTRACT.into(),
-        );
+        if require_aggregate_trades {
+            metadata.insert(
+                "trade_representation".to_owned(),
+                "aggregate_trade_only".into(),
+            );
+            metadata.insert(
+                "price_surface_derivation".to_owned(),
+                "latest aggregate trade price".into(),
+            );
+            metadata.insert(
+                "trade_summaries".to_owned(),
+                serde_json::to_value(trade_summaries)?,
+            );
+            metadata.insert(
+                "trade_summary_contract".to_owned(),
+                AGGREGATE_TRADE_SUMMARY_CONTRACT.into(),
+            );
+        }
         metadata.insert(
             "lob_continuity".to_owned(),
             serde_json::to_value(lob_continuity.context("market tape has no LOB summary")?)?,

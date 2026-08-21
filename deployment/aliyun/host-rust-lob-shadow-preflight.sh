@@ -31,8 +31,8 @@ manifest_passes() {
       expected_streams='["aggTrade","bookTicker","depth@100ms","trade"]'
       ;;
     usdm)
-      expected_dataset=usdm_perpetual_all_rust_shadow
-      expected_streams='["aggTrade","bookTicker","depth@100ms","forceOrder","trade"]'
+      expected_dataset=usdm_perpetual_top100_lob_rust_shadow
+      expected_streams='["bookTicker","depth@100ms"]'
       ;;
     *)
       return 1
@@ -58,7 +58,16 @@ manifest_passes() {
     and .lob_continuity.covered_symbol_count == (.symbols | length)
     and .lob_continuity.missing_symbols == []
     and ((.event_types.stale_raw_trade // 0) == 0)
-    and (.event_types.raw_trade | type == "number" and . > 0)' "$manifest" >/dev/null
+    and (if $market == "usdm" then
+      (.event_types.book_ticker | type == "number" and . > 0)
+      and ((.event_types.agg_trade // 0) == 0)
+      and ((.event_types.raw_trade // 0) == 0)
+      and ((.event_types.force_order // 0) == 0)
+      and (has("trade_summary_contract") | not)
+      and (has("trade_summaries") | not)
+    else
+      (.event_types.raw_trade | type == "number" and . > 0)
+    end)' "$manifest" >/dev/null
 }
 
 self_test() {
@@ -234,12 +243,12 @@ verify_market() {
   done <"$selected"
   run_strict_verifier --require-lob-continuity "${verifier_args[@]}" \
     || die "$market sealed-triplet LOB continuity verification failed"
-  run_strict_verifier --verify-aggregate-trade-continuity "${verifier_args[@]}" \
-    || die "$market sealed-triplet aggregate-trade continuity verification failed"
-  run_strict_verifier --verify-raw-trade-continuity "${verifier_args[@]}" \
-    || die "$market sealed-triplet raw-trade continuity verification failed"
-  run_strict_verifier "${verifier_args[@]}" \
-    || die "$market sealed-triplet strict verification failed"
+  if [[ $market == spot ]]; then
+    run_strict_verifier --verify-aggregate-trade-continuity "${verifier_args[@]}" \
+      || die "$market sealed-triplet aggregate-trade continuity verification failed"
+    run_strict_verifier --verify-raw-trade-continuity "${verifier_args[@]}" \
+      || die "$market sealed-triplet raw-trade continuity verification failed"
+  fi
 }
 
 tmp_dir=$(mktemp -d)
