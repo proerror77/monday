@@ -2527,10 +2527,7 @@ mod tests {
         gate["passed"] = serde_json::json!(false);
         gate["failure_codes"] = serde_json::json!(["insufficient_evidence"]);
         let mut gate: CexBaselineGateV1 = serde_json::from_value(gate).unwrap();
-        gate.gate_id = format!(
-            "cex-baseline-gate-{}",
-            canonical_json_hash(&gate).unwrap()
-        );
+        gate.gate_id = format!("cex-baseline-gate-{}", canonical_json_hash(&gate).unwrap());
         gate.validate().unwrap();
         data_mission::write_json_atomic(&gate_path, &gate).unwrap();
         std::fs::remove_file(&subset_path).unwrap();
