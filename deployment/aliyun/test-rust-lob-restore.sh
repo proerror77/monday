@@ -306,7 +306,7 @@ mock_write_health() {
     --arg market "$market" \
     --arg session "$session" \
     --argjson symbol_count "$symbol_count" \
-    '{market:$market,dataset:(if $market=="spot" then "spot_all" else "usdm_perpetual_all" end),
+    '{market:$market,dataset:(if $market=="spot" then "spot_all" else "usdm_perpetual_top100_lob" end),
       status:"synced",session_id:$session,updated_at_ns:$now,sequence_gaps:0,
       symbol_count:$symbol_count,snapshot_ready_count:$symbol_count,bridged_count:$symbol_count,
       stream_coverage_verified_count:$symbol_count,snapshot_only_symbols:[],

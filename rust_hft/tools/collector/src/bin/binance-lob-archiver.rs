@@ -427,9 +427,10 @@ impl Config {
 
     /// Declared per-symbol stream-type list carried by the v2 tape manifest
     /// and repeated by every session_start row. Spot keeps the full tape;
-    /// USD-M uses the dedicated depth/bookTicker LOB-first contract.
+    /// USD-M uses the dedicated depth/bookTicker LOB-first contract, while
+    /// the legacy full-tape dataset keeps its recorded five stream families.
     fn stream_types(&self) -> Vec<String> {
-        stream_types_for_market(self.market)
+        stream_types_for_dataset(self.market, &self.dataset)
     }
 
     fn segment_config(&self) -> SegmentConfig {
@@ -501,6 +502,63 @@ impl Config {
                                     "wss://data-stream.binance.vision/stream?streams={book_tickers}"
                                 ),
                                 streams: book_ticker_streams,
+                            },
+                        ]
+                    }
+                    Market::Usdm if is_legacy_usdm_dataset(&self.dataset) => {
+                        let aggregate_trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let trade_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@trade", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let force_order_streams = symbols
+                            .iter()
+                            .map(|symbol| format!("{}@forceOrder", symbol.to_ascii_lowercase()))
+                            .collect::<BTreeSet<_>>();
+                        let aggregate_trades = aggregate_trade_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        let trades = trade_streams.iter().cloned().collect::<Vec<_>>().join("/");
+                        let force_orders = force_order_streams
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        vec![
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={depth}"
+                                ),
+                                streams: depth_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                                ),
+                                streams: aggregate_trade_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={trades}"
+                                ),
+                                streams: trade_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/public/stream?streams={book_tickers}"
+                                ),
+                                streams: book_ticker_streams,
+                            },
+                            StreamShard {
+                                url: format!(
+                                    "wss://fstream.binance.com/market/stream?streams={force_orders}"
+                                ),
+                                streams: force_order_streams,
                             },
                         ]
                     }
@@ -1145,8 +1203,8 @@ fn recover_parts_only() -> anyhow::Result<()> {
     let nonempty_parts =
         validated_nonempty_recovery_parts(&parts, recovery_uid, recovery_gid)?;
     backup_recovery_parts(&spool_dir, &backup_dir, &parts, market, &dataset, &shard_id)?;
+    let stream_types = stream_types_for_recovery(market, &dataset)?;
     drop_recovery_privileges(recovery_uid, recovery_gid)?;
-    let stream_types = stream_types_for_market(market);
     let symbols = if nonempty_parts.is_empty() {
         Vec::new()
     } else {
@@ -1241,6 +1299,38 @@ fn stream_types_for_market(market: Market) -> Vec<String> {
         // USD-M is intentionally LOB-first: only the depth and book-ticker
         // public routes are part of this dataset identity.
         Market::Usdm => vec!["depth@100ms".to_owned(), "bookTicker".to_owned()],
+    }
+}
+
+fn is_legacy_usdm_dataset(dataset: &str) -> bool {
+    matches!(dataset, "usdm_all" | "usdm_perpetual_all")
+}
+
+fn stream_types_for_dataset(market: Market, dataset: &str) -> Vec<String> {
+    if market == Market::Usdm && is_legacy_usdm_dataset(dataset) {
+        vec![
+            "depth@100ms".to_owned(),
+            "aggTrade".to_owned(),
+            "trade".to_owned(),
+            "bookTicker".to_owned(),
+            "forceOrder".to_owned(),
+        ]
+    } else {
+        stream_types_for_market(market)
+    }
+}
+
+fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Vec<String>> {
+    match (market, dataset) {
+        (Market::Spot, "spot_all") => Ok(stream_types_for_market(Market::Spot)),
+        // A canonical drain starts with the old deployment environment when
+        // it must consume a residual full-tape USD-M part.  Keep that
+        // recorded five-family contract distinct from the new LOB identity.
+        (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
+            Ok(stream_types_for_dataset(Market::Usdm, dataset))
+        }
+        (Market::Usdm, "usdm_perpetual_top100_lob") => Ok(stream_types_for_market(Market::Usdm)),
+        _ => anyhow::bail!("unsupported recovery market/dataset identity: {market:?}/{dataset}"),
     }
 }
 
@@ -4945,6 +5035,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_stream_contract_follows_recorded_dataset_identity() {
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, "usdm_perpetual_all").unwrap(),
+            vec![
+                "depth@100ms".to_owned(),
+                "aggTrade".to_owned(),
+                "trade".to_owned(),
+                "bookTicker".to_owned(),
+                "forceOrder".to_owned()
+            ]
+        );
+        assert_eq!(
+            stream_types_for_recovery(Market::Usdm, "usdm_perpetual_top100_lob").unwrap(),
+            vec!["depth@100ms".to_owned(), "bookTicker".to_owned()]
+        );
+        assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());
+    }
+
+    #[test]
     fn recovery_backup_is_read_only_and_receipted_before_mutation() {
         let root = tempfile::tempdir().unwrap();
         let spool = root.path().join("spool");
@@ -6161,6 +6270,15 @@ mod tests {
                     || stream.ends_with("@forceOrder")
             })
         }));
+        let mut legacy_config = test_config("http://unused".into());
+        legacy_config.market = Market::Usdm;
+        legacy_config.dataset = "usdm_perpetual_all".into();
+        let legacy = legacy_config.stream_shards();
+        assert_eq!(legacy.len(), 5);
+        assert_eq!(
+            legacy_config.stream_types(),
+            ["depth@100ms", "aggTrade", "trade", "bookTicker", "forceOrder"]
+        );
         // Liquidation orders are USD-M only in the legacy/full-tape contract;
         // the LOB-first USD-M dataset deliberately does not subscribe them.
         assert!(spot

@@ -66,6 +66,20 @@ fn trade(symbol: &str, milliseconds: u64) -> Value {
 }
 
 #[rustfmt::skip]
+fn book_ticker(symbol: &str, milliseconds: u64) -> Value {
+    let received_at_ns = event_ns(milliseconds);
+    json!({
+        "schema": "binance.market_tape.v2", "received_at_ns": received_at_ns,
+        "type": "book_ticker", "session_id": "session-1",
+        "frame": {"stream": format!("{}@bookTicker", lowercase(symbol)), "data": {
+            "e": "bookTicker", "u": 400900217, "E": received_at_ns / 1_000_000,
+            "T": received_at_ns / 1_000_000, "s": symbol,
+            "b": "100.5", "B": "31.21", "a": "100.6", "A": "40.66"
+        }}
+    })
+}
+
+#[rustfmt::skip]
 fn checkpoint(symbol: &str, milliseconds: u64, last_update_id: u64) -> Value {
     json!({
         "schema": "binance.market_tape.v2", "received_at_ns": event_ns(milliseconds),
@@ -93,6 +107,21 @@ fn segment_rows() -> Vec<Value> {
         }
         rows.push(trade(symbol, base + 9000));
         rows.push(checkpoint(symbol, base + 9500, 100 + diff_count));
+    }
+    rows
+}
+
+fn usdm_lob_segment_rows() -> Vec<Value> {
+    let mut rows = vec![
+        json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":3,"websocket_shards":2,"websocket_streams":6,"stream_types":["depth@100ms","bookTicker"]}),
+        json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@depth@100ms","btcusdt@bookTicker","ethusdt@depth@100ms","ethusdt@bookTicker"],["solusdt@depth@100ms","solusdt@bookTicker"]]}),
+    ];
+    for (index, symbol) in SYMBOLS.iter().enumerate() {
+        let base = 100_u64 + index as u64 * 10_000;
+        rows.push(snapshot(symbol, base));
+        rows.push(diff(symbol, base + 1, 101));
+        rows.push(book_ticker(symbol, base + 2));
+        rows.push(checkpoint(symbol, base + 3, 101));
     }
     rows
 }
@@ -178,6 +207,24 @@ impl Fixture {
         fs::write(sibling(&data, "._SUCCESS"), format!("{content_sha256}\n")).unwrap();
 
         Self { directory, data }
+    }
+
+    fn new_lob() -> Self {
+        Self::new_with_manifest(&usdm_lob_segment_rows(), |mut manifest| {
+            manifest["market"] = json!("usdm");
+            manifest["dataset"] = json!("usdm_perpetual_top100_lob");
+            manifest["replay_scope"] = json!("captured_snapshot_seed_plus_sequence_checked_diffs");
+            manifest["stream_types"] = json!(["depth@100ms", "bookTicker"]);
+            for field in [
+                "trade_representation",
+                "price_surface_derivation",
+                "trade_summary_contract",
+                "trade_summaries",
+            ] {
+                manifest.as_object_mut().unwrap().remove(field);
+            }
+            manifest
+        })
     }
 
     fn slice(&self, output_dir: &Path, extra: &[String]) -> Output {
@@ -313,6 +360,28 @@ fn cli_extracts_a_requested_symbol_subset_and_is_idempotent() {
     );
     let missing = materialize(&slice_dir, slice, "BTCUSDT", &artifact_dir);
     assert!(!missing.status.success());
+}
+
+#[test]
+fn cli_slices_usdm_lob_without_trade_contract() {
+    let fixture = Fixture::new_lob();
+    let slice_dir = fixture.directory.join("slices");
+    let report = slice_report(&fixture.slice(&slice_dir, &[]));
+    assert_eq!(report["source"]["selected_symbols"], json!(3));
+    assert_eq!(report["slices"].as_array().unwrap().len(), 1);
+    let slice = &report["slices"][0];
+    let manifest_path = sibling(
+        &slice_dir.join(slice["file"].as_str().unwrap()),
+        ".manifest.json",
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["dataset"], json!("usdm_perpetual_top100_lob"));
+    assert_eq!(manifest["stream_types"], json!(["depth@100ms", "bookTicker"]));
+    assert!(manifest.get("trade_summary_contract").is_none());
+    assert!(manifest.get("trade_summaries").is_none());
+    assert!(manifest.get("trade_representation").is_none());
+    assert!(manifest.get("price_surface_derivation").is_none());
+    assert_eq!(manifest["event_types"]["agg_trade"], Value::Null);
 }
 
 #[test]

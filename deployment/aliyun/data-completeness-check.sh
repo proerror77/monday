@@ -48,6 +48,11 @@
 #   COMPLETENESS_GRACE_HOURS      default grace lag in hours (default 1)
 #   COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}
 #                                 per-dataset grace override
+#   COMPLETENESS_START_EPOCH_USDM
+#                                 optional UTC epoch when the LOB-only USD-M
+#                                 dataset became authoritative; when omitted,
+#                                 the first landed hour in the window is used
+#                                 as a fail-closed activation boundary
 #   MONDAY_COMPLETENESS_NOW_EPOCH overrides "now" (epoch seconds); reserved
 #                                 for the offline contract test
 set -u
@@ -65,6 +70,7 @@ GRACE_USDM=${COMPLETENESS_GRACE_HOURS_USDM:-$DEFAULT_GRACE}
 GRACE_BYBIT=${COMPLETENESS_GRACE_HOURS_BYBIT:-$DEFAULT_GRACE}
 GRACE_POLYMARKET=${COMPLETENESS_GRACE_HOURS_POLYMARKET:-$DEFAULT_GRACE}
 GRACE_REFERENCE=${COMPLETENESS_GRACE_HOURS_REFERENCE:-$DEFAULT_GRACE}
+START_EPOCH_USDM=${COMPLETENESS_START_EPOCH_USDM:-}
 
 JSON_MODE=0
 OUTPUT_FILE=""
@@ -115,6 +121,16 @@ case "$NOW_SEC" in
     ;;
 esac
 CURRENT_HOUR_START=$((NOW_SEC - NOW_SEC % 3600))
+case "$START_EPOCH_USDM" in
+  *[!0-9]*)
+    printf 'ok:false\nbreach: invalid COMPLETENESS_START_EPOCH_USDM\n' >&2
+    exit 2
+    ;;
+esac
+if [ -n "$START_EPOCH_USDM" ] && [ "$START_EPOCH_USDM" -gt "$NOW_SEC" ]; then
+  printf 'ok:false\nbreach: COMPLETENESS_START_EPOCH_USDM is in the future\n' >&2
+  exit 2
+fi
 
 log() {
   logger -t "$TAG" -p "daemon.$1" -- "$2" 2>/dev/null || true
@@ -230,11 +246,14 @@ while [ "$i" -lt "$WINDOW_HOURS" ]; do
 done
 
 check_dataset() {
-  # $1 = label, $2 = lake prefix (ends with /), $3 = mode, $4 = grace hours
+  # $1 = label, $2 = lake prefix (ends with /), $3 = mode, $4 = grace hours,
+  # $5 = optional activation epoch (only used by the USD-M LOB dataset)
   label=$1
   prefix=$2
   mode=$3
   grace=$4
+  start_epoch=${5:-}
+  start_source=none
   listing_file="$TMP_DIR/$label.listing"
   parsed_file="$TMP_DIR/$label.parsed"
   present_file="$TMP_DIR/$label.present"
@@ -266,6 +285,36 @@ check_dataset() {
   grep '^H ' "$parsed_file" | sort -u >"$present_file" || true
   grep '^V ' "$parsed_file" >"$violations_file" || true
 
+  # The USD-M dataset identity changed from the full tape to the Top-100
+  # LOB-only prefix.  Do not call hours before that identity first landed
+  # "missing"; if an operator knows the cutover epoch it can be pinned
+  # explicitly, otherwise the earliest observed hour is the conservative
+  # activation boundary.  A window with no landed hour is still a breach so a
+  # total outage cannot silently become a green pre-launch window.
+  if [ "$label" = binance-usdm ]; then
+    if [ -n "$start_epoch" ]; then
+      start_epoch=$((start_epoch - start_epoch % 3600))
+      start_source=configured
+    else
+      first_landed_hour_start=""
+      while read -r hour_start day hh; do
+        if grep -Fqx "H $day $hh" "$present_file" \
+          && { [ -z "$first_landed_hour_start" ] || [ "$hour_start" -lt "$first_landed_hour_start" ]; }; then
+          first_landed_hour_start=$hour_start
+        fi
+      done <"$HOURS_FILE"
+      if [ -n "$first_landed_hour_start" ]; then
+        start_epoch=$first_landed_hour_start
+        start_source=inferred_first_landed_hour
+      else
+        record_breach "$label: no landed hour establishes the dataset activation boundary"
+        start_epoch=$((NOW_SEC + 3600))
+        start_source=missing
+      fi
+    fi
+  fi
+  [ -n "$start_epoch" ] || start_epoch=0
+
   expected_count=0
   present_count=0
   missing=""
@@ -277,11 +326,13 @@ check_dataset() {
         latest_hour_start=$hour_start
         latest_hour_iso=$(utc_fmt "$hour_start" +%Y-%m-%dT%H:00:00Z)
       fi
-      if [ $((hour_start + 3600 + grace * 3600)) -le "$NOW_SEC" ]; then
+      if [ "$hour_start" -ge "$start_epoch" ] \
+        && [ $((hour_start + 3600 + grace * 3600)) -le "$NOW_SEC" ]; then
         expected_count=$((expected_count + 1))
         present_count=$((present_count + 1))
       fi
-    elif [ $((hour_start + 3600 + grace * 3600)) -le "$NOW_SEC" ]; then
+    elif [ "$hour_start" -ge "$start_epoch" ] \
+      && [ $((hour_start + 3600 + grace * 3600)) -le "$NOW_SEC" ]; then
       expected_count=$((expected_count + 1))
       missing="$missing date=$day/hour=$hh"
     fi
@@ -313,16 +364,24 @@ check_dataset() {
   missing_json=$(printf '%s\n' $missing | jq -Rsc 'split("\n") | map(select(length > 0))')
   violations_json=$(sed 's/^V \([^ ]*\) \([^ ]*\) /date=\1\/hour=\2 /' "$violations_file" \
     | jq -Rsc 'split("\n") | map(select(length > 0))')
+  if [ -n "$start_epoch" ] && [ "$start_epoch" -le "$NOW_SEC" ]; then
+    start_epoch_json=$start_epoch
+  else
+    start_epoch_json=null
+  fi
   dobj=$(jq -n --arg prefix "$prefix" --arg mode "$mode" \
     --argjson grace "$grace" --argjson expected "$expected_count" \
     --argjson present "$present_count" --argjson missing "$missing_json" \
     --argjson violations "$violations_json" --argjson latest "$latest_json" \
-    --argjson listing_failed "$listing_failed" \
+    --argjson listing_failed "$listing_failed" --arg start_source "$start_source" \
+    --argjson start_epoch "$start_epoch_json" \
     '{prefix: $prefix, mode: $mode, grace_hours: $grace,
       expected_hours: $expected, present_hours: $present,
       missing_partitions: $missing, triplet_violations: $violations,
       latest_landed_hour: $latest.latest_landed_hour,
       lag_seconds: $latest.lag_seconds,
+      activation_start_epoch: $start_epoch,
+      activation_start_source: $start_source,
       listing_failed: ($listing_failed == 1)}')
   datasets_json=$(jq -n --argjson base "$datasets_json" --arg k "$label" --argjson v "$dobj" \
     '$base + {($k): $v}')
@@ -330,19 +389,19 @@ check_dataset() {
 
 check_dataset binance-spot \
   'lake/raw/venue=binance/market=spot/dataset=spot_all/shard=all/' \
-  triplet "$GRACE_SPOT"
+  triplet "$GRACE_SPOT" ""
 check_dataset binance-usdm \
   'lake/raw/venue=binance/market=usdm/dataset=usdm_perpetual_top100_lob/shard=all/' \
-  triplet "$GRACE_USDM"
+  triplet "$GRACE_USDM" "$START_EPOCH_USDM"
 check_dataset bybit-options \
   'lake/raw/venue=bybit/market=option/dataset=options_quotes/' \
-  manifest "$GRACE_BYBIT"
+  manifest "$GRACE_BYBIT" ""
 check_dataset polymarket-crypto-expiry \
   'lake/raw/venue=polymarket/dataset=crypto_expiry/' \
-  triplet "$GRACE_POLYMARKET"
+  triplet "$GRACE_POLYMARKET" ""
 check_dataset binance-usdm-reference \
   'lake/raw/venue=binance_usdm/dataset=reference/' \
-  presence "$GRACE_REFERENCE"
+  presence "$GRACE_REFERENCE" ""
 
 emit_report() {
   jq -n --argjson ok "$1" --arg checked "$CHECKED_AT" \

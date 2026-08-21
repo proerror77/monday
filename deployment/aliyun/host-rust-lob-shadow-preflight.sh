@@ -249,8 +249,6 @@ verify_market() {
     run_strict_verifier --verify-raw-trade-continuity "${verifier_args[@]}" \
       || die "$market sealed-triplet raw-trade continuity verification failed"
   fi
-  run_strict_verifier "${verifier_args[@]}" \
-    || die "$market sealed-triplet strict verification failed"
 }
 
 tmp_dir=$(mktemp -d)

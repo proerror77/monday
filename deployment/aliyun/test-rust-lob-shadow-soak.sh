@@ -79,8 +79,12 @@ grep -Fq 'tail -n 1' "$PREFLIGHT"
 grep -Fq 'replay_identity_sha256' "$PREFLIGHT"
 grep -Fq 'strict_verifier' "$PREFLIGHT"
 grep -Fq 'checks:{candidate_identity:true,sealed_triplets:true,strict_verifier:true' "$PREFLIGHT"
-grep -Fq 'sealed-triplet strict verification failed' "$PREFLIGHT"
-grep -Fq 'run_strict_verifier "${verifier_args[@]}"' "$PREFLIGHT"
+grep -Fq 'sealed-triplet LOB continuity verification failed' "$PREFLIGHT"
+grep -Fq 'run_strict_verifier --require-lob-continuity "${verifier_args[@]}"' "$PREFLIGHT"
+if grep -Fq 'run_strict_verifier "${verifier_args[@]}"' "$PREFLIGHT"; then
+  printf 'shadow preflight still invokes the trade-summary verifier unconditionally\n' >&2
+  exit 1
+fi
 grep -Fq 'triplet_identity_sha256' "$PREFLIGHT"
 grep -Fq 'TRIPLET_ROOT_CANONICAL' "$PREFLIGHT"
 grep -Fq 'assert_no_symlink_ancestors' "$PREFLIGHT"

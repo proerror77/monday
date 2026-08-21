@@ -270,10 +270,14 @@ An hour is expected once it has ended and the per-dataset grace lag has passed
 still be in flight). Configuration: `COMPLETENESS_WINDOW_DAYS` (default 2),
 `COMPLETENESS_GRACE_HOURS` plus per-dataset
 `COMPLETENESS_GRACE_HOURS_{SPOT,USDM,BYBIT,POLYMARKET,REFERENCE}`, and the
-usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. The JSON
-report (`--json`, or `--output FILE`) carries per-dataset `expected_hours`,
-`present_hours`, `missing_partitions`, `triplet_violations`,
-`latest_landed_hour`, and `lag_seconds`.
+usual `OSS_BUCKET`/`OSS_ENDPOINT`/`OSS_REGION`/`ALIYUN_PROFILE`. For the
+new USD-M Top-100 LOB prefix, `COMPLETENESS_START_EPOCH_USDM` may pin the
+UTC activation epoch; when omitted, the checker infers the earliest landed
+hour in the reconciliation window and fails closed if no hour has landed, so
+pre-launch hours are not reported as missing. The JSON report (`--json`, or
+`--output FILE`) carries per-dataset `expected_hours`, `present_hours`,
+`missing_partitions`, `triplet_violations`, `latest_landed_hour`,
+`lag_seconds`, and the activation boundary/source.
 `test-data-completeness-check.sh` is the self-contained offline contract test
 (stubbed `aliyun ossutil ls` over a fixture lake).
 

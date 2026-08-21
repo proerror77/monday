@@ -120,12 +120,12 @@ copy_health_evidence() {
 
 health_ready_for_release() {
   local market=$1 minimum_symbols=$2 old_session=$3 minimum_updated_ns=${4:-0}
-  local health expected_dataset
+  local expected_dataset=${5:-} health
   health="$CANONICAL_SPOOL/$market/health.json"
   [[ -f $health && ! -L $health ]] || return 1
   case "$market" in
     spot) expected_dataset=spot_all ;;
-    usdm) expected_dataset=usdm_perpetual_all ;;
+    usdm) [[ -n $expected_dataset ]] || return 1 ;;
     *) return 1 ;;
   esac
   jq -e \
@@ -163,7 +163,7 @@ wait_for_release_health() {
     done
     if health_ready_for_release spot 1000 "$old_spot_session" "$minimum_updated_ns" \
       && health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
-        "$old_usdm_session" "$minimum_updated_ns" \
+        "$old_usdm_session" "$minimum_updated_ns" "$USDM_EXPECTED_DATASET" \
       && runtime_matches_release "$binary" false; then
       return 0
     fi
@@ -348,6 +348,7 @@ restore_release() (
   OLD_SESSION_SPOT=
   OLD_SESSION_USDM=
   USDM_MINIMUM_SYMBOLS=400
+  USDM_EXPECTED_DATASET=
   trap on_error ERR
   trap on_exit EXIT
 
@@ -463,6 +464,14 @@ restore_release() (
     "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env") != ALL ]]; then
     USDM_MINIMUM_SYMBOLS=100
   fi
+  dataset_lines=$(grep -Ec '^DATASET=[^[:space:]]+$' \
+    "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env" || true)
+  [[ $dataset_lines == 1 ]] || fail 'candidate USD-M deployment must declare exactly one DATASET'
+  USDM_EXPECTED_DATASET=$(sed -n 's/^DATASET=//p' \
+    "$CANDIDATE_DEPLOYMENT/binance-lob-archiver-production-usdm.env")
+  [[ $USDM_EXPECTED_DATASET == usdm_perpetual_all \
+    || $USDM_EXPECTED_DATASET == usdm_perpetual_top100_lob ]] \
+    || fail "candidate USD-M deployment has unsupported DATASET=$USDM_EXPECTED_DATASET"
   grep -Fxq 'RuntimeMaxSec=21600' "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
     || fail 'installed production unit no longer declares RuntimeMaxSec=21600'
 
@@ -497,7 +506,7 @@ restore_release() (
   health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$RESTART_STARTED_NS" \
     || fail 'Spot health changed while enabling production'
   health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
-    "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" \
+    "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" "$USDM_EXPECTED_DATASET" \
     || fail 'USD-M health changed while enabling production'
 
   STEP=write-recovery-evidence
