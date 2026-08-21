@@ -717,6 +717,7 @@ validate_observation_sample() {
   health_samples[$market]=$((health_samples[$market] + sample_increment))
 }
 
+observation_started_ns=$(date +%s%N)
 observation_started_mono=$(monotonic_seconds)
 observation_deadline=$((observation_started_mono + gate_seconds))
 while (( $(monotonic_seconds) < observation_deadline )); do
@@ -881,7 +882,7 @@ verify_oss_round_trips() {
     fi
     start_ns=$(jq -er '.start_received_at_ns' "$manifest")
     end_ns=$(jq -er '.end_received_at_ns' "$manifest")
-    ((start_ns < gate_started_ns)) && continue
+    ((start_ns < observation_started_ns)) && continue
     jq -e --arg session_id "${observed_session[$market]}" \
       --arg market "$market" \
       --argjson expected_stream_types "${expected_stream_types[$market]}" \
@@ -975,7 +976,7 @@ verify_oss_round_trips() {
             and .event_types.agg_trade > 0
         end)' \
       "$manifest" >/dev/null \
-      || die "$market has an incomplete market-tape manifest after gate start: $uri"
+      || die "$market has an incomplete market-tape manifest after observation start: $uri"
     candidate_schema=$(jq -er '.schema' "$manifest")
     if [[ -z $tape_schema ]]; then
       tape_schema=$candidate_schema
@@ -1005,7 +1006,7 @@ verify_oss_round_trips() {
 
   candidate_count=$(wc -l <"$candidates" | tr -d ' ')
   ((candidate_count >= 2)) \
-    || die "$market has fewer than two replay-safe complete OSS manifests after gate start"
+    || die "$market has fewer than two replay-safe complete OSS manifests after observation start"
 
   if [[ $tape_schema == binance.market_tape.v2 ]]; then
     stream_type_count=$(jq -er 'length' <<<"${expected_stream_types[$market]}")

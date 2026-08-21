@@ -225,7 +225,12 @@ grep -Fq 'candidate shadow gate USD-M symbols differ from the deployment bundle'
 grep -Fq 'or (.diff_count == 0' "$GATE"
 grep -Fq 'and .first_update_id == null' "$GATE"
 grep -Fq 'and .last_update_id == null' "$GATE"
-grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"
+grep -Fq 'observation_started_ns=$(date +%s%N)' "$GATE"
+grep -Fq '((start_ns < observation_started_ns)) && continue' "$GATE"
+if grep -Fq '((start_ns < gate_started_ns)) && continue' "$GATE"; then
+  printf 'manifest discovery still admits health-settle warmup segments\n' >&2
+  exit 1
+fi
 grep -Fq 'gate_started_ns=$(date +%s%N)' "$GATE"
 grep -Fq 'all(.[].lob_reconnect_boundary; . == false)' "$GATE"
 grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
@@ -243,10 +248,12 @@ if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GA
 fi
 
 gate_started_ns=1000000900
-pre_gate_start_ns=1000000100
-same_second_gate_start_ns=1000000950
-((pre_gate_start_ns < gate_started_ns)) || {
-  printf 'nanosecond cutoff admitted a pre-gate segment\n' >&2
+observation_started_ns=1000001000
+warmup_segment_start_ns=1000000950
+observed_segment_start_ns=1000001050
+((warmup_segment_start_ns >= gate_started_ns \
+  && warmup_segment_start_ns < observation_started_ns)) || {
+  printf 'observation cutoff fixture does not model a health-settle warmup segment\n' >&2
   exit 1
 }
 
@@ -290,8 +297,8 @@ production_spot_snapshot_producers=$(sed -n 's/^SNAPSHOT_PRODUCERS=//p' \
 }
 grep -Fq 'Spot shadow SNAPSHOT_PRODUCERS must be 16' "$GATE"
 grep -Fq 'Spot shadow and production SNAPSHOT_PRODUCERS differ' "$GATE"
-((same_second_gate_start_ns >= gate_started_ns)) || {
-  printf 'nanosecond cutoff rejected a same-second gate segment\n' >&2
+((observed_segment_start_ns >= observation_started_ns)) || {
+  printf 'nanosecond observation cutoff rejected an observed segment\n' >&2
   exit 1
 }
 
