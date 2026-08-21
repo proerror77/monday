@@ -51,7 +51,9 @@
 - Never replace missing real data with fixtures, fabricate completeness, weaken a
   fail-closed gate, or call a successful preparation step terminal evidence.
 - Publishing an issue, PR, artifact, image, or job is not completion. Read back
-  its immutable identity, checks, terminal result, and output.
+  its relationships, checks, immutable identity, terminal result, and output.
+- Remote build or validation tasks must use `monday-remote-build`; never place a
+  workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
 - Runtime, deployment, and collector cutovers require one named controller,
   exact target and rollback identities, stop rules, automatic cleanup, and direct
   readback. A failed attempt may run again only after its cause or relevant input
