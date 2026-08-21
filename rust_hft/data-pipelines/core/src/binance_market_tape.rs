@@ -466,6 +466,10 @@ impl DepthSourceClockSequenceValidator {
         );
         Ok(())
     }
+
+    pub fn reset_symbol(&mut self, symbol: &str) {
+        self.last.remove(symbol);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1794,21 +1798,22 @@ mod tests {
 
         let mut nonzero_quantity = zero.clone();
         nonzero_quantity["data"]["q"] = json!("0.25");
-        assert!(RawTrade::from_zero_price_frame(&nonzero_quantity, received_at_ns)
-            .unwrap_err()
-            .to_string()
-            .contains("q is not zero"));
-
-        let mut positive_with_zero_quantity = raw_trade_frame(
-            1,
-            1_700_000_000_000,
-            1_700_000_000_000,
+        assert!(
+            RawTrade::from_zero_price_frame(&nonzero_quantity, received_at_ns)
+                .unwrap_err()
+                .to_string()
+                .contains("q is not zero")
         );
+
+        let mut positive_with_zero_quantity =
+            raw_trade_frame(1, 1_700_000_000_000, 1_700_000_000_000);
         positive_with_zero_quantity["data"]["q"] = json!("0");
-        assert!(RawTrade::from_frame(&positive_with_zero_quantity, received_at_ns)
-            .unwrap_err()
-            .to_string()
-            .contains("q is not positive"));
+        assert!(
+            RawTrade::from_frame(&positive_with_zero_quantity, received_at_ns)
+                .unwrap_err()
+                .to_string()
+                .contains("q is not positive")
+        );
 
         let mut malformed = zero.clone();
         malformed["data"]["q"] = Value::Null;
@@ -1823,7 +1828,10 @@ mod tests {
         assert!(RawTrade::from_zero_price_frame(&wrong_status, received_at_ns).is_err());
 
         let mut missing_execution = zero.clone();
-        missing_execution["data"].as_object_mut().unwrap().remove("X");
+        missing_execution["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("X");
         assert!(RawTrade::from_zero_price_frame(&missing_execution, received_at_ns).is_err());
 
         let mut wrong_execution = zero.clone();
@@ -1832,10 +1840,12 @@ mod tests {
 
         let mut unknown_execution = zero;
         unknown_execution["data"]["X"] = json!("UNKNOWN");
-        assert!(RawTrade::from_zero_price_frame(&unknown_execution, received_at_ns)
-            .unwrap_err()
-            .to_string()
-            .contains("X is unsupported"));
+        assert!(
+            RawTrade::from_zero_price_frame(&unknown_execution, received_at_ns)
+                .unwrap_err()
+                .to_string()
+                .contains("X is unsupported")
+        );
 
         let insurance_fund = json!({
             "stream": "cysusdt@trade",
@@ -1877,8 +1887,7 @@ mod tests {
                 "st": 1_u64
             }
         });
-        let trade = RawTrade::from_zero_price_frame(&frame, 1_786_430_320_300_000_000)
-            .unwrap();
+        let trade = RawTrade::from_zero_price_frame(&frame, 1_786_430_320_300_000_000).unwrap();
         assert_eq!(trade.symbol, "BTCUSDC");
         assert_eq!(trade.trade_id, 553104312);
         assert_eq!(trade.price, Decimal::ZERO);
@@ -1974,13 +1983,12 @@ mod tests {
         .unwrap();
         let mut reversed = book_ticker_frame(1_700_000_000_000);
         reversed["data"]["T"] = json!(1_700_000_000_001_u64);
-        assert!(BookTicker::from_frame_allow_stale(
-            &reversed,
-            1_700_000_031_000_000_000,
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("reversed"));
+        assert!(
+            BookTicker::from_frame_allow_stale(&reversed, 1_700_000_031_000_000_000,)
+                .unwrap_err()
+                .to_string()
+                .contains("reversed")
+        );
         assert!(BookTicker::from_frame_allow_stale(
             &book_ticker_frame(1_700_000_000_100 + MAX_SOURCE_LEAD_MS + 1),
             received_at_ns,
@@ -2051,13 +2059,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing"));
-        assert!(BookTicker::from_frame_allow_stale(
-            &spot_book_ticker_frame(),
-            received_at_ns,
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("USD-M event identity"));
+        assert!(
+            BookTicker::from_frame_allow_stale(&spot_book_ticker_frame(), received_at_ns,)
+                .unwrap_err()
+                .to_string()
+                .contains("USD-M event identity")
+        );
     }
 
     #[test]

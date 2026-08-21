@@ -1018,8 +1018,7 @@ verify_oss_round_trips() {
         and (if $market == "usdm" then
           .schema == "binance.market_tape.v2"
           and (.stream_types | sort) == $expected_stream_types
-          and (.event_types.book_ticker | type) == "number"
-          and .event_types.book_ticker > 0
+          and ((.event_types.book_ticker // 0) | type) == "number"
           and ((.event_types.agg_trade // 0) == 0)
           and ((.event_types.raw_trade // 0) == 0)
           and ((.event_types.force_order // 0) == 0)

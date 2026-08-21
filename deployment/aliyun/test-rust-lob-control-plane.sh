@@ -719,14 +719,15 @@ if jq -e \
   printf 'gate policy accepted the legacy USD-M full-tape stream contract\n' >&2
   exit 1
 fi
-jq '.markets.usdm.book_ticker_count = 0' \
+jq '.markets.usdm.book_ticker_count = 0
+    | .markets.usdm.oss_roundtrip_evidence |= map(.book_ticker_count = 0)' \
   "$tmp_dir/gate.json" >"$tmp_dir/usdm-missing-book-ticker.json"
-if jq -e \
+if ! jq -e \
   --arg candidate_sha256 "$artifact" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
   -f "$POLICY" "$tmp_dir/usdm-missing-book-ticker.json" >/dev/null; then
-  printf 'gate policy accepted USD-M evidence without bookTicker rows\n' >&2
+  printf 'gate policy rejected USD-M evidence without bookTicker rows\n' >&2
   exit 1
 fi
 

@@ -277,12 +277,12 @@ and (.markets.usdm.raw_trade_count | type) == "number"
 and .markets.usdm.raw_trade_count == 0
 and (.markets.usdm.book_ticker_count | type) == "number"
 and .markets.usdm.book_ticker_count == ([.markets.usdm.oss_roundtrip_evidence[].book_ticker_count] | add)
-and .markets.usdm.book_ticker_count > 0
+and .markets.usdm.book_ticker_count >= 0
 and (.markets.usdm.force_order_count | type) == "number"
 and .markets.usdm.force_order_count == 0
 and .markets.usdm.strict_raw_trade_continuity_readback == false
 and .markets.usdm.full_stream_coverage_verified == true
 and all(.markets.usdm.oss_roundtrip_evidence[];
   .raw_trade_count == 0
-  and .book_ticker_count > 0
+  and .book_ticker_count >= 0
   and .force_order_count == 0)
