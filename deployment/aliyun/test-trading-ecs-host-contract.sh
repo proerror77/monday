@@ -931,6 +931,111 @@ JSON
   [[ $(<"$identity_attempts") == 3 ]]
 )
 
+# Readback consumes the merged governance identities once, without calling
+# systemd or sleeping, and fails closed on mismatched durable runtime evidence.
+(
+  source "$HOSTCTL"
+  readback_activation=$tmp_dir/readback-activation
+  readback_state_root=$tmp_dir/readback-state
+  readback_evidence=$tmp_dir/readback-evidence
+  readback_current=$tmp_dir/readback-current.env
+  readback_preflight=$tmp_dir/readback-preflight
+  readback_calls=$tmp_dir/readback-calls
+  mkdir -p "$readback_activation/deployment" "$readback_state_root" \
+    "$readback_evidence"
+  chmod 0700 "$readback_activation" "$readback_activation/deployment" \
+    "$readback_state_root" "$readback_evidence"
+  cat >"$readback_activation/deployment/envelope.json" <<JSON
+{"envelope":{"deployment_id":"deployment-1","asset_revision_id":"asset-1","promotion_id":"promotion-1","bundle_id":"bundle-1","bundle_hash":"$(printf 'b%.0s' {1..64})","risk_policy_hash":"$(printf 'd%.0s' {1..64})","nonce":"nonce-1","account_id":"account-1","venue":"binance","allowed_intent_types":["LoadFactor","StartShadow"]},"key_id":"deployment-key","signature_hex":"$(printf 'f%.0s' {1..128})"}
+JSON
+  printf '%s\n' '{"runtime_paused":false}' \
+    >"$readback_activation/deployment/policy.json"
+  (
+    cd "$readback_activation"
+    find . -type f ! -path ./activation.sha256 -print \
+      | sed 's#^./##' | LC_ALL=C sort \
+      | while IFS= read -r path; do sha256sum "$path"; done \
+      >activation.sha256
+  )
+  chmod 0444 "$readback_activation/activation.sha256"
+  readback_activation_sha=$(sha256sum "$readback_activation/activation.sha256" \
+    | awk '{print $1}')
+  write_current_file "$readback_current" "$valid_image" \
+    "$(printf 'd%.0s' {1..64})" "$readback_activation" \
+    "$(printf 'c%.0s' {1..40})"
+  readback_pointer_sha=$(sha256sum "$readback_current" | awk '{print $1}')
+  jq -S -n --arg activation "$readback_activation_sha" \
+    --arg source "$(printf 'c%.0s' {1..40})" \
+    --arg release "$(printf 'd%.0s' {1..64})" \
+    '{activation_manifest_sha256:$activation,source_revision:$source,
+      release_manifest_sha256:$release}' >"$readback_evidence/cutover.json"
+  (
+    cd "$readback_evidence"
+    sha256sum cutover.json >PASSED.sha256
+  )
+  chmod 0444 "$readback_evidence/cutover.json" \
+    "$readback_evidence/PASSED.sha256"
+  readback_state_dir=$readback_state_root/$readback_activation_sha
+  mkdir -m 0700 "$readback_state_dir"
+  printf '%s\n' \
+    '{"nonce":"nonce-1","deployment_id":"deployment-1","accepted_at":"2026-08-21T00:00:00Z"}' \
+    >"$readback_state_dir/nonces.jsonl"
+  printf '%s\n' \
+    '{"deployment_id":"deployment-1","phase":"pre_activation","result":"verified","reason":null,"recorded_at":"2026-08-21T00:00:00Z"}' \
+    '{"deployment_id":"deployment-1","phase":"configuration","result":"prepared","reason":null,"recorded_at":"2026-08-21T00:00:01Z"}' \
+    '{"deployment_id":"deployment-1","phase":"runtime","result":"activated","reason":null,"recorded_at":"2026-08-21T00:00:02Z"}' \
+    >"$readback_state_dir/audit.jsonl"
+  cat >"$readback_state_dir/feedback.jsonl" <<JSON
+{"event":{"event_id":"activation:deployment-1","deployment_id":"deployment-1","asset_revision_id":"asset-1","mission_id":null,"mode":"Shadow","outcome":"Activated","kind":"Activation","strategy_id":null,"order_id":null,"account_id":"account-1","venue":"binance","symbol":null,"metrics":{},"reason":null,"observed_at":"2026-08-21T00:00:02Z"},"key_id":"runtime-feedback-1","content_hash":"$(printf 'e%.0s' {1..64})","signature_hex":"$(printf 'f%.0s' {1..128})"}
+JSON
+  chmod 0600 "$readback_state_dir"/*.jsonl
+  cat >"$readback_preflight" <<'SH'
+#!/usr/bin/env bash
+[[ ${1:-} == preflight ]]
+printf 'preflight\n' >>"$READBACK_CALLS"
+SH
+  chmod 0700 "$readback_preflight"
+  EXPECTED_ROOT_UID=$(id -u)
+  EXPECTED_RUNTIME_UID=$(id -u)
+  EXPECTED_RUNTIME_GID=$(id -g)
+  CURRENT_FILE=$readback_current
+  STATE_ROOT=$readback_state_root
+  RUNTIME_PROGRAM=$readback_preflight
+  READBACK_CALLS=$readback_calls
+  export READBACK_CALLS
+  id() {
+    [[ $1 == -u && $# -eq 1 ]] || return 2
+    printf '0\n'
+  }
+  verify_rollback_lineage() {
+    ROLLBACK_IMAGE=$valid_image
+    ROLLBACK_EXPECTED_IDENTITY=active-identity
+    ROLLBACK_CANDIDATE_SHA=$readback_pointer_sha
+  }
+  runtime_identity_matches() {
+    [[ $1 == "$valid_image" && $2 == active-identity ]]
+  }
+  systemctl() { return 99; }
+  sleep() { return 99; }
+  readback_json=$(readback_cutover "$readback_evidence")
+  jq -e '
+    .schema == "monday.hft_trading_ecs_readback.v1" and
+    .result == "active_governed" and
+    .deployment_id == "deployment-1" and
+    .promotion_id == "promotion-1" and .bundle_id == "bundle-1" and
+    .mode == "Shadow" and .nonce_consumed == true and
+    .audit_activated == true and
+    .activation_feedback_signature_present == true and
+    .service_enabled == false and .automatic_restart_enabled == false and
+    .live_small_enabled == false
+  ' <<<"$readback_json" >/dev/null
+  [[ $(<"$readback_calls") == preflight ]]
+  printf '%s\n' \
+    '{"deployment_id":"deployment-1","phase":"runtime","result":"failed","reason":"tampered","recorded_at":"2026-08-21T00:00:03Z"}' \
+    >>"$readback_state_dir/audit.jsonl"
+  ! (readback_cutover "$readback_evidence" >/dev/null 2>&1)
+)
+
 # Pointer installation must not let a failed durable write be masked by later
 # successful commands when the helper itself is called from an `if !` context.
 (

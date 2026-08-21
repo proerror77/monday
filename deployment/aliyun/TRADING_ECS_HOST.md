@@ -172,6 +172,26 @@ rechecks once more immediately before atomically
 committing the single-file `PASSED.sha256` marker. No marker means no successful
 cutover; an uncommitted JSON file is explicitly marked `cutover.unconfirmed.json`.
 
+Use the exact successful cutover directory for a one-shot governed readback:
+
+```bash
+sudo /usr/local/sbin/monday-hft-trading-hostctl readback \
+  /var/lib/monday/evidence/hft-trading/cutover/<run-id>
+```
+
+`readback` never starts, stops, restarts, or enables the service and contains no
+retry loop. It accepts only an unrevoked `PASSED.sha256`, the same current
+pointer and systemd/container identity recorded by cutover, and a fresh pass of
+the installed production preflight. It then binds the merged governance
+identities (`deployment_id`, `asset_revision_id`, `promotion_id`, `bundle_id`,
+bundle hash, risk-policy hash, and nonce hash) to the consumed nonce, the exact
+verified/prepared/activated audit sequence, and the signed activation-feedback
+wrapper in the activation's private state directory. Any missing, stale,
+tampered, restarted, rolled-back, or cross-activation input exits once with a
+failure instead of polling. The shell reports the feedback content hash and
+signature presence; Ed25519 verification remains the governance ingestion
+authority and is not reimplemented in host shell code.
+
 On any failure or shell `EXIT`, `TERM`, or `INT` after cutover becomes armed, the
 candidate is stopped, the prior non-secret pointer is restored, and an atomic
 `FAILED.sha256` evidence marker is written. Cleanup ignores a second HUP, INT,
