@@ -15,7 +15,7 @@ use crate::{
         cex_global_holdout_claim_object, validate_dns_label,
     },
 };
-use alpha_domain::{canonical_json_hash, CexFactorBankRevisionV2};
+use alpha_domain::{canonical_json_hash, CexBaselineGateV1, CexFactorBankRevisionV2};
 use alpha_engine::engines::CexFactorBankMctsResultV1;
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
@@ -887,6 +887,8 @@ fn collect_round_ledger(
     let results = execute_dir.join("results");
     let factor_bank: CexFactorBankRevisionV2 =
         serde_json::from_slice(&std::fs::read(results.join("factor-bank.json"))?)?;
+    let baseline_gate: CexBaselineGateV1 =
+        serde_json::from_slice(&std::fs::read(results.join("baseline-gate.json"))?)?;
     let strategy_path = results.join("combination-walk-forward.json");
     let subset_result = load_round_subset_result(&results)?;
     let consumed_trials = factor_bank.attempts.len()
@@ -905,6 +907,11 @@ fn collect_round_ledger(
             bail!("empty Factor Bank cannot produce subset search artifacts");
         }
         ("no_accepted_factors".to_string(), None, None, None)
+    } else if !baseline_gate.passed {
+        if subset_result.is_some() || strategy_exists || report.replay_receipt_id.is_some() {
+            bail!("failed baseline gate cannot produce subset search artifacts");
+        }
+        ("baseline_gate_failed".to_string(), None, None, None)
     } else {
         let subset_result =
             subset_result.context("non-empty Factor Bank is missing factor subset MCTS result")?;
@@ -2512,6 +2519,25 @@ mod tests {
         assert!(ledger.selected_candidate_id.is_none());
         assert!(ledger.selected_candidate_content_hash.is_none());
         assert!(ledger.selected_score.is_none());
+
+        let gate_path = results.join("baseline-gate.json");
+        let mut gate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&gate_path).unwrap()).unwrap();
+        gate["gate_id"] = serde_json::json!("");
+        gate["passed"] = serde_json::json!(false);
+        gate["failure_codes"] = serde_json::json!(["insufficient_evidence"]);
+        let mut gate: CexBaselineGateV1 = serde_json::from_value(gate).unwrap();
+        gate.gate_id = format!(
+            "cex-baseline-gate-{}",
+            canonical_json_hash(&gate).unwrap()
+        );
+        gate.validate().unwrap();
+        data_mission::write_json_atomic(&gate_path, &gate).unwrap();
+        std::fs::remove_file(&subset_path).unwrap();
+
+        let baseline_failed = collect_round_ledger(&execute_dir, &round, &report).unwrap();
+        assert_eq!(baseline_failed.termination_reason, "baseline_gate_failed");
+        assert!(baseline_failed.selected_candidate_id.is_none());
     }
 
     #[test]

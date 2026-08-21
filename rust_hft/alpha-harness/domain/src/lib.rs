@@ -4223,11 +4223,11 @@ impl CexFourStageWalkForwardV1 {
             || self.ridge.evaluation.evaluator_version
                 != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
             || self.cart.evaluation.evaluator_version != CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
-            || !self.selected.evaluation.passed
             || evaluations.iter().any(|evaluation| {
-                evaluation.protocol_binding().map_or(true, |(_, hash)| {
-                    hash != self.evaluation_protocol.content_sha256
-                })
+                !evaluation.passed
+                    || evaluation.protocol_binding().map_or(true, |(_, hash)| {
+                        hash != self.evaluation_protocol.content_sha256
+                    })
             })
         {
             return Err(DomainError::InvalidStrategyBundle);
@@ -7415,7 +7415,7 @@ mod tests {
     }
 
     #[test]
-    fn four_stage_walk_forward_accepts_failed_baselines_when_selected_passes() {
+    fn four_stage_walk_forward_rejects_failed_baselines_when_selected_passes() {
         let factor_bank = factor_bank();
         let protocol = evaluation_protocol();
         let selected = factor_bank.attempts[0]
@@ -7430,7 +7430,10 @@ mod tests {
             failed_baseline_evaluation(&protocol),
         );
 
-        assert!(walk_forward.validate().is_ok());
+        assert_eq!(
+            walk_forward.validate(),
+            Err(DomainError::InvalidStrategyBundle)
+        );
     }
 
     #[test]
