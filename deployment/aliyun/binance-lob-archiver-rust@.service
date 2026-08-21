@@ -31,6 +31,7 @@ RestrictSUIDSGID=true
 StateDirectory=hft-collector
 ReadWritePaths=/data/monday/spool/binance-lob-rust-shadow
 CPUQuota=80%
+OOMScoreAdjust=500
 MemoryHigh=4400M
 MemoryMax=5000M
 

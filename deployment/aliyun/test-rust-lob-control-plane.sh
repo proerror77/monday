@@ -25,6 +25,41 @@ LIB="$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 . "$LIB"
 "$SCRIPT_DIR/test-rust-lob-shadow-soak.sh"
 
+required_memory=11559501824
+[[ $(monday_shadow_memory_admission \
+  "$required_memory" 1073741824 10485760000 0) == "$required_memory" ]] || {
+  printf 'shadow gate memory admission rejected exact headroom\n' >&2
+  exit 1
+}
+if monday_shadow_memory_admission \
+  "$((required_memory - 1))" 1073741824 10485760000 0 >/dev/null; then
+  printf 'shadow gate memory admission accepted one byte below the requirement\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 1 1 invalid 0 >/dev/null 2>&1; then
+  printf 'shadow gate memory admission accepted an invalid phase limit\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 999999999999999999999999999999 \
+  1 1 0 >/dev/null 2>&1; then
+  printf 'shadow gate memory admission accepted an overflowing host value\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 1 1 9223372036854775808 \
+  0 >/dev/null 2>&1; then
+  printf 'shadow gate memory admission accepted an overflowing component\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 1 9223372036854775807 \
+  1 >/dev/null 2>&1; then
+  printf 'shadow gate memory admission accepted an overflowing sum\n' >&2
+  exit 1
+fi
+if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
+  printf 'shadow gate memory admission accepted a zero requirement\n' >&2
+  exit 1
+fi
+
 for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing test dependency: %s\n' "$command" >&2
@@ -248,9 +283,30 @@ grep -Fq 'SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$ACR_WORKFL
 grep -Fq "grep -Fqx 'binance-lob-archiver \${{ needs.selector.outputs.source_sha }}'" "$ACR_WORKFLOW"
 grep -Fxq 'MemoryHigh=4400M' "$SHADOW_UNIT"
 grep -Fxq 'MemoryMax=5000M' "$SHADOW_UNIT"
+grep -Fxq 'OOMScoreAdjust=500' "$SHADOW_UNIT"
 grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
 grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
 grep -Fq 'memory_max_bytes[$market] == 5242880000' "$GATE"
+grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
+grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=6710886400' "$GATE"
+grep -Fq 'monday_shadow_memory_admission' "$GATE"
+grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
+grep -Fq 'host_swap_total_bytes' "$GATE"
+grep -Fq 'shadow_phase_memory_bytes' "$GATE"
+grep -Fq 'production_memory_headroom_bytes' "$GATE"
+grep -Fq 'host_memory_required_bytes' "$GATE"
+grep -Fq 'host_memory_shortfall_bytes' "$GATE"
+grep -Fq 'host_memory_headroom_ok' "$GATE"
+grep -Fq 'systemctl_value "$market" OOMScoreAdjust' "$GATE"
+memory_guard_line=$(grep -nF 'insufficient host memory headroom for concurrent shadow gate' \
+  "$GATE" | cut -d: -f1)
+shadow_start_line=$(grep -nF 'systemctl start "${unit[spot]}" "${unit[usdm]}"' \
+  "$GATE" | cut -d: -f1)
+[[ -n $memory_guard_line && -n $shadow_start_line \
+  && $memory_guard_line -lt $shadow_start_line ]] || {
+  printf 'shadow gate memory guard does not run before both shadow units start\n' >&2
+  exit 1
+}
 if grep -Fq 'binance-lob-archiver-rust-usdm-memory.conf' "$INSTALL_RELEASE" "$GATE"; then
   printf 'shadow memory contract still depends on a persistent USD-M drop-in\n' >&2
   exit 1
