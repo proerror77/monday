@@ -345,6 +345,30 @@ fn validate_cex_replay_features_v3(
     features: &FeatureDatasetManifest,
 ) -> anyhow::Result<()> {
     snapshot.validate()?;
+    if snapshot.instrument_type == "spot" {
+        if features.modalities != BTreeSet::from([DataModality::Lob, DataModality::TradeTick]) {
+            bail!("feature modalities do not match the historical CEX replay snapshot");
+        }
+        return validate_cex_replay_features_v1(
+            &CexReplaySnapshotV1 {
+                schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V1.to_string(),
+                venue: snapshot.venue.clone(),
+                instrument_type: snapshot.instrument_type.clone(),
+                symbol: snapshot.symbol.clone(),
+                replay_clock: snapshot.replay_clock.clone(),
+                required_modalities: snapshot.required_modalities.clone(),
+                source_segments: snapshot.source_segments.clone(),
+                first_event_time: snapshot.first_event_time,
+                last_event_time: snapshot.last_event_time,
+                feature_artifact_sha256: snapshot.feature_artifact_sha256.clone(),
+                feature_availability_policy: snapshot.feature_availability_policy.clone(),
+                bucket_ms: snapshot.bucket_ms,
+                label_horizon_buckets: snapshot.label_horizon_buckets,
+                top_depth: snapshot.top_depth,
+            },
+            features,
+        );
+    }
     validate_cex_replay_features_v4(
         &CexReplaySnapshotV4 {
             schema_version: CEX_REPLAY_SNAPSHOT_SCHEMA_V4.to_string(),
@@ -1126,6 +1150,194 @@ mod tests {
             .unwrap();
 
         assert!(require_promotable_research_dataset(&store, "cex-v1").is_err());
+    }
+
+    #[test]
+    fn historical_spot_cex_replay_v2_and_v3_are_readback_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.jsonl");
+        let ingestion = Utc::now();
+        let source_content_sha256 = "a".repeat(64);
+        let source_revision = source_revision([source_content_sha256.as_str()]);
+        let rows = (0..3)
+            .map(|index| {
+                let event_time = ingestion - Duration::seconds(10 - index);
+                PointInTimeFeatureRow {
+                    series_id: 1,
+                    event_time,
+                    feature_available_time: event_time,
+                    label_available_time: event_time + Duration::seconds(1),
+                    ingestion_time: ingestion,
+                    symbol: "BTCUSDT".to_string(),
+                    source_revisions: BTreeMap::from([(
+                        "binance-spot-lob".to_string(),
+                        source_revision.clone(),
+                    )]),
+                    modalities: BTreeSet::from([DataModality::Lob, DataModality::TradeTick]),
+                    features: BTreeMap::from([("book_imbalance".to_string(), index as f64)]),
+                    label: index as f64 * 0.001,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut bytes, row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&input, bytes).unwrap();
+
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let features = import_and_register_features(
+            &mut store,
+            "historical-spot-readback",
+            &input,
+            &directory.path().join("artifacts"),
+        )
+        .unwrap();
+        let triplet = |data: char, manifest: char| hft_research_manifest::CexArtifactTripletV2 {
+            data_sha256: data.to_string().repeat(64),
+            manifest_sha256: manifest.to_string().repeat(64),
+            success_sha256: data.to_string().repeat(64),
+        };
+        let first_event_time = rows.first().unwrap().event_time;
+        let last_event_time = rows.last().unwrap().event_time;
+        let last_label_available_time = rows.last().unwrap().label_available_time;
+        let snapshot_v3 = CexReplaySnapshotV3 {
+            schema_version: hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V3.to_string(),
+            venue: "binance".to_string(),
+            instrument_type: "spot".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            replay_clock: hft_research_manifest::CEX_REPLAY_CLOCK_RECEIVED_AT_NS.to_string(),
+            required_modalities: BTreeSet::from([
+                hft_research_manifest::CEX_MODALITY_LOB.to_string(),
+                hft_research_manifest::CEX_MODALITY_AGGREGATE_TRADE.to_string(),
+            ]),
+            source_segments: vec![hft_research_manifest::CexReplaySegmentIdentity {
+                content_sha256: source_content_sha256,
+                manifest_sha256: "1".repeat(64),
+                start_received_at_ns: u64::try_from(
+                    (first_event_time - Duration::seconds(1))
+                        .timestamp_nanos_opt()
+                        .unwrap(),
+                )
+                .unwrap(),
+                end_received_at_ns: u64::try_from(
+                    last_label_available_time.timestamp_nanos_opt().unwrap(),
+                )
+                .unwrap(),
+                events: rows.len() as u64,
+            }],
+            first_event_time,
+            last_event_time,
+            feature_artifact_sha256: features.artifact_sha256.clone(),
+            feature_availability_policy: hft_research_manifest::CEX_FEATURE_AVAILABILITY_POLICY
+                .to_string(),
+            bucket_ms: 1_000,
+            label_horizon_buckets: 1,
+            top_depth: 5,
+            instrument_rules: hft_research_manifest::CexInstrumentRulesV2 {
+                tick_size: "0.1".to_string(),
+                step_size: "0.001".to_string(),
+                min_notional: "5".to_string(),
+                available_at: first_event_time - Duration::seconds(1),
+                valid_through: last_label_available_time,
+                evidence: vec![triplet('2', '3')],
+            },
+            fee_schedule: hft_research_manifest::CexFeeScheduleV2 {
+                runtime_account_id: "historical/spot".to_string(),
+                account_fingerprint: "4".repeat(64),
+                maker_buy_fee_bps: "2".to_string(),
+                maker_sell_fee_bps: "2".to_string(),
+                taker_buy_fee_bps: "5".to_string(),
+                taker_sell_fee_bps: "5".to_string(),
+                available_at: first_event_time - Duration::seconds(1),
+                valid_through: last_label_available_time,
+                evidence: vec![triplet('5', '6')],
+            },
+            derivatives_reference: None,
+        };
+        let mut snapshot_v2_value = serde_json::to_value(&snapshot_v3).unwrap();
+        snapshot_v2_value["schema_version"] =
+            serde_json::json!(hft_research_manifest::CEX_REPLAY_SNAPSHOT_SCHEMA_V2);
+        snapshot_v2_value["latency_cost"] = serde_json::json!({
+            "method": "verified_order_lifecycle_realized_slippage",
+            "venue": "binance",
+            "symbol": "BTCUSDT",
+            "runtime_account_id": "historical/spot",
+            "account_fingerprint": "4".repeat(64),
+            "evidence": triplet('7', '8'),
+            "first_observed_at": first_event_time - Duration::seconds(2),
+            "last_observed_at": first_event_time - Duration::seconds(1),
+            "available_at": first_event_time - Duration::seconds(1),
+            "observations": 2,
+            "p50_ns": 1_000_000,
+            "p95_ns": 2_000_000,
+            "p99_ns": 3_000_000,
+            "p50_cost_bps": "0.1",
+            "p95_cost_bps": "0.2",
+            "p99_cost_bps": "0.3"
+        });
+        let snapshot_v2: CexReplaySnapshotV2 = serde_json::from_value(snapshot_v2_value).unwrap();
+        let snapshot_v2_sha256 = snapshot_v2.sha256();
+        let snapshot_v3_sha256 = snapshot_v3.sha256();
+        let manifests = [
+            serde_json::to_value(CexReplayDatasetManifestV2 {
+                dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
+                schema_version: CEX_REPLAY_DATASET_SCHEMA_V2.to_string(),
+                manifest_id: format!("dataset-cex-replay-{snapshot_v2_sha256}"),
+                feature_manifest_id: features.manifest_id.clone(),
+                snapshot: snapshot_v2,
+                snapshot_sha256: snapshot_v2_sha256,
+            })
+            .unwrap(),
+            serde_json::to_value(CexReplayDatasetManifestV3 {
+                dataset_kind: CEX_REPLAY_DATASET_KIND.to_string(),
+                schema_version: CEX_REPLAY_DATASET_SCHEMA_V3.to_string(),
+                manifest_id: format!("dataset-cex-replay-{snapshot_v3_sha256}"),
+                feature_manifest_id: features.manifest_id.clone(),
+                snapshot: snapshot_v3,
+                snapshot_sha256: snapshot_v3_sha256,
+            })
+            .unwrap(),
+        ];
+
+        for (index, manifest) in manifests.into_iter().enumerate() {
+            let manifest_id = manifest["manifest_id"].as_str().unwrap().to_string();
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: manifest_id.clone(),
+                    registry_kind: "dataset".to_string(),
+                    asset_id: "BTCUSDT".to_string(),
+                    parent_revision_id: Some(features.manifest_id.clone()),
+                    payload: manifest.clone(),
+                    created_at: features.created_at,
+                })
+                .unwrap();
+            let manifest_path = directory.path().join(format!("historical-{index}.json"));
+            write_json_atomic(&manifest_path, &manifest).unwrap();
+
+            let registered = read_registered_research_dataset(&store, &manifest_path).unwrap();
+            assert_eq!(registered.manifest_id(), manifest_id);
+            assert!(registered
+                .load_rows(&EvaluationCostsV1 {
+                    fee_bps: 2.0,
+                    rebate_bps: 0.0,
+                    funding_bps: 0.0,
+                    latency_bps: 0.0,
+                    slippage_bps: 0.0,
+                    cross_spread: false,
+                    position_notional_usd: 0.0,
+                    capacity_depth_levels: 0,
+                    max_book_depth_fraction: 0.0,
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("read-only and cannot execute"));
+            assert!(require_promotable_research_dataset(&store, &manifest_id)
+                .unwrap_err()
+                .to_string()
+                .contains("read-only and cannot be promoted"));
+        }
     }
 
     #[cfg(unix)]
