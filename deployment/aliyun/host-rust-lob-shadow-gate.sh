@@ -318,7 +318,7 @@ min_symbols[usdm]=100
 # the new families, so both schema generations remain gateable during the
 # transition.
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
-expected_stream_types[usdm]='["bookTicker","depth@100ms"]'
+expected_stream_types[usdm]='["depth@100ms"]'
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
 bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
@@ -1018,8 +1018,7 @@ verify_oss_round_trips() {
         and (if $market == "usdm" then
           .schema == "binance.market_tape.v2"
           and (.stream_types | sort) == $expected_stream_types
-          and (.event_types.book_ticker | type) == "number"
-          and .event_types.book_ticker > 0
+          and ((.event_types.book_ticker // 0) == 0)
           and ((.event_types.agg_trade // 0) == 0)
           and ((.event_types.raw_trade // 0) == 0)
           and ((.event_types.force_order // 0) == 0)
@@ -1279,7 +1278,7 @@ verify_oss_round_trips() {
           else . end)
       | if .invalid then error("malformed market-tape row")
         elif $market == "usdm"
-          and (.book_ticker == 0 or .agg_trade > 0 or .raw_trade > 0 or .force_order > 0)
+          and (.book_ticker > 0 or .agg_trade > 0 or .raw_trade > 0 or .force_order > 0)
           then error("USD-M LOB stream family contract")
         elif $market == "spot" and .agg_trade == 0 then error("missing agg_trade")
         elif $market == "spot" and $schema == "binance.market_tape.v2"

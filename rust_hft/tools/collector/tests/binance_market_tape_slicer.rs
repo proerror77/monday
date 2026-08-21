@@ -111,7 +111,7 @@ fn segment_rows() -> Vec<Value> {
     rows
 }
 
-fn usdm_lob_segment_rows() -> Vec<Value> {
+fn historical_usdm_lob_segment_rows() -> Vec<Value> {
     let mut rows = vec![
         json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":3,"websocket_shards":2,"websocket_streams":6,"stream_types":["depth@100ms","bookTicker"]}),
         json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@depth@100ms","btcusdt@bookTicker","ethusdt@depth@100ms","ethusdt@bookTicker"],["solusdt@depth@100ms","solusdt@bookTicker"]]}),
@@ -121,6 +121,20 @@ fn usdm_lob_segment_rows() -> Vec<Value> {
         rows.push(snapshot(symbol, base));
         rows.push(diff(symbol, base + 1, 101));
         rows.push(book_ticker(symbol, base + 2));
+        rows.push(checkpoint(symbol, base + 3, 101));
+    }
+    rows
+}
+
+fn usdm_lob_depth_only_segment_rows() -> Vec<Value> {
+    let mut rows = vec![
+        json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":3,"websocket_shards":1,"websocket_streams":3,"stream_types":["depth@100ms"]}),
+        json!({"schema":"binance.market_tape.v2","received_at_ns":event_ns(1),"type":"stream_coverage","session_id":"session-1","shards":[["btcusdt@depth@100ms","ethusdt@depth@100ms","solusdt@depth@100ms"]]}),
+    ];
+    for (index, symbol) in SYMBOLS.iter().enumerate() {
+        let base = 100_u64 + index as u64 * 10_000;
+        rows.push(snapshot(symbol, base));
+        rows.push(diff(symbol, base + 1, 101));
         rows.push(checkpoint(symbol, base + 3, 101));
     }
     rows
@@ -210,7 +224,25 @@ impl Fixture {
     }
 
     fn new_lob() -> Self {
-        Self::new_with_manifest(&usdm_lob_segment_rows(), |mut manifest| {
+        Self::new_with_manifest(&usdm_lob_depth_only_segment_rows(), |mut manifest| {
+            manifest["market"] = json!("usdm");
+            manifest["dataset"] = json!("usdm_perpetual_top100_lob");
+            manifest["replay_scope"] = json!("captured_snapshot_seed_plus_sequence_checked_diffs");
+            manifest["stream_types"] = json!(["depth@100ms"]);
+            for field in [
+                "trade_representation",
+                "price_surface_derivation",
+                "trade_summary_contract",
+                "trade_summaries",
+            ] {
+                manifest.as_object_mut().unwrap().remove(field);
+            }
+            manifest
+        })
+    }
+
+    fn new_historical_lob() -> Self {
+        Self::new_with_manifest(&historical_usdm_lob_segment_rows(), |mut manifest| {
             manifest["market"] = json!("usdm");
             manifest["dataset"] = json!("usdm_perpetual_top100_lob");
             manifest["replay_scope"] = json!("captured_snapshot_seed_plus_sequence_checked_diffs");
@@ -376,12 +408,29 @@ fn cli_slices_usdm_lob_without_trade_contract() {
     );
     let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
     assert_eq!(manifest["dataset"], json!("usdm_perpetual_top100_lob"));
-    assert_eq!(manifest["stream_types"], json!(["depth@100ms", "bookTicker"]));
+    assert_eq!(manifest["stream_types"], json!(["depth@100ms"]));
     assert!(manifest.get("trade_summary_contract").is_none());
     assert!(manifest.get("trade_summaries").is_none());
     assert!(manifest.get("trade_representation").is_none());
     assert!(manifest.get("price_surface_derivation").is_none());
     assert_eq!(manifest["event_types"]["agg_trade"], Value::Null);
+    assert_eq!(manifest["event_types"]["book_ticker"], Value::Null);
+}
+
+#[test]
+fn cli_preserves_historical_usdm_lob_book_ticker_contract_without_trade_contract() {
+    let fixture = Fixture::new_historical_lob();
+    let slice_dir = fixture.directory.join("slices");
+    let report = slice_report(&fixture.slice(&slice_dir, &[]));
+    let slice = &report["slices"][0];
+    let manifest_path = sibling(
+        &slice_dir.join(slice["file"].as_str().unwrap()),
+        ".manifest.json",
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["stream_types"], json!(["depth@100ms", "bookTicker"]));
+    assert_eq!(manifest["event_types"]["book_ticker"], 3);
+    assert!(manifest.get("trade_summary_contract").is_none());
 }
 
 #[test]

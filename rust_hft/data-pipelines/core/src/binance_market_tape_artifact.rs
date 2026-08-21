@@ -30,7 +30,8 @@ const REPLAY_SCOPE: &str =
     "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs";
 const LOB_REPLAY_SCOPE: &str = "captured_snapshot_seed_plus_sequence_checked_diffs";
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
-const USDM_LOB_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
+const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
+const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 const TRADE_REPRESENTATION: &str = "aggregate_trade_only";
 const PRICE_SURFACE_DERIVATION: &str = "latest aggregate trade price";
 const MAX_COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
@@ -1349,8 +1350,13 @@ fn manifest_is_usdm_lob_only(manifest: &TapeManifest) -> bool {
         && manifest.dataset == USDM_LOB_DATASET
         && manifest.schema == MARKET_TAPE_SCHEMA_V2
         && manifest.stream_types.as_ref().is_some_and(|stream_types| {
-            stream_types.iter().map(String::as_str).collect::<BTreeSet<_>>()
-                == USDM_LOB_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
+            let declared = stream_types.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            declared == USDM_LOB_DEPTH_ONLY_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
+                || declared
+                    == USDM_LOB_HISTORICAL_STREAM_TYPES
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
         })
 }
 
@@ -1979,7 +1985,6 @@ mod tests {
                 |row| row["received_at_ns"].as_u64().unwrap() + 1,
             );
         if let Some(session) = rows.iter_mut().find(|row| row["type"] == "session_start") {
-            session["websocket_shards"] = json!(2);
             session["websocket_streams"] = json!(symbols.len() * stream_types.len());
         }
         let mut streams = symbols
@@ -1991,8 +1996,15 @@ mod tests {
                     .map(move |stream_type| format!("{symbol}@{stream_type}"))
             })
             .collect::<Vec<_>>();
-        let second_shard = streams.split_off(streams.len() / 2);
-        rows.push(json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"stream_coverage","session_id":"session-1","shards":[streams, second_shard]}));
+        let second_shard = streams.split_off((streams.len() + 1) / 2);
+        let mut shards = vec![streams];
+        if !second_shard.is_empty() {
+            shards.push(second_shard);
+        }
+        if let Some(session) = rows.iter_mut().find(|row| row["type"] == "session_start") {
+            session["websocket_shards"] = json!(shards.len());
+        }
+        rows.push(json!({"schema":MARKET_TAPE_SCHEMA_V2,"received_at_ns":received_at_ns,"type":"stream_coverage","session_id":"session-1","shards":shards}));
         rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
         rows
     }
@@ -2832,7 +2844,46 @@ mod tests {
     }
 
     #[test]
-    fn strict_gate_verifier_accepts_usdm_lob_only_v2_without_trade_rows() {
+    fn strict_gate_verifier_accepts_usdm_lob_depth_only_v2_without_trade_rows() {
+        let root = tempdir();
+        let mut rows = valid_v2_rows()
+            .into_iter()
+            .filter(|row| {
+                !matches!(
+                    row["type"].as_str(),
+                    Some("agg_trade")
+                        | Some("raw_trade")
+                        | Some("force_order")
+                        | Some("book_ticker")
+                        | Some("stale_book_ticker")
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(session) = rows.iter_mut().find(|row| row["type"] == "session_start") {
+            session["stream_types"] = json!(["depth@100ms"]);
+        }
+        rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &["depth@100ms"]);
+        let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &["depth@100ms"]);
+        let _ = rewrite_manifest(&triplet, |manifest| {
+            manifest["dataset"] = json!("usdm_perpetual_top100_lob");
+            manifest["replay_scope"] = json!(LOB_REPLAY_SCOPE);
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("trade_representation");
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("price_surface_derivation");
+        });
+        let anchor = add_lob_continuity(&triplet, &rows, &["BTCUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+    }
+
+    #[test]
+    fn strict_gate_verifier_accepts_historical_usdm_lob_book_ticker_contract() {
         let root = tempdir();
         let mut rows = valid_v2_rows()
             .into_iter()

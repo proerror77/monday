@@ -640,11 +640,12 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
   | .symbols_config = $symbols_config
   | .catalog_sha256 = $catalog_sha256
   | .configured_catalog_sha256 = $catalog_sha256
-    | .stream_types = ["bookTicker","depth@100ms"]
+    | .stream_types = ["depth@100ms"]
     | .agg_trade_segments = 0
     | .agg_trade_count = 0
     | .raw_trade_segments = 0
     | .raw_trade_count = 0
+    | .book_ticker_count = 0
     | .strict_trade_summary_readback = false
     | .strict_raw_trade_continuity_readback = false
     | .force_order_count = 0
@@ -652,7 +653,7 @@ usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" \
       .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
       | .stream_coverage_verified_count = 100
       | .agg_trade_count = 0 | .raw_trade_count = 0
-      | .book_ticker_count = 1 | .force_order_count = 0)' \
+      | .book_ticker_count = 0 | .force_order_count = 0)' \
   <<<"$market_json")
 jq -n \
   --arg artifact "$artifact" \
@@ -719,14 +720,15 @@ if jq -e \
   printf 'gate policy accepted the legacy USD-M full-tape stream contract\n' >&2
   exit 1
 fi
-jq '.markets.usdm.book_ticker_count = 0' \
-  "$tmp_dir/gate.json" >"$tmp_dir/usdm-missing-book-ticker.json"
+jq '.markets.usdm.book_ticker_count = 1
+    | .markets.usdm.oss_roundtrip_evidence |= map(.book_ticker_count = 1)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/usdm-book-ticker-rows.json"
 if jq -e \
   --arg candidate_sha256 "$artifact" \
   --arg deployment_bundle_sha256 "$bundle" \
   --arg deployment_source_revision "$source_revision" \
-  -f "$POLICY" "$tmp_dir/usdm-missing-book-ticker.json" >/dev/null; then
-  printf 'gate policy accepted USD-M evidence without bookTicker rows\n' >&2
+  -f "$POLICY" "$tmp_dir/usdm-book-ticker-rows.json" >/dev/null; then
+  printf 'gate policy accepted USD-M evidence with bookTicker rows\n' >&2
   exit 1
 fi
 
@@ -792,11 +794,12 @@ v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
   | .bridged_count = 100
   | .stream_coverage_verified_count = 100
   | .symbols_config = $symbols_config
-  | .stream_types = ["bookTicker","depth@100ms"]
+  | .stream_types = ["depth@100ms"]
   | .agg_trade_segments = 0
   | .agg_trade_count = 0
   | .raw_trade_segments = 0
   | .raw_trade_count = 0
+  | .book_ticker_count = 0
   | .strict_trade_summary_readback = false
   | .strict_raw_trade_continuity_readback = false
   | .force_order_count = 0
@@ -804,7 +807,7 @@ v1_usdm_market=$(jq -c --arg symbols_config "$usdm_symbols_config" '
       .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
       | .stream_coverage_verified_count = 100
       | .agg_trade_count = 0 | .raw_trade_count = 0
-      | .book_ticker_count = 1 | .force_order_count = 0)' \
+      | .book_ticker_count = 0 | .force_order_count = 0)' \
   <<<"$v1_market")
 jq -n \
   --arg artifact "$artifact" \

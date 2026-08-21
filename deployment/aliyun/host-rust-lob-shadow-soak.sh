@@ -324,7 +324,7 @@ is_usdm_top100 "${configured_symbols[usdm]}" \
 min_symbols[spot]=1000
 min_symbols[usdm]=100
 expected_stream_types[spot]='["aggTrade","bookTicker","depth@100ms","trade"]'
-expected_stream_types[usdm]='["bookTicker","depth@100ms"]'
+expected_stream_types[usdm]='["depth@100ms"]'
 
 for asset in \
   binance-lob-archiver-rust@.service \
@@ -1022,8 +1022,7 @@ verify_market_readback() {
          and ((.event_types.agg_trade // 0) == 0)
          and ((.event_types.raw_trade // 0) == 0)
          and ((.event_types.force_order // 0) == 0)
-         and (.event_types.book_ticker | type) == "number"
-         and .event_types.book_ticker > 0
+         and ((.event_types.book_ticker // 0) == 0)
        else
          .trade_summary_contract == "binance.aggregate_trade_summary.v1"
          and (.trade_summaries|type) == "object" and (.trade_summaries|length) > 0
@@ -1042,7 +1041,9 @@ verify_market_readback() {
          else (.event_types.agg_trade|type) == "number" and .event_types.agg_trade > 0
            and (.event_types.raw_trade|type) == "number" and .event_types.raw_trade > 0
        end)
-       and (.event_types.book_ticker|type) == "number" and .event_types.book_ticker > 0' \
+       and (if $market == "usdm" then ((.event_types.book_ticker // 0) == 0)
+         else (.event_types.book_ticker|type) == "number" and .event_types.book_ticker > 0
+       end)' \
       "$manifest" >/dev/null \
       || die "$market manifest failed soak readback validation: $uri"
     file=$(jq -er '.file' "$manifest")

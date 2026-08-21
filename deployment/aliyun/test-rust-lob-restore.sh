@@ -234,12 +234,12 @@ setup_fixture() {
     | .symbols_config = $symbols_config
     | .catalog_sha256 = $catalog_sha256
     | .configured_catalog_sha256 = $catalog_sha256
-    | .stream_types = ["bookTicker","depth@100ms"]
+    | .stream_types = ["depth@100ms"]
     | .agg_trade_segments = 0
     | .agg_trade_count = 0
     | .raw_trade_segments = 0
     | .raw_trade_count = 0
-    | .book_ticker_count = 2
+    | .book_ticker_count = 0
     | .strict_trade_summary_readback = false
     | .strict_raw_trade_continuity_readback = false
     | .full_stream_coverage_verified = true
@@ -248,7 +248,7 @@ setup_fixture() {
         .lob_declared_symbol_count = 100 | .lob_covered_symbol_count = 100
         | .stream_coverage_verified_count = 100
         | .agg_trade_count = 0 | .raw_trade_count = 0
-        | .book_ticker_count = 1 | .force_order_count = 0)' \
+        | .book_ticker_count = 0 | .force_order_count = 0)' \
     <<<"$market")
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \

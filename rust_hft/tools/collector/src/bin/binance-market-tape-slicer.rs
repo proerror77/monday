@@ -38,7 +38,8 @@ const MAX_SOURCE_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const SESSION_ROW_SLACK_BYTES: u64 = 4 * 1024;
 const COMPRESSION_LEVEL: i32 = 3;
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
-const USDM_LOB_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
+const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
+const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -394,11 +395,20 @@ fn manifest_is_usdm_lob_only(manifest: &Map<String, Value>) -> bool {
             .get("stream_types")
             .and_then(Value::as_array)
             .is_some_and(|stream_types| {
-                stream_types
+                let declared = stream_types
                     .iter()
                     .filter_map(Value::as_str)
-                    .collect::<BTreeSet<_>>()
-                    == USDM_LOB_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
+                    .collect::<BTreeSet<_>>();
+                declared
+                    == USDM_LOB_DEPTH_ONLY_STREAM_TYPES
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                    || declared
+                        == USDM_LOB_HISTORICAL_STREAM_TYPES
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
             })
 }
 
