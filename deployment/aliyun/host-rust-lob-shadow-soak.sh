@@ -384,6 +384,16 @@ assert_shadow_units_quiescent() {
     || die 'Spot shadow primary is not disabled before soak'
   [[ $(systemctl is-enabled "${unit[usdm]}" 2>/dev/null || true) == disabled ]] \
     || die 'USD-M shadow primary is not disabled before soak'
+  for market in "${MARKETS[@]}"; do
+    [[ -z $(systemctl_prop "${unit[$market]}" DropInPaths) ]] \
+      || die "$market shadow primary has an unexpected systemd drop-in"
+    [[ $(systemctl_prop "${unit[$market]}" OOMScoreAdjust) == 500 ]] \
+      || die "$market shadow primary has the wrong OOMScoreAdjust"
+    [[ $(systemctl_prop "${unit[$market]}" MemoryHigh) == 1879048192 ]] \
+      || die "$market shadow primary has the wrong MemoryHigh"
+    [[ $(systemctl_prop "${unit[$market]}" MemoryMax) == 2147483648 ]] \
+      || die "$market shadow primary has the wrong MemoryMax"
+  done
   for upload_unit in binance-lob-archiver-rust-upload@spot.service \
     binance-lob-archiver-rust-upload@usdm.service; do
     [[ $(systemctl is-active "$upload_unit" 2>/dev/null || true) == inactive ]] \
@@ -965,8 +975,9 @@ run_strict_verifier() {
   strict_verifier_unit="monday-rust-soak-verifier-$$-$strict_verifier_counter.service"
   if systemd-run --quiet --wait --collect --unit="$strict_verifier_unit" \
     --uid="$SERVICE_USER" --gid="$SERVICE_USER" \
-    --property=KillMode=control-group --property=MemoryHigh=5000M \
-    --property=MemoryMax=6400M -- "$candidate_binary" "$@"; then
+    --property=KillMode=control-group --property=OOMScoreAdjust=500 \
+    --property=MemoryHigh=2560M \
+    --property=MemoryMax=3072M -- "$candidate_binary" "$@"; then
     status=0
   else
     status=$?

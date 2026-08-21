@@ -10,7 +10,7 @@ readonly GATE_SEGMENT_SECONDS=120
 readonly MAX_HEALTH_SILENCE_SECONDS=120
 readonly MAX_SEGMENT_GAP_NS=90000000000
 readonly HOST_MEMORY_RESERVE_BYTES=1073741824
-readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=6710886400
+readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472
 readonly SHADOW_BINARY=/opt/monday/bin/binance-lob-archiver-shadow
 readonly RELEASE_ROOT=/opt/monday/releases/binance-lob-archiver
 readonly EVIDENCE_ROOT=/data/monday/evidence/shadow-gates
@@ -255,12 +255,12 @@ for market in "${markets[@]}"; do
   shadow_unit=${unit[$market]}
   [[ -z $(systemctl show "$shadow_unit" --property=DropInPaths --value) ]] \
     || die "$market shadow service has an unexpected systemd drop-in"
-  [[ $(systemctl show "$shadow_unit" --property=MemoryHigh --value) == 4613734400 ]] \
+  [[ $(systemctl show "$shadow_unit" --property=MemoryHigh --value) == 1879048192 ]] \
     || die "$market shadow service MemoryHigh differs from the gated template"
   [[ $(systemctl show "$shadow_unit" --property=OOMScoreAdjust --value) == 500 ]] \
     || die "$market shadow service OOMScoreAdjust differs from the gated template"
   memory_max=$(systemctl show "$shadow_unit" --property=MemoryMax --value)
-  [[ $memory_max == 5242880000 ]] \
+  [[ $memory_max == 2147483648 ]] \
     || die "$market shadow service MemoryMax differs from the gated template"
   shadow_memory_max_bytes+=("$memory_max")
 done
@@ -490,8 +490,9 @@ run_strict_verifier() {
   if systemd-run --quiet --wait --collect \
     --unit="$strict_verifier_unit" \
     --property=KillMode=control-group \
-    --property=MemoryHigh=5000M \
-    --property=MemoryMax=6400M \
+    --property=OOMScoreAdjust=500 \
+    --property=MemoryHigh=2560M \
+    --property=MemoryMax=3072M \
     -- "$candidate_binary" "$@" >/dev/null; then
     verifier_status=0
   else
@@ -680,11 +681,11 @@ for market in "${markets[@]}"; do
   ((cpu_quota_us[$market] > 0)) || die "$market CPU quota must be finite"
   [[ -z $(systemctl_value "$market" DropInPaths) ]] \
     || die "$market shadow service has an unexpected systemd drop-in"
-  [[ $(systemctl_value "$market" MemoryHigh) == 4613734400 ]] \
+  [[ $(systemctl_value "$market" MemoryHigh) == 1879048192 ]] \
     || die "$market shadow service MemoryHigh differs from the gated template"
   memory_max_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryMax)" \
     "$market MemoryMax")
-  ((memory_max_bytes[$market] == 5242880000)) \
+  ((memory_max_bytes[$market] == 2147483648)) \
     || die "$market shadow service MemoryMax differs from the gated template"
   max_memory_bytes[$market]=$(require_uint "$(systemctl_value "$market" MemoryCurrent)" \
     "$market MemoryCurrent")

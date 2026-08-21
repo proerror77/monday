@@ -59,6 +59,12 @@ if monday_shadow_memory_admission 1 0 0 >/dev/null 2>&1; then
   printf 'shadow gate memory admission accepted a zero requirement\n' >&2
   exit 1
 fi
+calibrated_gate_bytes=5368709120
+[[ $(monday_shadow_memory_admission \
+  "$calibrated_gate_bytes" 1073741824 4294967296 0) == "$calibrated_gate_bytes" ]] || {
+  printf 'calibrated dual-market gate does not fit its exact 5 GiB budget\n' >&2
+  exit 1
+}
 
 for command in awk base64 cmp cut grep install jq mktemp sed seq sha256sum sort tail; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -112,8 +118,9 @@ grep -Fq 'or (.full_stream_coverage_verified == true))' "$RUNTIME_POLICY"
 grep -Fq '"full_stream_coverage_verified"' "$LOB_ARCHIVER"
 grep -Fq -- '--unit="$strict_verifier_unit"' "$GATE"
 grep -Fq -- '--property=KillMode=control-group' "$GATE"
-grep -Fq 'MemoryHigh=5000M' "$GATE"
-grep -Fq 'MemoryMax=6400M' "$GATE"
+grep -Fq 'MemoryHigh=2560M' "$GATE"
+grep -Fq 'MemoryMax=3072M' "$GATE"
+grep -Fq 'OOMScoreAdjust=500' "$GATE"
 grep -Fq 'verify_oss_round_trips "$market" >"$round_trips_path"' "$GATE"
 if grep -Fq 'round_trips=$(verify_oss_round_trips "$market")' "$GATE"; then
   printf 'shadow gate still runs OSS verification in a command-substitution subshell\n' >&2
@@ -281,14 +288,14 @@ grep -Fq 'ARG SOURCE_REVISION' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo' "$COLLECTOR_DOCKERFILE"
 grep -Fq 'SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$ACR_WORKFLOW"
 grep -Fq "grep -Fqx 'binance-lob-archiver \${{ needs.selector.outputs.source_sha }}'" "$ACR_WORKFLOW"
-grep -Fxq 'MemoryHigh=4400M' "$SHADOW_UNIT"
-grep -Fxq 'MemoryMax=5000M' "$SHADOW_UNIT"
+grep -Fxq 'MemoryHigh=1792M' "$SHADOW_UNIT"
+grep -Fxq 'MemoryMax=2048M' "$SHADOW_UNIT"
 grep -Fxq 'OOMScoreAdjust=500' "$SHADOW_UNIT"
 grep -Fq 'systemctl_value "$market" DropInPaths' "$GATE"
 grep -Fq 'systemctl_value "$market" MemoryHigh' "$GATE"
-grep -Fq 'memory_max_bytes[$market] == 5242880000' "$GATE"
+grep -Fq 'memory_max_bytes[$market] == 2147483648' "$GATE"
 grep -Fq 'readonly HOST_MEMORY_RESERVE_BYTES=1073741824' "$GATE"
-grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=6710886400' "$GATE"
+grep -Fq 'readonly STRICT_VERIFIER_MEMORY_MAX_BYTES=3221225472' "$GATE"
 grep -Fq 'monday_shadow_memory_admission' "$GATE"
 grep -Fq 'host_memory_available_bytes_at_preflight' "$GATE"
 grep -Fq 'host_swap_total_bytes' "$GATE"
@@ -429,8 +436,9 @@ run_strict_verifier_fixture() (
     exit 1
   }
   for verifier_unit in "${verifier_units[@]}"; do
-    [[ $verifier_unit == *'--property=MemoryHigh=5000M'* ]] || exit 1
-    [[ $verifier_unit == *'--property=MemoryMax=6400M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=OOMScoreAdjust=500'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryHigh=2560M'* ]] || exit 1
+    [[ $verifier_unit == *'--property=MemoryMax=3072M'* ]] || exit 1
   done
 )
 run_strict_verifier_fixture
