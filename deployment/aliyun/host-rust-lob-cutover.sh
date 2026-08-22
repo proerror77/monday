@@ -280,6 +280,7 @@ validate_memory_only_dropin() {
       service_count = 0
       memory_high = 0
       memory_max = 0
+      invalid = 0
     }
     /^[[:space:]]*($|#|;)/ { next }
     /^\[Service\][[:space:]]*$/ {
@@ -287,12 +288,14 @@ validate_memory_only_dropin() {
       section = "Service"
       next
     }
-    /^\[/ { exit 1 }
-    section != "Service" { exit 1 }
+    /^\[/ { invalid = 1; exit }
+    section != "Service" { invalid = 1; exit }
     /^[[:space:]]*MemoryHigh=[^[:space:]].*$/ { memory_high += 1; next }
     /^[[:space:]]*MemoryMax=[^[:space:]].*$/ { memory_max += 1; next }
-    { exit 1 }
-    END { exit !(service_count == 1 && memory_high == 1 && memory_max == 1) }
+    { invalid = 1; exit }
+    END {
+      exit !(invalid == 0 && service_count == 1 && memory_high == 1 && memory_max == 1)
+    }
   ' "$path" >/dev/null \
     || fail "production USD-M drop-in must contain only [Service], MemoryHigh, and MemoryMax: $path"
 }
@@ -744,7 +747,12 @@ rollback_after_failure() {
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
-      ROLLBACK_RESULT=previous-release-restored-contained
+      if production_is_fail_closed; then
+        ROLLBACK_RESULT=previous-release-restored-contained
+      else
+        safe_to_restart=0
+        ROLLBACK_RESULT=previous-release-restore-containment-failed
+      fi
     else
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0
@@ -929,8 +937,11 @@ if (( active_count == 2 && enabled_count == 2 )); then
   DRAIN_REQUIRED=1
 elif (( active_count == 0 && enabled_count == 2 )) && [[ -L $PRODUCTION_LINK ]]; then
   capture_existing_production_identity contained-upgrade
+  DRAIN_REQUIRED=1
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
+  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \
+    || fail 'new host must not retain a production USD-M drop-in'
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
 else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count symlink=$PRODUCTION_LINK"
@@ -972,7 +983,7 @@ for unit in "${PRODUCTION_UNITS[@]}"; do
     || fail "candidate production service retained an unexpected systemd drop-in: $unit_dropins"
 done
 
-if [[ $OLD_MODE == upgrade ]]; then
+if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then
   STEP=drain-old-production-with-candidate
   DRAIN_ATTEMPTED=1
   run_candidate_drain "$OLD_DEPLOYMENT"

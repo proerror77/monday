@@ -1255,12 +1255,70 @@ grep -Fq 'binance-lob-archiver@spot.service' "$CUTOVER"
 grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
 grep -Fq 'contained-upgrade' "$CUTOVER"
 grep -Fq 'capture_existing_production_identity contained-upgrade' "$CUTOVER"
+grep -Fq 'if [[ $OLD_MODE == upgrade || $OLD_MODE == contained-upgrade ]]; then' "$CUTOVER"
+grep -Fq "fail 'new host must not retain a production USD-M drop-in'" "$CUTOVER"
 grep -Fq 'binance-lob-archiver-production@usdm.service.d/10-memory.conf' "$CUTOVER"
 grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
 grep -Fq 'production unit remained enabled after disable' "$CUTOVER"
 grep -Fq 'candidate production service retained an unexpected systemd drop-in' "$CUTOVER"
 grep -Fq 'validate_existing_production_dropins' "$CUTOVER"
 grep -Fq 'remove_allowlisted_production_dropins_for_candidate' "$CUTOVER"
+
+host_state_dispatch=$(sed -n '/^if (( active_count == 2/,/^fi$/p' "$CUTOVER")
+grep -Fq 'OLD_MODE=new-host' <<<"$host_state_dispatch"
+grep -Fq '(( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 ))' <<<"$host_state_dispatch"
+grep -Fq $'capture_existing_production_identity contained-upgrade\n  DRAIN_REQUIRED=1' \
+  <<<"$host_state_dispatch"
+
+new_host_dropin_guard="$tmp_dir/new-host-dropin-guard.sh"
+sed -n '/^  (( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 )) \\/,+1p' "$CUTOVER" \
+  | sed 's/^  //' >"$new_host_dropin_guard"
+run_new_host_dropin_guard() (
+  PRODUCTION_USDM_MEMORY_DROPIN_PRESENT=$1
+  fail() { printf '%s\n' "$*" >&2; return 1; }
+  # shellcheck disable=SC1090
+  . "$new_host_dropin_guard"
+)
+run_new_host_dropin_guard 0
+if run_new_host_dropin_guard 1 >"$tmp_dir/new-host-dropin.out" 2>&1; then
+  printf 'new-host classification accepted a production drop-in\n' >&2
+  exit 1
+fi
+grep -Fq 'new host must not retain a production USD-M drop-in' \
+  "$tmp_dir/new-host-dropin.out"
+
+drain_dispatch_body="$tmp_dir/drain-dispatch.sh"
+sed -n \
+  '/^if \[\[ \$OLD_MODE == upgrade || \$OLD_MODE == contained-upgrade \]\]; then$/,/^fi$/p' \
+  "$CUTOVER" >"$drain_dispatch_body"
+run_drain_dispatch_fixture() (
+  local calls=$1
+  OLD_MODE=$2
+  OLD_DEPLOYMENT=old-deployment
+  DRAIN_REQUIRED=1
+  DRAIN_ATTEMPTED=0
+  DRAIN_MAY_HAVE_MUTATED=0
+  run_candidate_drain() { printf 'drain %s\n' "$1" >>"$calls"; }
+  require_empty_segment_spool() { printf 'require-empty\n' >>"$calls"; }
+  fail() { return 1; }
+  # shellcheck disable=SC1090
+  . "$drain_dispatch_body"
+)
+contained_drain_calls="$tmp_dir/contained-drain.calls"
+new_host_drain_calls="$tmp_dir/new-host-drain.calls"
+run_drain_dispatch_fixture "$contained_drain_calls" contained-upgrade
+run_drain_dispatch_fixture "$new_host_drain_calls" new-host
+grep -Fxq 'drain old-deployment' "$contained_drain_calls"
+if grep -Fq 'require-empty' "$contained_drain_calls"; then
+  printf 'contained upgrade used the new-host spool invariant\n' >&2
+  exit 1
+fi
+grep -Fxq 'require-empty' "$new_host_drain_calls"
+if grep -Fq 'drain ' "$new_host_drain_calls"; then
+  printf 'new-host cutover tried to drain an old deployment\n' >&2
+  exit 1
+fi
+
 grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXXXXX")' \
   "$INSTALL_RELEASE"
 grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
@@ -1373,6 +1431,7 @@ run_dropin_roundtrip_fixture
 cat >"$dropin_path" <<'EOF'
 [Service]
 MemoryHigh=4096M
+MemoryMax=5120M
 ExecStart=/bin/false
 EOF
 if run_dropin_roundtrip_fixture >"$tmp_dir/dropin-invalid.out" 2>&1; then
@@ -1461,6 +1520,7 @@ grep -Fq 'installed production asset drifted from the active immutable release' 
   "$tmp_dir/drift.out"
 
 run_contained_upgrade_rollback_fixture() (
+  local expect_contained=${1:-1}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1489,9 +1549,14 @@ run_contained_upgrade_rollback_fixture() (
         if [[ ${2:-} == --quiet ]]; then
           return 1
         fi
-        printf 'masked-runtime\n'
+        if (( expect_contained )); then
+          printf 'masked-runtime\n'
+        else
+          printf 'disabled\n'
+        fi
         return 1
         ;;
+      mask) (( expect_contained )) ;;
       *) return 0 ;;
     esac
   }
@@ -1506,7 +1571,6 @@ run_contained_upgrade_rollback_fixture() (
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
-  [[ $ROLLBACK_RESULT == previous-release-restored-contained ]]
   grep -Fq 'restore-dropin' "$calls"
   grep -Eq '^daemon-reload( |$)' "$calls"
   if grep -Eq '^(start|enable|unmask) ' "$calls"; then
@@ -1517,6 +1581,8 @@ run_contained_upgrade_rollback_fixture() (
 )
 
 [[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 0) \
+  == previous-release-restore-containment-failed ]]
 
 run_new_host_rollback_fixture() (
   local active_unit=${1:-} unit
