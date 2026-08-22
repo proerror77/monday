@@ -9867,6 +9867,49 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_trade_reconnect_does_not_restart_capture_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut process_state = trusted_process_state(&config.symbols);
+        assert_eq!(
+            process_event(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "session-1",
+                Event::StreamDisconnected {
+                    streams: vec!["btcusdt@aggTrade".into()],
+                    reason: "test".into(),
+                },
+                &mut process_state,
+            )
+            .unwrap(),
+            ProcessAction::None
+        );
+        assert!(!segment.is_replay_safe());
+
+        assert_eq!(
+            archive_first_btc_aggregate_trade(
+                &config,
+                &mut segment,
+                &mut states,
+                &mut budget,
+                &mut process_state,
+            ),
+            ProcessAction::None
+        );
+        assert!(process_state.streams_healthy());
+    }
+
+    #[test]
     fn depth_reconnect_invalidates_only_affected_symbols_and_requests_local_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_config("http://unused".into());
