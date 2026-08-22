@@ -438,7 +438,7 @@ has_incomplete_segment_artifacts() {
 }
 
 run_candidate_drain() {
-  local deployment=$1 market env_file key value recovery_parent recovery_dir
+  local deployment=$1 market env_file key value
   local -a env_args
   canonical_spool_paths_safe || return 1
   for market in spot usdm; do
@@ -451,26 +451,9 @@ run_candidate_drain() {
       env_args+=("$key=$value")
     done
     if has_incomplete_segment_artifacts "$CANONICAL_SPOOL/$market"; then
-      recovery_parent="$EVIDENCE_DIR/recovery-input/$market"
-      install -d -m 0750 -o root -g root -- "$recovery_parent" || return 1
-      recovery_dir="$recovery_parent/$(date -u +%Y%m%dT%H%M%S%NZ)-$$"
-      [[ ! -e $recovery_dir && ! -L $recovery_dir ]] || return 1
-      if ! env -i \
-        HOME=/root \
-        PATH="$SAFE_PATH" \
-        RUST_LOG=info \
-        "${env_args[@]}" \
-        RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256" \
-        RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION" \
-        RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256" \
-        RECOVERY_UID="$(id -u hftcollector)" \
-        RECOVERY_GID="$(id -g hftcollector)" \
-        RECOVERY_BACKUP_DIR="$recovery_dir" \
-        "$CANDIDATE_BINARY" --recover-parts-only; then
-        [[ -f $recovery_dir/receipt.json ]] && DRAIN_MAY_HAVE_MUTATED=1
-        return 1
-      fi
+      /opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market" || return 1
       DRAIN_MAY_HAVE_MUTATED=1
+      continue
     fi
     DRAIN_MAY_HAVE_MUTATED=1
     runuser --user hftcollector -- env -i \
@@ -752,6 +735,12 @@ production_is_fail_closed() {
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
+  for unit in "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state == disabled || $state == masked || $state == masked-runtime \
+      || $state == not-found ]] || return 1
+  done
 }
 
 write_evidence() {
@@ -805,11 +794,7 @@ rollback_after_failure() {
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
-  for unit in "${PRODUCTION_UNITS[@]}"; do
-    if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
-      safe_to_restart=0
-    fi
-  done
+  production_is_fail_closed || safe_to_restart=0
   if (( safe_to_restart == 0 )); then
     if production_is_fail_closed; then
       ROLLBACK_RESULT=production-stop-or-disable-failed-but-contained
@@ -861,11 +846,6 @@ rollback_after_failure() {
     elif ! systemctl daemon-reload; then
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
-    elif (( safe_to_restart \
-      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
-      safe_to_restart=0
-      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
       if production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restored-contained
@@ -873,6 +853,11 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-release-restore-containment-failed
       fi
+    elif (( safe_to_restart \
+      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif (( safe_to_restart )); then
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0

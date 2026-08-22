@@ -216,22 +216,16 @@ for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do
     exit 1
   }
 done
-backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1)
-recover_line=$(grep -n -- '--recover-parts-only' <<<"$drain_body" | cut -d: -f1)
-upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)
-[[ -n $backup_line && -n $recover_line && -n $upload_line \
-  && $backup_line -lt $recover_line && $recover_line -lt $upload_line ]] || {
-  printf 'cutover does not recover interrupted parts before upload-only drain\n' >&2
+backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1 || true)
+isolate_line=$(grep -n -- 'monday-rust-lob-recovery-queue isolate "$market"' <<<"$drain_body" | cut -d: -f1 || true)
+upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1 || true)
+[[ -z ${backup_line:-} && -n $isolate_line && -n $upload_line \
+  && $isolate_line -lt $upload_line ]] || {
+  printf 'cutover does not detach interrupted spools before upload-only drain\n' >&2
   exit 1
 }
 recover_body=$(sed -n '/^fn recover_parts_only()/,/^fn stream_types_for_market/p' "$COLLECTOR")
-grep -Fq 'RECOVERY_UID="$(id -u hftcollector)"' "$CUTOVER"
-grep -Fq 'RECOVERY_GID="$(id -g hftcollector)"' "$CUTOVER"
-grep -Fq 'RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256"' "$CUTOVER"
-grep -Fq 'RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
-grep -Fq 'RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256"' "$CUTOVER"
-grep -Fq -- '--arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
-grep -Fq 'deployment_source_revision:' "$CUTOVER"
+grep -Fq '/opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market"' "$CUTOVER"
 grep -Fq 'spool_lock.owner()' <<<"$recover_body"
 grep -Fq 'validated_nonempty_recovery_parts' <<<"$recover_body"
 grep -Fq 'validated_recovery_temporaries' <<<"$recover_body"
@@ -1596,6 +1590,9 @@ run_contained_upgrade_rollback_fixture() (
   local expect_contained=${1:-1}
   local pending_drain=${2:-0}
   local mode=${3:-contained-upgrade}
+  local old_recovery_timers_enabled=${4:-0}
+  local active_recovery_timer=${5:-}
+  local enabled_recovery_timer=${6:-}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1614,7 +1611,7 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_REQUIRED=$pending_drain
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
-  OLD_RECOVERY_TIMERS_ENABLED=0
+  OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
   SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
   mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
     "$(dirname "$PRODUCTION_LINK")"
@@ -1622,10 +1619,17 @@ run_contained_upgrade_rollback_fixture() (
   systemctl() {
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
     case "$1" in
-      is-active) return 1 ;;
+      is-active)
+        [[ ${!#} == "$active_recovery_timer" ]]
+        ;;
       is-enabled)
         if [[ ${2:-} == --quiet ]]; then
-          return 1
+          [[ ${!#} == "$enabled_recovery_timer" ]]
+          return
+        fi
+        if [[ ${!#} == "$enabled_recovery_timer" ]]; then
+          printf 'enabled\n'
+          return 0
         fi
         if (( expect_contained )); then
           printf 'masked-runtime\n'
@@ -1649,10 +1653,16 @@ run_contained_upgrade_rollback_fixture() (
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
-  grep -Fq "install $OLD_DEPLOYMENT" "$calls"
-  grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
-  grep -Fq 'restore-dropin' "$calls"
-  grep -Eq '^daemon-reload( |$)' "$calls"
+  if (( expect_contained )) \
+    && [[ -z $active_recovery_timer && -z $enabled_recovery_timer ]]; then
+    grep -Fq "install $OLD_DEPLOYMENT" "$calls"
+    grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
+    grep -Fq 'restore-dropin' "$calls"
+    grep -Eq '^daemon-reload( |$)' "$calls"
+  elif grep -Eq '^(install|symlink|restore-dropin|daemon-reload)( |$)' "$calls"; then
+    printf 'uncontained rollback tried to restore the previous release\n' >&2
+    exit 1
+  fi
   if grep -Eq '^(start|enable|unmask) ' "$calls"; then
     printf 'contained rollback tried to restart or unmask the previous release\n' >&2
     exit 1
@@ -1671,8 +1681,14 @@ run_contained_upgrade_rollback_fixture() (
 
 [[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 0) \
-  == previous-release-restore-containment-failed ]]
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
+  == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 recovery-spot) \
+  == production-stop-or-disable-containment-failed ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 '' recovery-spot) \
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
 
@@ -1722,8 +1738,10 @@ run_new_host_rollback_fixture() (
 )
 
 [[ $(run_new_host_rollback_fixture) == new-host-disabled ]]
-[[ $(run_new_host_rollback_fixture legacy-spot) == new-host-containment-failed ]]
-[[ $(run_new_host_rollback_fixture upload-usdm) == new-host-containment-failed ]]
+[[ $(run_new_host_rollback_fixture legacy-spot) \
+  == production-stop-or-disable-containment-failed ]]
+[[ $(run_new_host_rollback_fixture upload-usdm) \
+  == production-stop-or-disable-containment-failed ]]
 
 mock_bin="$tmp_dir/bin"
 mock_state="$tmp_dir/mock-state"

@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
@@ -673,6 +674,70 @@ fn finalize_segment(
     raw_trade_incomplete_symbols: BTreeSet<String>,
     readiness: ReadinessSummary,
 ) -> anyhow::Result<SegmentArtifacts> {
+    finalize_segment_with_recovered_file(
+        config,
+        path,
+        counts,
+        trade_summaries,
+        schema,
+        identity_start_ns,
+        start_ns,
+        end_ns,
+        has_replay_safe_checkpoint,
+        raw_trade_incomplete_symbols,
+        readiness,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_recovered_segment(
+    config: &SegmentConfig,
+    path: &Path,
+    counts: BTreeMap<String, u64>,
+    trade_summaries: BTreeMap<String, AggregateTradeSummary>,
+    schema: &str,
+    identity_start_ns: u64,
+    start_ns: u64,
+    end_ns: u64,
+    has_replay_safe_checkpoint: bool,
+    raw_trade_incomplete_symbols: BTreeSet<String>,
+    readiness: ReadinessSummary,
+    recovered_file: &mut File,
+    recovered_bytes: u64,
+    recovered_metadata: &fs::Metadata,
+) -> anyhow::Result<SegmentArtifacts> {
+    finalize_segment_with_recovered_file(
+        config,
+        path,
+        counts,
+        trade_summaries,
+        schema,
+        identity_start_ns,
+        start_ns,
+        end_ns,
+        has_replay_safe_checkpoint,
+        raw_trade_incomplete_symbols,
+        readiness,
+        Some((recovered_file, recovered_bytes, recovered_metadata)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_segment_with_recovered_file(
+    config: &SegmentConfig,
+    path: &Path,
+    counts: BTreeMap<String, u64>,
+    trade_summaries: BTreeMap<String, AggregateTradeSummary>,
+    schema: &str,
+    identity_start_ns: u64,
+    start_ns: u64,
+    end_ns: u64,
+    has_replay_safe_checkpoint: bool,
+    raw_trade_incomplete_symbols: BTreeSet<String>,
+    readiness: ReadinessSummary,
+    mut recovered_file: Option<(&mut File, u64, &fs::Metadata)>,
+) -> anyhow::Result<SegmentArtifacts> {
     let require_aggregate_trades = config
         .stream_types
         .iter()
@@ -682,28 +747,69 @@ fn finalize_segment(
         schema if market_tape_schema(schema) && require_aggregate_trades => {
             "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs"
         }
-        schema if market_tape_schema(schema) => "captured_snapshot_seed_plus_sequence_checked_diffs",
+        schema if market_tape_schema(schema) => {
+            "captured_snapshot_seed_plus_sequence_checked_diffs"
+        }
         _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
     };
     let lob_continuity = if market_tape_schema(schema) {
-        Some(summarize_lob_continuity(path, config.symbols.clone())?)
+        Some(match recovered_file.as_mut() {
+            Some((file, recovered_bytes, _)) => {
+                summarize_lob_continuity_file(file, config.symbols.clone(), *recovered_bytes)?
+            }
+            None => summarize_lob_continuity(path, config.symbols.clone())?,
+        })
     } else {
         None
     };
     let data = path.with_file_name(format!("part-{identity_start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
-    let mut command = Command::new("zstd");
-    command
-        .args(["-q", "-f", "-T1", "-3"])
-        .arg(path)
-        .arg("-o")
-        .arg(&temporary_data);
-    let status = command_status_with_timeout(&mut command, config.zstd_timeout)?;
-    if !status.success() {
-        anyhow::bail!("zstd failed with {status}");
+    if let Some((file, recovered_bytes, recovered_metadata)) = recovered_file.as_mut() {
+        let temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary_data)?;
+        let remove_temporary = || {
+            let metadata = temporary.metadata()?;
+            unlink_recovery_part(&temporary_data, &temporary, &metadata)
+        };
+        let compression = (|| -> anyhow::Result<()> {
+            file.seek(SeekFrom::Start(0))?;
+            let mut encoder = zstd::stream::write::Encoder::new(temporary.try_clone()?, 3)?;
+            let copied = std::io::copy(&mut file.take(*recovered_bytes), &mut encoder)?;
+            anyhow::ensure!(
+                copied == *recovered_bytes,
+                "recovery source ended before the validated byte boundary"
+            );
+            encoder.finish()?.sync_all()?;
+            ensure_recovery_path_matches_snapshot(path, file, recovered_metadata)?;
+            Ok(())
+        })();
+        if let Err(error) = compression {
+            let _ = remove_temporary();
+            return Err(error);
+        }
+        if let Err(error) = fs::hard_link(&temporary_data, &data) {
+            let _ = remove_temporary();
+            return Err(error.into());
+        }
+        fs::remove_file(&temporary_data)?;
+    } else {
+        let mut command = Command::new("zstd");
+        command
+            .args(["-q", "-f", "-T1", "-3"])
+            .arg(path)
+            .arg("-o")
+            .arg(&temporary_data);
+        let status = command_status_with_timeout(&mut command, config.zstd_timeout)?;
+        if !status.success() {
+            anyhow::bail!("zstd failed with {status}");
+        }
+        File::open(&temporary_data)?.sync_all()?;
+        fs::rename(&temporary_data, &data)?;
     }
-    File::open(&temporary_data)?.sync_all()?;
-    fs::rename(&temporary_data, &data)?;
     sync_parent(&data)?;
 
     let digest = sha256_file(&data)?;
@@ -793,7 +899,9 @@ fn finalize_segment(
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     ));
-    fs::remove_file(path)?;
+    if recovered_file.is_none() {
+        fs::remove_file(path)?;
+    }
     Ok(SegmentArtifacts {
         data,
         manifest,
@@ -806,8 +914,29 @@ fn summarize_lob_continuity(
     path: &Path,
     symbols: Vec<String>,
 ) -> anyhow::Result<LobContinuitySummary> {
+    summarize_lob_continuity_reader(BufReader::new(File::open(path)?), symbols)
+}
+
+fn summarize_lob_continuity_file(
+    file: &mut File,
+    symbols: Vec<String>,
+    recovered_bytes: u64,
+) -> anyhow::Result<LobContinuitySummary> {
+    file.seek(SeekFrom::Start(0))?;
+    let summary = summarize_lob_continuity_reader(
+        BufReader::new((&mut *file).take(recovered_bytes)),
+        symbols,
+    )?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(summary)
+}
+
+fn summarize_lob_continuity_reader(
+    reader: impl BufRead,
+    symbols: Vec<String>,
+) -> anyhow::Result<LobContinuitySummary> {
     let mut summary = LobContinuitySummaryBuilder::new(symbols)?;
-    for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+    for (index, line) in reader.lines().enumerate() {
         let line = line?;
         let raw: Value = serde_json::from_str(&line)
             .with_context(|| format!("parse LOB continuity row {}", index + 1))?;
@@ -848,31 +977,43 @@ pub fn recover_parts_from_paths(
         return Ok(Vec::new());
     }
     anyhow::ensure!(
-        fs::symlink_metadata(&config.spool_dir)?.file_type().is_dir(),
+        fs::symlink_metadata(&config.spool_dir)?
+            .file_type()
+            .is_dir(),
         "configured recovery spool is not a direct directory"
     );
     let spool_dir = fs::canonicalize(&config.spool_dir)?;
     let mut artifacts = Vec::new();
-    let mut recovered_paths = BTreeSet::new();
+    let mut recovered_files = BTreeSet::new();
     for path in paths {
-        let metadata = fs::symlink_metadata(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        let named_metadata = fs::symlink_metadata(path)?;
         let resolved = fs::canonicalize(path)?;
+        let resolved_metadata = fs::metadata(&resolved)?;
         anyhow::ensure!(
-            metadata.file_type().is_file()
+            named_metadata.file_type().is_file()
+                && metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.gid() == unsafe { libc::getegid() }
+                && recovery_metadata_matches(&metadata, &named_metadata, 1, true)
+                && recovery_metadata_matches(&metadata, &resolved_metadata, 1, true)
                 && resolved.starts_with(&spool_dir)
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.ends_with(".jsonl.part"))
-                && recovered_paths.insert(resolved),
-            "recovery path is not a unique part beneath the configured spool: {}",
+                && recovered_files.insert((metadata.dev(), metadata.ino())),
+            "recovery path is not a unique single-link part owned by the recovery process beneath the configured spool: {}",
             path.display()
         );
-        let file = File::open(path)?;
-        let file_len = usize::try_from(file.metadata()?.len())?;
+        let file_len = usize::try_from(metadata.len())?;
         if file_len == 0 {
-            drop(file);
-            fs::remove_file(path)?;
+            unlink_recovery_part(path, &file, &metadata)?;
             continue;
         }
         // Stream rows instead of reading the whole part into memory: an
@@ -992,29 +1133,24 @@ pub fn recover_parts_from_paths(
             *counts.entry(event_type.to_owned()).or_default() += 1;
             offset += line.len();
         }
-        if quarantine {
-            fs::rename(path, path.with_extension("part.corrupt"))?;
+        let mut file = reader.into_inner();
+        if quarantine || invalid_at.is_some_and(|(_, has_following_data)| has_following_data) {
+            quarantine_recovery_part(path, &file, &metadata)?;
             continue;
-        }
-        if let Some((valid_bytes, has_following_data)) = invalid_at {
-            if has_following_data {
-                fs::rename(path, path.with_extension("part.corrupt"))?;
-                continue;
-            }
-            OpenOptions::new()
-                .write(true)
-                .open(path)?
-                .set_len(u64::try_from(valid_bytes)?)?;
         }
         if counts.is_empty() {
-            fs::remove_file(path)?;
+            unlink_recovery_part(path, &file, &metadata)?;
             continue;
         }
+        let recovered_bytes = invalid_at
+            .map(|(valid_bytes, _)| u64::try_from(valid_bytes))
+            .transpose()?
+            .unwrap_or(metadata.len());
         let schema = detected_schema
             .map(|(_, schema)| schema)
             .expect("non-empty recovered segment has a detected schema");
         let trade_summaries = trade_summaries.finish()?;
-        artifacts.push(finalize_segment(
+        let artifact = finalize_recovered_segment(
             config,
             path,
             counts,
@@ -1032,9 +1168,84 @@ pub fn recover_parts_from_paths(
                     .iter()
                     .map(|symbol| (symbol.as_str(), false, false, false)),
             ),
-        )?);
+            &mut file,
+            recovered_bytes,
+            &metadata,
+        )?;
+        unlink_recovery_part(path, &file, &metadata)?;
+        artifacts.push(artifact);
     }
     Ok(artifacts)
+}
+
+fn recovery_metadata_matches(
+    expected: &fs::Metadata,
+    actual: &fs::Metadata,
+    nlink: u64,
+    compare_ctime: bool,
+) -> bool {
+    actual.is_file()
+        && actual.dev() == expected.dev()
+        && actual.ino() == expected.ino()
+        && actual.nlink() == nlink
+        && actual.uid() == expected.uid()
+        && actual.gid() == expected.gid()
+        && actual.mode() == expected.mode()
+        && actual.len() == expected.len()
+        && actual.mtime() == expected.mtime()
+        && actual.mtime_nsec() == expected.mtime_nsec()
+        && (!compare_ctime
+            || (actual.ctime() == expected.ctime() && actual.ctime_nsec() == expected.ctime_nsec()))
+}
+
+fn ensure_recovery_path_matches_snapshot(
+    path: &Path,
+    file: &File,
+    expected: &fs::Metadata,
+) -> anyhow::Result<()> {
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        named.file_type().is_file()
+            && recovery_metadata_matches(expected, &opened, 1, true)
+            && recovery_metadata_matches(expected, &named, 1, true),
+        "recovery part changed after validation: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn unlink_recovery_part(path: &Path, file: &File, expected: &fs::Metadata) -> anyhow::Result<()> {
+    ensure_recovery_path_matches_snapshot(path, file, expected)?;
+    fs::remove_file(path)?;
+    let unlinked = file.metadata()?;
+    anyhow::ensure!(
+        recovery_metadata_matches(expected, &unlinked, 0, false),
+        "recovery part gained another link or changed while being detached: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn quarantine_recovery_part(
+    path: &Path,
+    file: &File,
+    expected: &fs::Metadata,
+) -> anyhow::Result<()> {
+    ensure_recovery_path_matches_snapshot(path, file, expected)?;
+    let corrupt = path.with_extension("part.corrupt");
+    fs::hard_link(path, &corrupt)?;
+    fs::remove_file(path)?;
+    let opened = file.metadata()?;
+    let quarantined = fs::symlink_metadata(&corrupt)?;
+    anyhow::ensure!(
+        recovery_metadata_matches(expected, &opened, 1, false)
+            && recovery_metadata_matches(expected, &quarantined, 1, false),
+        "recovery part changed while being quarantined: {}",
+        path.display()
+    );
+    sync_parent(&corrupt)?;
+    Ok(())
 }
 
 pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -2249,6 +2460,163 @@ mod tests {
         assert!(recover_parts(&config).unwrap().is_empty());
         assert!(!path.exists());
         assert!(path.with_extension("part.corrupt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_hardlinked_parts() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-hardlink-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let alias = root
+            .path()
+            .join(format!("part-{}.jsonl.part", start_ns + 1));
+        fs::hard_link(&path, &alias).unwrap();
+
+        let error = recover_parts(&config).unwrap_err().to_string();
+        assert!(error.contains("unique single-link part"), "{error}");
+        assert!(path.exists());
+        assert!(alias.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_truncate_if_a_hardlink_appears_after_validation() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-hardlink-race-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        let expected = file.metadata().unwrap();
+        let alias = root.path().join("late-hardlink.jsonl.part");
+        fs::hard_link(&path, &alias).unwrap();
+
+        assert!(unlink_recovery_part(&path, &file, &expected).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), expected.len());
+        assert_eq!(fs::metadata(&alias).unwrap().len(), expected.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_finalization_rejects_a_replaced_source_path() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-fd-finalize-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        let expected = file.metadata().unwrap();
+        unlink_recovery_part(&path, &file, &expected).unwrap();
+        fs::write(&path, b"replacement must not be published\n").unwrap();
+
+        finalize_recovered_segment(
+            &config,
+            &path,
+            BTreeMap::from([("diff".to_owned(), 1)]),
+            BTreeMap::new(),
+            LEGACY_LOB_TAPE_SCHEMA,
+            start_ns,
+            start_ns,
+            start_ns,
+            false,
+            BTreeSet::new(),
+            readiness_summary(1, [("BTCUSDT", false, false, false)].into_iter()),
+            &mut file,
+            expected.len(),
+            &expected,
+        )
+        .unwrap_err();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"replacement must not be published\n"
+        );
+        assert!(!path.with_extension("zst.tmp").exists());
+        assert!(!path.with_extension("zst").exists());
+    }
+
+    #[test]
+    fn recovery_finalization_failure_retains_the_complete_source() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-retry-source-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let mut expected = fs::read(&path).unwrap();
+        expected.extend_from_slice(b"{\"received_at_ns\":");
+        fs::write(&path, &expected).unwrap();
+        let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
+        fs::write(&data, b"existing output\n").unwrap();
+
+        recover_parts(&config).unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read(&data).unwrap(), b"existing output\n");
+        assert!(!data.with_extension("zst.tmp").exists());
+    }
+
+    #[test]
+    fn recovery_compresses_only_the_valid_prefix_of_an_interrupted_tail() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-valid-prefix-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let expected = fs::read(&path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"received_at_ns\":")
+            .unwrap();
+
+        let artifacts = recover_parts(&config).unwrap();
+        let recovered = zstd::stream::decode_all(File::open(&artifacts[0].data).unwrap()).unwrap();
+
+        assert_eq!(recovered, expected);
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
