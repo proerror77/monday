@@ -21,6 +21,7 @@ readonly MAX_OUTPUT_AGE_SECONDS=120
 
 test_root=${MONDAY_MARKET_RECORDER_DEPLOY_TEST_ROOT:-}
 expected_uid=0
+expected_config_gid=0
 verify_user=hftcollector
 if [[ -n $test_root ]]; then
   [[ ${MONDAY_MARKET_RECORDER_DEPLOY_TEST_MODE:-0} == 1 && $test_root == /* \
@@ -28,11 +29,14 @@ if [[ -n $test_root ]]; then
     || { printf 'invalid market-recorder deploy test root\n' >&2; exit 2; }
   test_root=$(cd -- "$test_root" && pwd -P)
   expected_uid=$(id -u)
+  expected_config_gid=$(id -g)
   verify_user=
 else
   PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  expected_config_gid=$(id -g "$verify_user") \
+    || { printf 'market-recorder service group is missing\n' >&2; exit 1; }
 fi
-readonly test_root expected_uid verify_user PATH
+readonly test_root expected_uid expected_config_gid verify_user PATH
 readonly RELEASE_ROOT="$test_root$RELEASE_SUBDIR"
 readonly UNIT_PATH="$test_root$UNIT_SUBPATH"
 readonly CONFIG_PATH="$test_root$CONFIG_SUBPATH"
@@ -75,6 +79,7 @@ stat_value() {
   fi
 }
 stat_uid() { stat_value %u %u "$1"; }
+stat_gid() { stat_value %g %g "$1"; }
 stat_mode() { stat_value %a %Lp "$1"; }
 stat_mtime() { stat_value %Y %m "$1"; }
 secure_regular_file() {
@@ -134,6 +139,7 @@ verify_unit() {
 }
 verify_config() {
   secure_regular_file "$CONFIG_PATH" 640 || return 1
+  [[ $(stat_gid "$CONFIG_PATH") == "$expected_config_gid" ]] || return 1
   cmp -s "$CONFIG_TEMPLATE" "$CONFIG_PATH"
 }
 verify_fresh_output() {

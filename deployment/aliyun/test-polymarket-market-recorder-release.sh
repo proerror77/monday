@@ -422,6 +422,14 @@ run_deploy preflight "$archive" "$source_revision" "$image_digest" \
 cp "$CONFIG" "$config"
 chmod 0640 "$config"
 
+wrong_config_gid=$(id -G | tr ' ' '\n' | awk -v expected="$(id -g)" \
+  '$0 != expected {print; exit}')
+[[ -n $wrong_config_gid ]]
+chgrp "$wrong_config_gid" "$config"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/inactive-config-group.out" 2>&1 && exit 1
+chgrp "$(id -g)" "$config"
+
 run_deploy preflight "$archive" "$source_revision" "$image_digest"
 [[ ! -s $mutation_log && ! -s $output ]]
 run_deploy install "$archive" "$source_revision" "$image_digest"
