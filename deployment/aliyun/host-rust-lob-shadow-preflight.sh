@@ -32,7 +32,7 @@ manifest_passes() {
       ;;
     usdm)
       expected_dataset=usdm_perpetual_top100_lob_rust_shadow
-      expected_streams='["bookTicker","depth@100ms"]'
+      expected_streams='["depth@100ms"]'
       ;;
     *)
       return 1
@@ -59,7 +59,7 @@ manifest_passes() {
     and .lob_continuity.missing_symbols == []
     and ((.event_types.stale_raw_trade // 0) == 0)
     and (if $market == "usdm" then
-      (.event_types.book_ticker | type == "number" and . > 0)
+      ((.event_types.book_ticker // 0) == 0)
       and ((.event_types.agg_trade // 0) == 0)
       and ((.event_types.raw_trade // 0) == 0)
       and ((.event_types.force_order // 0) == 0)

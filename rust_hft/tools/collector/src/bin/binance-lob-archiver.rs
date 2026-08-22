@@ -41,6 +41,7 @@ const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_REVISION") 
     Some(revision) => revision,
     None => "unbound-source-revision",
 };
+const USDM_TOP100_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
 
 #[derive(Debug, Parser)]
 #[command(name = "binance-lob-archiver", version = BUILD_SOURCE_REVISION)]
@@ -433,8 +434,8 @@ impl Config {
 
     /// Declared per-symbol stream-type list carried by the v2 tape manifest
     /// and repeated by every session_start row. Spot keeps the full tape;
-    /// USD-M uses the dedicated depth/bookTicker LOB-first contract, while
-    /// the legacy full-tape dataset keeps its recorded five stream families.
+    /// USD-M Top100 emits depth only, while the legacy full-tape dataset keeps
+    /// its recorded five stream families.
     fn stream_types(&self) -> Vec<String> {
         stream_types_for_dataset(self.market, &self.dataset)
     }
@@ -572,7 +573,7 @@ impl Config {
                 }
             })
             .collect::<Vec<_>>();
-        if self.market == Market::Usdm {
+        if self.market == Market::Usdm && is_legacy_usdm_dataset(&self.dataset) {
             shards.extend(
                 symbols
                     .chunks(self.usdm_book_ticker_shard_size)
@@ -1323,12 +1324,12 @@ fn recover_parts_only() -> anyhow::Result<()> {
         &recovery_deployment_source_revision,
         &recovery_deployment_bundle_sha256,
     )?;
-    let stream_types = stream_types_for_recovery(market, &dataset)?;
+    let expected_stream_types = stream_types_for_recovery(market, &dataset)?;
     drop_recovery_privileges(recovery_uid, recovery_gid)?;
-    let symbols = if nonempty_parts.is_empty() {
-        Vec::new()
+    let (symbols, stream_types) = if nonempty_parts.is_empty() {
+        (Vec::new(), expected_stream_types)
     } else {
-        discover_recovery_catalog(&nonempty_parts, market, &stream_types)?
+        discover_recovery_catalog(&nonempty_parts, market, &expected_stream_types)?
     };
     remove_recovery_temporaries(&temporaries)?;
     let config = SegmentConfig {
@@ -1497,14 +1498,22 @@ fn stream_types_for_market(market: Market) -> Vec<String> {
             "trade".to_owned(),
             "bookTicker".to_owned(),
         ],
-        // USD-M is intentionally LOB-first: only the depth and book-ticker
-        // public routes are part of this dataset identity.
-        Market::Usdm => vec!["depth@100ms".to_owned(), "bookTicker".to_owned()],
+        // USD-M Top100 is intentionally depth-only; historical Top100 tapes
+        // that also carried bookTicker remain readable via recovery.
+        Market::Usdm => vec!["depth@100ms".to_owned()],
     }
 }
 
 fn is_legacy_usdm_dataset(dataset: &str) -> bool {
     matches!(dataset, "usdm_all" | "usdm_perpetual_all")
+}
+
+fn is_usdm_top100_depth_only_stream_types(stream_types: &[String]) -> bool {
+    stream_types == ["depth@100ms".to_owned()]
+}
+
+fn historical_usdm_top100_stream_types() -> Vec<String> {
+    vec!["depth@100ms".to_owned(), "bookTicker".to_owned()]
 }
 
 fn stream_types_for_dataset(market: Market, dataset: &str) -> Vec<String> {
@@ -1530,7 +1539,7 @@ fn stream_types_for_recovery(market: Market, dataset: &str) -> anyhow::Result<Ve
         (Market::Usdm, dataset) if is_legacy_usdm_dataset(dataset) => {
             Ok(stream_types_for_dataset(Market::Usdm, dataset))
         }
-        (Market::Usdm, "usdm_perpetual_top100_lob") => Ok(stream_types_for_market(Market::Usdm)),
+        (Market::Usdm, USDM_TOP100_LOB_DATASET) => Ok(stream_types_for_market(Market::Usdm)),
         _ => anyhow::bail!("unsupported recovery market/dataset identity: {market:?}/{dataset}"),
     }
 }
@@ -1539,7 +1548,7 @@ fn discover_recovery_catalog(
     parts: &[PathBuf],
     market: Market,
     expected_stream_types: &[String],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     for path in parts.iter().rev() {
         let mut reader = BufReader::new(std::fs::File::open(path)?);
         let mut line = Vec::new();
@@ -1602,15 +1611,31 @@ fn discover_recovery_catalog(
                 .iter()
                 .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, market)))
                 .collect::<HashMap<_, _>>();
-            validate_stream_coverage_shards(&shards, &states, expected_stream_types)
-                .context("recovery stream coverage does not prove the complete catalog")?;
+            let stream_types =
+                match validate_stream_coverage_shards(&shards, &states, expected_stream_types) {
+                    Ok(_) => expected_stream_types.to_vec(),
+                    Err(error) => {
+                        let historical = historical_usdm_top100_stream_types();
+                        if market == Market::Usdm
+                            && is_usdm_top100_depth_only_stream_types(expected_stream_types)
+                            && validate_stream_coverage_shards(&shards, &states, &historical)
+                                .is_ok()
+                        {
+                            historical
+                        } else {
+                            return Err(error).context(
+                                "recovery stream coverage does not prove the complete catalog",
+                            );
+                        }
+                    }
+                };
             for part in parts {
                 anyhow::ensure!(
                     first_recovery_identity(part)?.0 == session_id,
                     "recovery parts do not share the stream-coverage session"
                 );
             }
-            return Ok(symbols.into_iter().collect());
+            return Ok((symbols.into_iter().collect(), stream_types));
         }
     }
     bail!("recovery parts contain no complete stream-coverage catalog")
@@ -5394,14 +5419,15 @@ mod tests {
             .unwrap(),
             vec![first.clone(), second.clone()]
         );
+        let spot_stream_types = stream_types_for_market(Market::Spot);
         assert_eq!(
             discover_recovery_catalog(
                 &[first.clone(), second.clone()],
                 Market::Spot,
-                &stream_types_for_market(Market::Spot),
+                &spot_stream_types,
             )
             .unwrap(),
-            vec!["BTCUSDT"]
+            (vec!["BTCUSDT".to_owned()], spot_stream_types)
         );
 
         std::fs::write(
@@ -5435,9 +5461,106 @@ mod tests {
         );
         assert_eq!(
             stream_types_for_recovery(Market::Usdm, "usdm_perpetual_top100_lob").unwrap(),
-            vec!["depth@100ms".to_owned(), "bookTicker".to_owned()]
+            vec!["depth@100ms".to_owned()]
         );
         assert!(stream_types_for_recovery(Market::Usdm, "unexpected").is_err());
+    }
+
+    #[test]
+    fn recovery_preserves_detected_top100_stream_contract() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        for (name, expected_stream_types) in [
+            ("current", vec!["depth@100ms".to_owned()]),
+            ("historical", historical_usdm_top100_stream_types()),
+        ] {
+            let root = tempfile::Builder::new()
+                .prefix(&format!("monday-top100-recovery-{name}-"))
+                .tempdir()
+                .unwrap();
+            let part = root.path().join("part-1.jsonl.part");
+            let has_book_ticker = expected_stream_types
+                .iter()
+                .any(|stream_type| stream_type == "bookTicker");
+            let mut rows = Vec::new();
+            if has_book_ticker {
+                rows.push(json!({
+                    "schema": RAW_SCHEMA,
+                    "received_at_ns": 1,
+                    "type": "book_ticker",
+                    "session_id": "session-1",
+                    "frame": {
+                        "stream": "btcusdt@bookTicker",
+                        "data": {
+                            "u": 1,
+                            "s": "BTCUSDT",
+                            "b": "1",
+                            "B": "1",
+                            "a": "2",
+                            "A": "1"
+                        }
+                    }
+                }));
+            }
+            rows.push(json!({
+                "schema": RAW_SCHEMA,
+                "received_at_ns": 2,
+                "type": "stream_coverage",
+                "session_id": "session-1",
+                "shards": expected_stream_types
+                    .iter()
+                    .map(|stream_type| vec![format!("btcusdt@{stream_type}")])
+                    .collect::<Vec<_>>()
+            }));
+            let mut contents = rows
+                .iter()
+                .map(|row| serde_json::to_string(row).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            contents.push('\n');
+            std::fs::write(&part, contents).unwrap();
+
+            let configured_stream_types =
+                stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_DATASET).unwrap();
+            let (symbols, stream_types) = discover_recovery_catalog(
+                std::slice::from_ref(&part),
+                Market::Usdm,
+                &configured_stream_types,
+            )
+            .unwrap();
+            assert_eq!(symbols, vec!["BTCUSDT"], "case={name}");
+            assert_eq!(stream_types, expected_stream_types, "case={name}");
+
+            let artifacts = recover_parts(&SegmentConfig {
+                spool_dir: root.path().to_owned(),
+                market: Market::Usdm,
+                dataset: USDM_TOP100_LOB_DATASET.to_owned(),
+                shard_id: "all".to_owned(),
+                symbols,
+                security_token_symbols: Vec::new(),
+                excluded_symbols: Vec::new(),
+                snapshot_limit: 100,
+                zstd_timeout: Duration::from_secs(30),
+                stream_types,
+            })
+            .unwrap();
+            let manifest: Value =
+                serde_json::from_reader(std::fs::File::open(&artifacts[0].manifest).unwrap())
+                    .unwrap();
+            assert_eq!(
+                manifest["stream_types"],
+                json!(expected_stream_types),
+                "case={name}"
+            );
+            assert_eq!(
+                manifest["event_types"]["book_ticker"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                u64::from(has_book_ticker),
+                "case={name}"
+            );
+        }
     }
 
     #[test]
@@ -6717,31 +6840,26 @@ mod tests {
         usdm_config.symbols = (0..100).map(|index| format!("S{index:03}USDT")).collect();
         usdm_config.ws_shard_size = 25;
         let usdm = usdm_config.stream_shards();
-        assert_eq!(usdm.len(), 9);
+        assert_eq!(usdm.len(), 4);
         assert!(usdm
             .iter()
             .all(|shard| shard.url.starts_with("wss://fstream.binance.com/public/stream")));
-        assert_eq!(usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(), 200);
+        assert_eq!(usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(), 100);
         assert_eq!(
-            usdm.iter()
-                .filter(|shard| shard
-                    .streams
-                    .iter()
-                    .all(|stream| stream.ends_with("@bookTicker")))
-                .map(|shard| shard.streams.len())
-                .collect::<Vec<_>>(),
-            [20, 20, 20, 20, 20]
+            usdm.iter().map(|shard| shard.streams.len()).collect::<Vec<_>>(),
+            [25, 25, 25, 25]
         );
         assert!(usdm.iter().all(|shard| {
             shard
                 .streams
                 .iter()
-                .all(|stream| stream.ends_with("@depth@100ms") || stream.ends_with("@bookTicker"))
+                .all(|stream| stream.ends_with("@depth@100ms"))
         }));
         assert!(!usdm.iter().any(|shard| {
             shard.streams.iter().any(|stream| {
                 stream.ends_with("@aggTrade")
                     || stream.ends_with("@trade")
+                    || stream.ends_with("@bookTicker")
                     || stream.ends_with("@forceOrder")
             })
         }));
@@ -6765,7 +6883,7 @@ mod tests {
         );
         assert_eq!(
             usdm_config.stream_types(),
-            ["depth@100ms", "bookTicker"]
+            ["depth@100ms"]
         );
     }
 
@@ -8370,12 +8488,6 @@ mod tests {
                         pre_trade_received_at_ns,
                     ),
                 ],
-                "bookTicker" => {
-                    let mut current = book_ticker_frame(pre_trade_received_at_ns + 1_000_000);
-                    current["stream"] = json!("cysusdt@bookTicker");
-                    current["data"]["s"] = json!("CYSUSDT");
-                    vec![(current, pre_trade_received_at_ns + 1_000_000)]
-                }
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
             };
             for (frame, received_at_ns) in frames {
@@ -8408,8 +8520,8 @@ mod tests {
         assert_eq!(manifest["event_types"].get("raw_trade").and_then(Value::as_u64), None);
         assert_eq!(manifest["event_types"].get("agg_trade").and_then(Value::as_u64), None);
         assert_eq!(manifest["event_types"].get("force_order").and_then(Value::as_u64), None);
-        assert_eq!(manifest["event_types"]["book_ticker"], 1);
-        assert_eq!(manifest["stream_types"], json!(["depth@100ms", "bookTicker"]));
+        assert_eq!(manifest["event_types"].get("book_ticker"), None);
+        assert_eq!(manifest["stream_types"], json!(["depth@100ms"]));
         assert_eq!(manifest["lob_continuity"]["sequence_gaps"], 0);
         assert_eq!(process_state.sequence_gaps, 0);
 
