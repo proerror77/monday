@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
@@ -848,29 +849,46 @@ pub fn recover_parts_from_paths(
         return Ok(Vec::new());
     }
     anyhow::ensure!(
-        fs::symlink_metadata(&config.spool_dir)?.file_type().is_dir(),
+        fs::symlink_metadata(&config.spool_dir)?
+            .file_type()
+            .is_dir(),
         "configured recovery spool is not a direct directory"
     );
     let spool_dir = fs::canonicalize(&config.spool_dir)?;
     let mut artifacts = Vec::new();
-    let mut recovered_paths = BTreeSet::new();
+    let mut recovered_files = BTreeSet::new();
     for path in paths {
-        let metadata = fs::symlink_metadata(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        let named_metadata = fs::symlink_metadata(path)?;
         let resolved = fs::canonicalize(path)?;
+        let resolved_metadata = fs::metadata(&resolved)?;
         anyhow::ensure!(
-            metadata.file_type().is_file()
+            named_metadata.file_type().is_file()
+                && metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.gid() == unsafe { libc::getegid() }
+                && (metadata.dev(), metadata.ino())
+                    == (named_metadata.dev(), named_metadata.ino())
+                && (metadata.dev(), metadata.ino())
+                    == (resolved_metadata.dev(), resolved_metadata.ino())
                 && resolved.starts_with(&spool_dir)
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.ends_with(".jsonl.part"))
-                && recovered_paths.insert(resolved),
-            "recovery path is not a unique part beneath the configured spool: {}",
+                && recovered_files.insert((metadata.dev(), metadata.ino())),
+            "recovery path is not a unique single-link part owned by the recovery process beneath the configured spool: {}",
             path.display()
         );
-        let file = File::open(path)?;
-        let file_len = usize::try_from(file.metadata()?.len())?;
+        let file_len = usize::try_from(metadata.len())?;
         if file_len == 0 {
+            ensure_recovery_path_matches_file(path, &file)?;
             drop(file);
             fs::remove_file(path)?;
             continue;
@@ -993,20 +1011,20 @@ pub fn recover_parts_from_paths(
             offset += line.len();
         }
         if quarantine {
+            ensure_recovery_path_matches_file(path, reader.get_ref())?;
             fs::rename(path, path.with_extension("part.corrupt"))?;
             continue;
         }
         if let Some((valid_bytes, has_following_data)) = invalid_at {
             if has_following_data {
+                ensure_recovery_path_matches_file(path, reader.get_ref())?;
                 fs::rename(path, path.with_extension("part.corrupt"))?;
                 continue;
             }
-            OpenOptions::new()
-                .write(true)
-                .open(path)?
-                .set_len(u64::try_from(valid_bytes)?)?;
+            reader.get_ref().set_len(u64::try_from(valid_bytes)?)?;
         }
         if counts.is_empty() {
+            ensure_recovery_path_matches_file(path, reader.get_ref())?;
             fs::remove_file(path)?;
             continue;
         }
@@ -1014,6 +1032,7 @@ pub fn recover_parts_from_paths(
             .map(|(_, schema)| schema)
             .expect("non-empty recovered segment has a detected schema");
         let trade_summaries = trade_summaries.finish()?;
+        ensure_recovery_path_matches_file(path, reader.get_ref())?;
         artifacts.push(finalize_segment(
             config,
             path,
@@ -1035,6 +1054,19 @@ pub fn recover_parts_from_paths(
         )?);
     }
     Ok(artifacts)
+}
+
+fn ensure_recovery_path_matches_file(path: &Path, file: &File) -> anyhow::Result<()> {
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        named.file_type().is_file()
+            && opened.nlink() == 1
+            && (opened.dev(), opened.ino()) == (named.dev(), named.ino()),
+        "recovery part changed after validation: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -2249,6 +2281,31 @@ mod tests {
         assert!(recover_parts(&config).unwrap().is_empty());
         assert!(!path.exists());
         assert!(path.with_extension("part.corrupt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_hardlinked_parts() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-hardlink-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let alias = root
+            .path()
+            .join(format!("part-{}.jsonl.part", start_ns + 1));
+        fs::hard_link(&path, &alias).unwrap();
+
+        let error = recover_parts(&config).unwrap_err().to_string();
+        assert!(error.contains("unique single-link part"), "{error}");
+        assert!(path.exists());
+        assert!(alias.exists());
     }
 
     #[cfg(unix)]

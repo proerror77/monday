@@ -861,11 +861,6 @@ rollback_after_failure() {
     elif ! systemctl daemon-reload; then
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
-    elif (( safe_to_restart \
-      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
-      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
-      safe_to_restart=0
-      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
       if production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restored-contained
@@ -873,6 +868,11 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-release-restore-containment-failed
       fi
+    elif (( safe_to_restart \
+      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif (( safe_to_restart )); then
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0

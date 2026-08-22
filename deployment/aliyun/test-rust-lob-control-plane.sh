@@ -1596,6 +1596,7 @@ run_contained_upgrade_rollback_fixture() (
   local expect_contained=${1:-1}
   local pending_drain=${2:-0}
   local mode=${3:-contained-upgrade}
+  local old_recovery_timers_enabled=${4:-0}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1614,7 +1615,7 @@ run_contained_upgrade_rollback_fixture() (
   DRAIN_REQUIRED=$pending_drain
   DRAIN_ATTEMPTED=0
   DRAIN_MAY_HAVE_MUTATED=0
-  OLD_RECOVERY_TIMERS_ENABLED=0
+  OLD_RECOVERY_TIMERS_ENABLED=$old_recovery_timers_enabled
   SPOOL_ENV_DEPLOYMENT=$OLD_DEPLOYMENT
   mkdir -p "$CANONICAL_SPOOL" "$OLD_DEPLOYMENT" "$EVIDENCE_DIR" \
     "$(dirname "$PRODUCTION_LINK")"
@@ -1673,6 +1674,8 @@ run_contained_upgrade_rollback_fixture() (
 [[ $(run_contained_upgrade_rollback_fixture 0) \
   == previous-release-restore-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
+  == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
 
