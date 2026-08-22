@@ -1356,11 +1356,12 @@ fn manifest_is_usdm_lob_only(manifest: &TapeManifest) -> bool {
         && manifest.stream_types.as_ref().is_some_and(|stream_types| {
             let declared = stream_types.iter().map(String::as_str).collect::<BTreeSet<_>>();
             declared == USDM_LOB_DEPTH_ONLY_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
-                || declared
-                    == USDM_LOB_HISTORICAL_STREAM_TYPES
-                        .iter()
-                        .copied()
-                        .collect::<BTreeSet<_>>()
+                || (manifest.dataset == USDM_LOB_DATASET
+                    && declared
+                        == USDM_LOB_HISTORICAL_STREAM_TYPES
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>())
         })
 }
 
@@ -2937,6 +2938,12 @@ mod tests {
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+
+        let shadow_anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["dataset"] = json!(USDM_LOB_SHADOW_DATASET);
+        });
+        let error = seal_binance_market_tape_triplet(&triplet, &shadow_anchor).unwrap_err();
+        assert!(error.to_string().contains("manifest identity"), "{error:#}");
     }
 
     #[test]
