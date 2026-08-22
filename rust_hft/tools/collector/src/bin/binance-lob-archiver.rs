@@ -1324,12 +1324,12 @@ fn recover_parts_only() -> anyhow::Result<()> {
         &recovery_deployment_source_revision,
         &recovery_deployment_bundle_sha256,
     )?;
-    let stream_types = stream_types_for_recovery(market, &dataset)?;
+    let expected_stream_types = stream_types_for_recovery(market, &dataset)?;
     drop_recovery_privileges(recovery_uid, recovery_gid)?;
-    let symbols = if nonempty_parts.is_empty() {
-        Vec::new()
+    let (symbols, stream_types) = if nonempty_parts.is_empty() {
+        (Vec::new(), expected_stream_types)
     } else {
-        discover_recovery_catalog(&nonempty_parts, market, &stream_types)?
+        discover_recovery_catalog(&nonempty_parts, market, &expected_stream_types)?
     };
     remove_recovery_temporaries(&temporaries)?;
     let config = SegmentConfig {
@@ -1548,7 +1548,7 @@ fn discover_recovery_catalog(
     parts: &[PathBuf],
     market: Market,
     expected_stream_types: &[String],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     for path in parts.iter().rev() {
         let mut reader = BufReader::new(std::fs::File::open(path)?);
         let mut line = Vec::new();
@@ -1611,29 +1611,31 @@ fn discover_recovery_catalog(
                 .iter()
                 .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, market)))
                 .collect::<HashMap<_, _>>();
-            if let Err(error) =
-                validate_stream_coverage_shards(&shards, &states, expected_stream_types)
-            {
-                let allow_historical_top100 = market == Market::Usdm
-                    && is_usdm_top100_depth_only_stream_types(expected_stream_types)
-                    && validate_stream_coverage_shards(
-                        &shards,
-                        &states,
-                        &historical_usdm_top100_stream_types(),
-                    )
-                    .is_ok();
-                if !allow_historical_top100 {
-                    return Err(error)
-                        .context("recovery stream coverage does not prove the complete catalog");
-                }
-            }
+            let stream_types =
+                match validate_stream_coverage_shards(&shards, &states, expected_stream_types) {
+                    Ok(_) => expected_stream_types.to_vec(),
+                    Err(error) => {
+                        let historical = historical_usdm_top100_stream_types();
+                        if market == Market::Usdm
+                            && is_usdm_top100_depth_only_stream_types(expected_stream_types)
+                            && validate_stream_coverage_shards(&shards, &states, &historical)
+                                .is_ok()
+                        {
+                            historical
+                        } else {
+                            return Err(error).context(
+                                "recovery stream coverage does not prove the complete catalog",
+                            );
+                        }
+                    }
+                };
             for part in parts {
                 anyhow::ensure!(
                     first_recovery_identity(part)?.0 == session_id,
                     "recovery parts do not share the stream-coverage session"
                 );
             }
-            return Ok(symbols.into_iter().collect());
+            return Ok((symbols.into_iter().collect(), stream_types));
         }
     }
     bail!("recovery parts contain no complete stream-coverage catalog")
@@ -5417,14 +5419,15 @@ mod tests {
             .unwrap(),
             vec![first.clone(), second.clone()]
         );
+        let spot_stream_types = stream_types_for_market(Market::Spot);
         assert_eq!(
             discover_recovery_catalog(
                 &[first.clone(), second.clone()],
                 Market::Spot,
-                &stream_types_for_market(Market::Spot),
+                &spot_stream_types,
             )
             .unwrap(),
-            vec!["BTCUSDT"]
+            (vec!["BTCUSDT".to_owned()], spot_stream_types)
         );
 
         std::fs::write(
@@ -5465,15 +5468,36 @@ mod tests {
 
     #[test]
     fn recovery_accepts_historical_top100_book_ticker_catalog() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let part = root.path().join("part-1.jsonl.part");
         std::fs::write(
             &part,
             format!(
-                "{}\n",
+                "{}\n{}\n",
                 serde_json::to_string(&json!({
                     "schema": RAW_SCHEMA,
                     "received_at_ns": 1,
+                    "type": "book_ticker",
+                    "session_id": "session-1",
+                    "frame": {
+                        "stream": "btcusdt@bookTicker",
+                        "data": {
+                            "u": 1,
+                            "s": "BTCUSDT",
+                            "b": "1",
+                            "B": "1",
+                            "a": "2",
+                            "A": "1"
+                        }
+                    }
+                }))
+                .unwrap(),
+                serde_json::to_string(&json!({
+                    "schema": RAW_SCHEMA,
+                    "received_at_ns": 2,
                     "type": "stream_coverage",
                     "session_id": "session-1",
                     "shards": [[
@@ -5486,15 +5510,92 @@ mod tests {
         )
         .unwrap();
 
+        let expected_stream_types =
+            stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_DATASET).unwrap();
+        let (symbols, stream_types) = discover_recovery_catalog(
+            std::slice::from_ref(&part),
+            Market::Usdm,
+            &expected_stream_types,
+        )
+        .unwrap();
+        assert_eq!(symbols, vec!["BTCUSDT"]);
+        assert_eq!(stream_types, historical_usdm_top100_stream_types());
+
+        let artifacts = recover_parts(&SegmentConfig {
+            spool_dir: root.path().to_owned(),
+            market: Market::Usdm,
+            dataset: USDM_TOP100_LOB_DATASET.to_owned(),
+            shard_id: "all".to_owned(),
+            symbols,
+            security_token_symbols: Vec::new(),
+            excluded_symbols: Vec::new(),
+            snapshot_limit: 100,
+            zstd_timeout: Duration::from_secs(30),
+            stream_types,
+        })
+        .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts[0].manifest).unwrap()).unwrap();
         assert_eq!(
-            discover_recovery_catalog(
-                &[part],
-                Market::Usdm,
-                &stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_DATASET).unwrap(),
-            )
-            .unwrap(),
-            vec!["BTCUSDT"]
+            manifest["stream_types"],
+            json!(["depth@100ms", "bookTicker"])
         );
+        assert_eq!(manifest["event_types"]["book_ticker"], 1);
+    }
+
+    #[test]
+    fn recovery_preserves_depth_only_top100_manifest_contract() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("part-1.jsonl.part");
+        std::fs::write(
+            &part,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "schema": RAW_SCHEMA,
+                    "received_at_ns": 2,
+                    "type": "stream_coverage",
+                    "session_id": "session-1",
+                    "shards": [[
+                        "btcusdt@depth@100ms"
+                    ]]
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let expected_stream_types =
+            stream_types_for_recovery(Market::Usdm, USDM_TOP100_LOB_DATASET).unwrap();
+        let (symbols, stream_types) = discover_recovery_catalog(
+            std::slice::from_ref(&part),
+            Market::Usdm,
+            &expected_stream_types,
+        )
+        .unwrap();
+        assert_eq!(symbols, vec!["BTCUSDT"]);
+        assert_eq!(stream_types, vec!["depth@100ms"]);
+
+        let artifacts = recover_parts(&SegmentConfig {
+            spool_dir: root.path().to_owned(),
+            market: Market::Usdm,
+            dataset: USDM_TOP100_LOB_DATASET.to_owned(),
+            shard_id: "all".to_owned(),
+            symbols,
+            security_token_symbols: Vec::new(),
+            excluded_symbols: Vec::new(),
+            snapshot_limit: 100,
+            zstd_timeout: Duration::from_secs(30),
+            stream_types,
+        })
+        .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts[0].manifest).unwrap()).unwrap();
+        assert_eq!(manifest["stream_types"], json!(["depth@100ms"]));
+        assert_eq!(manifest["event_types"]["book_ticker"], Value::Null);
     }
 
     #[test]
