@@ -79,14 +79,31 @@ pub async fn run_strategy_with_deployment_id_and_output(
     );
 
     let symbols = prepare_feed_symbols(runtime_config.mode, &config.strategy.symbols);
-    let strategy = ploy_strategy_bundles::build_strategy(&config);
 
     let (result, snapshot) = match runtime_config.mode {
         RuntimeMode::Backtest => {
-            run_backtest_entry(&config, &symbols, strategy, runtime_config.clone()).await
+            run_backtest_entry(
+                &config,
+                &symbols,
+                ploy_strategy_bundles::build_strategy(&config),
+                runtime_config.clone(),
+            )
+            .await
         }
-        RuntimeMode::Replay => run_replay_entry(&config, strategy, runtime_config.clone()).await,
+        RuntimeMode::Replay => {
+            run_replay_entry(
+                &config,
+                ploy_strategy_bundles::build_strategy(&config),
+                runtime_config.clone(),
+            )
+            .await
+        }
         RuntimeMode::Live | RuntimeMode::DryRun => {
+            let strategy = if config.is_market_update_recorder_profile(runtime_config.mode) {
+                None
+            } else {
+                Some(ploy_strategy_bundles::build_strategy(&config))
+            };
             run_live_or_dry_run_entry(
                 &config,
                 &symbols,
@@ -508,7 +525,7 @@ async fn run_replay_entry(
 async fn run_live_or_dry_run_entry(
     _config: &FullConfig,
     _symbols: &[String],
-    _strategy: Box<dyn StrategyLogic>,
+    _strategy: Option<Box<dyn StrategyLogic>>,
     _runtime_config: RuntimeModeConfig,
     _deployment_id: String,
 ) -> (

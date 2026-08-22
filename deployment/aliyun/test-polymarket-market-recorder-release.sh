@@ -11,6 +11,7 @@ readonly DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.pol
 readonly RUNNER="$SCRIPT_DIR/../../rust_hft/prediction-markets/apps/new-ploy-runner/src/main.rs"
 readonly DEPLOY="$SCRIPT_DIR/polymarket-market-recorder-deploy.sh"
 readonly SERVICE="$SCRIPT_DIR/polymarket-market-tape.service"
+readonly CONFIG="$SCRIPT_DIR/polymarket-market-tape.toml"
 
 shellcheck "$0"
 test -x "$ARTIFACT_HELPER"
@@ -107,8 +108,10 @@ release_dir="$fixture/artifact"
 archive="$fixture/polymarket-market-recorder-linux-amd64.tar"
 baseline_binary="$fixture/opt/monday/bin/new-ploy-runner"
 unit="$fixture/etc/systemd/system/polymarket-market-tape.service"
+config="$fixture/etc/monday/polymarket-market-tape.toml"
 output="$fixture/data/monday/spool/polymarket/market-updates.ndjson"
 mkdir -p "$fake_bin" "$release_dir" "${baseline_binary%/*}" "${unit%/*}" \
+  "${config%/*}" \
   "$fixture/proc/4101" "$fixture/run/lock" \
   "$fixture/opt/monday/releases/polymarket-market-recorder" "${output%/*}"
 
@@ -154,14 +157,16 @@ baseline_sha=$(sha256sum "$baseline_binary" | awk '{print $1}')
 sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner|$baseline_binary|" \
   "$SERVICE" >"$unit"
 chmod 0644 "$unit"
+cp "$CONFIG" "$config"
+chmod 0644 "$config"
 ln -s "$baseline_binary" "$fixture/proc/4101/exe"
 printf '{"fixture":"fresh"}\n' >"$output"
 
 baseline_exec="$baseline_binary --config /etc/monday/polymarket-market-tape.toml --deployment-id polymarket-market-data-ecs --dry-run"
 service_args='--config /etc/monday/polymarket-market-tape.toml --deployment-id polymarket-market-data-ecs --dry-run'
 jq -n --arg fragment "$unit" --arg exec "$baseline_exec" '
-  {active:true,fragment:$fragment,drop_ins:"",exec:$exec,pid:"4101",
-    invocation:("d"*32),restarts:"0"}' >"$state"
+  {active:true,substate:"running",enabled:"enabled",fragment:$fragment,
+    drop_ins:"",exec:$exec,pid:"4101",invocation:("d"*32),restarts:"0"}' >"$state"
 : >"$mutation_log"
 
 cat >"$fake_bin/systemctl" <<'SYSTEMCTL'
@@ -172,6 +177,11 @@ shift
 case "$command" in
   is-active)
     [[ $(jq -r .active "$FAKE_SYSTEMCTL_STATE") == true ]]
+    ;;
+  is-enabled)
+    enabled=$(jq -r .enabled "$FAKE_SYSTEMCTL_STATE")
+    printf '%s\n' "$enabled"
+    [[ $enabled == enabled ]]
     ;;
   show)
     property=${1#--property=}
@@ -184,6 +194,7 @@ case "$command" in
           printf 'inactive\n'
         fi
         ;;
+      SubState) jq -r .substate "$FAKE_SYSTEMCTL_STATE" ;;
       FragmentPath) jq -r .fragment "$FAKE_SYSTEMCTL_STATE" ;;
       DropInPaths) jq -r .drop_ins "$FAKE_SYSTEMCTL_STATE" ;;
       ExecStart) printf '{ argv[]=%s ; }\n' "$(jq -r .exec "$FAKE_SYSTEMCTL_STATE")" ;;
@@ -196,6 +207,12 @@ case "$command" in
   daemon-reload|reset-failed|restart|stop)
     printf '%s\n' "$command $*" >>"$FAKE_SYSTEMCTL_MUTATION_LOG"
     case "$command" in
+      daemon-reload)
+        binary=$(sed -n 's|^ExecStart=\([^ ]*\).*$|\1|p' "$FAKE_SYSTEMCTL_UNIT")
+        jq --arg exec "$binary $FAKE_SYSTEMCTL_EXPECTED_ARGS" \
+          '.exec=$exec' "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
+          && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
+        ;;
       reset-failed)
         jq '.restarts = "0"' "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
           && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
@@ -216,13 +233,14 @@ case "$command" in
         ln -s "$proc_binary" "$FAKE_SYSTEMCTL_ROOT/proc/$pid/exe"
         jq --arg exec "$binary $FAKE_SYSTEMCTL_EXPECTED_ARGS" \
           --arg pid "$pid" --arg invocation "$invocation" \
-          '.active=true | .exec=$exec | .pid=$pid | .invocation=$invocation | .restarts="0"' \
+          '.active=true | .substate="running" | .exec=$exec | .pid=$pid | .invocation=$invocation | .restarts="0"' \
           "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
           && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
         printf '{"fixture":"fresh-after-restart"}\n' >>"$FAKE_SYSTEMCTL_OUTPUT"
         ;;
       stop)
-        jq '.active=false | .pid="0"' "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
+        jq '.active=false | .substate="dead" | .pid="0" | .invocation=""' \
+          "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
           && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
         ;;
     esac
@@ -347,5 +365,71 @@ query_error_property=ActiveState
 if run_deploy rollback >"$fixture/failed-recovery.out" 2>&1; then exit 1; fi
 grep -Fq 'recovery_status=stop_failed' "$fixture/failed-recovery.out"
 jq -e '.active == false and .pid == "0"' "$state" >/dev/null
+
+query_error_property=
+baseline_release_binary="$baseline_release/new-ploy-runner"
+baseline_release_exec="$baseline_release_binary $service_args"
+sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner|$baseline_release_binary|" \
+  "$SERVICE" >"$unit"
+chmod 0644 "$unit"
+jq --arg exec "$baseline_release_exec" '
+  .active=false | .substate="dead" | .enabled="enabled" | .exec=$exec
+  | .pid="0" | .invocation="" | .restarts="0"' \
+  "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+: >"$output"
+: >"$mutation_log"
+
+jq '.pid="77"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/inactive-pid.out" 2>&1 && exit 1
+jq '.pid="0"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+jq '.enabled="disabled"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/inactive-disabled.out" 2>&1 && exit 1
+jq '.enabled="enabled"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+printf '# drift\n' >>"$config"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/inactive-config-drift.out" 2>&1 && exit 1
+cp "$CONFIG" "$config"
+chmod 0644 "$config"
+
+run_deploy preflight "$archive" "$source_revision" "$image_digest"
+[[ ! -s $mutation_log && ! -s $output ]]
+run_deploy install "$archive" "$source_revision" "$image_digest"
+jq -e '.active == true and .substate == "running" and .pid != "0"' "$state" >/dev/null
+pid=$(jq -r .pid "$state")
+[[ $(readlink -f "$fixture/proc/$pid/exe") == "$candidate_binary" ]]
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+
+sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner|$baseline_release_binary|" \
+  "$SERVICE" >"$unit"
+chmod 0644 "$unit"
+jq --arg exec "$baseline_release_exec" '
+  .active=false | .substate="dead" | .exec=$exec | .pid="0"
+  | .invocation="" | .restarts="0"' \
+  "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+jq --arg current_sha "$baseline_sha" --arg current_source "$baseline_source" \
+  --arg previous_sha "$candidate_sha" --arg previous_source "$source_revision" '
+  .current={sha256:$current_sha,source_revision:$current_source}
+  | .previous={sha256:$previous_sha,source_revision:$previous_source}' \
+  "$state_file" >"$state_file.tmp"
+chmod 0600 "$state_file.tmp"
+mv "$state_file.tmp" "$state_file"
+: >"$output"
+: >"$mutation_log"
+rm -f -- "$bad_once" "$bad_once.used"
+printf '%s\n' "$candidate_binary" >"$bad_once"
+run_deploy install "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/failed-inactive-install.out" 2>&1 && exit 1
+grep -Fq "restored sha256=$baseline_sha source_revision=$baseline_source activity=inactive" \
+  "$fixture/failed-inactive-install.out"
+grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
+jq -e --arg exec "$baseline_release_exec" '
+  .active == false and .substate == "dead" and .enabled == "enabled"
+  and .pid == "0" and .exec == $exec' "$state" >/dev/null
+jq -e --arg current "$baseline_sha" '.current.sha256 == $current' \
+  "$state_file" >/dev/null
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+[[ $(grep -c '^stop polymarket-market-tape.service$' "$mutation_log") == 1 ]]
 
 printf 'Polymarket market-recorder release contract tests passed\n'
