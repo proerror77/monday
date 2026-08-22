@@ -204,13 +204,20 @@ case "$command" in
       *) exit 2 ;;
     esac
     ;;
-  daemon-reload|reset-failed|restart|stop)
+  daemon-reload|disable|enable|reset-failed|restart|stop)
     printf '%s\n' "$command $*" >>"$FAKE_SYSTEMCTL_MUTATION_LOG"
     case "$command" in
       daemon-reload)
         binary=$(sed -n 's|^ExecStart=\([^ ]*\).*$|\1|p' "$FAKE_SYSTEMCTL_UNIT")
         jq --arg exec "$binary $FAKE_SYSTEMCTL_EXPECTED_ARGS" \
           '.exec=$exec' "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
+          && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
+        ;;
+      disable|enable)
+        unit_state=disabled
+        [[ $command == enable ]] && unit_state=enabled
+        jq --arg enabled "$unit_state" \
+          '.enabled=$enabled' "$FAKE_SYSTEMCTL_STATE" >"$FAKE_SYSTEMCTL_STATE.tmp" \
           && mv "$FAKE_SYSTEMCTL_STATE.tmp" "$FAKE_SYSTEMCTL_STATE"
         ;;
       reset-failed)
@@ -230,7 +237,7 @@ case "$command" in
         pid=$(( $(jq -r .pid "$FAKE_SYSTEMCTL_STATE") + 1 ))
         invocation=$(printf '%032x' "$pid")
         mkdir -p "$FAKE_SYSTEMCTL_ROOT/proc/$pid"
-        ln -s "$proc_binary" "$FAKE_SYSTEMCTL_ROOT/proc/$pid/exe"
+        ln -sfn "$proc_binary" "$FAKE_SYSTEMCTL_ROOT/proc/$pid/exe"
         jq --arg exec "$binary $FAKE_SYSTEMCTL_EXPECTED_ARGS" \
           --arg pid "$pid" --arg invocation "$invocation" \
           '.active=true | .substate="running" | .exec=$exec | .pid=$pid | .invocation=$invocation | .restarts="0"' \
@@ -377,7 +384,7 @@ printf '%s\n' "$candidate_binary" >"$bad_once"
 query_error_property=ActiveState
 if run_deploy rollback >"$fixture/failed-recovery.out" 2>&1; then exit 1; fi
 grep -Fq 'recovery_status=stop_failed' "$fixture/failed-recovery.out"
-jq -e '.active == false and .pid == "0"' "$state" >/dev/null
+jq -e '.active == false and .enabled == "disabled" and .pid == "0"' "$state" >/dev/null
 
 query_error_property=
 baseline_release_binary="$baseline_release/new-ploy-runner"
@@ -386,7 +393,7 @@ sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORD
   "$SERVICE" >"$unit"
 chmod 0644 "$unit"
 jq --arg exec "$baseline_release_exec" '
-  .active=false | .substate="dead" | .enabled="enabled" | .exec=$exec
+  .active=false | .substate="dead" | .enabled="disabled" | .exec=$exec
   | .pid="0" | .invocation="" | .restarts="0"' \
   "$state" >"$state.tmp" && mv "$state.tmp" "$state"
 jq -S -n --arg current_sha "$baseline_sha" \
@@ -405,10 +412,10 @@ jq '.pid="77"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
 run_deploy preflight "$archive" "$source_revision" "$image_digest" \
   >"$fixture/inactive-pid.out" 2>&1 && exit 1
 jq '.pid="0"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
-jq '.enabled="disabled"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
-run_deploy preflight "$archive" "$source_revision" "$image_digest" \
-  >"$fixture/inactive-disabled.out" 2>&1 && exit 1
 jq '.enabled="enabled"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+run_deploy preflight "$archive" "$source_revision" "$image_digest" \
+  >"$fixture/inactive-enabled.out" 2>&1 && exit 1
+jq '.enabled="disabled"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
 printf '# drift\n' >>"$config"
 run_deploy preflight "$archive" "$source_revision" "$image_digest" \
   >"$fixture/inactive-config-drift.out" 2>&1 && exit 1
@@ -418,7 +425,7 @@ chmod 0644 "$config"
 run_deploy preflight "$archive" "$source_revision" "$image_digest"
 [[ ! -s $mutation_log && ! -s $output ]]
 run_deploy install "$archive" "$source_revision" "$image_digest"
-jq -e '.active == true and .substate == "running" and .pid != "0"' "$state" >/dev/null
+jq -e '.active == true and .substate == "running" and .enabled == "enabled" and .pid != "0"' "$state" >/dev/null
 pid=$(jq -r .pid "$state")
 [[ $(readlink -f "$fixture/proc/$pid/exe") == "$candidate_binary" ]]
 jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
@@ -437,7 +444,7 @@ run_deploy rollback
 grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
 cmp -s "$CONFIG" "$config"
 jq -e --arg exec "$baseline_release_exec" '
-  .active == false and .substate == "dead" and .enabled == "enabled"
+  .active == false and .substate == "dead" and .enabled == "disabled"
   and .pid == "0" and .exec == $exec' "$state" >/dev/null
 jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
   .current.sha256 == $current and .current.activity == "inactive"
@@ -458,7 +465,7 @@ grep -Fq "restored sha256=$baseline_sha source_revision=$baseline_source activit
 grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
 cmp -s "$CONFIG" "$config"
 jq -e --arg exec "$baseline_release_exec" '
-  .active == false and .substate == "dead" and .enabled == "enabled"
+  .active == false and .substate == "dead" and .enabled == "disabled"
   and .pid == "0" and .exec == $exec' "$state" >/dev/null
 jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
   .schema == "monday.polymarket_market_recorder_deploy.v2"
@@ -467,6 +474,48 @@ jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
   "$state_file" >/dev/null
 [[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
 [[ $(grep -c '^stop polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+
+# A candidate that has already exited is still an exact rollback source. The
+# stopped baseline must be restored without starting either release.
+: >"$output"
+: >"$mutation_log"
+rm -f -- "$bad_once" "$bad_once.used"
+rm -rf -- "$fixture/proc/1"
+run_deploy install "$archive" "$source_revision" "$image_digest"
+jq '.active=false | .substate="dead" | .pid="0" | .invocation=""' \
+  "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+run_deploy rollback
+grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
+jq -e --arg exec "$baseline_release_exec" '
+  .active == false and .substate == "dead" and .enabled == "disabled"
+  and .pid == "0" and .exec == $exec' "$state" >/dev/null
+jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
+  .current.sha256 == $current and .current.activity == "inactive"
+  and .previous.sha256 == $previous and .previous.activity == "active"' \
+  "$state_file" >/dev/null
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+
+# A healthy candidate remains the authoritative active state if an ordinary
+# rollback cannot publish its state transition.
+: >"$output"
+: >"$mutation_log"
+rm -rf -- "$fixture/proc/1"
+run_deploy install "$archive" "$source_revision" "$image_digest"
+mv_fail_destination=$state_file
+run_deploy rollback >"$fixture/failed-healthy-state-publication.out" 2>&1 && exit 1
+mv_fail_destination=
+grep -Fq 'rollback was reversed because deployment state could not be published' \
+  "$fixture/failed-healthy-state-publication.out"
+grep -Fqx "ExecStart=$candidate_binary \\" "$unit"
+jq -e --arg exec "$candidate_binary $service_args" '
+  .active == true and .substate == "running" and .enabled == "enabled"
+  and .pid != "0" and .exec == $exec' "$state" >/dev/null
+jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
+  .current.sha256 == $current and .current.activity == "active"
+  and .previous.sha256 == $previous and .previous.activity == "inactive"' \
+  "$state_file" >/dev/null
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 2 ]]
+run_deploy rollback
 
 # If state publication fails after a degraded candidate is rolled back, keep
 # the contained baseline stopped instead of restarting the failed candidate.
@@ -486,7 +535,7 @@ grep -Fq "recovery_status=stopped failed_sha256=$candidate_sha recovery_sha256=$
   "$fixture/failed-contained-state-publication.out"
 grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
 jq -e --arg exec "$baseline_release_exec" '
-  .active == false and .substate == "dead" and .enabled == "enabled"
+  .active == false and .substate == "dead" and .enabled == "disabled"
   and .pid == "0" and .exec == $exec' "$state" >/dev/null
 jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
   .current.sha256 == $current and .current.activity == "active"

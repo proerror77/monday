@@ -104,6 +104,7 @@ runner_version() {
   runuser -u "$verify_user" -- "$1" --version
 }
 systemctl_value() { systemctl show --property="$2" --value "$1"; }
+unit_file_state() { systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true; }
 effective_exec_argv() {
   local raw argv
   raw=$(systemctl_value "$1" ExecStart) || return 1
@@ -150,6 +151,7 @@ verify_fresh_output() {
 capture_runtime() {
   local configured_exec actual_exe
   systemctl is-active --quiet "$UNIT_NAME" || return 1
+  [[ $(unit_file_state) == enabled ]] || return 1
   configured_exec=$(effective_exec_argv "$UNIT_NAME") || return 1
   runtime_binary=${configured_exec%% *}
   [[ $configured_exec == "$runtime_binary $EXPECTED_ARGS" ]] || return 1
@@ -170,7 +172,8 @@ capture_runtime() {
   [[ $runtime_source =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ $(systemctl_value "$UNIT_NAME" MainPID) == "$runtime_pid" \
     && $(systemctl_value "$UNIT_NAME" InvocationID) == "$runtime_invocation" \
-    && $(systemctl_value "$UNIT_NAME" NRestarts) == "$runtime_restarts" ]] || return 1
+    && $(systemctl_value "$UNIT_NAME" NRestarts) == "$runtime_restarts" \
+    && $(unit_file_state) == enabled ]] || return 1
   [[ $(readlink -f -- "$PROC_ROOT/$runtime_pid/exe") == "$actual_exe" \
     && $(sha256sum "$PROC_ROOT/$runtime_pid/exe" | awk '{print $1}') == "$runtime_sha" ]]
 }
@@ -207,14 +210,13 @@ verify_installed_release() {
       || return 1
   fi
 }
-capture_contained_inactive_runtime() {
-  local configured_exec enabled source_readback
+capture_inactive_runtime() {
+  local expected_unit_state=$1 configured_exec source_readback
   [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive ]] || return 1
   [[ $(systemctl_value "$UNIT_NAME" SubState) == dead ]] || return 1
   runtime_pid=$(systemctl_value "$UNIT_NAME" MainPID) || return 1
   [[ $runtime_pid == 0 ]] || return 1
-  enabled=$(systemctl is-enabled "$UNIT_NAME") || return 1
-  [[ $enabled == enabled ]] || return 1
+  [[ $(unit_file_state) == "$expected_unit_state" ]] || return 1
   configured_exec=$(effective_exec_argv "$UNIT_NAME") || return 1
   runtime_binary=${configured_exec%% *}
   [[ $configured_exec == "$runtime_binary $EXPECTED_ARGS" ]] || return 1
@@ -232,11 +234,12 @@ capture_contained_inactive_runtime() {
   [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive \
     && $(systemctl_value "$UNIT_NAME" SubState) == dead \
     && $(systemctl_value "$UNIT_NAME" MainPID) == 0 \
-    && $(systemctl is-enabled "$UNIT_NAME") == enabled \
+    && $(unit_file_state) == "$expected_unit_state" \
     && $(effective_exec_argv "$UNIT_NAME") == "$configured_exec" \
     && $(sha256sum "$runtime_binary" | awk '{print $1}') == "$runtime_sha" \
     && $source_readback == "new-ploy-runner $runtime_source" ]]
 }
+capture_contained_inactive_runtime() { capture_inactive_runtime disabled; }
 publish_runtime_snapshot() {
   local sha=$1 source_revision=$2 proc_exe=$3 destination
   destination="$RELEASE_ROOT/$sha"
@@ -305,6 +308,8 @@ install_release_unit() {
 activate_release() {
   local sha=$1 source_revision=$2 started attempt
   install_release_unit "$sha" "$source_revision" || return 1
+  systemctl enable "$UNIT_NAME" || return 1
+  [[ $(unit_file_state) == enabled ]] || return 1
   systemctl reset-failed "$UNIT_NAME" || return 1
   [[ $(systemctl_value "$UNIT_NAME" NRestarts) == 0 ]] || return 1
   started=$(date +%s)
@@ -321,6 +326,7 @@ restore_contained_inactive_release() {
   local sha=$1 source_revision=$2
   systemctl stop "$UNIT_NAME" || return 1
   install_release_unit "$sha" "$source_revision" || return 1
+  systemctl disable "$UNIT_NAME" || return 1
   capture_contained_inactive_runtime || return 1
   [[ $runtime_sha == "$sha" && $runtime_source == "$source_revision" ]]
 }
@@ -389,9 +395,11 @@ write_state() {
 stop_with_recovery_evidence() {
   local failed_sha=$1 recovery_sha=$2 recovery_status=stop_failed active_state main_pid
   if systemctl stop "$UNIT_NAME" >/dev/null 2>&1 \
+    && systemctl disable "$UNIT_NAME" >/dev/null 2>&1 \
     && active_state=$(systemctl_value "$UNIT_NAME" ActiveState) \
     && main_pid=$(systemctl_value "$UNIT_NAME" MainPID) \
-    && [[ $active_state == inactive && $main_pid == 0 ]]; then
+    && [[ $active_state == inactive && $main_pid == 0 \
+      && $(unit_file_state) == disabled ]]; then
     recovery_status=stopped
   fi
   printf 'market-recorder deploy: recovery_status=%s failed_sha256=%s recovery_sha256=%s unit=%s state=%s\n' \
@@ -526,6 +534,7 @@ verify_current() {
 rollback_release() {
   local current_sha current_source current_activity
   local previous_sha previous_source previous_activity
+  local rollback_current_healthy=0
   [[ -n $test_root || $EUID -eq 0 ]] || die 'install and rollback require root'
   load_state || die 'deployment state is missing or invalid'
   current_sha=$state_current_sha
@@ -536,8 +545,17 @@ rollback_release() {
   previous_activity=$state_previous_activity
   if [[ $current_activity == active ]]; then
     if [[ $previous_activity == inactive ]]; then
-      verify_running_identity "$current_sha" "$current_source" \
-        || die 'current release identity is not exact; refusing contained rollback'
+      if verify_running_release "$current_sha" "$current_source" \
+        "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))"; then
+        rollback_current_healthy=1
+      elif verify_running_identity "$current_sha" "$current_source"; then
+        :
+      else
+        capture_inactive_runtime enabled \
+          || die 'current release identity is not exact; refusing contained rollback'
+        [[ $runtime_sha == "$current_sha" && $runtime_source == "$current_source" ]] \
+          || die 'current stopped release does not match deployment state'
+      fi
     else
       verify_running_release "$current_sha" "$current_source" \
         "$(($(date +%s) - MAX_OUTPUT_AGE_SECONDS))" \
@@ -562,7 +580,7 @@ rollback_release() {
     "$current_sha" "$current_source" "$current_activity"; then
     printf 'market-recorder deploy: rollback state publication failed; restoring sha256=%s\n' \
       "$current_sha" >&2
-    if [[ $previous_activity == inactive ]]; then
+    if [[ $previous_activity == inactive && $rollback_current_healthy == 0 ]]; then
       stop_with_recovery_evidence "$current_sha" "$previous_sha" || true
       die 'rollback state publication failed; contained baseline remains stopped'
     fi
