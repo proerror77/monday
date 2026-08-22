@@ -1653,10 +1653,16 @@ run_contained_upgrade_rollback_fixture() (
   # shellcheck disable=SC1090
   . "$rollback_body"
   rollback_after_failure
-  grep -Fq "install $OLD_DEPLOYMENT" "$calls"
-  grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
-  grep -Fq 'restore-dropin' "$calls"
-  grep -Eq '^daemon-reload( |$)' "$calls"
+  if (( expect_contained )) \
+    && [[ -z $active_recovery_timer && -z $enabled_recovery_timer ]]; then
+    grep -Fq "install $OLD_DEPLOYMENT" "$calls"
+    grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
+    grep -Fq 'restore-dropin' "$calls"
+    grep -Eq '^daemon-reload( |$)' "$calls"
+  elif grep -Eq '^(install|symlink|restore-dropin|daemon-reload)( |$)' "$calls"; then
+    printf 'uncontained rollback tried to restore the previous release\n' >&2
+    exit 1
+  fi
   if grep -Eq '^(start|enable|unmask) ' "$calls"; then
     printf 'contained rollback tried to restart or unmask the previous release\n' >&2
     exit 1
@@ -1675,14 +1681,14 @@ run_contained_upgrade_rollback_fixture() (
 
 [[ $(run_contained_upgrade_rollback_fixture) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 0) \
-  == previous-release-restore-containment-failed ]]
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
   == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 recovery-spot) \
-  == previous-release-restore-containment-failed ]]
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 '' recovery-spot) \
-  == previous-release-restore-containment-failed ]]
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
 
@@ -1732,8 +1738,10 @@ run_new_host_rollback_fixture() (
 )
 
 [[ $(run_new_host_rollback_fixture) == new-host-disabled ]]
-[[ $(run_new_host_rollback_fixture legacy-spot) == new-host-containment-failed ]]
-[[ $(run_new_host_rollback_fixture upload-usdm) == new-host-containment-failed ]]
+[[ $(run_new_host_rollback_fixture legacy-spot) \
+  == production-stop-or-disable-containment-failed ]]
+[[ $(run_new_host_rollback_fixture upload-usdm) \
+  == production-stop-or-disable-containment-failed ]]
 
 mock_bin="$tmp_dir/bin"
 mock_state="$tmp_dir/mock-state"

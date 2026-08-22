@@ -19,7 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -704,6 +704,8 @@ fn finalize_recovered_segment(
     raw_trade_incomplete_symbols: BTreeSet<String>,
     readiness: ReadinessSummary,
     recovered_file: &mut File,
+    recovered_bytes: u64,
+    recovered_metadata: &fs::Metadata,
 ) -> anyhow::Result<SegmentArtifacts> {
     finalize_segment_with_recovered_file(
         config,
@@ -717,7 +719,7 @@ fn finalize_recovered_segment(
         has_replay_safe_checkpoint,
         raw_trade_incomplete_symbols,
         readiness,
-        Some(recovered_file),
+        Some((recovered_file, recovered_bytes, recovered_metadata)),
     )
 }
 
@@ -734,7 +736,7 @@ fn finalize_segment_with_recovered_file(
     has_replay_safe_checkpoint: bool,
     raw_trade_incomplete_symbols: BTreeSet<String>,
     readiness: ReadinessSummary,
-    mut recovered_file: Option<&mut File>,
+    mut recovered_file: Option<(&mut File, u64, &fs::Metadata)>,
 ) -> anyhow::Result<SegmentArtifacts> {
     let require_aggregate_trades = config
         .stream_types
@@ -745,12 +747,16 @@ fn finalize_segment_with_recovered_file(
         schema if market_tape_schema(schema) && require_aggregate_trades => {
             "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs"
         }
-        schema if market_tape_schema(schema) => "captured_snapshot_seed_plus_sequence_checked_diffs",
+        schema if market_tape_schema(schema) => {
+            "captured_snapshot_seed_plus_sequence_checked_diffs"
+        }
         _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
     };
     let lob_continuity = if market_tape_schema(schema) {
-        Some(match recovered_file.as_deref_mut() {
-            Some(file) => summarize_lob_continuity_file(file, config.symbols.clone())?,
+        Some(match recovered_file.as_mut() {
+            Some((file, recovered_bytes, _)) => {
+                summarize_lob_continuity_file(file, config.symbols.clone(), *recovered_bytes)?
+            }
             None => summarize_lob_continuity(path, config.symbols.clone())?,
         })
     } else {
@@ -758,25 +764,37 @@ fn finalize_segment_with_recovered_file(
     };
     let data = path.with_file_name(format!("part-{identity_start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
-    if let Some(file) = recovered_file.as_deref_mut() {
-        file.seek(SeekFrom::Start(0))?;
+    if let Some((file, recovered_bytes, recovered_metadata)) = recovered_file.as_mut() {
         let temporary = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o640)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temporary_data)?;
-        let mut command = Command::new("zstd");
-        command
-            .args(["-q", "-T1", "-3", "-c"])
-            .stdin(Stdio::from(file.try_clone()?))
-            .stdout(Stdio::from(temporary.try_clone()?));
-        let status = command_status_with_timeout(&mut command, config.zstd_timeout)?;
-        if !status.success() {
-            anyhow::bail!("zstd failed with {status}");
+        let remove_temporary = || {
+            let metadata = temporary.metadata()?;
+            unlink_recovery_part(&temporary_data, &temporary, &metadata)
+        };
+        let compression = (|| -> anyhow::Result<()> {
+            file.seek(SeekFrom::Start(0))?;
+            let mut encoder = zstd::stream::write::Encoder::new(temporary.try_clone()?, 3)?;
+            let copied = std::io::copy(&mut file.take(*recovered_bytes), &mut encoder)?;
+            anyhow::ensure!(
+                copied == *recovered_bytes,
+                "recovery source ended before the validated byte boundary"
+            );
+            encoder.finish()?.sync_all()?;
+            ensure_recovery_path_matches_snapshot(path, file, recovered_metadata)?;
+            Ok(())
+        })();
+        if let Err(error) = compression {
+            let _ = remove_temporary();
+            return Err(error);
         }
-        temporary.sync_all()?;
-        fs::hard_link(&temporary_data, &data)?;
+        if let Err(error) = fs::hard_link(&temporary_data, &data) {
+            let _ = remove_temporary();
+            return Err(error.into());
+        }
         fs::remove_file(&temporary_data)?;
     } else {
         let mut command = Command::new("zstd");
@@ -902,9 +920,13 @@ fn summarize_lob_continuity(
 fn summarize_lob_continuity_file(
     file: &mut File,
     symbols: Vec<String>,
+    recovered_bytes: u64,
 ) -> anyhow::Result<LobContinuitySummary> {
     file.seek(SeekFrom::Start(0))?;
-    let summary = summarize_lob_continuity_reader(BufReader::new(&mut *file), symbols)?;
+    let summary = summarize_lob_continuity_reader(
+        BufReader::new((&mut *file).take(recovered_bytes)),
+        symbols,
+    )?;
     file.seek(SeekFrom::Start(0))?;
     Ok(summary)
 }
@@ -1116,18 +1138,19 @@ pub fn recover_parts_from_paths(
             quarantine_recovery_part(path, &file, &metadata)?;
             continue;
         }
-        unlink_recovery_part(path, &file, &metadata)?;
-        if let Some((valid_bytes, _)) = invalid_at {
-            file.set_len(u64::try_from(valid_bytes)?)?;
-        }
         if counts.is_empty() {
+            unlink_recovery_part(path, &file, &metadata)?;
             continue;
         }
+        let recovered_bytes = invalid_at
+            .map(|(valid_bytes, _)| u64::try_from(valid_bytes))
+            .transpose()?
+            .unwrap_or(metadata.len());
         let schema = detected_schema
             .map(|(_, schema)| schema)
             .expect("non-empty recovered segment has a detected schema");
         let trade_summaries = trade_summaries.finish()?;
-        artifacts.push(finalize_recovered_segment(
+        let artifact = finalize_recovered_segment(
             config,
             path,
             counts,
@@ -1146,7 +1169,11 @@ pub fn recover_parts_from_paths(
                     .map(|symbol| (symbol.as_str(), false, false, false)),
             ),
             &mut file,
-        )?);
+            recovered_bytes,
+            &metadata,
+        )?;
+        unlink_recovery_part(path, &file, &metadata)?;
+        artifacts.push(artifact);
     }
     Ok(artifacts)
 }
@@ -1168,8 +1195,7 @@ fn recovery_metadata_matches(
         && actual.mtime() == expected.mtime()
         && actual.mtime_nsec() == expected.mtime_nsec()
         && (!compare_ctime
-            || (actual.ctime() == expected.ctime()
-                && actual.ctime_nsec() == expected.ctime_nsec()))
+            || (actual.ctime() == expected.ctime() && actual.ctime_nsec() == expected.ctime_nsec()))
 }
 
 fn ensure_recovery_path_matches_snapshot(
@@ -1189,11 +1215,7 @@ fn ensure_recovery_path_matches_snapshot(
     Ok(())
 }
 
-fn unlink_recovery_part(
-    path: &Path,
-    file: &File,
-    expected: &fs::Metadata,
-) -> anyhow::Result<()> {
+fn unlink_recovery_part(path: &Path, file: &File, expected: &fs::Metadata) -> anyhow::Result<()> {
     ensure_recovery_path_matches_snapshot(path, file, expected)?;
     fs::remove_file(path)?;
     let unlinked = file.metadata()?;
@@ -2496,17 +2518,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovered_finalization_never_reopens_the_source_path() {
-        if Command::new("zstd").arg("--version").output().is_err() {
-            return;
-        }
+    fn recovered_finalization_rejects_a_replaced_source_path() {
         let start_ns = 1_700_000_000_000_000_000;
         let root = tempfile::Builder::new()
             .prefix("monday-recovery-fd-finalize-")
             .tempdir()
             .unwrap();
         let config = recovery_config(root.path().to_owned());
-        let original = format!("{{\"received_at_ns\":{start_ns},\"type\":\"diff\"}}\n");
         let path = write_recovery_part(
             &config,
             start_ns,
@@ -2522,7 +2540,7 @@ mod tests {
         unlink_recovery_part(&path, &file, &expected).unwrap();
         fs::write(&path, b"replacement must not be published\n").unwrap();
 
-        let artifacts = finalize_recovered_segment(
+        finalize_recovered_segment(
             &config,
             &path,
             BTreeMap::from([("diff".to_owned(), 1)]),
@@ -2535,16 +2553,70 @@ mod tests {
             BTreeSet::new(),
             readiness_summary(1, [("BTCUSDT", false, false, false)].into_iter()),
             &mut file,
+            expected.len(),
+            &expected,
         )
-        .unwrap();
-        let output = Command::new("zstd")
-            .args(["-q", "-d", "-c"])
-            .arg(artifacts.data)
-            .output()
+        .unwrap_err();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"replacement must not be published\n"
+        );
+        assert!(!path.with_extension("zst.tmp").exists());
+        assert!(!path.with_extension("zst").exists());
+    }
+
+    #[test]
+    fn recovery_finalization_failure_retains_the_complete_source() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-retry-source-")
+            .tempdir()
             .unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), original);
-        assert_eq!(fs::read(&path).unwrap(), b"replacement must not be published\n");
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let mut expected = fs::read(&path).unwrap();
+        expected.extend_from_slice(b"{\"received_at_ns\":");
+        fs::write(&path, &expected).unwrap();
+        let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
+        fs::write(&data, b"existing output\n").unwrap();
+
+        recover_parts(&config).unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read(&data).unwrap(), b"existing output\n");
+        assert!(!data.with_extension("zst.tmp").exists());
+    }
+
+    #[test]
+    fn recovery_compresses_only_the_valid_prefix_of_an_interrupted_tail() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::Builder::new()
+            .prefix("monday-recovery-valid-prefix-")
+            .tempdir()
+            .unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let path = write_recovery_part(
+            &config,
+            start_ns,
+            &[json!({"received_at_ns": start_ns, "type": "diff"})],
+        );
+        let expected = fs::read(&path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"received_at_ns\":")
+            .unwrap();
+
+        let artifacts = recover_parts(&config).unwrap();
+        let recovered = zstd::stream::decode_all(File::open(&artifacts[0].data).unwrap()).unwrap();
+
+        assert_eq!(recovered, expected);
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]

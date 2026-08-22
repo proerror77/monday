@@ -794,11 +794,7 @@ rollback_after_failure() {
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
-  for unit in "${PRODUCTION_UNITS[@]}"; do
-    if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
-      safe_to_restart=0
-    fi
-  done
+  production_is_fail_closed || safe_to_restart=0
   if (( safe_to_restart == 0 )); then
     if production_is_fail_closed; then
       ROLLBACK_RESULT=production-stop-or-disable-failed-but-contained
