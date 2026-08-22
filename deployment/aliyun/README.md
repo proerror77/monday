@@ -1130,7 +1130,11 @@ Normal production restart does not perform this recovery inline. Its privileged
 pre-start step only locks and atomically moves the affected market spool to a
 root-owned recovery queue, recreates an empty canonical spool, and lets live
 acquisition start. A separate timer drains one market at a time with the exact
-release and env recorded in the queue receipt. Failed or interrupted jobs stay
+binary digest and a private copy of the release env stored with the queue job;
+later bundle-only publication cannot change that recovery input. The previous
+`upload-status.json` is copied into the replacement spool without advancing its
+timestamp, so the existing health policy revalidates the last delivery readback
+while the new hourly segment is still open. Failed or interrupted jobs stay
 `.failed` or `.running` for manual inspection and are never retried in a restart
 loop. Queue age and failure state are separate collector-health breaches; a
 healthy live collector does not claim that a queued historical segment has been

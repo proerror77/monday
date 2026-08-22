@@ -199,6 +199,15 @@ grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
 grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
   "$SCRIPT_DIR/binance-lob-archiver-recovery@.timer"
 grep -Fq 'host-rust-lob-recovery-queue.sh' "$INSTALL_RELEASE"
+queue_root_line=$(grep -n 'install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"' \
+  "$CUTOVER" | cut -d: -f1)
+candidate_start_line=$(grep -n '^STEP=start-candidate-production$' "$CUTOVER" | cut -d: -f1)
+[[ -n $queue_root_line && -n $candidate_start_line \
+  && $queue_root_line -lt $candidate_start_line ]] || {
+  printf 'cutover does not create the recovery queue root before entering the systemd sandbox\n' >&2
+  exit 1
+}
+grep -Fq '"$RECOVERY_EVIDENCE_ROOT"' "$CUTOVER"
 drain_body=$(sed -n '/^run_candidate_drain()/,/^}/p' "$CUTOVER")
 incomplete_body=$(sed -n '/^has_incomplete_segment_artifacts()/,/^}/p' "$CUTOVER")
 for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do

@@ -21,6 +21,7 @@ configure_paths() {
   EVIDENCE_ROOT="$root/data/monday/evidence/recoveries"
   LOCK_ROOT="$root/run/lock"
   CANONICAL_SPOOL="$root/data/monday/spool/binance-lob"
+  RECOVERY_QUEUE_ROOT="$root/data/monday/spool/binance-lob-recovery"
   HEALTH_TIMEOUT_SECONDS=300
   EXPECTED_ROOT_UID=0
 }
@@ -361,10 +362,18 @@ restore_release() (
   trap on_exit EXIT
 
   STEP=prepare-recovery-evidence
-  for path in "$DATA_ROOT" "$DATA_ROOT/monday" "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"; do
+  for path in \
+    "$DATA_ROOT" \
+    "$DATA_ROOT/monday" \
+    "$DATA_ROOT/monday/evidence" \
+    "$EVIDENCE_ROOT" \
+    "$DATA_ROOT/monday/spool" \
+    "$RECOVERY_QUEUE_ROOT"; do
     path_is_direct_or_absent "$path" || fail "recovery evidence path contains a symlink: $path"
   done
-  install -d -m 0750 "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"
+  install -d -m 0750 -o root -g root \
+    "$DATA_ROOT/monday/evidence" "$EVIDENCE_ROOT"
+  install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"
   mkdir -m 0750 -- "$EVIDENCE_DIR" \
     || fail "refusing to reuse recovery evidence directory: $EVIDENCE_DIR"
 

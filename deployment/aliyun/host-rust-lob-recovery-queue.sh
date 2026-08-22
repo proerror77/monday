@@ -150,19 +150,14 @@ same_filesystem() {
   [[ $left_dev == "$right_dev" ]]
 }
 
-incomplete_part_paths() {
+has_incomplete_parts() {
   local spool=$1
-  [[ -d $spool && ! -L $spool ]] || return 0
-  find "$spool" -type f \( \
+  [[ -d $spool && ! -L $spool ]] || return 1
+  [[ -n $(find "$spool" -type f \( \
     -name '*.jsonl.part' -o \
     -name '*.zst.tmp' -o \
     -name '*.part.corrupt' \
-  \) -print
-}
-
-has_incomplete_parts() {
-  local spool=$1
-  incomplete_part_paths "$spool" | grep -q .
+  \) -print -quit) ]]
 }
 
 segment_artifacts() {
@@ -239,7 +234,12 @@ drain_lock() {
 }
 
 write_job_receipt() {
-  local job_id=$1 queue_unit=$2 tmp
+  local job_id=$1 queue_unit=$2 tmp env_copy env_tmp
+  env_copy="$CANONICAL_SPOOL/recovery.env"
+  env_tmp="$env_copy.tmp.$$"
+  install -m 0640 -o root -g root -- "$RELEASE_ENV_FILE" "$env_tmp"
+  mv -Tf "$env_tmp" "$env_copy"
+  sync -f "$env_copy"
   tmp="$CANONICAL_SPOOL/job.json.tmp.$$"
   jq -n \
     --arg schema monday.rust_lob_recovery_queue.v1 \
@@ -251,7 +251,7 @@ write_job_receipt() {
     --arg release_sha256 "$RELEASE_SHA256" \
     --arg deployment_bundle_sha256 "$RELEASE_BUNDLE_SHA256" \
     --arg deployment_source_revision "$RELEASE_SOURCE_REVISION" \
-    --arg release_env "$RELEASE_ENV_FILE" \
+    --arg release_env recovery.env \
     --arg recovery_unit "$queue_unit" \
     '{schema:$schema,job_id:$job_id,queued_at:$queued_at,market:$market,
       canonical_spool:$canonical_spool,env_sha256:$env_sha256,
@@ -281,7 +281,7 @@ job_receipt_valid_for_canonical() {
     --arg market "$MARKET" \
     --arg canonical "$CANONICAL_SPOOL" \
     --arg expected_id "$expected_id" \
-    --arg release_env "$RELEASE_ROOT/$(jq -er '.release_sha256' "$queue_dir/job.json")/deployment/binance-lob-archiver-production-$MARKET.env" \
+    --arg release_env recovery.env \
     --arg recovery_unit "$RECOVERY_SERVICE@$MARKET.service" \
     '.schema == $schema
       and .market == $market
@@ -316,7 +316,7 @@ recover_missing_canonical_after_partial_isolate() {
 }
 
 isolate_market() {
-  local hft_uid hft_gid job_id ready_dir queue_unit spool_lock
+  local hft_uid hft_gid job_id ready_dir queue_unit spool_lock prior_upload_status
   hft_uid=$(id -u hftcollector)
   hft_gid=$(id -g hftcollector)
   ensure_queue_directory "$QUEUE_ROOT" "$hft_gid"
@@ -343,6 +343,13 @@ isolate_market() {
   sync -f "$CANONICAL_ROOT"
   sync -f "$QUEUE_MARKET_ROOT"
   install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
+  prior_upload_status="$ready_dir/upload-status.json"
+  if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
+    install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
+      "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
+    sync -f "$CANONICAL_SPOOL/upload-status.json"
+  fi
+  sync -f "$CANONICAL_SPOOL"
   sync -f "$CANONICAL_ROOT"
   systemctl start --no-block "$queue_unit" >/dev/null 2>&1 || true
 }
@@ -350,7 +357,7 @@ isolate_market() {
 oldest_ready_dir() {
   [[ -d $QUEUE_MARKET_ROOT && ! -L $QUEUE_MARKET_ROOT ]] || return 0
   find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print \
-    | sort | head -n 1
+    | sort | sed -n '1p'
 }
 
 running_dirs() {
@@ -390,7 +397,7 @@ write_result() {
 }
 
 load_job() {
-  local queue_dir=$1 job_json queue_id job_schema
+  local queue_dir=$1 job_json queue_id job_schema job_env
   job_json="$queue_dir/job.json"
   secure_regular_file "$job_json" 0
   queue_id=$(job_dir_id "$queue_dir") || fail "queued job directory has an invalid name: $queue_dir"
@@ -402,7 +409,7 @@ load_job() {
   JOB_BUNDLE_SHA256=$(jq -er '.deployment_bundle_sha256' "$job_json")
   JOB_SOURCE_REVISION=$(jq -er '.deployment_source_revision' "$job_json")
   JOB_ENV_SHA256=$(jq -er '.env_sha256' "$job_json")
-  JOB_RELEASE_ENV=$(jq -er '.release_env' "$job_json")
+  job_env=$(jq -er '.release_env' "$job_json")
   JOB_RECOVERY_UNIT=$(jq -er '.recovery_unit' "$job_json")
   [[ $job_schema == monday.rust_lob_recovery_queue.v1 ]] || fail "queued job has an invalid schema: $queue_dir"
   [[ $JOB_ID == "$queue_id" ]] || fail "queued job id does not match its directory: $queue_dir"
@@ -412,8 +419,9 @@ load_job() {
   [[ $JOB_BUNDLE_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid bundle sha: $queue_dir"
   [[ $JOB_SOURCE_REVISION =~ ^[a-f0-9]{40,64}$ ]] || fail "queued job has an invalid source revision: $queue_dir"
   [[ $JOB_ENV_SHA256 =~ ^[a-f0-9]{64}$ ]] || fail "queued job has an invalid env sha: $queue_dir"
-  [[ $JOB_RELEASE_ENV == "$RELEASE_ROOT/$JOB_RELEASE_SHA256/deployment/binance-lob-archiver-production-$MARKET.env" ]] \
+  [[ $job_env == recovery.env ]] \
     || fail "queued job release env mismatch: $queue_dir"
+  JOB_RELEASE_ENV="$queue_dir/$job_env"
   [[ $JOB_RECOVERY_UNIT == "$RECOVERY_SERVICE@$MARKET.service" ]] \
     || fail "queued job recovery unit mismatch: $queue_dir"
 }
@@ -452,7 +460,7 @@ check_upload_readback() {
 }
 
 run_drain_job() {
-  local running_dir=$1 release_dir release_binary release_env release_json evidence_root backup_dir result_path
+  local running_dir=$1 release_dir release_binary release_env evidence_root backup_dir result_path
   local -a env_args
   load_job "$running_dir"
   JOB_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -460,22 +468,11 @@ run_drain_job() {
   path_is_direct_or_absent "$release_dir" || fail "release path contains a symlink: $release_dir"
   release_binary="$release_dir/binance-lob-archiver"
   release_env="$JOB_RELEASE_ENV"
-  release_json="$release_dir/release.json"
   secure_regular_file "$release_binary" 0
   secure_regular_file "$release_env" 0
-  secure_regular_file "$release_json" 0
   [[ $(sha256sum "$release_env" | awk '{print $1}') == "$JOB_ENV_SHA256" ]] \
     || fail "queued env does not match the recorded digest: $release_env"
   printf '%s  %s\n' "$JOB_RELEASE_SHA256" "$release_binary" | sha256sum --check --strict >/dev/null
-  jq -e \
-    --arg sha "$JOB_RELEASE_SHA256" \
-    --arg bundle "$JOB_BUNDLE_SHA256" \
-    --arg source "$JOB_SOURCE_REVISION" \
-    '.artifact_sha256 == $sha
-      and .deployment_bundle_sha256 == $bundle
-      and .deployment_source_revision == $source' \
-    "$release_json" >/dev/null \
-    || fail "queued job release metadata mismatch: $release_json"
   evidence_root=$(job_evidence_root "$JOB_ID")
   ensure_root_directory "$DATA_ROOT/monday/evidence"
   ensure_root_directory "$DATA_ROOT/monday/evidence/recoveries"
@@ -594,7 +591,7 @@ main() {
     usage
     exit 2
   fi
-  for command in awk chmod date env find flock grep head id install jq mv readlink runuser sha256sum sort stat sync systemctl; do
+  for command in awk chmod date env find flock grep id install jq mv readlink runuser sed sha256sum sort stat sync systemctl; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done

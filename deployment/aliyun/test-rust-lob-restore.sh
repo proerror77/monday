@@ -92,6 +92,17 @@ mv() {
   command mv -f "${args[@]}"
 }
 
+install() {
+  local -a args=()
+  while (($#)); do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  command install "${args[@]}"
+}
+
 sha256sum() {
   local -a args=()
   local arg check=0 checksum_file
@@ -412,6 +423,8 @@ run_success_fixture() (
   setup_fixture "$fixture"
   restore_release "$CANDIDATE_SHA256" >"$fixture/out" 2>&1 \
     || { printf 'restore failed in success fixture\n' >&2; exit 1; }
+  [[ -d $RECOVERY_QUEUE_ROOT && ! -L $RECOVERY_QUEUE_ROOT ]]
+  [[ -d $EVIDENCE_ROOT && ! -L $EVIDENCE_ROOT ]]
   evidence=$(restore_evidence_dir)
   [[ -n $evidence ]] || { printf 'no recovery evidence directory\n' >&2; exit 1; }
   jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \

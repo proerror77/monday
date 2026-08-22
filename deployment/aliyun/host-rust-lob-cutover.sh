@@ -40,6 +40,8 @@ DEPLOYMENT_SOURCE_REVISION=
 PRODUCTION_LINK=/opt/monday/bin/binance-lob-archiver
 SHADOW_LINK=/opt/monday/bin/binance-lob-archiver-shadow
 CANONICAL_SPOOL=/data/monday/spool/binance-lob
+RECOVERY_QUEUE_ROOT=/data/monday/spool/binance-lob-recovery
+RECOVERY_EVIDENCE_ROOT=/data/monday/evidence/recoveries
 HEALTH_TIMEOUT_SECONDS=300
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -124,13 +126,21 @@ path_is_direct_or_absent() {
   [[ $resolved == "$path" ]]
 }
 
-for path in /data/monday /data/monday/evidence /data/monday/evidence/cutovers; do
+for path in \
+  /data/monday \
+  /data/monday/evidence \
+  /data/monday/evidence/cutovers \
+  "$RECOVERY_EVIDENCE_ROOT" \
+  /data/monday/spool \
+  "$RECOVERY_QUEUE_ROOT"; do
   if ! path_is_direct_or_absent "$path"; then
     printf 'evidence path contains a symlink: %s\n' "$path" >&2
     exit 1
   fi
 done
-install -d -m 0750 /data/monday/evidence/cutovers
+install -d -m 0750 -o root -g root \
+  /data/monday/evidence/cutovers "$RECOVERY_EVIDENCE_ROOT"
+install -d -m 0750 -o root -g hftcollector "$RECOVERY_QUEUE_ROOT"
 mkdir -m 0750 -- "$EVIDENCE_DIR" \
   || { printf 'refusing to reuse cutover evidence directory: %s\n' "$EVIDENCE_DIR" >&2; exit 1; }
 

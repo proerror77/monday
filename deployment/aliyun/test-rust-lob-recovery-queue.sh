@@ -5,7 +5,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 QUEUE_SCRIPT="$SCRIPT_DIR/host-rust-lob-recovery-queue.sh"
 
-for command in awk grep install jq mktemp sed sha256sum; do
+for command in awk cmp grep install jq mktemp sed sha256sum; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -283,19 +283,49 @@ test_no_part_noop() {
 }
 
 test_isolate_creates_ready_job() {
-  local fixture=$tmp_dir/isolate-ready ready_dir job_json
+  local fixture=$tmp_dir/isolate-ready ready_dir job_json env_sha
   setup_fixture "$fixture"
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
   run_action "$fixture" isolate spot
   ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
   [[ -n $ready_dir ]] || exit 1
   job_json="$ready_dir/job.json"
-  jq -e '.market == "spot" and (.canonical_spool | endswith("/spot"))' "$job_json" >/dev/null
+  jq -e '.market == "spot"
+    and (.canonical_spool | endswith("/spot"))
+    and .release_env == "recovery.env"' "$job_json" >/dev/null
+  env_sha=$(sha256sum "$ready_dir/recovery.env" | awk '{print $1}')
+  jq -e --arg env_sha "$env_sha" '.env_sha256 == $env_sha' "$job_json" >/dev/null
   assert canonical-clean test ! -e "$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
   assert canonical-recreated test -d "$fixture/data/monday/spool/binance-lob/spot"
   assert systemctl-start grep -Fq 'start --no-block binance-lob-archiver-recovery@spot.service' "$fixture/systemctl.log"
   assert canonical-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob" "$fixture/sync.log"
   assert queue-parent-synced grep -Fq -- '-f '"$fixture/data/monday/spool/binance-lob-recovery/spot" "$fixture/sync.log"
+}
+
+test_many_incomplete_parts_isolate_without_sigpipe() {
+  local fixture=$tmp_dir/many-parts ready_dir index
+  setup_fixture "$fixture"
+  for index in {0001..1200}; do
+    : >"$fixture/data/monday/spool/binance-lob/spot/part-$index.jsonl.part"
+  done
+  run_action "$fixture" isolate spot
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print -quit)
+  [[ -n $ready_dir ]]
+}
+
+test_isolate_preserves_upload_readback() {
+  local fixture=$tmp_dir/preserve-upload ready_dir
+  setup_fixture "$fixture"
+  printf 'part\n' >"$fixture/data/monday/spool/binance-lob/spot/part-001.jsonl.part"
+  jq -n '{last_success_at:"2026-08-22T00:00:00Z",last_error_at:null,
+    last_error:null,failure_count:0}' \
+    >"$fixture/data/monday/spool/binance-lob/spot/upload-status.json"
+  run_action "$fixture" isolate spot
+  ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/spot" \
+    -mindepth 1 -maxdepth 1 -type d -name '*.ready' -print -quit)
+  cmp -s "$ready_dir/upload-status.json" \
+    "$fixture/data/monday/spool/binance-lob/spot/upload-status.json"
 }
 
 test_drain_runs_recover_then_upload() {
@@ -317,13 +347,19 @@ test_drain_runs_recover_then_upload() {
   assert evidence-synced grep -Fq -- '-f '"$evidence_dir" "$fixture/sync.log"
 }
 
-test_drain_does_not_depend_on_current_production_symlink() {
-  local fixture=$tmp_dir/drain-no-current
+test_drain_uses_queued_immutable_inputs() {
+  local fixture=$tmp_dir/drain-no-current release_dir
   setup_fixture "$fixture"
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
   run_action "$fixture" isolate usdm
+  release_dir=$(dirname "$(readlink -f "$fixture/opt/monday/bin/binance-lob-archiver")")
   rm -f "$fixture/opt/monday/bin/binance-lob-archiver"
   rm -f "$fixture/etc/monday/binance-lob-archiver-production-usdm.env"
+  printf 'replaced bundle env\n' \
+    >"$release_dir/deployment/binance-lob-archiver-production-usdm.env"
+  jq '.deployment_bundle_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    "$release_dir/release.json" >"$release_dir/release.json.tmp"
+  mv "$release_dir/release.json.tmp" "$release_dir/release.json"
   run_action "$fixture" drain usdm
   grep -Eq '^usdm --upload-only ' "$fixture/binary.log"
 }
@@ -365,7 +401,7 @@ test_invalid_release_env_never_executes_recovery_binary() {
   printf 'part\n' >"$fixture/data/monday/spool/binance-lob/usdm/part-001.jsonl.part"
   run_action "$fixture" isolate usdm
   ready_dir=$(find "$fixture/data/monday/spool/binance-lob-recovery/usdm" -mindepth 1 -maxdepth 1 -type d -name '*.ready' | head -n 1)
-  release_env=$(jq -r '.release_env' "$ready_dir/job.json")
+  release_env="$ready_dir/$(jq -r '.release_env' "$ready_dir/job.json")"
   sed '/^OSS_COPY_TIMEOUT_SECONDS=/d' "$release_env" >"$release_env.tmp"
   mv "$release_env.tmp" "$release_env"
   env_sha=$(sha256sum "$release_env" | awk '{print $1}')
@@ -469,8 +505,10 @@ test_running_job_ignores_untrusted_in_spool_pass_result() {
 
 test_no_part_noop
 test_isolate_creates_ready_job
+test_many_incomplete_parts_isolate_without_sigpipe
+test_isolate_preserves_upload_readback
 test_drain_runs_recover_then_upload
-test_drain_does_not_depend_on_current_production_symlink
+test_drain_uses_queued_immutable_inputs
 test_failed_job_is_not_retried
 test_other_market_recovery_defers_without_mutating_job
 test_invalid_release_env_never_executes_recovery_binary
