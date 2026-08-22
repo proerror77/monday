@@ -33,6 +33,10 @@ UPLOAD_UNITS=(
   binance-lob-archiver-upload@spot.service
   binance-lob-archiver-upload@usdm.service
 )
+RECOVERY_TIMERS=(
+  binance-lob-archiver-recovery@spot.timer
+  binance-lob-archiver-recovery@usdm.timer
+)
 LEGACY_UNITS=(
   binance-lob-archiver@spot.service
   binance-lob-archiver@usdm.service
@@ -44,8 +48,11 @@ TRANSITION_MASK_UNITS=(
 )
 RESTORE_ASSETS=(
   binance-lob-archiver-production@.service
+  binance-lob-archiver-recovery@.service
+  binance-lob-archiver-recovery@.timer
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
+  host-rust-lob-recovery-queue.sh
 )
 
 fail() {
@@ -443,17 +450,18 @@ restore_release() (
       "$CANONICAL_SPOOL/spot" "$CANONICAL_SPOOL/usdm"
   fi
 
-  STEP=validate-segment-spool
-  if [[ ${MONDAY_ALLOW_RESTORE_WITH_PENDING:-0} != 1 ]] \
-    && ! require_empty_segment_spool; then
-    fail 'canonical spool contains segment artifacts; set MONDAY_ALLOW_RESTORE_WITH_PENDING=1 to force'
-  fi
+  STEP=validate-recovery-isolation
+  grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+    "$SYSTEMD_ROOT/binance-lob-archiver-production@.service" \
+    || fail 'installed production unit cannot isolate interrupted spools'
 
   STEP=validate-installed-production-assets
   for asset in "${RESTORE_ASSETS[@]}"; do
     case "$asset" in
-      *.service) installed_asset="$SYSTEMD_ROOT/$asset" ;;
+      *.service|*.timer) installed_asset="$SYSTEMD_ROOT/$asset" ;;
       *.env) installed_asset="$CONFIG_ROOT/$asset" ;;
+      host-rust-lob-recovery-queue.sh)
+        installed_asset="$BIN_DIR/monday-rust-lob-recovery-queue" ;;
     esac
     secure_regular_file "$installed_asset"
     secure_regular_file "$CANDIDATE_DEPLOYMENT/$asset"
@@ -508,6 +516,13 @@ restore_release() (
   health_ready_for_release usdm "$USDM_MINIMUM_SYMBOLS" \
     "$OLD_SESSION_USDM" "$RESTART_STARTED_NS" "$USDM_EXPECTED_DATASET" \
     || fail 'USD-M health changed while enabling production'
+  systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null
+  for timer in "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-enabled --quiet "$timer" \
+      || fail "recovery timer did not enable: $timer"
+    systemctl is-active --quiet "$timer" \
+      || fail "recovery timer did not start: $timer"
+  done
 
   STEP=write-recovery-evidence
   RESULT=passed

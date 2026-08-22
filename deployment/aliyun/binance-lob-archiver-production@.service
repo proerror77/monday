@@ -13,6 +13,7 @@ Environment=RUST_LOG=info
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/binance-lob-archiver-production-%i.env
 ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test
+ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i
 ExecStart=/opt/monday/bin/binance-lob-archiver
 Restart=always
 RestartSec=5
@@ -28,7 +29,7 @@ ProtectControlGroups=true
 LockPersonality=true
 RestrictSUIDSGID=true
 StateDirectory=hft-collector
-ReadWritePaths=/data/monday/spool/binance-lob
+ReadWritePaths=/data/monday/spool/binance-lob -/data/monday/spool/binance-lob-recovery
 CPUQuota=80%
 MemoryHigh=3072M
 MemoryMax=3584M

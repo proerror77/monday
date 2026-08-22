@@ -1180,8 +1180,11 @@ Before starting anything the host restore requires all of the following:
 4. The production symlink exists (a missing symlink is refused, never recreated).
 5. The canonical spool path is a direct directory tree under `/data` (no symlink
    escapes) and the spot/usdm subdirectories exist.
-6. The canonical spool contains no segment artifacts, unless the operator forces
-   with `MONDAY_ALLOW_RESTORE_WITH_PENDING=1`.
+6. The installed production unit already declares
+   `ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i`, so
+   any residual `.jsonl.part`/`.zst.tmp`/`.part.corrupt` is detached into
+   `/data/monday/spool/binance-lob-recovery/<market>/<job>.ready` before the
+   collector starts.
 7. The installed production unit/env files match the gated deployment bundle
    `cmp`-for-`cmp` and the production unit still declares `RuntimeMaxSec=21600`.
 

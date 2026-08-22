@@ -48,6 +48,7 @@ DRAIN_REQUIRED=0
 DRAIN_ATTEMPTED=0
 DRAIN_MAY_HAVE_MUTATED=0
 SPOOL_ENV_DEPLOYMENT=
+OLD_RECOVERY_TIMERS_ENABLED=0
 
 PRODUCTION_UNITS=(
   binance-lob-archiver-production@spot.service
@@ -56,6 +57,10 @@ PRODUCTION_UNITS=(
 UPLOAD_UNITS=(
   binance-lob-archiver-upload@spot.service
   binance-lob-archiver-upload@usdm.service
+)
+RECOVERY_TIMERS=(
+  binance-lob-archiver-recovery@spot.timer
+  binance-lob-archiver-recovery@usdm.timer
 )
 LEGACY_UNITS=(
   binance-lob-archiver@spot.service
@@ -75,11 +80,16 @@ QUIESCENT_UNITS=(
   binance-lob-archiver-upload@usdm.service
   "${LEGACY_UNITS[@]}"
 )
-DEPLOYMENT_ASSETS=(
+BASE_DEPLOYMENT_ASSETS=(
   binance-lob-archiver-production@.service
   binance-lob-archiver-upload@.service
   binance-lob-archiver-production-spot.env
   binance-lob-archiver-production-usdm.env
+)
+RECOVERY_DEPLOYMENT_ASSETS=(
+  binance-lob-archiver-recovery@.service
+  binance-lob-archiver-recovery@.timer
+  host-rust-lob-recovery-queue.sh
 )
 DRAIN_ENV_KEYS=(
   MARKET
@@ -225,11 +235,21 @@ validate_production_env() {
 }
 
 validate_deployment() {
-  local directory=$1 strict=${2:-false} asset usdm_dataset
+  local directory=$1 strict=${2:-false} asset usdm_dataset recovery_assets=0
   [[ -d $directory && ! -L $directory ]] || fail "staged deployment is missing: $directory"
-  for asset in "${DEPLOYMENT_ASSETS[@]}"; do
+  for asset in "${BASE_DEPLOYMENT_ASSETS[@]}"; do
     secure_regular_file "$directory/$asset"
   done
+  for asset in "${RECOVERY_DEPLOYMENT_ASSETS[@]}"; do
+    [[ -e $directory/$asset ]] && ((recovery_assets += 1))
+  done
+  if [[ $strict == true ]] || (( recovery_assets > 0 )); then
+    (( recovery_assets == ${#RECOVERY_DEPLOYMENT_ASSETS[@]} )) \
+      || fail "staged deployment has partial recovery assets: $directory"
+    for asset in "${RECOVERY_DEPLOYMENT_ASSETS[@]}"; do
+      secure_regular_file "$directory/$asset"
+    done
+  fi
 
   validate_production_env \
     "$directory/binance-lob-archiver-production-spot.env" \
@@ -260,6 +280,9 @@ validate_deployment() {
     grep -Fxq 'ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test' \
       "$directory/binance-lob-archiver-production@.service" \
       || fail 'candidate production unit does not run the binary self-test'
+    grep -Fxq 'ExecStartPre=+/opt/monday/bin/monday-rust-lob-recovery-queue isolate %i' \
+      "$directory/binance-lob-archiver-production@.service" \
+      || fail 'candidate production unit does not isolate interrupted spools'
     grep -Fxq 'AssertPathIsMountPoint=/data' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit does not assert the /data mount'
@@ -269,6 +292,12 @@ validate_deployment() {
     grep -Fxq 'EnvironmentFile=/etc/monday/binance-lob-archiver-production-%i.env' \
       "$directory/binance-lob-archiver-upload@.service" \
       || fail 'candidate upload unit has the wrong environment file'
+    grep -Fxq 'ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i' \
+      "$directory/binance-lob-archiver-recovery@.service" \
+      || fail 'candidate recovery unit has the wrong executable'
+    grep -Fxq 'Unit=binance-lob-archiver-recovery@%i.service' \
+      "$directory/binance-lob-archiver-recovery@.timer" \
+      || fail 'candidate recovery timer has the wrong service target'
   fi
 }
 
@@ -316,6 +345,14 @@ install_deployment() {
     /etc/systemd/system/binance-lob-archiver-production@.service || return 1
   atomic_install 0644 "$directory/binance-lob-archiver-upload@.service" \
     /etc/systemd/system/binance-lob-archiver-upload@.service || return 1
+  if [[ -f $directory/binance-lob-archiver-recovery@.service ]]; then
+    atomic_install 0644 "$directory/binance-lob-archiver-recovery@.service" \
+      /etc/systemd/system/binance-lob-archiver-recovery@.service || return 1
+    atomic_install 0644 "$directory/binance-lob-archiver-recovery@.timer" \
+      /etc/systemd/system/binance-lob-archiver-recovery@.timer || return 1
+    atomic_install 0755 "$directory/host-rust-lob-recovery-queue.sh" \
+      /opt/monday/bin/monday-rust-lob-recovery-queue || return 1
+  fi
   atomic_install 0640 "$directory/binance-lob-archiver-production-spot.env" \
     /etc/monday/binance-lob-archiver-production-spot.env || return 1
   atomic_install 0640 "$directory/binance-lob-archiver-production-usdm.env" \
@@ -419,21 +456,50 @@ run_candidate_drain() {
 }
 
 stage_existing_deployment_for_rollback() {
-  local existing=0 asset source installed_source mode source_kind old_usdm_symbols
+  local existing_base=0 existing_recovery=0 installed_recovery=0
+  local asset source installed_source mode source_kind old_usdm_symbols
+  local -a rollback_assets
   local release_deployment=$OLD_DEPLOYMENT
   local snapshot="$EVIDENCE_DIR/rollback-deployment"
   local manifest="$EVIDENCE_DIR/rollback-deployment.sha256"
   [[ ! -L $OLD_DEPLOYMENT ]] || fail "old staged deployment is a symlink: $OLD_DEPLOYMENT"
-  for asset in "${DEPLOYMENT_ASSETS[@]}"; do
+  for asset in "${BASE_DEPLOYMENT_ASSETS[@]}"; do
     if [[ -e $release_deployment/$asset ]]; then
-      ((existing += 1))
+      ((existing_base += 1))
     fi
   done
-  if (( existing == ${#DEPLOYMENT_ASSETS[@]} )); then
+  for asset in "${RECOVERY_DEPLOYMENT_ASSETS[@]}"; do
+    if [[ -e $release_deployment/$asset ]]; then
+      ((existing_recovery += 1))
+    fi
+  done
+  if (( existing_base == ${#BASE_DEPLOYMENT_ASSETS[@]} )); then
+    (( existing_recovery == 0 \
+      || existing_recovery == ${#RECOVERY_DEPLOYMENT_ASSETS[@]} )) \
+      || fail "old release has partial recovery assets: $release_deployment"
     validate_deployment "$release_deployment" false
     source_kind=release
-  elif (( existing == 0 )); then
+    rollback_assets=("${BASE_DEPLOYMENT_ASSETS[@]}")
+    if (( existing_recovery )); then
+      rollback_assets+=("${RECOVERY_DEPLOYMENT_ASSETS[@]}")
+    fi
+  elif (( existing_base == 0 && existing_recovery == 0 )); then
     source_kind=installed
+    rollback_assets=("${BASE_DEPLOYMENT_ASSETS[@]}")
+    for asset in "${RECOVERY_DEPLOYMENT_ASSETS[@]}"; do
+      case "$asset" in
+        *.service|*.timer) installed_source="/etc/systemd/system/$asset" ;;
+        host-rust-lob-recovery-queue.sh)
+          installed_source=/opt/monday/bin/monday-rust-lob-recovery-queue ;;
+      esac
+      [[ -e $installed_source ]] && ((installed_recovery += 1))
+    done
+    (( installed_recovery == 0 \
+      || installed_recovery == ${#RECOVERY_DEPLOYMENT_ASSETS[@]} )) \
+      || fail 'installed production has partial recovery assets'
+    if (( installed_recovery )); then
+      rollback_assets+=("${RECOVERY_DEPLOYMENT_ASSETS[@]}")
+    fi
   else
     fail "old release has a partial staged deployment: $release_deployment"
   fi
@@ -441,10 +507,14 @@ stage_existing_deployment_for_rollback() {
   [[ ! -e $snapshot && ! -L $snapshot ]] \
     || fail "rollback evidence snapshot already exists: $snapshot"
   install -d -m 0750 "$snapshot"
-  for asset in "${DEPLOYMENT_ASSETS[@]}"; do
+  for asset in "${rollback_assets[@]}"; do
     case "$asset" in
-      *.service) installed_source="/etc/systemd/system/$asset"; mode=0644 ;;
+      *.service|*.timer) installed_source="/etc/systemd/system/$asset"; mode=0644 ;;
       *.env) installed_source="/etc/monday/$asset"; mode=0640 ;;
+      host-rust-lob-recovery-queue.sh)
+        installed_source=/opt/monday/bin/monday-rust-lob-recovery-queue
+        mode=0755
+        ;;
     esac
     secure_regular_file "$installed_source"
     if [[ $source_kind == release ]]; then
@@ -467,7 +537,7 @@ stage_existing_deployment_for_rollback() {
   fi
   (
     cd "$snapshot"
-    sha256sum "${DEPLOYMENT_ASSETS[@]}"
+    sha256sum "${rollback_assets[@]}"
   ) >"$manifest"
   chmod 0640 "$manifest"
   ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
@@ -475,12 +545,22 @@ stage_existing_deployment_for_rollback() {
 }
 
 capture_existing_production_identity() {
+  local timer
   OLD_MODE=$1
   [[ -L $PRODUCTION_LINK ]] || fail 'running production binary must be a release symlink'
   OLD_BINARY=$(readlink -f "$PRODUCTION_LINK")
   [[ $OLD_BINARY =~ ^$RELEASE_ROOT/([a-f0-9]{64})/binance-lob-archiver$ ]] \
     || fail "running production symlink is not digest-addressed: $OLD_BINARY"
   OLD_SHA256=${BASH_REMATCH[1]}
+  OLD_RECOVERY_TIMERS_ENABLED=0
+  for timer in "${RECOVERY_TIMERS[@]}"; do
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+      ((OLD_RECOVERY_TIMERS_ENABLED += 1))
+    fi
+  done
+  (( OLD_RECOVERY_TIMERS_ENABLED == 0 \
+    || OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+    || fail 'old production has partially enabled recovery timers'
   [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
@@ -692,6 +772,7 @@ write_evidence() {
 rollback_after_failure() {
   local safe_to_restart=1 unit rollback_started_ns=0
   ROLLBACK_RESULT=disabled
+  systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
   for unit in "${PRODUCTION_UNITS[@]}"; do
@@ -749,6 +830,10 @@ rollback_after_failure() {
     elif ! systemctl daemon-reload; then
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
+    elif (( OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+      && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
+      safe_to_restart=0
+      ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
     elif [[ $OLD_MODE == contained-upgrade ]]; then
       if production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restored-contained
@@ -1032,6 +1117,15 @@ health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$CANDIDATE_STARTED_NS" \
 health_ready_for_release usdm 100 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
+
+STEP=enable-recovery-timers
+systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null
+for timer in "${RECOVERY_TIMERS[@]}"; do
+  systemctl is-enabled --quiet "$timer" \
+    || fail "recovery timer did not enable: $timer"
+  systemctl is-active --quiet "$timer" \
+    || fail "recovery timer did not start: $timer"
+done
 
 STEP=write-cutover-evidence
 RESULT=passed

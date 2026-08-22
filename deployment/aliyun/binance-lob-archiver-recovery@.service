@@ -1,0 +1,27 @@
+[Unit]
+Description=Rust Binance LOB detached spool recovery (%i)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+AssertPathIsMountPoint=/data
+
+[Service]
+Type=oneshot
+ExecStart=/opt/monday/bin/monday-rust-lob-recovery-queue drain %i
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=-/data/monday/spool/binance-lob-recovery -/data/monday/evidence/recoveries
+CPUQuota=25%
+MemoryHigh=1024M
+MemoryMax=1536M
