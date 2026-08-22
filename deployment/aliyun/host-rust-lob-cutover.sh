@@ -735,6 +735,12 @@ production_is_fail_closed() {
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
+  for unit in "${RECOVERY_TIMERS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ $state == disabled || $state == masked || $state == masked-runtime \
+      || $state == not-found ]] || return 1
+  done
 }
 
 write_evidence() {

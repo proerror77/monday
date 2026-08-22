@@ -1591,6 +1591,8 @@ run_contained_upgrade_rollback_fixture() (
   local pending_drain=${2:-0}
   local mode=${3:-contained-upgrade}
   local old_recovery_timers_enabled=${4:-0}
+  local active_recovery_timer=${5:-}
+  local enabled_recovery_timer=${6:-}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
@@ -1617,10 +1619,17 @@ run_contained_upgrade_rollback_fixture() (
   systemctl() {
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
     case "$1" in
-      is-active) return 1 ;;
+      is-active)
+        [[ ${!#} == "$active_recovery_timer" ]]
+        ;;
       is-enabled)
         if [[ ${2:-} == --quiet ]]; then
-          return 1
+          [[ ${!#} == "$enabled_recovery_timer" ]]
+          return
+        fi
+        if [[ ${!#} == "$enabled_recovery_timer" ]]; then
+          printf 'enabled\n'
+          return 0
         fi
         if (( expect_contained )); then
           printf 'masked-runtime\n'
@@ -1670,6 +1679,10 @@ run_contained_upgrade_rollback_fixture() (
 [[ $(run_contained_upgrade_rollback_fixture 1 1) == previous-release-restored-contained ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 2) \
   == previous-release-restored-contained ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 recovery-spot) \
+  == previous-release-restore-containment-failed ]]
+[[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 '' recovery-spot) \
+  == previous-release-restore-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
 
