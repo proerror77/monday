@@ -8,9 +8,11 @@ readonly ARTIFACT_HELPER_DIR
 readonly ARTIFACT_HELPER="$ARTIFACT_HELPER_DIR/polymarket-market-recorder-release-artifact.sh"
 readonly UNIT_NAME=polymarket-market-tape.service
 readonly UNIT_TEMPLATE="$SCRIPT_DIR/$UNIT_NAME"
+readonly CONFIG_TEMPLATE="$SCRIPT_DIR/polymarket-market-tape.toml"
 readonly UNIT_BINARY_MARKER=/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner
 readonly RELEASE_SUBDIR=/opt/monday/releases/polymarket-market-recorder
 readonly UNIT_SUBPATH="/etc/systemd/system/$UNIT_NAME"
+readonly CONFIG_SUBPATH=/etc/monday/polymarket-market-tape.toml
 readonly OUTPUT_SUBDIR=/data/monday/spool/polymarket
 readonly LOCK_SUBPATH=/run/lock/monday-polymarket-market-recorder-deploy.lock
 readonly STATE_SUBPATH=/opt/monday/state/polymarket-market-recorder-deploy.json
@@ -33,6 +35,7 @@ fi
 readonly test_root expected_uid verify_user PATH
 readonly RELEASE_ROOT="$test_root$RELEASE_SUBDIR"
 readonly UNIT_PATH="$test_root$UNIT_SUBPATH"
+readonly CONFIG_PATH="$test_root$CONFIG_SUBPATH"
 readonly PROC_ROOT="$test_root/proc"
 readonly OUTPUT_DIR="$test_root$OUTPUT_SUBDIR"
 readonly LOCK_PATH="$test_root$LOCK_SUBPATH"
@@ -128,6 +131,10 @@ verify_unit() {
   rm -f -- "$rendered_unit"
   rendered_unit=
 }
+verify_config() {
+  secure_regular_file "$CONFIG_PATH" 644 || return 1
+  cmp -s "$CONFIG_TEMPLATE" "$CONFIG_PATH"
+}
 verify_fresh_output() {
   local not_before=$1 file mtime latest=0 now
   [[ -d $OUTPUT_DIR && ! -L $OUTPUT_DIR ]] || return 1
@@ -200,6 +207,36 @@ verify_installed_release() {
       || return 1
   fi
 }
+capture_contained_inactive_runtime() {
+  local configured_exec enabled source_readback
+  [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive ]] || return 1
+  [[ $(systemctl_value "$UNIT_NAME" SubState) == dead ]] || return 1
+  runtime_pid=$(systemctl_value "$UNIT_NAME" MainPID) || return 1
+  [[ $runtime_pid == 0 ]] || return 1
+  enabled=$(systemctl is-enabled "$UNIT_NAME") || return 1
+  [[ $enabled == enabled ]] || return 1
+  configured_exec=$(effective_exec_argv "$UNIT_NAME") || return 1
+  runtime_binary=${configured_exec%% *}
+  [[ $configured_exec == "$runtime_binary $EXPECTED_ARGS" ]] || return 1
+  verify_unit "$runtime_binary" || return 1
+  verify_config || return 1
+  secure_regular_file "$runtime_binary" 555 || return 1
+  runtime_sha=$(sha256sum "$runtime_binary" | awk '{print $1}') || return 1
+  [[ $runtime_sha =~ ^[0-9a-f]{64}$ ]] || return 1
+  runtime_source=$(runner_version "$runtime_binary") || return 1
+  runtime_source=${runtime_source#new-ploy-runner }
+  [[ $runtime_source =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ $runtime_binary == "$RELEASE_ROOT/$runtime_sha/new-ploy-runner" ]] || return 1
+  verify_installed_release "$runtime_sha" "$runtime_source" || return 1
+  source_readback=$(runner_version "$runtime_binary") || return 1
+  [[ $(systemctl_value "$UNIT_NAME" ActiveState) == inactive \
+    && $(systemctl_value "$UNIT_NAME" SubState) == dead \
+    && $(systemctl_value "$UNIT_NAME" MainPID) == 0 \
+    && $(systemctl is-enabled "$UNIT_NAME") == enabled \
+    && $(effective_exec_argv "$UNIT_NAME") == "$configured_exec" \
+    && $(sha256sum "$runtime_binary" | awk '{print $1}') == "$runtime_sha" \
+    && $source_readback == "new-ploy-runner $runtime_source" ]]
+}
 publish_runtime_snapshot() {
   local sha=$1 source_revision=$2 proc_exe=$3 destination
   destination="$RELEASE_ROOT/$sha"
@@ -249,8 +286,8 @@ verify_running_release() {
     && $runtime_source == "$source_revision" && $runtime_restarts == 0 ]] || return 1
   verify_fresh_output "$not_before"
 }
-activate_release() {
-  local sha=$1 source_revision=$2 started attempt
+install_release_unit() {
+  local sha=$1 source_revision=$2
   local binary="$RELEASE_ROOT/$sha/new-ploy-runner"
   verify_installed_release "$sha" "$source_revision" || return 1
   rendered_unit=$(mktemp "${UNIT_PATH}.new.XXXXXX") || return 1
@@ -259,6 +296,10 @@ activate_release() {
   mv -f "$rendered_unit" "$UNIT_PATH" || return 1
   rendered_unit=
   systemctl daemon-reload || return 1
+}
+activate_release() {
+  local sha=$1 source_revision=$2 started attempt
+  install_release_unit "$sha" "$source_revision" || return 1
   systemctl reset-failed "$UNIT_NAME" || return 1
   [[ $(systemctl_value "$UNIT_NAME" NRestarts) == 0 ]] || return 1
   started=$(date +%s)
@@ -270,6 +311,22 @@ activate_release() {
     ((attempt == verify_attempts)) || sleep "$verify_sleep_seconds"
   done
   return 1
+}
+restore_contained_inactive_release() {
+  local sha=$1 source_revision=$2
+  systemctl stop "$UNIT_NAME" || return 1
+  install_release_unit "$sha" "$source_revision" || return 1
+  capture_contained_inactive_runtime || return 1
+  [[ $runtime_sha == "$sha" && $runtime_source == "$source_revision" ]]
+}
+restore_baseline_after_failure() {
+  local activity=$1 sha=$2 source_revision=$3
+  if [[ $activity == active ]]; then
+    activate_release "$sha" "$source_revision"
+  else
+    [[ $activity == inactive ]] || return 1
+    restore_contained_inactive_release "$sha" "$source_revision"
+  fi
 }
 load_state() {
   secure_regular_file "$STATE_PATH" 600 || return 1
@@ -342,10 +399,17 @@ pre_mutation_feasibility() {
     || die 'immutable release root is not owned by root'
   (( (8#$(stat_mode "$RELEASE_ROOT") & 8#022) == 0 )) \
     || die 'immutable release root is writable outside its owner'
-  capture_runtime || die 'current market-recorder runtime identity is not exact'
-  now=$(date +%s)
-  verify_fresh_output "$((now - MAX_OUTPUT_AGE_SECONDS))" \
-    || die 'current market-tape output is stale or missing'
+  if systemctl is-active --quiet "$UNIT_NAME"; then
+    capture_runtime || die 'current active market-recorder runtime identity is not exact'
+    runtime_activity=active
+    now=$(date +%s)
+    verify_fresh_output "$((now - MAX_OUTPUT_AGE_SECONDS))" \
+      || die 'current market-tape output is stale or missing'
+  else
+    capture_contained_inactive_runtime \
+      || die 'current stopped market-recorder baseline is not exact and contained'
+    runtime_activity=inactive
+  fi
   if [[ -e $STATE_PATH || -L $STATE_PATH ]]; then
     load_state || die 'existing deployment state is not exact'
     [[ $state_current_sha == "$runtime_sha" \
@@ -362,32 +426,40 @@ pre_mutation_feasibility() {
 
 install_release() {
   local archive=$1 source_revision=$2 image_digest=$3 baseline_sha baseline_source
-  local baseline_pid
+  local baseline_activity baseline_pid
   [[ -n $test_root || $EUID -eq 0 ]] || die 'install and rollback require root'
   prepare_candidate "$archive" "$source_revision" "$image_digest"
   pre_mutation_feasibility "$source_revision" "$image_digest"
   baseline_sha=$runtime_sha
   baseline_source=$runtime_source
+  baseline_activity=$runtime_activity
   baseline_pid=$runtime_pid
-  publish_runtime_snapshot "$baseline_sha" "$baseline_source" \
-    "$PROC_ROOT/$baseline_pid/exe" \
-    || die 'could not preserve the verified current release'
+  if [[ $baseline_activity == active ]]; then
+    publish_runtime_snapshot "$baseline_sha" "$baseline_source" \
+      "$PROC_ROOT/$baseline_pid/exe" \
+      || die 'could not preserve the verified current release'
+  else
+    verify_installed_release "$baseline_sha" "$baseline_source" \
+      || die 'stopped baseline release is not immutable and verified'
+  fi
   publish_candidate "$candidate_sha" "$source_revision" "$image_digest" \
     || die 'could not publish the immutable candidate release'
   if ! activate_release "$candidate_sha" "$source_revision"; then
     printf 'market-recorder deploy: candidate verification failed; restoring sha256=%s\n' \
       "$baseline_sha" >&2
-    if ! activate_release "$baseline_sha" "$baseline_source"; then
+    if ! restore_baseline_after_failure \
+      "$baseline_activity" "$baseline_sha" "$baseline_source"; then
       stop_with_recovery_evidence "$candidate_sha" "$baseline_sha"
       return 1
     fi
-    die "candidate failed post-start verification; restored sha256=$baseline_sha source_revision=$baseline_source"
+    die "candidate failed post-start verification; restored sha256=$baseline_sha source_revision=$baseline_source activity=$baseline_activity"
   fi
   if ! write_state "$candidate_sha" "$source_revision" \
     "$baseline_sha" "$baseline_source"; then
     printf 'market-recorder deploy: state publication failed; restoring sha256=%s\n' \
       "$baseline_sha" >&2
-    if ! activate_release "$baseline_sha" "$baseline_source"; then
+    if ! restore_baseline_after_failure \
+      "$baseline_activity" "$baseline_sha" "$baseline_source"; then
       stop_with_recovery_evidence "$candidate_sha" "$baseline_sha"
       return 1
     fi
@@ -446,6 +518,8 @@ secure_directory_chain "$ARTIFACT_HELPER_DIR" || die 'artifact helper path is in
 secure_regular_file "$ARTIFACT_HELPER" || die 'artifact verifier is indirect or unsafe'
 secure_regular_file "$UNIT_TEMPLATE" \
   || die 'service template is missing, indirect, or unsafe'
+secure_regular_file "$CONFIG_TEMPLATE" \
+  || die 'config template is missing, indirect, or unsafe'
 [[ $# -ge 1 ]] || usage
 mode=$1
 shift

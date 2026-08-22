@@ -474,12 +474,19 @@ impl FullConfig {
         self.runtime.feed_lag_policy
     }
 
+    /// Whether this runtime is only draining live market updates into a tape.
+    pub fn is_market_update_recorder_profile(&self, mode: RuntimeMode) -> bool {
+        mode == RuntimeMode::DryRun
+            && self.runtime.canonical_strategy_variant() == "noop"
+            && self.record_market_updates_path().is_some()
+    }
+
     /// Trading runtimes must remain fail-closed on feed lag; only a pure noop
     /// dry-run recorder may skip lagged updates, because there a restart loses
     /// more tape than a bounded, warn-logged gap.
     pub fn feed_lag_policy_allowed(&self, mode: RuntimeMode) -> bool {
         self.runtime.feed_lag_policy != LagPolicy::SkipAndContinue
-            || (mode == RuntimeMode::DryRun && self.runtime.strategy_variant == "noop")
+            || self.is_market_update_recorder_profile(mode)
     }
 
     /// Build SimulatedExecutorConfig from the parsed config.
@@ -930,22 +937,33 @@ record_market_updates_max_bytes = 1048576
         let recorder = r#"
 [runtime]
 mode = "dryrun"
-strategy_variant = "noop"
+strategy_variant = " NoOp "
 feed_lag_policy = "skip_and_continue"
+record_market_updates_to = "tmp/market-updates.ndjson"
 
 [strategy]
 "#;
         let config = FullConfig::from_toml(recorder).unwrap();
         assert_eq!(config.feed_lag_policy(), LagPolicy::SkipAndContinue);
+        assert!(config.is_market_update_recorder_profile(RuntimeMode::DryRun));
         assert!(config.feed_lag_policy_allowed(RuntimeMode::DryRun));
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::Live));
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::Backtest));
 
         let trading = recorder.replace(
-            "strategy_variant = \"noop\"",
+            "strategy_variant = \" NoOp \"",
             "strategy_variant = \"delta_neutral\"",
         );
         let config = FullConfig::from_toml(&trading).unwrap();
+        assert!(!config.is_market_update_recorder_profile(RuntimeMode::DryRun));
+        assert!(!config.feed_lag_policy_allowed(RuntimeMode::DryRun));
+
+        let without_tape = recorder.replace(
+            "record_market_updates_to = \"tmp/market-updates.ndjson\"",
+            "",
+        );
+        let config = FullConfig::from_toml(&without_tape).unwrap();
+        assert!(!config.is_market_update_recorder_profile(RuntimeMode::DryRun));
         assert!(!config.feed_lag_policy_allowed(RuntimeMode::DryRun));
     }
 

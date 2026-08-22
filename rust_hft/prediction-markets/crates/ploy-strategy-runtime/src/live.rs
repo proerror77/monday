@@ -504,7 +504,7 @@ use crate::{database_unavailable_is_fatal, RuntimeModeConfig};
 pub(crate) async fn run_live_or_dry_run_entry(
     config: &FullConfig,
     symbols: &[String],
-    strategy: Box<dyn StrategyLogic>,
+    strategy: Option<Box<dyn StrategyLogic>>,
     runtime_config: RuntimeModeConfig,
     deployment_id: String,
 ) -> (
@@ -533,7 +533,7 @@ fn restore_live_trading_runtime(
 async fn run_live_or_dry_run(
     config: &FullConfig,
     symbols: &[String],
-    strategy: Box<dyn StrategyLogic>,
+    strategy: Option<Box<dyn StrategyLogic>>,
     runtime_config: RuntimeModeConfig,
     deployment_id: String,
 ) -> (
@@ -672,54 +672,64 @@ async fn run_live_or_dry_run(
         Box::new(LiveFeed::with_lag_policy(rx, config.feed_lag_policy()))
     };
 
-    let recorder = build_signal_recorder(db_pool.clone(), runtime_config.mode);
-    let result = if runtime_config.mode == RuntimeMode::Live {
-        #[cfg(not(feature = "live-execution"))]
-        {
-            eprintln!("Live execution requires the `live-execution` feature");
-            std::process::exit(1);
-        }
+    let result = if config.is_market_update_recorder_profile(runtime_config.mode) {
+        assert!(
+            strategy.is_none(),
+            "pure recorder must not construct a strategy"
+        );
+        drain_market_update_recorder(feed, &runtime_config).await
+    } else {
+        let strategy = strategy.expect("trading runtime requires a strategy");
+        let recorder = build_signal_recorder(db_pool.clone(), runtime_config.mode);
+        if runtime_config.mode == RuntimeMode::Live {
+            #[cfg(not(feature = "live-execution"))]
+            {
+                eprintln!("Live execution requires the `live-execution` feature");
+                std::process::exit(1);
+            }
 
-        #[cfg(feature = "live-execution")]
-        {
-            let client = ploy_control_client::ControlPlaneClient::default();
-            let trading =
+            #[cfg(feature = "live-execution")]
+            {
+                let client = ploy_control_client::ControlPlaneClient::default();
+                let trading =
                 restore_live_trading_runtime(&client, &deployment_id).unwrap_or_else(|error| {
                     error!(%error, %deployment_id, "Live restore failed; refusing to start empty");
                     std::process::exit(1);
                 });
+                let executor =
+                    build_live_executor(client, config.live_execution_policy(), &deployment_id);
+                let mut runtime = ploy_strategy_bundles::StrategyRuntime::new_with_trading(
+                    strategy,
+                    feed,
+                    executor,
+                    recorder,
+                    runtime_config,
+                    trading,
+                )
+                .with_deployment_id(deployment_id.clone());
+                let result = runtime.run().await;
+                let snapshot = runtime
+                    .trading()
+                    .snapshot(&std::collections::BTreeMap::new());
+                (result, snapshot)
+            }
+        } else {
             let executor =
-                build_live_executor(client, config.live_execution_policy(), &deployment_id);
-            let mut runtime = ploy_strategy_bundles::StrategyRuntime::new_with_trading(
+                ploy_strategy_bundles::SimulatedExecutor::new(config.sim_executor_config());
+            let mut runtime = ploy_strategy_bundles::StrategyRuntime::new(
                 strategy,
                 feed,
                 executor,
                 recorder,
                 runtime_config,
-                trading,
             )
-            .with_deployment_id(deployment_id.clone());
+            .with_deployment_id(deployment_id);
             let result = runtime.run().await;
             let snapshot = runtime
                 .trading()
                 .snapshot(&std::collections::BTreeMap::new());
             (result, snapshot)
         }
-    } else {
-        let executor = ploy_strategy_bundles::SimulatedExecutor::new(config.sim_executor_config());
-        let mut runtime = ploy_strategy_bundles::StrategyRuntime::new(
-            strategy,
-            feed,
-            executor,
-            recorder,
-            runtime_config,
-        )
-        .with_deployment_id(deployment_id);
-        let result = runtime.run().await;
-        let snapshot = runtime
-            .trading()
-            .snapshot(&std::collections::BTreeMap::new());
-        (result, snapshot)
     };
 
     for handle in feed_handles {
@@ -727,6 +737,62 @@ async fn run_live_or_dry_run(
     }
 
     result
+}
+
+async fn drain_market_update_recorder(
+    mut feed: Box<dyn Feed>,
+    runtime_config: &RuntimeModeConfig,
+) -> (
+    ploy_strategy_bundles::RuntimeResult,
+    ploy_trading::TradingRuntimeSnapshot,
+) {
+    let start = std::time::Instant::now();
+    let mut updates_processed = 0_u64;
+    let mut quote_updates_observed = 0_u64;
+    let mut depth_quote_updates_observed = 0_u64;
+
+    while let Some(update) = feed.next().await {
+        updates_processed += 1;
+        if let ploy_strategy_bundles::MarketUpdate::Quote {
+            bid_levels,
+            ask_levels,
+            ..
+        } = update
+        {
+            quote_updates_observed += 1;
+            if !bid_levels.is_empty() || !ask_levels.is_empty() {
+                depth_quote_updates_observed += 1;
+            }
+        }
+        if runtime_config
+            .max_updates
+            .is_some_and(|max| updates_processed >= max)
+        {
+            break;
+        }
+    }
+
+    let result = ploy_strategy_bundles::RuntimeResult {
+        mode: runtime_config.mode,
+        updates_processed,
+        quote_updates_observed,
+        depth_quote_updates_observed,
+        intents_submitted: 0,
+        fills_recorded: 0,
+        non_settlement_fills_observed: 0,
+        full_depth_fills_observed: 0,
+        pnl: ploy_trading::PnlSnapshot::default(),
+        risk: ploy_trading::RiskSnapshot::default(),
+        elapsed_secs: start.elapsed().as_secs_f64(),
+        strategy_diagnostics: Vec::new(),
+    };
+    info!(
+        updates = result.updates_processed,
+        quotes = result.quote_updates_observed,
+        depth_quotes = result.depth_quote_updates_observed,
+        "Pure market recorder stopped",
+    );
+    (result, ploy_trading::TradingRuntimeSnapshot::default())
 }
 
 #[cfg(test)]
@@ -738,6 +804,101 @@ mod feed_source_tests {
         assert!(uses_db_primary_ticks(MarketDataSource::LocalDb));
         assert!(!uses_db_primary_ticks(MarketDataSource::Dual));
         assert!(!uses_db_primary_ticks(MarketDataSource::ExternalDirect));
+    }
+}
+
+#[cfg(test)]
+mod pure_recorder_tests {
+    use super::{drain_market_update_recorder, RuntimeModeConfig};
+    use chrono::Utc;
+    use ploy_strategy_bundles::feed::{RecordingKind, RecordingPolicy};
+    use ploy_strategy_bundles::{HistoricalFeed, MarketUpdate, RecordingFeed, RuntimeMode};
+    use rust_decimal::Decimal;
+    use std::fs;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn pure_recorder_preserves_full_market_updates_without_trading_state() {
+        let now = Utc::now();
+        let updates = vec![
+            MarketUpdate::Quote {
+                token_id: Arc::from("up-1"),
+                bid: Some(Decimal::new(49, 2)),
+                ask: Some(Decimal::new(51, 2)),
+                bid_size: Some(Decimal::new(12, 0)),
+                ask_size: Some(Decimal::new(11, 0)),
+                bid_levels: vec![
+                    serde_json::from_value(serde_json::json!({"price":"0.49","size":"12"}))
+                        .expect("bid level"),
+                    serde_json::from_value(serde_json::json!({"price":"0.48","size":"13"}))
+                        .expect("second bid level"),
+                ],
+                ask_levels: vec![
+                    serde_json::from_value(serde_json::json!({"price":"0.51","size":"11"}))
+                        .expect("ask level"),
+                    serde_json::from_value(serde_json::json!({"price":"0.52","size":"14"}))
+                        .expect("second ask level"),
+                ],
+                ts: now,
+            },
+            MarketUpdate::AggTrade {
+                symbol: Arc::from("BTCUSDT"),
+                agg_trade_id: 42,
+                price: Decimal::new(100_000, 0),
+                quantity: Decimal::new(25, 1),
+                is_buyer_maker: false,
+                ts: now,
+            },
+            MarketUpdate::L2 {
+                symbol: Arc::from("BTCUSDT"),
+                obi: 0.25,
+                spread_bps: 2,
+                ts: now,
+            },
+        ];
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("polymarket-pure-recorder-{unique}.ndjson"));
+        let feed = RecordingFeed::with_policy(
+            HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                include_kinds: vec![
+                    RecordingKind::Quote,
+                    RecordingKind::AggTrade,
+                    RecordingKind::L2,
+                ],
+                quote_sample_ms: Some(0),
+                ..RecordingPolicy::default()
+            },
+        )
+        .expect("recording feed");
+        let runtime_config = RuntimeModeConfig {
+            mode: RuntimeMode::DryRun,
+            throttle_hz: None,
+            max_updates: None,
+            skip_settlement_exits: true,
+        };
+
+        let (result, snapshot) =
+            drain_market_update_recorder(Box::new(feed), &runtime_config).await;
+
+        let recorded = fs::read_to_string(&path).expect("read recorded tape");
+        assert!(recorded.contains("\"bid_levels\":[{\"price\":\"0.49\",\"size\":\"12\"}"));
+        assert!(recorded.contains("\"agg_trade_id\":42"));
+        assert!(recorded.contains("\"obi\":0.25"));
+        assert_eq!(result.updates_processed, 3);
+        assert_eq!(result.quote_updates_observed, 1);
+        assert_eq!(result.depth_quote_updates_observed, 1);
+        assert_eq!(result.intents_submitted, 0);
+        assert_eq!(result.fills_recorded, 0);
+        assert!(snapshot.intents.is_empty());
+        assert!(snapshot.orders.is_empty());
+        assert!(snapshot.fills.is_empty());
+
+        let _ = fs::remove_file(path);
     }
 }
 
