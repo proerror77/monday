@@ -305,6 +305,7 @@ atomic_install() {
   temporary="${destination}.new.$$"
   install -m "$mode" "$source" "$temporary" || return 1
   mv -Tf "$temporary" "$destination" || return 1
+  cmp -s -- "$source" "$destination"
 }
 
 install_deployment() {
@@ -322,11 +323,13 @@ install_deployment() {
 }
 
 atomic_symlink() {
-  local target=$1 link=$2 temporary
+  local target=$1 link=$2 temporary resolved_target
+  resolved_target=$(readlink -f -- "$target" 2>/dev/null) || return 1
   temporary="${link}.new.$$"
   rm -f "$temporary" || return 1
   ln -s "$target" "$temporary" || return 1
   mv -Tf "$temporary" "$link" || return 1
+  [[ -L $link && $(readlink -f -- "$link" 2>/dev/null || true) == "$resolved_target" ]]
 }
 
 canonical_spool_paths_safe() {

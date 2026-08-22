@@ -1264,6 +1264,45 @@ grep -Fq 'candidate production service retained an unexpected systemd drop-in' "
 grep -Fq 'validate_existing_production_dropins' "$CUTOVER"
 grep -Fq 'remove_allowlisted_production_dropins_for_candidate' "$CUTOVER"
 
+atomic_helpers_body="$tmp_dir/atomic-cutover-helpers.sh"
+{
+  sed -n '/^atomic_install()/,/^}/p' "$CUTOVER"
+  sed -n '/^atomic_symlink()/,/^}/p' "$CUTOVER"
+} >"$atomic_helpers_body"
+atomic_helpers_root="$tmp_dir/atomic-cutover-helpers"
+mkdir -p "$atomic_helpers_root"
+printf 'old bytes\n' >"$atomic_helpers_root/source"
+printf 'new bytes\n' >"$atomic_helpers_root/target"
+run_atomic_helpers_success_fixture() (
+  mv() { command mv -f "$2" "$3"; }
+  # shellcheck disable=SC1090
+  . "$atomic_helpers_body"
+  atomic_install 0640 "$atomic_helpers_root/source" "$atomic_helpers_root/installed"
+  cmp -s "$atomic_helpers_root/source" "$atomic_helpers_root/installed"
+  atomic_symlink "$atomic_helpers_root/target" "$atomic_helpers_root/current"
+  [[ $(readlink -f "$atomic_helpers_root/current") \
+    == "$(readlink -f "$atomic_helpers_root/target")" ]]
+)
+run_atomic_helpers_fail_closed_fixture() (
+  mv() { return 0; }
+  # shellcheck disable=SC1090
+  . "$atomic_helpers_body"
+  printf 'stale bytes\n' >"$atomic_helpers_root/stale-installed"
+  if atomic_install 0640 \
+    "$atomic_helpers_root/source" "$atomic_helpers_root/stale-installed"; then
+    printf 'atomic install accepted unread-back bytes\n' >&2
+    exit 1
+  fi
+  printf 'wrong target\n' >"$atomic_helpers_root/wrong-target"
+  ln -s "$atomic_helpers_root/wrong-target" "$atomic_helpers_root/stale-current"
+  if atomic_symlink "$atomic_helpers_root/target" "$atomic_helpers_root/stale-current"; then
+    printf 'atomic symlink accepted an unread-back target\n' >&2
+    exit 1
+  fi
+)
+run_atomic_helpers_success_fixture
+run_atomic_helpers_fail_closed_fixture
+
 host_state_dispatch=$(sed -n '/^if (( active_count == 2/,/^fi$/p' "$CUTOVER")
 grep -Fq 'OLD_MODE=new-host' <<<"$host_state_dispatch"
 grep -Fq '(( PRODUCTION_USDM_MEMORY_DROPIN_PRESENT == 0 ))' <<<"$host_state_dispatch"
