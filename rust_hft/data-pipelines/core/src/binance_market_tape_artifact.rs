@@ -30,6 +30,7 @@ const REPLAY_SCOPE: &str =
     "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs";
 const LOB_REPLAY_SCOPE: &str = "captured_snapshot_seed_plus_sequence_checked_diffs";
 const USDM_LOB_DATASET: &str = "usdm_perpetual_top100_lob";
+const USDM_LOB_SHADOW_DATASET: &str = "usdm_perpetual_top100_lob_rust_shadow";
 const USDM_LOB_DEPTH_ONLY_STREAM_TYPES: [&str; 1] = ["depth@100ms"];
 const USDM_LOB_HISTORICAL_STREAM_TYPES: [&str; 2] = ["depth@100ms", "bookTicker"];
 const TRADE_REPRESENTATION: &str = "aggregate_trade_only";
@@ -1347,16 +1348,20 @@ fn validate_manifest_identity(
 
 fn manifest_is_usdm_lob_only(manifest: &TapeManifest) -> bool {
     manifest.market == "usdm"
-        && manifest.dataset == USDM_LOB_DATASET
+        && matches!(
+            manifest.dataset.as_str(),
+            USDM_LOB_DATASET | USDM_LOB_SHADOW_DATASET
+        )
         && manifest.schema == MARKET_TAPE_SCHEMA_V2
         && manifest.stream_types.as_ref().is_some_and(|stream_types| {
             let declared = stream_types.iter().map(String::as_str).collect::<BTreeSet<_>>();
             declared == USDM_LOB_DEPTH_ONLY_STREAM_TYPES.iter().copied().collect::<BTreeSet<_>>()
-                || declared
-                    == USDM_LOB_HISTORICAL_STREAM_TYPES
-                        .iter()
-                        .copied()
-                        .collect::<BTreeSet<_>>()
+                || (manifest.dataset == USDM_LOB_DATASET
+                    && declared
+                        == USDM_LOB_HISTORICAL_STREAM_TYPES
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>())
         })
 }
 
@@ -2844,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_gate_verifier_accepts_usdm_lob_depth_only_v2_without_trade_rows() {
+    fn strict_gate_verifier_accepts_exact_usdm_lob_datasets_without_trade_rows() {
         let root = tempdir();
         let mut rows = valid_v2_rows()
             .into_iter()
@@ -2865,7 +2870,7 @@ mod tests {
         rows = with_stream_coverage_v2(rows, &["BTCUSDT"], &["depth@100ms"]);
         let (triplet, _) = write_triplet_v2(root.path(), &rows, &["BTCUSDT"], &["depth@100ms"]);
         let _ = rewrite_manifest(&triplet, |manifest| {
-            manifest["dataset"] = json!("usdm_perpetual_top100_lob");
+            manifest["dataset"] = json!(USDM_LOB_SHADOW_DATASET);
             manifest["replay_scope"] = json!(LOB_REPLAY_SCOPE);
             manifest
                 .as_object_mut()
@@ -2880,6 +2885,19 @@ mod tests {
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+
+        let production_anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["dataset"] = json!(USDM_LOB_DATASET);
+        });
+        let production =
+            seal_binance_market_tape_triplet(&triplet, &production_anchor).unwrap();
+        verify_binance_market_tape_for_strict_gate(vec![production]).unwrap();
+
+        let lookalike_anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["dataset"] = json!("usdm_perpetual_top100_lob_rust_shadow_extra");
+        });
+        let error = seal_binance_market_tape_triplet(&triplet, &lookalike_anchor).unwrap_err();
+        assert!(error.to_string().contains("manifest identity"), "{error:#}");
     }
 
     #[test]
@@ -2920,6 +2938,12 @@ mod tests {
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
         verify_binance_market_tape_for_strict_gate(vec![sealed]).unwrap();
+
+        let shadow_anchor = rewrite_manifest(&triplet, |manifest| {
+            manifest["dataset"] = json!(USDM_LOB_SHADOW_DATASET);
+        });
+        let error = seal_binance_market_tape_triplet(&triplet, &shadow_anchor).unwrap_err();
+        assert!(error.to_string().contains("manifest identity"), "{error:#}");
     }
 
     #[test]
