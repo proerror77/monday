@@ -1131,15 +1131,18 @@ and each process's `/proc/<pid>/exe` resolving to the requested release; only a
 verified candidate is enabled for reboot.
 
 Any failure after production stops triggers a fail-closed Rust-to-Rust restore of
-the previous digest-addressed binary. Before production stops, its deployment
+the previous digest-addressed binary state. Before production stops, its deployment
 assets are copied into the unique cutover evidence directory and covered by a
 SHA-256 manifest; mutable `/etc` files are never written back into an old
-digest-addressed release. Rollback verifies that snapshot before use, removes
-candidate health, starts the old units while disabled, requires health written
-after that restart, and verifies full catalog, zero restarts, and the old
-`/proc/<pid>/exe` targets before enabling. If a safe restore cannot be proved,
-both production units remain disabled and masked. Cutover evidence is written
-under `/data/monday/evidence/cutovers/`.
+digest-addressed release. On a normal `active=2 enabled=2` upgrade, rollback
+verifies that snapshot before use, removes candidate health, starts the old units
+while disabled, requires health written after that restart, and verifies full
+catalog, zero restarts, and the old `/proc/<pid>/exe` targets before enabling.
+On a contained `active=0 enabled=2` host, rollback restores the old digest,
+deployment snapshot, and allowlisted USD-M memory drop-in bytes but leaves the
+runtime disabled and masked. If a safe restore cannot be proved, both production
+units remain disabled and masked. Cutover evidence is written under
+`/data/monday/evidence/cutovers/`.
 
 Rollback uses the same `ACTION=cutover` operation with a previously installed,
 previously gated artifact digest. There is no Python fallback and no manual
@@ -1148,13 +1151,13 @@ symlink shortcut.
 ### 4. Restore a stopped, already-gated production release
 
 If an already-gated, already-cutover release was later stopped and disabled (for
-example, during a disk-full incident), `ACTION=cutover` cannot bring it back:
-`host-rust-lob-cutover.sh` refuses an active==2/enabled==2 host with an
-"ambiguous production state" error and there is no governed restore path.
-`host-rust-lob-restore.sh` closes that gap. It is fail-closed: it never rewrites
-the production symlink and never touches the digest-addressed release or its
-deployment assets, so the restored runtime is byte-identical to the cutover
-artifact.
+example, during a disk-full incident), `ACTION=cutover` still cannot bring it
+back: the cutover path accepts a contained `active=0 enabled=2` emergency-stop
+state so it can transition to a new candidate, but it does not resume an already
+disabled production runtime. `host-rust-lob-restore.sh` closes that gap. It is
+fail-closed: it never rewrites the production symlink and never touches the
+digest-addressed release or its deployment assets, so the restored runtime is
+byte-identical to the cutover artifact.
 
 Invoke it with the immutable artifact digest that is already on disk and already
 gated:
