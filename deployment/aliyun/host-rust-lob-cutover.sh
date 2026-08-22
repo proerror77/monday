@@ -438,7 +438,7 @@ has_incomplete_segment_artifacts() {
 }
 
 run_candidate_drain() {
-  local deployment=$1 market env_file key value recovery_parent recovery_dir
+  local deployment=$1 market env_file key value
   local -a env_args
   canonical_spool_paths_safe || return 1
   for market in spot usdm; do
@@ -451,26 +451,9 @@ run_candidate_drain() {
       env_args+=("$key=$value")
     done
     if has_incomplete_segment_artifacts "$CANONICAL_SPOOL/$market"; then
-      recovery_parent="$EVIDENCE_DIR/recovery-input/$market"
-      install -d -m 0750 -o root -g root -- "$recovery_parent" || return 1
-      recovery_dir="$recovery_parent/$(date -u +%Y%m%dT%H%M%S%NZ)-$$"
-      [[ ! -e $recovery_dir && ! -L $recovery_dir ]] || return 1
-      if ! env -i \
-        HOME=/root \
-        PATH="$SAFE_PATH" \
-        RUST_LOG=info \
-        "${env_args[@]}" \
-        RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256" \
-        RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION" \
-        RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256" \
-        RECOVERY_UID="$(id -u hftcollector)" \
-        RECOVERY_GID="$(id -g hftcollector)" \
-        RECOVERY_BACKUP_DIR="$recovery_dir" \
-        "$CANDIDATE_BINARY" --recover-parts-only; then
-        [[ -f $recovery_dir/receipt.json ]] && DRAIN_MAY_HAVE_MUTATED=1
-        return 1
-      fi
+      /opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market" || return 1
       DRAIN_MAY_HAVE_MUTATED=1
+      continue
     fi
     DRAIN_MAY_HAVE_MUTATED=1
     runuser --user hftcollector -- env -i \

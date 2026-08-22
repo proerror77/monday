@@ -216,22 +216,16 @@ for suffix in '*.jsonl.part' '*.zst.tmp' '*.part.corrupt'; do
     exit 1
   }
 done
-backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1)
-recover_line=$(grep -n -- '--recover-parts-only' <<<"$drain_body" | cut -d: -f1)
-upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1)
-[[ -n $backup_line && -n $recover_line && -n $upload_line \
-  && $backup_line -lt $recover_line && $recover_line -lt $upload_line ]] || {
-  printf 'cutover does not recover interrupted parts before upload-only drain\n' >&2
+backup_line=$(grep -n -- 'RECOVERY_BACKUP_DIR=' <<<"$drain_body" | cut -d: -f1 || true)
+isolate_line=$(grep -n -- 'monday-rust-lob-recovery-queue isolate "$market"' <<<"$drain_body" | cut -d: -f1 || true)
+upload_line=$(grep -n -- '--upload-only' <<<"$drain_body" | cut -d: -f1 || true)
+[[ -z ${backup_line:-} && -n $isolate_line && -n $upload_line \
+  && $isolate_line -lt $upload_line ]] || {
+  printf 'cutover does not detach interrupted spools before upload-only drain\n' >&2
   exit 1
 }
 recover_body=$(sed -n '/^fn recover_parts_only()/,/^fn stream_types_for_market/p' "$COLLECTOR")
-grep -Fq 'RECOVERY_UID="$(id -u hftcollector)"' "$CUTOVER"
-grep -Fq 'RECOVERY_GID="$(id -g hftcollector)"' "$CUTOVER"
-grep -Fq 'RECOVERY_ARTIFACT_SHA256="$CANDIDATE_SHA256"' "$CUTOVER"
-grep -Fq 'RECOVERY_DEPLOYMENT_SOURCE_REVISION="$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
-grep -Fq 'RECOVERY_DEPLOYMENT_BUNDLE_SHA256="$DEPLOYMENT_BUNDLE_SHA256"' "$CUTOVER"
-grep -Fq -- '--arg deployment_source_revision "$DEPLOYMENT_SOURCE_REVISION"' "$CUTOVER"
-grep -Fq 'deployment_source_revision:' "$CUTOVER"
+grep -Fq '/opt/monday/bin/monday-rust-lob-recovery-queue isolate "$market"' "$CUTOVER"
 grep -Fq 'spool_lock.owner()' <<<"$recover_body"
 grep -Fq 'validated_nonempty_recovery_parts' <<<"$recover_body"
 grep -Fq 'validated_recovery_temporaries' <<<"$recover_body"
