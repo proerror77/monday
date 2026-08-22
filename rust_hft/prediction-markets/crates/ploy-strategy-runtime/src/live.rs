@@ -893,10 +893,30 @@ mod pure_recorder_tests {
         let (result, snapshot) =
             drain_market_update_recorder(Box::new(feed), &runtime_config).await;
 
-        let recorded = fs::read_to_string(&path).expect("read recorded tape");
-        assert!(recorded.contains("\"bid_levels\":[{\"price\":\"0.49\",\"size\":\"12\"}"));
-        assert!(recorded.contains("\"agg_trade_id\":42"));
-        assert!(recorded.contains("\"obi\":0.25"));
+        let recorded_bytes = fs::read(&path).expect("read recorded tape");
+        let recorded = std::str::from_utf8(&recorded_bytes).expect("UTF-8 market tape");
+        let records = recorded
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("recorded update"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["sequence"].as_u64().expect("sequence"))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        for (record, expected) in records.into_iter().zip(&updates) {
+            let mut actual = record["update"].clone();
+            if let Some(object) = actual.as_object_mut() {
+                object.remove("request_status");
+                object.remove("collection_result");
+            }
+            assert_eq!(
+                actual,
+                serde_json::to_value(expected).expect("expected update")
+            );
+        }
         assert_eq!(result.updates_processed, 3);
         assert_eq!(result.quote_updates_observed, 1);
         assert_eq!(result.depth_quote_updates_observed, 1);

@@ -249,6 +249,16 @@ case "$command" in
 esac
 SYSTEMCTL
 chmod 0755 "$fake_bin/systemctl"
+cat >"$fake_bin/mv" <<'MV'
+#!/usr/bin/env bash
+set -euo pipefail
+destination=${!#}
+if [[ -n ${FAKE_MV_FAIL_DESTINATION:-} && $destination == "$FAKE_MV_FAIL_DESTINATION" ]]; then
+  exit 1
+fi
+exec /bin/mv "$@"
+MV
+chmod 0755 "$fake_bin/mv"
 printf '#!/bin/sh\nexit 0\n' >"$fake_bin/flock"
 chmod 0755 "$fake_bin/flock"
 
@@ -264,6 +274,7 @@ run_deploy() {
   FAKE_SYSTEMCTL_BAD_ONCE_FILE="${bad_once:-}" \
   FAKE_SYSTEMCTL_BAD_PROC_EXE="${bad_proc_exe:-}" \
   FAKE_SYSTEMCTL_QUERY_ERROR_PROPERTY="${query_error_property:-}" \
+  FAKE_MV_FAIL_DESTINATION="${mv_fail_destination:-}" \
   PATH="$fake_bin:$PATH" \
     "$DEPLOY" "$@"
 }
@@ -328,8 +339,9 @@ state_file="$fixture/opt/monday/state/polymarket-market-recorder-deploy.json"
 [[ $(<"$baseline_release/source-revision.txt") == "$baseline_source" ]]
 grep -Fqx "ExecStart=$candidate_binary \\" "$unit"
 jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
-  .schema == "monday.polymarket_market_recorder_deploy.v1"
-  and .current.sha256 == $current and .previous.sha256 == $previous' \
+  .schema == "monday.polymarket_market_recorder_deploy.v2"
+  and .current.sha256 == $current and .current.activity == "active"
+  and .previous.sha256 == $previous and .previous.activity == "active"' \
   "$state_file" >/dev/null
 pid=$(jq -r .pid "$state")
 [[ $(readlink -f "$fixture/proc/$pid/exe") == "$candidate_binary" ]]
@@ -340,7 +352,8 @@ run_deploy verify
 run_deploy rollback
 grep -Fqx "ExecStart=$baseline_release/new-ploy-runner \\" "$unit"
 jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
-  .current.sha256 == $current and .previous.sha256 == $previous' \
+  .current.sha256 == $current and .current.activity == "active"
+  and .previous.sha256 == $previous and .previous.activity == "active"' \
   "$state_file" >/dev/null
 pid=$(jq -r .pid "$state")
 [[ $(readlink -f "$fixture/proc/$pid/exe") == "$baseline_release/new-ploy-runner" ]]
@@ -376,6 +389,15 @@ jq --arg exec "$baseline_release_exec" '
   .active=false | .substate="dead" | .enabled="enabled" | .exec=$exec
   | .pid="0" | .invocation="" | .restarts="0"' \
   "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+jq -S -n --arg current_sha "$baseline_sha" \
+  --arg current_source "$baseline_source" --arg previous_sha "$candidate_sha" \
+  --arg previous_source "$source_revision" '
+  {schema:"monday.polymarket_market_recorder_deploy.v1",
+    current:{sha256:$current_sha,source_revision:$current_source},
+    previous:{sha256:$previous_sha,source_revision:$previous_source}}' \
+  >"$state_file.tmp"
+chmod 0600 "$state_file.tmp"
+mv "$state_file.tmp" "$state_file"
 : >"$output"
 : >"$mutation_log"
 
@@ -399,22 +421,32 @@ run_deploy install "$archive" "$source_revision" "$image_digest"
 jq -e '.active == true and .substate == "running" and .pid != "0"' "$state" >/dev/null
 pid=$(jq -r .pid "$state")
 [[ $(readlink -f "$fixture/proc/$pid/exe") == "$candidate_binary" ]]
+jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
+  .schema == "monday.polymarket_market_recorder_deploy.v2"
+  and .current.sha256 == $current and .current.activity == "active"
+  and .previous.sha256 == $previous and .previous.activity == "inactive"' \
+  "$state_file" >/dev/null
 [[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
 
-sed "s|/opt/monday/releases/polymarket-market-recorder/@POLYMARKET_MARKET_RECORDER_SHA256@/new-ploy-runner|$baseline_release_binary|" \
-  "$SERVICE" >"$unit"
-chmod 0644 "$unit"
-jq --arg exec "$baseline_release_exec" '
-  .active=false | .substate="dead" | .exec=$exec | .pid="0"
-  | .invocation="" | .restarts="0"' \
-  "$state" >"$state.tmp" && mv "$state.tmp" "$state"
-jq --arg current_sha "$baseline_sha" --arg current_source "$baseline_source" \
-  --arg previous_sha "$candidate_sha" --arg previous_source "$source_revision" '
-  .current={sha256:$current_sha,source_revision:$current_source}
-  | .previous={sha256:$previous_sha,source_revision:$previous_source}' \
-  "$state_file" >"$state_file.tmp"
-chmod 0600 "$state_file.tmp"
-mv "$state_file.tmp" "$state_file"
+# A failed soak may leave the exact candidate running without fresh output and
+# with a recorded restart. Contained rollback must still restore the stopped
+# baseline instead of reviving its old hot loop.
+: >"$output"
+jq '.restarts="1"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+run_deploy rollback
+grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
+cmp -s "$CONFIG" "$config"
+jq -e --arg exec "$baseline_release_exec" '
+  .active == false and .substate == "dead" and .enabled == "enabled"
+  and .pid == "0" and .exec == $exec' "$state" >/dev/null
+jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
+  .current.sha256 == $current and .current.activity == "inactive"
+  and .previous.sha256 == $previous and .previous.activity == "active"' \
+  "$state_file" >/dev/null
+run_deploy verify
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+[[ $(grep -c '^stop polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+
 : >"$output"
 : >"$mutation_log"
 rm -f -- "$bad_once" "$bad_once.used"
@@ -424,12 +456,42 @@ run_deploy install "$archive" "$source_revision" "$image_digest" \
 grep -Fq "restored sha256=$baseline_sha source_revision=$baseline_source activity=inactive" \
   "$fixture/failed-inactive-install.out"
 grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
+cmp -s "$CONFIG" "$config"
 jq -e --arg exec "$baseline_release_exec" '
   .active == false and .substate == "dead" and .enabled == "enabled"
   and .pid == "0" and .exec == $exec' "$state" >/dev/null
-jq -e --arg current "$baseline_sha" '.current.sha256 == $current' \
+jq -e --arg current "$baseline_sha" --arg previous "$candidate_sha" '
+  .schema == "monday.polymarket_market_recorder_deploy.v2"
+  and .current.sha256 == $current and .current.activity == "inactive"
+  and .previous.sha256 == $previous and .previous.activity == "active"' \
   "$state_file" >/dev/null
 [[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
 [[ $(grep -c '^stop polymarket-market-tape.service$' "$mutation_log") == 1 ]]
+
+# If state publication fails after a degraded candidate is rolled back, keep
+# the contained baseline stopped instead of restarting the failed candidate.
+: >"$output"
+: >"$mutation_log"
+rm -f -- "$bad_once" "$bad_once.used"
+rm -rf -- "$fixture/proc/1"
+run_deploy install "$archive" "$source_revision" "$image_digest"
+: >"$output"
+jq '.restarts="1"' "$state" >"$state.tmp" && mv "$state.tmp" "$state"
+mv_fail_destination=$state_file
+run_deploy rollback >"$fixture/failed-contained-state-publication.out" 2>&1 && exit 1
+mv_fail_destination=
+grep -Fq 'contained baseline remains stopped' \
+  "$fixture/failed-contained-state-publication.out"
+grep -Fq "recovery_status=stopped failed_sha256=$candidate_sha recovery_sha256=$baseline_sha" \
+  "$fixture/failed-contained-state-publication.out"
+grep -Fqx "ExecStart=$baseline_release_binary \\" "$unit"
+jq -e --arg exec "$baseline_release_exec" '
+  .active == false and .substate == "dead" and .enabled == "enabled"
+  and .pid == "0" and .exec == $exec' "$state" >/dev/null
+jq -e --arg current "$candidate_sha" --arg previous "$baseline_sha" '
+  .current.sha256 == $current and .current.activity == "active"
+  and .previous.sha256 == $previous and .previous.activity == "inactive"' \
+  "$state_file" >/dev/null
+[[ $(grep -c '^restart polymarket-market-tape.service$' "$mutation_log") == 1 ]]
 
 printf 'Polymarket market-recorder release contract tests passed\n'
