@@ -800,7 +800,7 @@ write_evidence() {
 }
 
 rollback_after_failure() {
-  local safe_to_restart=1 unit rollback_started_ns=0
+  local safe_to_restart=1 safe_to_restore=1 unit rollback_started_ns=0
   ROLLBACK_RESULT=disabled
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
@@ -820,7 +820,7 @@ rollback_after_failure() {
     return
   fi
 
-  if [[ -d $CANONICAL_SPOOL && $DRAIN_REQUIRED -eq 1 ]]; then
+  if [[ -d $CANONICAL_SPOOL && $DRAIN_REQUIRED -eq 1 && $OLD_MODE == upgrade ]]; then
     if [[ -z $SPOOL_ENV_DEPLOYMENT \
       || ( $DRAIN_ATTEMPTED -eq 1 && $DRAIN_MAY_HAVE_MUTATED -eq 0 ) ]]; then
       safe_to_restart=0
@@ -838,15 +838,16 @@ rollback_after_failure() {
     if [[ -n $ROLLBACK_DEPLOYMENT_MANIFEST_SHA256 ]]; then
       printf '%s  %s\n' "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
         "$EVIDENCE_DIR/rollback-deployment.sha256" | sha256sum --check --strict \
-        || safe_to_restart=0
+        || safe_to_restore=0
       (
         cd "$OLD_DEPLOYMENT"
         sha256sum --check --strict "$EVIDENCE_DIR/rollback-deployment.sha256"
-      ) || safe_to_restart=0
+      ) || safe_to_restore=0
     else
-      safe_to_restart=0
+      safe_to_restore=0
     fi
-    if (( safe_to_restart == 0 )); then
+    if (( safe_to_restore == 0 )); then
+      safe_to_restart=0
       ROLLBACK_RESULT=rollback-evidence-unverified-disabled
     elif ! install_deployment "$OLD_DEPLOYMENT"; then
       safe_to_restart=0
@@ -860,7 +861,8 @@ rollback_after_failure() {
     elif ! systemctl daemon-reload; then
       safe_to_restart=0
       ROLLBACK_RESULT=daemon-reload-failed-disabled
-    elif (( OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
+    elif (( safe_to_restart \
+      && OLD_RECOVERY_TIMERS_ENABLED == ${#RECOVERY_TIMERS[@]} )) \
       && ! systemctl enable --now "${RECOVERY_TIMERS[@]}" >/dev/null; then
       safe_to_restart=0
       ROLLBACK_RESULT=recovery-timer-restore-failed-disabled
@@ -871,7 +873,7 @@ rollback_after_failure() {
         safe_to_restart=0
         ROLLBACK_RESULT=previous-release-restore-containment-failed
       fi
-    else
+    elif (( safe_to_restart )); then
       systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null \
         || safe_to_restart=0
     fi

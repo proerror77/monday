@@ -836,9 +836,39 @@ pub fn write_success_marker(data: &Path, digest: &str) -> anyhow::Result<PathBuf
 pub const MAX_RECOVERY_ROW_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifacts>> {
+    let parts = files_with_suffix(&config.spool_dir, ".jsonl.part")?;
+    recover_parts_from_paths(config, &parts)
+}
+
+pub fn recover_parts_from_paths(
+    config: &SegmentConfig,
+    paths: &[PathBuf],
+) -> anyhow::Result<Vec<SegmentArtifacts>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        fs::symlink_metadata(&config.spool_dir)?.file_type().is_dir(),
+        "configured recovery spool is not a direct directory"
+    );
+    let spool_dir = fs::canonicalize(&config.spool_dir)?;
     let mut artifacts = Vec::new();
-    for path in files_with_suffix(&config.spool_dir, ".jsonl.part")? {
-        let file = File::open(&path)?;
+    let mut recovered_paths = BTreeSet::new();
+    for path in paths {
+        let metadata = fs::symlink_metadata(path)?;
+        let resolved = fs::canonicalize(path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_file()
+                && resolved.starts_with(&spool_dir)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".jsonl.part"))
+                && recovered_paths.insert(resolved),
+            "recovery path is not a unique part beneath the configured spool: {}",
+            path.display()
+        );
+        let file = File::open(path)?;
         let file_len = usize::try_from(file.metadata()?.len())?;
         if file_len == 0 {
             drop(file);
@@ -963,17 +993,17 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             offset += line.len();
         }
         if quarantine {
-            fs::rename(&path, path.with_extension("part.corrupt"))?;
+            fs::rename(path, path.with_extension("part.corrupt"))?;
             continue;
         }
         if let Some((valid_bytes, has_following_data)) = invalid_at {
             if has_following_data {
-                fs::rename(&path, path.with_extension("part.corrupt"))?;
+                fs::rename(path, path.with_extension("part.corrupt"))?;
                 continue;
             }
             OpenOptions::new()
                 .write(true)
-                .open(&path)?
+                .open(path)?
                 .set_len(u64::try_from(valid_bytes)?)?;
         }
         if counts.is_empty() {
@@ -986,7 +1016,7 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let trade_summaries = trade_summaries.finish()?;
         artifacts.push(finalize_segment(
             config,
-            &path,
+            path,
             counts,
             trade_summaries,
             &schema,
