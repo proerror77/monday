@@ -64,6 +64,10 @@ RECOVERY_TIMERS=(
   binance-lob-archiver-recovery@spot.timer
   binance-lob-archiver-recovery@usdm.timer
 )
+RECOVERY_UNITS=(
+  binance-lob-archiver-recovery@spot.service
+  binance-lob-archiver-recovery@usdm.service
+)
 LEGACY_UNITS=(
   binance-lob-archiver@spot.service
   binance-lob-archiver@usdm.service
@@ -741,6 +745,9 @@ production_is_fail_closed() {
     [[ $state == disabled || $state == masked || $state == masked-runtime \
       || $state == not-found ]] || return 1
   done
+  for unit in "${RECOVERY_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
+  done
 }
 
 write_evidence() {
@@ -792,6 +799,7 @@ rollback_after_failure() {
   local safe_to_restart=1 safe_to_restore=1 unit rollback_started_ns=0
   ROLLBACK_RESULT=disabled
   systemctl disable --now "${RECOVERY_TIMERS[@]}" >/dev/null 2>&1 || true
+  systemctl stop "${RECOVERY_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
   systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
   production_is_fail_closed || safe_to_restart=0
