@@ -223,6 +223,8 @@ healthy_scenario() {
   write_scenario <<'EOF'
 binance-lob-archiver-production@spot.service	active	enabled	success	4
 binance-lob-archiver-production@usdm.service	active	enabled	success	4
+binance-lob-archiver-recovery@spot.timer	active	enabled	-	-
+binance-lob-archiver-recovery@usdm.timer	active	enabled	-	-
 binance-usdm-reference-collector.service	active	enabled	success	12
 bybit-options-archiver.service	active	enabled	success	1
 polymarket-market-tape-upload.timer	active	enabled	-	-
@@ -722,6 +724,25 @@ rewrite_scenario 's|^polymarket-market-tape-upload-watchdog.timer	active	enabled
 run_health
 expect "timer not enabled: exit 0" "$(rc_is 0; echo $?)"
 expect "timer not enabled: warning message" "$(grep_out '^warning: .*timer not enabled'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^binance-lob-archiver-recovery@spot.timer	active	enabled|binance-lob-archiver-recovery@spot.timer	inactive	disabled|'
+run_health
+expect "recovery timer down: exit 1" "$(rc_is 1; echo $?)"
+expect "recovery timer down: active breach" "$(grep_out '^breach: binance-lob-archiver-recovery@spot.timer: timer not active'; echo $?)"
+expect "recovery timer down: enabled breach" "$(grep_out '^breach: binance-lob-archiver-recovery@spot.timer: timer not enabled'; echo $?)"
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+rewrite_scenario 's|^binance-lob-archiver-production@spot.service	active|binance-lob-archiver-production@spot.service	inactive|; s|^binance-lob-archiver-recovery@spot.timer	active	enabled|binance-lob-archiver-recovery@spot.timer	inactive	disabled|'
+run_health
+expect "contained recovery timer down: exit 0" "$(rc_is 0; echo $?)"
+expect "contained recovery timer down: no recovery alert" "$(grep_not_out 'binance-lob-archiver-recovery@spot.timer:'; echo $?)"
 
 reset_env
 reset_state

@@ -138,6 +138,8 @@ BYBIT_PENDING_MAX_AGE=7200
 # their delivery is hard-gated through upload-status.json instead.
 ARCHIVER_SPOT=binance-lob-archiver-production@spot.service
 ARCHIVER_USDM=binance-lob-archiver-production@usdm.service
+RECOVERY_SPOT_TIMER=binance-lob-archiver-recovery@spot.timer
+RECOVERY_USDM_TIMER=binance-lob-archiver-recovery@usdm.timer
 REFERENCE_COLLECTOR=binance-usdm-reference-collector.service
 POLY_MARKET_UPLOAD_TIMER=polymarket-market-tape-upload.timer
 POLY_MARKET_UPLOAD_SERVICE=polymarket-market-tape-upload.service
@@ -352,10 +354,22 @@ check_timer() {
   # Timer: active AND enabled (drives a oneshot upload/watchdog service).
   unit=$1
   label=$2
+  backing_service=${3:-}
   active=$(unit_is_active "$unit")
   enabled=$(unit_is_enabled "$unit")
-  [ "$active" = "active" ] || record_warning "$label: timer not active (is-active='$active')"
-  [ "$enabled" = "enabled" ] || record_warning "$label: timer not enabled (is-enabled='$enabled')"
+  if [ -n "$backing_service" ]; then
+    service_active=$(unit_is_active "$backing_service")
+    service_enabled=$(unit_is_enabled "$backing_service")
+    if [ "$service_active" = "active" ] && [ "$service_enabled" = "enabled" ]; then
+      [ "$active" = "active" ] \
+        || record_breach "$label: timer not active (is-active='$active') while service $backing_service is active and enabled"
+      [ "$enabled" = "enabled" ] \
+        || record_breach "$label: timer not enabled (is-enabled='$enabled') while service $backing_service is active and enabled"
+    fi
+  else
+    [ "$active" = "active" ] || record_warning "$label: timer not active (is-active='$active')"
+    [ "$enabled" = "enabled" ] || record_warning "$label: timer not enabled (is-enabled='$enabled')"
+  fi
   obj=$(jq -n --arg a "$active" --arg e "$enabled" \
     '{active: ($a == "active"), enabled: ($e == "enabled")}')
   units_json=$(jq -n --argjson base "$units_json" --arg k "$unit" --argjson v "$obj" \
@@ -961,6 +975,8 @@ check_disk
 
 check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot"
 check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm"
+check_timer "$RECOVERY_SPOT_TIMER" "binance-lob-archiver-recovery@spot.timer" "$ARCHIVER_SPOT"
+check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$ARCHIVER_USDM"
 check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
 check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
 
