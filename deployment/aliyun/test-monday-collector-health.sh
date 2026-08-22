@@ -153,16 +153,9 @@ make_spools() {
 }
 
 touch_age() {
-  python3 - "$1" "$2" <<'PY'
-import os
-import sys
-import time
-
-path = sys.argv[1]
-age = int(sys.argv[2])
-timestamp = time.time() - age
-os.utime(path, (timestamp, timestamp))
-PY
+  touch -t "$(jq -rn --argjson age "$2" '
+    now - $age | floor | localtime | strftime("%Y%m%d%H%M.%S")
+  ')" "$1"
 }
 
 write_health() {

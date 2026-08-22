@@ -5,12 +5,13 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 QUEUE_SCRIPT="$SCRIPT_DIR/host-rust-lob-recovery-queue.sh"
 
-for command in awk grep install jq mktemp python3 sed sha256sum; do
+for command in awk grep install jq mktemp sed sha256sum; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
 
-tmp_dir=$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.mkdtemp()))')
+raw_tmp_dir=$(mktemp -d /tmp/monday-rust-lob-recovery-queue.XXXXXX 2>/dev/null || mktemp -d -t monday-rust-lob-recovery-queue)
+tmp_dir=$(cd "$raw_tmp_dir" && pwd -P)
 cleanup() {
   chmod -R u+w "$tmp_dir" 2>/dev/null || true
   rm -rf "$tmp_dir"
