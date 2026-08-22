@@ -1593,10 +1593,12 @@ run_contained_upgrade_rollback_fixture() (
   local old_recovery_timers_enabled=${4:-0}
   local active_recovery_timer=${5:-}
   local enabled_recovery_timer=${6:-}
+  local active_recovery_unit=${7:-}
   local calls="$tmp_dir/contained-rollback.calls"
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
+  RECOVERY_UNITS=(recovery-spot-service recovery-usdm-service)
   LEGACY_UNITS=(legacy-spot legacy-usdm)
   TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
   CANONICAL_SPOOL="$tmp_dir/rollback-spool"
@@ -1620,7 +1622,7 @@ run_contained_upgrade_rollback_fixture() (
     printf '%s %s\n' "$1" "${*:2}" >>"$calls"
     case "$1" in
       is-active)
-        [[ ${!#} == "$active_recovery_timer" ]]
+        [[ ${!#} == "$active_recovery_timer" || ${!#} == "$active_recovery_unit" ]]
         ;;
       is-enabled)
         if [[ ${2:-} == --quiet ]]; then
@@ -1654,7 +1656,8 @@ run_contained_upgrade_rollback_fixture() (
   . "$rollback_body"
   rollback_after_failure
   if (( expect_contained )) \
-    && [[ -z $active_recovery_timer && -z $enabled_recovery_timer ]]; then
+    && [[ -z $active_recovery_timer && -z $enabled_recovery_timer \
+      && -z $active_recovery_unit ]]; then
     grep -Fq "install $OLD_DEPLOYMENT" "$calls"
     grep -Fq "symlink $OLD_BINARY $PRODUCTION_LINK" "$calls"
     grep -Fq 'restore-dropin' "$calls"
@@ -1689,6 +1692,9 @@ run_contained_upgrade_rollback_fixture() (
   == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 0 contained-upgrade 0 '' recovery-spot) \
   == production-stop-or-disable-containment-failed ]]
+[[ $(run_contained_upgrade_rollback_fixture \
+  1 0 contained-upgrade 0 '' '' recovery-spot-service) \
+  == production-stop-or-disable-containment-failed ]]
 [[ $(run_contained_upgrade_rollback_fixture 1 1 upgrade) \
   == previous-release-restored-disabled ]]
 
@@ -1697,6 +1703,7 @@ run_new_host_rollback_fixture() (
   PRODUCTION_UNITS=(production-spot production-usdm)
   UPLOAD_UNITS=(upload-spot upload-usdm)
   RECOVERY_TIMERS=(recovery-spot recovery-usdm)
+  RECOVERY_UNITS=(recovery-spot-service recovery-usdm-service)
   LEGACY_UNITS=(legacy-spot legacy-usdm)
   TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}" "${LEGACY_UNITS[@]}")
   CANONICAL_SPOOL="$tmp_dir/nonexistent-spool"
@@ -1741,6 +1748,8 @@ run_new_host_rollback_fixture() (
 [[ $(run_new_host_rollback_fixture legacy-spot) \
   == production-stop-or-disable-containment-failed ]]
 [[ $(run_new_host_rollback_fixture upload-usdm) \
+  == production-stop-or-disable-containment-failed ]]
+[[ $(run_new_host_rollback_fixture recovery-spot-service) \
   == production-stop-or-disable-containment-failed ]]
 
 mock_bin="$tmp_dir/bin"
